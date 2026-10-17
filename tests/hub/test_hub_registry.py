@@ -134,3 +134,84 @@ def test_projection_rebuilds_from_log_and_survives_idempotent_replay(tmp_path: P
         id=project.id, name="B", aliases=["b-alias"], created=reg.get(project.id).created
     )
     assert reg2.get(project.id) == expected
+
+
+def test_cross_project_rename_key_reuse_conflicts(tmp_path: Path) -> None:
+    _, reg = _registry(tmp_path)
+    a = reg.create_project("A", ACTOR)
+    b = reg.create_project("B", ACTOR)
+    reg.rename_project(a.id, "Renamed", ACTOR, idempotency_key="RK")
+    # Same key, same new name, different project: a conflict, not a stale-key retry.
+    with pytest.raises(IdempotencyConflict):
+        reg.rename_project(b.id, "Renamed", ACTOR, idempotency_key="RK")
+    assert reg.get(b.id).name == "B"
+
+
+@pytest.mark.parametrize(
+    ("name", "override"),
+    [
+        ("B", {}),  # name
+        ("A", {"sources": [ProjectSource("drp_file", {"path": "/b.drp"})]}),
+        ("A", {"aliases": ["y"]}),
+        ("A", {"project_id": "prj_other"}),
+    ],
+)
+def test_create_conflicts_when_any_compared_field_changes(
+    tmp_path: Path, name: str, override: dict
+) -> None:
+    _, reg = _registry(tmp_path)
+    base = {
+        "sources": [ProjectSource("drp_file", {"path": "/a.drp"})],
+        "aliases": ["x"],
+        "project_id": "prj_base",
+    }
+    reg.create_project("A", ACTOR, idempotency_key="C", **base)
+    with pytest.raises(IdempotencyConflict):
+        reg.create_project(name, ACTOR, idempotency_key="C", **{**base, **override})
+
+
+def test_add_alias_conflicts_on_a_different_value(tmp_path: Path) -> None:
+    _, reg = _registry(tmp_path)
+    project = reg.create_project("A", ACTOR)
+    reg.add_alias(project.id, "x", ACTOR, idempotency_key="AK")
+    with pytest.raises(IdempotencyConflict):
+        reg.add_alias(project.id, "y", ACTOR, idempotency_key="AK")
+
+
+def test_add_source_conflicts_on_a_different_value(tmp_path: Path) -> None:
+    _, reg = _registry(tmp_path)
+    project = reg.create_project("A", ACTOR)
+    reg.add_source(
+        project.id, ProjectSource("drp_file", {"path": "/a.drp"}), ACTOR, idempotency_key="SK"
+    )
+    with pytest.raises(IdempotencyConflict):
+        reg.add_source(
+            project.id, ProjectSource("drp_file", {"path": "/b.drp"}), ACTOR, idempotency_key="SK"
+        )
+
+
+def test_create_key_reused_for_rename_conflicts(tmp_path: Path) -> None:
+    # Pins the event_type clause in match_or_conflict: a create key reused for a rename
+    # to the *same* name matches on every compared field, so only the type check catches
+    # it. Without that clause the rename is silently accepted and nothing is written.
+    log, reg = _registry(tmp_path)
+    project = reg.create_project("C", ACTOR, idempotency_key="CK")
+    with pytest.raises(IdempotencyConflict):
+        reg.rename_project(project.id, "C", ACTOR, idempotency_key="CK")
+    assert reg.get(project.id).name == "C"
+    assert log.read(types=["project.renamed"]) == []
+
+
+def test_create_retry_with_a_different_actor_conflicts(tmp_path: Path) -> None:
+    _, reg = _registry(tmp_path)
+    reg.create_project("A", Actor("human", "a1"), idempotency_key="K")
+    with pytest.raises(IdempotencyConflict):
+        reg.create_project("A", Actor("human", "a2"), idempotency_key="K")
+
+
+def test_rename_retry_with_a_different_actor_conflicts(tmp_path: Path) -> None:
+    _, reg = _registry(tmp_path)
+    project = reg.create_project("A", ACTOR)
+    reg.rename_project(project.id, "B", Actor("human", "a1"), idempotency_key="K")
+    with pytest.raises(IdempotencyConflict):
+        reg.rename_project(project.id, "B", Actor("human", "a2"), idempotency_key="K")

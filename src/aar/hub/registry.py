@@ -183,7 +183,14 @@ class Registry:
                     compare = ["name", "sources", "aliases"]
                     if project_id is not None:
                         compare.append("project_id")
-                    match_or_conflict(existing, EVENT_PROJECT_CREATED, expected, compare)
+                    match_or_conflict(
+                        existing,
+                        EVENT_PROJECT_CREATED,
+                        expected,
+                        compare,
+                        project_id=project_id,
+                        actor=actor,
+                    )
                     return self._projects[existing.payload["project_id"]]
             pid = project_id or new_project_id()
             if pid in self._projects:
@@ -300,7 +307,14 @@ class Registry:
             if idempotency_key is not None:
                 existing = txn.find_by_idempotency_key(idempotency_key)
                 if existing is not None:
-                    match_or_conflict(existing, event_type, payload, payload.keys())
+                    match_or_conflict(
+                        existing,
+                        event_type,
+                        payload,
+                        payload.keys(),
+                        project_id=project_id,
+                        actor=actor,
+                    )
                     return self._projects[project_id]
             event = txn.append(
                 event_type,

@@ -81,9 +81,14 @@ def _iter_source(source: bytes | bytearray | str | PathLike[str]) -> Iterator[by
 class ArtifactStore:
     """A content-addressed store rooted at a directory, with metadata on the event log."""
 
-    def __init__(self, root: str | PathLike[str], log: EventLog) -> None:
+    def __init__(self, root: str | PathLike[str], log: EventLog, *, create: bool = True) -> None:
         self._root = Path(root)
-        self._root.mkdir(parents=True, exist_ok=True)
+        if create:
+            self._root.mkdir(parents=True, exist_ok=True)
+        elif not self._root.is_dir():
+            # The read-only serve path passes create=False so a mistyped --artifacts
+            # is a clear error, not a freshly created empty directory.
+            raise FileNotFoundError(f"no artifact store directory at {self._root}")
         self._log = log
 
     def _path_for(self, artifact_id: str) -> Path:
