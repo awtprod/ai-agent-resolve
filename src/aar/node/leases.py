@@ -4,8 +4,11 @@ Scopes:
 
 - ``instance``: the right to switch the instance's current project or timeline.
   Key: ``(instance_id,)``.
-- ``project``: exclusive use of a project. Key: ``(project,)``.
-- ``timeline``: exclusive use of one timeline. Key: ``(project, timeline)``.
+- ``project``: exclusive use of a project. Key: ``(project_id,)``, the project's
+  ``Project.GetUniqueId()``; never its name, which changes on rename and is shared by
+  same-named projects in other folders.
+- ``timeline``: exclusive use of one timeline. Key: ``(project_id, timeline_id)``, with the
+  timeline's ``Timeline.GetUniqueId()``.
 
 Conflict rules: two leases conflict when they have the same scope and key, or when one is a
 project lease and the other a timeline lease in that project. Leases held by the same holder
@@ -117,12 +120,14 @@ def instance_key(instance_id: str = "default") -> tuple[str]:
     return (instance_id,)
 
 
-def project_key(project: str) -> tuple[str]:
-    return (project,)
+def project_key(project_id: str) -> tuple[str]:
+    """Key of a project lease: the project's unique id."""
+    return (project_id,)
 
 
-def timeline_key(project: str, timeline: str) -> tuple[str, str]:
-    return (project, timeline)
+def timeline_key(project_id: str, timeline_id: str) -> tuple[str, str]:
+    """Key of a timeline lease: the project's and the timeline's unique ids."""
+    return (project_id, timeline_id)
 
 
 def leases_conflict(a_scope: Scope, a_key: tuple[str, ...], b: Lease) -> bool:
