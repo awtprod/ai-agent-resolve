@@ -1,13 +1,20 @@
 """Known Resolve scripting traps, each with a stable id, its symptom, its cause and its fix.
 
 Ops cite these ids in their errors and results (``OpError.trap_id``, ``Note.trap_id``), so an
-agent that hits one can look the fix up instead of rediscovering it. Every entry was observed
-on DaVinci Resolve Studio 21.1; ``verified`` says how.
+agent that hits one can look the fix up instead of rediscovering it.
+
+Each entry separates what is known from what is assumed. ``confirmed`` is the behaviour seen
+on a live DaVinci Resolve Studio 21.1 and where it was seen. ``presumed`` is what the op
+library (and the test fake) assume on top of that without having seen it; empty when nothing
+is assumed. A presumed behaviour should be checked live before it is relied on.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+
+REPORTED = "reported from live work on Resolve 21.1 (project notes)"
+PROBED = "read-only probe of a live Resolve 21.1, 2026-10-17"
 
 
 @dataclass(frozen=True)
@@ -17,7 +24,14 @@ class Trap:
     symptom: str
     cause: str
     fix: str
-    verified: str = "live, Resolve 21.1"
+    confirmed: str
+    """What was seen live, and where."""
+    presumed: str = ""
+    """What the code assumes beyond that without having seen it; empty if nothing."""
+
+    @property
+    def fully_confirmed(self) -> bool:
+        return not self.presumed
 
     def to_dict(self) -> dict[str, str]:
         return asdict(self)
@@ -31,6 +45,8 @@ _ALL: tuple[Trap, ...] = (
         cause="MediaPool.AppendToTimeline treats endFrame as exclusive: [startFrame, endFrame).",
         fix="Pass half-open ranges straight through: endFrame is the first frame not wanted. "
         "Do not subtract 1.",
+        confirmed=f"endFrame is exclusive; {REPORTED}",
+        presumed="",
     ),
     Trap(
         id="append-fps-short",
@@ -41,6 +57,14 @@ _ALL: tuple[Trap, ...] = (
         "conversion to timeline frames can round down.",
         fix="Read every appended item back. If it is 1 frame short, delete it and re-append "
         "with endFrame + 1, then read it back again.",
+        confirmed=(
+            "24 fps media appended into a 29.97 timeline landed 1 frame short, and a re-append "
+            f"with endFrame + 1 fixed it; {REPORTED}"
+        ),
+        presumed=(
+            "the exact rounding rule (the test fake truncates the exact-rate conversion), and "
+            "that the repair lands exactly on the planned length"
+        ),
     ),
     Trap(
         id="append-still-ignores-range",
@@ -50,6 +74,14 @@ _ALL: tuple[Trap, ...] = (
         cause="AppendToTimeline does not apply source ranges to still images.",
         fix="Do not append stills. Render the still to a ProRes 4444 MOV of the wanted length "
         "and append that.",
+        confirmed=(
+            "a still appended with a range came in at a 150-frame default with an offset; "
+            f"{REPORTED}"
+        ),
+        presumed=(
+            "the size of the offset, and that a still's clip Type reads 'Still' (stills are also "
+            "recognised by file extension)"
+        ),
     ),
     Trap(
         id="append-ungraded",
@@ -60,6 +92,14 @@ _ALL: tuple[Trap, ...] = (
         fix="Copy the grade from a graded reference item of the same camera with "
         "TimelineItem.CopyGrades([...]); this works across timelines. CopyGrades replaces the "
         "whole node graph, so re-apply per-clip LUTs afterwards.",
+        confirmed=(
+            "appended items had no grade; CopyGrades worked across timelines and replaced the "
+            f"node graph, per-clip LUTs included; {REPORTED}"
+        ),
+        presumed=(
+            "that Graph.GetNodeLabel / GetToolsInNode / GetLUT show a grade, which the op uses to"
+            " refuse an ungraded reference and to verify the copy"
+        ),
     ),
     Trap(
         id="av-append-video-only",
@@ -69,6 +109,11 @@ _ALL: tuple[Trap, ...] = (
         cause="The returned list only holds the video item for BRAW 'av' appends.",
         fix="Find the audio items by walking Timeline.GetItemListInTrack('audio', n) for items "
         "of the same media at the same start.",
+        confirmed=f"an audio+video append of BRAW returned only the video item; {REPORTED}",
+        presumed=(
+            "that other media return both items (the op walks the audio track for every "
+            "audio+video append anyway)"
+        ),
     ),
     Trap(
         id="volume-key",
@@ -78,6 +123,8 @@ _ALL: tuple[Trap, ...] = (
         "validated before anything is applied.",
         fix="Use SetProperties({'AudioVolume': dB}). Check every property setter's return "
         "value and read the property back.",
+        confirmed=f"SetProperty('Volume') returned False and AudioVolume worked; {REPORTED}",
+        presumed="",
     ),
     Trap(
         id="setproperty-after-color",
@@ -86,6 +133,14 @@ _ALL: tuple[Trap, ...] = (
         "returns False.",
         cause="A page-state problem in Resolve; not documented.",
         fix="OpenPage to another page and back, then retry once.",
+        confirmed=(
+            "SetProperty returned False for everything after Color -> Edit, and an OpenPage "
+            f"bounce cleared it; {REPORTED}"
+        ),
+        presumed=(
+            "that SetFades, TimelineItem.CopyGrades and Graph.SetLUT jam the same way (the ops "
+            "bounce and retry them too)"
+        ),
     ),
     Trap(
         id="rcm-input-colorspace",
@@ -97,6 +152,11 @@ _ALL: tuple[Trap, ...] = (
         fix="Set the clip property 'Input Color Space' on each affected media-pool item, "
         "listed explicitly. Never on BRAW clips, never by sweeping a bin tree, and never by "
         "changing the project's colour settings.",
+        confirmed=(
+            "imported Rec.709 media took the camera-log input default in a colour-managed "
+            f"project; {REPORTED}"
+        ),
+        presumed="",
     ),
     Trap(
         id="custom-res-resets-colour-science",
@@ -109,6 +169,11 @@ _ALL: tuple[Trap, ...] = (
         "colorSpaceOutput, inputDRT, outputDRT, useInverseDRT, useColorSpaceAwareGradingTools "
         "and the other timeline colour settings first, set them back afterwards, and read "
         "them back.",
+        confirmed=f"a per-timeline custom resolution reset the timeline to davinciYRGB; {REPORTED}",
+        presumed=(
+            "that colorScienceMode set first, then the other colour keys, is accepted by "
+            "Timeline.SetSettings"
+        ),
     ),
     Trap(
         id="multicam-angles",
@@ -119,6 +184,10 @@ _ALL: tuple[Trap, ...] = (
         fix="Do not append multicam clips. Duplicate the timeline to a scratch copy, flatten "
         "it (TimelineItem.FlattenMulticam), and measure the constant offset of each camera "
         "from the flattened items; then append the camera files with those offsets.",
+        confirmed=(
+            f"the API has no angle setter and appended multicam clips lost their angle; {REPORTED}"
+        ),
+        presumed="",
     ),
     Trap(
         id="deliver-clobber",
@@ -129,6 +198,11 @@ _ALL: tuple[Trap, ...] = (
         "GetRenderSettings to read them first.",
         fix="Save the Deliver settings as a temporary render preset before and load it back "
         "afterwards. The broker does this for every borrowed context.",
+        confirmed=f"LoadRenderPreset replaced every Deliver setting; {REPORTED}",
+        presumed=(
+            "that a render preset saved with SaveAsNewRenderPreset round-trips the format and "
+            "codec (the broker sets both again after loading it)"
+        ),
     ),
     Trap(
         id="render-uses-original-media",
@@ -137,6 +211,13 @@ _ALL: tuple[Trap, ...] = (
         cause="Playback can come from proxies, but a render always reads the original media.",
         fix="Before rendering, check every item's media 'Online Status'; relink or sync the "
         "original media rather than relying on proxies.",
+        confirmed=(
+            f"a timeline playing from proxies failed to export with 'frames offline'; {REPORTED}"
+        ),
+        presumed=(
+            "that the clip property 'Online Status' reads other than 'Online' for missing "
+            "originals while a proxy plays"
+        ),
     ),
     Trap(
         id="pm-folder-scoped-load",
@@ -148,6 +229,14 @@ _ALL: tuple[Trap, ...] = (
         fix="Address projects by ProjectLocator: navigate to the folder path from the root "
         "(GotoRootFolder, then OpenFolder per segment), load, and verify the project's unique "
         "id.",
+        confirmed=(
+            f"GetCurrentFolder() returns only the folder name, '' at the root ({PROBED}); "
+            f"LoadProject resolves names in the current folder only ({REPORTED})"
+        ),
+        presumed=(
+            "that project names are unique within one folder, that GotoParentFolder only fails at"
+            " the root, and that a folder listing shows the open project under its current name"
+        ),
     ),
     Trap(
         id="source-frame-readback-rounding",
@@ -158,7 +247,11 @@ _ALL: tuple[Trap, ...] = (
         cause="Source positions are kept as times and rounded to frames on readback.",
         fix="Measure placement on timeline frames (GetStart/GetEnd, end exclusive). Treat "
         "source readback as accurate to +/- 1 frame and report the measured value.",
-        verified="live, Resolve 21.1, read-only probe of four items on one timeline",
+        confirmed=(
+            "GetSourceEndFrame - GetSourceStartFrame read as duration - 1, duration and duration "
+            f"+ 1 on one timeline ({PROBED})"
+        ),
+        presumed="that the error is never more than 1 frame",
     ),
 )
 

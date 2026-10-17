@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from pydantic import BaseModel
 
-from aar.node.broker import Broker, BrokerConfig, OpError, OpResult, OpStatus
+from aar.node.broker import Broker, BrokerConfig, BrokerEvent, OpError, OpResult, OpStatus
 from aar.node.gateway import ScriptApiGateway
 from aar.node.leases import Holder, LeaseManager
 from aar.node.locator import ProjectLocator
@@ -29,14 +30,31 @@ CONFIG = BrokerConfig(
 class OpsWorld:
     """A fake Resolve with a broker in front of it, already past the presence warm-up."""
 
-    def __init__(self, fake: FakeResolve, config: BrokerConfig = CONFIG) -> None:
+    def __init__(
+        self,
+        fake: FakeResolve,
+        config: BrokerConfig = CONFIG,
+        on_event: Callable[[BrokerEvent], None] | None = None,
+    ) -> None:
         self.fake = fake
         self.gw = ScriptApiGateway(self.fake)
         self.clock = FakeClock()
         self.leases = LeaseManager(self.clock)
         self.presence = PresenceGuard(idle_window=IDLE)
+        self.events: list[BrokerEvent] = []
+
+        def sink(event: BrokerEvent) -> None:
+            self.events.append(event)
+            if on_event is not None:
+                on_event(event)
+
         self.broker = Broker(
-            self.gw, leases=self.leases, presence=self.presence, clock=self.clock, config=config
+            self.gw,
+            leases=self.leases,
+            presence=self.presence,
+            clock=self.clock,
+            sink=sink,
+            config=config,
         )
         self.presence.observe(self.gw.get_context(), self.clock())
         self.clock.advance(IDLE)
@@ -72,7 +90,12 @@ class Show(OpsWorld):
     """Project "Show" in Project Manager folder ``Shows``: a 29.97 timeline "Main", an empty
     agent branch "Main [agent]" and a media pool with one clip of each kind."""
 
-    def __init__(self, fake: FakeResolve | None = None, config: BrokerConfig = CONFIG) -> None:
+    def __init__(
+        self,
+        fake: FakeResolve | None = None,
+        config: BrokerConfig = CONFIG,
+        on_event: Callable[[BrokerEvent], None] | None = None,
+    ) -> None:
         fake = fake or FakeResolve(
             {"Show": ["Main", "Main [agent]"], "Other": ["Other main"]},
             current="Show",
@@ -90,7 +113,11 @@ class Show(OpsWorld):
         self.music = pool.add_clip(("Music",), "theme", kind="audio", frames=20000)
         self.main: FakeTimeline = self.project.timeline("Main")
         self.branch: FakeTimeline = self.project.timeline("Main [agent]")
-        super().__init__(fake, config)
+        super().__init__(fake, config, on_event)
+
+    @property
+    def pid(self) -> str:
+        return self.project.GetUniqueId()
 
 
 def media(clip: FakeMediaPoolItem) -> dict[str, Any]:

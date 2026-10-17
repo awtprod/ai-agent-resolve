@@ -13,7 +13,12 @@ Mutating calls (and Project Manager navigation and page changes) are recorded in
 
 Every known trap of ``aar.node.traps`` is modelled here as it was observed on Resolve 21.1.
 Each modelled behaviour carries a ``# trap: <id>`` comment. Where the observation does not
-pin the exact numbers down, the comment says what the model chose.
+pin the exact numbers down, the comment says what the model chose; behaviours the trap
+registry lists as presumed are marked "(presumed)".
+
+``FakeResolve.faults`` switches on lies Resolve's API can tell (a setter that returns True
+without applying, a returned object that is not really there). They are not traps seen live;
+they exist so the ops' read-back checks are proven to matter. See ``FAULTS``.
 """
 
 from __future__ import annotations
@@ -26,6 +31,20 @@ from fractions import Fraction
 from typing import Any
 
 PAGES = ("media", "photo", "cut", "edit", "fusion", "color", "fairlight", "deliver")
+
+FAULTS = frozenset(
+    {
+        "SetProperties:no-op",  # SetProperties/SetProperty return True, apply nothing
+        "SetFades:no-op",  # SetFades returns True, applies nothing
+        "CopyGrades:no-op",  # CopyGrades returns True, copies nothing
+        "SetLUT:no-op",  # Graph.SetLUT returns True, sets nothing
+        "SetClipProperty:no-op",  # SetClipProperty returns True, sets nothing
+        "DeleteClips:no-op",  # Timeline.DeleteClips returns True, deletes nothing
+        "DuplicateTimeline:detached",  # returns a timeline that is not in the project
+        "LoadRenderPreset:drops-codec",  # a preset round trip resets the codec to H264
+        "OpenPage:keeps-jam",  # a page bounce does not clear the after-Color setter jam
+    }
+)
 _TIMECODE = re.compile(r"^\d{2}:\d{2}:\d{2}[:;]\d{2}$")
 MARKER_COLORS = (
     "Blue", "Cyan", "Green", "Yellow", "Red", "Pink", "Purple", "Fuchsia",
@@ -211,6 +230,8 @@ class FakeMediaPoolItem:
         project = self._app.current
         if project is None or "ColorManaged" not in project.settings.get("colorScienceMode", ""):
             return False
+        if "SetClipProperty:no-op" in self._app.faults:
+            return True
         # A BRAW clip accepts the change, which is the harm: its decode colour space is set
         # by the RAW settings, and overriding it breaks the grade. The guard is in the op.
         self.props["Input Color Space"] = propertyValue
@@ -340,10 +361,14 @@ class FakeGraph:
 
     def SetLUT(self, nodeIndex: int, lutPath: str) -> bool:
         self._app.calls.append(("SetLUT", nodeIndex, lutPath))
+        if self._app.props_stuck:
+            return False  # trap: setproperty-after-color (presumed for Graph.SetLUT)
         if not 1 <= nodeIndex <= len(self.nodes) or not lutPath:
             return False
         if lutPath in self._app.unknown_luts:
             return False  # Resolve only applies LUTs it has discovered
+        if "SetLUT:no-op" in self._app.faults:
+            return True
         self.nodes[nodeIndex - 1].lut = lutPath
         return True
 
@@ -455,6 +480,10 @@ class FakeTimelineItem:
 
     def SetFades(self, fades: dict[str, int]) -> bool:
         self._app.calls.append(("SetFades", self._uid, dict(fades)))
+        if self._app.props_stuck:
+            return False  # trap: setproperty-after-color (presumed for SetFades)
+        if "SetFades:no-op" in self._app.faults:
+            return True
         if not fades or set(fades) - {"FadeIn", "FadeOut"}:
             return False
         new = dict(self.fades)
@@ -487,6 +516,8 @@ class FakeTimelineItem:
         return self.props.get(propertyKey)
 
     def _set_props(self, properties: dict[str, Any]) -> bool:
+        if "SetProperties:no-op" in self._app.faults:
+            return True
         if self._app.props_stuck:
             # trap: setproperty-after-color: after coming back to Edit from Color every
             # property setter returns False until the page is bounced.
@@ -506,8 +537,12 @@ class FakeTimelineItem:
 
     def CopyGrades(self, tgtTimelineItems: list[FakeTimelineItem]) -> bool:
         self._app.calls.append(("CopyGrades", self._uid, [t._uid for t in tgtTimelineItems]))
+        if self._app.props_stuck:
+            return False  # trap: setproperty-after-color (presumed for CopyGrades)
         if self.track_type != "video" or any(t.track_type != "video" for t in tgtTimelineItems):
             return False
+        if "CopyGrades:no-op" in self._app.faults:
+            return True
         # trap: append-ungraded: CopyGrades works across timelines, and it replaces the
         # target's whole node graph, per-clip LUTs included.
         for target in tgtTimelineItems:
@@ -668,6 +703,8 @@ class FakeTimeline:
         self, timelineItems: list[FakeTimelineItem], rippleDelete: bool = False
     ) -> bool:
         self._app.calls.append(("DeleteClips", [i.GetUniqueId() for i in timelineItems]))
+        if "DeleteClips:no-op" in self._app.faults:
+            return True
         found = True
         for item in timelineItems:
             for tracks in self.tracks.values():
@@ -704,6 +741,8 @@ class FakeTimeline:
         }
         twin.custom_settings = dict(self.custom_settings) if self.custom_settings else None
         twin.markers = {f: dict(m) for f, m in self.markers.items()}
+        if "DuplicateTimeline:detached" in self._app.faults:
+            return twin  # a timeline object the project does not hold
         project.timelines.append(twin)
         return twin
 
@@ -937,6 +976,10 @@ class FakeProject:
             return False
         # trap: deliver-clobber: loading a preset replaces every Deliver setting.
         self.deliver = preset.copy()
+        if "LoadRenderPreset:drops-codec" in self._app.faults:
+            # fault: a preset round trip that loses the codec (presumed not to happen live;
+            # the broker sets format and codec again after loading the preset anyway).
+            self.deliver.codec = "H264"
         return True
 
     def DeleteRenderPreset(self, presetName: str) -> bool:
@@ -1051,6 +1094,7 @@ class FakeResolve:
         self.load_silently_fails: set[str] = set()
         self.save_fails = False
         self.unknown_luts: set[str] = set()
+        self.faults: set[str] = set()  # names from FAULTS
         self.source_readback_skew = 0  # applied to items created from now on
         self._pm = FakeProjectManager(self)
 
@@ -1074,7 +1118,7 @@ class FakeResolve:
         # setters; going to any other page (and back) clears it.
         if self.page == "color" and page == "edit":
             self.props_stuck = True
-        elif page not in ("edit", "color"):
+        elif page not in ("edit", "color") and "OpenPage:keeps-jam" not in self.faults:
             self.props_stuck = False
         self.page = page
 

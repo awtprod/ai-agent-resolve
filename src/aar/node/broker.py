@@ -8,19 +8,38 @@ time-slices them:
   projects as rarely as possible. When the batch quota runs out and other projects are
   waiting, the next batch goes to another project. An op that has waited ``max_wait_seconds``
   ends the running batch at the next op boundary and goes next (bounded starvation).
-- Projects are addressed by ``ProjectLocator`` (Project Manager folder path, name, and the
-  stable ``project_id`` when known). Queues are keyed by ``locator.key``; leases by project
-  name, which is conservative: same-named projects in different folders share a lease.
+- Projects are addressed by ``ProjectLocator`` (Project Manager folder path, name and the
+  stable ``project_id``, which every submitted op must carry). Queues are keyed by
+  ``locator.key``.
+- Leases are keyed by identity, never by name: a project lease by ``project_id``, a timeline
+  lease by ``(project_id, timeline unique id)``. An op that names its timeline by unique id
+  needs that timeline; any other op (no timeline, or a timeline by name only) needs the
+  whole project. Why this never under-blocks: two leases conflict when they share a project
+  id and either is a project lease or both name the same timeline id. Ids do not change on
+  rename and differ between same-named projects or timelines, so an op that touches project
+  P (timeline T) always checks a key that conflicts with every lease on P (on T). The op is
+  then held to that identity: the broker asserts the open project's id and the current
+  timeline's id before it runs, and refuses a ref whose name and id disagree. The cost is an
+  over-block, never an under-block: an op that names its timeline only by name waits for
+  every timeline lease in its project.
 - Before it acts in or switches away from a context it did not create, the broker asks the
   ``PresenceGuard``, checks leases, and snapshots the human's context: the full Deliver
-  settings (saved into a temporary render preset), the full Project Manager path, and where
-  the human's project lives. When the queue drains it restores that context (navigating the
-  Project Manager back before loading), but never while the human is active again; if the
-  human has changed the context in the meantime, the human has taken over and the restore is
-  abandoned.
-- Before every op it asserts the expected project (by ``project_id`` when the locator has
-  one, and timeline and page when given), re-selecting once on mismatch. An op is never run
-  against the wrong project; it fails with a structured ``OpError`` instead.
+  settings (saved into a temporary render preset), the full Project Manager path the human
+  is browsing, and where the human's project lives. That locator is found by identity, never
+  from the folder the human is browsing: a locator the broker itself loaded and verified
+  earlier, or a full Project Manager search in which the project's name is unique. When the
+  human's project cannot be located that way, the broker does not switch away from it at
+  all: ops for other projects fail with ``switch_refused``, because the broker could never
+  bring the human back.
+- When the queue drains it restores that context: the human's project by its locator (then
+  verified by id), then, separately, the Project Manager folder the human was browsing, then
+  the rest. It never restores while the human is active again; if the human has changed the
+  context in the meantime, the human has taken over and the restore is abandoned.
+- Before every op it asserts the expected project by ``project_id`` (and timeline and page
+  when given), re-selecting once on mismatch. An op is never run against the wrong project;
+  it fails with a structured ``OpError`` instead.
+- An op body runs only inside the broker: ``running_op_id()`` names the op being run, and
+  the op library refuses to run outside it.
 - An op body that raises ``HotOpFailure`` (the op library's ``OpError`` does) fails with that
   failure's code and detail instead of the generic ``op_raised``.
 - Each op gets its own ``OpResult``. A failing op does not abort the batch unless it is
@@ -48,6 +67,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 
@@ -70,6 +90,17 @@ from aar.node.presence import Decision, PresenceGuard
 OpFn = Callable[[ResolveGateway], object]
 """An op body. It receives the gateway (``ScriptApiGateway.resolve`` gives raw API access)."""
 
+_RUNNING_OP: ContextVar[str | None] = ContextVar("aar_running_hot_op", default=None)
+
+
+def running_op_id() -> str | None:
+    """The id of the hot op whose body the broker is running right now, else ``None``.
+
+    Set only by ``Broker`` around an op body, after its lease, project, timeline and page
+    checks. Op code uses it to refuse running outside the broker.
+    """
+    return _RUNNING_OP.get()
+
 
 class HotOpFailure(Exception):
     """An op body's structured failure: the broker records its ``code`` and ``detail``."""
@@ -83,6 +114,10 @@ class HotOpFailure(Exception):
 
 @dataclass(frozen=True)
 class HotOp:
+    """One unit of hot work. ``timeline``/``timeline_id`` name the timeline the op needs; it
+    is made current and asserted before the op runs. Only ``timeline_id`` narrows the lease
+    to that timeline; a name alone leases the whole project."""
+
     project: ProjectLocator
     fn: OpFn
     holder: Holder
@@ -93,6 +128,7 @@ class HotOp:
     label: str = ""
     submitted_at: float | None = None
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    timeline_id: str | None = None
 
 
 class OpStatus(StrEnum):
@@ -148,6 +184,10 @@ class RestoreReport:
     final: ResolveContext
     errors: Mapping[str, str]
     mismatches: Mapping[str, tuple[object, object]]
+    kept_preset: str | None = None
+    """A temporary Deliver preset left in place because it may be the only copy of the
+    human's Deliver settings (an op ran in the human's project, and the project could not be
+    restored). ``None`` when there was none or it was deleted."""
 
 
 class TickKind(StrEnum):
@@ -189,7 +229,9 @@ class BrokerConfig:
     snapshot_deliver_preset: bool = True
     snapshot_project_manager_path: bool = True
     """Measure the human's Project Manager path (a walk up to the root and back) so it can be
-    restored, and locate the human's project for the restore."""
+    restored, and search the Project Manager for the human's project. When off, the human's
+    project is located only from locators the broker verified itself; if it cannot be, the
+    broker never switches away from it."""
     preset_prefix: str = "aar-restore-"
 
     def __post_init__(self) -> None:
@@ -232,6 +274,9 @@ class Broker:
         self._drained_since: float | None = None
         self._notices: dict[str, str] = {}
         self.last_restore: RestoreReport | None = None
+        self._known: dict[str, ProjectLocator] = {}
+        self._touched_human_project = False
+        self._last_target: ProjectLocator | None = None
 
     # -- public API ------------------------------------------------------------------------
 
@@ -244,9 +289,21 @@ class Broker:
     def snapshot(self) -> HumanSnapshot | None:
         return self._snapshot
 
+    def known_locators(self) -> dict[str, ProjectLocator]:
+        """Locators the broker loaded and verified by id itself, keyed by ``project_id``."""
+        return dict(self._known)
+
     def submit(self, op: HotOp) -> str:
         if not isinstance(op.project, ProjectLocator):
             raise ValueError("a hot op needs a ProjectLocator")
+        if op.project.project_id is None:
+            raise ValueError(
+                "a hot op's locator needs a project_id: the broker leases and asserts by id"
+            )
+        if op.timeline is not None and not op.timeline:
+            raise ValueError("timeline must be a non-empty name or None")
+        if op.timeline_id is not None and not op.timeline_id:
+            raise ValueError("timeline_id must be a non-empty id or None")
         if op.page is not None and op.page not in VALID_PAGES:
             raise ValueError(f"page {op.page!r} is not one of {sorted(VALID_PAGES)}")
         if op.submitted_at is None:
@@ -262,6 +319,7 @@ class Broker:
             project=op.project.key,
             project_id=op.project.project_id,
             timeline=op.timeline,
+            timeline_id=op.timeline_id,
             page=op.page,
             holder=str(op.holder),
             priority=op.priority,
@@ -313,6 +371,9 @@ class Broker:
         self._notices.pop("defer", None)
 
         if not _is_open(target, ctx):
+            refused = self._refuse_unreturnable_switch(ctx, target)
+            if refused is not None:
+                return refused
             failed = self._switch(ctx, target)
             if failed is not None:
                 return failed
@@ -404,12 +465,15 @@ class Broker:
         decided from leases alone, never from which timeline happens to be current, so a
         blocked op cannot make the broker switch projects only to find it cannot run.
         """
-        name = op.project.name
-        if op.timeline is None:
-            blocking = self._leases.conflicts_for(op.holder, Scope.PROJECT, project_key(name))
+        project_id = op.project.project_id
+        assert project_id is not None  # submit() requires it
+        if op.timeline_id is None:
+            # No timeline, or one known only by name: the op may touch any timeline of the
+            # project, so it needs the whole project (an over-block, never an under-block).
+            blocking = self._leases.conflicts_for(op.holder, Scope.PROJECT, project_key(project_id))
         else:
             blocking = self._leases.conflicts_for(
-                op.holder, Scope.TIMELINE, timeline_key(name, op.timeline)
+                op.holder, Scope.TIMELINE, timeline_key(project_id, op.timeline_id)
             )
         return blocking[0].describe() if blocking else None
 
@@ -490,12 +554,12 @@ class Broker:
                 return Decision(
                     False, "render_in_progress", f"project {ctx.project!r} is rendering"
                 )
-            if ctx.project is not None:
+            if ctx.project_id is not None:
                 for lease in self._leases.active():
                     if (
                         lease.holder.is_human
                         and lease.scope in (Scope.PROJECT, Scope.TIMELINE)
-                        and lease.key[0] == ctx.project
+                        and lease.key[0] == ctx.project_id
                     ):
                         return Decision(False, "human_lease_on_current", lease.describe())
         return Decision(True, "ok", "")
@@ -547,8 +611,14 @@ class Broker:
             ctx = replace(ctx, project_manager_path=pm_path)
             # The walk ends where it began; note it so it can never read as a human change.
             self._presence.note_broker_context(self._gw.get_context(), now)
+        elif ctx.project_id is not None:
+            # Without Project Manager navigation only a locator the broker verified itself
+            # can say where the human's project lives.
+            known = self._known.get(ctx.project_id)
+            human_project = known if known is not None and known.name == ctx.project else None
         self._snapshot = HumanSnapshot(ctx, now, preset, tuple(warnings), human_project)
         self._control_since = now
+        self._touched_human_project = False
         self._emit(
             "snapshot",
             context=asdict(ctx),
@@ -561,22 +631,27 @@ class Broker:
     def _snapshot_project_manager(
         self, ctx: ResolveContext, warnings: list[str]
     ) -> tuple[tuple[str, ...] | None, ProjectLocator | None]:
-        """Measure the human's Project Manager path and locate the human's open project.
+        """Measure the Project Manager path the human is browsing, and locate the human's
+        open project by identity.
 
-        The project is looked for in the human's current Project Manager folder first; if it
-        is not there (the human browsed elsewhere after opening it), the whole tree is
-        searched. Only a single match is trusted. Failures become snapshot warnings.
+        The folder being browsed says nothing about where the open project lives (the human
+        may have opened it elsewhere and browsed on), so it is never used for that. The
+        project is located by (1) a locator the broker loaded and verified by id itself, or
+        (2) a full Project Manager search in which its name is unique (names are unique
+        within a folder, and the open project is in some folder, so a name found exactly
+        once is the open project). Anything else leaves it unlocated, with a warning.
         """
         try:
             path = self._gw.get_project_manager_path()
         except GatewayError as exc:
             warnings.append(f"Project Manager path not measured: {exc}")
-            return None, None
-        if ctx.project is None:
+            path = None
+        if ctx.project is None or ctx.project_id is None:
             return path, None
+        known = self._known.get(ctx.project_id)
+        if known is not None and known.name == ctx.project:
+            return path, known
         try:
-            if ctx.project in self._gw.list_project_manager_folder().projects:
-                return path, ProjectLocator(path, ctx.project, ctx.project_id)
             folders = self._gw.find_project_folders(ctx.project)
         except GatewayError as exc:
             warnings.append(f"human project not located: {exc}")
@@ -585,14 +660,62 @@ class Broker:
             return path, ProjectLocator(folders[0], ctx.project, ctx.project_id)
         where = ", ".join("/".join(f) or "<root>" for f in folders) or "nowhere"
         warnings.append(
-            f"human project {ctx.project!r} is not in the current Project Manager folder and "
-            f"was found in {len(folders)} folder(s) ({where}); it cannot be reloaded on restore"
+            f"human project {ctx.project!r} [{ctx.project_id}] cannot be located by identity: "
+            f"its name is in {len(folders)} Project Manager folder(s) ({where}); the broker "
+            f"will not switch away from it"
         )
         return path, None
+
+    def _refuse_unreturnable_switch(
+        self, ctx: ResolveContext, target: ProjectLocator
+    ) -> TickOutcome | None:
+        """Fail ``target``'s ops instead of leaving a human project the broker cannot reload."""
+        snapshot = self._snapshot
+        if snapshot is None or snapshot.project is not None:
+            return None
+        human = _human_target(snapshot)
+        if human is None or not _is_open(human, ctx):
+            return None
+        key = target.key
+        error = OpError(
+            "switch_refused",
+            f"the human's project {snapshot.context.project!r} cannot be located by identity "
+            f"(see the snapshot warnings), so the broker will not switch away from it to "
+            f"{key!r}",
+            {
+                "trap_id": "pm-folder-scoped-load",
+                "fix_hint": "give the human's project a name that is unique in the Project "
+                "Manager, or run the op when the human has that project closed",
+                "human_project": snapshot.context.project,
+                "human_project_id": snapshot.context.project_id,
+                "warnings": list(snapshot.warnings),
+            },
+        )
+        failed = [
+            op.id
+            for op in self._ordered(key)
+            if self._finish_unrun(op, OpStatus.FAILED, error) is not None
+        ]
+        self._emit("switch_failed", source=ctx.project, target=key, code="switch_refused")
+        return TickOutcome(
+            TickKind.SWITCH_FAILED, key, tuple(failed), "switch_refused", error.message
+        )
+
+    def _load(self, locator: ProjectLocator) -> None:
+        """``load_project`` that remembers locators it verified and forgets ones that failed."""
+        try:
+            self._gw.load_project(locator)
+        except GatewayError:
+            if locator.project_id is not None:
+                self._known.pop(locator.project_id, None)
+            raise
+        if locator.project_id is not None:
+            self._known[locator.project_id] = locator
 
     def _drop_control(self) -> None:
         self._snapshot = None
         self._control_since = None
+        self._touched_human_project = False
         self._drained_since = None
         self._last_turn = None
         self._release_instance_lease()
@@ -629,7 +752,7 @@ class Broker:
                 )
                 return TickOutcome(TickKind.DEFERRED, key, code=exc.code, reason=exc.message)
         try:
-            self._gw.load_project(target)
+            self._load(target)
         except GatewayError as exc:
             self._note_broker_context()
             self._emit(
@@ -740,7 +863,7 @@ class Broker:
         if not _is_open(want, ctx):
             self._emit("reselect", op_id=op.id, expected=want.key, actual=ctx.project)
             try:
-                gw.load_project(want)
+                self._load(want)
             except GatewayError as exc:
                 self._note_broker_context()
                 return self._fail(
@@ -755,9 +878,12 @@ class Broker:
                     gateway_message=exc.message,
                 )
             ctx = self._note_broker_context()
-        if op.timeline is not None and ctx.timeline != op.timeline:
+        wants_timeline = op.timeline is not None or op.timeline_id is not None
+        if wants_timeline and not _timeline_matches(op, ctx):
             try:
-                gw.set_current_timeline(op.timeline)
+                # strict: the unique id is the identity the op was leased on, and a name given
+                # with it must agree (a mixed ref must not reach another timeline).
+                gw.set_current_timeline(op.timeline, op.timeline_id, strict=True)
             except GatewayError as exc:
                 self._note_broker_context()
                 return self._fail(
@@ -765,10 +891,18 @@ class Broker:
                     "timeline_unavailable",
                     exc.message,
                     expected=op.timeline,
+                    expected_id=op.timeline_id,
                     actual=ctx.timeline,
+                    actual_id=ctx.timeline_id,
                     gateway_code=exc.code,
                 )
-            self._emit("timeline_selected", op_id=op.id, source=ctx.timeline, target=op.timeline)
+            self._emit(
+                "timeline_selected",
+                op_id=op.id,
+                source=ctx.timeline,
+                target=op.timeline,
+                target_id=op.timeline_id,
+            )
         if op.page is not None and ctx.page != op.page:
             try:
                 gw.open_page(op.page)
@@ -790,13 +924,16 @@ class Broker:
                 actual=ctx.project,
                 actual_id=ctx.project_id,
             )
-        if op.timeline is not None and ctx.timeline != op.timeline:
+        if wants_timeline and not _timeline_matches(op, ctx):
             return self._fail(
                 op,
                 "wrong_timeline",
-                f"expected timeline {op.timeline!r}, found {ctx.timeline!r}",
+                f"expected timeline {op.timeline!r} [{op.timeline_id}], found "
+                f"{ctx.timeline!r} [{ctx.timeline_id}]",
                 expected=op.timeline,
+                expected_id=op.timeline_id,
                 actual=ctx.timeline,
+                actual_id=ctx.timeline_id,
             )
         if op.page is not None and ctx.page != op.page:
             return self._fail(
@@ -819,6 +956,12 @@ class Broker:
 
         if not self._remove(op):
             return None  # cancelled from another thread after the checks
+        self._last_target = want
+        snapshot = self._snapshot
+        if snapshot is not None:
+            human = _human_target(snapshot)
+            if human is not None and _is_open(human, ctx):
+                self._touched_human_project = True
         started = self._clock()
         self._emit(
             "op_started",
@@ -830,6 +973,7 @@ class Broker:
         )
         value: object = None
         error: OpError | None = None
+        token = _RUNNING_OP.set(op.id)
         try:
             value = op.fn(gw)
         except HotOpFailure as exc:
@@ -840,6 +984,8 @@ class Broker:
                 f"{type(exc).__name__}: {exc}",
                 {"exception": type(exc).__name__, "traceback": traceback.format_exc()},
             )
+        finally:
+            _RUNNING_OP.reset(token)
         finished = self._clock()
         self._last_served[want.key] = finished
         self._note_broker_context()
@@ -910,10 +1056,10 @@ class Broker:
             if snapshot.project is None:
                 raise GatewayError(
                     "human_project_unlocated",
-                    f"the snapshot does not say which Project Manager folder holds "
-                    f"{want.project!r}; see the snapshot warnings",
+                    f"the snapshot could not locate {want.project!r} by identity; see the "
+                    f"snapshot warnings",
                 )
-            gw.load_project(snapshot.project)
+            self._load(snapshot.project)  # verified by id after loading
 
         project_ok = True
         target = _human_target(snapshot)
@@ -921,17 +1067,28 @@ class Broker:
             if self.config.save_before_switch and ctx.project is not None:
                 project_ok = step("save", gw.save_project)
             project_ok = project_ok and step("project", load_human_project)
+            if "project" in errors:
+                self._recover_from_failed_load(ctx, step)
+        # The folder the human was browsing is restored on its own, after the project (whose
+        # load navigates to the project's folder), and whether or not the project came back.
+        pm_path = want.project_manager_path
+        if pm_path is not None:
+            step("project_manager_path", lambda: gw.open_project_manager_path(pm_path))
+        preset = snapshot.deliver_preset
+        kept: str | None = None
         if project_ok:  # never touch the rest of the context in the wrong project
-            pm_path = want.project_manager_path
-            if pm_path is not None:
-                step("project_manager_path", lambda: gw.open_project_manager_path(pm_path))
-            if want.timeline is not None:
-                step("timeline", lambda: gw.set_current_timeline(want.timeline, want.timeline_id))
+            timeline_ok = want.timeline is not None and step(
+                "timeline", lambda: gw.set_current_timeline(want.timeline, want.timeline_id)
+            )
             if want.folder is not None:
                 step("folder", lambda: gw.set_current_folder(want.folder))
-            preset = snapshot.deliver_preset
-            if preset is not None and step("deliver_preset", lambda: gw.load_render_preset(preset)):
-                step("deliver_preset_cleanup", lambda: gw.delete_render_preset(preset))
+            if preset is not None:
+                if step("deliver_preset", lambda: gw.load_render_preset(preset)):
+                    step("deliver_preset_cleanup", lambda: gw.delete_render_preset(preset))
+                else:
+                    kept = preset  # not applied: it still holds the human's Deliver settings
+            # After the preset: a preset round trip that loses the format or codec is
+            # corrected here, and it is the only Deliver restore when no preset was saved.
             if want.render_format is not None and want.render_codec is not None:
                 step(
                     "render_format",
@@ -941,13 +1098,24 @@ class Broker:
                 step("render_mode", lambda: gw.set_render_mode(want.render_mode))
             if want.page is not None:
                 step("page", lambda: gw.open_page(want.page))
-            if want.playhead is not None and want.timeline is not None:
+            if want.playhead is not None and timeline_ok:  # never on some other timeline
                 step("playhead", lambda: gw.set_playhead(want.playhead))
+        elif preset is not None:
+            if self._touched_human_project:
+                # An op ran in the human's project, so its Deliver settings may have been
+                # changed and this preset may be their only copy: keep it and say so.
+                kept = preset
+            else:
+                # No op ran in the human's project: its own Deliver settings are untouched,
+                # so the preset is redundant. Do not leave it behind.
+                step("deliver_preset_cleanup", lambda: gw.delete_render_preset(preset))
 
         final = gw.get_context(with_pm_path=want.project_manager_path is not None)
         self._presence.note_broker_context(final, self._clock())
         mismatches = want.diff(final)
-        report = RestoreReport(not errors and not mismatches, snapshot, final, errors, mismatches)
+        report = RestoreReport(
+            not errors and not mismatches, snapshot, final, errors, mismatches, kept
+        )
         self.last_restore = report
         self._emit(
             "restored",
@@ -955,10 +1123,27 @@ class Broker:
             project=snapshot.project.key if snapshot.project is not None else want.project,
             errors=dict(errors),
             mismatches={k: [str(a), str(b)] for k, (a, b) in mismatches.items()},
-            deliver_preset=snapshot.deliver_preset,
+            deliver_preset=preset,
+            kept_preset=kept,
         )
         self._drop_control()
         return report
+
+    def _recover_from_failed_load(
+        self, before: ResolveContext, step: Callable[[str, Callable[[], None]], bool]
+    ) -> None:
+        """After a failed restore load, never leave the instance in a project nobody asked for.
+
+        A load can fail after ``LoadProject`` has already opened something (an id mismatch
+        is only seen afterwards). Then go back to the project the broker was working in.
+        """
+        now = self._gw.get_context()
+        if before.project_id is None or now.project_id == before.project_id:
+            return
+        back = self._last_target
+        if back is None or not _is_open(back, before):
+            return
+        step("project_recover", lambda: self._load(back))
 
 
 def _is_open(target: ProjectLocator, ctx: ResolveContext) -> bool:
@@ -975,3 +1160,11 @@ def _human_target(snapshot: HumanSnapshot) -> ProjectLocator | None:
         return snapshot.project
     # Not located: still recognisable by id (or name), just not reloadable.
     return ProjectLocator((), want.project, want.project_id)
+
+
+def _timeline_matches(op: HotOp, ctx: ResolveContext) -> bool:
+    """Is the op's timeline current in ``ctx``? By id when it has one (and by name too when
+    it gives both, so a ref whose name and id disagree never matches)."""
+    if op.timeline_id is not None and ctx.timeline_id != op.timeline_id:
+        return False
+    return op.timeline is None or ctx.timeline == op.timeline

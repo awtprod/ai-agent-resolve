@@ -224,3 +224,36 @@ def test_append_leases_and_selects_the_named_timeline() -> None:
         holder=AGENT,
     )
     assert hot.timeline == "Main [agent]" and hot.label == "timeline.append_ranges"
+
+
+def test_ntsc_rates_are_converted_exactly() -> None:
+    # 1501 frames at 24 fps fill 1500.4995... frames at 23.976 (24000/1001) but only 1499.4995
+    # at a rounded 23.976: the exact-rate table decides between 1500 and 1499.
+    assert converted_length(1501, 24.0, 23.976) == 1500
+    show = Show()
+    show.project.settings["timelineFrameRate"] = 23.976
+    result = append(show, rng(show.cam_24, 0, 1501))
+    placed = result.ranges[0]
+    assert placed.planned_frames == 1500
+    assert placed.video is not None and placed.video.duration == 1500
+    assert spans(show) == [(0, 1500)]
+
+
+def test_a_short_range_at_the_end_of_its_media_is_not_deleted_to_be_repaired() -> None:
+    show = Show()
+    tail = show.project.media_pool.add_clip(("Footage",), "short 24p", fps=24.0, frames=7)
+    error = show.fails("timeline.append_ranges", {"timeline": BRANCH, "ranges": [rng(tail, 0, 7)]})
+    assert (error.code, error.detail["trap_id"]) == ("repair_beyond_media", "append-fps-short")
+    assert spans(show) == [(0, 8)]  # the short item stays for the agent to decide
+    assert not [c for c in show.fake.calls if c[0] == "DeleteClips"]
+
+
+def test_a_short_item_that_will_not_delete_stops_the_repair() -> None:
+    show = Show()
+    show.fake.faults.add("DeleteClips:no-op")
+    error = show.fails(
+        "timeline.append_ranges", {"timeline": BRANCH, "ranges": [rng(show.cam_24, 0, 7)]}
+    )
+    assert (error.code, error.detail["trap_id"]) == ("repair_delete_failed", "append-fps-short")
+    assert spans(show) == [(0, 8)]  # never appended a second copy on top
+    assert appends(show) == 1

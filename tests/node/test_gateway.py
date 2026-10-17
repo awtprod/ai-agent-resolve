@@ -153,7 +153,8 @@ def test_open_pm_path_and_listing(library: FakeResolve) -> None:
     assert gw.list_project_manager_folder().folders == ("Archive", "Shows")
     with pytest.raises(GatewayError) as err:
         gw.open_project_manager_path(("Shows", "Season 9"))
-    assert err.value.code == "pm_open_failed"
+    assert err.value.code == "pm_path_unverified"
+    assert "left in 'Shows'" in err.value.message  # says where the walk stopped
 
 
 def test_walk_lists_every_folder_and_restores_the_path(library: FakeResolve) -> None:
@@ -300,3 +301,47 @@ def test_context_diff_ignores_render_state() -> None:
     b = ResolveContext(project="A", playhead="01:00:01:00", rendering=True)
     assert a.diff(b) == {"playhead": ("01:00:00:00", "01:00:01:00")}
     assert a.same_position(ResolveContext(project="A", playhead="01:00:00:00", rendering=True))
+
+
+def test_a_failed_parent_step_is_an_error_not_the_root(library: FakeResolve) -> None:
+    pm = library.GetProjectManager()
+    real_parent = pm.GotoParentFolder
+    state = {"calls": 0}
+
+    def flaky_parent() -> bool:
+        state["calls"] += 1
+        return False if state["calls"] == 2 else real_parent()
+
+    pm.GotoParentFolder = flaky_parent  # type: ignore[method-assign]
+    with pytest.raises(GatewayError) as err:
+        ScriptApiGateway(library).get_project_manager_path()
+    assert err.value.code == "pm_parent_failed"
+    assert library.pm_path == ("Shows", "Season 2")  # walked back down to where it started
+
+
+def test_the_walk_down_checks_every_level_from_the_root(library: FakeResolve) -> None:
+    # A folder named like the target leaf, but somewhere else: only the leaf would match.
+    library.add_pm_folder(("Archive", "Season 2"))
+    gw = ScriptApiGateway(library)
+    gw.open_project_manager_path(("Archive", "Season 2"))
+    assert gw.get_project_manager_path() == ("Archive", "Season 2")
+    pm = library.GetProjectManager()
+    real_open = pm.OpenFolder
+    pm.OpenFolder = lambda name: real_open("Archive" if name == "Shows" else name)  # type: ignore[method-assign]
+    with pytest.raises(GatewayError) as err:
+        gw.open_project_manager_path(("Shows", "Season 2"))
+    assert err.value.code == "pm_open_failed"
+    assert "stopped in '<root>'" in err.value.message
+
+
+def test_strict_timeline_selection_refuses_a_name_that_belongs_elsewhere(
+    fake: FakeResolve, gw: ScriptApiGateway
+) -> None:
+    main_id = fake.project("A").timeline("A main").GetUniqueId()
+    with pytest.raises(GatewayError) as err:
+        gw.set_current_timeline("A alt", main_id, strict=True)
+    assert err.value.code == "timeline_ref_mismatch"
+    with pytest.raises(GatewayError) as err:
+        gw.set_current_timeline("A alt", "no-such-id", strict=True)
+    assert err.value.code == "timeline_not_found"  # no fallback to the name
+    assert gw.get_context().timeline == "A main"

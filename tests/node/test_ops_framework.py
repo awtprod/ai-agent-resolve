@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
-from aar.node.broker import OpStatus
-from aar.node.leases import Holder, Scope, project_key
+from aar.node.broker import BrokerEvent, HotOp, OpStatus
+from aar.node.leases import Holder, Scope, project_key, timeline_key
 from aar.node.locator import ProjectLocator
-from aar.node.ops import OpError, get_op, list_ops, make_hot_op, submit_op
+from aar.node.ops import OpEnv, OpError, get_op, list_ops, make_hot_op, submit_op
+from aar.node.ops import write as write_ops
 
-from .ops_support import AGENT, Show, media
+from .fake_resolve import FakeResolve
+from .ops_support import AGENT, Show, content_writes, human_settles, media
+
+OTHER = Holder.agent("thread-other")
 
 EXPECTED = {
     "project.find": (True, False),
@@ -63,7 +69,7 @@ def test_a_target_without_project_id_is_refused() -> None:
 def test_ops_wait_in_the_broker_queue_behind_leases() -> None:
     show = Show()
     other = Holder.agent("thread-other")
-    lease = show.leases.acquire(other, Scope.PROJECT, project_key("Show"), ttl=600)
+    lease = show.leases.acquire(other, Scope.PROJECT, project_key(show.pid), ttl=600)
     op_id = submit_op(show.broker, "timeline.list", {}, target=show.locator(), holder=AGENT)
     show.broker.run_until_idle()
     assert show.broker.result(op_id) is None
@@ -74,20 +80,250 @@ def test_ops_wait_in_the_broker_queue_behind_leases() -> None:
     assert result is not None and result.status is OpStatus.OK
 
 
-def test_op_body_never_runs_in_a_project_with_another_id() -> None:
+def test_op_body_never_acts_in_a_project_with_another_id() -> None:
+    # A human opens a same-named project between the broker's checks and the op body: the
+    # body's own id assertion is the last line of defence, and a name check would pass.
+    holder: dict[str, Any] = {}
+
+    def human_switches(event: BrokerEvent) -> None:
+        if event.kind == "op_started":
+            fake = holder["show"].fake
+            fake.current = holder["twin"]
+
+    show = Show(on_event=human_switches)
+    holder["show"] = show
+    holder["twin"] = show.fake.add_project("Show", ["Main"], ("Elsewhere",))
+    error = show.fails("markers.add", {"timeline": {"name": "Main"}, "markers": [{"frame": 5}]})
+    assert error.code == "wrong_project"
+    assert error.detail["actual_id"] == holder["twin"].GetUniqueId()
+    assert error.detail["actual_name"] == "Show"
+    assert error.detail["trap_id"] == "pm-folder-scoped-load"
+    assert content_writes(show.fake) == []
+
+
+def test_op_code_cannot_run_outside_the_broker() -> None:
     show = Show()
-    twin = show.fake.add_project("Show", ["Main"], ("Elsewhere",))
+    show.leases.acquire(OTHER, Scope.PROJECT, project_key(show.pid), ttl=600)
     hot = make_hot_op(
-        "timeline.duplicate",
-        {"name": "copy"},
-        target=ProjectLocator(("Elsewhere",), "Show", twin.GetUniqueId()),
+        "markers.add",
+        {"timeline": {"name": "Main"}, "markers": [{"frame": 5, "name": "direct"}]},
+        target=show.locator(),
         holder=AGENT,
     )
     with pytest.raises(OpError) as err:
-        hot.fn(show.gw)  # the human's "Show" is open, not the twin
-    assert err.value.code == "wrong_project"
-    assert err.value.detail["actual_id"] == show.project.GetUniqueId()
-    assert show.fake.calls == []  # nothing was duplicated in the wrong project
+        hot.fn(show.gw)  # the HotOp body, called by hand
+    assert err.value.code == "outside_broker"
+    with pytest.raises(OpError) as err:
+        OpEnv(show.gw, show.locator())
+    assert err.value.code == "outside_broker"
+    spec = get_op("markers.add")
+    assert not hasattr(spec, "fn")
+    params = spec.params.model_validate({"timeline": {"name": "Main"}, "markers": [{"frame": 5}]})
+    with pytest.raises(OpError) as err:
+        spec._body(object(), params)  # type: ignore[arg-type]
+    assert err.value.code == "outside_broker"
+    with pytest.raises(OpError) as err:
+        write_ops.markers_add(object(), params)  # type: ignore[arg-type]
+    assert err.value.code == "outside_broker"
+    assert show.main.GetMarkers() == {}
+    assert content_writes(show.fake) == []
+
+
+# -- timeline leases by identity (F1) -----------------------------------------------------------
+
+
+def _marker(show: Show, ref: dict[str, Any], frame: int = 30) -> str:
+    return submit_op(
+        show.broker,
+        "markers.add",
+        {"timeline": ref, "markers": [{"frame": frame, "name": "m"}]},
+        target=show.locator(),
+        holder=AGENT,
+    )
+
+
+def _lease_main(show: Show) -> None:
+    key = timeline_key(show.pid, show.main.GetUniqueId())
+    show.leases.acquire(OTHER, Scope.TIMELINE, key, ttl=600)
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        pytest.param("mixed", id="name-of-branch-with-id-of-main"),
+        pytest.param("id", id="id-only"),
+        pytest.param("name", id="name-only"),
+    ],
+)
+def test_a_timeline_lease_holds_whatever_form_the_ref_takes(ref: str) -> None:
+    show = Show()
+    _lease_main(show)
+    refs = {
+        "mixed": {"name": "Main [agent]", "unique_id": show.main.GetUniqueId()},
+        "id": {"unique_id": show.main.GetUniqueId()},
+        "name": {"name": "Main"},
+    }
+    op_id = _marker(show, refs[ref])
+    show.broker.run_until_idle()
+    assert show.broker.result(op_id) is None  # still queued behind OTHER's lease
+    assert show.main.GetMarkers() == {} and show.branch.GetMarkers() == {}
+
+
+def test_a_ref_whose_name_and_id_disagree_is_refused_and_writes_nothing() -> None:
+    show = Show()
+    op_id = _marker(show, {"name": "Main [agent]", "unique_id": show.main.GetUniqueId()})
+    show.broker.run_until_idle()
+    result = show.broker.result(op_id)
+    assert result is not None and result.status is OpStatus.FAILED and result.error is not None
+    assert result.error.code == "timeline_unavailable"
+    assert result.error.detail["gateway_code"] == "timeline_ref_mismatch"
+    assert show.main.GetMarkers() == {} and show.branch.GetMarkers() == {}
+
+
+def test_the_op_itself_refuses_a_mismatched_ref() -> None:
+    # A read op is not timeline-selected by the broker, so the check in OpEnv.timeline is
+    # what stops it.
+    show = Show()
+    error = show.fails(
+        "timeline.describe",
+        {"timeline": {"name": "Main [agent]", "unique_id": show.main.GetUniqueId()}},
+    )
+    assert error.code == "timeline_ref_mismatch"
+
+
+def test_an_id_ref_is_not_blocked_by_a_lease_on_another_timeline() -> None:
+    show = Show()
+    _lease_main(show)
+    op_id = _marker(show, {"unique_id": show.branch.GetUniqueId()})
+    show.broker.run_until_idle()
+    result = show.broker.result(op_id)
+    assert result is not None and result.status is OpStatus.OK
+    assert list(show.branch.GetMarkers()) == [30] and show.main.GetMarkers() == {}
+
+
+def test_an_op_naming_two_timelines_leases_the_whole_project() -> None:
+    show = Show()
+    hot = make_hot_op(
+        "grades.copy",
+        {
+            "timeline": {"unique_id": show.branch.GetUniqueId()},
+            "groups": [
+                {
+                    "reference": {"track_type": "video", "track": 1, "item_id": "r"},
+                    "reference_timeline": {"unique_id": show.main.GetUniqueId()},
+                    "targets": [{"track_type": "video", "track": 1, "item_id": "t"}],
+                }
+            ],
+        },
+        target=show.locator(),
+        holder=AGENT,
+    )
+    assert (hot.timeline, hot.timeline_id) == (None, None)  # project scope
+    single = make_hot_op(
+        "markers.add",
+        {"timeline": {"unique_id": show.branch.GetUniqueId()}, "markers": [{"frame": 1}]},
+        target=show.locator(),
+        holder=AGENT,
+    )
+    assert single.timeline_id == show.branch.GetUniqueId()
+
+
+# -- project and timeline leases survive renames and same names (F2) ---------------------------
+
+
+def test_a_project_lease_holds_after_the_project_is_renamed() -> None:
+    show = Show()
+    show.leases.acquire(OTHER, Scope.PROJECT, project_key(show.pid), ttl=600)
+    show.project._name = "Show Renamed"
+    human_settles(show)
+    renamed = ProjectLocator(("Shows",), "Show Renamed", show.pid)
+    op_id = submit_op(
+        show.broker,
+        "markers.add",
+        {"timeline": {"name": "Main"}, "markers": [{"frame": 5}]},
+        target=renamed,
+        holder=AGENT,
+    )
+    show.broker.run_until_idle()
+    assert show.broker.result(op_id) is None
+    assert show.main.GetMarkers() == {}
+
+
+def test_a_timeline_lease_holds_after_the_timeline_is_renamed() -> None:
+    show = Show()
+    _lease_main(show)
+    show.main._name = "Main renamed"
+    human_settles(show)
+    for ref in ({"unique_id": show.main.GetUniqueId()}, {"name": "Main renamed"}):
+        op_id = _marker(show, ref)
+        show.broker.run_until_idle()
+        assert show.broker.result(op_id) is None, ref
+    assert show.main.GetMarkers() == {}
+
+
+def test_a_lease_on_one_project_does_not_block_a_same_named_project() -> None:
+    # The human works in "Other"; OTHER leases the "Show" in Shows; the agent targets the
+    # "Show" in Elsewhere, which is a different project.
+    fake = FakeResolve(
+        {"Show": ["Main", "Main [agent]"], "Other": ["Other main"]},
+        current="Other",
+        folder=("Shows",),
+    )
+    twin = fake.add_project("Show", ["Main"], ("Elsewhere",))
+    show = Show(fake)
+    show.leases.acquire(OTHER, Scope.PROJECT, project_key(show.pid), ttl=600)
+    op_id = submit_op(
+        show.broker,
+        "timeline.list",
+        {},
+        target=ProjectLocator(("Elsewhere",), "Show", twin.GetUniqueId()),
+        holder=AGENT,
+    )
+    show.broker.run_until_idle()
+    result = show.broker.result(op_id)
+    assert result is not None and result.status is OpStatus.OK
+    assert result.value.project_id == twin.GetUniqueId()
+
+
+def test_no_lease_and_ref_combination_under_blocks() -> None:
+    """Every lease on the timeline an op writes (or on its project) blocks the op, whatever
+    names the lease and the op use; a lease on another timeline never matters to an id ref."""
+    for lease_scope in ("project", "main", "branch"):
+        for form in ("id", "name", "both"):
+            for rename in (False, True):
+                show = Show()
+                main_id = show.main.GetUniqueId()
+                if lease_scope == "project":
+                    show.leases.acquire(OTHER, Scope.PROJECT, project_key(show.pid), ttl=600)
+                else:
+                    tl = show.main if lease_scope == "main" else show.branch
+                    key = timeline_key(show.pid, tl.GetUniqueId())
+                    show.leases.acquire(OTHER, Scope.TIMELINE, key, ttl=600)
+                if rename:
+                    show.main._name = "Main 2"
+                    show.project._name = "Show 2"
+                    human_settles(show)
+                name = show.main.GetName()
+                ref = {"id": {"unique_id": main_id}, "name": {"name": name}}.get(
+                    form, {"name": name, "unique_id": main_id}
+                )
+                target = ProjectLocator(("Shows",), show.project.GetName(), show.pid)
+                op_id = submit_op(
+                    show.broker,
+                    "markers.add",
+                    {"timeline": ref, "markers": [{"frame": 7}]},
+                    target=target,
+                    holder=AGENT,
+                )
+                show.broker.run_until_idle()
+                wrote = bool(show.main.GetMarkers())
+                label = (lease_scope, form, rename)
+                if lease_scope in ("project", "main"):
+                    assert not wrote and show.broker.result(op_id) is None, label
+                elif form == "name":
+                    assert not wrote, label  # by name: the whole project (an over-block)
+                else:
+                    assert wrote, label
 
 
 def test_op_errors_reach_the_broker_result_with_fix_hint_and_trap() -> None:
@@ -108,3 +344,30 @@ def test_get_op_names_the_known_ops_on_a_miss() -> None:
     with pytest.raises(KeyError) as err:
         get_op("nope")
     assert "timeline.describe" in str(err.value)
+
+
+def test_an_op_body_cannot_run_another_ops_body_inside_the_broker() -> None:
+    # Inside the broker some op is running, but not this one: its lease and context checks
+    # never happened, so it must refuse.
+    show = Show()
+    show.leases.acquire(
+        OTHER, Scope.PROJECT, project_key(show.fake.project("Other").GetUniqueId()), ttl=600
+    )
+    inner = make_hot_op(
+        "markers.add",
+        {"timeline": {"name": "Main"}, "markers": [{"frame": 9, "name": "smuggled"}]},
+        target=show.locator(),
+        holder=AGENT,
+    )
+    errors: list[str] = []
+
+    def outer(gw: Any) -> None:
+        try:
+            inner.fn(gw)
+        except OpError as exc:
+            errors.append(exc.code)
+
+    show.broker.submit(HotOp(project=show.locator(), fn=outer, holder=AGENT))
+    show.broker.run_until_idle()
+    assert errors == ["outside_broker"]
+    assert show.main.GetMarkers() == {}

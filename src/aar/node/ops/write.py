@@ -8,6 +8,7 @@ repeating it. None of these ops calls a project-level colour setter.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -91,8 +92,8 @@ def _media_id(item: Any) -> str | None:
 
 
 class Resolution(OpModel):
-    width: int = Field(gt=0, le=16384)
-    height: int = Field(gt=0, le=16384)
+    width: int = Field(strict=True, gt=0, le=16384)
+    height: int = Field(strict=True, gt=0, le=16384)
 
 
 class DuplicateParams(OpModel):
@@ -100,7 +101,9 @@ class DuplicateParams(OpModel):
     name: str = Field(min_length=1)
     if_exists: Literal["error", "reuse"] = Field(
         default="error",
-        description="'reuse' picks up a timeline of that name left by an earlier attempt.",
+        description="'reuse' picks up a timeline of that name left by an earlier attempt. It "
+        "never changes it: it must already match the source's colour settings and the "
+        "resolution asked for (else the op is refused), and it is never the source itself.",
     )
     resolution: Resolution | None = Field(
         default=None, description="Give the copy its own resolution (e.g. a vertical cut)."
@@ -211,13 +214,19 @@ def timeline_duplicate(env: OpEnv, params: DuplicateParams) -> DuplicateResult:
     existing = [t for t in env.timelines() if t.GetName() == params.name]
     created = False
     if existing:
+        if any(t.GetUniqueId() == source.GetUniqueId() for t in existing):
+            raise OpError(
+                "reuse_is_source",
+                f"{params.name!r} is the source timeline itself",
+                "choose a new name for the copy",
+            )
         if params.if_exists == "error" or len(existing) > 1:
             raise OpError(
                 "timeline_exists",
                 f"{len(existing)} timeline(s) named {params.name!r} already exist",
                 "choose another name, or pass if_exists='reuse' to pick up an earlier attempt",
             )
-        dup = existing[0]
+        return _reuse(env, source, existing[0], params)
     else:
         before = int(project.GetTimelineCount() or 0)
         made = source.DuplicateTimeline(params.name)
@@ -264,6 +273,50 @@ def timeline_duplicate(env: OpEnv, params: DuplicateParams) -> DuplicateResult:
     )
 
 
+def _reuse(env: OpEnv, source: Any, dup: Any, params: DuplicateParams) -> DuplicateResult:
+    """Pick up an existing timeline without changing it, if it is what the op would make."""
+    reference = source.GetSettings() or {}
+    have = dup.GetSettings() or {}
+    expected = {
+        k: str(reference[k]) for k in TIMELINE_COLOUR_KEYS if reference.get(k) not in (None, "")
+    }
+    if params.resolution is not None:
+        expected["timelineResolutionWidth"] = str(params.resolution.width)
+        expected["timelineResolutionHeight"] = str(params.resolution.height)
+    else:
+        for key in ("timelineResolutionWidth", "timelineResolutionHeight"):
+            if reference.get(key) not in (None, ""):
+                expected[key] = str(reference[key])
+    checks = [
+        SettingCheck(key=k, expected=v, actual=_setting(have.get(k))) for k, v in expected.items()
+    ]
+    bad = [c for c in checks if c.actual != c.expected]
+    if bad:
+        raise OpError(
+            "reuse_mismatch",
+            f"timeline {params.name!r} exists but differs from what this op would make: "
+            f"{[c.key for c in bad]}; it is left unchanged",
+            "choose a new name, or delete the old attempt first",
+            "custom-res-resets-colour-science" if params.resolution is not None else None,
+            mismatches=[c.model_dump() for c in bad],
+        )
+    width = _int(have.get("timelineResolutionWidth"))
+    height = _int(have.get("timelineResolutionHeight"))
+    return DuplicateResult(
+        source=env.identity(source),
+        timeline=env.identity(dup),
+        created=False,
+        timeline_count=int(env.project().GetTimelineCount() or 0),
+        resolution=(
+            Resolution(width=width, height=height)
+            if params.resolution is not None and width and height
+            else None
+        ),
+        colour=[c for c in checks if c.key in TIMELINE_COLOUR_KEYS],
+        notes=[Note(code="reused", message=f"timeline {params.name!r} already matched; unchanged")],
+    )
+
+
 # -- timeline.append_ranges --------------------------------------------------------------------
 
 
@@ -271,11 +324,14 @@ class AppendRange(OpModel):
     """One source range. ``src_out`` is exclusive, like ``aar.plan`` Segment ranges."""
 
     media: MediaRef
-    src_in: int = Field(ge=0, description="First source frame, in the source's frame rate.")
-    src_out: int = Field(ge=1, description="End source frame (exclusive).")
-    track: int = Field(default=1, ge=1)
+    src_in: int = Field(
+        strict=True, ge=0, description="First source frame, in the source's frame rate."
+    )
+    src_out: int = Field(strict=True, ge=1, description="End source frame (exclusive).")
+    track: int = Field(strict=True, default=1, ge=1)
     media_type: Literal["av", "video", "audio"] = "av"
     record_in: int | None = Field(
+        strict=True,
         default=None,
         ge=0,
         description="Frames from the timeline start. Omit to follow the previous range on "
@@ -293,9 +349,11 @@ class AppendRange(OpModel):
 class AppendParams(OpModel):
     timeline: TimelineRef | None = Field(default=None, description="Default: current timeline.")
     ranges: list[AppendRange] = Field(min_length=1, max_length=5000)
-    cursor: int = Field(default=0, ge=0, description="Index of the first range to process.")
-    max_ranges: int = Field(default=25, ge=1, le=200, description="Ranges per call.")
-    repair_short: bool = True
+    cursor: int = Field(
+        strict=True, default=0, ge=0, description="Index of the first range to process."
+    )
+    max_ranges: int = Field(strict=True, default=25, ge=1, le=200, description="Ranges per call.")
+    repair_short: bool = Field(default=True, strict=True)
 
     @model_validator(mode="after")
     def _cursor_in_range(self) -> AppendParams:
@@ -749,13 +807,20 @@ def timeline_append_ranges(env: OpEnv, params: AppendParams) -> AppendResult:
 
 class GainTarget(OpModel):
     item: ItemRef
-    gain_db: float = Field(ge=-100.0, le=30.0, description="Clip gain in dB (AudioVolume).")
+    gain_db: float = Field(
+        strict=True, ge=-100.0, le=30.0, description="Clip gain in dB (AudioVolume)."
+    )
 
 
 class GainParams(OpModel):
     timeline: TimelineRef | None = Field(default=None, description="Default: current timeline.")
     targets: list[GainTarget] = Field(min_length=1, max_length=500)
-    tolerance_db: float = Field(default=0.05, gt=0, le=1.0)
+    tolerance_db: float = Field(strict=True, default=0.05, gt=0, le=1.0)
+
+    @model_validator(mode="after")
+    def _once(self) -> GainParams:
+        _no_repeats([t.item.item_id for t in self.targets], "item")
+        return self
 
 
 class GainChange(OpModel):
@@ -771,18 +836,39 @@ class GainResult(OpModel):
     notes: list[Note]
 
 
+def _no_repeats(keys: list[Any], what: str) -> None:
+    seen: set[Any] = set()
+    repeated = sorted({k for k in keys if k in seen or seen.add(k)}, key=str)
+    if repeated:
+        raise ValueError(f"each {what} may be listed once per request; repeated: {repeated}")
+
+
+_JAM_HINT = (
+    "Resolve's setters can jam after a Color -> Edit round trip: open another page and back "
+    "by hand, then retry"
+)
+
+
+def _with_bounce(env: OpEnv, call: Callable[[], Any]) -> tuple[bool, bool]:
+    """Run a Resolve setter; on False, bounce the page once and retry (trap
+    ``setproperty-after-color``). Returns ``(succeeded, bounced)``."""
+    if call():
+        return True, False
+    env.bounce_page()  # trap setproperty-after-color
+    return bool(call()), True
+
+
 def _set_properties(env: OpEnv, item: Any, props: dict[str, Any]) -> bool:
     """``SetProperties`` with the page-bounce retry. Returns whether a bounce was needed."""
-    if item.SetProperties(props):
-        return False
-    env.bounce_page()  # trap setproperty-after-color
-    if item.SetProperties(props):
-        return True
+    ok, bounced = _with_bounce(env, lambda: item.SetProperties(props))
+    if ok:
+        return bounced
     raise OpError(
         "set_properties_failed",
         f"SetProperties({sorted(props)}) on item {item.GetUniqueId()} returned False, also "
         "after a page bounce",
-        "check the keys against TimelineItemProperties and that the item's track is not locked",
+        "check the keys against TimelineItemProperties and that the item's track is not "
+        f"locked; {_JAM_HINT}",
         "setproperty-after-color",
     )
 
@@ -820,7 +906,10 @@ def item_set_audio_gain(env: OpEnv, params: GainParams) -> GainResult:
     notes: list[Note] = []
     for target, item, before in items:
         # trap volume-key: the key is AudioVolume; "Volume" is silently refused.
-        bounced = _set_properties(env, item, {"AudioVolume": float(target.gain_db)})
+        try:
+            bounced = _set_properties(env, item, {"AudioVolume": float(target.gain_db)})
+        except OpError as exc:
+            raise _with_completed(exc, changes) from exc
         if bounced:
             notes.append(
                 Note(
@@ -856,8 +945,8 @@ def item_set_audio_gain(env: OpEnv, params: GainParams) -> GainResult:
 
 class FadeTarget(OpModel):
     item: ItemRef
-    fade_in: int | None = Field(default=None, ge=0, description="Frames.")
-    fade_out: int | None = Field(default=None, ge=0, description="Frames.")
+    fade_in: int | None = Field(strict=True, default=None, ge=0, description="Frames.")
+    fade_out: int | None = Field(strict=True, default=None, ge=0, description="Frames.")
 
     @model_validator(mode="after")
     def _one(self) -> FadeTarget:
@@ -869,6 +958,11 @@ class FadeTarget(OpModel):
 class FadesParams(OpModel):
     timeline: TimelineRef | None = Field(default=None, description="Default: current timeline.")
     targets: list[FadeTarget] = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def _once(self) -> FadesParams:
+        _no_repeats([t.item.item_id for t in self.targets], "item")
+        return self
 
 
 class FadeChange(OpModel):
@@ -882,6 +976,7 @@ class FadeChange(OpModel):
 class FadesResult(OpModel):
     timeline: TimelineIdentity
     changes: list[FadeChange]
+    notes: list[Note] = Field(default_factory=list)
 
 
 def _fades(item: Any) -> tuple[int, int]:
@@ -894,7 +989,7 @@ def item_set_fades(env: OpEnv, params: FadesParams) -> FadesResult:
     """Set fade-in/out lengths (frames) on timeline items, read back per item."""
     timeline = env.timeline(params.timeline)
     resolved = [(t, env.item(timeline, t.item)) for t in params.targets]
-    changes = []
+    planned = []
     for target, item in resolved:
         before = _fades(item)
         wanted = {
@@ -903,13 +998,38 @@ def item_set_fades(env: OpEnv, params: FadesParams) -> FadesResult:
             if v is not None
         }
         expected = (wanted.get("FadeIn", before[0]), wanted.get("FadeOut", before[1]))
-        if before != expected and not item.SetFades(wanted):
+        duration = int(item.GetEnd()) - int(item.GetStart())
+        if sum(expected) > duration:
             raise OpError(
-                "set_fades_failed",
-                f"SetFades({wanted}) on item {target.item.item_id} returned False",
-                "fades must fit inside the item; check its duration with timeline.describe",
-                completed=[c.model_dump() for c in changes],
+                "fades_too_long",
+                f"item {target.item.item_id}: fades {expected} add up to more than its "
+                f"{duration} frames",
+                "shorten the fades so fade-in plus fade-out fit inside the item",
             )
+        planned.append((target, item, before, wanted, expected))
+    changes: list[FadeChange] = []
+    notes: list[Note] = []
+    for target, item, before, wanted, expected in planned:
+        if before != expected:
+            ok, bounced = _with_bounce(env, lambda item=item, wanted=wanted: item.SetFades(wanted))
+            if not ok:
+                raise OpError(
+                    "set_fades_failed",
+                    f"SetFades({wanted}) on item {target.item.item_id} returned False, also "
+                    "after a page bounce",
+                    f"the fades fit the item, so the setter is refusing: {_JAM_HINT}",
+                    "setproperty-after-color",
+                    completed=[c.model_dump() for c in changes],
+                )
+            if bounced:
+                notes.append(
+                    Note(
+                        code="page_bounced",
+                        message=f"SetFades returned False until a page bounce (item "
+                        f"{target.item.item_id})",
+                        trap_id="setproperty-after-color",
+                    )
+                )
         after = _fades(item)
         if after != expected:
             raise OpError(
@@ -927,7 +1047,7 @@ def item_set_fades(env: OpEnv, params: FadesParams) -> FadesResult:
                 after_out=after[1],
             )
         )
-    return FadesResult(timeline=env.identity(timeline), changes=changes)
+    return FadesResult(timeline=env.identity(timeline), changes=changes, notes=notes)
 
 
 # -- grades.copy -------------------------------------------------------------------------------
@@ -947,8 +1067,25 @@ class GradesParams(OpModel):
     timeline: TimelineRef | None = Field(default=None, description="Default: current timeline.")
     groups: list[GradeGroup] = Field(min_length=1, max_length=50)
     reapply_luts: bool = Field(
-        default=True, description="Put back each target's per-node LUTs after the copy."
+        strict=True,
+        default=True,
+        description="Put back each target's per-node LUTs after the copy.",
     )
+    require_graded_reference: bool = Field(
+        strict=True,
+        default=True,
+        description="Refuse a reference whose nodes show no tools and no LUT (an ungraded "
+        "item would wipe the targets' grades).",
+    )
+
+    @model_validator(mode="after")
+    def _once(self) -> GradesParams:
+        targets = [t.item_id for g in self.groups for t in g.targets]
+        _no_repeats(targets, "target item")
+        both = sorted({g.reference.item_id for g in self.groups} & set(targets))
+        if both:
+            raise ValueError(f"an item cannot be both a reference and a target: {both}")
+        return self
 
 
 class LutCheck(OpModel):
@@ -984,15 +1121,52 @@ def _luts(graph: Any) -> dict[int, str]:
     return {n: str(graph.GetLUT(n)) for n in range(1, count + 1) if graph.GetLUT(n)}
 
 
+def _grade_print(graph: Any) -> list[tuple[str, tuple[str, ...], str]]:
+    """What a node graph holds, node by node: label, tools and LUT."""
+    count = int(graph.GetNumNodes() or 0)
+    return [
+        (
+            str(graph.GetNodeLabel(n) or ""),
+            tuple(str(t) for t in (graph.GetToolsInNode(n) or [])),
+            str(graph.GetLUT(n) or ""),
+        )
+        for n in range(1, count + 1)
+    ]
+
+
+def _with_completed(exc: OpError, done: list[Any]) -> OpError:
+    """``exc`` with the work finished so far as ``completed`` (unless it already has it)."""
+    if "completed" in exc.detail:
+        return exc
+    extra = {k: v for k, v in exc.detail.items() if k not in ("fix_hint", "trap_id")}
+    return OpError(
+        exc.code,
+        exc.message,
+        exc.fix_hint,
+        exc.trap_id,
+        **extra,
+        completed=[d.model_dump() for d in done],
+    )
+
+
 @op(
     "grades.copy",
     params=GradesParams,
     result=GradesResult,
     mutates=True,
-    traps=("append-ungraded",),
+    traps=("append-ungraded", "setproperty-after-color"),
 )
 def grades_copy(env: OpEnv, params: GradesParams) -> GradesResult:
     """Copy a reference item's grade to target items, per camera, keeping per-clip LUTs."""
+    results: list[GradeGroupResult] = []
+    try:
+        return _grades_copy(env, params, results)
+    except OpError as exc:
+        # Every error says which groups were copied (and verified) before it.
+        raise _with_completed(exc, results) from exc
+
+
+def _grades_copy(env: OpEnv, params: GradesParams, results: list[GradeGroupResult]) -> GradesResult:
     timeline = env.timeline(params.timeline)
     plan = []
     for group in params.groups:
@@ -1007,88 +1181,147 @@ def grades_copy(env: OpEnv, params: GradesParams) -> GradesResult:
                 "use video track item refs",
             )
         reference = env.item(ref_tl, group.reference)
-        targets = [env.item(timeline, t) for t in group.targets]
-        plan.append((group, reference, targets))
-    results = []
-    for group, reference, targets in plan:
-        before = [
-            (t, int(t.GetNodeGraph().GetNumNodes() or 0), _luts(t.GetNodeGraph())) for t in targets
-        ]
-        if not reference.CopyGrades(targets):
+        print_ref = _grade_print(reference.GetNodeGraph())
+        if params.require_graded_reference and not any(tools or lut for _, tools, lut in print_ref):
             raise OpError(
-                "copy_grades_failed",
-                f"group {group.camera!r}: CopyGrades returned False",
-                "check the reference and targets are video items of open timelines",
+                "reference_ungraded",
+                f"group {group.camera!r}: reference item {group.reference.item_id} shows no "
+                f"tools and no LUT on its {len(print_ref)} node(s); copying it would wipe "
+                f"the targets' grades",
+                "pick a graded item of that camera as the reference (or pass "
+                "require_graded_reference=false if its grade is not visible to the API)",
                 "append-ungraded",
-                completed=[r.model_dump() for r in results],
             )
-        ref_nodes = int(reference.GetNodeGraph().GetNumNodes() or 0)
-        graded = []
-        for target, nodes_before, luts_before in before:
-            graph = target.GetNodeGraph()
-            nodes_after = int(graph.GetNumNodes() or 0)
-            if nodes_after != ref_nodes:
+        targets = []
+        for ref in group.targets:
+            item = env.item(timeline, ref)
+            luts = _luts(item.GetNodeGraph())
+            # Checked before anything is copied: CopyGrades replaces the whole graph, so a LUT
+            # on a node the copied grade does not have could never be put back.
+            beyond = {n: lut for n, lut in luts.items() if n > len(print_ref)}
+            if params.reapply_luts and beyond:
                 raise OpError(
-                    "grade_unverified",
-                    f"item {target.GetUniqueId()} has {nodes_after} nodes after the copy, the "
-                    f"reference {ref_nodes}",
-                    "check the grade on the Color page",
+                    "lut_node_missing",
+                    f"item {ref.item_id} has LUT(s) {beyond} on node(s) the reference's "
+                    f"{len(print_ref)}-node grade does not have; nothing was copied",
+                    "add nodes to the reference grade, or move the LUTs to its nodes first",
                     "append-ungraded",
                 )
-            reapplied = []
-            if params.reapply_luts:
-                # trap append-ungraded: CopyGrades replaced the node graph, so put the
-                # target's own LUTs back on their nodes.
-                for node, lut in sorted(luts_before.items()):
-                    if node > nodes_after:
-                        raise OpError(
-                            "lut_node_missing",
-                            f"item {target.GetUniqueId()} had LUT {lut!r} on node {node}, but "
-                            f"the copied grade has {nodes_after} nodes",
-                            "add the LUT to a node of the copied grade by hand",
-                            "append-ungraded",
-                        )
-                    if not graph.SetLUT(node, lut):
-                        raise OpError(
-                            "lut_reapply_failed",
-                            f"SetLUT({node}, {lut!r}) on item {target.GetUniqueId()} "
-                            "returned False",
-                            "refresh the LUT list (Project.RefreshLUTList) and retry",
-                            "append-ungraded",
-                        )
-                    after = str(graph.GetLUT(node) or "")
-                    if after != lut:
-                        raise OpError(
-                            "lut_unverified",
-                            f"node {node} of item {target.GetUniqueId()} reads back LUT {after!r}",
-                            "set the LUT by hand",
-                            "append-ungraded",
-                        )
-                    reapplied.append(LutCheck(node=node, lut=lut, after=after))
-            graded.append(
-                GradedItem(
-                    item_id=str(target.GetUniqueId()),
-                    nodes_before=nodes_before,
-                    nodes_after=nodes_after,
-                    luts_before=luts_before,
-                    luts_after=_luts(target.GetNodeGraph()),
-                    reapplied=reapplied,
-                )
-            )
-        results.append(
-            GradeGroupResult(
-                camera=group.camera,
-                reference_item_id=str(reference.GetUniqueId()),
-                reference_nodes=ref_nodes,
-                targets=graded,
+            targets.append((item, int(item.GetNodeGraph().GetNumNodes() or 0), luts))
+        plan.append((group, reference, print_ref, targets))
+
+    notes: list[Note] = []
+    for group, reference, print_ref, targets in plan:
+        results.append(_copy_group(env, params, group, reference, print_ref, targets, notes))
+    return GradesResult(timeline=env.identity(timeline), groups=results, notes=notes)
+
+
+def _copy_group(
+    env: OpEnv,
+    params: GradesParams,
+    group: GradeGroup,
+    reference: Any,
+    print_ref: list[tuple[str, tuple[str, ...], str]],
+    targets: list[tuple[Any, int, dict[int, str]]],
+    notes: list[Note],
+) -> GradeGroupResult:
+    items = [t for t, _, _ in targets]
+    ok, bounced = _with_bounce(env, lambda: reference.CopyGrades(items))
+    if not ok:
+        raise OpError(
+            "copy_grades_failed",
+            f"group {group.camera!r}: CopyGrades returned False, also after a page bounce",
+            "check the reference and targets are video items of open timelines; " + _JAM_HINT,
+            "setproperty-after-color",
+        )
+    if bounced:
+        notes.append(
+            Note(
+                code="page_bounced",
+                message=f"CopyGrades returned False until a page bounce (group {group.camera!r})",
+                trap_id="setproperty-after-color",
             )
         )
-    return GradesResult(timeline=env.identity(timeline), groups=results, notes=[])
+    graded = []
+    for target, nodes_before, luts_before in targets:
+        graph = target.GetNodeGraph()
+        copied = _grade_print(graph)
+        if copied != print_ref:
+            raise OpError(
+                "grade_unverified",
+                f"item {target.GetUniqueId()} does not hold the reference's grade after "
+                f"CopyGrades ({len(copied)} node(s), the reference {len(print_ref)})",
+                "check the grade on the Color page",
+                "append-ungraded",
+                completed_targets=[g.model_dump() for g in graded],
+            )
+        reapplied = []
+        if params.reapply_luts:
+            # trap append-ungraded: CopyGrades replaced the node graph, so put the target's
+            # own LUTs back on their nodes (checked to exist before the copy).
+            for node, lut in sorted(luts_before.items()):
+                ok, bounced = _with_bounce(
+                    env, lambda node=node, lut=lut, graph=graph: graph.SetLUT(node, lut)
+                )
+                if not ok:
+                    raise OpError(
+                        "lut_reapply_failed",
+                        f"SetLUT({node}, {lut!r}) on item {target.GetUniqueId()} returned "
+                        "False, also after a page bounce",
+                        "refresh the LUT list (Project.RefreshLUTList) so Resolve knows the "
+                        f"LUT; {_JAM_HINT}",
+                        "setproperty-after-color",
+                        completed_targets=[g.model_dump() for g in graded],
+                    )
+                if bounced:
+                    notes.append(
+                        Note(
+                            code="page_bounced",
+                            message=f"SetLUT returned False until a page bounce (item "
+                            f"{target.GetUniqueId()}, node {node})",
+                            trap_id="setproperty-after-color",
+                        )
+                    )
+                after = str(graph.GetLUT(node) or "")
+                if after != lut:
+                    raise OpError(
+                        "lut_unverified",
+                        f"node {node} of item {target.GetUniqueId()} reads back LUT {after!r}, "
+                        f"not {lut!r}",
+                        "set the LUT by hand",
+                        "append-ungraded",
+                        completed_targets=[g.model_dump() for g in graded],
+                    )
+                reapplied.append(LutCheck(node=node, lut=lut, after=after))
+        graded.append(
+            GradedItem(
+                item_id=str(target.GetUniqueId()),
+                nodes_before=nodes_before,
+                nodes_after=len(copied),
+                luts_before=luts_before,
+                luts_after=_luts(target.GetNodeGraph()),
+                reapplied=reapplied,
+            )
+        )
+    return GradeGroupResult(
+        camera=group.camera,
+        reference_item_id=str(reference.GetUniqueId()),
+        reference_nodes=len(print_ref),
+        targets=graded,
+    )
 
 
 # -- clip.set_input_color_space -----------------------------------------------------------------
 
 _SELECTOR_KEYS = frozenset({"bin", "bin_path", "folder", "folders", "recursive", "all", "selector"})
+
+# Colour-space names seen in a live 21.1 project (clip 'Input Color Space' values and timeline
+# colour spaces). A name is accepted if it is here, in the project's colour settings, or on a
+# clip in the listed items' bins; anything else is refused before any write.
+OBSERVED_COLOR_SPACES: frozenset[str] = frozenset(
+    {"Rec.709 (Scene)", "Blackmagic Design Film Gen 5", "DaVinci WG/Intermediate"}
+)
+_PROJECT_COLOUR_KEYS = ("colorSpaceInput", "colorSpaceTimeline", "colorSpaceOutput")
 
 
 class InputColourParams(OpModel):
@@ -1114,7 +1347,21 @@ class InputColourParams(OpModel):
         ids = [m.unique_id for m in self.items]
         if len(ids) != len(set(ids)):
             raise ValueError("media items are listed more than once")
+        if self.color_space != self.color_space.strip() or not self.color_space.strip():
+            raise ValueError("color_space must be an exact name, without surrounding spaces")
         return self
+
+
+def _known_colour_spaces(env: OpEnv, bins: set[tuple[str, ...]]) -> set[str]:
+    known = set(OBSERVED_COLOR_SPACES)
+    settings = env.project().GetSettings() or {}
+    known |= {str(settings[k]) for k in _PROJECT_COLOUR_KEYS if settings.get(k)}
+    for path in bins:
+        for clip in env.bin(path).GetClipList() or []:
+            value = (clip.GetClipProperty() or {}).get("Input Color Space")
+            if value:
+                known.add(str(value))
+    return known
 
 
 class ColourChange(OpModel):
@@ -1165,6 +1412,15 @@ def clip_set_input_color_space(env: OpEnv, params: InputColourParams) -> InputCo
             "list video media files only",
             trap,
         )
+    known = _known_colour_spaces(env, {where for _, where in found.values()})
+    if params.color_space not in known:
+        raise OpError(
+            "color_space_unknown",
+            f"{params.color_space!r} is not a colour space this project or its bins use",
+            f"use an exact name from Clip Attributes; known here: {sorted(known)}",
+            trap,
+            known=sorted(known),
+        )
     changes = []
     for _, mpi, f in facts:
         before = f["input_color_space"]
@@ -1198,17 +1454,23 @@ def clip_set_input_color_space(env: OpEnv, params: InputColourParams) -> InputCo
 
 
 class MarkerSpec(OpModel):
-    frame: int = Field(ge=0, description="Frames from the timeline start.")
+    frame: int = Field(strict=True, ge=0, description="Frames from the timeline start.")
     color: MarkerColor = "Blue"
     name: str = ""
     note: str = ""
-    duration: int = Field(default=1, ge=1)
+    duration: int = Field(strict=True, default=1, ge=1)
     custom_data: str | None = None
 
 
 class MarkersParams(OpModel):
     timeline: TimelineRef | None = Field(default=None, description="Default: current timeline.")
     markers: list[MarkerSpec] = Field(min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def _one_per_frame(self) -> MarkersParams:
+        # A timeline holds one marker per frame: two in one request could never both land.
+        _no_repeats([m.frame for m in self.markers], "marker frame")
+        return self
 
 
 class MarkerAdded(OpModel):

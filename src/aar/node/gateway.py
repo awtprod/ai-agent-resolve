@@ -160,8 +160,16 @@ class ResolveGateway(Protocol):
         """Save the current project."""
         ...
 
-    def set_current_timeline(self, name: str, unique_id: str | None = None) -> None:
-        """Make a timeline of the current project current, by unique id if given, else by name."""
+    def set_current_timeline(
+        self, name: str | None, unique_id: str | None = None, *, strict: bool = False
+    ) -> None:
+        """Make a timeline of the current project current, by unique id if given, else by name.
+
+        ``strict``: the unique id is the identity; a name given with it must be that
+        timeline's name (``timeline_ref_mismatch`` otherwise), and an unknown id never falls
+        back to the name. Without ``strict`` (the broker's restore) the id wins over a stale
+        name and an unknown id falls back to the name.
+        """
         ...
 
     def open_page(self, page: str) -> None:
@@ -305,6 +313,37 @@ class ScriptApiGateway:
 
     # -- ResolveGateway ----------------------------------------------------------------------
 
+    def _descend(self, pm: Any, path: tuple[str, ...]) -> None:
+        """From the root, open ``path`` one listed child at a time, verifying every level.
+
+        Each segment must be listed in its parent (``GetFolderListInCurrentFolder``) and must
+        become the current folder; so the whole path from the root is checked, not just its
+        leaf. On a failure the error says how far the walk got (where the Project Manager is).
+        """
+        if self._pm_folder_name(pm) != "":
+            raise GatewayError(
+                "pm_root_failed",
+                f"expected the Project Manager root, found {self._pm_folder_name(pm)!r}",
+            )
+        here: tuple[str, ...] = ()
+        for name in path:
+            listed = [str(f) for f in (pm.GetFolderListInCurrentFolder() or [])]
+            where = "/".join(here) or "<root>"
+            if name not in listed:
+                raise GatewayError(
+                    "pm_path_unverified",
+                    f"folder {name!r} is not listed in {where!r}; the Project Manager is left "
+                    f"in {where!r}",
+                )
+            try:
+                self._open_child(pm, name, here)
+            except GatewayError as exc:
+                raise GatewayError(
+                    exc.code,
+                    f"{exc.message}; the walk to {'/'.join(path)!r} stopped in {where!r}",
+                ) from exc
+            here = (*here, name)
+
     def get_project_manager_path(self) -> tuple[str, ...]:
         # GetCurrentFolder() only returns the current folder's name ("" at the root), so the
         # path is read by walking up to the root, recording names, and walking back down.
@@ -318,31 +357,28 @@ class ScriptApiGateway:
             if name == "":
                 break
             if not pm.GotoParentFolder():
-                break  # a named folder without a parent: it is the root
+                # The root reads as "" (live 21.1), so a named folder has a parent: this is a
+                # failure, not the root. Walk back down to where the walk started, then report.
+                for child in reversed(names):
+                    if not pm.OpenFolder(child):
+                        break
+                raise GatewayError(
+                    "pm_parent_failed",
+                    f"GotoParentFolder() returned False in {name!r} while reading the path of "
+                    f"{start!r}; the Project Manager is in {self._pm_folder_name(pm)!r}",
+                )
             names.append(name)
         else:
             raise GatewayError("pm_too_deep", f"folders nest deeper than {MAX_PM_DEPTH}")
         path = tuple(reversed(names))
-        here: tuple[str, ...] = ()
-        for name in path:
-            self._open_child(pm, name, here)
-            here = (*here, name)
-        if self._pm_folder_name(pm) != start:
-            raise GatewayError(
-                "pm_path_unverified",
-                f"walked {'/'.join(path)!r} but ended in {self._pm_folder_name(pm)!r}, "
-                f"not {start!r}",
-            )
+        self._descend(pm, path)
         return path
 
     def open_project_manager_path(self, path: tuple[str, ...]) -> None:
         pm = self._project_manager()
         if not pm.GotoRootFolder():
             raise GatewayError("pm_root_failed", "GotoRootFolder() returned False")
-        here: tuple[str, ...] = ()
-        for name in path:
-            self._open_child(pm, name, here)
-            here = (*here, name)
+        self._descend(pm, path)
 
     def list_project_manager_folder(self) -> PMFolderListing:
         pm = self._project_manager()
@@ -426,17 +462,27 @@ class ScriptApiGateway:
         if not self._project_manager().SaveProject():
             raise GatewayError("save_failed", "ProjectManager.SaveProject() returned False")
 
-    def set_current_timeline(self, name: str, unique_id: str | None = None) -> None:
+    def set_current_timeline(
+        self, name: str | None, unique_id: str | None = None, *, strict: bool = False
+    ) -> None:
+        if name is None and unique_id is None:
+            raise GatewayError("timeline_ref_empty", "a timeline needs a name or a unique id")
         project = self._project()
         timelines = list(self._timelines(project))
+        label = name if name is not None else unique_id
         matches = []
         if unique_id is not None:
             matches = [t for t in timelines if t.GetUniqueId() == unique_id]
-        if not matches:
+            if strict and matches and name is not None and matches[0].GetName() != name:
+                raise GatewayError(
+                    "timeline_ref_mismatch",
+                    f"timeline id {unique_id!r} is {matches[0].GetName()!r}, not {name!r}",
+                )
+        if not matches and name is not None and not (strict and unique_id is not None):
             matches = [t for t in timelines if t.GetName() == name]
         if not matches:
             raise GatewayError(
-                "timeline_not_found", f"no timeline {name!r} in project {project.GetName()!r}"
+                "timeline_not_found", f"no timeline {label!r} in project {project.GetName()!r}"
             )
         if len(matches) > 1:
             raise GatewayError(
@@ -448,10 +494,10 @@ class ScriptApiGateway:
         if current is not None and current.GetUniqueId() == target.GetUniqueId():
             return
         if not project.SetCurrentTimeline(target):
-            raise GatewayError("timeline_set_failed", f"SetCurrentTimeline({name!r}) failed")
+            raise GatewayError("timeline_set_failed", f"SetCurrentTimeline({label!r}) failed")
         current = project.GetCurrentTimeline()
         if current is None or current.GetUniqueId() != target.GetUniqueId():
-            raise GatewayError("timeline_set_failed", f"timeline {name!r} did not become current")
+            raise GatewayError("timeline_set_failed", f"timeline {label!r} did not become current")
 
     def open_page(self, page: str) -> None:
         if page not in VALID_PAGES:

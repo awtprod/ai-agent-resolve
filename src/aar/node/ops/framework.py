@@ -6,26 +6,41 @@ pydantic params and result models, and two flags: ``hot`` (needs Resolve) and ``
 ``HotOp`` aimed at a target ``ProjectLocator``, so it queues, batches, respects leases and the
 presence guard, and is context-asserted like any other hot op.
 
-Inside the broker, ``execute`` first asserts that the open project's unique id is the
-target's ``project_id``; a mismatch raises ``OpError`` and the op body never runs. Op bodies
-raise ``OpError(code, message, fix_hint, trap_id)`` for every refusal or failed check; the
-broker records its code and detail on the ``OpResult``. Results carry values measured from
-Resolve after each write, never echoes of the inputs.
+Op code runs only inside the broker. ``make_hot_op`` gives the ``HotOp`` a body that refuses
+to run unless the broker is running that very op (``broker.running_op_id()``), so the lease,
+project, timeline and page checks have happened; ``OpEnv`` cannot be built outside it, and a
+registered op body (``OpSpec`` keeps it private) refuses to run outside it too. Inside, the
+body first asserts that the open project's unique id is the target's ``project_id``; a
+mismatch raises ``OpError`` and the body never acts. Op bodies raise
+``OpError(code, message, fix_hint, trap_id)`` for every refusal or failed check; the broker
+records its code and detail on the ``OpResult``. Results carry values measured from Resolve
+after each write, never echoes of the inputs.
+
+Timelines are leased by identity: a mutating op whose params name exactly one timeline, by
+unique id, leases that timeline; every other op leases the whole project (see
+``aar.node.broker``). A ``TimelineRef`` that gives both a name and a unique id must name one
+timeline; if they disagree the op is refused.
 
 Ops are kept short (well under the 60 s cap of a live MCP call) and idempotent: re-running
 one after a timeout finds its own earlier work and reports it instead of doing it twice.
 Batch ops take a resume ``cursor``.
+
+Not here yet (follow-up F15): the D3 sandbox / human-approval gate for mutating ops on a
+production project. It belongs where S7 wires ``submit_op`` to the shared instance, using
+S12's approval tokens; until then mutating ops are exercised against the test fake only.
 """
 
 from __future__ import annotations
 
+import functools
+import uuid
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from aar.node.broker import Broker, HotOp, HotOpFailure
+from aar.node.broker import Broker, HotOp, HotOpFailure, running_op_id
 from aar.node.gateway import GatewayError, ResolveGateway
 from aar.node.leases import Holder
 from aar.node.locator import ProjectLocator
@@ -90,7 +105,7 @@ class ItemRef(OpModel):
     """A timeline item: its track and its ``TimelineItem.GetUniqueId()``."""
 
     track_type: TrackType
-    track: int = Field(ge=1)
+    track: int = Field(strict=True, ge=1)
     item_id: str = Field(min_length=1)
 
 
@@ -111,18 +126,26 @@ class TimelineIdentity(OpModel):
 OpFn = Callable[["OpEnv", Any], BaseModel]
 
 
+def _outside_broker(what: str) -> OpError:
+    return OpError(
+        "outside_broker",
+        f"{what} runs only inside the session broker",
+        "submit the op with submit_op(broker, ...) and let the broker run it",
+    )
+
+
 @dataclass(frozen=True)
 class OpSpec:
     name: str
     params: type[OpModel]
     result: type[OpModel]
-    fn: OpFn
     hot: bool
     mutates: bool
     summary: str
     traps: tuple[str, ...] = ()
     needs_current_timeline: bool = False
     """The op acts on Resolve's current timeline (e.g. ``AppendToTimeline``)."""
+    _body: OpFn = field(default=lambda env, params: None, repr=False, compare=False)
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -157,10 +180,25 @@ def op(
         if name in _REGISTRY:
             raise ValueError(f"op {name} is already registered")
         summary = (fn.__doc__ or "").strip().splitlines()[0] if fn.__doc__ else ""
+
+        @functools.wraps(fn)
+        def guarded(env: OpEnv, op_params: Any) -> BaseModel:
+            if running_op_id() is None or env.op_id != running_op_id():
+                raise _outside_broker(f"op {name}")
+            return fn(env, op_params)
+
         _REGISTRY[name] = OpSpec(
-            name, params, result, fn, hot, mutates, summary, traps, needs_current_timeline
+            name,
+            params,
+            result,
+            hot,
+            mutates,
+            summary,
+            traps,
+            needs_current_timeline,
+            _body=guarded,
         )
-        return fn
+        return guarded
 
     return register
 
@@ -180,9 +218,16 @@ def list_ops() -> list[OpSpec]:
 
 
 class OpEnv:
-    """What an op body gets: the gateway, the raw ``resolve`` object and lookup helpers."""
+    """What an op body gets: the gateway, the raw ``resolve`` object and lookup helpers.
+
+    Only the broker's run of an op can build one.
+    """
 
     def __init__(self, gateway: ResolveGateway, target: ProjectLocator) -> None:
+        op_id = running_op_id()
+        if op_id is None:
+            raise _outside_broker("OpEnv")
+        self.op_id = op_id
         resolve = getattr(gateway, "resolve", None)
         if resolve is None:
             raise OpError(
@@ -252,10 +297,17 @@ class OpEnv:
                 raise OpError("no_timeline", "the project has no current timeline", "name one")
             return current
         timelines = list(self.timelines())
-        matches = []
         if ref.unique_id is not None:
+            # The id is the identity (and what the op was leased on): never fall back to the
+            # name, and refuse a name that belongs to another timeline.
             matches = [t for t in timelines if t.GetUniqueId() == ref.unique_id]
-        if not matches and ref.name is not None:
+            if matches and ref.name is not None and matches[0].GetName() != ref.name:
+                raise OpError(
+                    "timeline_ref_mismatch",
+                    f"timeline id {ref.unique_id!r} is {matches[0].GetName()!r}, not {ref.name!r}",
+                    "give the name and the unique_id of the same timeline, or only the unique_id",
+                )
+        else:
             matches = [t for t in timelines if t.GetName() == ref.name]
         if not matches:
             raise OpError(
@@ -391,12 +443,12 @@ class OpEnv:
         return other
 
 
-def execute(spec: OpSpec, gateway: ResolveGateway, target: ProjectLocator, params: OpModel) -> Any:
-    """Run one op body after asserting the open project. Called by the broker, not directly."""
+def _execute(spec: OpSpec, gateway: ResolveGateway, target: ProjectLocator, params: OpModel) -> Any:
+    """Run one op body after asserting the open project. Only the broker gets here."""
     env = OpEnv(gateway, target)
     env.assert_project()
     try:
-        result = spec.fn(env, params)
+        result = spec._body(env, params)
     except GatewayError as exc:
         raise OpError(exc.code, exc.message, "see the gateway message") from exc
     if not isinstance(result, spec.result):
@@ -425,23 +477,57 @@ def make_hot_op(
             "pm-folder-scoped-load",
         )
     checked = params if isinstance(params, spec.params) else spec.params.model_validate(params)
-    timeline = None
-    ref = getattr(checked, "timeline", None)
-    if (spec.mutates or spec.needs_current_timeline) and isinstance(ref, TimelineRef):
-        timeline = ref.name  # the broker leases (and selects) the timeline by name
+    timeline, timeline_id = _lease_timeline(spec, checked)
+    op_id = uuid.uuid4().hex
 
     def run(gateway: ResolveGateway) -> Any:
-        return execute(spec, gateway, target, checked)
+        if running_op_id() != op_id:
+            raise _outside_broker(f"op {name}")
+        return _execute(spec, gateway, target, checked)
 
     return HotOp(
         project=target,
         fn=run,
         holder=holder,
         timeline=timeline,
+        timeline_id=timeline_id,
         priority=priority,
         abort_batch_on_failure=abort_batch_on_failure,
         label=name,
+        id=op_id,
     )
+
+
+def _timeline_refs(value: Any) -> list[TimelineRef]:
+    """Every ``TimelineRef`` inside an op's params."""
+    if isinstance(value, TimelineRef):
+        return [value]
+    if isinstance(value, BaseModel):
+        return [
+            ref for name in type(value).model_fields for ref in _timeline_refs(getattr(value, name))
+        ]
+    if isinstance(value, list | tuple):
+        return [ref for item in value for ref in _timeline_refs(item)]
+    if isinstance(value, dict):
+        return [ref for item in value.values() for ref in _timeline_refs(item)]
+    return []
+
+
+def _lease_timeline(spec: OpSpec, params: OpModel) -> tuple[str | None, str | None]:
+    """The timeline (name, unique id) the broker selects and leases for this op.
+
+    A mutating (or current-timeline) op that names exactly one timeline gets it selected; it
+    is leased by itself only when the ref carries its unique id. An op naming no timeline,
+    several, or one by name only leases the whole project (``(None, None)`` leases the
+    project; a name without an id is selected but still leases the project).
+    """
+    if not (spec.mutates or spec.needs_current_timeline):
+        return None, None
+    top = getattr(params, "timeline", None)
+    refs = {(ref.name, ref.unique_id) for ref in _timeline_refs(params)}
+    if not isinstance(top, TimelineRef) or len(refs) != 1:
+        return None, None
+    return top.name, top.unique_id
 
 
 def submit_op(

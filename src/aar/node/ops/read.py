@@ -30,11 +30,12 @@ from aar.node.ops.framework import (
 class ProjectFindParams(OpModel):
     name: str | None = Field(default=None, min_length=1, description="Exact project name.")
     recursive: bool = Field(
+        strict=True,
         default=True,
         description="Walk the whole Project Manager tree (and restore it). False lists the "
         "current folder only; reading its path navigates only when it is not the root.",
     )
-    max_folders: int = Field(default=500, ge=1, le=5000)
+    max_folders: int = Field(strict=True, default=500, ge=1, le=5000)
 
 
 class FoundProject(OpModel):
@@ -185,8 +186,8 @@ def timeline_list(env: OpEnv, params: TimelineListParams) -> TimelineListResult:
 class DescribeParams(OpModel):
     timeline: TimelineRef | None = Field(default=None, description="Default: current timeline.")
     track_types: tuple[TrackType, ...] = ("video", "audio", "subtitle")
-    max_items_per_track: int = Field(default=1000, ge=1, le=20000)
-    include_media: bool = True
+    max_items_per_track: int = Field(strict=True, default=1000, ge=1, le=20000)
+    include_media: bool = Field(default=True, strict=True)
 
 
 class TimelineInfo(OpModel):
@@ -426,7 +427,7 @@ class MediaFindParams(OpModel):
         default=None, min_length=1, description="Substring of the clip's file path."
     )
     recursive: bool = False
-    limit: int = Field(default=200, ge=1, le=5000)
+    limit: int = Field(strict=True, default=200, ge=1, le=5000)
 
 
 class MediaFindResult(OpModel):

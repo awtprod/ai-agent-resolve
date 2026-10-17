@@ -85,13 +85,19 @@ class World:
         self.clock.advance(IDLE)
 
     def loc(self, project: str | ProjectLocator) -> ProjectLocator:
-        """A locator with the project's real folder and id (none for unknown projects)."""
+        """A locator with the project's real folder and id (a made-up id for unknown ones)."""
         if isinstance(project, ProjectLocator):
             return project
         known = self.fake.projects.get(project)
         if known is None:
-            return ProjectLocator(("CCN",), project)
+            return ProjectLocator(("CCN",), project, f"proj-unknown-{project}")
         return ProjectLocator(known.folder, project, known.GetUniqueId())
+
+    def pid(self, project: str) -> str:
+        return self.fake.project(project).GetUniqueId()
+
+    def tid(self, project: str, timeline: str) -> str:
+        return self.fake.project(project).timeline(timeline).GetUniqueId()
 
     def op(
         self,
@@ -111,6 +117,12 @@ class World:
                 action(gw)
             return name
 
+        timeline = kwargs.get("timeline")
+        if timeline is not None and "timeline_id" not in kwargs:
+            known = self.fake.projects.get(project) if isinstance(project, str) else None
+            match = [t for t in (known.timelines if known else []) if t.GetName() == timeline]
+            if len(match) == 1:
+                kwargs["timeline_id"] = match[0].GetUniqueId()
         return HotOp(project=self.loc(project), fn=fn, holder=holder, label=name, **kwargs)
 
     def submit(self, project: str | ProjectLocator, name: str, **kwargs: Any) -> str:
@@ -297,7 +309,9 @@ def test_human_instance_lease_blocks_the_broker(world: World) -> None:
 
 
 def test_human_lease_on_current_project_blocks_switching_away(world: World) -> None:
-    world.leases.acquire(ANDREW, Scope.TIMELINE, timeline_key("A", "A alt"), ttl=None)
+    world.leases.acquire(
+        ANDREW, Scope.TIMELINE, timeline_key(world.pid("A"), world.tid("A", "A alt")), ttl=None
+    )
     world.settle()
     world.submit("B", "b1")
     outcome = world.broker.tick()
@@ -520,8 +534,10 @@ def test_priority_orders_ops_within_a_project(world: World) -> None:
 
 
 def test_lease_blocked_op_waits_while_others_run(world: World) -> None:
-    held = world.leases.acquire(OTHER_AGENT, Scope.TIMELINE, timeline_key("B", "B main"), ttl=600)
-    world.leases.acquire(OTHER_AGENT, Scope.PROJECT, project_key("C"), ttl=600)
+    held = world.leases.acquire(
+        OTHER_AGENT, Scope.TIMELINE, timeline_key(world.pid("B"), world.tid("B", "B main")), ttl=600
+    )
+    world.leases.acquire(OTHER_AGENT, Scope.PROJECT, project_key(world.pid("C")), ttl=600)
     world.settle()
     blocked = world.submit("B", "b-main", timeline="B main")
     c1 = world.submit("C", "c1")
@@ -544,7 +560,9 @@ def test_lease_blocked_op_waits_while_others_run(world: World) -> None:
 
 
 def test_op_without_timeline_needs_the_whole_project(world: World) -> None:
-    world.leases.acquire(OTHER_AGENT, Scope.TIMELINE, timeline_key("B", "B alt"), ttl=600)
+    world.leases.acquire(
+        OTHER_AGENT, Scope.TIMELINE, timeline_key(world.pid("B"), world.tid("B", "B alt")), ttl=600
+    )
     world.settle()
     blocked = world.submit("B", "b-any")
     outcomes = world.broker.run_until_idle()
@@ -552,13 +570,14 @@ def test_op_without_timeline_needs_the_whole_project(world: World) -> None:
     assert [o.kind for o in outcomes] == [TickKind.IDLE]
     assert world.fake.calls == []  # never switched (or snapshotted) for an op it could not run
     assert [op.id for op in world.broker.pending()] == [blocked]
-    assert world.of("skipped")[0].data["code"].startswith("lease:timeline lease on B/B alt")
+    lease_on = f"lease:timeline lease on {world.pid('B')}/{world.tid('B', 'B alt')}"
+    assert world.of("skipped")[0].data["code"].startswith(lease_on)
 
 
 def test_lease_taken_mid_batch_is_respected() -> None:
     def other_agent_grabs_b(world: World, event: BrokerEvent) -> None:
         if event.kind == "op_succeeded" and not world.leases.active()[1:]:
-            world.leases.acquire(OTHER_AGENT, Scope.PROJECT, project_key("B"), ttl=600)
+            world.leases.acquire(OTHER_AGENT, Scope.PROJECT, project_key(world.pid("B")), ttl=600)
 
     world = World(on_event=other_agent_grabs_b)
     world.settle()
@@ -653,18 +672,20 @@ def test_restore_reports_a_project_manager_path_it_could_not_restore() -> None:
 
     report = world.broker.last_restore
     assert report is not None and not report.ok
-    assert report.errors["project_manager_path"].startswith("pm_open_failed")
+    assert report.errors["project_manager_path"].startswith("pm_path_unverified")
     assert report.mismatches["project_manager_path"] == (("Archive", "2024"), ())
     assert world.gw.get_context().project == "A"  # the project itself came back
 
 
 def test_same_named_project_in_another_folder_is_switched_to_by_id() -> None:
-    fake = FakeResolve(PROJECTS, current="A")
+    fake = FakeResolve(PROJECTS, current="C")
     twin = fake.add_project("A", ["A main", "A alt"], ("Clients", "Acme"))
     world = World(fake=fake)
-    human_id = fake.project("A").GetUniqueId()
+    human_id = fake.project("C").GetUniqueId()
     seen: list[str | None] = []
     world.settle()
+    # The Project Manager is in CCN, which has its own "A": a load by name from there would
+    # open the wrong one.
     world.submit(
         ProjectLocator(("Clients", "Acme"), "A", twin.GetUniqueId()),
         "twin",
@@ -672,30 +693,120 @@ def test_same_named_project_in_another_folder_is_switched_to_by_id() -> None:
     )
     world.broker.run_until_idle()
 
-    assert seen == [twin.GetUniqueId()]  # a name-only match would have run it in the human's A
-    assert world.loads() == ["A", "A"]
+    assert seen == [twin.GetUniqueId()]
+    assert world.loads() == ["A", "C"]
     assert world.gw.get_context().project_id == human_id
     report = world.broker.last_restore
     assert report is not None and report.ok
 
 
-def test_unlocatable_human_project_is_reported_not_guessed() -> None:
+def _ambiguous_human() -> World:
+    """The human has "A" open (from CCN) and is browsing Archive; a second "A" lives in
+    Clients/Acme, so the name does not say which "A" is open."""
     fake = FakeResolve(PROJECTS, current="A")
     fake.add_project("A", ["A main"], ("Clients", "Acme"))
     fake.add_pm_folder(("Archive",))
-    fake.human_browse_project_manager(("Archive",))  # and there are two projects named A
-    world = World(fake=fake)
+    fake.human_browse_project_manager(("Archive",))
+    return World(fake=fake)
+
+
+def test_an_unlocatable_human_project_is_never_left() -> None:
+    world = _ambiguous_human()
+    presets_before = set(world.fake.presets)
     world.settle()
-    world.submit("B", "b1")
+    op_id = world.submit("B", "b1")
     world.broker.run_until_idle()
 
-    snapshot_warnings = world.of("snapshot")[0].data["warnings"]
-    assert any("cannot be reloaded on restore" in w for w in snapshot_warnings)
+    result = world.broker.result(op_id)
+    assert result is not None and result.status is OpStatus.FAILED and result.error is not None
+    assert result.error.code == "switch_refused"
+    assert result.error.detail["trap_id"] == "pm-folder-scoped-load"
+    warnings = world.of("snapshot")[0].data["warnings"]
+    assert any("cannot be located by identity" in w for w in warnings)
+    assert world.loads() == []  # never left A, never loaded a guessed "A"
+    assert world.ran == []
+    report = world.broker.last_restore
+    assert report is not None and report.ok, report
+    assert world.gw.get_context(with_pm_path=True).project_manager_path == ("Archive",)
+    assert set(world.fake.presets) == presets_before
+
+
+def test_a_locator_the_broker_verified_earlier_locates_an_ambiguous_human_project() -> None:
+    world = _ambiguous_human()
+    world.fake.human_open_project("B")
+    world.settle()
+    world.submit("A", "a1")  # the broker loads CCN/A by locator and verifies its id
+    world.broker.run_until_idle()
+    assert world.broker.known_locators()[world.pid("A")] == world.loc("A")
+
+    world.fake.human_open_project("A")
+    world.fake.human_browse_project_manager(("Archive",))
+    world.clock.advance(IDLE)
+    world.settle()
+    world.submit("C", "c1")
+    world.broker.run_until_idle()
+
+    assert world.names() == ["a1", "c1"]
+    assert world.of("snapshot")[-1].data["project_locator"] == world.loc("A").to_dict()
+    report = world.broker.last_restore
+    assert report is not None and report.ok, report
+    ctx = world.gw.get_context(with_pm_path=True)
+    assert (ctx.project_id, ctx.project_manager_path) == (world.pid("A"), ("Archive",))
+
+
+def test_restore_never_ends_in_a_same_named_project_it_did_not_confirm() -> None:
+    world = World()
+    world.settle()
+    world.submit("B", "b1")
+    assert world.broker.tick().kind is TickKind.RAN
+    # While the broker works in B, the human's A is moved away and another "A" takes its
+    # place in CCN: the locator taken at the snapshot now points at the impostor.
+    impostor = world.fake.add_project("A", ["X"], ("CCN",))
+    world.fake.project("A").folder = ("Moved",)
+    world.fake.projects["A"] = impostor
+    outcome = world.broker.tick()
+
+    assert outcome.kind is TickKind.RESTORED and outcome.code == "partial"
+    report = world.broker.last_restore
+    assert report is not None and report.errors["project"].startswith("project_id_mismatch")
+    # The id was only seen after LoadProject; the broker went back to B, not leaving the
+    # instance in a project nobody asked for.
+    assert "project_recover" not in report.errors
+    assert world.gw.get_context().project_id == world.pid("B")
+
+
+def test_failed_project_restore_deletes_a_redundant_deliver_preset() -> None:
+    world = World()
+    presets_before = set(world.fake.presets)
+    world.settle()
+    world.submit("B", "b1")
+    assert world.broker.tick().kind is TickKind.RAN
+    world.fake.missing.add("A")  # the human's project can no longer be loaded
+    world.broker.tick()
+
+    report = world.broker.last_restore
+    assert report is not None and report.errors["project"].startswith("project_not_found")
+    assert report.kept_preset is None
+    assert set(world.fake.presets) == presets_before  # no op ran in A: nothing worth keeping
+
+
+def test_failed_project_restore_keeps_and_reports_a_preset_that_may_be_the_only_copy() -> None:
+    world = World()
+    presets_before = set(world.fake.presets)
+    world.settle()
+    world.submit("A", "a1", action=lambda gw: gw.load_render_preset("YouTube 1080p"))
+    world.submit("B", "b1")
+    world.broker.tick()  # a1 in the human's project: its Deliver settings were clobbered
+    world.broker.tick()  # b1
+    world.fake.missing.add("A")
+    world.broker.tick()
+
     report = world.broker.last_restore
     assert report is not None and not report.ok
-    assert report.errors["project"].startswith("human_project_unlocated")
-    assert world.loads() == ["B"]  # never loaded a guessed "A"
-    assert world.gw.get_context().project == "B"
+    kept = report.kept_preset
+    assert kept is not None and kept.startswith("aar-restore-")
+    assert set(world.fake.presets) - presets_before == {kept}
+    assert world.of("restored")[-1].data["kept_preset"] == kept
 
 
 def test_pm_path_snapshot_can_be_turned_off_for_read_only_use() -> None:
@@ -714,3 +825,139 @@ def test_pm_path_snapshot_can_be_turned_off_for_read_only_use() -> None:
     assert "SaveAsNewRenderPreset" not in names
     snapshot = world.broker.snapshot
     assert snapshot is not None and snapshot.context.project_manager_path is None
+
+
+# -- restore order and guards ---------------------------------------------------------------
+
+
+def test_a_lossy_preset_round_trip_is_corrected_by_the_format_and_codec_step() -> None:
+    world = World()
+    world.fake.faults.add("LoadRenderPreset:drops-codec")
+    before = world.gw.get_context()
+    world.settle()
+    world.submit("A", "a1", action=lambda gw: gw.load_render_preset("YouTube 1080p"))
+    world.broker.run_until_idle()
+    report = world.broker.last_restore
+    assert report is not None and report.ok, report
+    after = world.gw.get_context()
+    assert (after.render_format, after.render_codec) == (before.render_format, before.render_codec)
+    names = world.fake.call_names()
+    restore = names[names.index("LoadRenderPreset", names.index("LoadRenderPreset") + 1) :]
+    assert restore.index("SetCurrentRenderFormatAndCodec") > 0  # after the preset load
+
+
+def test_without_a_preset_the_format_and_codec_are_still_restored() -> None:
+    world = World()
+    world.fake.project("A").SaveAsNewRenderPreset = lambda presetName: False  # type: ignore[method-assign]
+    before = world.gw.get_context()
+    world.settle()
+    world.submit("A", "a1", action=lambda gw: gw.set_render_format_and_codec("mp4", "H265"))
+    world.broker.run_until_idle()
+    after = world.gw.get_context()
+    assert (after.render_format, after.render_codec) == ("mov", "ProRes422HQ")
+    assert after.render_codec == before.render_codec
+
+
+def test_the_playhead_is_not_moved_when_the_humans_timeline_is_gone() -> None:
+    world = World()
+    world.settle()
+
+    def delete_human_timeline(gw: ResolveGateway) -> None:
+        a = world.fake.project("A")
+        a.timelines.remove(a.timeline("A alt"))
+        a.current_timeline = a.timeline("A main")
+
+    world.submit("A", "a1", action=delete_human_timeline)
+    world.broker.run_until_idle()
+    report = world.broker.last_restore
+    assert report is not None and report.errors["timeline"].startswith("timeline_not_found")
+    assert "playhead" not in report.errors
+    assert not [c for c in world.fake.calls if c[0] == "SetCurrentTimecode"]
+    assert world.fake.project("A").timeline("A main").timecode == "01:00:00:00"
+
+
+# -- identity, not names (F2, F3) -------------------------------------------------------------
+
+
+def test_the_broker_refuses_an_op_without_a_project_id() -> None:
+    world = World()
+    with pytest.raises(ValueError, match="project_id"):
+        world.broker.submit(
+            HotOp(project=ProjectLocator(("CCN",), "B"), fn=lambda gw: None, holder=AGENT)
+        )
+
+
+def test_the_folder_the_human_browses_never_stands_for_the_humans_project() -> None:
+    # The human opened "A" from CCN, then browsed to Archive, which has another "A".
+    fake = FakeResolve(PROJECTS, current="A")
+    impostor = fake.add_project("A", ["X"], ("Archive",))
+    fake.human_browse_project_manager(("Archive",))
+    world = World(fake=fake)
+    human_id = world.pid("A")
+    world.settle()
+    op_id = world.submit("B", "b1")
+    world.broker.run_until_idle()
+
+    result = world.broker.result(op_id)
+    assert result is not None and result.error is not None
+    assert result.error.code == "switch_refused"
+    assert world.of("snapshot")[0].data["project_locator"] is None
+    assert world.loads() == []  # never loaded either "A"
+    ctx = world.gw.get_context(with_pm_path=True)
+    assert ctx.project_id == human_id != impostor.GetUniqueId()
+    assert ctx.project_manager_path == ("Archive",)
+
+
+def test_a_failed_project_restore_still_puts_back_the_folder_the_human_browsed() -> None:
+    fake = FakeResolve(PROJECTS, current="A", folders={"B": ("Clients", "Acme")})
+    fake.add_pm_folder(("Archive",))
+    fake.human_browse_project_manager(("Archive",))
+    world = World(fake=fake)
+    world.settle()
+    world.submit("B", "b1")
+    assert world.broker.tick().kind is TickKind.RAN
+    world.fake.missing.add("A")
+    world.broker.tick()
+
+    report = world.broker.last_restore
+    assert report is not None and "project" in report.errors
+    assert "project_manager_path" not in report.errors
+    assert world.gw.get_context(with_pm_path=True).project_manager_path == ("Archive",)
+
+
+def test_an_open_project_with_the_targets_name_but_another_id_is_switched_away_from() -> None:
+    fake = FakeResolve(PROJECTS, current="B")
+    twin = fake.add_project("A", ["A main"], ("Clients", "Acme"))
+    world = World(fake=fake)
+    world.settle()
+    world.submit("A", "learn")  # the broker loads CCN/A by locator, so it can locate it later
+    world.broker.run_until_idle()
+    world.fake.human_open_project("A")
+    world.clock.advance(IDLE)
+    world.settle()
+    seen: list[str | None] = []
+    world.submit(
+        ProjectLocator(("Clients", "Acme"), "A", twin.GetUniqueId()),
+        "twin",
+        action=lambda gw: seen.append(gw.get_context().project_id),
+    )
+    world.broker.run_until_idle()
+
+    assert seen == [twin.GetUniqueId()]  # not the human's "A", although the names match
+    assert world.gw.get_context().project_id == world.pid("A")
+
+
+def test_a_target_whose_id_does_not_match_fails_closed_and_the_human_comes_back() -> None:
+    world = World()
+    world.settle()
+    op_id = world.submit(ProjectLocator(("CCN",), "B", "proj-not-b"), "wrong id")
+    world.broker.run_until_idle()
+
+    result = world.broker.result(op_id)
+    assert result is not None and result.status is OpStatus.FAILED and result.error is not None
+    assert result.error.code == "project_unavailable"
+    assert result.error.detail["gateway_code"] == "project_id_mismatch"
+    assert world.ran == []
+    report = world.broker.last_restore
+    assert report is not None and report.ok, report
+    assert world.gw.get_context().project_id == world.pid("A")
