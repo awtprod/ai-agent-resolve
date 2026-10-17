@@ -79,6 +79,76 @@ def read_media(mpi: Any) -> dict[str, Any]:
     return out
 
 
+# The per-clip 'Cloud Sync' property is one of these resolve.CLOUD_SYNC_* status codes (21.1
+# stubs). Its live integer values were not probed, so ops do not hard-code them: they read the
+# constants off the ``resolve`` object and label each clip's value by matching it.
+CLOUD_SYNC_STATUS_CONSTANTS = (
+    "CLOUD_SYNC_DEFAULT",
+    "CLOUD_SYNC_DOWNLOAD_IN_QUEUE",
+    "CLOUD_SYNC_DOWNLOAD_IN_PROGRESS",
+    "CLOUD_SYNC_DOWNLOAD_SUCCESS",
+    "CLOUD_SYNC_DOWNLOAD_FAIL",
+    "CLOUD_SYNC_DOWNLOAD_NOT_FOUND",
+    "CLOUD_SYNC_UPLOAD_IN_QUEUE",
+    "CLOUD_SYNC_UPLOAD_IN_PROGRESS",
+    "CLOUD_SYNC_UPLOAD_SUCCESS",
+    "CLOUD_SYNC_UPLOAD_FAIL",
+    "CLOUD_SYNC_UPLOAD_NOT_FOUND",
+    "CLOUD_SYNC_SUCCESS",
+)
+
+
+def cloud_sync_labels(resolve: Any) -> dict[Any, str]:
+    """Map each cloud-sync code value to its ``resolve.CLOUD_SYNC_*`` name, read off ``resolve``.
+
+    Keyed by both the raw value and ``str(value)`` so a property returned as an int or a string
+    both resolve to the same label.
+    """
+    labels: dict[Any, str] = {}
+    for name in CLOUD_SYNC_STATUS_CONSTANTS:
+        value = getattr(resolve, name, None)
+        if value is not None:
+            labels[value] = name
+            labels[str(value)] = name
+    return labels
+
+
+def classify_cloud_sync(props: dict[str, Any], labels: dict[Any, str]) -> dict[str, Any]:
+    """Cloud-sync facts of one clip from its ``GetClipProperty()`` dict and a label map.
+
+    ``proxy_only`` is the audio-loss case of trap ``cloud-proxy-only-no-audio``: a proxy is
+    present while the original reads offline, so a build would use the (audio-less) proxy.
+    """
+    raw_value = props.get("Cloud Sync")
+    raw_str = "" if raw_value is None else str(raw_value)
+    label = labels.get(raw_value) or labels.get(raw_str) or raw_str
+    proxy = str(props.get("Proxy") or "")
+    online = str(props.get("Online Status") or "")
+    has_proxy = proxy not in ("", "None")
+    original_offline = online not in ("", "Online")
+    return {
+        "cloud_sync": label,
+        "cloud_sync_raw": raw_str,
+        "proxy": proxy,
+        "has_proxy": has_proxy,
+        "online_status": online,
+        "original_offline": original_offline,
+        "proxy_only": has_proxy and original_offline,
+    }
+
+
+def read_cloud_sync(mpi: Any, labels: dict[Any, str]) -> dict[str, Any]:
+    """Identity and cloud-sync facts of one ``MediaPoolItem``."""
+    props = mpi.GetClipProperty() or {}
+    media = classify_media(props)
+    out = classify_cloud_sync(props, labels)
+    out["media_id"] = str(mpi.GetUniqueId())
+    out["name"] = str(mpi.GetName())
+    out["type"] = media["type"]
+    out["has_audio"] = media["has_audio"]
+    return out
+
+
 def read_item(item: Any, timeline_start: int) -> dict[str, Any]:
     """Positions, source range, fades and gain of one ``TimelineItem``."""
     start = int(item.GetStart())
