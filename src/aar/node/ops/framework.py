@@ -92,7 +92,11 @@ TrackType = Literal["video", "audio", "subtitle"]
 
 
 class TimelineRef(OpModel):
-    """A timeline of the target project, by unique id (preferred) or name."""
+    """A timeline of the target project. Ops that change Resolve, and ops that act on the
+    current timeline, need its unique_id: a name-only ref is refused with
+    timeline_id_required. A name given with the unique_id is a cross-check; if it is not that
+    timeline's name the op is refused with timeline_ref_mismatch. Only read-only ops accept a
+    name alone."""
 
     name: str | None = Field(default=None, min_length=1)
     unique_id: str | None = Field(default=None, min_length=1)

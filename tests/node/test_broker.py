@@ -1031,3 +1031,52 @@ def test_without_the_project_manager_snapshot_foreign_switches_are_refused() -> 
     assert result is not None and result.error is not None
     assert result.error.code == "switch_refused"
     assert world.loads() == []
+
+
+# -- round 3b ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [("",), (None,), (1,)])
+def test_extra_timeline_ids_must_be_non_empty_ids(bad: tuple[Any, ...]) -> None:
+    world = World()
+    with pytest.raises(ValueError, match="extra_timeline_ids"):
+        world.broker.submit(
+            HotOp(
+                project=world.loc("B"),
+                fn=lambda gw: None,
+                holder=AGENT,
+                extra_timeline_ids=bad,  # type: ignore[arg-type]
+            )
+        )
+    assert world.broker.pending() == []
+
+
+def test_the_submitted_event_names_every_timeline_the_op_leases() -> None:
+    world = World()
+    extra = (world.tid("B", "B alt"),)
+    world.submit("B", "b1", timeline="B main", extra_timeline_ids=extra)
+    submitted = world.of("submitted")[-1].data
+    assert submitted["timeline_id"] == world.tid("B", "B main")
+    assert submitted["extra_timeline_ids"] == list(extra)
+
+
+def test_an_op_in_the_humans_project_counts_only_for_its_own_control_session() -> None:
+    # Session 1 runs an op in the human's A, so its preset could have been the only copy.
+    # Session 2 only works in B; when A then cannot be loaded, its preset is redundant.
+    world = World()
+    presets_before = set(world.fake.presets)
+    world.settle()
+    world.submit("A", "a1", action=lambda gw: gw.load_render_preset("YouTube 1080p"))
+    world.submit("B", "b1")
+    world.broker.run_until_idle()
+    assert world.broker.snapshot is None  # session 1 ended
+    world.settle()
+    world.submit("B", "b2")
+    world.broker.tick()
+    world.fake.missing.add("A")
+    world.broker.run_until_idle()
+
+    report = world.broker.last_restore
+    assert report is not None and report.errors["project"].startswith("project_not_found")
+    assert report.kept_preset is None
+    assert set(world.fake.presets) == presets_before

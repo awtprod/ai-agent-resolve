@@ -40,3 +40,15 @@ def test_node_ops_text_shows_one_entry_per_op(capsys: pytest.CaptureFixture[str]
 def test_node_without_a_command_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["node"]) == 2
     assert "COMMAND" in capsys.readouterr().err
+
+
+def test_the_published_timeline_ref_text_states_the_id_rule(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Agents read this schema text: it must not say a name is enough for a write.
+    assert main(["node", "ops", "--json"]) == 0
+    listed = {d["name"]: d for d in json.loads(capsys.readouterr().out)}
+    text = listed["markers.add"]["params_schema"]["$defs"]["TimelineRef"]["description"]
+    assert "unique_id" in text and "timeline_id_required" in text
+    assert "timeline_ref_mismatch" in text
+    assert "or name" not in text and "preferred" not in text

@@ -286,6 +286,8 @@ def timeline_duplicate(env: OpEnv, params: DuplicateParams) -> DuplicateResult:
 
 def _reuse(env: OpEnv, source: Any, dup: Any, params: DuplicateParams) -> DuplicateResult:
     """Pick up an existing timeline without changing it, if it is what the op would make."""
+    # Unleased read of `dup` (its id is only known now, after submit): acceptable because it
+    # only reads settings and never writes; a mismatch is refused with `dup` left unchanged.
     reference = source.GetSettings() or {}
     have = dup.GetSettings() or {}
     expected = {
