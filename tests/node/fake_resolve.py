@@ -150,6 +150,21 @@ _KIND_TYPE = {
 }
 
 
+def _cloud_sync_prop(value: int | float | str | None) -> str:
+    """The 'Cloud Sync' clip property as Resolve returns it: the code as an integer-form string.
+
+    Observed live 2026-10-17: every clip on a cloud library read "-1" (CLOUD_SYNC_DEFAULT); the
+    string form of the other codes was not seen, so it is modelled as the integer form here.
+    """
+    if value is None:
+        return "-1"
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int | float):
+        return str(int(value))
+    return str(value)
+
+
 class FakeMediaPoolItem:
     """A media-pool clip. ``kind`` is one of ``_KIND_TYPE``; ``braw`` marks Blackmagic RAW."""
 
@@ -201,10 +216,11 @@ class FakeMediaPoolItem:
             # can read "Offline" while a linked proxy ("Proxy" is its size) still plays.
             "Online Status": online,
             "Proxy": proxy,
-            # Blackmagic Cloud per-clip sync status (CloudSyncStatus); DEFAULT when the clip is
-            # not cloud media. The property is read back as the enumerated code, labelled by
-            # the op from the resolve.CLOUD_SYNC_* constants below. (presumed: the live value)
-            "Cloud Sync": cloud_sync if cloud_sync is not None else app.CLOUD_SYNC_DEFAULT,
+            # Blackmagic Cloud per-clip sync status (CloudSyncStatus), read back as a string
+            # ("-1" = DEFAULT, observed live). The op labels it from the float CLOUD_SYNC_*
+            # constants by matching numerically, so a string here against a float constant is
+            # the real shape, not a mismatch.
+            "Cloud Sync": _cloud_sync_prop(cloud_sync),
             "Audio Ch": "2" if kind in ("av", "audio") else "0",
         }  # fmt: skip
 
@@ -1107,21 +1123,22 @@ class FakeResolve:
     projects in other folders. The Project Manager starts in the current project's folder.
     """
 
-    # resolve.CLOUD_SYNC_* status codes (CloudSyncStatus). Model choice (presumed): the live
-    # integer values were not probed, so these are placeholders. Ops read these same attributes
-    # off the object to label a clip's 'Cloud Sync' value, so the exact integers do not matter.
-    CLOUD_SYNC_DEFAULT = 0
-    CLOUD_SYNC_DOWNLOAD_IN_QUEUE = 1
-    CLOUD_SYNC_DOWNLOAD_IN_PROGRESS = 2
-    CLOUD_SYNC_DOWNLOAD_SUCCESS = 3
-    CLOUD_SYNC_DOWNLOAD_FAIL = 4
-    CLOUD_SYNC_DOWNLOAD_NOT_FOUND = 5
-    CLOUD_SYNC_UPLOAD_IN_QUEUE = 6
-    CLOUD_SYNC_UPLOAD_IN_PROGRESS = 7
-    CLOUD_SYNC_UPLOAD_SUCCESS = 8
-    CLOUD_SYNC_UPLOAD_FAIL = 9
-    CLOUD_SYNC_UPLOAD_NOT_FOUND = 10
-    CLOUD_SYNC_SUCCESS = 11
+    # resolve.CLOUD_SYNC_* status codes (CloudSyncStatus), observed live 2026-10-17 as floats.
+    # The clip property reads them back as strings (e.g. "-1"), so the op matches numerically.
+    # The sync-MODE codes (NONE 0.0, PROXY_ONLY 1.0, PROXY_AND_ORIG 2.0) collide with these, so
+    # they are kept out of the status map; they are not modelled here (no op reads the mode).
+    CLOUD_SYNC_DEFAULT = -1.0
+    CLOUD_SYNC_DOWNLOAD_IN_QUEUE = 0.0
+    CLOUD_SYNC_DOWNLOAD_IN_PROGRESS = 1.0
+    CLOUD_SYNC_DOWNLOAD_SUCCESS = 2.0
+    CLOUD_SYNC_DOWNLOAD_FAIL = 3.0
+    CLOUD_SYNC_DOWNLOAD_NOT_FOUND = 4.0
+    CLOUD_SYNC_UPLOAD_IN_QUEUE = 5.0
+    CLOUD_SYNC_UPLOAD_IN_PROGRESS = 6.0
+    CLOUD_SYNC_UPLOAD_SUCCESS = 7.0
+    CLOUD_SYNC_UPLOAD_FAIL = 8.0
+    CLOUD_SYNC_UPLOAD_NOT_FOUND = 9.0
+    CLOUD_SYNC_SUCCESS = 10.0
 
     def __init__(
         self,
@@ -1148,11 +1165,16 @@ class FakeResolve:
                 "mp4", "H265", 1, {"TargetDir": "C:/Exports", "CustomName": "yt"}
             )
         }
-        # ProjectManager.GetCurrentDatabase. Model choice (presumed): the DbType/DbName a
-        # Blackmagic Cloud library reports were not probed (GetDatabaseList does not list it,
-        # DESIGN F2); "acme" is a placeholder. Tests set this to the local database to exercise
-        # the local_database note.
-        self.database: dict[str, str] = {"DbType": "Cloud", "DbName": "acme cloud library"}
+        # ProjectManager.GetCurrentDatabase. Observed live 2026-10-17: a Blackmagic Cloud library
+        # reports DbType "PostgreSQL" with an IpAddress (GetDatabaseList does not list it,
+        # DESIGN F2). The name and IP here are placeholders ("198.51.100.10" is an RFC 5737
+        # documentation address): no real host goes in the repo, and the op must drop IpAddress.
+        # Tests set this to the local database to exercise the local_database note.
+        self.database: dict[str, str] = {
+            "DbType": "PostgreSQL",
+            "DbName": "acme cloud library",
+            "IpAddress": "198.51.100.10",
+        }
         self.missing: set[str] = set()
         self.load_silently_fails: set[str] = set()
         self.save_fails = False

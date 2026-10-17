@@ -227,20 +227,19 @@ def _source_readback() -> None:
 
 def _cloud_proxy_only() -> None:
     fake, _ = _world()
-    # Proxy-only: the original reads offline while a proxy is present, so a build uses the
-    # (audio-less) proxy. The fake also carries the per-clip 'Cloud Sync' status code.
-    clip = fake.project("Show").media_pool.add_clip(
-        (),
-        "cam",
-        online="Offline",
-        proxy="1920x1080",
-        cloud_sync=FakeResolve.CLOUD_SYNC_DOWNLOAD_NOT_FOUND,
-    )
-    props = clip.GetClipProperty()
+    pool = fake.project("Show").media_pool
+    # Proxy-only: a resolution proxy is present while the original reads offline, so a build
+    # uses the (audio-less) proxy.
+    proxy_only = pool.add_clip((), "cam", online="Offline", proxy="1920x1080")
+    props = proxy_only.GetClipProperty()
     assert (props["Online Status"], props["Proxy"]) == ("Offline", "1920x1080")
-    assert props["Cloud Sync"] == FakeResolve.CLOUD_SYNC_DOWNLOAD_NOT_FOUND
-    # a fully-synced clip is not proxy-only
-    good = fake.project("Show").media_pool.add_clip((), "ok", online="Online")
+    # The status constants are floats, but the clip property reads back as the string "-1".
+    assert fake.CLOUD_SYNC_DEFAULT == -1.0 and props["Cloud Sync"] == "-1"
+    # A proxy that is itself "Offline" is not a playable proxy (so not the proxy-only case).
+    proxy_gone = pool.add_clip((), "cam2", online="Offline", proxy="Offline")
+    assert proxy_gone.GetClipProperty()["Proxy"] == "Offline"
+    # A fully-synced clip is neither.
+    good = pool.add_clip((), "ok", online="Online")
     assert good.GetClipProperty()["Online Status"] == "Online"
 
 

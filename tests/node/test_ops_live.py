@@ -127,9 +127,11 @@ def test_live_cloud_read_ops(resolve: Any) -> None:
     for clip in sync.clips:
         assert clip.media_id and clip.cloud_sync
         assert clip.proxy_only == (clip.has_proxy and clip.original_offline)
+        assert clip.fully_offline == (clip.original_offline and not clip.has_proxy)
+        assert not (clip.proxy_only and clip.fully_offline)
     # Report proxy-only media (the audio-loss case) and the raw status codes seen live.
     print("cloud sync codes:", sync.status_counts)
-    print("proxy-only:", sync.proxy_only, "offline-no-proxy:", sync.offline_no_proxy)
+    print("proxy-only:", sync.proxy_only, "fully-offline:", sync.fully_offline)
 
     fresh = _run(resolve, "cloud.freshness", {})
     assert fresh.folder_count == len(fresh.folders)

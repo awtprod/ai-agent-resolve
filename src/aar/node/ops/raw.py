@@ -80,8 +80,10 @@ def read_media(mpi: Any) -> dict[str, Any]:
 
 
 # The per-clip 'Cloud Sync' property is one of these resolve.CLOUD_SYNC_* status codes (21.1
-# stubs). Its live integer values were not probed, so ops do not hard-code them: they read the
-# constants off the ``resolve`` object and label each clip's value by matching it.
+# stubs). Observed live 2026-10-17: the constants are floats (DEFAULT -1.0 .. SUCCESS 10.0) but
+# the clip property reads back as a string (e.g. "-1"), so codes are matched numerically. The
+# sync-MODE constants (CLOUD_SYNC_NONE/PROXY_ONLY/PROXY_AND_ORIG) reuse these numeric values and
+# are deliberately absent here: a status code must never be matched against a mode code.
 CLOUD_SYNC_STATUS_CONSTANTS = (
     "CLOUD_SYNC_DEFAULT",
     "CLOUD_SYNC_DOWNLOAD_IN_QUEUE",
@@ -98,46 +100,70 @@ CLOUD_SYNC_STATUS_CONSTANTS = (
 )
 
 
-def cloud_sync_labels(resolve: Any) -> dict[Any, str]:
-    """Map each cloud-sync code value to its ``resolve.CLOUD_SYNC_*`` name, read off ``resolve``.
+def _as_number(value: Any) -> float | None:
+    """``value`` as a float, or ``None`` if it is not numeric. '-1', '-1.0' and -1.0 give -1.0."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
-    Keyed by both the raw value and ``str(value)`` so a property returned as an int or a string
-    both resolve to the same label.
+
+def _is_resolution(value: str) -> bool:
+    """True for a 'WxH' resolution such as '1920x1080'; False for '', 'None' or 'Offline'."""
+    parts = value.split("x")
+    return len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit()
+
+
+def cloud_sync_labels(resolve: Any) -> dict[float, str]:
+    """Map each cloud-sync status code (as a float) to its ``resolve.CLOUD_SYNC_*`` name.
+
+    Keyed numerically because the clip property reads back as a string while the constants are
+    floats. Only the status constants are read, never the colliding sync-MODE constants.
     """
-    labels: dict[Any, str] = {}
+    labels: dict[float, str] = {}
     for name in CLOUD_SYNC_STATUS_CONSTANTS:
-        value = getattr(resolve, name, None)
-        if value is not None:
-            labels[value] = name
-            labels[str(value)] = name
+        number = _as_number(getattr(resolve, name, None))
+        if number is not None:
+            labels[number] = name
     return labels
 
 
-def classify_cloud_sync(props: dict[str, Any], labels: dict[Any, str]) -> dict[str, Any]:
+def classify_cloud_sync(props: dict[str, Any], labels: dict[float, str]) -> dict[str, Any]:
     """Cloud-sync facts of one clip from its ``GetClipProperty()`` dict and a label map.
 
-    ``proxy_only`` is the audio-loss case of trap ``cloud-proxy-only-no-audio``: a proxy is
-    present while the original reads offline, so a build would use the (audio-less) proxy.
+    A playable proxy is a resolution in 'Proxy'; 'Offline' means the proxy file itself is
+    offline, so it is not playable. ``proxy_only`` (trap ``cloud-proxy-only-no-audio``) is a
+    playable proxy with the original offline, so a build uses the audio-less proxy;
+    ``fully_offline`` is an offline original with no playable proxy, so a build renders nothing.
+    An unparseable status stays raw (in ``cloud_sync_raw``) and is labelled 'unknown', never
+    swallowed.
     """
     raw_value = props.get("Cloud Sync")
     raw_str = "" if raw_value is None else str(raw_value)
-    label = labels.get(raw_value) or labels.get(raw_str) or raw_str
+    number = _as_number(raw_value)
+    label = labels.get(number) if number is not None else None
     proxy = str(props.get("Proxy") or "")
     online = str(props.get("Online Status") or "")
-    has_proxy = proxy not in ("", "None")
+    has_proxy = _is_resolution(proxy)
     original_offline = online not in ("", "Online")
     return {
-        "cloud_sync": label,
+        "cloud_sync": label if label is not None else "unknown",
         "cloud_sync_raw": raw_str,
         "proxy": proxy,
         "has_proxy": has_proxy,
+        "proxy_offline": proxy == "Offline",
         "online_status": online,
         "original_offline": original_offline,
         "proxy_only": has_proxy and original_offline,
+        "fully_offline": original_offline and not has_proxy,
     }
 
 
-def read_cloud_sync(mpi: Any, labels: dict[Any, str]) -> dict[str, Any]:
+def read_cloud_sync(mpi: Any, labels: dict[float, str]) -> dict[str, Any]:
     """Identity and cloud-sync facts of one ``MediaPoolItem``."""
     props = mpi.GetClipProperty() or {}
     media = classify_media(props)

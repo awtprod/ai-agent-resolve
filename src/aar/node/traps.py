@@ -267,14 +267,15 @@ _ALL: tuple[Trap, ...] = (
         "original is offline while a proxy is present; do not render while any clip is "
         "proxy-only.",
         confirmed=(
-            "the cloud proxies in this setup carry no audio, so a proxy-only build loses audio; "
-            f"{REPORTED}"
+            "the cloud proxies in this setup carry no audio, so a proxy-only build loses audio "
+            f"({REPORTED}); the resolve.CLOUD_SYNC_* status codes are floats (DEFAULT -1.0) while "
+            "the 'Cloud Sync' clip property reads back as a string, 'Proxy' is a resolution, "
+            "'None', '' or 'Offline' (the proxy file itself offline), and a resolution proxy "
+            f"with the original 'Online Status' offline is a common state ({PROBED})"
         ),
         presumed=(
-            "the value the 'Cloud Sync' clip property reads back for each resolve.CLOUD_SYNC_* "
-            "status, that an offline original with a proxy present is exactly the proxy-only "
-            "case, and that the project's cloud sync mode cannot be read back; the read-only "
-            "probe did not cover a live cloud project"
+            "the string the 'Cloud Sync' property takes for statuses other than "
+            "CLOUD_SYNC_DEFAULT; every clip seen live read '-1'"
         ),
     ),
 )

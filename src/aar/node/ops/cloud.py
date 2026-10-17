@@ -167,13 +167,18 @@ class ClipSync(OpModel):
     type: str
     has_audio: bool
     cloud_sync: str
-    """The resolve.CLOUD_SYNC_* status name, or the raw value if it matched no known constant."""
+    """The resolve.CLOUD_SYNC_* status name, or 'unknown' if the raw value matched no code."""
     cloud_sync_raw: str
     proxy: str
     has_proxy: bool
+    """A playable proxy (a resolution in 'Proxy'); 'Offline'/'None'/'' are not playable."""
+    proxy_offline: bool
     online_status: str
     original_offline: bool
     proxy_only: bool
+    """A playable proxy with the original offline: a build uses it and loses audio."""
+    fully_offline: bool
+    """The original is offline and there is no playable proxy: a build renders nothing."""
 
 
 class CloudSyncResult(OpModel):
@@ -189,7 +194,7 @@ class CloudSyncResult(OpModel):
     status_counts: dict[str, int]
     """Per ``cloud_sync`` status totals for this page; sum across pages for the whole pool."""
     proxy_only: int
-    offline_no_proxy: int
+    fully_offline: int
     notes: list[Note]
 
 
@@ -217,7 +222,7 @@ def cloud_sync_status(env: OpEnv, params: CloudSyncParams) -> CloudSyncResult:
     window = flat[params.cursor : params.cursor + params.max_clips]
     clips: list[ClipSync] = []
     status_counts: dict[str, int] = {}
-    proxy_only = offline_no_proxy = 0
+    proxy_only = fully_offline = 0
     for where, clip in window:
         data = raw.read_cloud_sync(clip, labels)
         clips.append(
@@ -231,16 +236,18 @@ def cloud_sync_status(env: OpEnv, params: CloudSyncParams) -> CloudSyncResult:
                 cloud_sync_raw=data["cloud_sync_raw"],
                 proxy=data["proxy"],
                 has_proxy=data["has_proxy"],
+                proxy_offline=data["proxy_offline"],
                 online_status=data["online_status"],
                 original_offline=data["original_offline"],
                 proxy_only=data["proxy_only"],
+                fully_offline=data["fully_offline"],
             )
         )
         status_counts[data["cloud_sync"]] = status_counts.get(data["cloud_sync"], 0) + 1
         if data["proxy_only"]:
             proxy_only += 1
-        elif data["original_offline"]:
-            offline_no_proxy += 1
+        if data["fully_offline"]:
+            fully_offline += 1
     reached = params.cursor + len(window)
     next_cursor = reached if reached < total else None
     notes: list[Note] = []
@@ -249,16 +256,16 @@ def cloud_sync_status(env: OpEnv, params: CloudSyncParams) -> CloudSyncResult:
             Note(
                 code="proxy_only",
                 message=f"{proxy_only} clip(s) on this page are proxy-only (original offline, a "
-                "proxy is present); a build from them loses audio",
+                "playable proxy present); a build from them loses audio",
                 trap_id="cloud-proxy-only-no-audio",
             )
         )
-    if offline_no_proxy:
+    if fully_offline:
         notes.append(
             Note(
-                code="media_offline",
-                message=f"{offline_no_proxy} clip(s) on this page are offline with no proxy; a "
-                "render will fail on them",
+                code="fully_offline",
+                message=f"{fully_offline} clip(s) on this page have no playable media (original "
+                "offline, no usable proxy); a render would produce nothing",
                 trap_id="render-uses-original-media",
             )
         )
@@ -273,7 +280,7 @@ def cloud_sync_status(env: OpEnv, params: CloudSyncParams) -> CloudSyncResult:
         clips=clips,
         status_counts=status_counts,
         proxy_only=proxy_only,
-        offline_no_proxy=offline_no_proxy,
+        fully_offline=fully_offline,
         notes=notes,
     )
 
