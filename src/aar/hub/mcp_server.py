@@ -22,6 +22,8 @@ from mcp_types import ToolAnnotations
 
 from aar.hub import approvals, control, reviews
 from aar.hub.artifacts import ArtifactStore
+from aar.hub.collab import branches as collab_branches
+from aar.hub.collab import project_board as collab_project_board
 from aar.hub.common import Clock, skipped_summary, utcnow
 from aar.hub.events import Event, EventLog
 from aar.hub.graph import WorkGraph
@@ -256,6 +258,35 @@ def build_server(
     def lease_board() -> dict[str, Any]:
         board = project_lease_board(log, clock=clock)
         return {**board.to_dict(), "skipped": skipped_summary(board.skipped)}
+
+    @server.tool(
+        name="project_board",
+        description=(
+            "The lease board narrowed to one project: who holds the project and which of "
+            "its timelines, and which humans are active. project_id is the Resolve project's "
+            'unique id (the first part of a lease key). Returns {"project_id": id, "as_of": '
+            'ts, "leases": [...], "presence": [...]}. Instance leases are left out; presence '
+            "is node-level. Use this when a hot op is refused or delayed to see who holds what."
+        ),
+        annotations=_READ_ONLY,
+    )
+    def project_board(project_id: str) -> dict[str, Any]:
+        board = collab_project_board(log, project_id, clock=clock)
+        return {**board.to_dict(), "skipped": skipped_summary(board.skipped)}
+
+    @server.tool(
+        name="agent_branches",
+        description=(
+            "List the agent branch timelines recorded for a project. Each entry has the "
+            "source timeline (id, name), the owning agent_id, the branch timeline (id, name), "
+            "its version, and a handoff note (merging back is a human step: Compare "
+            "Timelines). Omit project_id for every project."
+        ),
+        annotations=_READ_ONLY,
+    )
+    def agent_branches(project_id: str | None = None) -> dict[str, Any]:
+        found = collab_branches(log, project_id)
+        return {"branches": [branch.to_dict() for branch in found]}
 
     @server.tool(
         name="approvals_list",

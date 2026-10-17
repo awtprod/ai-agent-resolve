@@ -30,6 +30,8 @@ TOOL_NAMES = {
     "review_get",
     "control_status",
     "lease_board",
+    "project_board",
+    "agent_branches",
     "approvals_list",
 }
 
