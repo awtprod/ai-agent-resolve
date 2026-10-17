@@ -8,6 +8,7 @@ import os
 import sys
 from typing import TextIO
 
+from aar.drp import diff_cli
 from aar.drp.describe import DEFAULT_MAX_ITEMS, describe, printable
 from aar.drp.errors import DrpError
 from aar.drp.model import DrpFile
@@ -68,6 +69,8 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         help=f"media clips and items per track to list (default {DEFAULT_MAX_ITEMS}, 0 = all)",
     )
     desc.set_defaults(func=_describe)
+
+    diff_cli.register(sub)
 
 
 def _safe(text: str, stream: TextIO) -> str:

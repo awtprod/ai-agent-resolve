@@ -69,7 +69,7 @@ Work is either hot or cold:
 ### R1. Read, modify and create `.drp` files
 
 - **Read (S1).** A lossless container reader produces a typed model: project settings, bins, media clips, timelines, tracks, items, and markers where they can be decoded. It keeps the raw text spans so later edits can splice them. It uses a tolerant scanner rather than a stock XML parser, because tags like `ListMgt::LmVersionTable` break those parsers. The version header is exposed. `.drt` is covered fully. `.drb` is best effort because its internals are still unknown.
-- **Diff (S2).** A semantic diff of two files shows what an agent or a human changed between versions.
+- **Diff (S2).** A semantic diff of two files shows what an agent or a human changed between versions. Objects are matched by DbId, and every byte the reader does not decode is compared raw and reported as `opaque-changed`. Its gate mode (`aar drp diff --gate`) is S8's post-write check: it passes only when every change is decoded and DbId-matched. Known limits: inside a blob the reader decodes (`FrameRate`, `Resolution`, `Clip`, ...), a difference only in zstd framing or only in hex letter case is not seen, because those blobs are compared after decoding.
 - **Modify (S8).** Only a whitelist of round-trip-verified edits is allowed:
   - rename
   - relink and path mapping (Windows drive letters to Mac `/Volumes` and back)
