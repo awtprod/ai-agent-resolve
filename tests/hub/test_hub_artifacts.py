@@ -111,3 +111,13 @@ def test_put_repairs_a_corrupt_existing_copy(tmp_path: Path) -> None:
     again = store.put(b"good bytes", actor=ACTOR)
     assert again == artifact_id
     assert store.read_bytes(artifact_id) == b"good bytes"
+
+
+def test_no_create_mode_requires_an_existing_directory(tmp_path: Path) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    with pytest.raises(FileNotFoundError):
+        ArtifactStore(tmp_path / "missing", log, create=False)
+    assert not (tmp_path / "missing").exists()  # a mistyped --artifacts creates nothing
+
+    (tmp_path / "present").mkdir()
+    ArtifactStore(tmp_path / "present", log, create=False)  # an existing dir is fine

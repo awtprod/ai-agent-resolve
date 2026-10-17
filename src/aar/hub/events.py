@@ -17,6 +17,7 @@ cannot interleave with another writer.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import sqlite3
 import threading
@@ -28,6 +29,7 @@ from datetime import UTC, datetime
 from os import PathLike
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 ACTOR_KINDS = frozenset({"human", "agent", "node"})
 
@@ -99,23 +101,43 @@ class IdempotencyConflict(ValueError):
     """Raised when an idempotency key is reused for a different event."""
 
 
-def _canonical(payload: dict[str, Any]) -> str:
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+def _canonical(value: Any) -> str:
+    # allow_nan=False: NaN/Infinity cannot round-trip through JSON, so an event that
+    # carried one could never compare equal to its own reload. Reject it at the point
+    # of serialization (append) rather than store a value that breaks idempotency.
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def match_or_conflict(
-    existing: Event, event_type: str, expected: dict[str, Any], compare_keys: Iterable[str]
+    existing: Event,
+    event_type: str,
+    expected: dict[str, Any],
+    compare_keys: Iterable[str],
+    *,
+    project_id: str | None = None,
 ) -> None:
     """Raise :class:`IdempotencyConflict` unless ``existing`` is the same request.
 
     Projections short-circuit an idempotent retry on the key alone, so they must
-    confirm the stored event is the *same* request (same type and the request-defining
-    fields) rather than a different one that happens to reuse the key. Auto-generated
-    ids are left out of ``compare_keys`` by the caller.
+    confirm the stored event is the *same* request before returning the stored entity.
+
+    Fields are compared by canonical JSON, not Python ``==``: ``existing.payload`` has
+    been through JSON (tuples became lists, dict keys became strings) while ``expected``
+    is the live request, so a raw ``==`` both rejects genuine retries (tuple vs list)
+    and accepts distinct requests (``True`` vs ``1``, ``1`` vs ``1.0``). When
+    ``project_id`` is given, the stored event must also belong to it, so a
+    globally-unique key reused in another project's scope is a conflict rather than a
+    ``KeyError`` on the return path. The ``event_type`` check keeps that return path
+    (indexing by the stored ``node_id``/``edge_id``/``project_id``) type-correct.
     """
-    same = existing.type == event_type and all(
-        existing.payload.get(key) == expected.get(key) for key in compare_keys
-    )
+    same = existing.type == event_type
+    if same and project_id is not None:
+        same = existing.project_id == project_id
+    if same:
+        same = all(
+            _canonical(existing.payload.get(key)) == _canonical(expected.get(key))
+            for key in compare_keys
+        )
     if not same:
         raise IdempotencyConflict(
             f"idempotency key {existing.idempotency_key!r} was already used for a different request"
@@ -314,12 +336,8 @@ class EventLog:
     ) -> None:
         self._path = str(db_path)
         self._read_only = read_only
-        # A read-only open must not create a database: fail clearly on a missing path
-        # (e.g. a mistyped --db) instead of leaving a stray 0-byte file.
-        if read_only and self._path != ":memory:" and not Path(self._path).exists():
-            raise FileNotFoundError(f"no event log database at {self._path!r}")
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self._path, check_same_thread=False)
+        self._conn = self._open(read_only)
         self._conn.row_factory = sqlite3.Row
         # Manage transactions explicitly (BEGIN IMMEDIATE) rather than via the
         # sqlite3 module's implicit transaction handling.
@@ -335,6 +353,35 @@ class EventLog:
             self._conn.executescript(_SCHEMA)
         else:
             self._assert_schema()
+
+    def _open(self, read_only: bool) -> sqlite3.Connection:
+        if not read_only:
+            return sqlite3.connect(self._path, check_same_thread=False)
+        if self._path == ":memory:":
+            raise ValueError("a read-only event log needs a file-backed database, not ':memory:'")
+        if "\x00" in self._path:
+            # A NUL is truncated at %00 and would silently open a different file.
+            raise ValueError("event log path must not contain a NUL byte")
+        # mode=rw opens an existing database but never creates one, so a missing or
+        # unopenable path fails atomically here -- no exists()/connect() race and no
+        # stray 0-byte file. The URI is built from the absolute path, bytes-safe:
+        # fsencode handles a non-UTF-8 filename, quote (default safe="/") encodes
+        # '?', '#', '%' and spaces, and the file:// + absolute form stops a leading
+        # '//' from being read as a URI authority. query_only=ON (set by the caller)
+        # enforces read-only; rw (not ro) lets a WAL database with a pending -wal
+        # still create its -shm and be read in any state.
+        uri = "file://" + quote(os.fsencode(os.path.abspath(self._path))) + "?mode=rw"
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+            conn.execute("PRAGMA schema_version")  # force the open to happen now
+        except sqlite3.DatabaseError as exc:
+            if conn is not None:
+                conn.close()
+            if not Path(self._path).exists():
+                raise FileNotFoundError(f"no event log database at {self._path!r}") from exc
+            raise OSError(f"cannot open event log database at {self._path!r}: {exc}") from exc
+        return conn
 
     def _assert_schema(self) -> None:
         rows = self._conn.execute(
@@ -357,19 +404,23 @@ class EventLog:
     def _lookup_idempotent(
         self, idempotency_key: str, event_type: str, project_id: str | None, payload_json: str
     ) -> Event | None:
-        """Return the stored event for a key if it matches; raise on a different payload."""
+        """Return the stored event for a key if it is the same request; raise on a mismatch.
+
+        The stored payload is compared as text -- it is already canonical JSON on disk --
+        and never re-``json.dumps``'d, so a legacy row whose payload contains NaN/inf does
+        not raise a bare ValueError here on a retry of its key.
+        """
         row = self._conn.execute(
             "SELECT * FROM events WHERE idempotency_key = ?", (idempotency_key,)
         ).fetchone()
         if row is None:
             return None
-        event = _row_to_event(row)
         if (
-            event.type == event_type
-            and event.project_id == project_id
-            and _canonical(event.payload) == payload_json
+            row["type"] == event_type
+            and row["project_id"] == project_id
+            and row["payload"] == payload_json
         ):
-            return event
+            return _row_to_event(row)
         raise IdempotencyConflict(
             f"idempotency key {idempotency_key!r} was already used for a different event"
         )
@@ -468,14 +519,16 @@ class EventLog:
                     causation_id,
                 )
             except sqlite3.IntegrityError:
-                # Lost an idempotency-key race against a concurrent writer: the row
-                # we meant to write already exists, so return the winner's event.
+                # Lost an idempotency-key race against a concurrent writer: the row we
+                # meant to write already exists. Run the same match check on the winner
+                # (type, project, payload) so a *different* request raises a conflict
+                # instead of silently receiving someone else's event.
                 if idempotency_key is not None:
-                    row = self._conn.execute(
-                        "SELECT * FROM events WHERE idempotency_key = ?", (idempotency_key,)
-                    ).fetchone()
-                    if row is not None:
-                        return _row_to_event(row)
+                    existing = self._lookup_idempotent(
+                        idempotency_key, event_type, project_id, payload_json
+                    )
+                    if existing is not None:
+                        return existing
                 raise
         return _row_to_event(row)
 

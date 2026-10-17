@@ -10,11 +10,10 @@ from aar.cli import main
 from aar.hub.events import EventLog
 
 
-def _hub_db(tmp_path: Path) -> Path:
-    """Create an initialised (empty) hub database the read-only server can open."""
-    db = tmp_path / "hub.db"
-    EventLog(db).close()
-    return db
+def _hub_paths(tmp_path: Path) -> None:
+    """Create an initialised (empty) hub database and artifact store the server can open."""
+    EventLog(tmp_path / "hub.db").close()
+    (tmp_path / "artifacts").mkdir()
 
 
 def _stub_run(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
@@ -41,7 +40,7 @@ def _serve_args(tmp_path: Path, *extra: str) -> list[str]:
 
 
 def test_serve_accepts_loopback_hosts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _hub_db(tmp_path)
+    _hub_paths(tmp_path)
     calls = _stub_run(monkeypatch)
     for host in ("127.0.0.1", "localhost", "::1"):
         calls.clear()
@@ -53,7 +52,7 @@ def test_serve_accepts_loopback_hosts(tmp_path: Path, monkeypatch: pytest.Monkey
 def test_serve_accepts_non_loopback_with_allow_remote(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _hub_db(tmp_path)
+    _hub_paths(tmp_path)
     calls = _stub_run(monkeypatch)
     assert main(_serve_args(tmp_path, "--host", "0.0.0.0", "--allow-remote")) == 0
     assert calls[-1]["host"] == "0.0.0.0"
@@ -75,12 +74,79 @@ def test_serve_reports_a_missing_database(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     calls = _stub_run(monkeypatch)
-    # No hub.db was created, so the read-only open must fail cleanly.
     code = main(_serve_args(tmp_path, "--host", "127.0.0.1"))
     assert code == 2
-    assert "hub database" in capsys.readouterr().err
+    assert "event log database" in capsys.readouterr().err
     assert calls == []
     assert not (tmp_path / "hub.db").exists()  # nothing was created
+
+
+def test_serve_reports_a_directory_as_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = _stub_run(monkeypatch)
+    (tmp_path / "hub.db").mkdir()  # a directory where a file was expected
+    code = main(_serve_args(tmp_path, "--host", "127.0.0.1"))
+    assert code == 2
+    assert "event log database" in capsys.readouterr().err
+    assert calls == []
+
+
+def test_serve_reports_a_non_sqlite_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = _stub_run(monkeypatch)
+    (tmp_path / "hub.db").write_text("this is not a sqlite database")
+    code = main(_serve_args(tmp_path, "--host", "127.0.0.1"))
+    assert code == 2
+    assert "event log database" in capsys.readouterr().err
+    assert calls == []
+
+
+def test_serve_reports_a_memory_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "artifacts").mkdir()
+    calls = _stub_run(monkeypatch)
+    code = main(
+        [
+            "hub",
+            "serve",
+            "--db",
+            ":memory:",
+            "--artifacts",
+            str(tmp_path / "artifacts"),
+            "--host",
+            "127.0.0.1",
+        ]
+    )
+    assert code == 2
+    assert ":memory:" in capsys.readouterr().err
+    assert calls == []
+
+
+def test_serve_reports_a_schemaless_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "hub.db").touch()  # a 0-byte file is a valid but schema-less sqlite db
+    (tmp_path / "artifacts").mkdir()
+    calls = _stub_run(monkeypatch)
+    code = main(_serve_args(tmp_path, "--host", "127.0.0.1"))
+    assert code == 2
+    assert "event log" in capsys.readouterr().err
+    assert calls == []
+
+
+def test_serve_reports_a_missing_artifacts_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    EventLog(tmp_path / "hub.db").close()  # valid db, but no artifacts dir
+    calls = _stub_run(monkeypatch)
+    code = main(_serve_args(tmp_path, "--host", "127.0.0.1"))
+    assert code == 2
+    assert "artifact store" in capsys.readouterr().err
+    assert calls == []
+    assert not (tmp_path / "artifacts").exists()  # not created by the failed open
 
 
 def test_hub_requires_a_subcommand(capsys: pytest.CaptureFixture[str]) -> None:

@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import multiprocessing
+import os
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-from aar.hub.events import Actor, EventLog, IdempotencyConflict, new_event_id
+from aar.hub.events import (
+    Actor,
+    EventLog,
+    IdempotencyConflict,
+    match_or_conflict,
+    new_event_id,
+)
 
 
 def _log(tmp_path: Path) -> EventLog:
@@ -111,18 +119,43 @@ def test_same_key_dedupes_but_different_payload_conflicts(tmp_path: Path) -> Non
     assert log.latest_seq() == 1
 
 
-def test_append_recovers_from_idempotency_key_race(tmp_path: Path, monkeypatch) -> None:
+def _miss_precheck_once(log: EventLog, monkeypatch) -> None:
+    """Make the pre-check miss once (a simulated lost race) but keep the recovery real."""
+    real = log._lookup_idempotent
+    state = {"missed": False}
+
+    def wrapper(key, event_type, project_id, payload_json):
+        if not state["missed"]:
+            state["missed"] = True
+            return None  # pre-check misses: the INSERT runs and trips the UNIQUE key
+        return real(key, event_type, project_id, payload_json)
+
+    monkeypatch.setattr(log, "_lookup_idempotent", wrapper)
+
+
+def test_append_recovery_branch_returns_the_winner_on_a_match(tmp_path: Path, monkeypatch) -> None:
     log = _log(tmp_path)
     actor = Actor("agent", "a1")
     first = log.append("note", actor, {"n": 1}, idempotency_key="k")
 
-    # Simulate losing the pre-check race: pretend the key is absent so the INSERT runs
-    # and trips the UNIQUE constraint, exercising the recovery branch.
-    monkeypatch.setattr(log, "_lookup_idempotent", lambda *a, **k: None)
-    recovered = log.append("note", actor, {"n": 1}, idempotency_key="k")
+    _miss_precheck_once(log, monkeypatch)
+    recovered = log.append("note", actor, {"n": 1}, idempotency_key="k")  # same request
 
     assert recovered.seq == first.seq
     assert recovered.id == first.id
+    assert log.latest_seq() == 1
+
+
+def test_append_recovery_branch_conflicts_on_a_mismatch(tmp_path: Path, monkeypatch) -> None:
+    log = _log(tmp_path)
+    actor = Actor("agent", "a1")
+    log.append("note", actor, {"n": 1}, idempotency_key="k")
+
+    _miss_precheck_once(log, monkeypatch)
+    # Different payload under the same key: the recovery branch must re-check and raise,
+    # not hand back the winner's event.
+    with pytest.raises(IdempotencyConflict):
+        log.append("note", actor, {"n": 2}, idempotency_key="k")
     assert log.latest_seq() == 1
 
 
@@ -217,3 +250,178 @@ def test_transaction_cannot_be_used_after_its_block(tmp_path: Path) -> None:
         stale.append("note", Actor("agent", "a1"), {})
     with pytest.raises(RuntimeError):
         stale.read()
+
+
+def _stored(log: EventLog, payload: dict) -> object:
+    """Append a payload then reload it, so it has been through JSON like a real event."""
+    log.append("thing", Actor("agent", "a1"), payload, idempotency_key="K")
+    return log.get_by_idempotency_key("K")
+
+
+@pytest.mark.parametrize(
+    ("stored_payload", "expected_payload"),
+    [
+        ({"v": [1, 2]}, {"v": (1, 2)}),  # a tuple request reloads as a list
+        ({"v": {"1": "a"}}, {"v": {1: "a"}}),  # an int dict key reloads as a string
+    ],
+)
+def test_match_or_conflict_accepts_json_equivalent_retries(
+    tmp_path: Path, stored_payload: dict, expected_payload: dict
+) -> None:
+    existing = _stored(_log(tmp_path), stored_payload)
+    # Same request once JSON-normalised: must be treated as a retry, not a conflict.
+    match_or_conflict(existing, "thing", expected_payload, ["v"])
+
+
+@pytest.mark.parametrize(
+    ("stored_value", "expected_value"),
+    [
+        (True, 1),  # bool vs int
+        (1, True),
+        (False, 0),
+        (1, 1.0),  # int vs float
+    ],
+)
+def test_match_or_conflict_rejects_json_distinct_requests(
+    tmp_path: Path, stored_value: object, expected_value: object
+) -> None:
+    existing = _stored(_log(tmp_path), {"v": stored_value})
+    with pytest.raises(IdempotencyConflict):
+        match_or_conflict(existing, "thing", {"v": expected_value}, ["v"])
+
+
+def test_append_rejects_non_finite_floats(tmp_path: Path) -> None:
+    log = _log(tmp_path)
+    actor = Actor("agent", "a1")
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            log.append("thing", actor, {"v": bad})
+    assert log.latest_seq() == 0  # nothing was written
+
+
+def test_read_only_memory_database_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        EventLog(":memory:", read_only=True)
+
+
+def test_read_only_open_handles_special_characters_in_path(tmp_path: Path) -> None:
+    db = tmp_path / "weird ?#name.db"
+    EventLog(db).append("note", Actor("agent", "a1"), {"k": 1})
+    ro = EventLog(db, read_only=True)
+    assert len(ro.read()) == 1
+
+
+def _race_worker(db_path: str, key: str, index: int, barrier, queue) -> None:
+    """One forked contender: append the same key with a unique payload, report the outcome."""
+    from aar.hub.events import Actor, EventLog, IdempotencyConflict
+
+    log = EventLog(db_path)
+    try:
+        barrier.wait(timeout=20)
+        event = log.append("race", Actor("agent", f"w{index}"), {"n": index}, idempotency_key=key)
+        queue.put(("ok", index, event.payload["n"]))
+    except IdempotencyConflict:
+        queue.put(("conflict", index, None))
+    except Exception as exc:  # report any other failure to the parent
+        queue.put(("error", index, repr(exc)))
+    finally:
+        log.close()
+
+
+def test_append_fork_race_resolves_to_one_winner(tmp_path: Path) -> None:
+    db = tmp_path / "hub.db"
+    EventLog(db).close()  # create the schema before forking
+    n = 6
+    ctx = multiprocessing.get_context("fork")
+    barrier = ctx.Barrier(n)
+    queue: multiprocessing.Queue = ctx.Queue()
+    procs = [
+        ctx.Process(target=_race_worker, args=(str(db), "RACE", i, barrier, queue))
+        for i in range(n)
+    ]
+    for proc in procs:
+        proc.start()
+    results = [queue.get(timeout=30) for _ in range(n)]
+    for proc in procs:
+        proc.join(timeout=30)
+
+    errors = [r for r in results if r[0] == "error"]
+    oks = [r for r in results if r[0] == "ok"]
+    conflicts = [r for r in results if r[0] == "conflict"]
+    assert errors == []
+    assert len(oks) == 1  # exactly one winner, never a non-winner handed someone else's event
+    assert len(conflicts) == n - 1
+
+    stored = EventLog(db, read_only=True).read(types=["race"])
+    assert len(stored) == 1
+    winner_index = oks[0][1]
+    assert oks[0][2] == winner_index == stored[0].payload["n"]
+
+
+def test_append_rejects_cross_project_key_reuse(tmp_path: Path) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    actor = Actor("agent", "a1")
+    log.append("t", actor, {"n": 1}, project_id="prj_A", idempotency_key="K")
+    # Same key, same type, same payload, different project: a conflict, not a silent reuse.
+    with pytest.raises(IdempotencyConflict):
+        log.append("t", actor, {"n": 1}, project_id="prj_B", idempotency_key="K")
+
+
+def test_lookup_tolerates_legacy_non_finite_payload(tmp_path: Path) -> None:
+    db = tmp_path / "hub.db"
+    log = EventLog(db)
+    # A legacy row written before allow_nan=False: insert NaN text directly.
+    raw = sqlite3.connect(db)
+    raw.execute(
+        "INSERT INTO events (id, project_id, type, actor_kind, actor_id, ts, payload, "
+        "idempotency_key) VALUES "
+        "('legacy0000000000000000000', NULL, 'legacy', 'agent', 'a', 'now', '{\"v\":NaN}', 'LK')"
+    )
+    raw.commit()
+    raw.close()
+    # Retrying that key with a finite payload must conflict, not raise a bare ValueError.
+    with pytest.raises(IdempotencyConflict):
+        log.append("legacy", Actor("agent", "a"), {"v": 1}, idempotency_key="LK")
+
+
+def test_read_only_open_of_directory_raises_oserror(tmp_path: Path) -> None:
+    directory = tmp_path / "adir"
+    directory.mkdir()
+    with pytest.raises(OSError) as err:
+        EventLog(directory, read_only=True)
+    # A directory exists, so it is an OSError, not the missing-file FileNotFoundError.
+    assert not isinstance(err.value, FileNotFoundError)
+
+
+def test_read_only_open_of_non_sqlite_file_raises_oserror(tmp_path: Path) -> None:
+    junk = tmp_path / "notadb.txt"
+    junk.write_text("definitely not sqlite")
+    with pytest.raises(OSError) as err:
+        EventLog(junk, read_only=True)
+    assert not isinstance(err.value, FileNotFoundError)
+
+
+def test_read_only_open_rejects_nul_byte_in_path(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        EventLog(f"{tmp_path / 'x.db'}\x00evil", read_only=True)
+
+
+def test_read_only_open_tolerates_non_utf8_path(tmp_path: Path) -> None:
+    weird = os.fsdecode(os.fsencode(tmp_path) + b"/\xff\xfe.db")  # a non-UTF-8 filename
+    # Must reach the missing-file branch, not crash with UnicodeEncodeError in the URI.
+    with pytest.raises(FileNotFoundError):
+        EventLog(weird, read_only=True)
+
+
+def test_read_only_open_handles_leading_double_slash(tmp_path: Path) -> None:
+    db = tmp_path / "x.db"
+    EventLog(db).append("note", Actor("agent", "a1"), {"k": 1})
+    doubled = "/" + str(db)  # e.g. //tmp/.../x.db -- must not parse as a URI authority
+    assert doubled.startswith("//")
+    assert len(EventLog(doubled, read_only=True).read()) == 1
+
+
+def test_read_only_open_handles_percent_in_path(tmp_path: Path) -> None:
+    db = tmp_path / "a%2Fb.db"  # a literal percent must be encoded, not left raw
+    EventLog(db).append("note", Actor("agent", "a1"), {"k": 1})
+    assert len(EventLog(db, read_only=True).read()) == 1

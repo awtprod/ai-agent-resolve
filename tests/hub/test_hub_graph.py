@@ -204,3 +204,119 @@ def test_projection_rebuild_equals_live_state_and_is_project_scoped(tmp_path: Pa
     other = WorkGraph(log, "prj_2")
     assert other.nodes() == []
     assert other.edges() == []
+
+
+# -- cross-project key collisions (a globally-unique key reused in another project) --
+
+
+def test_cross_project_node_key_reuse_conflicts(tmp_path: Path) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    ga = WorkGraph(log, "prj_A")
+    gb = WorkGraph(log, "prj_B")
+    ga.add_node("op", ACTOR, node_id="nd_x", idempotency_key="K")
+    # Identical fields, different project: a conflict, not a KeyError on the return path.
+    with pytest.raises(IdempotencyConflict):
+        gb.add_node("op", ACTOR, node_id="nd_x", idempotency_key="K")
+
+
+def test_cross_project_status_key_reuse_conflicts(tmp_path: Path) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    ga = WorkGraph(log, "prj_A")
+    ga.add_node("op", ACTOR, node_id="nd_s")
+    ga.set_status("nd_s", "active", ACTOR, idempotency_key="SK")
+    gb = WorkGraph(log, "prj_B")
+    gb.add_node("op", ACTOR, node_id="nd_s")  # same id exists in B, so the field compare matches
+    with pytest.raises(IdempotencyConflict):
+        gb.set_status("nd_s", "active", ACTOR, idempotency_key="SK")
+    assert gb.node("nd_s").status == "pending"  # not silently reported as changed
+
+
+def test_cross_project_edge_key_reuse_conflicts(tmp_path: Path) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    ga = WorkGraph(log, "prj_A")
+    ga.add_node("op", ACTOR, node_id="nd_op")
+    ga.add_node("artifact", ACTOR, node_id="nd_art")
+    ga.add_edge("produces", "nd_op", "nd_art", ACTOR, edge_id="edg_1", idempotency_key="EK")
+    gb = WorkGraph(log, "prj_B")
+    gb.add_node("op", ACTOR, node_id="nd_op")
+    gb.add_node("artifact", ACTOR, node_id="nd_art")
+    with pytest.raises(IdempotencyConflict):
+        gb.add_edge("produces", "nd_op", "nd_art", ACTOR, edge_id="edg_1", idempotency_key="EK")
+
+
+# -- each compared field is pinned: changing only it, under the same key, conflicts --
+
+
+@pytest.mark.parametrize(
+    ("kind", "override"),
+    [
+        ("plan", {}),  # kind
+        ("op", {"status": "active"}),
+        ("op", {"title": "other"}),
+        ("op", {"data": {"a": 2}}),
+        ("op", {"node_id": "nd_other"}),
+    ],
+)
+def test_add_node_conflicts_when_any_compared_field_changes(
+    tmp_path: Path, kind: str, override: dict
+) -> None:
+    _, graph = _graph(tmp_path)
+    base = {"title": "t", "status": "pending", "data": {"a": 1}, "node_id": "nd_base"}
+    graph.add_node("op", ACTOR, idempotency_key="K", **base)
+    with pytest.raises(IdempotencyConflict):
+        graph.add_node(kind, ACTOR, idempotency_key="K", **{**base, **override})
+
+
+@pytest.mark.parametrize("change", ["node_id", "to"])
+def test_set_status_conflicts_when_any_compared_field_changes(tmp_path: Path, change: str) -> None:
+    _, graph = _graph(tmp_path)
+    graph.add_node("op", ACTOR, node_id="nd_1")
+    graph.add_node("op", ACTOR, node_id="nd_2")
+    graph.set_status("nd_1", "active", ACTOR, idempotency_key="S")
+    if change == "node_id":
+        with pytest.raises(IdempotencyConflict):
+            graph.set_status("nd_2", "active", ACTOR, idempotency_key="S")
+    else:
+        with pytest.raises(IdempotencyConflict):
+            graph.set_status("nd_1", "blocked", ACTOR, idempotency_key="S")
+
+
+@pytest.mark.parametrize(
+    ("edge_type", "override"),
+    [
+        ("derives_from", {}),  # type
+        ("produces", {"src": "nd_op2"}),
+        ("produces", {"dst": "nd_art2"}),
+        ("produces", {"data": {"x": 2}}),
+        ("produces", {"edge_id": "edg_other"}),
+    ],
+)
+def test_add_edge_conflicts_when_any_compared_field_changes(
+    tmp_path: Path, edge_type: str, override: dict
+) -> None:
+    _, graph = _graph(tmp_path)
+    for nid in ("nd_op", "nd_op2"):
+        graph.add_node("op", ACTOR, node_id=nid)
+    for nid in ("nd_art", "nd_art2"):
+        graph.add_node("artifact", ACTOR, node_id=nid)
+    base = {"src": "nd_op", "dst": "nd_art", "data": {"x": 1}, "edge_id": "edg_base"}
+    graph.add_edge(
+        "produces",
+        base["src"],
+        base["dst"],
+        ACTOR,
+        data=base["data"],
+        edge_id=base["edge_id"],
+        idempotency_key="E",
+    )
+    merged = {**base, **override}
+    with pytest.raises(IdempotencyConflict):
+        graph.add_edge(
+            edge_type,
+            merged["src"],
+            merged["dst"],
+            ACTOR,
+            data=merged["data"],
+            edge_id=merged["edge_id"],
+            idempotency_key="E",
+        )

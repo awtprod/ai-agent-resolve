@@ -8,6 +8,7 @@ actually started, so the core CLI keeps working without the optional ``hub`` ext
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 
 _LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -50,15 +51,22 @@ def _serve(args: argparse.Namespace) -> int:
     from aar.hub.mcp_server import build_server
     from aar.hub.registry import Registry
 
-    # The read surface never writes, so open the log read-only (the DB must already
-    # exist; writers create it). This is defence in depth on top of the no-auth guard.
+    # The read surface never writes, so open the log read-only and the artifact store
+    # without creating anything (both must already exist; writers create them). A bad
+    # --db or --artifacts is reported and exits 2 rather than raising a traceback or
+    # leaving a stray empty file/directory behind.
     try:
         log = EventLog(args.db, read_only=True)
-    except (FileNotFoundError, RuntimeError, OSError) as exc:
-        print(f"cannot open hub database {args.db!r}: {exc}", file=sys.stderr)
+    except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+        # The exception message already names the path and the reason; don't re-prefix.
+        print(f"aar hub serve: {exc}", file=sys.stderr)
+        return 2
+    try:
+        artifacts = ArtifactStore(args.artifacts, log, create=False)
+    except OSError as exc:
+        print(f"aar hub serve: {exc}", file=sys.stderr)
         return 2
     registry = Registry(log)
-    artifacts = ArtifactStore(args.artifacts, log)
     server = build_server(log, registry, artifacts)
     server.run(transport="streamable-http", host=args.host, port=args.port)
     return 0
