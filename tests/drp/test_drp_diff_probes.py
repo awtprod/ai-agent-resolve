@@ -13,6 +13,7 @@ import zipfile
 from collections.abc import Callable
 from pathlib import Path
 
+import pytest
 from diff_testing import (
     CLIP,
     H264,
@@ -465,3 +466,217 @@ def test_json_has_a_schema_version() -> None:
     data = diff(H264, H264).to_dict()
     assert data["schema_version"] == 2
     assert data["gate"] == {"passed": True, "reasons": [], "requested": False}
+
+
+# --------------------------------------------------------------------------- round 3
+
+
+R19_SEQ = "SeqContainer/277c0f51-503d-4bf4-9ad7-2e96c74447c6.xml"
+UNIT_ROOTS = [
+    (
+        "h264-container",
+        H264,
+        SEQ_MEMBER,
+        "Sm2SequenceContainer",
+        "106d9f2b-2951-4ab9-b961-0aa934df20e9",
+    ),
+    ("h264-timeline-clip", H264, POOL, "Sm2MpTimelineClip", "6d692bf3-f02a-4943-ac2f-74d3f0b9fe1f"),
+    ("r19-container", R19, R19_SEQ, "Sm2SequenceContainer", "277c0f51-503d-4bf4-9ad7-2e96c74447c6"),
+    (
+        "r19-timeline-clip",
+        R19,
+        R19_POOL,
+        "Sm2MpTimelineClip",
+        "7d029318-2b54-4cac-bc7d-2b439dd74a99",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("src", "member", "tag", "dbid"), [r[1:] for r in UNIT_ROOTS], ids=[r[0] for r in UNIT_ROOTS]
+)
+def test_h3_a_unit_root_dbid_flip_is_never_identical(
+    src: Path, member: str, tag: str, dbid: str, tmp_path: Path
+) -> None:
+    start_tag = f'<{tag} DbId="{dbid}">'.encode()
+    for i, ch in enumerate(dbid):
+        if ch == "-":
+            continue
+        flipped = dbid[:i] + ("1" if ch == "0" else "0") + dbid[i + 1 :]
+        b = edited(
+            tmp_path,
+            f"b{i}.drp",
+            {member: once(start_tag, start_tag.replace(dbid.encode(), flipped.encode()))},
+            src=src,
+        )
+        d = diff(src, b, gate=True)
+        assert not d.identical and not d.gate.passed, (i, d.to_text())
+        assert any(
+            c.kind == "opaque-changed" and "attribute(s) DbId changed" in c.detail
+            for c in d.changes
+        ), i
+
+
+def test_h1_prolog_bytes_and_header_comment_attributes(tmp_path: Path) -> None:
+    probes = {
+        "encoding": once(b'encoding="UTF-8"', b'encoding="UTF-9"'),
+        "whitespace": once(b"?>\n<!--", b"?>\r\n<!--"),
+        "comment attribute": once(b'DbPrjVer="17"-->', b'DbPrjVer="17" Extra="1"-->'),
+        "after the root": lambda d: d + b"\n",
+    }
+    for name, edit in probes.items():
+        b = edited(tmp_path, f"{name}.drp", {SEQ_MEMBER: edit})
+        d = assert_mirrors(H264, b)
+        assert [(c.kind, c.field_name) for c in d.changes] == [("opaque-changed", SEQ_MEMBER)], name
+        assert not diff(H264, b, gate=True).gate.passed, name
+
+
+def test_h1_a_version_stamp_change_stays_a_header_change(tmp_path: Path) -> None:
+    stamp = (b'DbAppVer="21.0.0.0048"', b'DbAppVer="21.0.0.0049"')
+    with zipfile.ZipFile(H264) as z:
+        xml = [n for n in z.namelist() if n.endswith(".xml")]
+    b = edited(tmp_path, "b.drp", {n: once(*stamp) for n in xml})
+    d = assert_mirrors(H264, b)
+    # Gallery.xml is not interpreted, so its bytes are compared whole.
+    assert sorted((c.section, c.field_name) for c in d.changes) == [
+        ("header", "DbAppVer"),
+        ("opaque", "Gallery.xml"),
+    ]
+
+
+def test_tag_or_wrapper_change_under_the_same_parent_is_not_a_move(tmp_path: Path) -> None:
+    a = edited(tmp_path, "a.drp", {"project.xml": lockable_set("MI")})
+
+    def retag(data: bytes) -> bytes:
+        data = lockable_set("MI")(data)
+        start, end = element_span(data, ITEM_BLOB)
+        piece = data[start:end].replace(b"Sm2MpItemLockableBlob", b"Sm2MpOtherLockableBlob")
+        return data[:start] + piece + data[end:]
+
+    for name, edit in (("retag", retag), ("unwrap", lockable_set("Mi"))):
+        b = edited(tmp_path, f"{name}.drp", {"project.xml": edit})
+        d = assert_mirrors(a, b)
+        assert sorted(c.kind for c in d.changes) == ["opaque-added", "opaque-removed"], name
+        assert not any("; moved:" in c.detail for c in d.changes), name
+
+
+# Pins for the review's surviving mutants.
+
+
+def test_m29_an_added_unit_whose_wrapper_holds_more(tmp_path: Path) -> None:
+    def run(data: bytes) -> bytes:
+        start, end = element_span(data, V1_ITEM)
+        copy = (
+            data[start:end]
+            .replace(V1_ITEM.encode(), NEW_ITEM.encode())
+            .replace(b"<Start>86400<", b"<Start>90064<")
+            .replace(b"<Element>", b'<Element x="1">', 1)
+        )
+        return data[:end] + b"\n     " + copy + data[end:]
+
+    d = assert_mirrors(H264, edited(tmp_path, "b.drp", {SEQ_MEMBER: run}))
+    found = sorted((c.section, c.kind, c.object_id) for c in d.changes)
+    assert found[0][:2] == ("opaque", "opaque-added") and found[1] == (
+        "timelines",
+        "added",
+        NEW_ITEM,
+    )
+    assert len(found) == 2
+    assert "the <Element> wrapper holds more than the object" in next(
+        c.detail for c in d.changes if c.section == "opaque"
+    )
+
+
+def test_n20_unit_order_counts_outside_the_semantic_vectors(tmp_path: Path) -> None:
+    # (a) next to a non-unit sibling inside Items, a unit keeps its place
+    extra = b"<Extra/>\n     "
+    v1_wrapper = f'<Element>\n      <Sm2TiVideoClip DbId="{V1_ITEM}"'.encode()
+
+    def extra_last(data: bytes) -> bytes:
+        end = element_span(data, V1_ITEM)[1]
+        return data[:end] + b"\n     <Extra/>" + data[end:]
+
+    a = edited(tmp_path, "a.drp", {SEQ_MEMBER: extra_last})
+    b = edited(tmp_path, "b.drp", {SEQ_MEMBER: once(v1_wrapper, extra + v1_wrapper)})
+    c = only_change(a, b)
+    assert "order of child elements changed" in c.detail and c.field_name.endswith("Items")
+    # (b) two units (marker blobs) under a parent that is neither a set nor a semantic vector
+    timeline_blob = carrier(
+        MARKER_BLOB_ID, SEQUENCE, markers_fields_blob(marker_entry(48, 32, "T"))
+    )
+    item_blob_ = carrier(
+        "0c0c0c0c-1111-2222-3333-444444444444",
+        V1_ITEM,
+        markers_fields_blob(marker_entry(3, 2, "I")),
+        tag="Sm2TiItemLockableBlob",
+    )
+
+    def two_units(first: bytes, second: bytes) -> Callable[[bytes], bytes]:
+        moved = b"</LocableBlobSet>\n   " + first.strip() + b"\n   " + second.strip()
+        return once(b"</LocableBlobSet>", moved)
+
+    x = edited(tmp_path, "x.drp", {"project.xml": two_units(timeline_blob, item_blob_)})
+    y = edited(tmp_path, "y.drp", {"project.xml": two_units(item_blob_, timeline_blob)})
+    c = only_change(x, y)
+    assert "order of child elements changed" in c.detail
+    assert c.field_name.endswith("Sm2LockableBlobMap")
+
+
+def test_n21_dbid_element_order_counts_outside_a_set(tmp_path: Path) -> None:
+    def outside(order: str) -> Callable[[bytes], bytes]:
+        def run(data: bytes) -> bytes:
+            data = lockable_set("")(data)
+            with zipfile.ZipFile(H264) as z:
+                project = z.read("project.xml")
+            start, end = element_span(project, MEDIA_BLOB)
+            parts = {"M": project[start:end], "I": item_blob(project[start:end])}
+            body = b"\n   ".join(parts[k] for k in order)
+            return data.replace(b"</LocableBlobSet>", b"</LocableBlobSet>\n   " + body, 1)
+
+        return run
+
+    a = edited(tmp_path, "a.drp", {"project.xml": outside("MI")})
+    b = edited(tmp_path, "b.drp", {"project.xml": outside("IM")})
+    c = only_change(a, b)
+    assert "order of child elements changed" in c.detail
+    assert c.field_name.endswith("Sm2LockableBlobMap")
+
+
+def test_s03_units_inside_a_set_are_unordered(tmp_path: Path) -> None:
+    timeline_blob = carrier(
+        MARKER_BLOB_ID, SEQUENCE, markers_fields_blob(marker_entry(48, 32, "T"))
+    )
+    item_blob_ = carrier(
+        "0c0c0c0c-1111-2222-3333-444444444444",
+        V1_ITEM,
+        markers_fields_blob(marker_entry(3, 2, "I")),
+        tag="Sm2TiItemLockableBlob",
+    )
+    a = edited(tmp_path, "a.drp", {"project.xml": add_carrier(timeline_blob + item_blob_)})
+    b = edited(tmp_path, "b.drp", {"project.xml": add_carrier(item_blob_ + timeline_blob)})
+    d = diff(a, b, gate=True)
+    assert d.changes == [] and d.gate.passed, d.to_text()
+
+
+def test_s08_a_set_dbid_key_includes_the_tag(tmp_path: Path) -> None:
+    a = edited(tmp_path, "a.drp", {"project.xml": lockable_set("mi")})
+
+    def retag(data: bytes) -> bytes:
+        data = lockable_set("mi")(data)
+        return data.replace(b"<Sm2MpItemLockableBlob", b"<Sm2MpOtherLockableBlob").replace(
+            b"</Sm2MpItemLockableBlob>", b"</Sm2MpOtherLockableBlob>"
+        )
+
+    d = assert_mirrors(a, edited(tmp_path, "b.drp", {"project.xml": retag}))
+    assert sorted((c.kind, c.field_name.rsplit("/", 1)[-1][:22]) for c in d.changes) == [
+        ("opaque-added", "Sm2MpOtherLockableBlob"),
+        ("opaque-removed", "Sm2MpItemLockableBlob["),
+    ]
+
+
+def test_s09_two_copies_against_one_is_reported(tmp_path: Path) -> None:
+    a = edited(tmp_path, "a.drp", {"project.xml": lockable_set("MM")})
+    b = edited(tmp_path, "b.drp", {"project.xml": lockable_set("M")})
+    d = assert_mirrors(a, b)
+    assert [c.kind for c in d.changes] == ["opaque-removed"]
+    assert not diff(a, b, gate=True).gate.passed

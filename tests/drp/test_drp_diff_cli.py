@@ -144,3 +144,64 @@ def test_an_internal_error_exits_2(
     code, out, err = run(capsys, str(H264), str(H264))
     assert code == 2 and out == ""
     assert "internal error: RuntimeError: synthetic failure" in err
+
+
+@pytest.mark.skipif(not Path("/dev/full").exists(), reason="needs /dev/full (Linux)")
+@pytest.mark.parametrize("json_flag", [[], ["--json"]])
+def test_full_disk_exits_74_with_one_line(json_flag: list[str]) -> None:
+    with open("/dev/full", "wb") as full:
+        proc = run_process(*json_flag, str(R19), str(H264), stdout=full.fileno())
+    assert proc.returncode == 74
+    lines = proc.stderr.decode().splitlines()
+    assert lines == ["aar drp diff: cannot write output: [Errno 28] No space left on device"]
+
+
+def test_closed_stdout_exits_74_without_traceback() -> None:
+    proc = subprocess.run(
+        [sys.executable, "-c", CLI, "drp", "diff", str(R19), str(H264)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        preexec_fn=lambda: os.close(1),
+        check=False,
+    )
+    assert proc.returncode == 74
+    assert proc.stderr.decode().splitlines() == ["aar drp diff: stdout is closed; nothing written"]
+
+
+def test_stdout_is_silenced_after_a_broken_pipe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After EPIPE, stdout's descriptor points at /dev/null, so a final flush cannot fail."""
+    from aar.drp import diff_cli
+
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+
+    class Broken:
+        encoding = "utf-8"
+
+        def write(self, text: str) -> int:
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def flush(self) -> None:
+            return None
+
+        def fileno(self) -> int:
+            return write_end
+
+    monkeypatch.setattr(sys, "stdout", Broken())
+    try:
+        assert diff_cli._emit("text") == 141
+        assert os.write(write_end, b"late output") == len(b"late output")  # no EPIPE any more
+    finally:
+        os.close(write_end)
+
+
+@pytest.mark.parametrize("encoding", ["ascii", "cp1252", "utf-8"])
+def test_json_is_valid_and_unchanged_in_any_output_encoding(encoding: str) -> None:
+    reference = run_process("--json", str(R19), str(H264), env={"PYTHONIOENCODING": "utf-8"})
+    proc = run_process("--json", str(R19), str(H264), env={"PYTHONIOENCODING": encoding})
+    assert proc.returncode == 1 and proc.stderr == b""
+    assert proc.stdout.isascii()
+    data = json.loads(proc.stdout.decode("ascii"))
+    assert data == json.loads(reference.stdout.decode("utf-8"))
+    header = [c["text"] for c in data["changes"] if c["field"] == "DbAppVer"]
+    assert header == ["Header: DbAppVer 19.1.3.0007 → 21.0.0.0048"]  # the arrow survives

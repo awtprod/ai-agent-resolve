@@ -28,9 +28,17 @@ bin contents reordered, track labels). An element with a DbId that leaves one pa
 another is reported on both sides as moved. Not compared, by design: whitespace between
 elements and the zip container's own metadata.
 
-Known limit: a blob is compared on its decoded content where the reader decodes it, so two
-zstd frames that differ only in framing (for example the last-block bit) but decompress to the
-same bytes are reported as equal.
+The prolog (``<?xml ...?>`` and the header comment) and anything after the root are compared
+as raw bytes; only the values of ``DbAppVer``/``DbPrjVer`` are left to the header comparison.
+A unit root's ``DbId`` is compared like any attribute, except where the semantic layer reports
+it itself (the project's DbId).
+
+Known limits: a blob is compared on its decoded content where the reader decodes it, so
+(1) two zstd frames that differ only in framing (for example the last-block bit) but
+decompress to the same bytes, and (2) hex text that differs only in letter case inside a blob
+the reader decodes (``FrameRate``, ``Resolution``, ``MediaExtents``, ``Time``, ``Geometry``,
+``Clip``, marker and settings blobs) are reported as equal. Blobs that are not decoded are
+compared as text, so letter case counts there.
 """
 
 from __future__ import annotations
@@ -63,6 +71,7 @@ _INDEXED = re.compile(r"^(\w+)\[(\d+)\]$")
 _FRAME_FIELDS = frozenset({"record_start", "duration", "source_in"})
 _FRAME_RATE_HINT = re.compile(r"\d+(\.\d+)?")
 _PATH_SEP = re.compile(r"[\\/]")
+_STAMP_VALUES = re.compile(rb'(\b(?:DbAppVer|DbPrjVer)\s*=\s*")[^"]*(")()')
 
 
 def member_root(member: str) -> Provenance:
@@ -98,6 +107,10 @@ class Unit:
     b: Provenance | None
     obj_a: Any = None
     obj_b: Any = None
+    # The root DbId on each side that the semantic layer reports itself (the project's); a
+    # root DbId is skipped only when it equals this, otherwise it is compared like any attribute.
+    dbid_a: str | None = None
+    dbid_b: str | None = None
 
 
 @dataclass(slots=True)
@@ -209,7 +222,10 @@ class OpaqueEngine:
         self.skip: set[int] = set()
         self._same: dict[str, bool] = {}
         # DbId -> indexes in ``out`` of elements with that DbId present under one parent only
-        self._lone_dbids: dict[str, dict[str, list[int]]] = {"a": {}, "b": {}}
+        self._lone_dbids: dict[str, dict[str, list[tuple[int, tuple[int, int]]]]] = {
+            "a": {},
+            "b": {},
+        }
 
     # ------------------------------------------------------------------ setup
 
@@ -234,10 +250,16 @@ class OpaqueEngine:
         return self.out
 
     def _mark_moves(self) -> None:
-        """An element with a DbId that is gone from one parent and new under another moved."""
+        """An element with a DbId that is gone from one parent and new under another moved.
+
+        Under the same parent (only its tag or its wrapper changed) it did not move.
+        """
         for dbid in sorted(set(self._lone_dbids["a"]) & set(self._lone_dbids["b"])):
-            for side in ("a", "b"):
-                for i in self._lone_dbids[side][dbid]:
+            for side, other in (("a", "b"), ("b", "a")):
+                parents = {p for _, p in self._lone_dbids[other][dbid]}
+                for i, parent in self._lone_dbids[side][dbid]:
+                    if parents <= {parent}:
+                        continue
                     c = self.out[i]
                     self.out[i] = dataclasses.replace(
                         c,
@@ -520,7 +542,7 @@ class OpaqueEngine:
                 count, _ = _diff_size(da.data, db.data)
                 self._member_change(name, "has no root element on one side; bytes differ", count)
             return
-        tail_a, tail_b = da.data[ra.end :].strip(), db.data[rb.end :].strip()
+        tail_a, tail_b = da.data[ra.end :], db.data[rb.end :]
         if tail_a != tail_b:
             count, _ = _diff_size(tail_a, tail_b)
             self._member_change(name, "content after the root element changed", count)
@@ -536,21 +558,31 @@ class OpaqueEngine:
             self._lone(rb, name, "b", unit, (rb.tag,))
 
     def _prolog(self, name: str, da: Document, db: Document) -> None:
+        """The prolog and header comment, as raw bytes; only the stamp values are left out.
+
+        The ``DbAppVer``/``DbPrjVer`` values are compared as version stamps below (and by the
+        header section); every other byte before the root, whitespace included, must match.
+        """
         stamps = []
-        cleaned = []
+        heads = []
+        masked = []
         for doc in (da, db):
             end = doc.root.start if doc.root is not None else len(doc.data)
             head = doc.data[:end]
+            heads.append(head)
             v = parse_version_header(head, name)
             if v is not None:
-                head = head[: v.offset] + head[v.end :]
+                comment = _STAMP_VALUES.sub(rb"\1\2\3", head[v.offset : v.end])
+                masked.append(head[: v.offset] + comment + head[v.end :])
                 stamps.append((v.app_version, v.project_version))
             else:
+                masked.append(head)
                 stamps.append(None)
-            cleaned.append(b"".join(head.split()))
-        if cleaned[0] != cleaned[1]:
-            count, _ = _diff_size(cleaned[0], cleaned[1])
-            self._member_change(name, "XML prolog changed (outside the version stamp)", count)
+        if masked[0] != masked[1]:
+            count, _ = _diff_size(heads[0], heads[1])
+            self._member_change(
+                name, "XML prolog or header comment changed (beyond the version stamp)", count
+            )
         main = []
         for side in ("a", "b"):
             v = self.drp[side].versions
@@ -615,7 +647,7 @@ class OpaqueEngine:
         if ea.tag != eb.tag:
             self._changed(unit, here, ma, ea, mb, eb, f"element <{ea.tag}> became <{eb.tag}>")
             return []
-        self._attrs(unit, here, ma, ea, mb, eb, drop_dbid=root)
+        self._attrs(unit, here, ma, ea, mb, eb, drop=(unit.dbid_a, unit.dbid_b) if root else None)
         if not ea.children and not eb.children:
             self._leaf(ea, ma, eb, mb, unit, here)
             return []
@@ -626,18 +658,19 @@ class OpaqueEngine:
         if seq_a != seq_b:
             self._changed(unit, here, ma, ea, mb, eb, "order of child elements changed")
         pushed = []
+        parent = (id(ea), id(eb))
         for key, ca in ka.items():
             cb = kb.get(key)
             seg = (*path, _segment(key, ca))
             if cb is None:
-                self._lone_child(ca, ma, "a", unit, seg)
+                self._lone_child(ca, ma, "a", unit, seg, parent)
             elif ca.unit is not None:
                 self._unit_child(ca, ma, cb, mb, unit, seg)
             else:
                 pushed.append((ca.el, cb.el, seg, False))
         for key, cb in kb.items():
             if key not in ka:
-                self._lone_child(cb, mb, "b", unit, (*path, _segment(key, cb)))
+                self._lone_child(cb, mb, "b", unit, (*path, _segment(key, cb)), parent)
         return pushed
 
     def _attrs(
@@ -649,12 +682,13 @@ class OpaqueEngine:
         mb: str,
         eb: Element,
         *,
-        drop_dbid: bool,
+        drop: tuple[str | None, str | None] | None,
     ) -> None:
         attrs_a, attrs_b = dict(ea.attrs), dict(eb.attrs)
-        if drop_dbid:  # a unit's identity is its match, reported by the semantic layer
-            attrs_a.pop("DbId", None)
-            attrs_b.pop("DbId", None)
+        if drop is not None:  # the root DbId the semantic layer reports, and nothing else
+            for attrs, expected in ((attrs_a, drop[0]), (attrs_b, drop[1])):
+                if expected is not None and attrs.get("DbId") == expected:
+                    del attrs["DbId"]
         if attrs_a != attrs_b:
             names = sorted(
                 k for k in set(attrs_a) | set(attrs_b) if attrs_a.get(k) != attrs_b.get(k)
@@ -723,20 +757,26 @@ class OpaqueEngine:
         if ca.wrapper != cb.wrapper:
             self._changed(unit, path, ma, ca.el, mb, cb.el, "a model object is wrapped differently")
         elif ca.wrapper:
-            self._attrs(unit, path, ma, ca.el, mb, cb.el, drop_dbid=False)
+            self._attrs(unit, path, ma, ca.el, mb, cb.el, drop=None)
             self._loose(
                 unit, path, ma, ca.el, mb, cb.el, "text inside the <Element> wrapper changed"
             )
 
     def _lone_child(
-        self, child: _Child, member: str, side: str, unit: Unit, path: tuple[str, ...]
+        self,
+        child: _Child,
+        member: str,
+        side: str,
+        unit: Unit,
+        path: tuple[str, ...],
+        parent: tuple[int, int],
     ) -> None:
         if child.unit is None:
             before = len(self.out)
             self._lone(child.el, member, side, unit, path)
             dbid = _dbid_of(child)
             if dbid is not None and len(self.out) > before:
-                self._lone_dbids[side].setdefault(dbid, []).append(before)
+                self._lone_dbids[side].setdefault(dbid, []).append((before, parent))
             return
         u = child.unit
         one_sided = u.a is None or u.b is None

@@ -35,9 +35,12 @@ Gate (S8's post-write check). ``ProjectDiff.gate`` passes only when every change
 (decoded) and matched by DbId (markers: owner DbId plus frame), no DbId or zip member name is
 duplicated, and both files read without warnings. ``diff_projects(..., gate=True)`` also turns
 off the heuristic pairing of markers by name, so a moved marker shows as removed plus added.
-Known limit: blob content is compared after decoding where the reader decodes it, so two zstd
-frames that differ only in framing (for example the last-block bit) but decompress to the same
-bytes pass as equal.
+Known limits: blob content is compared after decoding where the reader decodes it, so (1) two
+zstd frames that differ only in framing (for example the last-block bit) but decompress to the
+same bytes, and (2) hex text that differs only in letter case inside a decoded blob
+(``FrameRate``, ``Resolution``, ``Clip`` and the other blobs listed in
+:mod:`aar.drp.diff_opaque`) pass as equal. Everything else, the XML prolog and header comment
+included, is compared byte for byte.
 """
 
 from __future__ import annotations
@@ -492,7 +495,15 @@ class _Differ:
             obj_b=pb,
         )
         self.units.append(
-            Unit(key, "project", ctx, pa.source if pa else None, pb.source if pb else None)
+            Unit(
+                key,
+                "project",
+                ctx,
+                pa.source if pa else None,
+                pb.source if pb else None,
+                dbid_a=pa.id if pa else None,  # a project DbId change is reported as "id"
+                dbid_b=pb.id if pb else None,
+            )
         )
         if pa is None or pb is None:
             kind = "added" if pa is None else "removed"

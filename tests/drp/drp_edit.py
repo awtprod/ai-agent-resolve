@@ -111,11 +111,12 @@ def reindent(data: bytes) -> bytes:
     """Deepen the indentation between elements; the text of leaves is left untouched.
 
     Whitespace between a start tag and its own end tag (``<Notes>\n</Notes>``) is a leaf's
-    text, so it is kept as it is.
+    text, so it is kept as it is; so is the prolog before the root element.
     """
     out = []
     pos = 0
-    for m in _GAP.finditer(data):
+    root = re.search(rb"<[^?!/]", data)  # the prolog before the root is left byte for byte
+    for m in _GAP.finditer(data, root.start() if root else 0):
         tag = data[data.rfind(b"<", 0, m.start()) : m.start() + 1]
         opens = not tag.startswith((b"</", b"<?", b"<!")) and not tag.endswith(b"/>")
         if opens and data.startswith(b"</", m.end() - 1):
