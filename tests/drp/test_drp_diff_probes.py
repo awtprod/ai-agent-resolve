@@ -261,45 +261,79 @@ def test_order_of_items_in_a_track_is_reported(tmp_path: Path) -> None:
     assert (c.old, c.new) == ([V1_ITEM, NEW_ITEM], [NEW_ITEM, V1_ITEM])
 
 
-def test_order_in_a_set_counts_except_among_dbid_entries_of_one_tag(tmp_path: Path) -> None:
-    note = b"<Note>x</Note>\n    "
-    end_set = b"</Element>\n   </LocableBlobSet>"
-    a = edited(
-        tmp_path,
-        "a.drp",
-        {"project.xml": once(end_set, b"</Element>\n    " + note + b"</LocableBlobSet>")},
+MEDIA_BLOB = "fcf30d1a-d0f2-4670-856a-da986df1912a"
+ITEM_BLOB = "22222222-3333-4444-5555-666666666666"
+
+
+def item_blob(media: bytes) -> bytes:
+    return media.replace(MEDIA_BLOB.encode(), ITEM_BLOB.encode()).replace(
+        b"Sm2MediaPoolLockableBlob", b"Sm2MpItemLockableBlob"
     )
-    b = edited(
-        tmp_path,
-        "b.drp",
-        {"project.xml": once(b"<LocableBlobSet>\n    ", b"<LocableBlobSet>\n    " + note)},
-    )
-    c = only_change(a, b)
-    assert c.kind == "opaque-changed" and "order of child elements changed" in c.detail
 
-    def two_blobs(swapped: bool) -> Callable[[bytes], bytes]:
-        def run(data: bytes) -> bytes:
-            start, end = element_span(data, "fcf30d1a-d0f2-4670-856a-da986df1912a")
-            piece = data[start:end]
-            copy = piece.replace(b"fcf30d1a-d0f2", b"aaaaaaaa-d0f2")
-            first, second = (copy, piece) if swapped else (piece, copy)
-            return data[:start] + first + b"\n    " + second + data[end:]
 
-        return run
+def lockable_set(order: str) -> Callable[[bytes], bytes]:
+    """Rebuild the project's LocableBlobSet from parts in ``order``.
 
-    x = edited(tmp_path, "x.drp", {"project.xml": two_blobs(False)})
-    y = edited(tmp_path, "y.drp", {"project.xml": two_blobs(True)})
-    assert diff(x, y).changes == []  # a set: same entries in another order
+    M = the template's media-pool blob, I = an item lockable blob, C = a marker blob for the
+    timeline (a unit), N = <Note>, O = <Other> (the last two without a DbId); lowercase m, i
+    are M, I without their <Element> wrapper.
+    """
+
+    def run(data: bytes) -> bytes:
+        start, end = element_span(data, MEDIA_BLOB)
+        media = data[start:end]
+        markers = markers_fields_blob(marker_entry(48, 32, "Laugh"))
+        parts = {
+            "M": media,
+            "I": item_blob(media),
+            "C": carrier(MARKER_BLOB_ID, SEQUENCE, markers).strip(),
+            "N": b"<Note>x</Note>",
+            "O": b"<Other>y</Other>",
+        }
+        # m, i: the same two blobs without their <Element> wrapper (DbId on the child itself)
+        parts["m"] = parts["M"].split(b"<Element>", 1)[1].rsplit(b"</Element>", 1)[0].strip()
+        parts["i"] = parts["I"].split(b"<Element>", 1)[1].rsplit(b"</Element>", 1)[0].strip()
+        return data[:start] + b"\n    ".join(parts[k] for k in order) + data[end:]
+
+    return run
+
+
+def test_a_set_with_its_dbid_children_reordered_is_identical(tmp_path: Path) -> None:
+    # What Resolve does on its own round trip: a mixed-tag set rewritten in hash order.
+    a = edited(tmp_path, "a.drp", {"project.xml": lockable_set("MICN")})
+    b = edited(tmp_path, "b.drp", {"project.xml": lockable_set("CNIM")})
+    assert [m.name for m in read_drp(b).timelines[0].markers] == ["Laugh"]
+    d = diff(a, b, gate=True)
+    assert d.changes == [] and d.identical and d.gate.passed, d.to_text()
+    # The same for DbId children written straight into the set, without wrappers.
+    x = edited(tmp_path, "x.drp", {"project.xml": lockable_set("miN")})
+    y = edited(tmp_path, "y.drp", {"project.xml": lockable_set("Nim")})
+    assert diff(x, y, gate=True).changes == []
 
 
 def test_entries_without_dbid_keep_their_order_inside_a_set(tmp_path: Path) -> None:
-    def notes(first: bytes, second: bytes) -> Callable[[bytes], bytes]:
-        return once(b"<LocableBlobSet>\n    ", b"<LocableBlobSet>\n    " + first + second)
-
-    a = edited(tmp_path, "a.drp", {"project.xml": notes(b"<Note>x</Note>", b"<Other>y</Other>")})
-    b = edited(tmp_path, "b.drp", {"project.xml": notes(b"<Other>y</Other>", b"<Note>x</Note>")})
+    a = edited(tmp_path, "a.drp", {"project.xml": lockable_set("NMIO")})
+    b = edited(tmp_path, "b.drp", {"project.xml": lockable_set("OIMN")})
     c = only_change(a, b)
     assert c.kind == "opaque-changed" and "order of child elements changed" in c.detail
+    assert c.field_name is not None and c.field_name.endswith("LocableBlobSet")
+
+
+def test_a_dbid_child_leaving_the_set_is_a_move(tmp_path: Path) -> None:
+    a = edited(tmp_path, "a.drp", {"project.xml": lockable_set("MI")})
+
+    def out_of_set(data: bytes) -> bytes:
+        data = lockable_set("M")(data)
+        start, end = element_span(data, MEDIA_BLOB)
+        moved = b"</LocableBlobSet>\n   " + item_blob(data[start:end])
+        return data.replace(b"</LocableBlobSet>", moved, 1)
+
+    b = edited(tmp_path, "b.drp", {"project.xml": out_of_set})
+    d = assert_mirrors(a, b)
+    assert sorted(c.kind for c in d.changes) == ["opaque-added", "opaque-removed"]
+    tail = "under another parent element on the other side"
+    assert all(c.detail.endswith(tail) for c in d.changes)
+    assert not diff(a, b, gate=True).gate.passed
 
 
 def test_a_unit_under_another_parent_without_a_reported_move(tmp_path: Path) -> None:

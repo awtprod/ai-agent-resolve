@@ -19,11 +19,14 @@ compares everything else, so a difference is never hidden because it is not deco
   blob and the bytes left after removing exactly what the reader decoded are the same on both
   sides. Any other difference is ``opaque-changed`` with member, byte span and byte count.
 
-Order: children are compared in order, except (1) DbId-keyed ``<Element>`` entries of the same
-tag inside a ``...Set`` element (a set), and (2) units inside ``Items``, ``MediaVec`` and
-``...TrackVec``, whose order the semantic layer reports (items and bin contents reordered,
-track labels). Not compared, by design: whitespace between elements and the zip container's
-own metadata.
+Order: children are compared in order, except (1) inside a ``...Set`` element, every child
+that carries a DbId (directly or in its ``<Element>`` wrapper) is matched by DbId and is
+unordered, across tags: Resolve writes such sets in hash order, which differs between its own
+exports. Children without a DbId keep their order relative to each other. (2) Units inside
+``Items``, ``MediaVec`` and ``...TrackVec``, whose order the semantic layer reports (items and
+bin contents reordered, track labels). An element with a DbId that leaves one parent for
+another is reported on both sides as moved. Not compared, by design: whitespace between
+elements and the zip container's own metadata.
 
 Known limit: a blob is compared on its decoded content where the reader decodes it, so two
 zstd frames that differ only in framing (for example the last-block bit) but decompress to the
@@ -32,6 +35,7 @@ same bytes are reported as equal.
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from collections import Counter
 from collections.abc import Callable, Iterator
@@ -204,6 +208,8 @@ class OpaqueEngine:
         self.elements: dict[str, dict[Span, Element]] = {"a": {}, "b": {}}
         self.skip: set[int] = set()
         self._same: dict[str, bool] = {}
+        # DbId -> indexes in ``out`` of elements with that DbId present under one parent only
+        self._lone_dbids: dict[str, dict[str, list[int]]] = {"a": {}, "b": {}}
 
     # ------------------------------------------------------------------ setup
 
@@ -224,7 +230,20 @@ class OpaqueEngine:
                 self._walk_unit(unit)
             elif unit.kind == "markers":
                 self._lone_carrier(unit)
+        self._mark_moves()
         return self.out
+
+    def _mark_moves(self) -> None:
+        """An element with a DbId that is gone from one parent and new under another moved."""
+        for dbid in sorted(set(self._lone_dbids["a"]) & set(self._lone_dbids["b"])):
+            for side in ("a", "b"):
+                for i in self._lone_dbids[side][dbid]:
+                    c = self.out[i]
+                    self.out[i] = dataclasses.replace(
+                        c,
+                        detail=c.detail + "; moved: the same DbId sits under another parent "
+                        "element on the other side",
+                    )
 
     def _carriers(self) -> None:
         """Marker blobs live in ``project.xml``; pair them by the owner they belong to."""
@@ -602,8 +621,8 @@ class OpaqueEngine:
             return []
         self._loose(unit, here, ma, ea, mb, eb, "text outside child elements changed")
         ka, kb = self._keyed(ea, ma, "a"), self._keyed(eb, mb, "b")
-        seq_a = [_order_key(ea.tag, k, c) for k, c in ka.items() if k in kb]
-        seq_b = [_order_key(eb.tag, k, c) for k, c in kb.items() if k in ka]
+        seq_a = [o for k, c in ka.items() if k in kb and (o := _order_key(ea.tag, k, c))]
+        seq_b = [o for k, c in kb.items() if k in ka and (o := _order_key(eb.tag, k, c))]
         if seq_a != seq_b:
             self._changed(unit, here, ma, ea, mb, eb, "order of child elements changed")
         pushed = []
@@ -685,6 +704,9 @@ class OpaqueEngine:
             elif inner is not None and inner.attrs.get("DbId"):
                 key = ("Element", inner.tag, inner.attrs["DbId"])
                 entry = _Child(child, None, False, inner.tag)
+            elif el.tag.endswith("Set") and child.attrs.get("DbId"):
+                key = ("dbid", child.tag, child.attrs["DbId"])
+                entry = _Child(child, None, False, child.tag)
             else:
                 counts[child.tag] += 1
                 key, entry = (child.tag, counts[child.tag]), _Child(child, None, False, child.tag)
@@ -710,7 +732,11 @@ class OpaqueEngine:
         self, child: _Child, member: str, side: str, unit: Unit, path: tuple[str, ...]
     ) -> None:
         if child.unit is None:
+            before = len(self.out)
             self._lone(child.el, member, side, unit, path)
+            dbid = _dbid_of(child)
+            if dbid is not None and len(self.out) > before:
+                self._lone_dbids[side].setdefault(dbid, []).append(before)
             return
         u = child.unit
         one_sided = u.a is None or u.b is None
@@ -910,17 +936,27 @@ def _segment(key: tuple[Any, ...], child: _Child) -> str:
         return f"{child.el.tag}[{child.tag}]" if child.wrapper else child.tag
     if key[0] == "Element" and len(key) >= 3:
         return f"Element[{key[1]} {str(key[2])[:8]}]"
+    if key[0] == "dbid" and len(key) >= 3:
+        return f"{key[1]}[{str(key[2])[:8]}]"
     tag, n = key[0], key[1]
     return str(tag) if n == 1 else f"{tag}[{n}]"
 
 
-def _order_key(parent: str, key: tuple[Any, ...], child: _Child) -> tuple[Any, ...]:
-    """What the order of children is compared on (see the module docstring)."""
+def _order_key(parent: str, key: tuple[Any, ...], child: _Child) -> tuple[Any, ...] | None:
+    """What the order of children is compared on; ``None`` = not part of the order."""
+    if parent.endswith("Set") and key[0] in ("unit", "Element", "dbid"):
+        return None  # a set's DbId children: matched by DbId, unordered across tags
     if key[0] == "unit" and (parent in _SEMANTIC_ORDER or parent.endswith("TrackVec")):
         return ("unit",)
-    if parent.endswith("Set") and key[0] in ("unit", "Element"):
-        return ("dbid", child.tag)
     return key
+
+
+def _dbid_of(child: _Child) -> str | None:
+    if child.el.attrs.get("DbId"):
+        return child.el.attrs["DbId"]
+    if child.el.tag == "Element" and len(child.el.children) == 1:
+        return child.el.children[0].attrs.get("DbId")
+    return None
 
 
 def _loose_text(el: Element, data: bytes) -> bytes:
