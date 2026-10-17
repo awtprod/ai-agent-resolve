@@ -16,6 +16,7 @@ crashed, say). Presence ("a human is active on node X since T") works the same w
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -118,8 +119,14 @@ def _node_id(node_id: Any) -> str:
     return clean_text(node_id, "node_id", max_len=MAX_NODE_ID)
 
 
-def _wall(monotonic: float, wall_offset: float) -> str:
-    return iso(datetime.fromtimestamp(monotonic + wall_offset, UTC))
+def _wall(monotonic: float, wall_offset: float, field: str) -> str:
+    value = monotonic + wall_offset
+    if not math.isfinite(value):
+        raise InvalidInput(field, f"must be a finite time, got {value!r}")
+    try:
+        return iso(datetime.fromtimestamp(value, UTC))
+    except (OverflowError, OSError, ValueError) as exc:
+        raise InvalidInput(field, f"is not a representable time: {value!r}") from exc
 
 
 def _holder(holder: Holder) -> dict[str, str]:
@@ -133,16 +140,20 @@ def lease_event_to_hub(event: LeaseEvent, node_id: str, *, wall_offset: float) -
         raise InvalidInput("kind", f"unknown lease event kind {event.kind!r}")
     node_id = _node_id(node_id)
     lease = event.lease
+    if lease.ttl is not None and not math.isfinite(lease.ttl):
+        raise InvalidInput("ttl", f"must be finite, got {lease.ttl!r}")
     payload = {
         "node_id": node_id,
         "lease_id": lease.id,
         "scope": lease.scope.value,
         "key": list(lease.key),
         "holder": _holder(lease.holder),
-        "acquired_at": _wall(lease.acquired_at, wall_offset),
-        "expires_at": (None if lease.expires_at is None else _wall(lease.expires_at, wall_offset)),
+        "acquired_at": _wall(lease.acquired_at, wall_offset, "acquired_at"),
+        "expires_at": (
+            None if lease.expires_at is None else _wall(lease.expires_at, wall_offset, "expires_at")
+        ),
         "ttl": lease.ttl,
-        "at": _wall(event.at, wall_offset),
+        "at": _wall(event.at, wall_offset, "at"),
         "by": None if event.by is None else _holder(event.by),
     }
     key = f"lease:{node_id}:{lease.id}:{event.kind}:{event.at!r}"

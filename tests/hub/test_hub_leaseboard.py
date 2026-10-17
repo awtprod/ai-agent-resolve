@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -576,3 +577,28 @@ def test_presence_ttl_of_exactly_24_hours_is_accepted(tmp_path: Path) -> None:
     assert [entry.expires_at for entry in board.presence] == [
         (T0 + timedelta(hours=24)).isoformat()
     ]
+
+
+@pytest.mark.parametrize(
+    ("ttl", "offset"),
+    [
+        (math.inf, 0.0),
+        (math.nan, 0.0),
+        (60.0, math.inf),
+        (60.0, math.nan),
+        (60.0, 1e300),
+    ],
+    ids=["inf-ttl", "nan-ttl", "inf-offset", "nan-offset", "unrepresentable-offset"],
+)
+def test_non_finite_lease_times_are_invalid_input_and_never_logged(
+    tmp_path: Path, ttl: float, offset: float
+) -> None:
+    log = _log(tmp_path)
+    manager, _clock, events = _node()
+    manager.acquire(AGENT, Scope.PROJECT, (PROJECT,), ttl=ttl)
+
+    with pytest.raises(InvalidInput):
+        lease_event_to_hub(events[0], "node-1", wall_offset=offset)
+    with pytest.raises(InvalidInput):
+        record_lease_event(log, events[0], "node-1", wall_offset=offset)
+    assert log.latest_seq() == 0

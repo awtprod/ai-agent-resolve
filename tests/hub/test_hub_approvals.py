@@ -85,6 +85,9 @@ def test_grant_validates_scope_ttl_and_text(log: EventLog) -> None:
         _grant(log, clock, ttl=timedelta(hours=25))
     with pytest.raises(InvalidInput):
         _grant(log, clock, ttl=0)
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(InvalidInput):
+            _grant(log, clock, ttl=bad)
     with pytest.raises(InvalidInput):
         _grant(log, clock, reason="")
     with pytest.raises(InvalidInput):

@@ -23,6 +23,19 @@ AGENT = Actor("agent", "agent-1")
 UNSTORED_RENDER = "ab" * 32  # well-formed artifact id with no content behind it
 
 
+@pytest.fixture(autouse=True)
+def _never_serve(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every console call here is an error path: fail fast if one ever starts serving.
+
+    Without this, a regressed guard would bind a real port and hang the suite.
+    """
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise AssertionError("aar hub console started serving on an error path")
+
+    monkeypatch.setattr("uvicorn.run", refuse)
+
+
 @dataclass
 class Hub:
     """A hub with one project, one work-graph node to review and one stored render."""
@@ -554,3 +567,89 @@ def test_console_rejects_a_malformed_operator_before_opening_the_database(
     assert err is not None
     assert err["error"]["code"] == "invalid_input"
     assert list(tmp_path.iterdir()) == []
+
+
+# -- unusable --db and --artifacts paths --------------------------------------------
+
+
+def _unusable_db(tmp_path: Path, kind: str) -> str:
+    """Make a ``--db`` value that is not a hub database, of the given kind."""
+    if kind == "directory":
+        path = tmp_path / "hub.db"
+        path.mkdir()
+        return str(path)
+    if kind == "not-sqlite":
+        path = tmp_path / "hub.db"
+        path.write_text("this is not a sqlite database")
+        return str(path)
+    if kind == "memory":
+        return ":memory:"
+    raise AssertionError(kind)
+
+
+@pytest.mark.parametrize("kind", ["directory", "not-sqlite", "memory"])
+@pytest.mark.parametrize("command", ["request", "note", "list", "show", "console"])
+def test_an_unusable_database_path_is_a_json_error_not_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str, kind: str
+) -> None:
+    db = _unusable_db(tmp_path, kind)
+    before = sorted(p.name for p in tmp_path.iterdir())
+    group = ["hub", "console"] if command == "console" else ["hub", "review", command]
+    argv = (
+        ["--artifacts", str(tmp_path / "artifacts")]
+        if command == "console"
+        else _command_argv(command, tmp_path / "artifacts")
+    )
+
+    code, out, err = _run(capsys, *group, "--db", db, *argv)
+
+    assert code == 2
+    assert out is None
+    assert err is not None
+    assert err["error"]["code"] == "database_unavailable"
+    # Nothing was created beside it: no -wal/-shm and no artifact store directory.
+    assert sorted(p.name for p in tmp_path.iterdir()) == before
+
+
+def test_a_write_command_does_not_switch_a_foreign_sqlite_file_to_wal(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = tmp_path / "other.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE unrelated (x INTEGER)")
+    conn.commit()
+    conn.close()
+    argv = _command_argv("request", tmp_path / "artifacts")
+
+    code, _, err = _run(capsys, "hub", "review", "request", "--db", str(db), *argv)
+
+    assert code == 2
+    assert err is not None and err["error"]["code"] == "database_unavailable"
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("command", ["request", "console"])
+def test_a_missing_artifact_store_is_reported_and_not_created(
+    hub: Hub, tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+) -> None:
+    missing = tmp_path / "no-such-store"
+    if command == "console":
+        argv = ["hub", "console", "--db", str(hub.db), "--artifacts", str(missing)]
+    else:
+        argv = _request_argv(hub)
+        argv[argv.index("--artifacts") + 1] = str(missing)
+    seq = hub.log.latest_seq()
+
+    code, out, err = _run(capsys, *argv)
+
+    assert code == 2
+    assert out is None
+    assert err is not None
+    assert err["error"]["code"] == "artifact_store_unavailable"
+    assert str(missing) in err["error"]["message"]
+    assert not missing.exists()
+    assert hub.log.latest_seq() == seq

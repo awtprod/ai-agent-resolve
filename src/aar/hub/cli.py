@@ -186,16 +186,47 @@ class _DatabaseUnavailable(Exception):
     """The hub database is missing or is not an aar event log."""
 
 
+class _StoreUnavailable(Exception):
+    """The artifact store directory is missing."""
+
+
+# Everything EventLog raises for a path that is not a usable hub database: missing
+# (FileNotFoundError), a directory or a non-SQLite file (OSError, or sqlite3.Error on
+# the write path), ':memory:' (ValueError) and a SQLite file without the hub schema
+# (RuntimeError).
+_DB_OPEN_ERRORS = (OSError, ValueError, RuntimeError, sqlite3.Error)
+
+
 def _open_existing(db: str, *, read_only: bool = False) -> Any:
-    """Open an existing hub database, without creating a stray file."""
+    """Open an existing hub database, without creating or modifying anything else.
+
+    A write open is preceded by a read-only one, so a SQLite file that is not a hub
+    database is rejected by the schema check before the write open could switch its
+    journal mode to WAL.
+    """
     from aar.hub.events import EventLog
 
-    if not Path(db).exists():
-        raise _DatabaseUnavailable(f"no hub database at {db!r}")
+    path = Path(db)
+    if db == ":memory:" or not path.is_file():
+        what = "a directory" if path.is_dir() else "missing"
+        raise _DatabaseUnavailable(f"no hub database at {db!r} ({what})")
     try:
-        return EventLog(db, create=False, read_only=read_only)
-    except (RuntimeError, OSError) as exc:
+        checked = EventLog(db, read_only=True)
+        if read_only:
+            return checked
+        checked.close()
+        return EventLog(db, create=False)
+    except _DB_OPEN_ERRORS as exc:
         raise _DatabaseUnavailable(f"cannot open hub database {db!r}: {exc}") from exc
+
+
+def _open_store(root: str, log: Any) -> Any:
+    """Open an existing artifact store; a missing directory is an error, never created."""
+    from aar.hub.artifacts import ArtifactStore
+
+    if not Path(root).is_dir():
+        raise _StoreUnavailable(f"no artifact store directory at {root!r}")
+    return ArtifactStore(root, log)
 
 
 def _parse_actor(value: str) -> Any:
@@ -233,12 +264,15 @@ def _console(args: argparse.Namespace) -> int:
         log = _open_existing(args.db)
     except _DatabaseUnavailable as exc:
         return _fail("database_unavailable", str(exc))
+    try:
+        store = _open_store(args.artifacts, log)
+    except _StoreUnavailable as exc:
+        log.close()
+        return _fail("artifact_store_unavailable", str(exc))
 
     import uvicorn
 
-    from aar.hub.artifacts import ArtifactStore
-
-    app = build_app(log, ArtifactStore(args.artifacts, log), config)
+    app = build_app(log, store, config)
     if config.operator is None and not config.trust_tailscale_headers:
         print("console is read-only: no --operator and no trusted headers", file=sys.stderr)
     # proxy_headers=False: the peer address must be the real TCP peer, because trusting
@@ -266,6 +300,8 @@ def _with_review_errors(func: Any) -> Any:
             return func(args)
         except _DatabaseUnavailable as exc:
             return _fail("database_unavailable", str(exc))
+        except _StoreUnavailable as exc:
+            return _fail("artifact_store_unavailable", str(exc))
         except HumanRequired as exc:
             return _fail("human_required", str(exc))
         except IdempotencyConflict as exc:
@@ -280,7 +316,6 @@ def _with_review_errors(func: Any) -> Any:
 
 @_with_review_errors
 def _review_request(args: argparse.Namespace) -> int:
-    from aar.hub.artifacts import ArtifactStore
     from aar.hub.reviews import request_review
 
     actor = _parse_actor(args.actor)
@@ -288,7 +323,7 @@ def _review_request(args: argparse.Namespace) -> int:
     try:
         review = request_review(
             log,
-            ArtifactStore(args.artifacts, log),
+            _open_store(args.artifacts, log),
             args.project,
             args.subject,
             args.render,

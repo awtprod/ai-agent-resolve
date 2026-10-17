@@ -240,3 +240,17 @@ def test_list_reviews_pending_only_and_per_project(hub: Hub) -> None:
     assert [r.id for r in reviews.list_reviews(hub.log, pending_only=True)] == [open_review.id]
     assert {r.id for r in reviews.list_reviews(hub.log)} == {open_review.id, closed.id}
     assert reviews.list_reviews(hub.log, other) == []
+
+
+def test_a_decision_key_reused_in_another_project_conflicts(hub: Hub) -> None:
+    # Two projects with a review node of the same explicit id, so the decision
+    # payloads are identical and only the project tells the requests apart.
+    other = Registry(hub.log).create_project("demo-show-2", HUMAN).id
+    for project in (hub.project, other):
+        WorkGraph(hub.log, project).add_node("review", AGENT, node_id="nd_shared", status="active")
+    reviews.decide(hub.log, hub.project, "nd_shared", "approve", "ok", HUMAN, idempotency_key="k")
+    with pytest.raises(IdempotencyConflict):
+        reviews.decide(hub.log, other, "nd_shared", "approve", "ok", HUMAN, idempotency_key="k")
+    # The other project's review was not silently treated as decided.
+    stored = reviews.get_review(hub.log, other, "nd_shared")
+    assert stored is not None and stored.decision is None and stored.status == "active"

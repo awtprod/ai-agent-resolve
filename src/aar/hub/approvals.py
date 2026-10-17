@@ -22,6 +22,7 @@ This module is only the mechanism. Nothing here acts on Resolve.
 
 from __future__ import annotations
 
+import math
 import secrets
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -230,6 +231,8 @@ def _ttl(ttl: timedelta | float | int) -> timedelta:
     if isinstance(ttl, bool):
         raise InvalidInput("ttl", "must be a duration")
     if isinstance(ttl, (int, float)):
+        if not math.isfinite(ttl):
+            raise InvalidInput("ttl", f"must be a finite number of seconds, got {ttl!r}")
         ttl = timedelta(seconds=ttl)
     if not isinstance(ttl, timedelta):
         raise InvalidInput("ttl", f"must be a duration, got {type(ttl).__name__}")
