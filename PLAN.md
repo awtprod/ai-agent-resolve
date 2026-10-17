@@ -33,7 +33,7 @@ Status values: `todo` · `in-progress` · `review` · `merged` · `blocked(<reas
 | S9  | `aar.drp` create: build and `ExportProject`, plus version-matched templates | S8 | blocked(D3) | |
 | S10 | Cloud ops via the node: list, load, create, import, restore, sync status, freshness | S6 | blocked(D3) | read-only listing can start |
 | S11 | Collaboration: presence, agent branch timelines, review threads mirrored to markers | S4, S6 | todo | |
-| S12 | Human console (web): review queue, approve or reject, lease board, emergency stop | S4 | in-progress | review of 79b2cab+d8c492c: MERGE-WITH-FOLLOWUPS (31/38 mutations caught; XSS, headers, CSRF, artifact route and approval races clean). Round 2 dispatched: 3 malformed events permanently break read pages including `/control`; `set_status` bypasses the review gate; header and body-cap tests. Identity = reachability (D2, follow-up). Rebase onto S4f round 3 before merging |
+| S12 | Human console (web): review queue, approve or reject, lease board, emergency stop | S4 | review | round 2 at 2936ca3 (569 passed, 34/34 mutations caught): every projection skips malformed events and lists them on pages and in MCP results; `/control` panels render independently; writers validate before appending; review nodes move only by a human decision or a withdrawal by the agent that requested it; startup warning on non-loopback binds or trusted headers; structured 413 response; 7 survivors pinned. Also changes S4's `graph.py`, `registry.py` and `artifacts.py`. Re-validating. Round 1 review: MERGE-WITH-FOLLOWUPS. Identity = reachability (D2; DESIGN §7 item 6). Rebase onto S4f before merging |
 | S13 | CCN recipes: port the long-form, shorts, captions, thumbpipe and publish steps onto the work graph | S5, S7, S11 | todo | |
 | S14 | Spike: second Resolve instance, `-nogui`, `-rr` beside the GUI on the edit PC | none | blocked(D4 approval + idle window) | |
 
@@ -72,3 +72,4 @@ Status values: `todo` · `in-progress` · `review` · `merged` · `blocked(<reas
 - 2026-10-17: S6 round 3 (82a53b1) sent to the same validator.
 - 2026-10-17: S2 round 3 (d5e0b18) sent to the same validator.
 - 2026-10-17: S4f round 3 review: MERGE-WITH-FOLLOWUPS. Tiny round 4 for a Windows path regression and test gaps.
+- 2026-10-17: S12 round 2 (2936ca3) sent to the same validator.
