@@ -22,7 +22,7 @@ from mcp_types import ToolAnnotations
 
 from aar.hub import approvals, control, reviews
 from aar.hub.artifacts import ArtifactStore
-from aar.hub.common import Clock, utcnow
+from aar.hub.common import Clock, skipped_summary, utcnow
 from aar.hub.events import Event, EventLog
 from aar.hub.graph import WorkGraph
 from aar.hub.leaseboard import lease_board as project_lease_board
@@ -33,7 +33,8 @@ SERVER_INSTRUCTIONS = (
     "Use it to discover which projects exist and where, what has happened (the event "
     "log), what work is planned or in flight (the work graph), and what has been "
     "produced (artifacts). Call control_status before hot work: if it reports a stop, "
-    "do not touch Resolve. This surface is read-only."
+    "do not touch Resolve. Results carry skipped: {count, events}, the malformed log "
+    "events that were ignored. This surface is read-only."
 )
 
 # Every tool here only reads; advertise that to clients (SEP tool annotations).
@@ -82,7 +83,10 @@ def build_server(
     )
     def projects_list() -> dict[str, Any]:
         registry.refresh()
-        return {"projects": [project.to_dict() for project in registry.list()]}
+        return {
+            "projects": [project.to_dict() for project in registry.list()],
+            "skipped": skipped_summary(registry.skipped()),
+        }
 
     @server.tool(
         name="project_get",
@@ -96,9 +100,10 @@ def build_server(
     def project_get(project_id: str) -> dict[str, Any]:
         registry.refresh()
         project = registry.get(project_id)
+        skipped = skipped_summary(registry.skipped())
         if project is None:
-            return {"found": False, "project_id": project_id}
-        return {"found": True, "project": project.to_dict()}
+            return {"found": False, "project_id": project_id, "skipped": skipped}
+        return {"found": True, "project": project.to_dict(), "skipped": skipped}
 
     @server.tool(
         name="events_tail",
@@ -141,7 +146,7 @@ def build_server(
         if registry.get(project_id) is None:
             return {"found": False, "project_id": project_id}
         graph = WorkGraph(log, project_id)
-        return {"found": True, **graph.to_dict()}
+        return {"found": True, **graph.to_dict(), "skipped": skipped_summary(graph.skipped())}
 
     @server.tool(
         name="artifact_meta",
@@ -171,8 +176,11 @@ def build_server(
         annotations=_READ_ONLY,
     )
     def reviews_pending(project_id: str | None = None) -> dict[str, Any]:
-        found = reviews.list_reviews(log, project_id, pending_only=True)
-        return {"reviews": [review.to_dict() for review in found]}
+        scan = reviews.scan_reviews(log, project_id, pending_only=True)
+        return {
+            "reviews": [review.to_dict() for review in scan.reviews],
+            "skipped": skipped_summary(scan.skipped),
+        }
 
     @server.tool(
         name="review_get",
@@ -186,10 +194,16 @@ def build_server(
         annotations=_READ_ONLY,
     )
     def review_get(project_id: str, review_id: str) -> dict[str, Any]:
-        review = reviews.get_review(log, project_id, review_id)
+        review, skipped = reviews.review_view(log, project_id, review_id)
+        summary = skipped_summary(skipped)
         if review is None:
-            return {"found": False, "project_id": project_id, "review_id": review_id}
-        return {"found": True, "review": review.to_dict()}
+            return {
+                "found": False,
+                "project_id": project_id,
+                "review_id": review_id,
+                "skipped": summary,
+            }
+        return {"found": True, "review": review.to_dict(), "skipped": summary}
 
     @server.tool(
         name="control_status",
@@ -201,7 +215,8 @@ def build_server(
         annotations=_READ_ONLY,
     )
     def control_status() -> dict[str, Any]:
-        return control.status(log).to_dict()
+        state = control.status(log)
+        return {**state.to_dict(), "skipped": skipped_summary(state.skipped)}
 
     @server.tool(
         name="lease_board",
@@ -215,7 +230,8 @@ def build_server(
         annotations=_READ_ONLY,
     )
     def lease_board() -> dict[str, Any]:
-        return project_lease_board(log, clock=clock).to_dict()
+        board = project_lease_board(log, clock=clock)
+        return {**board.to_dict(), "skipped": skipped_summary(board.skipped)}
 
     @server.tool(
         name="approvals_list",
@@ -230,12 +246,12 @@ def build_server(
     )
     def approvals_list(include_inactive: bool = False) -> dict[str, Any]:
         now = clock()
-        tokens = approvals.list_approvals(log)
+        view = approvals.approvals_view(log)
         listed = [
             token.to_dict(now)
-            for token in tokens
+            for token in view.tokens
             if include_inactive or token.state(now) == "active"
         ]
-        return {"approvals": listed}
+        return {"approvals": listed, "skipped": skipped_summary(view.skipped)}
 
     return server

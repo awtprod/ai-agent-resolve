@@ -8,11 +8,12 @@ validated text for anything an agent or a form can supply.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from aar.hub.events import Actor
+from aar.hub.events import Actor, Event
 
 Clock = Callable[[], datetime]
 """Returns the current time as a timezone-aware datetime. Injected so tests never sleep."""
@@ -95,3 +96,63 @@ def clean_text(
 def actor_dict(actor: Actor) -> dict[str, str]:
     """Return an actor as plain JSON-ready data."""
     return {"kind": actor.kind, "id": actor.id}
+
+
+@dataclass(frozen=True, slots=True)
+class SkippedEvent:
+    """An event a projection could not use (malformed, forged, or out of order).
+
+    The log is append-only, so a bad event can never be removed. Projections skip it,
+    record it here, and carry on: one bad event must never break a read.
+    """
+
+    event_id: str
+    seq: int
+    type: str
+    reason: str
+
+    @classmethod
+    def of(cls, event: Event, reason: str) -> SkippedEvent:
+        return cls(event.id, event.seq, event.type, reason)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "seq": self.seq,
+            "type": self.type,
+            "reason": self.reason,
+        }
+
+
+MAX_SKIPPED_LISTED = 50
+
+
+def skipped_summary(skipped: Iterable[SkippedEvent]) -> dict[str, Any]:
+    """``{"count": N, "events": [...]}`` for tools and pages, listing at most 50 events."""
+    unique = {item.event_id: item for item in skipped}
+    ordered = sorted(unique.values(), key=lambda item: item.seq)
+    return {
+        "count": len(ordered),
+        "events": [item.to_dict() for item in ordered[:MAX_SKIPPED_LISTED]],
+    }
+
+
+def is_int(value: Any, low: int, high: int) -> bool:
+    """Whether ``value`` is a real int (not a bool) within ``[low, high]``."""
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
+def is_text(value: Any, max_len: int, *, allow_empty: bool = False) -> bool:
+    """Whether ``value`` is a string of at most ``max_len`` characters."""
+    return isinstance(value, str) and len(value) <= max_len and (allow_empty or bool(value))
+
+
+def is_ts(value: Any) -> bool:
+    """Whether ``value`` is an ISO-8601 timestamp with a timezone."""
+    if not is_text(value, 64):
+        return False
+    try:
+        parse_ts(value)
+    except (ValueError, OverflowError):
+        return False
+    return True

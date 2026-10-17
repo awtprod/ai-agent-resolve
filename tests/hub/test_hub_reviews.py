@@ -10,7 +10,7 @@ from aar.hub import reviews
 from aar.hub.artifacts import ArtifactStore
 from aar.hub.common import HumanRequired, InvalidInput
 from aar.hub.events import Actor, EventLog, IdempotencyConflict
-from aar.hub.graph import WorkGraph
+from aar.hub.graph import ProtectedNode, WorkGraph
 from aar.hub.registry import Registry
 
 AGENT = Actor("agent", "agent-1")
@@ -194,7 +194,7 @@ def test_a_stale_reader_cannot_decide_twice(hub: Hub, tmp_path: Path) -> None:
 
 def test_a_closed_review_cannot_be_decided_and_nothing_is_written(hub: Hub) -> None:
     review = hub.request()
-    WorkGraph(hub.log, hub.project).set_status(review.id, "cancelled", AGENT)
+    reviews.withdraw(hub.log, hub.project, review.id, "superseded by v2", AGENT)
     before = hub.log.latest_seq()
     with pytest.raises(reviews.ReviewNotOpen):
         reviews.decide(hub.log, hub.project, review.id, "approve", "ok", HUMAN)
@@ -254,3 +254,23 @@ def test_a_decision_key_reused_in_another_project_conflicts(hub: Hub) -> None:
     # The other project's review was not silently treated as decided.
     stored = reviews.get_review(hub.log, other, "nd_shared")
     assert stored is not None and stored.decision is None and stored.status == "active"
+
+
+def test_a_decided_review_cannot_be_reopened_even_by_a_human(hub: Hub) -> None:
+    review = hub.request()
+    reviews.decide(hub.log, hub.project, review.id, "reject", "redo the cold open", HUMAN)
+    before = hub.log.latest_seq()
+    with hub.log.transaction() as txn, pytest.raises(ProtectedNode):
+        WorkGraph(hub.log, hub.project).set_status_in(txn, review.id, "active", HUMAN)
+    assert hub.log.latest_seq() == before
+    # A reopen forged straight onto the log is skipped too.
+    forged = hub.log.append(
+        "graph.node_status_changed",
+        HUMAN,
+        {"node_id": review.id, "to": "active"},
+        project_id=hub.project,
+    )
+    graph = WorkGraph(hub.log, hub.project)
+    node = graph.node(review.id)
+    assert node is not None and node.status == "failed"
+    assert forged.id in {item.event_id for item in graph.skipped()}

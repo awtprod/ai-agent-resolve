@@ -42,6 +42,13 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     console = hub_sub.add_parser(
         "console",
         help="Serve the human supervision console (reviews, leases, approvals, STOP).",
+        description=(
+            "Serve the human supervision console. Identity is network reachability: "
+            "there are no accounts or passwords, so anyone who can reach the port acts "
+            "as --operator. Keep it on loopback and reach it through tailscale serve "
+            "(tailnet-only, DESIGN D2). A real credential is required before any "
+            "exposure beyond the tailnet."
+        ),
     )
     console.add_argument("--db", required=True, help="Path to the SQLite event-log database.")
     console.add_argument("--artifacts", required=True, help="Path to the artifact store directory.")
@@ -65,7 +72,8 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "--trust-tailscale-headers",
         action="store_true",
         help="Take the human from the Tailscale-User-Login header, honoured only for "
-        "requests from loopback (tailscale serve). Any local process can send it.",
+        "requests from loopback (tailscale serve). Any process on this host can send "
+        "it and claim any login, so use it only where every local process is trusted.",
     )
     console.add_argument(
         "--allowed-host",
@@ -109,6 +117,17 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     _add_actor(note)
     note.add_argument("--idempotency-key", help="Makes a retry a no-op.")
     note.set_defaults(func=_review_note)
+
+    withdraw = review_sub.add_parser(
+        "withdraw", help="Withdraw an open review you requested (it becomes cancelled)."
+    )
+    _add_db(withdraw)
+    withdraw.add_argument("--project", required=True, help="Project id (prj_...).")
+    withdraw.add_argument("--review", required=True, help="Review id.")
+    withdraw.add_argument("--reason", required=True, help="Why, for the audit trail.")
+    _add_actor(withdraw)
+    withdraw.add_argument("--idempotency-key", help="Makes a retry a no-op.")
+    withdraw.set_defaults(func=_review_withdraw)
 
     listing = review_sub.add_parser("list", help="List reviews (open ones by default).")
     _add_db(listing)
@@ -275,6 +294,8 @@ def _console(args: argparse.Namespace) -> int:
     app = build_app(log, store, config)
     if config.operator is None and not config.trust_tailscale_headers:
         print("console is read-only: no --operator and no trusted headers", file=sys.stderr)
+    for warning in _console_warnings(args):
+        print(f"WARNING: {warning}", file=sys.stderr)
     # proxy_headers=False: the peer address must be the real TCP peer, because trusting
     # Tailscale headers depends on it being loopback.
     uvicorn.run(
@@ -286,6 +307,24 @@ def _console(args: argparse.Namespace) -> int:
         log_level="info",
     )
     return 0
+
+
+def _console_warnings(args: argparse.Namespace) -> list[str]:
+    """Startup warnings for settings where identity is weaker than it may look."""
+    warnings = []
+    if args.trust_tailscale_headers:
+        warnings.append(
+            "--trust-tailscale-headers: any process on this host can send "
+            "Tailscale-User-Login to loopback and act as any login. Use only where every "
+            "local process is trusted."
+        )
+    if args.host not in _LOOPBACK:
+        warnings.append(
+            f"bound to {args.host}: anyone who can reach this address acts as "
+            f"{args.operator or 'the trusted-header login'}. There is no other "
+            "authentication; keep it on the tailnet."
+        )
+    return warnings
 
 
 def _with_review_errors(func: Any) -> Any:
@@ -359,6 +398,27 @@ def _review_note(args: argparse.Namespace) -> int:
     finally:
         log.close()
     _print(note.to_dict())
+    return 0
+
+
+@_with_review_errors
+def _review_withdraw(args: argparse.Namespace) -> int:
+    from aar.hub.reviews import withdraw
+
+    actor = _parse_actor(args.actor)
+    log = _open_existing(args.db)
+    try:
+        withdrawal = withdraw(
+            log,
+            args.project,
+            args.review,
+            args.reason,
+            actor,
+            idempotency_key=args.idempotency_key,
+        )
+    finally:
+        log.close()
+    _print(withdrawal.to_dict())
     return 0
 
 

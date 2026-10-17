@@ -27,10 +27,18 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NoReturn
 
 from aar.hub.artifacts import ArtifactStore, InvalidArtifactId
-from aar.hub.common import InvalidInput, actor_dict, clean_text, require_human
+from aar.hub.common import (
+    InvalidInput,
+    SkippedEvent,
+    actor_dict,
+    clean_text,
+    is_int,
+    is_text,
+    require_human,
+)
 from aar.hub.events import (
     Actor,
     Event,
@@ -39,17 +47,25 @@ from aar.hub.events import (
     Transaction,
     match_or_conflict,
 )
-from aar.hub.graph import EVENT_NODE_ADDED, IllegalTransition, WorkGraph
+from aar.hub.graph import (
+    EVENT_NODE_ADDED,
+    GraphNode,
+    IllegalTransition,
+    ProtectedNode,
+    WorkGraph,
+)
 from aar.hub.registry import Registry
 
 EVENT_NOTE_ADDED = "review.note_added"
 EVENT_DECIDED = "review.decided"
-_REVIEW_EVENT_TYPES = (EVENT_NOTE_ADDED, EVENT_DECIDED)
+EVENT_WITHDRAWN = "review.withdrawn"
+_REVIEW_EVENT_TYPES = (EVENT_NOTE_ADDED, EVENT_DECIDED, EVENT_WITHDRAWN)
 
 DECISIONS = ("approve", "reject")
 DECISION_STATUS = {"approve": "done", "reject": "failed"}
 OPEN_STATUSES = frozenset({"pending", "active", "blocked"})
 
+MAX_ID = 128
 MAX_TITLE = 200
 MAX_NOTE = 4000
 MAX_REASON = 2000
@@ -94,7 +110,15 @@ class ReviewAlreadyDecided(ReviewError):
 
 
 class ReviewNotOpen(ReviewError):
-    """The review's status no longer allows a decision (for example it was cancelled)."""
+    """The review is closed (decided, withdrawn or cancelled), so it takes no more input."""
+
+
+class SubjectCancelled(ReviewError):
+    """The node under review was cancelled, so the review cannot be approved."""
+
+
+class NotRequester(ReviewError, PermissionError):
+    """Only the agent that requested a review (or a human) may withdraw it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +168,26 @@ class Decision:
 
 
 @dataclass(frozen=True, slots=True)
+class Withdrawal:
+    """A review withdrawn by its requester (or a human) without a decision."""
+
+    event_id: str
+    review_id: str
+    reason: str
+    by: Actor
+    ts: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "review_id": self.review_id,
+            "reason": self.reason,
+            "by": actor_dict(self.by),
+            "ts": self.ts,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class Review:
     """A review request as projected from the work graph plus its notes and decision."""
 
@@ -160,6 +204,7 @@ class Review:
     updated: str | None
     notes: tuple[Note, ...]
     decision: Decision | None
+    withdrawal: Withdrawal | None = None
 
     @property
     def pending(self) -> bool:
@@ -182,6 +227,7 @@ class Review:
             "updated": self.updated,
             "notes": [note.to_dict() for note in self.notes],
             "decision": self.decision.to_dict() if self.decision else None,
+            "withdrawal": self.withdrawal.to_dict() if self.withdrawal else None,
         }
 
 
@@ -193,6 +239,8 @@ def _check_fps(fps: Any) -> float | None:
         return None
     if isinstance(fps, bool) or not isinstance(fps, (int, float)):
         raise InvalidInput("fps", f"must be a number, got {type(fps).__name__}")
+    if isinstance(fps, int) and not 0 < fps <= MAX_FPS:
+        raise InvalidInput("fps", f"must be a positive frame rate up to {MAX_FPS:g}")
     value = float(fps)
     if not math.isfinite(value) or value <= 0 or value > MAX_FPS:
         raise InvalidInput("fps", f"must be a positive frame rate up to {MAX_FPS:g}")
@@ -232,6 +280,47 @@ def frames_to_timecode(frame: int, fps: float) -> str:
 # -- projection --------------------------------------------------------------
 
 
+def _note_problem(payload: Any) -> str | None:
+    """Why a note payload is unusable, or ``None``. Shared by the writer and the fold."""
+    if not isinstance(payload, dict):
+        return "payload is not an object"
+    if not is_text(payload.get("review_id"), MAX_ID):
+        return "review_id is not an id"
+    if not is_int(payload.get("frame"), 0, MAX_FRAME):
+        return f"frame is not an integer between 0 and {MAX_FRAME}"
+    timecode = payload.get("timecode")
+    if not isinstance(timecode, str) or not _TIMECODE_RE.fullmatch(timecode):
+        return "timecode is not HH:MM:SS:FF"
+    if not is_text(payload.get("text"), MAX_NOTE):
+        return f"text is not 1-{MAX_NOTE} characters"
+    return None
+
+
+def _decision_problem(actor: Actor, payload: Any) -> str | None:
+    """Why a decision is unusable, or ``None``. Only a human's decision ever counts."""
+    if actor.kind != "human":
+        return f"decision by {actor.kind}:{actor.id}, not a human"
+    if not isinstance(payload, dict):
+        return "payload is not an object"
+    if not is_text(payload.get("review_id"), MAX_ID):
+        return "review_id is not an id"
+    if payload.get("decision") not in DECISIONS:
+        return "decision is not approve or reject"
+    if not is_text(payload.get("reason"), MAX_REASON):
+        return f"reason is not 1-{MAX_REASON} characters"
+    return None
+
+
+def _withdrawal_problem(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return "payload is not an object"
+    if not is_text(payload.get("review_id"), MAX_ID):
+        return "review_id is not an id"
+    if not is_text(payload.get("reason"), MAX_REASON):
+        return f"reason is not 1-{MAX_REASON} characters"
+    return None
+
+
 def _note_from_event(event: Event) -> Note:
     payload = event.payload
     return Note(
@@ -257,6 +346,16 @@ def _decision_from_event(event: Event) -> Decision:
     )
 
 
+def _withdrawal_from_event(event: Event) -> Withdrawal:
+    return Withdrawal(
+        event_id=event.id,
+        review_id=event.payload["review_id"],
+        reason=event.payload["reason"],
+        by=event.actor,
+        ts=event.ts,
+    )
+
+
 def _renders_from(data: dict[str, Any]) -> tuple[str, ...]:
     """Return the well-formed render ids in a review node's data.
 
@@ -269,115 +368,131 @@ def _renders_from(data: dict[str, Any]) -> tuple[str, ...]:
     return tuple(r for r in renders if isinstance(r, str) and _ARTIFACT_RE.fullmatch(r))
 
 
-def _optional_str(data: dict[str, Any], key: str) -> str | None:
+def _optional_str(data: dict[str, Any], key: str, max_len: int = MAX_TITLE) -> str | None:
     value = data.get(key)
-    return value if isinstance(value, str) else None
+    return value if is_text(value, max_len) else None
 
 
 def _build_review(
     graph: WorkGraph,
-    node_id: str,
+    node: GraphNode,
     notes: list[Note],
     decision: Decision | None,
-) -> Review | None:
-    node = graph.node(node_id)
-    if node is None or node.kind != "review":
-        return None
+    withdrawal: Withdrawal | None,
+) -> Review:
     data = node.payload if isinstance(node.payload, dict) else {}
-    fps = data.get("fps")
     try:
-        fps_value = _check_fps(fps)
+        fps_value = _check_fps(data.get("fps"))
     except InvalidInput:
         fps_value = None
+    title = node.title if is_text(node.title, MAX_TITLE) else None
     return Review(
         id=node.id,
         project_id=graph.project_id,
-        title=node.title or "(untitled review)",
+        title=title or "(untitled review)",
         status=node.status,
-        subject=_optional_str(data, "subject"),
+        subject=_optional_str(data, "subject", MAX_ID),
         renders=_renders_from(data),
-        timeline=_optional_str(data, "timeline"),
+        timeline=_optional_str(data, "timeline", MAX_TIMELINE),
         fps=fps_value,
-        requested_by=_optional_str(data, "requested_by"),
+        requested_by=_optional_str(data, "requested_by", MAX_ID),
         created=node.created,
         updated=node.updated,
         notes=tuple(sorted(notes, key=lambda n: (n.frame, n.ts, n.id))),
         decision=decision,
+        # A withdrawal is shown only when the graph agrees the review was cancelled.
+        withdrawal=withdrawal if node.status == "cancelled" else None,
     )
 
 
-def _well_formed(event: Event) -> bool:
-    """Whether a review event has the shape this module writes.
+@dataclass(frozen=True, slots=True)
+class ReviewScan:
+    """Reviews as projected from the log, plus the events that could not be used."""
 
-    The log is shared and anyone with the Python API can append any type, so the
-    projection skips malformed events instead of failing every read.
-    """
-    payload = event.payload
-    if event.project_id is None or not isinstance(payload.get("review_id"), str):
-        return False
-    if event.type == EVENT_NOTE_ADDED:
-        frame = payload.get("frame")
-        return (
-            isinstance(frame, int)
-            and not isinstance(frame, bool)
-            and isinstance(payload.get("timecode"), str)
-            and isinstance(payload.get("text"), str)
-        )
-    # Only a human's decision counts, even if an agent appended one straight to the log.
-    return (
-        event.actor.kind == "human"
-        and payload.get("decision") in DECISIONS
-        and isinstance(payload.get("reason"), str)
-    )
+    reviews: tuple[Review, ...]
+    skipped: tuple[SkippedEvent, ...]
 
 
-def _review_events(
-    log: EventLog, project_id: str | None
-) -> tuple[dict[tuple[str, str], list[Note]], dict[tuple[str, str], Decision]]:
-    notes: dict[tuple[str, str], list[Note]] = {}
-    decisions: dict[tuple[str, str], Decision] = {}
+def _project_reviews(
+    log: EventLog, project_id: str
+) -> tuple[dict[str, Review], list[SkippedEvent]]:
+    """Every review in one project, keyed by id, and the events skipped building them."""
+    graph = WorkGraph(log, project_id)
+    skipped = list(graph.skipped())
+    review_nodes = {node.id: node for node in graph.nodes() if node.kind == "review"}
+    notes: dict[str, list[Note]] = {}
+    decisions: dict[str, Decision] = {}
+    withdrawals: dict[str, Withdrawal] = {}
     for event in log.iter_events(project_id=project_id, types=_REVIEW_EVENT_TYPES):
-        if event.project_id is None or not _well_formed(event):
-            continue
-        key = (event.project_id, event.payload["review_id"])
         if event.type == EVENT_NOTE_ADDED:
-            notes.setdefault(key, []).append(_note_from_event(event))
-        elif event.type == EVENT_DECIDED and key not in decisions:
-            # The first decision stands; decide() never writes a second one.
-            decisions[key] = _decision_from_event(event)
-    return notes, decisions
+            problem = _note_problem(event.payload)
+        elif event.type == EVENT_DECIDED:
+            problem = _decision_problem(event.actor, event.payload)
+        else:
+            problem = _withdrawal_problem(event.payload)
+        review_id = event.payload.get("review_id") if problem is None else None
+        if problem is None and review_id not in review_nodes:
+            problem = f"no review {review_id!r} in this project"
+        if problem is None and event.type == EVENT_DECIDED and review_id in decisions:
+            problem = "a second decision; the first one stands"
+        if problem is not None:
+            skipped.append(SkippedEvent.of(event, problem))
+        elif event.type == EVENT_NOTE_ADDED:
+            notes.setdefault(review_id, []).append(_note_from_event(event))
+        elif event.type == EVENT_DECIDED:
+            decisions[review_id] = _decision_from_event(event)
+        else:
+            withdrawals.setdefault(review_id, _withdrawal_from_event(event))
+    reviews = {
+        node_id: _build_review(
+            graph, node, notes.get(node_id, []), decisions.get(node_id), withdrawals.get(node_id)
+        )
+        for node_id, node in review_nodes.items()
+    }
+    return reviews, skipped
+
+
+def scan_reviews(
+    log: EventLog, project_id: str | None = None, *, pending_only: bool = False
+) -> ReviewScan:
+    """Reviews (all projects, or one), oldest first, with the events skipped. Never raises
+    on a malformed event: it is skipped and listed instead."""
+    if project_id is not None:
+        project_ids = [project_id]
+    else:
+        seen: dict[str, None] = {}
+        for event in log.iter_events(types=[EVENT_NODE_ADDED]):
+            if isinstance(event.project_id, str):
+                seen.setdefault(event.project_id, None)
+        project_ids = list(seen)
+    found: list[Review] = []
+    skipped: list[SkippedEvent] = []
+    for pid in project_ids:
+        reviews, problems = _project_reviews(log, pid)
+        skipped.extend(problems)
+        found.extend(r for r in reviews.values() if r.pending or not pending_only)
+    found.sort(key=lambda r: (r.created or "", r.id))
+    return ReviewScan(tuple(found), tuple(skipped))
+
+
+def review_view(
+    log: EventLog, project_id: str, review_id: str
+) -> tuple[Review | None, tuple[SkippedEvent, ...]]:
+    """One review (or ``None``) and the events skipped in its project."""
+    reviews, skipped = _project_reviews(log, project_id)
+    return reviews.get(review_id), tuple(skipped)
 
 
 def get_review(log: EventLog, project_id: str, review_id: str) -> Review | None:
     """Return one review with its notes and decision, or ``None`` if there is no such review."""
-    graph = WorkGraph(log, project_id)
-    node = graph.node(review_id)
-    if node is None or node.kind != "review":
-        return None
-    notes, decisions = _review_events(log, project_id)
-    key = (project_id, review_id)
-    return _build_review(graph, review_id, notes.get(key, []), decisions.get(key))
+    return review_view(log, project_id, review_id)[0]
 
 
 def list_reviews(
     log: EventLog, project_id: str | None = None, *, pending_only: bool = False
 ) -> list[Review]:
     """Return reviews (all projects, or one), oldest first; ``pending_only`` keeps open ones."""
-    review_nodes: dict[str, list[str]] = {}
-    for event in log.iter_events(project_id=project_id, types=[EVENT_NODE_ADDED]):
-        if event.project_id is not None and event.payload.get("kind") == "review":
-            review_nodes.setdefault(event.project_id, []).append(event.payload["node_id"])
-    notes, decisions = _review_events(log, project_id)
-    reviews: list[Review] = []
-    for pid, node_ids in review_nodes.items():
-        graph = WorkGraph(log, pid)
-        for node_id in node_ids:
-            key = (pid, node_id)
-            review = _build_review(graph, node_id, notes.get(key, []), decisions.get(key))
-            if review is not None and (review.pending or not pending_only):
-                reviews.append(review)
-    reviews.sort(key=lambda r: (r.created or "", r.id))
-    return reviews
+    return list(scan_reviews(log, project_id, pending_only=pending_only).reviews)
 
 
 # -- mutations ---------------------------------------------------------------
@@ -465,31 +580,74 @@ def add_note(
     """
     frame = _check_frame(frame)
     text = clean_text(text, "text", max_len=MAX_NOTE, multiline=True)
-    review = get_review(log, project_id, review_id)
-    if review is None:
-        raise ReviewNotFound(f"no review {review_id!r} in project {project_id!r}")
-    if timecode is None:
-        if review.fps is None:
-            raise InvalidInput(
-                "timecode", "is required because the review has no frame rate to derive it from"
-            )
-        timecode = frames_to_timecode(frame, review.fps)
-    elif not isinstance(timecode, str) or not _TIMECODE_RE.fullmatch(timecode):
+    if timecode is not None and (
+        not isinstance(timecode, str) or not _TIMECODE_RE.fullmatch(timecode)
+    ):
         raise InvalidInput("timecode", f"must look like HH:MM:SS:FF, got {timecode!r}")
-    payload = {"review_id": review_id, "frame": frame, "timecode": timecode, "text": text}
-    event = log.append(
-        EVENT_NOTE_ADDED,
-        actor,
-        payload,
-        project_id=project_id,
-        idempotency_key=idempotency_key,
-    )
+    with log.transaction() as txn:
+        if idempotency_key is not None:
+            existing = txn.find_by_idempotency_key(idempotency_key)
+            if existing is not None:
+                # A retry returns the stored note even if the review closed since.
+                expected = {"review_id": review_id, "frame": frame, "text": text}
+                compare = list(expected)
+                if timecode is not None:
+                    expected["timecode"] = timecode
+                    compare.append("timecode")
+                match_or_conflict(existing, EVENT_NOTE_ADDED, expected, compare)
+                if existing.actor != actor or existing.project_id != project_id:
+                    _conflict(idempotency_key)
+                return _note_from_event(existing)
+        review = get_review(log, project_id, review_id)
+        if review is None:
+            raise ReviewNotFound(f"no review {review_id!r} in project {project_id!r}")
+        _require_open(review)
+        if timecode is None:
+            if review.fps is None:
+                raise InvalidInput(
+                    "timecode", "is required because the review has no frame rate to derive it"
+                )
+            timecode = frames_to_timecode(frame, review.fps)
+        payload = {"review_id": review_id, "frame": frame, "timecode": timecode, "text": text}
+        _assert_valid(_note_problem(payload))
+        event = txn.append(
+            EVENT_NOTE_ADDED,
+            actor,
+            payload,
+            project_id=project_id,
+            idempotency_key=idempotency_key,
+        )
     return _note_from_event(event)
+
+
+def _conflict(idempotency_key: str) -> NoReturn:
+    raise IdempotencyConflict(
+        f"idempotency key {idempotency_key!r} was already used for a different request"
+    )
+
+
+def _assert_valid(problem: str | None) -> None:
+    """Writers check their payload with the fold's own validator before appending."""
+    if problem is not None:
+        raise InvalidInput("payload", problem)
+
+
+def _require_open(review: Review) -> None:
+    if review.decision is not None:
+        raise ReviewNotOpen(
+            f"review {review.id} was already decided ({review.decision.decision} by "
+            f"{review.decision.by.kind}:{review.decision.by.id}); it takes no more notes"
+        )
+    if not review.pending:
+        raise ReviewNotOpen(f"review {review.id} is {review.status!r}; it takes no more input")
 
 
 def _existing_decision(txn: Transaction, project_id: str, review_id: str) -> Decision | None:
     for event in txn.read(0, project_id=project_id, types=[EVENT_DECIDED]):
-        if event.payload.get("review_id") == review_id and _well_formed(event):
+        if (
+            _decision_problem(event.actor, event.payload) is None
+            and event.payload["review_id"] == review_id
+        ):
             return _decision_from_event(event)
     return None
 
@@ -536,6 +694,14 @@ def decide(
         prior = _existing_decision(txn, project_id, review_id)
         if prior is not None:
             raise ReviewAlreadyDecided(prior)
+        subject_id = node.payload.get("subject") if isinstance(node.payload, dict) else None
+        subject = graph.node(subject_id) if isinstance(subject_id, str) else None
+        if decision == "approve" and subject is not None and subject.status == "cancelled":
+            raise SubjectCancelled(
+                f"cannot approve review {review_id}: the node it reviews ({subject_id}) was "
+                "cancelled. Reject the review instead, or have the agent request a new one."
+            )
+        _assert_valid(_decision_problem(actor, payload))
         try:
             if node.status in ("pending", "blocked"):
                 graph.set_status_in(txn, review_id, "active", actor)
@@ -552,3 +718,51 @@ def decide(
             idempotency_key=idempotency_key,
         )
     return _decision_from_event(event)
+
+
+def withdraw(
+    log: EventLog,
+    project_id: str,
+    review_id: str,
+    reason: str,
+    actor: Actor,
+    *,
+    idempotency_key: str | None = None,
+) -> Withdrawal:
+    """Withdraw an open review without a decision: it moves to ``cancelled``.
+
+    Only the agent that requested the review, or a human, may withdraw it, and only
+    while it is undecided. The ``review.withdrawn`` event (who, why) and the status
+    change are written in one transaction.
+    """
+    reason = clean_text(reason, "reason", max_len=MAX_REASON, multiline=True)
+    payload = {"review_id": review_id, "reason": reason}
+    _assert_valid(_withdrawal_problem(payload))
+    with log.transaction() as txn:
+        if idempotency_key is not None:
+            existing = txn.find_by_idempotency_key(idempotency_key)
+            if existing is not None:
+                match_or_conflict(existing, EVENT_WITHDRAWN, payload, payload.keys())
+                if existing.actor != actor or existing.project_id != project_id:
+                    _conflict(idempotency_key)
+                return _withdrawal_from_event(existing)
+        review = get_review(log, project_id, review_id)
+        if review is None:
+            raise ReviewNotFound(f"no review {review_id!r} in project {project_id!r}")
+        _require_open(review)
+        graph = WorkGraph(log, project_id)
+        try:
+            graph.set_status_in(txn, review_id, "cancelled", actor)
+        except ProtectedNode as exc:
+            raise NotRequester(
+                f"{actor.kind}:{actor.id} did not request review {review_id}; only its "
+                "requester or a human may withdraw it"
+            ) from exc
+        event = txn.append(
+            EVENT_WITHDRAWN,
+            actor,
+            payload,
+            project_id=project_id,
+            idempotency_key=idempotency_key,
+        )
+    return _withdrawal_from_event(event)

@@ -140,7 +140,9 @@ def test_flash_codes_are_not_reflected(hub: Hub) -> None:
 
 def test_every_write_route_is_post_only_and_get_is_rejected(hub: Hub) -> None:
     client = hub.client()
-    app = client.app.app  # inside the HostGuard
+    app: Any = client.app
+    while not hasattr(app, "routes"):  # unwrap SecurityHeaders and HostGuard
+        app = app.app
     posts = {r.path for r in app.routes if isinstance(r, Route) and "POST" in (r.methods or ())}
     assert posts == set(WRITE_ROUTES)
     for route in app.routes:
@@ -382,7 +384,11 @@ def test_stop_from_the_console_shows_in_control_status_then_resume(
     client = hub.client()
     reader = EventLog(tmp_path / "hub.db", read_only=True)
     server = build_server(reader, Registry(reader), ArtifactStore(hub.store_root, reader))
-    assert _mcp(server, "control_status") == {"running": True, "stops": []}
+    assert _mcp(server, "control_status") == {
+        "running": True,
+        "stops": [],
+        "skipped": {"count": 0, "events": []},
+    }
 
     form = _form(client.get("/control").text, "/control/stop")
     stop = client.post("/control/stop", data={**form, "scope": "all", "reason": ""}, headers=ORIGIN)
@@ -406,7 +412,11 @@ def test_stop_from_the_console_shows_in_control_status_then_resume(
         headers=ORIGIN,
     )
     assert response.status_code == 303
-    assert _mcp(server, "control_status") == {"running": True, "stops": []}
+    assert _mcp(server, "control_status") == {
+        "running": True,
+        "stops": [],
+        "skipped": {"count": 0, "events": []},
+    }
     control.assert_running(hub.log, project_id=hub.project)
 
 
@@ -527,3 +537,20 @@ def test_console_cli_binds_loopback_by_default_and_refuses_remote(
     assert main([*args, "--host", "0.0.0.0", "--allow-remote"]) == 0
     assert calls[-1]["host"] == "0.0.0.0"
     assert main([*args[:-1], "<bad name>"]) == 2
+
+
+def test_responses_that_are_not_pages_still_carry_the_security_headers(hub: Hub) -> None:
+    client = hub.client()
+    json_error = client.get("/nope", headers={"Accept": "application/json"})
+    wrong_host = client.get("/", headers={"Host": "evil.example"})
+    artifact = client.get(f"/artifacts/{hub.render}")
+    for name, response in (("json", json_error), ("421", wrong_host), ("artifact", artifact)):
+        assert response.headers["x-content-type-options"] == "nosniff", name
+        assert response.headers["x-frame-options"] == "DENY", name
+        assert "content-security-policy" in response.headers, name
+    assert json_error.status_code == 404 and wrong_host.status_code == 421
+    assert "frame-ancestors 'none'" in json_error.headers["content-security-policy"]
+    assert json_error.headers["cache-control"] == "no-store"
+    # A response that sets its own policy keeps it (artifacts are cacheable and sandboxed).
+    assert "immutable" in artifact.headers["cache-control"]
+    assert "sandbox" in artifact.headers["content-security-policy"]

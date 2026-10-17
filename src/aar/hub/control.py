@@ -17,7 +17,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from aar.hub.common import InvalidInput, actor_dict, clean_text, require_human
+from aar.hub.common import (
+    InvalidInput,
+    SkippedEvent,
+    actor_dict,
+    clean_text,
+    is_text,
+    require_human,
+)
 from aar.hub.events import (
     Actor,
     Event,
@@ -26,6 +33,7 @@ from aar.hub.events import (
     Transaction,
     match_or_conflict,
 )
+from aar.hub.registry import Registry
 
 EVENT_STOPPED = "control.stopped"
 EVENT_RESUMED = "control.resumed"
@@ -109,6 +117,7 @@ class ControlStatus:
     """Every active stop. ``running`` is true only when there are none."""
 
     stops: tuple[StopRecord, ...]
+    skipped: tuple[SkippedEvent, ...] = ()
 
     @property
     def running(self) -> bool:
@@ -137,24 +146,36 @@ class NotStopped(Exception):
     """Raised by :func:`resume` when the scope is not stopped."""
 
 
-def _fold(events: list[Event]) -> dict[str, StopRecord]:
+def _problem(event: Event) -> str | None:
+    """Why a control event is unusable, or ``None``. Shared by the writers and the fold."""
+    payload = event.payload
+    if not isinstance(payload, dict):
+        return "payload is not an object"
+    try:
+        StopScope.parse(payload.get("scope"))
+    except InvalidInput as exc:
+        return str(exc)
+    if not is_text(payload.get("reason"), MAX_REASON):
+        return f"reason is not 1-{MAX_REASON} characters"
+    if event.type == EVENT_RESUMED and event.actor.kind != "human":
+        # Only humans resume, even if an agent appended a resume straight to the log.
+        return f"resume by {event.actor.kind}:{event.actor.id}, not a human"
+    return None
+
+
+def _fold(events: list[Event], skipped: list[SkippedEvent] | None = None) -> dict[str, StopRecord]:
+    """Active stops by scope. A malformed or forged event is skipped, never raised."""
     stops: dict[str, StopRecord] = {}
     for event in events:
-        try:
-            scope = StopScope.parse(event.payload.get("scope"))
-        except InvalidInput:
+        problem = _problem(event)
+        if problem is not None:
+            if skipped is not None:
+                skipped.append(SkippedEvent.of(event, problem))
             continue
-        key = str(scope)
+        key = str(StopScope.parse(event.payload["scope"]))
         if event.type == EVENT_STOPPED:
-            reason = event.payload.get("reason")
-            stops[key] = StopRecord(
-                scope=scope,
-                reason=reason if isinstance(reason, str) else "",
-                by=event.actor,
-                at=event.ts,
-                event_id=event.id,
-            )
-        elif event.type == EVENT_RESUMED and event.actor.kind == "human":
+            stops[key] = _record(event)
+        else:
             stops.pop(key, None)
     return stops
 
@@ -166,7 +187,9 @@ def _order(stops: dict[str, StopRecord]) -> tuple[StopRecord, ...]:
 
 def status(log: EventLog) -> ControlStatus:
     """Return every active stop (``all`` first, then projects, then nodes)."""
-    return ControlStatus(_order(_fold(list(log.iter_events(types=_CONTROL_TYPES)))))
+    skipped: list[SkippedEvent] = []
+    stops = _fold(list(log.iter_events(types=_CONTROL_TYPES)), skipped)
+    return ControlStatus(_order(stops), tuple(skipped))
 
 
 def assert_running(
@@ -238,6 +261,12 @@ def stop(
         existing = _retry(txn, idempotency_key, EVENT_STOPPED, payload, by)
         if existing is not None:
             return _record(existing)
+        if scope.kind == "project" and Registry(log).get(scope.id or "") is None:
+            # A typo must not become a stop that matches nothing and looks like safety.
+            raise InvalidInput(
+                "scope",
+                f"no project {scope.id!r} in the registry; stop 'all' or a listed project",
+            )
         event = txn.append(
             EVENT_STOPPED,
             by,

@@ -85,7 +85,7 @@ def test_grant_validates_scope_ttl_and_text(log: EventLog) -> None:
         _grant(log, clock, ttl=timedelta(hours=25))
     with pytest.raises(InvalidInput):
         _grant(log, clock, ttl=0)
-    for bad in (float("nan"), float("inf"), float("-inf")):
+    for bad in (float("nan"), float("inf"), float("-inf"), 1e300, 10**30, -(10**30)):
         with pytest.raises(InvalidInput):
             _grant(log, clock, ttl=bad)
     with pytest.raises(InvalidInput):
@@ -152,9 +152,13 @@ def test_wrong_scope_and_wrong_target_are_refused_without_burning_the_token(
         approvals.consume(log, token.token_id, "cloud.restore", "Local Database", NODE, clock=clock)
     with pytest.raises(approvals.ApprovalTargetMismatch):
         approvals.consume(log, token.token_id, "db.switch", "Other Database", NODE, clock=clock)
+    before = log.latest_seq()
     with pytest.raises(approvals.ApprovalNotFound):
         approvals.consume(log, "apv_missing", "db.switch", "Local Database", NODE, clock=clock)
-    assert _refusal_codes(log) == ["wrong_scope", "wrong_target", "not_found"]
+    # An id nobody granted is refused without writing anything (no log flooding);
+    # refusals against a real token stay on the audit trail.
+    assert log.latest_seq() == before
+    assert _refusal_codes(log) == ["wrong_scope", "wrong_target"]
     # The refused attempts did not use it up.
     approvals.consume(log, token.token_id, "db.switch", "Local Database", NODE, clock=clock)
 

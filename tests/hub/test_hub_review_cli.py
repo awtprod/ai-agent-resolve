@@ -653,3 +653,21 @@ def test_a_missing_artifact_store_is_reported_and_not_created(
     assert str(missing) in err["error"]["message"]
     assert not missing.exists()
     assert hub.log.latest_seq() == seq
+
+
+def test_withdraw_by_the_requester_cancels_the_review_and_others_are_refused(
+    hub: Hub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    review_id = _request(hub, capsys)
+    base = ["hub", "review", "withdraw", "--db", str(hub.db), "--project", hub.project_id]
+    base += ["--review", review_id, "--reason", "superseded by v2"]
+
+    code, _, err = _run(capsys, *base, "--actor", "agent:agent-2")
+    assert code == 2
+    assert err is not None and err["error"]["code"] == "NotRequester"
+
+    code, out, err = _run(capsys, *base, "--actor", "agent:agent-1")
+    assert (code, err) == (0, None)
+    assert out is not None and out["reason"] == "superseded by v2"
+    review = get_review(hub.log, hub.project_id, review_id)
+    assert review is not None and review.status == "cancelled" and not review.pending

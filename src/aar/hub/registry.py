@@ -18,6 +18,7 @@ import secrets
 from dataclasses import dataclass, field
 from typing import Any
 
+from aar.hub.common import SkippedEvent
 from aar.hub.events import Actor, Event, EventLog, Transaction, match_or_conflict
 
 SOURCE_KINDS = frozenset({"cloud_library", "local_db", "drp_file", "drt_file"})
@@ -113,12 +114,62 @@ def _reduce(
             project.aliases.append(alias)
 
 
+def _source_ok(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("kind") in SOURCE_KINDS
+        and isinstance(value.get("locator"), dict)
+        and (value.get("host") is None or isinstance(value.get("host"), str))
+    )
+
+
+def _problem(projects: dict[str, Project], event: Event) -> str | None:
+    """Why ``event`` cannot be folded, or ``None``. A bad event is skipped, never raised."""
+    payload = event.payload
+    if not isinstance(payload, dict):
+        return "payload is not an object"
+    pid = payload.get("project_id")
+    if not isinstance(pid, str) or not 0 < len(pid) <= 128:
+        return "project_id is not an id"
+    if event.type == EVENT_PROJECT_CREATED:
+        if pid in projects:
+            return f"project {pid} already exists"
+        if not isinstance(payload.get("name"), str):
+            return "name is not text"
+        sources = payload.get("sources", [])
+        if not isinstance(sources, list) or not all(_source_ok(s) for s in sources):
+            return "sources are malformed"
+        aliases = payload.get("aliases", [])
+        if not isinstance(aliases, list) or not all(isinstance(a, str) for a in aliases):
+            return "aliases are not a list of text"
+        return None
+    if pid not in projects:
+        return f"no project {pid}"
+    if event.type == EVENT_PROJECT_RENAMED:
+        return None if isinstance(payload.get("name"), str) else "name is not text"
+    if event.type == EVENT_SOURCE_ADDED:
+        return None if _source_ok(payload.get("source")) else "source is malformed"
+    if event.type == EVENT_ALIAS_ADDED:
+        return None if isinstance(payload.get("alias"), str) else "alias is not text"
+    return f"not a registry event type: {event.type!r}"
+
+
+def _fold(projects: dict[str, Project], skipped: list[SkippedEvent], event: Event) -> None:
+    """Fold one event, or record it as skipped. Never raises."""
+    problem = _problem(projects, event)
+    if problem is None:
+        _reduce(projects, event.type, event.payload, event.ts)
+    else:
+        skipped.append(SkippedEvent.of(event, problem))
+
+
 class Registry:
     """Project registry projected from the event log."""
 
     def __init__(self, log: EventLog) -> None:
         self._log = log
         self._projects: dict[str, Project] = {}
+        self._skipped: list[SkippedEvent] = []
         self._last_seq = 0
         self.refresh()
 
@@ -127,8 +178,9 @@ class Registry:
     def rebuild(self) -> dict[str, Project]:
         """Return a fresh projection built from the whole log (independent of live state)."""
         projects: dict[str, Project] = {}
+        skipped: list[SkippedEvent] = []
         for event in self._log.iter_events(types=_REGISTRY_TYPES):
-            _reduce(projects, event.type, event.payload, event.ts)
+            _fold(projects, skipped, event)
         return projects
 
     def refresh(self) -> None:
@@ -138,16 +190,22 @@ class Registry:
         ``latest_seq()`` read that could jump past events appended since the rebuild.
         """
         projects: dict[str, Project] = {}
+        skipped: list[SkippedEvent] = []
         last_seq = 0
         for event in self._log.iter_events(types=_REGISTRY_TYPES):
-            _reduce(projects, event.type, event.payload, event.ts)
+            _fold(projects, skipped, event)
             last_seq = event.seq
         self._projects = projects
+        self._skipped = skipped
         self._last_seq = last_seq
 
     def snapshot(self) -> dict[str, Project]:
         """Return the current live projection."""
         return self._projects
+
+    def skipped(self) -> tuple[SkippedEvent, ...]:
+        """Events the live projection could not use (malformed or forged)."""
+        return tuple(self._skipped)
 
     # -- mutations ----------------------------------------------------------
 
@@ -329,10 +387,10 @@ class Registry:
     def _catch_up(self, txn: Transaction) -> None:
         for event in txn.read(self._last_seq, types=_REGISTRY_TYPES):
             if event.seq > self._last_seq:
-                _reduce(self._projects, event.type, event.payload, event.ts)
+                _fold(self._projects, self._skipped, event)
                 self._last_seq = event.seq
 
     def _apply(self, event: Event) -> None:
         if event.seq > self._last_seq:
-            _reduce(self._projects, event.type, event.payload, event.ts)
+            _fold(self._projects, self._skipped, event)
             self._last_seq = event.seq

@@ -6,6 +6,13 @@ console, plus the approval tokens of DESIGN section 5. It is a small Starlette a
 that renders HTML on the server, with inline CSS and a few lines of inline script
 (seek the player to a note), and works at phone width.
 
+Identity is network reachability (read this before exposing it). There are no
+accounts, passwords or sessions. Whoever can reach the port acts as ``--operator``;
+with ``--trust-tailscale-headers``, any process on this host can claim any login by
+sending the header to loopback. That is acceptable only on the tailnet with trusted
+local processes (DESIGN D2); a real credential is an open item (DESIGN section 7)
+and is required before any exposure beyond the tailnet.
+
 Security model (the hub is tailnet-only for v1, DESIGN D2):
 
 - It binds to 127.0.0.1 by default; the intended remote path is ``tailscale serve``
@@ -38,11 +45,10 @@ import os
 import re
 import secrets
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from datetime import timedelta
 from typing import BinaryIO
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qsl, quote, urlsplit
 
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
@@ -58,11 +64,19 @@ from starlette.responses import (
     StreamingResponse,
 )
 from starlette.routing import Route
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from aar.hub import approvals, control, reviews
 from aar.hub.artifacts import ArtifactStore, CorruptArtifact
-from aar.hub.common import Clock, HumanRequired, InvalidInput, parse_ts, utcnow
+from aar.hub.common import (
+    MAX_SKIPPED_LISTED,
+    Clock,
+    HumanRequired,
+    InvalidInput,
+    SkippedEvent,
+    parse_ts,
+    utcnow,
+)
 from aar.hub.events import Actor, EventLog, IdempotencyConflict
 from aar.hub.leaseboard import lease_board
 from aar.hub.registry import Registry
@@ -76,6 +90,8 @@ _CHUNK = 64 * 1024
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}$")
 _ARTIFACT_RE = re.compile(r"^[0-9a-f]{64}$")
 _IDEM_RE = re.compile(r"^[0-9a-f]{32}$")
+# ASCII digits only: str.isdigit() accepts "²" and other digits int() rejects.
+_UINT_RE = re.compile(r"^[0-9]{1,12}$")
 _RANGE_RE = re.compile(r"^bytes=(\d{0,18})-(\d{0,18})$")
 _PORT_RE = re.compile(r"^:\d{1,5}$")
 
@@ -236,6 +252,93 @@ def _is_loopback(host: str | None) -> bool:
     return address.is_loopback or (mapped is not None and mapped.is_loopback)
 
 
+_CONTENT_LENGTH_RE = re.compile(r"^[0-9]{1,18}$")
+MAX_FIELDS = 32
+
+
+async def read_form(request: Request) -> FormData:
+    """Read a urlencoded form, enforcing the body cap while streaming.
+
+    The cap is enforced here, not by Starlette's ``max_body_size``: that one replaces
+    whatever the app answers with a bare text 413, losing the structured error and the
+    security headers. A declared ``Content-Length`` over the cap is refused before any
+    byte is read; a body without one is counted as it arrives.
+    """
+    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if content_type != "application/x-www-form-urlencoded":
+        raise ConsoleError(
+            415, "unsupported_media_type", "console forms are application/x-www-form-urlencoded"
+        )
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        if not _CONTENT_LENGTH_RE.fullmatch(declared.strip()):
+            raise ConsoleError(400, "bad_content_length", "Content-Length is not a number")
+        if int(declared) > MAX_BODY:
+            raise _too_large()
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_BODY:
+            raise _too_large()
+        chunks.append(chunk)
+    try:
+        text = b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConsoleError(400, "bad_encoding", "the form is not valid UTF-8") from exc
+    try:
+        pairs = parse_qsl(text, keep_blank_values=True, max_num_fields=MAX_FIELDS)
+    except ValueError as exc:
+        raise ConsoleError(
+            400, "too_many_fields", f"a form has at most {MAX_FIELDS} fields"
+        ) from exc
+    return FormData(pairs)
+
+
+def _too_large() -> ConsoleError:
+    return ConsoleError(
+        413,
+        "body_too_large",
+        f"the form is larger than {MAX_BODY // 1024} KiB",
+        "Shorten the text and submit again.",
+    )
+
+
+_DEFAULT_HEADERS = (
+    (b"x-content-type-options", b"nosniff"),
+    (b"x-frame-options", b"DENY"),
+    (b"cache-control", b"no-store"),
+    (b"content-security-policy", b"default-src 'none'; frame-ancestors 'none'"),
+    (b"referrer-policy", b"same-origin"),
+)
+
+
+class SecurityHeaders:
+    """Add the console's security headers to every response that lacks them.
+
+    Pages set their own (a nonce CSP); this catches everything else: JSON errors,
+    the Host guard's 421 and anything a library answers directly.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                present = {name.lower() for name, _ in headers}
+                headers += [(n, v) for n, v in _DEFAULT_HEADERS if n not in present]
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
 class HostGuard:
     """Refuse any request whose ``Host`` is not an allowed name (blocks DNS rebinding)."""
 
@@ -284,6 +387,8 @@ def _map_error(exc: BaseException) -> ConsoleError | None:
         return ConsoleError(409, "already_decided", str(exc), "Reload to see the decision.")
     if isinstance(exc, reviews.ReviewNotOpen):
         return ConsoleError(409, "review_not_open", str(exc))
+    if isinstance(exc, reviews.SubjectCancelled):
+        return ConsoleError(409, "subject_cancelled", str(exc))
     if isinstance(exc, reviews.ReviewNotFound):
         return ConsoleError(404, "review_not_found", str(exc))
     if isinstance(exc, approvals.ApprovalNotFound):
@@ -381,6 +486,9 @@ background:#faf9f6}
 .decision.approve{border-color:var(--ok)}
 .decision.reject{border-color:var(--bad)}
 .empty{color:var(--muted);font-style:italic}
+.skipped{background:#fff6dc;border:1px solid #e6cf85;border-radius:8px;padding:.5rem .8rem;
+margin:0 0 1rem;font-size:.9rem;overflow-wrap:anywhere}
+.skipped summary{cursor:pointer;font-weight:600}
 .stopped{background:#fdecea;border:2px solid var(--bad)}
 table.board{width:100%;border-collapse:collapse;font-size:.92rem}
 table.board th,table.board td{text-align:left;padding:.45rem .5rem;
@@ -395,6 +503,7 @@ button.tc{background:#1f2a44;color:#cfe0ff;border-color:#34466f}
 .flash{background:#14301f;border-color:#235c37;color:#cfeedb}
 .error{background:#3a1715;border-color:#6e2a25}
 .stopped{background:#2a1413}
+.skipped{background:#2e2610;border-color:#5c4b1c}
 .badge{background:#2f3137;color:#d4d2cc}
 .badge.active,.badge.pending{background:#1e3366;color:#cfe0ff}
 .badge.done,.badge.approve{background:#173d26;color:#bde8cb}
@@ -463,10 +572,16 @@ class _Page:
     csrf: str | None
     nonce: str
     players: int = 0
+    skipped: dict[str, SkippedEvent] = field(default_factory=dict)
 
     def next_player_id(self) -> str:
         self.players += 1
         return f"player-{self.players}"
+
+    def note_skipped(self, items: tuple[SkippedEvent, ...] | list[SkippedEvent]) -> None:
+        """Record events a projection on this page could not use."""
+        for item in items:
+            self.skipped.setdefault(item.event_id, item)
 
 
 class Console:
@@ -539,7 +654,7 @@ class Console:
         """Run every write check and return the actor, the form and its idempotency key."""
         self.check_origin(request)
         actor = self.require_actor(request)
-        form = await request.form(max_files=0, max_fields=32, max_part_size=MAX_BODY)
+        form = await read_form(request)
         token = form.get("csrf")
         if not isinstance(token, str) or not self.csrf.verify(token, _ident(actor)):
             raise ConsoleError(
@@ -572,8 +687,19 @@ class Console:
     def render(
         self, ctx: _Page, title: str, nav: str, body: Html, *, status: int = 200
     ) -> HTMLResponse:
-        stops = control.status(self.log).stops
         banner = Html("")
+        try:
+            state = control.status(self.log)
+        except Exception:
+            ref = _log_failure("reading the emergency-stop state")
+            banner = fmt(
+                '<div class="banner" role="alert">Could not read the emergency-stop state '
+                '(reference {ref}). Check <a href="/control">Control</a>.</div>',
+                ref=ref,
+            )
+            state = control.ControlStatus(())
+        ctx.note_skipped(state.skipped)
+        stops = state.stops
         if stops:
             first = stops[0]
             more = f" (+{len(stops) - 1} more)" if len(stops) > 1 else ""
@@ -620,7 +746,7 @@ class Console:
             '<style nonce="{nonce}">{css}</style></head><body>'
             '<header><span class="brand">aar console</span><nav>{links}</nav>'
             '<span class="who">{who}</span></header>{banner}'
-            "<main><h1>{title}</h1>{flash}{body}</main>"
+            "<main><h1>{title}</h1>{flash}{skipped}{body}</main>"
             '<script nonce="{nonce}">{script}</script></body></html>',
             title=title,
             nonce=ctx.nonce,
@@ -629,6 +755,7 @@ class Console:
             who=who,
             banner=banner,
             flash=flash,
+            skipped=_skipped_notice(ctx.skipped.values()),
             body=body,
             script=Html(_SCRIPT),
         )
@@ -637,14 +764,9 @@ class Console:
             f"script-src 'nonce-{ctx.nonce}'; img-src 'self'; media-src 'self'; "
             "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
         )
-        headers = {
-            "Content-Security-Policy": csp,
-            "X-Content-Type-Options": "nosniff",
-            "X-Frame-Options": "DENY",
-            "Referrer-Policy": "same-origin",
-            "Cache-Control": "no-store",
-        }
-        return HTMLResponse(document, status_code=status, headers=headers)
+        # nosniff, X-Frame-Options, Referrer-Policy and no-store come from
+        # SecurityHeaders, which covers every response; a page adds its nonce CSP.
+        return HTMLResponse(document, status_code=status, headers={"Content-Security-Policy": csp})
 
     def error_response(self, request: Request, error: ConsoleError) -> Response:
         if _wants_json(request):
@@ -674,8 +796,10 @@ class Console:
 
     # -- reviews -------------------------------------------------------------
 
-    def project_names(self) -> dict[str, str]:
-        return {project.id: project.name for project in Registry(self.log).list()}
+    def project_names(self, ctx: _Page) -> dict[str, str]:
+        registry = Registry(self.log)
+        ctx.note_skipped(registry.skipped())
+        return {project.id: project.name for project in registry.list()}
 
     def media(self, ctx: _Page, artifact_id: str, label: str) -> tuple[Html, str | None]:
         """Return a player (or link) for one render, and the player's element id."""
@@ -739,7 +863,8 @@ class Console:
             )
         notes = self.notes_list(review, first_player)
         decision = self.decision_block(ctx, review, return_to="detail" if detail else "queue")
-        note_form = self.note_form(ctx, review, first_player) if detail else Html("")
+        open_for_notes = detail and review.pending and review.decision is None
+        note_form = self.note_form(ctx, review, first_player) if open_for_notes else Html("")
         return fmt(
             '<article class="card">{title}{meta}<div class="review-body"><div class="media">'
             '{players}{extra}</div><div class="side"><h3>Notes</h3>{notes}{decision}</div>'
@@ -798,6 +923,16 @@ class Console:
                 who=d.by.id,
                 at=_when(d.ts),
                 reason=d.reason,
+            )
+        if review.withdrawal is not None:
+            w = review.withdrawal
+            return fmt(
+                '<div class="decision"><p>{badge} by <strong>{who}</strong> at {at}</p>'
+                '<p class="note-text">{reason}</p></div>',
+                badge=_badge("withdrawn", "cancelled"),
+                who=f"{w.by.kind}:{w.by.id}",
+                at=_when(w.ts),
+                reason=w.reason,
             )
         if not review.pending:
             return fmt(
@@ -861,8 +996,10 @@ class Console:
         )
 
     def queue_body(self, ctx: _Page) -> Html:
-        names = self.project_names()
-        everything = reviews.list_reviews(self.log)
+        names = self.project_names(ctx)
+        scan = reviews.scan_reviews(self.log)
+        ctx.note_skipped(scan.skipped)
+        everything = list(scan.reviews)
         pending = [r for r in everything if r.pending]
         decided = sorted(
             (r for r in everything if not r.pending),
@@ -904,7 +1041,8 @@ class Console:
         )
 
     def detail_body(self, ctx: _Page, project_id: str, review_id: str) -> Html:
-        review = reviews.get_review(self.log, project_id, review_id)
+        review, skipped = reviews.review_view(self.log, project_id, review_id)
+        ctx.note_skipped(skipped)
         if review is None:
             raise ConsoleError(
                 404, "review_not_found", f"no review {review_id!r} in project {project_id!r}"
@@ -916,12 +1054,13 @@ class Console:
             id=review.id,
             pid=review.project_id,
         )
-        return join([subject, self.review_card(ctx, review, self.project_names(), detail=True)])
+        return join([subject, self.review_card(ctx, review, self.project_names(ctx), detail=True)])
 
     # -- leases ----------------------------------------------------------------
 
     def leases_body(self, ctx: _Page) -> Html:
         board = lease_board(self.log, clock=self.clock)
+        ctx.note_skipped(board.skipped)
         if board.leases:
             rows = join(
                 fmt(
@@ -975,7 +1114,9 @@ class Console:
 
     def approvals_body(self, ctx: _Page) -> Html:
         now = self.clock()
-        tokens = approvals.list_approvals(self.log)
+        view = approvals.approvals_view(self.log)
+        ctx.note_skipped(view.skipped)
+        tokens = list(view.tokens)
         active = [t for t in tokens if t.state(now) == "active"]
         inactive = [t for t in tokens if t.state(now) != "active"][:50]
         grant = self.write_disabled_note(ctx)
@@ -1080,50 +1221,25 @@ class Console:
 
     # -- control -------------------------------------------------------------------
 
+    def panel(self, ctx: _Page, what: str, build: Callable[[_Page], Html]) -> Html:
+        """Render one panel; if it fails, show that (with a log reference) instead.
+
+        Used on the STOP page so one broken projection can never hide the stop and
+        resume controls.
+        """
+        try:
+            return build(ctx)
+        except Exception:
+            ref = _log_failure(f"rendering the {what} panel")
+            return fmt(
+                '<section class="error" role="alert"><p>The {what} panel failed to load '
+                "(reference {ref}). The other controls on this page still work.</p></section>",
+                what=what,
+                ref=ref,
+            )
+
     def control_body(self, ctx: _Page) -> Html:
-        stops = control.status(self.log).stops
-        names = self.project_names()
-        if stops:
-            items = []
-            for stop in stops:
-                label = (
-                    names.get(stop.scope.id or "", stop.scope.id or "")
-                    if stop.scope.kind == "project"
-                    else str(stop.scope)
-                )
-                resume = self.write_disabled_note(ctx)
-                if ctx.actor is not None:
-                    resume = fmt(
-                        '<form method="post" action="/control/resume">{hidden}'
-                        '<input type="hidden" name="scope" value="{scope}">'
-                        '<label for="r-{n}">Why is it safe to resume?</label>'
-                        '<input id="r-{n}" name="reason" required maxlength="{rmax}">'
-                        '<div class="actions"><button class="approve" type="submit">Resume '
-                        "{label}</button></div></form>",
-                        hidden=self.hidden(ctx),
-                        scope=str(stop.scope),
-                        n=len(items),
-                        rmax=control.MAX_REASON,
-                        label=label,
-                    )
-                items.append(
-                    fmt(
-                        '<section class="card stopped"><h2>STOPPED: {label}</h2>'
-                        '<p class="note-text">{reason}</p>'
-                        '<p class="meta">by {kind} <strong>{who}</strong> at {at} &middot; scope '
-                        "<code>{scope}</code></p>{resume}</section>",
-                        label=label,
-                        reason=stop.reason,
-                        kind=_badge(stop.by.kind),
-                        who=stop.by.id,
-                        at=_when(stop.at),
-                        scope=str(stop.scope),
-                        resume=resume,
-                    )
-                )
-            current = join(items)
-        else:
-            current = Html('<p class="card">Everything is running. No stop is in effect.</p>')
+        current = self.panel(ctx, "current stops", self.stops_panel)
         if ctx.actor is None:
             return join([current, self.write_disabled_note(ctx)])
         big = fmt(
@@ -1136,32 +1252,126 @@ class Console:
             hidden=self.hidden(ctx),
             rmax=control.MAX_REASON,
         )
+        scoped = self.panel(ctx, "stop one project or node", self.targets_panel)
+        return join([current, big, scoped])
+
+    def safe_project_names(self, ctx: _Page) -> dict[str, str]:
+        """Project names for labels; empty (and logged) if the registry cannot be read."""
+        try:
+            return self.project_names(ctx)
+        except Exception:
+            _log_failure("reading project names for the STOP page")
+            return {}
+
+    def stops_panel(self, ctx: _Page) -> Html:
+        state = control.status(self.log)
+        ctx.note_skipped(state.skipped)
+        if not state.stops:
+            return Html('<p class="card">Everything is running. No stop is in effect.</p>')
+        names = self.safe_project_names(ctx)
+        items = []
+        for stop in state.stops:
+            label = (
+                names.get(stop.scope.id or "", stop.scope.id or "")
+                if stop.scope.kind == "project"
+                else str(stop.scope)
+            )
+            resume = self.write_disabled_note(ctx)
+            if ctx.actor is not None:
+                resume = fmt(
+                    '<form method="post" action="/control/resume">{hidden}'
+                    '<input type="hidden" name="scope" value="{scope}">'
+                    '<label for="r-{n}">Why is it safe to resume?</label>'
+                    '<input id="r-{n}" name="reason" required maxlength="{rmax}">'
+                    '<div class="actions"><button class="approve" type="submit">Resume '
+                    "{label}</button></div></form>",
+                    hidden=self.hidden(ctx),
+                    scope=str(stop.scope),
+                    n=len(items),
+                    rmax=control.MAX_REASON,
+                    label=label,
+                )
+            items.append(
+                fmt(
+                    '<section class="card stopped"><h2>STOPPED: {label}</h2>'
+                    '<p class="note-text">{reason}</p>'
+                    '<p class="meta">by {kind} <strong>{who}</strong> at {at} &middot; scope '
+                    "<code>{scope}</code></p>{resume}</section>",
+                    label=label,
+                    reason=stop.reason,
+                    kind=_badge(stop.by.kind),
+                    who=stop.by.id,
+                    at=_when(stop.at),
+                    scope=str(stop.scope),
+                    resume=resume,
+                )
+            )
+        return join(items)
+
+    def targets_panel(self, ctx: _Page) -> Html:
+        names = self.project_names(ctx)
         targets: list[tuple[str, str]] = [(f"project:{pid}", name) for pid, name in names.items()]
         board = lease_board(self.log, clock=self.clock)
+        ctx.note_skipped(board.skipped)
         nodes = sorted(
             {lease.node_id for lease in board.leases} | {p.node_id for p in board.presence}
         )
         targets += [(f"node:{node}", f"node {node}") for node in nodes]
-        if targets:
-            buttons = join(
-                fmt(
-                    '<form method="post" action="/control/stop">{hidden}'
-                    '<input type="hidden" name="scope" value="{scope}">'
-                    '<button class="danger" type="submit">Stop {label}</button></form>',
-                    hidden=self.hidden(ctx),
-                    scope=scope,
-                    label=label,
-                )
-                for scope, label in targets
+        if not targets:
+            return Html("")
+        buttons = join(
+            fmt(
+                '<form method="post" action="/control/stop">{hidden}'
+                '<input type="hidden" name="scope" value="{scope}">'
+                '<button class="danger" type="submit">Stop {label}</button></form>',
+                hidden=self.hidden(ctx),
+                scope=scope,
+                label=label,
             )
-            scoped = fmt(
-                '<section class="card"><h2>Stop one project or node</h2>'
-                '<div class="actions">{buttons}</div></section>',
-                buttons=buttons,
-            )
-        else:
-            scoped = Html("")
-        return join([current, big, scoped])
+            for scope, label in targets
+        )
+        return fmt(
+            '<section class="card"><h2>Stop one project or node</h2>'
+            '<div class="actions">{buttons}</div></section>',
+            buttons=buttons,
+        )
+
+
+def _log_failure(what: str) -> str:
+    """Log the current exception with a short reference a human can quote; return it."""
+    ref = secrets.token_hex(4)
+    logger.exception("console failure [%s] while %s", ref, what)
+    return ref
+
+
+def _skipped_notice(items: Iterable[SkippedEvent]) -> Html:
+    """'N malformed events ignored' with their ids, or nothing."""
+    listed = sorted(items, key=lambda item: item.seq)
+    if not listed:
+        return Html("")
+    rows = join(
+        fmt(
+            "<li><code>{id}</code> {type}: {reason}</li>",
+            id=item.event_id,
+            type=item.type,
+            reason=item.reason,
+        )
+        for item in listed[:MAX_SKIPPED_LISTED]
+    )
+    more = (
+        fmt("<li>and {n} more</li>", n=len(listed) - MAX_SKIPPED_LISTED)
+        if len(listed) > MAX_SKIPPED_LISTED
+        else Html("")
+    )
+    return fmt(
+        '<details class="skipped"><summary>{n} malformed event{s} ignored</summary>'
+        "<p>The log is append-only, so these stay, but nothing on this page uses them.</p>"
+        "<ul>{rows}{more}</ul></details>",
+        n=len(listed),
+        s="" if len(listed) == 1 else "s",
+        rows=rows,
+        more=more,
+    )
 
 
 def _back_path(request: Request) -> str:
@@ -1195,8 +1405,8 @@ def _field(form: FormData, name: str, *, required: bool = True) -> str:
 
 def _int_field(form: FormData, name: str) -> int:
     raw = _field(form, name).strip()
-    if not raw.isdigit() or len(raw) > 12:
-        raise ConsoleError(422, "invalid_input", f"{name}: must be a whole number")
+    if not _UINT_RE.fullmatch(raw):
+        raise ConsoleError(422, "invalid_input", f"{name}: must be a whole number (0-9 digits)")
     return int(raw)
 
 
@@ -1406,7 +1616,7 @@ def build_app(
                 log,
                 _field(form, "scope"),
                 _field(form, "target"),
-                timedelta(seconds=_int_field(form, "ttl")),
+                _int_field(form, "ttl"),
                 _field(form, "reason"),
                 actor,
                 idempotency_key=key,
@@ -1474,14 +1684,17 @@ def build_app(
         return response
 
     async def server_error(request: Request, exc: Exception) -> Response:
-        logger.exception("console request failed: %s %s", request.method, request.url.path)
+        # Never echo the exception into the page (it can carry paths or agent text);
+        # give the human a reference that finds the traceback in the log.
+        ref = _log_failure(f"handling {request.method} {request.url.path}")
         return console.error_response(
             request,
             ConsoleError(
                 500,
                 "internal_error",
-                f"{type(exc).__name__}: {exc}",
-                "The full traceback is in the console's log.",
+                f"The console hit an unexpected error (reference {ref}).",
+                "Reload the page to see the current state before trying again. The "
+                "traceback is in the console's log under that reference.",
             ),
         )
 
@@ -1502,10 +1715,9 @@ def build_app(
     app = Starlette(
         routes=routes,
         exception_handlers={HTTPException: http_error, Exception: server_error},
-        max_body_size=MAX_BODY,
     )
     allowed = LOOPBACK_HOSTS | {name.lower() for name in config.allowed_hosts}
-    return HostGuard(app, frozenset(allowed))
+    return SecurityHeaders(HostGuard(app, frozenset(allowed)))
 
 
 WRITE_ROUTES = (

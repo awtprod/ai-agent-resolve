@@ -17,6 +17,7 @@ from aar.hub.control import (
     stop,
 )
 from aar.hub.events import Actor, EventLog, IdempotencyConflict
+from aar.hub.registry import Registry
 
 HUMAN = Actor("human", "operator-1")
 OTHER_HUMAN = Actor("human", "operator-2")
@@ -28,7 +29,12 @@ RESUMED = "control.resumed"
 
 
 def _log(tmp_path: Path) -> EventLog:
-    return EventLog(tmp_path / "hub.db")
+    """A hub with the two projects these tests stop (stops on unknown projects are refused)."""
+    log = EventLog(tmp_path / "hub.db")
+    registry = Registry(log)
+    for project_id in ("prj_demo", "prj_other"):
+        registry.create_project(f"demo-show {project_id}", HUMAN, project_id=project_id)
+    return log
 
 
 def _scopes(log: EventLog) -> list[str]:
@@ -351,13 +357,14 @@ def test_a_bad_scope_is_rejected_by_stop_and_resume_without_writing(
     tmp_path: Path, scope: str
 ) -> None:
     log = _log(tmp_path)
+    setup_seq = log.latest_seq()
 
     with pytest.raises(InvalidInput):
         stop(log, scope, "halt", HUMAN)
     with pytest.raises(InvalidInput):
         resume(log, scope, "fixed", HUMAN)
 
-    assert log.latest_seq() == 0
+    assert log.latest_seq() == setup_seq
 
 
 @pytest.mark.parametrize(
@@ -383,3 +390,14 @@ def test_a_reason_of_exactly_1000_characters_is_accepted(tmp_path: Path) -> None
     record = stop(log, "all", "x" * 1000, HUMAN)
 
     assert len(record.reason) == 1000
+
+
+def test_stopping_a_project_that_is_not_in_the_registry_is_refused(tmp_path: Path) -> None:
+    log = _log(tmp_path)
+    before = log.latest_seq()
+    with pytest.raises(InvalidInput, match="no project 'prj_typo'"):
+        stop(log, "project:prj_typo", "halt", HUMAN)
+    assert log.latest_seq() == before
+    assert status(log).running is True
+    stop(log, "project:prj_demo", "halt", HUMAN)  # a registered project still stops
+    assert status(log).running is False

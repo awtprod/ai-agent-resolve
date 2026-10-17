@@ -32,8 +32,11 @@ from typing import Any
 from aar.hub.common import (
     Clock,
     InvalidInput,
+    SkippedEvent,
     actor_dict,
     clean_text,
+    is_text,
+    is_ts,
     iso,
     parse_ts,
     require_human,
@@ -70,6 +73,9 @@ class ApprovalScope(StrEnum):
     CLOUD_CREATE = "cloud.create"
     CLOUD_RESTORE = "cloud.restore"
     SWITCH_FORCE = "switch.force"
+
+
+_SCOPE_VALUES = frozenset(scope.value for scope in ApprovalScope)
 
 
 class ApprovalError(Exception):
@@ -154,20 +160,70 @@ class Approval:
 # -- projection --------------------------------------------------------------
 
 
-def _fold(events: list[Event]) -> dict[str, Approval]:
+def _grant_problem(actor: Actor, payload: Any) -> str | None:
+    """Why a grant is unusable, or ``None``. Shared by :func:`grant` and the fold."""
+    if actor.kind != "human":
+        return f"granted by {actor.kind}:{actor.id}, not a human"
+    if not isinstance(payload, dict):
+        return "payload is not an object"
+    if not is_text(payload.get("token_id"), MAX_TOKEN_ID):
+        return "token_id is not an id"
+    if payload.get("scope") not in _SCOPE_VALUES:
+        return "scope is not an approval scope"
+    if not is_text(payload.get("target"), MAX_TARGET):
+        return f"target is not 1-{MAX_TARGET} characters"
+    if not is_text(payload.get("reason"), MAX_REASON):
+        return f"reason is not 1-{MAX_REASON} characters"
+    if not is_ts(payload.get("granted_at")) or not is_ts(payload.get("expires_at")):
+        return "granted_at or expires_at is not a timestamp"
+    return None
+
+
+def _revoke_problem(actor: Actor, payload: Any, token: Approval | None) -> str | None:
+    """Why a revoke is unusable, or ``None``. Only a human may revoke."""
+    if actor.kind != "human":
+        return f"revoked by {actor.kind}:{actor.id}, not a human"
+    if not isinstance(payload, dict):
+        return "payload is not an object"
+    if token is None:
+        return "revoke of an unknown token"
+    if token.consumed_at is not None or token.revoked_at is not None:
+        return "token was already used or revoked"
+    if not is_text(payload.get("reason"), MAX_REASON):
+        return f"reason is not 1-{MAX_REASON} characters"
+    return None if is_ts(payload.get("at")) else "at is not a timestamp"
+
+
+def _consume_problem(payload: Any, token: Approval | None) -> str | None:
+    if not isinstance(payload, dict):
+        return "payload is not an object"
+    if token is None:
+        return "consume of an unknown token"
+    if token.consumed_at is not None:
+        return "token was already consumed"
+    return None if is_ts(payload.get("at")) else "at is not a timestamp"
+
+
+def _fold(events: list[Event]) -> tuple[dict[str, Approval], list[SkippedEvent]]:
+    """Project tokens from their events. A malformed or forged event is skipped and
+    recorded, never raised: grants and revokes count only from humans."""
     tokens: dict[str, Approval] = {}
+    skipped: list[SkippedEvent] = []
     for event in events:
         payload = event.payload
-        token_id = payload.get("token_id")
-        if not isinstance(token_id, str):
-            continue
+        token_id = payload.get("token_id") if isinstance(payload, dict) else None
+        token = tokens.get(token_id) if isinstance(token_id, str) else None
         if event.type == EVENT_GRANTED:
-            # A token id is granted once, and only by a human: skip regrants, junk, and
-            # grants an agent or node appended straight to the log, around grant().
-            if token_id in tokens or event.actor.kind != "human":
-                continue
-            if not _grant_well_formed(payload):
-                continue
+            problem = _grant_problem(event.actor, payload)
+            if problem is None and token is not None:
+                problem = f"token {token_id} was already granted"
+        elif event.type == EVENT_REVOKED:
+            problem = _revoke_problem(event.actor, payload, token)
+        else:
+            problem = _consume_problem(payload, token)
+        if problem is not None:
+            skipped.append(SkippedEvent.of(event, problem))
+        elif event.type == EVENT_GRANTED:
             tokens[token_id] = Approval(
                 token_id=token_id,
                 scope=ApprovalScope(payload["scope"]),
@@ -177,51 +233,45 @@ def _fold(events: list[Event]) -> dict[str, Approval]:
                 granted_at=payload["granted_at"],
                 expires_at=payload["expires_at"],
             )
-            continue
-        token = tokens.get(token_id)
-        if token is None:
-            continue
-        if event.type == EVENT_REVOKED and token.revoked_at is None:
+        elif event.type == EVENT_REVOKED:
             tokens[token_id] = replace(
                 token,
                 revoked_by=event.actor,
-                revoked_at=payload.get("at", event.ts),
-                revoke_reason=payload.get("reason"),
+                revoked_at=payload["at"],
+                revoke_reason=payload["reason"],
             )
-        elif event.type == EVENT_CONSUMED and token.consumed_at is None:
-            tokens[token_id] = replace(
-                token, consumed_by=event.actor, consumed_at=payload.get("at", event.ts)
-            )
-    return tokens
-
-
-def _grant_well_formed(payload: dict[str, Any]) -> bool:
-    """Whether a grant event has the shape :func:`grant` writes (the log is shared)."""
-    if payload.get("scope") not in {s.value for s in ApprovalScope}:
-        return False
-    fields = ("target", "reason", "granted_at", "expires_at")
-    if not all(isinstance(payload.get(name), str) for name in fields):
-        return False
-    try:
-        parse_ts(payload["expires_at"])
-    except ValueError:
-        return False
-    return True
+        else:
+            tokens[token_id] = replace(token, consumed_by=event.actor, consumed_at=payload["at"])
+    return tokens, skipped
 
 
 def _token_in(txn: Transaction, token_id: str) -> Approval | None:
-    return _fold(txn.read(0, types=_TOKEN_TYPES)).get(token_id)
+    return _fold(txn.read(0, types=_TOKEN_TYPES))[0].get(token_id)
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalsView:
+    """Every token (newest grant first) and the events that could not be used."""
+
+    tokens: tuple[Approval, ...]
+    skipped: tuple[SkippedEvent, ...]
+
+
+def approvals_view(log: EventLog) -> ApprovalsView:
+    """Project every token and list the skipped events. Never raises on a bad event."""
+    tokens, skipped = _fold(list(log.iter_events(types=_TOKEN_TYPES)))
+    ordered = sorted(tokens.values(), key=lambda t: (t.granted_at, t.token_id), reverse=True)
+    return ApprovalsView(tuple(ordered), tuple(skipped))
 
 
 def list_approvals(log: EventLog) -> list[Approval]:
     """Return every token, newest grant first."""
-    tokens = _fold(list(log.iter_events(types=_TOKEN_TYPES)))
-    return sorted(tokens.values(), key=lambda t: (t.granted_at, t.token_id), reverse=True)
+    return list(approvals_view(log).tokens)
 
 
 def get_approval(log: EventLog, token_id: str) -> Approval | None:
     """Return one token, or ``None``."""
-    return _fold(list(log.iter_events(types=_TOKEN_TYPES))).get(token_id)
+    return _fold(list(log.iter_events(types=_TOKEN_TYPES)))[0].get(token_id)
 
 
 # -- mutations ---------------------------------------------------------------
@@ -231,8 +281,10 @@ def _ttl(ttl: timedelta | float | int) -> timedelta:
     if isinstance(ttl, bool):
         raise InvalidInput("ttl", "must be a duration")
     if isinstance(ttl, (int, float)):
-        if not math.isfinite(ttl):
-            raise InvalidInput("ttl", f"must be a finite number of seconds, got {ttl!r}")
+        # Range-check the number itself: timedelta() overflows on huge values.
+        low, high = MIN_TTL.total_seconds(), MAX_TTL.total_seconds()
+        if not math.isfinite(ttl) or not low <= ttl <= high:
+            raise InvalidInput("ttl", f"must be between {low:g} and {high:g} seconds")
         ttl = timedelta(seconds=ttl)
     if not isinstance(ttl, timedelta):
         raise InvalidInput("ttl", f"must be a duration, got {type(ttl).__name__}")
@@ -301,6 +353,9 @@ def grant(
             "granted_at": iso(now),
             "expires_at": iso(now + ttl),
         }
+        problem = _grant_problem(by, payload)
+        if problem is not None:
+            raise InvalidInput("payload", problem)
         txn.append(EVENT_GRANTED, by, payload, idempotency_key=idempotency_key)
         token = _token_in(txn, token_id)
     if token is None:  # pragma: no cover - just appended
@@ -346,12 +401,11 @@ def revoke(
             raise ApprovalRevoked(
                 token_id, f"token {token_id} was already revoked at {token.revoked_at}"
             )
-        txn.append(
-            EVENT_REVOKED,
-            by,
-            {**request, "at": iso(clock())},
-            idempotency_key=idempotency_key,
-        )
+        payload = {**request, "at": iso(clock())}
+        problem = _revoke_problem(by, payload, token)
+        if problem is not None:
+            raise InvalidInput("payload", problem)
+        txn.append(EVENT_REVOKED, by, payload, idempotency_key=idempotency_key)
         token = _token_in(txn, token_id)
     if token is None:  # pragma: no cover - checked above
         raise ApprovalNotFound(token_id, f"no approval token {token_id!r}")
@@ -410,6 +464,10 @@ def consume(
     with log.transaction() as txn:
         now = clock()
         token = _token_in(txn, token_id)
+        if token is None:
+            # Nothing to audit against an id nobody granted: refuse without writing,
+            # so probing random ids cannot flood the log.
+            raise ApprovalNotFound(token_id, f"no approval token {token_id!r}")
         refusal = _refusal(token, token_id, scope, target, now)
         if refusal is None:
             try:

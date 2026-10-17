@@ -176,15 +176,24 @@ class ArtifactStore:
         event = self._log.get_by_idempotency_key(f"artifact:{artifact_id}")
         if event is None:
             return None
-        payload = event.payload
+        # The key is claimable by any writer, so read the payload defensively: a
+        # malformed record yields empty fields rather than an exception on every read.
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        size = payload.get("size")
+        meta = payload.get("meta")
+
+        def text(key: str) -> str | None:
+            value = payload.get(key)
+            return value if isinstance(value, str) else None
+
         return ArtifactMeta(
             id=artifact_id,
-            size=payload.get("size", 0),
-            mime=payload.get("mime"),
-            project_id=payload.get("project_id"),
-            producing_op=payload.get("producing_op"),
+            size=size if isinstance(size, int) and not isinstance(size, bool) else 0,
+            mime=text("mime"),
+            project_id=text("project_id"),
+            producing_op=text("producing_op"),
             created=event.ts,
-            meta=payload.get("meta", {}),
+            meta=meta if isinstance(meta, dict) else {},
         )
 
     def open(self, artifact_id: str) -> BinaryIO:

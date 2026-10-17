@@ -18,6 +18,7 @@ import secrets
 from dataclasses import dataclass, field
 from typing import Any
 
+from aar.hub.common import SkippedEvent
 from aar.hub.events import Actor, Event, EventLog, Transaction, match_or_conflict
 
 NODE_KINDS = frozenset({"brief", "plan", "op", "artifact", "review"})
@@ -62,6 +63,14 @@ class DuplicateNodeId(ValueError):
 
 class DuplicateEdgeId(ValueError):
     """Raised when an explicit edge id is reused for a new edge."""
+
+
+class ProtectedNode(PermissionError):
+    """Raised when a review node's status is changed outside the review gate.
+
+    A review closes only through a human decision (``aar.hub.reviews.decide``) or
+    its requester's withdrawal; the generic status API cannot finish or flip one.
+    """
 
 
 def new_node_id() -> str:
@@ -122,10 +131,16 @@ class Edge:
 
 @dataclass
 class GraphState:
-    """The projected state of one project's work graph."""
+    """The projected state of one project's work graph.
+
+    ``skipped`` lists events the projection could not use; ``creators`` records who
+    added each node (the review gate lets a requester withdraw its own review).
+    """
 
     nodes: dict[str, GraphNode] = field(default_factory=dict)
     edges: dict[str, Edge] = field(default_factory=dict)
+    skipped: list[SkippedEvent] = field(default_factory=list)
+    creators: dict[str, Actor] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -137,6 +152,95 @@ class GraphState:
 def allowed_transitions(status: str) -> frozenset[str]:
     """Return the statuses reachable from ``status`` in one step."""
     return _TRANSITIONS.get(status, frozenset())
+
+
+_REVIEW_CLOSED = frozenset({"done", "failed", "cancelled"})
+
+
+def review_status_change_allowed(
+    actor: Actor, creator: Actor | None, current: str, new_status: str
+) -> bool:
+    """Whether ``actor`` may move a ``review`` node from ``current`` to ``new_status``.
+
+    A review is decided once: once closed (done, failed, cancelled) nobody reopens
+    it. While open, humans decide; anyone else may only withdraw a review they
+    requested themselves, by cancelling it.
+    """
+    if current in _REVIEW_CLOSED:
+        return False
+    if actor.kind == "human":
+        return True
+    return new_status == "cancelled" and creator is not None and actor == creator
+
+
+def _is_id(value: Any) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= 128
+
+
+def _problem(state: GraphState, event: Event) -> str | None:
+    """Why ``event`` cannot be folded into ``state``, or ``None`` if it can.
+
+    The log is shared and append-only, so a malformed or forged event must be
+    skipped rather than break every read of the graph.
+    """
+    payload = event.payload
+    if not isinstance(payload, dict):
+        return "payload is not an object"
+    data = payload.get("data", {})
+    if event.type == EVENT_NODE_ADDED:
+        node_id = payload.get("node_id")
+        if not _is_id(node_id):
+            return "node_id is not a valid id"
+        if node_id in state.nodes:
+            return f"node {node_id} already exists"
+        if payload.get("kind") not in NODE_KINDS:
+            return "kind is not a node kind"
+        if payload.get("status") not in STATUSES:
+            return "status is not a status"
+        title = payload.get("title")
+        if title is not None and not isinstance(title, str):
+            return "title is not text"
+        return None if isinstance(data, dict) else "data is not an object"
+    if event.type == EVENT_NODE_STATUS_CHANGED:
+        node = state.nodes.get(payload.get("node_id")) if _is_id(payload.get("node_id")) else None
+        if node is None:
+            return "status change for an unknown node"
+        to = payload.get("to")
+        if to not in STATUSES or to not in allowed_transitions(node.status):
+            return f"illegal transition from {node.status!r} to {to!r}"
+        if node.kind == "review" and not review_status_change_allowed(
+            event.actor, state.creators.get(node.id), node.status, to
+        ):
+            return f"review status set to {to!r} by {event.actor.kind}:{event.actor.id}"
+        return None
+    if event.type == EVENT_EDGE_ADDED:
+        edge_id = payload.get("edge_id")
+        if not _is_id(edge_id) or edge_id in state.edges:
+            return "edge_id is missing or already used"
+        edge_type = payload.get("type")
+        if edge_type not in EDGE_TYPES:
+            return "type is not an edge type"
+        src = state.nodes.get(payload.get("src")) if _is_id(payload.get("src")) else None
+        dst = state.nodes.get(payload.get("dst")) if _is_id(payload.get("dst")) else None
+        if src is None or dst is None:
+            return "edge endpoint is not a known node"
+        if src.kind not in _EDGE_SRC_KINDS.get(edge_type, NODE_KINDS):
+            return f"{edge_type} edge cannot start at a {src.kind} node"
+        if dst.kind not in _EDGE_DST_KINDS.get(edge_type, NODE_KINDS):
+            return f"{edge_type} edge cannot end at a {dst.kind} node"
+        return None if isinstance(data, dict) else "data is not an object"
+    return f"not a graph event type: {event.type!r}"
+
+
+def _fold(state: GraphState, event: Event) -> None:
+    """Fold one event into ``state``, or record it as skipped. Never raises."""
+    problem = _problem(state, event)
+    if problem is not None:
+        state.skipped.append(SkippedEvent.of(event, problem))
+        return
+    if event.type == EVENT_NODE_ADDED:
+        state.creators[event.payload["node_id"]] = event.actor
+    _reduce(state, event.type, event.payload, event.ts)
 
 
 def _reduce(state: GraphState, event_type: str, payload: dict[str, Any], ts: str) -> None:
@@ -188,7 +292,7 @@ class WorkGraph:
         """Return a fresh projection built from the whole log (independent of live state)."""
         state = GraphState()
         for event in self._log.iter_events(project_id=self._project_id, types=_GRAPH_TYPES):
-            _reduce(state, event.type, event.payload, event.ts)
+            _fold(state, event)
         return state
 
     def refresh(self) -> None:
@@ -200,7 +304,7 @@ class WorkGraph:
         state = GraphState()
         last_seq = 0
         for event in self._log.iter_events(project_id=self._project_id, types=_GRAPH_TYPES):
-            _reduce(state, event.type, event.payload, event.ts)
+            _fold(state, event)
             last_seq = event.seq
         self._state = state
         self._last_seq = last_seq
@@ -294,6 +398,11 @@ class WorkGraph:
             node = self._state.nodes.get(node_id)
             if node is None:
                 raise KeyError(f"unknown node: {node_id!r}")
+            if node.kind == "review":
+                raise ProtectedNode(
+                    f"node {node_id} is a review: it closes only through a human decision or "
+                    "its requester's withdrawal (aar.hub.reviews), not the generic status API"
+                )
             if idempotency_key is not None:
                 existing = txn.find_by_idempotency_key(idempotency_key)
                 if existing is not None:
@@ -433,6 +542,13 @@ class WorkGraph:
             raise IllegalTransition(
                 f"cannot move node {node_id} from {node.status!r} to {new_status!r}"
             )
+        if node.kind == "review" and not review_status_change_allowed(
+            actor, self._state.creators.get(node_id), node.status, new_status
+        ):
+            raise ProtectedNode(
+                f"{actor.kind}:{actor.id} may not move review {node_id} to {new_status!r}: "
+                "only a human decides, and only the requester may withdraw"
+            )
         event = txn.append(
             EVENT_NODE_STATUS_CHANGED,
             actor,
@@ -442,15 +558,19 @@ class WorkGraph:
         self._apply(event)
         return event
 
+    def skipped(self) -> tuple[SkippedEvent, ...]:
+        """Events the live projection could not use (malformed or forged)."""
+        return tuple(self._state.skipped)
+
     # -- internals ----------------------------------------------------------
 
     def _catch_up(self, txn: Transaction) -> None:
         for event in txn.read(self._last_seq, project_id=self._project_id, types=_GRAPH_TYPES):
             if event.seq > self._last_seq:
-                _reduce(self._state, event.type, event.payload, event.ts)
+                _fold(self._state, event)
                 self._last_seq = event.seq
 
     def _apply(self, event: Event) -> None:
         if event.seq > self._last_seq:
-            _reduce(self._state, event.type, event.payload, event.ts)
+            _fold(self._state, event)
             self._last_seq = event.seq
