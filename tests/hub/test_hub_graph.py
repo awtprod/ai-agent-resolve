@@ -352,3 +352,27 @@ def test_add_node_on_legacy_nan_key_conflicts_not_valueerror(tmp_path: Path) -> 
     # from re-canonicalising the stored NaN.
     with pytest.raises(IdempotencyConflict):
         graph.add_node("op", ACTOR, data={"v": 1}, idempotency_key="NK")
+
+
+def test_add_node_retry_with_a_different_actor_conflicts(tmp_path: Path) -> None:
+    _, graph = _graph(tmp_path)
+    graph.add_node("op", Actor("agent", "a1"), idempotency_key="K")
+    with pytest.raises(IdempotencyConflict):
+        graph.add_node("op", Actor("agent", "a2"), idempotency_key="K")
+
+
+def test_set_status_retry_with_a_different_actor_conflicts(tmp_path: Path) -> None:
+    _, graph = _graph(tmp_path)
+    node = graph.add_node("op", ACTOR)
+    graph.set_status(node.id, "active", Actor("agent", "a1"), idempotency_key="K")
+    with pytest.raises(IdempotencyConflict):
+        graph.set_status(node.id, "active", Actor("agent", "a2"), idempotency_key="K")
+
+
+def test_add_edge_retry_with_a_different_actor_conflicts(tmp_path: Path) -> None:
+    _, graph = _graph(tmp_path)
+    op = graph.add_node("op", ACTOR)
+    art = graph.add_node("artifact", ACTOR)
+    graph.add_edge("produces", op.id, art.id, Actor("agent", "a1"), idempotency_key="K")
+    with pytest.raises(IdempotencyConflict):
+        graph.add_edge("produces", op.id, art.id, Actor("agent", "a2"), idempotency_key="K")

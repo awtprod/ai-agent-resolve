@@ -200,3 +200,18 @@ def test_create_key_reused_for_rename_conflicts(tmp_path: Path) -> None:
         reg.rename_project(project.id, "C", ACTOR, idempotency_key="CK")
     assert reg.get(project.id).name == "C"
     assert log.read(types=["project.renamed"]) == []
+
+
+def test_create_retry_with_a_different_actor_conflicts(tmp_path: Path) -> None:
+    _, reg = _registry(tmp_path)
+    reg.create_project("A", Actor("human", "a1"), idempotency_key="K")
+    with pytest.raises(IdempotencyConflict):
+        reg.create_project("A", Actor("human", "a2"), idempotency_key="K")
+
+
+def test_rename_retry_with_a_different_actor_conflicts(tmp_path: Path) -> None:
+    _, reg = _registry(tmp_path)
+    project = reg.create_project("A", ACTOR)
+    reg.rename_project(project.id, "B", Actor("human", "a1"), idempotency_key="K")
+    with pytest.raises(IdempotencyConflict):
+        reg.rename_project(project.id, "B", Actor("human", "a2"), idempotency_key="K")

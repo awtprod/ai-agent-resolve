@@ -64,6 +64,7 @@ def _serve(args: argparse.Namespace) -> int:
     try:
         artifacts = ArtifactStore(args.artifacts, log, create=False)
     except OSError as exc:
+        log.close()  # release the DB handle we just opened before bailing out
         print(f"aar hub serve: {exc}", file=sys.stderr)
         return 2
     registry = Registry(log)

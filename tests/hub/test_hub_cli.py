@@ -170,3 +170,23 @@ def test_hub_requires_a_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
 
 def test_top_level_still_prints_version() -> None:
     assert main(["--version"]) == 0
+
+
+def test_serve_closes_log_when_artifacts_open_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    EventLog(tmp_path / "hub.db").close()  # a valid db, but the artifacts dir is missing
+    import aar.hub.events as events_mod
+
+    real_close = events_mod.EventLog.close
+    closed: list = []
+
+    def spy(self) -> None:
+        closed.append(self)
+        real_close(self)
+
+    monkeypatch.setattr(events_mod.EventLog, "close", spy)
+    _stub_run(monkeypatch)
+    code = main(_serve_args(tmp_path, "--host", "127.0.0.1"))
+    assert code == 2
+    assert closed  # the read-only log opened by serve was closed before bailing out

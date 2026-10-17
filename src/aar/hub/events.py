@@ -27,7 +27,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from os import PathLike
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 ACTOR_KINDS = frozenset({"human", "agent", "node"})
@@ -108,10 +108,32 @@ def _canonical(value: Any) -> str:
 
 
 def _canonical_lenient(value: Any) -> str:
-    # Comparison-only canonical form: tolerates a legacy stored NaN/inf (allow_nan=True)
-    # so matching never raises a bare ValueError. Still distinguishes True/1 and 1/1.0,
-    # because json.dumps renders them as "true"/"1"/"1.0" regardless of allow_nan.
+    # Comparison-only canonical form for the STORED side: tolerates a legacy stored
+    # NaN/inf (allow_nan=True) so matching never raises on old data. Still distinguishes
+    # True/1 and 1/1.0, because json.dumps renders them as "true"/"1"/"1.0" either way.
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=True)
+
+
+def _sqlite_uri(path: str, cwd: str, flavour: type[PurePath] = Path) -> str:
+    r"""Build a ``file:`` URI (``mode=rw``) for an existing SQLite database.
+
+    The path is made absolute WITHOUT normalising it: ``..`` and symlinks must be
+    resolved by the OS on open, never collapsed as text (collapsing can reach a decoy
+    through a symlink). ``flavour`` is the pathlib flavour -- the real ``Path`` at
+    runtime, ``PureWindowsPath``/``PurePosixPath`` in tests. On Windows a root-relative
+    path (``\data\x.db`` or ``/data/x.db``) is not absolute, so it is anchored to the
+    drive of ``cwd``; a drive-relative path (``C:foo``) that still cannot be resolved,
+    and a UNC path (``\\host\share\...``) whose authority SQLite rejects, both raise
+    ``ValueError``. as_uri() keeps a leading ``//``, ``%`` and non-UTF-8 names intact.
+    """
+    pure = flavour(path)
+    if not pure.is_absolute():
+        pure = flavour(cwd) / pure
+    if not pure.is_absolute():
+        raise ValueError(f"cannot resolve a drive-relative path to an absolute file: {path!r}")
+    if pure.drive.startswith("\\\\"):
+        raise ValueError(f"UNC paths are not supported; map a network drive: {path!r}")
+    return pure.as_uri() + "?mode=rw"
 
 
 def match_or_conflict(
@@ -132,11 +154,13 @@ def match_or_conflict(
     been through JSON (tuples became lists, dict keys became strings) while ``expected``
     is the live request, so a raw ``==`` both rejects genuine retries (tuple vs list)
     and accepts distinct requests (``True`` vs ``1``, ``1`` vs ``1.0``). The stored side
-    is canonicalised leniently so a legacy NaN/inf payload yields a conflict, not a
-    ValueError. When ``project_id``/``actor`` are given the stored event must also match
-    them (a key reused in another project's scope, or by a different actor, conflicts);
-    ``ts`` is deliberately not compared. The ``event_type`` check keeps the return path
-    (indexing by the stored ``node_id``/``edge_id``/``project_id``) type-correct.
+    is canonicalised leniently so a legacy NaN/inf payload yields a conflict rather than
+    a ValueError; the expected (request) side is canonicalised strictly, so a NaN/inf in
+    the request raises ValueError, consistent with :meth:`EventLog.append`. When
+    ``project_id``/``actor`` are given the stored event must also match them (a key
+    reused in another project's scope, or by a different actor, conflicts); ``ts`` is
+    deliberately not compared. The ``event_type`` check keeps the return path (indexing
+    by the stored ``node_id``/``edge_id``/``project_id``) type-correct.
     """
     same = existing.type == event_type
     if same and project_id is not None:
@@ -145,7 +169,7 @@ def match_or_conflict(
         same = existing.actor == actor
     if same:
         same = all(
-            _canonical_lenient(existing.payload.get(key)) == _canonical_lenient(expected.get(key))
+            _canonical_lenient(existing.payload.get(key)) == _canonical(expected.get(key))
             for key in compare_keys
         )
     if not same:
@@ -381,18 +405,13 @@ class EventLog:
         if "\x00" in self._path:
             # A NUL is truncated at %00 and would silently open a different file.
             raise ValueError("event log path must not contain a NUL byte")
-        # Make the path absolute WITHOUT normalising it: '..' and symlinks must be
-        # resolved by the OS on open, never collapsed as text (collapsing can reach a
-        # decoy through a symlink). Path.as_uri() then builds a bytes-safe file: URI --
-        # valid on POSIX and Windows (drive letters, backslashes, UNC), keeping a
-        # leading '//', '%', and non-UTF-8 names intact. mode=rw opens an existing
-        # database but never creates one, so a missing/unopenable path fails atomically
-        # (no exists()/connect() race, no stray 0-byte file). query_only=ON (set by the
-        # caller) enforces read-only; rw (not ro) lets a WAL database with a pending
-        # -wal still create its -shm and be read in any state. Closing such a read-only
-        # handle may trigger a WAL checkpoint on the file.
-        raw = self._path if os.path.isabs(self._path) else os.path.join(os.getcwd(), self._path)
-        uri = Path(raw).as_uri() + "?mode=rw"
+        # Build the URI via the pure helper (non-normalising; Windows/POSIX-aware).
+        # mode=rw opens an existing database but never creates one, so a missing or
+        # unopenable path fails atomically (no exists()/connect() race, no stray 0-byte
+        # file). query_only=ON (set by the caller) enforces read-only; rw (not ro) lets
+        # a WAL database with a pending -wal still create its -shm and be read in any
+        # state. Closing such a read-only handle may trigger a WAL checkpoint on the file.
+        uri = _sqlite_uri(self._path, os.getcwd())
         conn: sqlite3.Connection | None = None
         try:
             conn = sqlite3.connect(uri, uri=True, check_same_thread=False)

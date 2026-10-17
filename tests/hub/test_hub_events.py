@@ -5,7 +5,7 @@ from __future__ import annotations
 import multiprocessing
 import os
 import sqlite3
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 
@@ -13,6 +13,7 @@ from aar.hub.events import (
     Actor,
     EventLog,
     IdempotencyConflict,
+    _sqlite_uri,
     match_or_conflict,
     new_event_id,
 )
@@ -443,12 +444,36 @@ def test_read_only_open_does_not_collapse_dotdot_through_symlink(tmp_path: Path)
     assert EventLog(through, read_only=True).read()[0].payload["which"] == "real"
 
 
-def test_windows_paths_make_valid_file_uris() -> None:
-    # The read-only open builds its URI with Path.as_uri(); confirm that is correct for
-    # Windows drive letters, backslashes and UNC paths (verified via PureWindowsPath).
-    assert PureWindowsPath("C:/data/hub.db").as_uri() == "file:///C:/data/hub.db"
-    assert PureWindowsPath(r"C:\data\hub.db").as_uri() == "file:///C:/data/hub.db"
-    assert PureWindowsPath(r"\\server\share\hub.db").as_uri() == "file://server/share/hub.db"
+def test_sqlite_uri_windows_drive_absolute() -> None:
+    assert (
+        _sqlite_uri("C:/data/x.db", r"D:\work", PureWindowsPath) == "file:///C:/data/x.db?mode=rw"
+    )
+    assert (
+        _sqlite_uri(r"C:\data\x.db", r"D:\work", PureWindowsPath) == "file:///C:/data/x.db?mode=rw"
+    )
+
+
+def test_sqlite_uri_windows_root_relative_uses_cwd_drive() -> None:
+    # A root-relative path has no drive, so it is anchored to the drive of the cwd.
+    assert _sqlite_uri(r"\data\x.db", r"D:\work", PureWindowsPath) == "file:///D:/data/x.db?mode=rw"
+    assert _sqlite_uri("/data/x.db", r"D:\work", PureWindowsPath) == "file:///D:/data/x.db?mode=rw"
+
+
+def test_sqlite_uri_windows_drive_relative_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        _sqlite_uri("C:foo", r"D:\work", PureWindowsPath)
+
+
+def test_sqlite_uri_unc_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        _sqlite_uri(r"\\host\share\x.db", r"D:\work", PureWindowsPath)
+
+
+def test_sqlite_uri_posix_relative_absolute_and_dotdot() -> None:
+    assert _sqlite_uri("x.db", "/cwd", PurePosixPath) == "file:///cwd/x.db?mode=rw"
+    assert _sqlite_uri("/a/x.db", "/cwd", PurePosixPath) == "file:///a/x.db?mode=rw"
+    # '..' is preserved (the OS resolves it on open; it is never collapsed as text).
+    assert _sqlite_uri("/a/link/../x.db", "/cwd", PurePosixPath) == "file:///a/link/../x.db?mode=rw"
 
 
 # -- create=False must not touch a foreign database (round 3) ---------------------
@@ -554,3 +579,60 @@ def test_transaction_find_after_block_raises(tmp_path: Path) -> None:
         captured.append(txn)
     with pytest.raises(RuntimeError):
         captured[0].find_by_idempotency_key("k")
+
+
+def test_read_only_open_resolves_a_relative_path(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    EventLog("rel.db").append("note", Actor("agent", "a1"), {"k": 1})  # relative, create mode
+    assert len(EventLog("rel.db", read_only=True).read()) == 1  # relative, read-only
+
+
+def test_match_or_conflict_rejects_nan_in_the_request(tmp_path: Path) -> None:
+    existing = _stored(_log(tmp_path), {"v": 1})
+    with pytest.raises(ValueError) as err:
+        match_or_conflict(existing, "thing", {"v": float("nan")}, ["v"])
+    # A NaN request raises a plain ValueError (like append), not an IdempotencyConflict.
+    assert not isinstance(err.value, IdempotencyConflict)
+
+
+def test_same_key_different_actor_kind_conflicts(tmp_path: Path) -> None:
+    log = _log(tmp_path)
+    log.append("t", Actor("agent", "x"), {"n": 1}, idempotency_key="K")
+    # Same actor id, different actor kind: a conflict (pins the actor_kind clause).
+    with pytest.raises(IdempotencyConflict):
+        log.append("t", Actor("human", "x"), {"n": 1}, idempotency_key="K")
+
+
+def test_transaction_append_rechecks_an_existing_key(tmp_path: Path) -> None:
+    log = _log(tmp_path)
+    actor = Actor("agent", "a1")
+    with log.transaction() as txn:
+        first = txn.append("t", actor, {"n": 1}, idempotency_key="K")
+        same = txn.append("t", actor, {"n": 1}, idempotency_key="K")
+        assert same.seq == first.seq  # same request returns the event, not IntegrityError
+        with pytest.raises(IdempotencyConflict):
+            txn.append("t", Actor("agent", "a2"), {"n": 1}, idempotency_key="K")
+        with pytest.raises(IdempotencyConflict):
+            txn.append("t", actor, {"n": 2}, idempotency_key="K")
+
+
+def test_open_closes_connection_on_read_only_failure(tmp_path: Path, monkeypatch) -> None:
+    import aar.hub.events as events_mod
+
+    real_connect = events_mod.sqlite3.connect
+    opened: list = []
+
+    def spy(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    junk = tmp_path / "junk.db"
+    junk.write_text("not a sqlite database")
+    monkeypatch.setattr(events_mod.sqlite3, "connect", spy)
+    with pytest.raises(OSError):
+        EventLog(junk, read_only=True)
+
+    assert opened, "no connection was opened"
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[-1].execute("SELECT 1")  # _open's except branch must close it
