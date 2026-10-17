@@ -43,6 +43,7 @@ from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from aar.node.branches import is_agent_branch
 from aar.node.broker import Broker, HotOp, HotOpFailure, running_op_id
 from aar.node.gateway import GatewayError, ResolveGateway
 from aar.node.leases import Holder
@@ -456,10 +457,46 @@ class OpEnv:
         return other
 
 
-def _execute(spec: OpSpec, gateway: ResolveGateway, target: ProjectLocator, params: OpModel) -> Any:
+def _assert_branch(env: OpEnv, spec: OpSpec, params: OpModel) -> None:
+    """Refuse an editing op aimed at a timeline that is not an agent branch.
+
+    Agents edit a branch (``timeline.branch``), never a human's timeline (DESIGN R3). The
+    guard is here, in the one choke point every op body passes, because this is where the
+    open project is already asserted and the op's real, current timeline can be read by
+    identity. It fires only for a mutating op that names a ``timeline`` it edits; ops that
+    build a copy from a ``source`` (``timeline.duplicate``, ``timeline.branch``) carry no
+    ``timeline`` field, so branching off a human timeline is never blocked, and
+    ``grades.copy`` may still read a grade from a human ``reference_timeline``.
+    """
+    if not (spec.mutates and "timeline" in type(params).model_fields):
+        return
+    timeline = env.timeline(params.timeline)
+    name = str(timeline.GetName())
+    if not is_agent_branch(name):
+        raise OpError(
+            "not_an_agent_branch",
+            f"op {spec.name} edits timeline {name!r}, which is not an agent branch; agents "
+            f"must not edit a human's timeline",
+            "branch it first with timeline.branch and edit the copy, or pass "
+            "require_branch=False to edit a production timeline deliberately",
+            timeline=name,
+            timeline_id=str(timeline.GetUniqueId()),
+        )
+
+
+def _execute(
+    spec: OpSpec,
+    gateway: ResolveGateway,
+    target: ProjectLocator,
+    params: OpModel,
+    *,
+    require_branch: bool = False,
+) -> Any:
     """Run one op body after asserting the open project. Only the broker gets here."""
     env = OpEnv(gateway, target)
     env.assert_project()
+    if require_branch:
+        _assert_branch(env, spec, params)
     try:
         result = spec._body(env, params)
     except GatewayError as exc:
@@ -477,8 +514,14 @@ def make_hot_op(
     holder: Holder,
     priority: int = 0,
     abort_batch_on_failure: bool = False,
+    require_branch: bool = False,
 ) -> HotOp:
-    """Validate ``params`` and wrap op ``name`` in a broker ``HotOp`` aimed at ``target``."""
+    """Validate ``params`` and wrap op ``name`` in a broker ``HotOp`` aimed at ``target``.
+
+    ``require_branch`` refuses an editing op whose timeline is not an agent branch (DESIGN
+    R3). It is off by default so the verified op library keeps its own behaviour; the
+    agent-facing path (the S7 runner) sets it, and the override is ``require_branch=False``.
+    """
     spec = get_op(name)
     if not spec.hot:
         raise ValueError(f"op {name} is not a hot op")
@@ -496,7 +539,7 @@ def make_hot_op(
     def run(gateway: ResolveGateway) -> Any:
         if running_op_id() != op_id:
             raise _outside_broker(f"op {name}")
-        return _execute(spec, gateway, target, checked)
+        return _execute(spec, gateway, target, checked, require_branch=require_branch)
 
     return HotOp(
         project=target,
@@ -574,8 +617,13 @@ def submit_op(
     holder: Holder,
     priority: int = 0,
     abort_batch_on_failure: bool = False,
+    require_branch: bool = False,
 ) -> str:
-    """Queue op ``name`` on ``broker``; returns the broker op id (see ``Broker.result``)."""
+    """Queue op ``name`` on ``broker``; returns the broker op id (see ``Broker.result``).
+
+    ``require_branch`` refuses an editing op on a non-branch timeline (see
+    :func:`make_hot_op`).
+    """
     return broker.submit(
         make_hot_op(
             name,
@@ -584,5 +632,6 @@ def submit_op(
             holder=holder,
             priority=priority,
             abort_batch_on_failure=abort_batch_on_failure,
+            require_branch=require_branch,
         )
     )

@@ -34,6 +34,9 @@ EXPECTED = {
     "grades.copy": (True, True),
     "clip.set_input_color_space": (True, True),
     "markers.add": (True, True),
+    "timeline.branch": (True, True),
+    "markers.mirror_review": (True, True),
+    "markers.read_review": (True, False),
 }
 
 
