@@ -4,46 +4,61 @@ The semantic layer only sees what the reader decodes. This module re-reads both 
 compares everything else, so a difference is never hidden because it is not decoded:
 
 * Members the reader does not interpret (``Gallery.xml``, stills, ``.dat``) are compared
-  whole. Members present on one side only are reported, directory entries included.
-* Every interpreted XML member is scanned again. Model objects (project, bins, media clips,
-  timeline containers, tracks, items, marker blobs) are "units": they are paired through the
-  semantic layer's DbId matches, so an object that moved to another member is still compared
-  with its counterpart. Inside a unit, children are aligned by the DbId of ``<Element>`` vector
-  entries, otherwise by tag and position; nested units are skipped and compared on their own.
+  whole. Members present on one side only are reported, directory entries included, and so is
+  a zip member name that occurs more than once (only its last copy can be read).
+* Every interpreted XML member that differs is scanned again, prolog and trailing content
+  included. Model objects (project, bins, media clips, timeline containers, tracks, items,
+  marker blobs) are "units": they are paired through the semantic layer's DbId matches, so an
+  object that moved to another member is still compared with its counterpart. Inside a unit,
+  children are aligned by unit, by the DbId of ``<Element>`` vector entries, otherwise by tag
+  and position. Nested units are compared on their own, but where they sit is checked here:
+  a unit under a different parent must have been reported as a move by the semantic layer,
+  and an ``<Element>`` wrapper around a unit is compared too (attributes, stray text).
 * A leaf whose bytes differ is accounted for only when (a) it is the text of a decoded field
-  that the semantic layer reports and that field's value differs, or (b) it is a blob and the
-  bytes left after removing exactly what the reader decoded are the same on both sides. Any
-  other difference becomes an ``opaque-changed`` change with member, byte span and byte count.
+  that the semantic layer reports and that leaf's own decoded value differs, or (b) it is a
+  blob and the bytes left after removing exactly what the reader decoded are the same on both
+  sides. Any other difference is ``opaque-changed`` with member, byte span and byte count.
 
-Not compared, by design: whitespace between elements, the zip container's own metadata, and the
-order of ``<Element>`` entries inside ``...Set`` elements (sets) or of nested units (their
-order is reported by the semantic layer where it means something, for example track order).
+Order: children are compared in order, except (1) DbId-keyed ``<Element>`` entries of the same
+tag inside a ``...Set`` element (a set), and (2) units inside ``Items``, ``MediaVec`` and
+``...TrackVec``, whose order the semantic layer reports (items and bin contents reordered,
+track labels). Not compared, by design: whitespace between elements and the zip container's
+own metadata.
+
+Known limit: a blob is compared on its decoded content where the reader decodes it, so two
+zstd frames that differ only in framing (for example the last-block bit) but decompress to the
+same bytes are reported as equal.
 """
 
 from __future__ import annotations
 
 import re
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from aar.drp import blobs
 from aar.drp.container import Container, open_container, parse_version_header
-from aar.drp.diff_model import REPORTED_FIELDS, Change, Ctx, DiffError
+from aar.drp.diff_model import REPORTED_FIELDS, Change, Ctx, DiffError, same_value
 from aar.drp.errors import BlobError, ContainerError
 from aar.drp.model import DrpFile, MediaClip, Provenance
-from aar.drp.reader import MARKER_COLORS
+from aar.drp.reader import MARKER_COLORS, join_clip_path
 from aar.drp.scan import Document, Element, scan
 
 __all__ = ["Cover", "OpaqueEngine", "Source", "Unit", "member_root"]
 
 _CARRIER_TAGS = frozenset({"Sm2SequenceLockableBlob", "Sm2TiItemLockableBlob"})
+_CARRIER_CHILDREN = frozenset({"FieldsBlob", "BlobOwner", "DbSavedTime"})
 _INFO_TAGS = frozenset({"BtVideoInfo", "BtAudioInfo"})
 _INFO_SKIP = frozenset({"Sequence", "TimelineSharedHandle"})
+_SEMANTIC_ORDER = frozenset({"Items", "MediaVec"})
 _INDEX = re.compile(r"\[\d+\]$")
+_INDEXED = re.compile(r"^(\w+)\[(\d+)\]$")
+_FRAME_FIELDS = frozenset({"record_start", "duration", "source_in"})
 _FRAME_RATE_HINT = re.compile(r"\d+(\.\d+)?")
+_PATH_SEP = re.compile(r"[\\/]")
 
 
 def member_root(member: str) -> Provenance:
@@ -58,12 +73,14 @@ class Cover:
     ``mode`` says how the leaf was decoded: ``text`` (its whole text is the value), or a blob
     layout whose decoded parts can be masked out (``rate``, ``fixed``, ``keyed``, ``setup``,
     ``clip``, ``markers``). ``arg`` is mode-specific (the keyed-dict key, clip path list...).
+    ``value`` is the value decoded from this very leaf (one entry of a list field).
     """
 
     unit: tuple[Any, ...]
     field: str
     mode: str
     arg: Any = None
+    value: Any = None
 
 
 @dataclass(slots=True)
@@ -79,42 +96,54 @@ class Unit:
     obj_b: Any = None
 
 
-class Source:
-    """Raw member access for one side, checked against the hash the reader recorded."""
+@dataclass(slots=True)
+class _Child:
+    """A child element as aligned: a unit, an ``<Element>`` wrapping a unit, or plain."""
 
-    def __init__(self, drp: DrpFile) -> None:
+    el: Element
+    unit: Unit | None
+    wrapper: bool
+    tag: str
+
+
+class Source:
+    """Raw member access for one side, checked against the hash the reader recorded.
+
+    A member that cannot be read raises :class:`DiffError`: an unreadable input is an error,
+    never a difference.
+    """
+
+    def __init__(self, drp: DrpFile, side: str = "A") -> None:
         self.drp = drp
-        self.errors: dict[str, str] = {}
-        self._raw: dict[str, bytes | None] = {}
-        self._docs: dict[str, Document | None] = {}
+        self.side = side
+        self._raw: dict[str, bytes] = {}
+        self._docs: dict[str, Document] = {}
         try:
             self.container: Container = open_container(drp.path)
         except ContainerError as exc:
-            raise DiffError(f"cannot reopen {drp.path}: {exc}") from exc
+            raise DiffError(f"{side}: cannot reopen {drp.path}: {exc}") from exc
         if self.container.sha256 != drp.sha256:
             self.container.close()
-            raise DiffError(f"{drp.path} changed on disk after it was read; read it again")
+            raise DiffError(f"{side}: {drp.path} changed on disk after it was read; read it again")
 
-    def data(self, name: str) -> bytes | None:
+    def data(self, name: str) -> bytes:
         if name not in self._raw:
             try:
                 self._raw[name] = self.container.read(name)
             except ContainerError as exc:
-                self.errors[name] = str(exc)
-                self._raw[name] = None
+                raise DiffError(f"{self.side}: member {name} cannot be read: {exc}") from exc
         return self._raw[name]
 
-    def doc(self, name: str) -> Document | None:
+    def doc(self, name: str) -> Document:
         if name not in self._docs:
-            data = self.data(name)
-            self._docs[name] = None if data is None else scan(data, name)
+            self._docs[name] = scan(self.data(name), name)
         return self._docs[name]
 
     def whole(self) -> bytes:
         try:
             return Path(self.drp.path).read_bytes()
         except OSError as exc:
-            raise DiffError(f"cannot read {self.drp.path}: {exc}") from exc
+            raise DiffError(f"{self.side}: cannot read {self.drp.path}: {exc}") from exc
 
     def close(self) -> None:
         self.container.close()
@@ -131,8 +160,26 @@ def _base_field(key: str) -> str:
     return _INDEX.sub("", key)
 
 
+def _span_value(obj: Any, key: str) -> Any:
+    """The decoded value that came from the span ``key`` of ``obj`` (one list entry if indexed)."""
+    m = _INDEXED.match(key)
+    if m:
+        seq = getattr(obj, m.group(1), None)
+        i = int(m.group(2))
+        return seq[i] if isinstance(seq, list | tuple) and i < len(seq) else None
+    value = getattr(obj, key, None)
+    fractions = getattr(obj, "fractions", None)
+    if key in _FRAME_FIELDS and isinstance(fractions, dict):
+        return (value, fractions.get(key))
+    return value
+
+
 class OpaqueEngine:
-    """Compare two sources member by member and unit by unit; see the module docstring."""
+    """Compare two sources member by member and unit by unit; see the module docstring.
+
+    ``relocated`` holds the keys of units the semantic layer reported as moved to another
+    parent (an item to another track, a clip to another bin); only those may change parent.
+    """
 
     def __init__(
         self,
@@ -141,6 +188,7 @@ class OpaqueEngine:
         cover_objects: dict[str, list[tuple[tuple[Any, ...], str, Any]]],
         changed: set[tuple[tuple[Any, ...], str]],
         owners: dict[str, dict[str, tuple[tuple[Any, ...], Ctx]]],
+        relocated: set[tuple[Any, ...]] | None = None,
     ) -> None:
         self.src = {"a": sources[0], "b": sources[1]}
         self.drp = {"a": sources[0].drp, "b": sources[1].drp}
@@ -148,6 +196,7 @@ class OpaqueEngine:
         self.cover_objects = cover_objects
         self.changed = changed
         self.owners = owners
+        self.relocated = relocated or set()
         self.out: list[Change] = []
         self.covers: dict[str, dict[Span, list[Cover]]] = {"a": {}, "b": {}}
         self.unit_at: dict[str, dict[Span, Unit]] = {"a": {}, "b": {}}
@@ -163,6 +212,7 @@ class OpaqueEngine:
         if not a.is_zip or not b.is_zip:
             self._whole_file()
             return self.out
+        self._duplicate_members()
         self._carriers()
         self._resolve_units()
         self._text_covers()
@@ -182,8 +232,10 @@ class OpaqueEngine:
         if self._identical("project.xml"):
             return  # byte-identical: no marker blob can differ
         for side in ("a", "b"):
-            doc = self.src[side].doc("project.xml") if self._has("project.xml", side) else None
-            if doc is None or doc.root is None:
+            if not self._has("project.xml", side):
+                continue
+            doc = self.src[side].doc("project.xml")
+            if doc.root is None:
                 continue
             seen: Counter[tuple[Any, ...]] = Counter()
             for el in doc.root.iter():
@@ -232,8 +284,7 @@ class OpaqueEngine:
             if not (self._has(member, "a") and self._has(member, "b")):
                 self._same[member] = False
             else:
-                da, db = self.src["a"].data(member), self.src["b"].data(member)
-                self._same[member] = da is not None and da == db
+                self._same[member] = self.src["a"].data(member) == self.src["b"].data(member)
         return self._same[member]
 
     def _resolve_units(self) -> None:
@@ -262,24 +313,24 @@ class OpaqueEngine:
                     self.root_units[side].add(prov.member)
                     if not needs_element:
                         continue
-                    doc = self.src[side].doc(prov.member)
-                    if doc is None or doc.root is None:
-                        prov = None
-                    else:
-                        prov = Provenance(prov.member, doc.root.start, doc.root.end, "element")
+                    root = self.src[side].doc(prov.member).root
+                    resolved = (
+                        Provenance(prov.member, root.start, root.end, "element") if root else None
+                    )
                     if side == "a":
-                        unit.a = prov
+                        unit.a = resolved
                     else:
-                        unit.b = prov
-                    if prov is None:
+                        unit.b = resolved
+                    if resolved is None:
                         continue
+                    prov = resolved
                 self.unit_at[side][(prov.member, prov.start, prov.end)] = unit
                 if needs_element:
                     wanted[side].setdefault(prov.member, set()).add((prov.start, prov.end))
         for side, members in wanted.items():
             for member, spans in members.items():
                 doc = self.src[side].doc(member)
-                if doc is None or doc.root is None:
+                if doc.root is None:
                     continue
                 for el in doc.root.iter():
                     if (el.start, el.end) in spans:
@@ -293,14 +344,19 @@ class OpaqueEngine:
                     name = _base_field(span_key)
                     if name not in reported:
                         continue
-                    cover = _cover_for(key, name, prov)
+                    cover = _cover_for(key, name, prov, _span_value(obj, span_key))
                     if cover is not None:
                         self.covers[side].setdefault(
                             (prov.member, prov.start, prov.end), []
                         ).append(cover)
 
     def _clip_covers(self, unit: Unit) -> None:
-        """Every ``Clip`` blob of a media clip: the reader joins its path and maybe its codec."""
+        """Every ``Clip`` blob of a media clip: the reader joins its path and maybe its codec.
+
+        Which stream's blob holds which path is checked through the residue (an index into
+        the clip's path list) unless the path list itself changed, which is reported.
+        """
+        changed = any((unit.key, f) in self.changed for f in ("path", "blob_path", "linked_paths"))
         for side, prov, clip in (("a", unit.a, unit.obj_a), ("b", unit.b, unit.obj_b)):
             if prov is None or not isinstance(clip, MediaClip):
                 continue
@@ -317,7 +373,9 @@ class OpaqueEngine:
                     continue
                 span = (prov.member, blob.inner_start, blob.inner_end)
                 takes_codec = codec is not None and (codec.start, codec.end) == span[1:]
-                self.covers[side][span] = [Cover(unit.key, "paths", "clip", (paths, takes_codec))]
+                self.covers[side][span] = [
+                    Cover(unit.key, "paths", "clip", (paths, takes_codec, changed))
+                ]
 
     # ------------------------------------------------------------------ members
 
@@ -340,6 +398,25 @@ class OpaqueEngine:
             )
         )
 
+    def _duplicate_members(self) -> None:
+        """A zip member name that occurs twice: only the last copy is read, the rest unseen."""
+        ca = Counter(m.name for m in self.drp["a"].members)
+        cb = Counter(m.name for m in self.drp["b"].members)
+        for name in sorted(n for n in set(ca) | set(cb) if ca[n] > 1 or cb[n] > 1):
+            self.out.append(
+                _member_ctx(name).change(
+                    "opaque",
+                    "opaque-changed",
+                    f"zip member name occurs {ca[name]} time(s) in A and {cb[name]} in B; only "
+                    "the last copy is read, so the others were not compared",
+                    field_name=name,
+                    old=ca[name],
+                    new=cb[name],
+                    where_a=Provenance(name, 0, 0, "member"),
+                    where_b=Provenance(name, 0, 0, "member"),
+                )
+            )
+
     def _members(self) -> None:
         a_members = {m.name: m for m in self.drp["a"].members}
         b_members = {m.name: m for m in self.drp["b"].members}
@@ -358,17 +435,17 @@ class OpaqueEngine:
             side = "a" if ma is not None else "b"
             m = ma if ma is not None else mb
             assert m is not None
-            if m.role != "directory" and m.interpreted and name in self.root_units[side]:
-                continue  # a model object reported (or paired) by the semantic layer
-            doc = self.src[side].doc(name) if m.role != "directory" and m.interpreted else None
-            if doc is not None and doc.root is not None and self._is_unit(side, name, doc.root):
-                continue
+            if m.role != "directory" and m.interpreted:
+                if name in self.root_units[side]:
+                    continue  # a model object reported (or paired) by the semantic layer
+                root = self.src[side].doc(name).root
+                if root is not None and self._is_unit(side, name, root):
+                    continue
             size = 0 if m.role == "directory" else m.size
             what = "zip directory entry" if m.role == "directory" else "member"
-            ctx = _member_ctx(name)
             prov = Provenance(name, 0, size, "member")
             self.out.append(
-                ctx.change(
+                _member_ctx(name).change(
                     "opaque",
                     "opaque-removed" if side == "a" else "opaque-added",
                     f"{what} {'removed' if side == 'a' else 'added'} ({size} bytes)",
@@ -397,11 +474,6 @@ class OpaqueEngine:
 
     def _raw_member(self, name: str) -> None:
         da, db = self.src["a"].data(name), self.src["b"].data(name)
-        if da is None or db is None:
-            self._member_change(
-                name, "could not be read on both sides, so it was not compared", None
-            )
-            return
         if da == db:
             return
         count, first = _diff_size(da, db)
@@ -422,11 +494,6 @@ class OpaqueEngine:
         if self._identical(name):
             return
         da, db = self.src["a"].doc(name), self.src["b"].doc(name)
-        if da is None or db is None:
-            self._member_change(
-                name, "could not be read on both sides, so it was not compared", None
-            )
-            return
         ra, rb = da.root, db.root
         self._prolog(name, da, db)
         if ra is None or rb is None:
@@ -512,6 +579,9 @@ class OpaqueEngine:
             pushed = self._compare(ca, ma, cb, mb, unit, path, is_root)
             stack.extend(reversed(pushed))
 
+    def _data(self, side: str, member: str) -> bytes:
+        return self.src[side].doc(member).data
+
     def _compare(
         self,
         ea: Element,
@@ -526,75 +596,146 @@ class OpaqueEngine:
         if ea.tag != eb.tag:
             self._changed(unit, here, ma, ea, mb, eb, f"element <{ea.tag}> became <{eb.tag}>")
             return []
+        self._attrs(unit, here, ma, ea, mb, eb, drop_dbid=root)
+        if not ea.children and not eb.children:
+            self._leaf(ea, ma, eb, mb, unit, here)
+            return []
+        self._loose(unit, here, ma, ea, mb, eb, "text outside child elements changed")
+        ka, kb = self._keyed(ea, ma, "a"), self._keyed(eb, mb, "b")
+        seq_a = [_order_key(ea.tag, k, c) for k, c in ka.items() if k in kb]
+        seq_b = [_order_key(eb.tag, k, c) for k, c in kb.items() if k in ka]
+        if seq_a != seq_b:
+            self._changed(unit, here, ma, ea, mb, eb, "order of child elements changed")
+        pushed = []
+        for key, ca in ka.items():
+            cb = kb.get(key)
+            seg = (*path, _segment(key, ca))
+            if cb is None:
+                self._lone_child(ca, ma, "a", unit, seg)
+            elif ca.unit is not None:
+                self._unit_child(ca, ma, cb, mb, unit, seg)
+            else:
+                pushed.append((ca.el, cb.el, seg, False))
+        for key, cb in kb.items():
+            if key not in ka:
+                self._lone_child(cb, mb, "b", unit, (*path, _segment(key, cb)))
+        return pushed
+
+    def _attrs(
+        self,
+        unit: Unit,
+        path: tuple[str, ...],
+        ma: str,
+        ea: Element,
+        mb: str,
+        eb: Element,
+        *,
+        drop_dbid: bool,
+    ) -> None:
         attrs_a, attrs_b = dict(ea.attrs), dict(eb.attrs)
-        if root:
+        if drop_dbid:  # a unit's identity is its match, reported by the semantic layer
             attrs_a.pop("DbId", None)
             attrs_b.pop("DbId", None)
         if attrs_a != attrs_b:
             names = sorted(
                 k for k in set(attrs_a) | set(attrs_b) if attrs_a.get(k) != attrs_b.get(k)
             )
+            tag_a = self._data("a", ma)[ea.start : ea.inner_start or ea.end]
+            tag_b = self._data("b", mb)[eb.start : eb.inner_start or eb.end]
             self._changed(
                 unit,
-                here,
+                path,
                 ma,
                 ea,
                 mb,
                 eb,
                 f"attribute(s) {', '.join(names)} changed",
-                tag_only=True,
+                part=(tag_a, tag_b),
             )
-        if not ea.children and not eb.children:
-            self._leaf(ea, ma, eb, mb, unit, here)
-            return []
-        if _loose_text(ea, self._data("a", ma)) != _loose_text(eb, self._data("b", mb)):
-            self._changed(unit, here, ma, ea, mb, eb, "text outside child elements changed")
-        ka, kb = self._keyed(ea, ma, "a"), self._keyed(eb, mb, "b")
-        shared_a = [k for k in ka if k in kb]
-        shared_b = [k for k in kb if k in ka]
-        if shared_a != shared_b and not ea.tag.endswith("Set"):
-            self._changed(unit, here, ma, ea, mb, eb, "order of child elements changed")
-        pushed = []
-        for key, ca in ka.items():
-            cb = kb.get(key)
-            seg = _segment(key)
-            if cb is None:
-                self._lone(ca, ma, "a", unit, (*path, seg))
-            else:
-                pushed.append((ca, cb, (*path, seg), False))
-        for key, cb in kb.items():
-            if key not in ka:
-                self._lone(cb, mb, "b", unit, (*path, _segment(key)))
-        return pushed
 
-    def _data(self, side: str, member: str) -> bytes:
-        doc = self.src[side].doc(member)
-        return doc.data if doc is not None else b""
+    def _loose(
+        self,
+        unit: Unit,
+        path: tuple[str, ...],
+        ma: str,
+        ea: Element,
+        mb: str,
+        eb: Element,
+        why: str,
+    ) -> None:
+        la, lb = _loose_text(ea, self._data("a", ma)), _loose_text(eb, self._data("b", mb))
+        if la != lb:
+            self._changed(unit, path, ma, ea, mb, eb, why, part=(la, lb))
 
-    def _keyed(self, el: Element, member: str, side: str) -> dict[tuple[Any, ...], Element]:
+    def _keyed(self, el: Element, member: str, side: str) -> dict[tuple[Any, ...], _Child]:
         units = self.unit_at[side]
-        data = self._data(side, member)
-        out: dict[tuple[Any, ...], Element] = {}
+        out: dict[tuple[Any, ...], _Child] = {}
         counts: Counter[Any] = Counter()
         for child in el.children:
-            if (member, child.start, child.end) in units:
-                continue
-            key: tuple[Any, ...] | None = None
-            if child.tag == "Element" and len(child.children) == 1:
-                inner = child.children[0]
-                if (member, inner.start, inner.end) in units and _wraps_only(child, inner, data):
-                    continue
-                dbid = inner.attrs.get("DbId")
-                if dbid:
-                    key = ("Element", inner.tag, dbid)
-            if key is None:
+            inner = (
+                child.children[0] if child.tag == "Element" and len(child.children) == 1 else None
+            )
+            u = units.get((member, child.start, child.end))
+            w = units.get((member, inner.start, inner.end)) if inner is not None else None
+            key: tuple[Any, ...]
+            if u is not None:
+                key, entry = ("unit", u.key), _Child(child, u, False, child.tag)
+            elif inner is not None and w is not None:
+                key, entry = ("unit", w.key), _Child(child, w, True, inner.tag)
+            elif inner is not None and inner.attrs.get("DbId"):
+                key = ("Element", inner.tag, inner.attrs["DbId"])
+                entry = _Child(child, None, False, inner.tag)
+            else:
                 counts[child.tag] += 1
-                key = (child.tag, counts[child.tag])
-            elif key in out:
+                key, entry = (child.tag, counts[child.tag]), _Child(child, None, False, child.tag)
+            if key in out:  # the same DbId twice among siblings
                 counts[key] += 1
                 key = (*key, counts[key])
-            out[key] = child
+            out[key] = entry
         return out
+
+    def _unit_child(
+        self, ca: _Child, ma: str, cb: _Child, mb: str, unit: Unit, path: tuple[str, ...]
+    ) -> None:
+        """The same unit under both parents: compare its ``<Element>`` wrapper, not the unit."""
+        if ca.wrapper != cb.wrapper:
+            self._changed(unit, path, ma, ca.el, mb, cb.el, "a model object is wrapped differently")
+        elif ca.wrapper:
+            self._attrs(unit, path, ma, ca.el, mb, cb.el, drop_dbid=False)
+            self._loose(
+                unit, path, ma, ca.el, mb, cb.el, "text inside the <Element> wrapper changed"
+            )
+
+    def _lone_child(
+        self, child: _Child, member: str, side: str, unit: Unit, path: tuple[str, ...]
+    ) -> None:
+        if child.unit is None:
+            self._lone(child.el, member, side, unit, path)
+            return
+        u = child.unit
+        one_sided = u.a is None or u.b is None
+        extra = child.wrapper and (
+            bool(child.el.attrs) or bool(_loose_text(child.el, self._data(side, member)))
+        )
+        if not one_sided and u.key not in self.relocated:
+            self._presence(
+                unit,
+                path,
+                member,
+                child.el,
+                side,
+                "a model object now sits under another parent element, which the semantic "
+                "layer did not report as a move",
+            )
+        elif extra:
+            self._presence(
+                unit,
+                path,
+                member,
+                child.el,
+                side,
+                "the <Element> wrapper holds more than the object",
+            )
 
     def _covers(self, side: str, member: str, el: Element) -> list[Cover]:
         found: list[Cover] = []
@@ -623,8 +764,13 @@ class OpaqueEngine:
     def _explained(self, ca: list[Cover], cb: list[Cover], ia: bytes, ib: bytes) -> bool:
         modes = {c.mode for c in ca} | {c.mode for c in cb}
         if modes == {"text"}:
-            fields = {(c.unit, c.field) for c in ca} | {(c.unit, c.field) for c in cb}
-            return fields <= self.changed
+            # Only this leaf: the field must be reported as changed *and* the value decoded
+            # from this very leaf must differ (one entry of a list, not just the list).
+            va = {(c.unit, c.field): c.value for c in ca}
+            vb = {(c.unit, c.field): c.value for c in cb}
+            return va.keys() == vb.keys() and all(
+                k in self.changed and not same_value(va[k], vb[k]) for k in va
+            )
         if len(modes) != 1:
             return False
         mode = modes.pop()
@@ -632,24 +778,36 @@ class OpaqueEngine:
         return ra is not None and rb is not None and _same_residue(ra, rb)
 
     def _lone(self, el: Element, member: str, side: str, unit: Unit, path: tuple[str, ...]) -> None:
-        """An element on one side only (nested units inside it are compared on their own)."""
+        """A plain element on one side only (units inside it are compared on their own)."""
         if not el.children:
             covers = self._covers(side, member, el)
             if covers and all(
                 c.mode == "text" and (c.unit, c.field) in self.changed for c in covers
             ):
                 return
+        self._presence(unit, path, member, el, side, None)
+
+    def _presence(
+        self,
+        unit: Unit,
+        path: tuple[str, ...],
+        member: str,
+        el: Element,
+        side: str,
+        why: str | None,
+    ) -> None:
         size = len(el.raw)
         if blobs.is_blob_tag(el.tag) and not el.children:
             data = _hex_bytes(el.inner_raw)
             size = len(data) if data is not None else size
         prov = Provenance(member, el.start, el.end, "element")
         verb = "removed" if side == "a" else "added"
+        reason = f"; {why}" if why else ""
         self.out.append(
             unit.ctx.change(
                 "opaque",
                 f"opaque-{verb}",
-                f"opaque <{'/'.join(path)}> {verb} ({size} bytes, {member} @{el.start})",
+                f"opaque <{'/'.join(path)}> {verb} ({size} bytes, {member} @{el.start}){reason}",
                 field_name="/".join(path),
                 where_a=prov if side == "a" else None,
                 where_b=prov if side == "b" else None,
@@ -658,16 +816,28 @@ class OpaqueEngine:
         )
 
     def _lone_carrier(self, unit: Unit) -> None:
-        """A marker blob on one side only is accounted for when every marker in it decoded."""
+        """A marker blob on one side only is accounted for when it is nothing but markers.
+
+        That is: no attributes but DbId, no stray text, only ``FieldsBlob``/``BlobOwner``/
+        ``DbSavedTime`` leaves, a keyed dict holding only ``BlobData``, and markers whose every
+        field the reader decodes (they are reported as added or removed markers).
+        """
         side, prov = ("a", unit.a) if unit.a is not None else ("b", unit.b)
         if prov is None:
             return
         el = self.elements[side].get((prov.member, prov.start, prov.end))
-        fb = el.find("FieldsBlob") if el is not None else None
-        if fb is not None and _residue("markers", fb.inner_raw, []) is not None:
+        if el is None:
             return
-        if el is not None:
-            self._lone(el, prov.member, side, unit, (el.tag,))
+        if _plain_carrier(el, self._data(side, prov.member)):
+            return
+        self._presence(
+            unit,
+            (el.tag,),
+            prov.member,
+            el,
+            side,
+            "marker blob with content the reader does not decode",
+        )
 
     def _changed(
         self,
@@ -679,22 +849,25 @@ class OpaqueEngine:
         eb: Element,
         why: str,
         *,
-        tag_only: bool = False,
+        part: tuple[bytes, bytes] | None = None,
     ) -> None:
-        leaf = not ea.children and not eb.children and not tag_only
-        if leaf:
+        leaf = not ea.children and not eb.children and part is None
+        if part is not None:
+            xa, xb = part
+            wa = Provenance(ma, ea.start, ea.end, "element")
+            wb = Provenance(mb, eb.start, eb.end, "element")
+        elif leaf:
             xa, xb = ea.inner_raw, eb.inner_raw
             if blobs.is_blob_tag(ea.tag):
                 ha, hb = _hex_bytes(xa), _hex_bytes(xb)
-                if ha is not None and hb is not None:
+                if ha is not None and hb is not None and ha != hb:
                     xa, xb = ha, hb
+                elif ha is not None and ha == hb:
+                    why = "same bytes, but the hex text differs (letter case or spacing)"
             wa = _inner_prov(ma, ea)
             wb = _inner_prov(mb, eb)
         else:
             xa, xb = ea.raw, eb.raw
-            if tag_only:
-                xa = xa[: (ea.inner_start or ea.end) - ea.start]
-                xb = xb[: (eb.inner_start or eb.end) - eb.start]
             wa = Provenance(ma, ea.start, ea.end, "element")
             wb = Provenance(mb, eb.start, eb.end, "element")
         count, first = _diff_size(xa, xb)
@@ -732,19 +905,22 @@ def _inner_prov(member: str, el: Element) -> Provenance:
     return Provenance(member, el.inner_start, el.inner_end, "text")
 
 
-def _segment(key: tuple[Any, ...]) -> str:
+def _segment(key: tuple[Any, ...], child: _Child) -> str:
+    if key[0] == "unit":
+        return f"{child.el.tag}[{child.tag}]" if child.wrapper else child.tag
     if key[0] == "Element" and len(key) >= 3:
         return f"Element[{key[1]} {str(key[2])[:8]}]"
     tag, n = key[0], key[1]
     return str(tag) if n == 1 else f"{tag}[{n}]"
 
 
-def _wraps_only(wrapper: Element, inner: Element, data: bytes) -> bool:
-    if wrapper.inner_start is None or wrapper.inner_end is None:
-        return False
-    before = data[wrapper.inner_start : inner.start]
-    after = data[inner.end : wrapper.inner_end]
-    return not (before.strip() or after.strip())
+def _order_key(parent: str, key: tuple[Any, ...], child: _Child) -> tuple[Any, ...]:
+    """What the order of children is compared on (see the module docstring)."""
+    if key[0] == "unit" and (parent in _SEMANTIC_ORDER or parent.endswith("TrackVec")):
+        return ("unit",)
+    if parent.endswith("Set") and key[0] in ("unit", "Element"):
+        return ("dbid", child.tag)
+    return key
 
 
 def _loose_text(el: Element, data: bytes) -> bytes:
@@ -763,7 +939,27 @@ def _loose_text(el: Element, data: bytes) -> bytes:
     return b"".join(parts)
 
 
-def _iter_skipping(el: Element, skip: frozenset[str]) -> Any:
+def _plain_carrier(el: Element, data: bytes) -> bool:
+    if set(el.attrs) - {"DbId"} or _loose_text(el, data):
+        return False
+    tags = [c.tag for c in el.children]
+    if len(tags) != len(set(tags)) or not set(tags) <= _CARRIER_CHILDREN:
+        return False
+    if any(c.children for c in el.children):
+        return False
+    fb = el.find("FieldsBlob")
+    residue = _residue("markers", fb.inner_raw, []) if fb is not None else None
+    if not isinstance(residue, tuple) or residue[1] != 1 or len(residue) != 3:
+        return False
+    blob_data = residue[2]
+    return (
+        isinstance(blob_data, tuple)
+        and isinstance(blob_data[-1], _MarkerList)
+        and blob_data[-1].plain()
+    )
+
+
+def _iter_skipping(el: Element, skip: frozenset[str]) -> Iterator[Element]:
     stack = list(reversed(el.children))
     while stack:
         node = stack.pop()
@@ -791,20 +987,20 @@ def _hex_bytes(inner: bytes) -> bytes | None:
         return None
 
 
-def _cover_for(unit: tuple[Any, ...], name: str, prov: Provenance) -> Cover | None:
+def _cover_for(unit: tuple[Any, ...], name: str, prov: Provenance, value: Any) -> Cover | None:
     if prov.kind in ("text", "element"):
-        return Cover(unit, name, "text")
+        return Cover(unit, name, "text", value=value)
     if prov.kind != "blob" or not prov.blob_path:
         return None
     bp = prov.blob_path
     if bp in ("FrameRate",):
-        return Cover(unit, name, "rate")
+        return Cover(unit, name, "rate", value=value)
     if bp in ("Resolution", "MediaExtents"):
-        return Cover(unit, name, "fixed")
+        return Cover(unit, name, "fixed", value=value)
     if bp.startswith(("Time>keyed:", "Geometry>keyed:")):
-        return Cover(unit, name, "keyed", bp.split(":", 1)[1])
+        return Cover(unit, name, "keyed", bp.split(":", 1)[1], value)
     if bp == "FieldsBlob>SetupBA>message>protobuf#69":
-        return Cover(unit, name, "setup")
+        return Cover(unit, name, "setup", value=value)
     return None  # e.g. MediaTimemapBA: only part of it is decoded, so it stays opaque
 
 
@@ -812,8 +1008,8 @@ def _cover_for(unit: tuple[Any, ...], name: str, prov: Provenance) -> Cover | No
 #
 # A residue is everything in a blob except exactly what the reader decoded into the model.
 # Two blobs with equal residues differ only in decoded values, which the semantic layer
-# reports. ``None`` means the blob could not be taken apart the way the reader does it, so
-# the caller falls back to calling it opaque.
+# reports (floats compared bit for bit). ``None`` means the blob could not be taken apart the
+# way the reader does it, so the caller falls back to calling it opaque.
 
 
 def _residue(mode: str, inner: bytes, covers: list[Cover]) -> Any:
@@ -836,7 +1032,7 @@ def _rate_residue(data: bytes, covers: list[Cover]) -> Any:
 def _fixed_residue(data: bytes, covers: list[Cover]) -> Any:
     if len(data) != 16:
         raise BlobError("not a 16-byte value")
-    return ("fixed",)  # every byte is part of the decoded value
+    return ("fixed",)  # every byte is part of the decoded value, compared bit for bit
 
 
 def _keyed_value_rest(key: str, value: Any) -> Any:
@@ -871,6 +1067,39 @@ def _pb_rest(payload: bytes, fields: list[blobs.PbField], skip: set[int]) -> tup
     return tuple(payload[f.offset : f.end] for f in fields if id(f) not in skip)
 
 
+def _varint(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = n & 0x7F
+        n >>= 7
+        out.append(byte | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def _noncanonical(payload: bytes, fields: list[blobs.PbField], used: set[int]) -> tuple[Any, ...]:
+    """Raw bytes of decoded fields whose encoding is not the shortest one (padded varints).
+
+    The decoded value hides the encoding, so a non-canonical key, length or varint value is
+    kept in the residue.
+    """
+    odd = []
+    for f in fields:
+        if id(f) not in used:
+            continue
+        raw = payload[f.offset : f.end]
+        head = _varint(f.number << 3 | f.wire)
+        if f.wire == 0 and isinstance(f.value, int):
+            canonical = head + _varint(f.value)
+        elif f.wire == 2 and isinstance(f.value, bytes):
+            canonical = head + _varint(len(f.value)) + f.value
+        else:
+            canonical = head + (f.value if isinstance(f.value, bytes) else b"")
+        if raw != canonical:
+            odd.append((f.number, raw))
+    return tuple(odd)
+
+
 def _setup_residue(data: bytes, covers: list[Cover]) -> Any:
     kd = blobs.decode_keyed_dict(data)
     if kd.error is not None:
@@ -891,25 +1120,21 @@ def _setup_residue(data: bytes, covers: list[Cover]) -> Any:
                 skip.add(id(f))
                 break
         out.append(
-            (e.key, e.type, e.subtype, env.version, env.codec, _pb_rest(payload, fields, skip))
+            (
+                e.key,
+                e.type,
+                e.subtype,
+                env.version,
+                env.codec,
+                _noncanonical(payload, fields, skip),
+                _pb_rest(payload, fields, skip),
+            )
         )
     return tuple(out)
 
 
-def _join_path(directory: str | None, filename: str | None) -> str | None:
-    # Same rule as the reader: join with the separator the directory already uses.
-    if not filename:
-        return directory or None
-    if not directory:
-        return filename
-    if directory.endswith(("\\", "/")):
-        return directory + filename
-    sep = "\\" if "\\" in directory and "/" not in directory else "/"
-    return directory + sep + filename
-
-
 def _clip_residue(data: bytes, covers: list[Cover]) -> Any:
-    paths, takes_codec = covers[0].arg
+    paths, takes_codec, paths_changed = covers[0].arg
     env = blobs.parse_envelope(data)
     if env is None:
         raise BlobError("Clip blob is not an envelope")
@@ -920,24 +1145,41 @@ def _clip_residue(data: bytes, covers: list[Cover]) -> Any:
         first.setdefault(f.number, f)
     directory = first[1].as_text if 1 in first else None
     filename = first[2].as_text if 2 in first else None
-    path = _join_path(directory, filename)
+    path = join_clip_path(directory, filename)
     skip: set[int] = set()
-    path_ref: int | None = None
+    split: Any = None
     if path and path in paths:
-        path_ref = paths.index(path)
+        # The joined path is reported; how it was split into directory and file name is not,
+        # so the split is kept: which fields exist, and where it falls against the last
+        # separator. Which stream holds which path is an index into the clip's path list,
+        # ignored only when that list changed (the change is reported).
+        tail = _PATH_SEP.split(path)[-1]
+        split = (
+            "*" if paths_changed else paths.index(path),
+            1 in first,
+            2 in first,
+            len(filename or "") - len(tail),
+            bool(directory) and str(directory).endswith(("\\", "/")),
+        )
         for number, text in ((1, directory), (2, filename)):
             if number in first and text is not None:
                 skip.add(id(first[number]))
     if takes_codec and 5 in first and first[5].as_text:
         skip.add(id(first[5]))
-    return (env.version, env.codec, path_ref, _pb_rest(payload, fields, skip))
+    return (
+        env.version,
+        env.codec,
+        split,
+        _noncanonical(payload, fields, skip),
+        _pb_rest(payload, fields, skip),
+    )
 
 
 def _clean_text(raw: bytes) -> bool:
     return raw.decode("utf-8", "replace").encode("utf-8") == raw
 
 
-def _marker_entry_residue(entry: blobs.PbField) -> Any:
+def _marker_entry_residue(entry: blobs.PbField) -> tuple[Any, ...]:
     if entry.number != 1 or not isinstance(entry.value, bytes):
         raise BlobError("marker list entry is not field 1")
     value = entry.value
@@ -964,7 +1206,7 @@ def _marker_entry_residue(entry: blobs.PbField) -> Any:
     for i, s in enumerate(strings[:3]):
         assert isinstance(s.value, bytes)
         text = s.value
-        if i == 1:
+        if i == 1:  # the duration: decoded as an int, so only its canonical spelling is masked
             ok = (text.isdigit() and str(int(text)).encode() == text) or text == b""
         else:
             ok = _clean_text(text)
@@ -972,13 +1214,21 @@ def _marker_entry_residue(entry: blobs.PbField) -> Any:
             skip.add(id(s))
     if custom is not None and isinstance(custom.value, bytes) and _clean_text(custom.value):
         skip.add(id(custom))
+    head_used = {id(frame), id(body)}
+    inner_used = {id(detail)} if detail is not None else set()
+    noncanonical = (
+        _noncanonical(value, parts, head_used)
+        + _noncanonical(env.payload, inner, inner_used)
+        + _noncanonical(detail_bytes, fields, skip)
+    )
     return (
-        _pb_rest(value, parts, {id(frame), id(body)}),
+        _pb_rest(value, parts, head_used),
         len(strings),
         env.version,
         env.codec,
-        _pb_rest(env.payload, inner, {id(detail)} if detail is not None else set()),
+        _pb_rest(env.payload, inner, inner_used),
         _pb_rest(detail_bytes, fields, skip),
+        noncanonical,
     )
 
 
@@ -988,13 +1238,18 @@ class _MarkerList:
 
     ``framing`` holds the framing of markers whose content is otherwise fully decoded (string
     count, body header version, codec); ``odd`` lists, sorted, every marker entry that carries
-    anything the reader does not decode. Markers that are added or removed are reported by the
-    semantic layer, so their framing only counts when both sides have plain markers to compare.
+    anything the reader does not decode (undecoded fields, non-canonical encodings). Markers
+    added or removed are reported by the semantic layer, so plain markers' framing only counts
+    when both sides have plain markers to compare; an ``odd`` entry always counts. The order
+    of markers in the list is reported by the semantic layer.
     """
 
     holders: int
     framing: frozenset[Any]
     odd: tuple[Any, ...]
+
+    def plain(self) -> bool:
+        return not self.odd
 
     def same_as(self, other: _MarkerList) -> bool:
         if self.odd != other.odd:
@@ -1012,11 +1267,10 @@ def _markers_payload_residue(payload: bytes) -> _MarkerList:
         if holder.number != 2 or not isinstance(holder.value, bytes):
             raise BlobError("marker list holder is not field 2")
         for entry in blobs.decode_protobuf(holder.value, nested_depth=0):
-            rest_entry, n_strings, version, codec, rest_inner, rest_detail = _marker_entry_residue(
-                entry
-            )
-            if rest_entry or rest_inner or rest_detail:
-                odd.append((rest_entry, n_strings, version, codec, rest_inner, rest_detail))
+            residue = _marker_entry_residue(entry)
+            rest_entry, n_strings, version, codec, rest_inner, rest_detail, noncanon = residue
+            if rest_entry or rest_inner or rest_detail or noncanon:
+                odd.append(residue)
             else:
                 framing.add((n_strings, version, codec))
     return _MarkerList(len(top), frozenset(framing), tuple(sorted(odd, key=repr)))

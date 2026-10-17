@@ -12,7 +12,7 @@ import zipfile
 from collections.abc import Callable
 from pathlib import Path
 
-from drp_helpers import envelope, kd, pb_len, pb_var
+from drp_helpers import envelope, kd, pb_len, pb_var, qstr, varint
 
 from aar.drp import blobs
 
@@ -128,15 +128,22 @@ def reindent(data: bytes) -> bytes:
 
 def rewrite_clip_blobs(
     replace: Callable[[list[blobs.PbField], bytes], bytes],
+    which: set[int] | None = None,
 ) -> Edit:
-    """Re-encode every ``<Clip>`` blob: decode, let ``replace`` rebuild the protobuf, recompress.
+    """Re-encode ``<Clip>`` blobs: decode, let ``replace`` rebuild the protobuf, recompress.
 
-    The envelope version and codec are kept, so only the protobuf content changes.
+    ``which`` picks blobs by position in the member (0 = first; ``None`` = all). The envelope
+    version and codec are kept, so only the protobuf content changes.
     """
     import zstandard
 
     def run(data: bytes) -> bytes:
+        seen = [-1]
+
         def repl(m: re.Match[bytes]) -> bytes:
+            seen[0] += 1
+            if which is not None and seen[0] not in which:
+                return m.group(0)
             raw = bytes.fromhex(m.group(1).decode())
             env = blobs.parse_envelope(raw)
             assert env is not None and env.version is not None
@@ -176,18 +183,31 @@ def set_fields(values: dict[int, bytes]) -> Callable[[list[blobs.PbField], bytes
     return build
 
 
-def marker_entry(frame: int, color: int, name: str, note: str = "", extra: bytes = b"") -> bytes:
-    """One marker list entry; ``extra`` is appended to the detail message (undecoded fields)."""
+def marker_entry(
+    frame: int,
+    color: int,
+    name: str,
+    note: str = "",
+    extra: bytes = b"",
+    duration: bytes = b"1",
+    frame_raw: bytes | None = None,
+) -> bytes:
+    """One marker list entry.
+
+    ``extra`` is appended to the detail message (undecoded fields); ``duration`` is the raw
+    duration text; ``frame_raw`` replaces the frame's varint bytes (e.g. a padded varint).
+    """
     detail = (
         pb_var(1, color)
         + pb_len(3, note.encode())
-        + pb_len(3, b"1")
+        + pb_len(3, duration)
         + pb_len(3, name.encode())
         + extra
     )
     inner = pb_len(1, detail)
     body = struct.pack(">II", 2, len(inner)) + inner
-    return pb_len(1, pb_var(1, frame) + pb_len(2, body))
+    frame_field = pb_var(1, frame) if frame_raw is None else varint(1 << 3) + frame_raw
+    return pb_len(1, frame_field + pb_len(2, body))
 
 
 def markers_fields_blob(*entries: bytes) -> str:
@@ -206,3 +226,36 @@ def carrier(dbid: str, owner: str, fields_blob: str, tag: str = "Sm2SequenceLock
 def add_carrier(element: bytes) -> Edit:
     """Insert a lockable-blob element at the start of ``<LocableBlobSet>``."""
     return once(b"<LocableBlobSet>\n    ", b"<LocableBlobSet>\n    " + element)
+
+
+def element_span(data: bytes, dbid: str) -> tuple[int, int]:
+    """Span of the ``<Element>`` wrapper around the element with this DbId (no nesting check
+    beyond the element's own closing tag)."""
+    at = data.index(f'DbId="{dbid}"'.encode())
+    tag_start = data.rindex(b"<", 0, at)
+    tag = data[tag_start + 1 : at].split()[0]
+    start = data.rindex(b"<Element>", 0, tag_start)
+    close = data.index(b"</" + tag + b">", at)
+    end = data.index(b"</Element>", close) + len(b"</Element>")
+    return start, end
+
+
+def move_element(dbid: str, before: bytes, after_anchor: bytes) -> Edit:
+    """Cut the ``<Element>`` wrapping ``dbid`` and insert it right after ``after_anchor``."""
+
+    def run(data: bytes) -> bytes:
+        start, end = element_span(data, dbid)
+        piece = data[start:end]
+        rest = data[:start] + data[end:]
+        i = rest.index(after_anchor) + len(after_anchor)
+        return rest[:i] + before + piece + rest[i:]
+
+    return run
+
+
+def kd_string(key: str, value: str) -> tuple[str, int, bytes]:
+    return (key, 0x0A, qstr(value))
+
+
+def kd_bytes(key: str, value: bytes) -> tuple[str, int, bytes]:
+    return (key, 0x0C, struct.pack(">I", len(value)) + value)
