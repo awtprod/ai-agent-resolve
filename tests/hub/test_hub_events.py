@@ -5,7 +5,7 @@ from __future__ import annotations
 import multiprocessing
 import os
 import sqlite3
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -124,11 +124,11 @@ def _miss_precheck_once(log: EventLog, monkeypatch) -> None:
     real = log._lookup_idempotent
     state = {"missed": False}
 
-    def wrapper(key, event_type, project_id, payload_json):
+    def wrapper(key, event_type, project_id, payload_json, actor):
         if not state["missed"]:
             state["missed"] = True
             return None  # pre-check misses: the INSERT runs and trips the UNIQUE key
-        return real(key, event_type, project_id, payload_json)
+        return real(key, event_type, project_id, payload_json, actor)
 
     monkeypatch.setattr(log, "_lookup_idempotent", wrapper)
 
@@ -425,3 +425,132 @@ def test_read_only_open_handles_percent_in_path(tmp_path: Path) -> None:
     db = tmp_path / "a%2Fb.db"  # a literal percent must be encoded, not left raw
     EventLog(db).append("note", Actor("agent", "a1"), {"k": 1})
     assert len(EventLog(db, read_only=True).read()) == 1
+
+
+# -- read-only open: path handling (round 3) --------------------------------------
+
+
+def test_read_only_open_does_not_collapse_dotdot_through_symlink(tmp_path: Path) -> None:
+    a = tmp_path / "A"
+    (a / "sub" / "subsub").mkdir(parents=True)
+    EventLog(a / "sub" / "x.db").append("note", Actor("agent", "a1"), {"which": "real"})
+    EventLog(a / "x.db").append("note", Actor("agent", "a1"), {"which": "decoy"})
+    (a / "link").symlink_to(a / "sub" / "subsub")
+
+    # The OS must resolve link -> A/sub/subsub, then '..' -> A/sub, reaching A/sub/x.db.
+    # Collapsing '..' as text (os.path.abspath) would wrongly reach the decoy A/x.db.
+    through = f"{a}/link/../x.db"
+    assert EventLog(through, read_only=True).read()[0].payload["which"] == "real"
+
+
+def test_windows_paths_make_valid_file_uris() -> None:
+    # The read-only open builds its URI with Path.as_uri(); confirm that is correct for
+    # Windows drive letters, backslashes and UNC paths (verified via PureWindowsPath).
+    assert PureWindowsPath("C:/data/hub.db").as_uri() == "file:///C:/data/hub.db"
+    assert PureWindowsPath(r"C:\data\hub.db").as_uri() == "file:///C:/data/hub.db"
+    assert PureWindowsPath(r"\\server\share\hub.db").as_uri() == "file://server/share/hub.db"
+
+
+# -- create=False must not touch a foreign database (round 3) ---------------------
+
+
+def test_create_false_leaves_a_foreign_database_untouched(tmp_path: Path) -> None:
+    foreign = tmp_path / "foreign.db"
+    con = sqlite3.connect(foreign)
+    con.execute("CREATE TABLE t (x)")
+    con.commit()
+    con.close()
+    before = foreign.read_bytes()
+    mtime = foreign.stat().st_mtime_ns
+
+    with pytest.raises(RuntimeError):
+        EventLog(foreign, create=False)
+
+    assert foreign.read_bytes() == before  # schema checked before any WAL switch
+    assert foreign.stat().st_mtime_ns == mtime
+    assert not (tmp_path / "foreign.db-wal").exists()
+    assert not (tmp_path / "foreign.db-shm").exists()
+
+
+def test_failed_open_closes_the_connection(tmp_path: Path, monkeypatch) -> None:
+    import aar.hub.events as events_mod
+
+    real_connect = events_mod.sqlite3.connect
+    opened: list = []
+
+    def spy(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    foreign = tmp_path / "foreign.db"
+    con = real_connect(foreign)
+    con.execute("CREATE TABLE t (x)")
+    con.commit()
+    con.close()
+
+    monkeypatch.setattr(events_mod.sqlite3, "connect", spy)
+    with pytest.raises(RuntimeError):
+        EventLog(foreign, create=False)
+
+    assert opened, "no connection was opened"
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[-1].execute("SELECT 1")  # the failed open's connection must be closed
+
+
+# -- idempotency matching survivors (round 3) -------------------------------------
+
+
+def test_lookup_conflicts_on_a_different_type(tmp_path: Path) -> None:
+    log = _log(tmp_path)
+    actor = Actor("agent", "a1")
+    log.append("a", actor, {"n": 1}, idempotency_key="K")
+    # Same payload/project/actor, different type: a conflict (pins the type clause).
+    with pytest.raises(IdempotencyConflict):
+        log.append("b", actor, {"n": 1}, idempotency_key="K")
+
+
+def test_lookup_distinguishes_true_from_one(tmp_path: Path) -> None:
+    log = _log(tmp_path)
+    actor = Actor("agent", "a1")
+    log.append("t", actor, {"v": True}, idempotency_key="K")
+    # True and 1 are Python-equal but text-distinct; reusing the key must conflict.
+    with pytest.raises(IdempotencyConflict):
+        log.append("t", actor, {"v": 1}, idempotency_key="K")
+
+
+def test_same_key_different_actor_conflicts(tmp_path: Path) -> None:
+    log = _log(tmp_path)
+    log.append("t", Actor("agent", "a1"), {"n": 1}, idempotency_key="K")
+    with pytest.raises(IdempotencyConflict):
+        log.append("t", Actor("agent", "a2"), {"n": 1}, idempotency_key="K")
+
+
+def test_same_key_same_actor_and_payload_dedupes(tmp_path: Path) -> None:
+    log = _log(tmp_path)
+    actor = Actor("agent", "a1")
+    first = log.append("t", actor, {"n": 1}, idempotency_key="K")
+    again = log.append("t", actor, {"n": 1}, idempotency_key="K")  # later ts, still a retry
+    assert again.seq == first.seq
+    assert log.latest_seq() == 1
+
+
+def test_read_only_connection_rejects_direct_writes(tmp_path: Path) -> None:
+    db = tmp_path / "hub.db"
+    EventLog(db).append("t", Actor("agent", "a1"), {"k": 1})
+    ro = EventLog(db, read_only=True)
+    # query_only must reject a write issued straight on the connection.
+    with pytest.raises(sqlite3.OperationalError):
+        ro._conn.execute(
+            "INSERT INTO events (id, type, actor_kind, actor_id, ts, payload) "
+            "VALUES ('x', 't', 'agent', 'a', 'now', '{}')"
+        )
+
+
+def test_transaction_find_after_block_raises(tmp_path: Path) -> None:
+    log = _log(tmp_path)
+    captured: list = []
+    with log.transaction() as txn:
+        captured.append(txn)
+    with pytest.raises(RuntimeError):
+        captured[0].find_by_idempotency_key("k")

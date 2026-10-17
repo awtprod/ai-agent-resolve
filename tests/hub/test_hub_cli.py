@@ -76,7 +76,8 @@ def test_serve_reports_a_missing_database(
     calls = _stub_run(monkeypatch)
     code = main(_serve_args(tmp_path, "--host", "127.0.0.1"))
     assert code == 2
-    assert "event log database" in capsys.readouterr().err
+    db = str(tmp_path / "hub.db")
+    assert capsys.readouterr().err.strip() == f"aar hub serve: no event log database at {db!r}"
     assert calls == []
     assert not (tmp_path / "hub.db").exists()  # nothing was created
 
@@ -88,7 +89,10 @@ def test_serve_reports_a_directory_as_database(
     (tmp_path / "hub.db").mkdir()  # a directory where a file was expected
     code = main(_serve_args(tmp_path, "--host", "127.0.0.1"))
     assert code == 2
-    assert "event log database" in capsys.readouterr().err
+    db = str(tmp_path / "hub.db")
+    assert capsys.readouterr().err.startswith(
+        f"aar hub serve: cannot open event log database at {db!r}: "
+    )
     assert calls == []
 
 
@@ -99,7 +103,10 @@ def test_serve_reports_a_non_sqlite_database(
     (tmp_path / "hub.db").write_text("this is not a sqlite database")
     code = main(_serve_args(tmp_path, "--host", "127.0.0.1"))
     assert code == 2
-    assert "event log database" in capsys.readouterr().err
+    db = str(tmp_path / "hub.db")
+    assert capsys.readouterr().err.startswith(
+        f"aar hub serve: cannot open event log database at {db!r}: "
+    )
     assert calls == []
 
 
@@ -121,7 +128,10 @@ def test_serve_reports_a_memory_database(
         ]
     )
     assert code == 2
-    assert ":memory:" in capsys.readouterr().err
+    assert (
+        capsys.readouterr().err.strip()
+        == "aar hub serve: a read-only event log needs a file-backed database, not ':memory:'"
+    )
     assert calls == []
 
 
@@ -133,7 +143,10 @@ def test_serve_reports_a_schemaless_database(
     calls = _stub_run(monkeypatch)
     code = main(_serve_args(tmp_path, "--host", "127.0.0.1"))
     assert code == 2
-    assert "event log" in capsys.readouterr().err
+    db = str(tmp_path / "hub.db")
+    assert capsys.readouterr().err.startswith(
+        f"aar hub serve: event log at {db!r} is missing append-only triggers"
+    )
     assert calls == []
 
 
@@ -144,9 +157,10 @@ def test_serve_reports_a_missing_artifacts_directory(
     calls = _stub_run(monkeypatch)
     code = main(_serve_args(tmp_path, "--host", "127.0.0.1"))
     assert code == 2
-    assert "artifact store" in capsys.readouterr().err
+    art = tmp_path / "artifacts"
+    assert capsys.readouterr().err.strip() == f"aar hub serve: no artifact store directory at {art}"
     assert calls == []
-    assert not (tmp_path / "artifacts").exists()  # not created by the failed open
+    assert not art.exists()  # not created by the failed open
 
 
 def test_hub_requires_a_subcommand(capsys: pytest.CaptureFixture[str]) -> None:

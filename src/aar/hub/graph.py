@@ -251,7 +251,12 @@ class WorkGraph:
                     if node_id is not None:
                         compare.append("node_id")
                     match_or_conflict(
-                        existing, EVENT_NODE_ADDED, expected, compare, project_id=self._project_id
+                        existing,
+                        EVENT_NODE_ADDED,
+                        expected,
+                        compare,
+                        project_id=self._project_id,
+                        actor=actor,
                     )
                     return self._state.nodes[existing.payload["node_id"]]
             nid = node_id or new_node_id()
@@ -298,6 +303,7 @@ class WorkGraph:
                         {"node_id": node_id, "to": new_status},
                         ["node_id", "to"],
                         project_id=self._project_id,
+                        actor=actor,
                     )
                     return node
             if new_status not in allowed_transitions(node.status):
@@ -344,7 +350,12 @@ class WorkGraph:
                     if edge_id is not None:
                         compare.append("edge_id")
                     match_or_conflict(
-                        existing, EVENT_EDGE_ADDED, expected, compare, project_id=self._project_id
+                        existing,
+                        EVENT_EDGE_ADDED,
+                        expected,
+                        compare,
+                        project_id=self._project_id,
+                        actor=actor,
                     )
                     return self._state.edges[existing.payload["edge_id"]]
             src_node = self._state.nodes.get(src)

@@ -29,7 +29,6 @@ from datetime import UTC, datetime
 from os import PathLike
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 ACTOR_KINDS = frozenset({"human", "agent", "node"})
 
@@ -108,6 +107,13 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def _canonical_lenient(value: Any) -> str:
+    # Comparison-only canonical form: tolerates a legacy stored NaN/inf (allow_nan=True)
+    # so matching never raises a bare ValueError. Still distinguishes True/1 and 1/1.0,
+    # because json.dumps renders them as "true"/"1"/"1.0" regardless of allow_nan.
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=True)
+
+
 def match_or_conflict(
     existing: Event,
     event_type: str,
@@ -115,6 +121,7 @@ def match_or_conflict(
     compare_keys: Iterable[str],
     *,
     project_id: str | None = None,
+    actor: Actor | None = None,
 ) -> None:
     """Raise :class:`IdempotencyConflict` unless ``existing`` is the same request.
 
@@ -124,18 +131,21 @@ def match_or_conflict(
     Fields are compared by canonical JSON, not Python ``==``: ``existing.payload`` has
     been through JSON (tuples became lists, dict keys became strings) while ``expected``
     is the live request, so a raw ``==`` both rejects genuine retries (tuple vs list)
-    and accepts distinct requests (``True`` vs ``1``, ``1`` vs ``1.0``). When
-    ``project_id`` is given, the stored event must also belong to it, so a
-    globally-unique key reused in another project's scope is a conflict rather than a
-    ``KeyError`` on the return path. The ``event_type`` check keeps that return path
+    and accepts distinct requests (``True`` vs ``1``, ``1`` vs ``1.0``). The stored side
+    is canonicalised leniently so a legacy NaN/inf payload yields a conflict, not a
+    ValueError. When ``project_id``/``actor`` are given the stored event must also match
+    them (a key reused in another project's scope, or by a different actor, conflicts);
+    ``ts`` is deliberately not compared. The ``event_type`` check keeps the return path
     (indexing by the stored ``node_id``/``edge_id``/``project_id``) type-correct.
     """
     same = existing.type == event_type
     if same and project_id is not None:
         same = existing.project_id == project_id
+    if same and actor is not None:
+        same = existing.actor == actor
     if same:
         same = all(
-            _canonical(existing.payload.get(key)) == _canonical(expected.get(key))
+            _canonical_lenient(existing.payload.get(key)) == _canonical_lenient(expected.get(key))
             for key in compare_keys
         )
     if not same:
@@ -305,7 +315,7 @@ class Transaction:
         payload_json = _canonical(payload)
         if idempotency_key is not None:
             existing = self._log._lookup_idempotent(
-                idempotency_key, event_type, project_id, payload_json
+                idempotency_key, event_type, project_id, payload_json, actor
             )
             if existing is not None:
                 return existing
@@ -338,21 +348,30 @@ class EventLog:
         self._read_only = read_only
         self._lock = threading.RLock()
         self._conn = self._open(read_only)
-        self._conn.row_factory = sqlite3.Row
-        # Manage transactions explicitly (BEGIN IMMEDIATE) rather than via the
-        # sqlite3 module's implicit transaction handling.
-        self._conn.isolation_level = None
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.execute("PRAGMA recursive_triggers=ON")
-        if read_only:
-            self._conn.execute("PRAGMA query_only=ON")
-            self._assert_schema()
-            return
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        if create:
-            self._conn.executescript(_SCHEMA)
-        else:
-            self._assert_schema()
+        try:
+            self._conn.row_factory = sqlite3.Row
+            # Manage transactions explicitly (BEGIN IMMEDIATE) rather than via the
+            # sqlite3 module's implicit transaction handling. These settings and the
+            # schema read below do not write to the database file.
+            self._conn.isolation_level = None
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.execute("PRAGMA recursive_triggers=ON")
+            if read_only:
+                self._conn.execute("PRAGMA query_only=ON")
+                self._assert_schema()
+            elif create:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.executescript(_SCHEMA)
+            else:
+                # Validate the schema BEFORE switching journal mode, so opening a
+                # foreign SQLite file leaves it byte-identical (no WAL switch, no
+                # -wal/-shm side files).
+                self._assert_schema()
+                self._conn.execute("PRAGMA journal_mode=WAL")
+        except BaseException:
+            # Close a failed open deterministically, not at GC time.
+            self._conn.close()
+            raise
 
     def _open(self, read_only: bool) -> sqlite3.Connection:
         if not read_only:
@@ -362,15 +381,18 @@ class EventLog:
         if "\x00" in self._path:
             # A NUL is truncated at %00 and would silently open a different file.
             raise ValueError("event log path must not contain a NUL byte")
-        # mode=rw opens an existing database but never creates one, so a missing or
-        # unopenable path fails atomically here -- no exists()/connect() race and no
-        # stray 0-byte file. The URI is built from the absolute path, bytes-safe:
-        # fsencode handles a non-UTF-8 filename, quote (default safe="/") encodes
-        # '?', '#', '%' and spaces, and the file:// + absolute form stops a leading
-        # '//' from being read as a URI authority. query_only=ON (set by the caller)
-        # enforces read-only; rw (not ro) lets a WAL database with a pending -wal
-        # still create its -shm and be read in any state.
-        uri = "file://" + quote(os.fsencode(os.path.abspath(self._path))) + "?mode=rw"
+        # Make the path absolute WITHOUT normalising it: '..' and symlinks must be
+        # resolved by the OS on open, never collapsed as text (collapsing can reach a
+        # decoy through a symlink). Path.as_uri() then builds a bytes-safe file: URI --
+        # valid on POSIX and Windows (drive letters, backslashes, UNC), keeping a
+        # leading '//', '%', and non-UTF-8 names intact. mode=rw opens an existing
+        # database but never creates one, so a missing/unopenable path fails atomically
+        # (no exists()/connect() race, no stray 0-byte file). query_only=ON (set by the
+        # caller) enforces read-only; rw (not ro) lets a WAL database with a pending
+        # -wal still create its -shm and be read in any state. Closing such a read-only
+        # handle may trigger a WAL checkpoint on the file.
+        raw = self._path if os.path.isabs(self._path) else os.path.join(os.getcwd(), self._path)
+        uri = Path(raw).as_uri() + "?mode=rw"
         conn: sqlite3.Connection | None = None
         try:
             conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
@@ -402,13 +424,19 @@ class EventLog:
     # -- internals shared by append() and Transaction.append() -------------
 
     def _lookup_idempotent(
-        self, idempotency_key: str, event_type: str, project_id: str | None, payload_json: str
+        self,
+        idempotency_key: str,
+        event_type: str,
+        project_id: str | None,
+        payload_json: str,
+        actor: Actor,
     ) -> Event | None:
         """Return the stored event for a key if it is the same request; raise on a mismatch.
 
         The stored payload is compared as text -- it is already canonical JSON on disk --
         and never re-``json.dumps``'d, so a legacy row whose payload contains NaN/inf does
-        not raise a bare ValueError here on a retry of its key.
+        not raise a bare ValueError here on a retry of its key. ``actor`` is part of the
+        request identity (a different actor reusing the key is a conflict); ``ts`` is not.
         """
         row = self._conn.execute(
             "SELECT * FROM events WHERE idempotency_key = ?", (idempotency_key,)
@@ -418,6 +446,8 @@ class EventLog:
         if (
             row["type"] == event_type
             and row["project_id"] == project_id
+            and row["actor_kind"] == actor.kind
+            and row["actor_id"] == actor.id
             and row["payload"] == payload_json
         ):
             return _row_to_event(row)
@@ -501,7 +531,7 @@ class EventLog:
         with self._lock:
             if idempotency_key is not None:
                 existing = self._lookup_idempotent(
-                    idempotency_key, event_type, project_id, payload_json
+                    idempotency_key, event_type, project_id, payload_json, actor
                 )
                 if existing is not None:
                     return existing
@@ -525,7 +555,7 @@ class EventLog:
                 # instead of silently receiving someone else's event.
                 if idempotency_key is not None:
                     existing = self._lookup_idempotent(
-                        idempotency_key, event_type, project_id, payload_json
+                        idempotency_key, event_type, project_id, payload_json, actor
                     )
                     if existing is not None:
                         return existing

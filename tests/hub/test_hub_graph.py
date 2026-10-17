@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -320,3 +321,34 @@ def test_add_edge_conflicts_when_any_compared_field_changes(
             edge_id=merged["edge_id"],
             idempotency_key="E",
         )
+
+
+def test_add_node_on_legacy_nan_key_conflicts_not_valueerror(tmp_path: Path) -> None:
+    db = tmp_path / "hub.db"
+    log = EventLog(db)
+    # A legacy node_added event whose data carries NaN, under key "NK" and the same
+    # actor the retry uses (so matching reaches the data field, not the actor check).
+    raw = sqlite3.connect(db)
+    raw.execute(
+        "INSERT INTO events "
+        "(id, project_id, type, actor_kind, actor_id, ts, payload, idempotency_key) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "legacynode0000000000000001",
+            "prj_1",
+            "graph.node_added",
+            "agent",
+            "editor-1",
+            "now",
+            '{"data":{"v":NaN},"kind":"op","node_id":"nd_legacy","status":"pending","title":null}',
+            "NK",
+        ),
+    )
+    raw.commit()
+    raw.close()
+
+    graph = WorkGraph(log, "prj_1")
+    # A finite-data add_node reusing that key must conflict, not raise a bare ValueError
+    # from re-canonicalising the stored NaN.
+    with pytest.raises(IdempotencyConflict):
+        graph.add_node("op", ACTOR, data={"v": 1}, idempotency_key="NK")
