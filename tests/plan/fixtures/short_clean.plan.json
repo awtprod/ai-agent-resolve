@@ -1,0 +1,140 @@
+{
+  "version": 1,
+  "project": "Example Show S01",
+  "timeline": "Short 03 - Parking Rant",
+  "kind": "short",
+  "fps": {
+    "num": 24000,
+    "den": 1001
+  },
+  "resolution": {
+    "width": 1080,
+    "height": 1920
+  },
+  "profile": "ccn",
+  "sources": [
+    {
+      "id": "cam-a",
+      "media": "media/take1_camA_close.mov",
+      "camera": "A",
+      "shot_size": "close",
+      "recording_id": "take-1",
+      "recording_origin": 0,
+      "duration": 20000
+    },
+    {
+      "id": "cam-b",
+      "media": "media/take1_camB_medium.mov",
+      "camera": "B",
+      "shot_size": "medium",
+      "recording_id": "take-1",
+      "recording_origin": 24,
+      "duration": 20000
+    },
+    {
+      "id": "cam-c",
+      "media": "media/take1_camC_wide.mov",
+      "camera": "C",
+      "shot_size": "wide",
+      "recording_id": "take-1",
+      "recording_origin": 48,
+      "duration": 20000
+    }
+  ],
+  "segments": [
+    {
+      "track": 1,
+      "source": "cam-a",
+      "src_in": 1000,
+      "src_out": 1240,
+      "reframe": [
+        {
+          "time": 0,
+          "x": 0.5,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 240,
+          "x": 0.52,
+          "y": 0.5,
+          "zoom": 1.05
+        }
+      ],
+      "gain_db": 0.0,
+      "label": "setup"
+    },
+    {
+      "track": 1,
+      "source": "cam-c",
+      "src_in": 1500,
+      "src_out": 1740,
+      "reframe": [],
+      "gain_db": -1.5,
+      "label": "turn"
+    },
+    {
+      "track": 1,
+      "source": "cam-b",
+      "src_in": 1764,
+      "src_out": 2004,
+      "reframe": [],
+      "gain_db": 0.0,
+      "label": "punchline"
+    }
+  ],
+  "transitions": [
+    {
+      "after": 0,
+      "video": "cut",
+      "video_frames": 0,
+      "audio": {
+        "type": "Cross Fade 0 dB",
+        "frames": 12
+      }
+    }
+  ],
+  "titles": [
+    {
+      "kind": "lower-third",
+      "lines": [
+        "Pat Example",
+        "Stand-up comic"
+      ],
+      "record_in": 24,
+      "record_out": 120,
+      "template": "Lower Third A"
+    }
+  ],
+  "caption_style": {
+    "font": "Montserrat",
+    "size": 64,
+    "color": "#FFFFFF",
+    "active_word_color": "#FFE600"
+  },
+  "captions": [
+    {
+      "lines": [
+        "I PARKED THERE",
+        "FOR ONE MINUTE"
+      ],
+      "record_in": 0,
+      "record_out": 96
+    },
+    {
+      "lines": [
+        "WAIT FOR IT"
+      ],
+      "record_in": 600,
+      "record_out": 696
+    }
+  ],
+  "markers": [
+    {
+      "record": 240,
+      "name": "angle change",
+      "color": "Blue",
+      "note": "close to wide"
+    }
+  ]
+}
