@@ -20,7 +20,18 @@ from aar.hub.graph import WorkGraph
 from aar.hub.mcp_server import build_server
 from aar.hub.registry import ProjectSource, Registry
 
-TOOL_NAMES = {"projects_list", "project_get", "events_tail", "work_graph", "artifact_meta"}
+TOOL_NAMES = {
+    "projects_list",
+    "project_get",
+    "events_tail",
+    "work_graph",
+    "artifact_meta",
+    "reviews_pending",
+    "review_get",
+    "control_status",
+    "lease_board",
+    "approvals_list",
+}
 
 
 def _payload(result: CallToolResult) -> dict[str, Any]:
