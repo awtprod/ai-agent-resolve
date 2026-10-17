@@ -44,7 +44,7 @@ from drp_edit import (
     rewrite_clip_blobs,
     set_fields,
 )
-from drp_helpers import envelope, kd, pb_len, pb_var
+from drp_helpers import envelope, kd, needs_zstandard, pb_len, pb_var
 
 from aar.drp.reader import read_drp
 
@@ -299,6 +299,7 @@ def lockable_set(order: str) -> Callable[[bytes], bytes]:
     return run
 
 
+@needs_zstandard
 def test_a_set_with_its_dbid_children_reordered_is_identical(tmp_path: Path) -> None:
     # What Resolve does on its own round trip: a mixed-tag set rewritten in hash order.
     a = edited(tmp_path, "a.drp", {"project.xml": lockable_set("MICN")})
@@ -462,6 +463,7 @@ def test_added_marker_with_undecoded_fields(tmp_path: Path) -> None:
     ]
 
 
+@needs_zstandard
 def test_json_has_a_schema_version() -> None:
     data = diff(H264, H264).to_dict()
     assert data["schema_version"] == 2
@@ -642,6 +644,7 @@ def test_n21_dbid_element_order_counts_outside_a_set(tmp_path: Path) -> None:
     assert c.field_name.endswith("Sm2LockableBlobMap")
 
 
+@needs_zstandard
 def test_s03_units_inside_a_set_are_unordered(tmp_path: Path) -> None:
     timeline_blob = carrier(
         MARKER_BLOB_ID, SEQUENCE, markers_fields_blob(marker_entry(48, 32, "T"))

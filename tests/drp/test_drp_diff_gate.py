@@ -32,6 +32,7 @@ from drp_edit import (
     rewrite_clip_blobs,
     set_fields,
 )
+from drp_helpers import needs_zstandard
 
 from aar.cli import main
 from aar.drp.diff import DiffError, diff_projects
@@ -46,6 +47,7 @@ EDITS: dict[str, dict[str, Callable[[bytes], bytes]]] = {
 }
 
 
+@needs_zstandard
 @pytest.mark.parametrize("name", sorted(EDITS))
 def test_gate_passes_decoded_dbid_matched_edits(name: str, tmp_path: Path) -> None:
     b = edited(tmp_path, "b.drp", EDITS[name])
@@ -54,12 +56,14 @@ def test_gate_passes_decoded_dbid_matched_edits(name: str, tmp_path: Path) -> No
     assert d.to_text().splitlines()[-2].startswith("gate: PASS")
 
 
+@needs_zstandard
 def test_gate_passes_identical_files_and_marker_adds(tmp_path: Path) -> None:
     assert diff(H264, H264, gate=True).gate.passed
     d = diff(H264, marker_file(tmp_path, "m.drp", marker_entry(48, 32, "Laugh")), gate=True)
     assert [c.match for c in d.changes] == ["owner+frame"] and d.gate.passed
 
 
+@needs_zstandard
 def test_gate_fails_on_opaque_changes(tmp_path: Path) -> None:
     b = edited(tmp_path, "b.drp", {SEQ_MEMBER: flip_hex_byte(V1, b"FieldsBlob", 40)})
     d = diff(H264, b, gate=True)
@@ -68,6 +72,7 @@ def test_gate_fails_on_opaque_changes(tmp_path: Path) -> None:
     assert d.to_text().splitlines()[-2].startswith("gate: FAIL: 1 opaque change(s)")
 
 
+@needs_zstandard
 def test_gate_fails_on_heuristic_matches(tmp_path: Path) -> None:
     strip = chain(
         once(f' DbId="{V1_ITEM}"'.encode(), b""), once(f' DbId="{A1_ITEM}"'.encode(), b"")
@@ -108,6 +113,7 @@ def test_gate_fails_on_duplicate_dbids(tmp_path: Path) -> None:
     assert {c.match for c in d.changes} == {"heuristic"}
 
 
+@needs_zstandard
 def test_gate_fails_on_a_degraded_read(tmp_path: Path) -> None:
     def odd_hex(data: bytes) -> bytes:
         at = data.index(V1)
@@ -120,6 +126,7 @@ def test_gate_fails_on_a_degraded_read(tmp_path: Path) -> None:
     assert "B: read with warnings (bad-hex)" in d.gate.reasons
 
 
+@needs_zstandard
 def test_gate_mode_pairs_no_markers_by_name(tmp_path: Path) -> None:
     a = marker_file(tmp_path, "a.drp", marker_entry(48, 32, "Laugh"))
     b = marker_file(tmp_path, "b.drp", marker_entry(60, 32, "Laugh"))
@@ -134,6 +141,7 @@ def test_gate_mode_pairs_no_markers_by_name(tmp_path: Path) -> None:
     assert strict.gate.passed
 
 
+@needs_zstandard
 def test_cli_gate_exit_codes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     ok = edited(tmp_path, "ok.drp", EDITS["trim"])
     bad = edited(tmp_path, "bad.drp", {SEQ_MEMBER: flip_hex_byte(V1, b"FieldsBlob", 40)})

@@ -12,7 +12,8 @@ import zipfile
 from collections.abc import Callable
 from pathlib import Path
 
-from drp_helpers import envelope, kd, pb_len, pb_var, qstr, varint
+import pytest
+from drp_helpers import ZSTD_REASON, envelope, kd, pb_len, pb_var, qstr, varint
 
 from aar.drp import blobs
 
@@ -136,9 +137,11 @@ def rewrite_clip_blobs(
     ``which`` picks blobs by position in the member (0 = first; ``None`` = all). The envelope
     version and codec are kept, so only the protobuf content changes.
     """
-    import zstandard
 
     def run(data: bytes) -> bytes:
+        # The templates' Clip blobs are zstd frames with compressed blocks; re-encoding them
+        # needs zstandard, so a test that edits them skips without it.
+        zstandard = pytest.importorskip("zstandard", reason=ZSTD_REASON)
         seen = [-1]
 
         def repl(m: re.Match[bytes]) -> bytes:
