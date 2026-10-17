@@ -165,6 +165,7 @@ class FakeMediaPoolItem:
         input_color_space: str | None = None,
         online: str = "Online",
         proxy: str = "None",
+        cloud_sync: int | str | None = None,
     ) -> None:
         if kind not in _KIND_TYPE:
             raise ValueError(f"unknown clip kind {kind!r}")
@@ -200,6 +201,10 @@ class FakeMediaPoolItem:
             # can read "Offline" while a linked proxy ("Proxy" is its size) still plays.
             "Online Status": online,
             "Proxy": proxy,
+            # Blackmagic Cloud per-clip sync status (CloudSyncStatus); DEFAULT when the clip is
+            # not cloud media. The property is read back as the enumerated code, labelled by
+            # the op from the resolve.CLOUD_SYNC_* constants below. (presumed: the live value)
+            "Cloud Sync": cloud_sync if cloud_sync is not None else app.CLOUD_SYNC_DEFAULT,
             "Audio Ch": "2" if kind in ("av", "audio") else "0",
         }  # fmt: skip
 
@@ -249,11 +254,13 @@ class FakeFolder:
         uid: str,
         subfolders: list[FakeFolder] | None = None,
         clips: list[FakeMediaPoolItem] | None = None,
+        stale: bool = False,
     ) -> None:
         self._name = name
         self._uid = uid
         self.subfolders = subfolders or []
         self.clips = clips or []
+        self.stale = stale
 
     def GetName(self) -> str:
         return self._name
@@ -263,6 +270,10 @@ class FakeFolder:
 
     def GetSubFolderList(self) -> list[FakeFolder]:
         return list(self.subfolders)
+
+    def GetIsFolderStale(self) -> bool:
+        # collaboration freshness (read-only); the write side is MediaPool.RefreshFolders.
+        return self.stale
 
     def GetClipList(self) -> list[FakeMediaPoolItem]:
         return list(self.clips)
@@ -890,6 +901,13 @@ class FakeProject:
         self._uid = f"proj-{next(app.ids)}"
         self.folder = tuple(folder)
         self.settings: dict[str, Any] = dict(_PROJECT_SETTINGS)
+        # ProjectAttributes as ProjectManager.GetProjectAttributesInCurrentFolder returns them.
+        self.attributes: dict[str, str] = {
+            "liveCollaborationMode": "single_user",
+            "lastModifiedDate": "2026-10-17T00:00:00+00:00",
+            "creationDate": "2026-10-01T00:00:00+00:00",
+            "notes": "",
+        }
         self.timelines = [FakeTimeline(app, t, f"tl-{next(app.ids)}", self) for t in timelines]
         self.current_timeline: FakeTimeline | None = self.timelines[0] if self.timelines else None
         ids = app.ids
@@ -1045,6 +1063,16 @@ class FakeProjectManager:
     def GetProjectListInCurrentFolder(self) -> list[str]:
         return [p.GetName() for p in self._app.all_projects if p.folder == self._app.pm_path]
 
+    def GetProjectAttributesInCurrentFolder(self) -> dict[str, dict[str, str]]:
+        return {
+            p.GetName(): dict(p.attributes)
+            for p in self._app.all_projects
+            if p.folder == self._app.pm_path
+        }
+
+    def GetCurrentDatabase(self) -> dict[str, str]:
+        return dict(self._app.database)
+
     def LoadProject(self, projectName: str) -> FakeProject | None:
         self._app.calls.append(("LoadProject", projectName))
         # trap: pm-folder-scoped-load: the name is looked up in the current folder only.
@@ -1079,6 +1107,22 @@ class FakeResolve:
     projects in other folders. The Project Manager starts in the current project's folder.
     """
 
+    # resolve.CLOUD_SYNC_* status codes (CloudSyncStatus). Model choice (presumed): the live
+    # integer values were not probed, so these are placeholders. Ops read these same attributes
+    # off the object to label a clip's 'Cloud Sync' value, so the exact integers do not matter.
+    CLOUD_SYNC_DEFAULT = 0
+    CLOUD_SYNC_DOWNLOAD_IN_QUEUE = 1
+    CLOUD_SYNC_DOWNLOAD_IN_PROGRESS = 2
+    CLOUD_SYNC_DOWNLOAD_SUCCESS = 3
+    CLOUD_SYNC_DOWNLOAD_FAIL = 4
+    CLOUD_SYNC_DOWNLOAD_NOT_FOUND = 5
+    CLOUD_SYNC_UPLOAD_IN_QUEUE = 6
+    CLOUD_SYNC_UPLOAD_IN_PROGRESS = 7
+    CLOUD_SYNC_UPLOAD_SUCCESS = 8
+    CLOUD_SYNC_UPLOAD_FAIL = 9
+    CLOUD_SYNC_UPLOAD_NOT_FOUND = 10
+    CLOUD_SYNC_SUCCESS = 11
+
     def __init__(
         self,
         projects: dict[str, list[str]],
@@ -1104,6 +1148,11 @@ class FakeResolve:
                 "mp4", "H265", 1, {"TargetDir": "C:/Exports", "CustomName": "yt"}
             )
         }
+        # ProjectManager.GetCurrentDatabase. Model choice (presumed): the DbType/DbName a
+        # Blackmagic Cloud library reports were not probed (GetDatabaseList does not list it,
+        # DESIGN F2); "acme" is a placeholder. Tests set this to the local database to exercise
+        # the local_database note.
+        self.database: dict[str, str] = {"DbType": "Cloud", "DbName": "acme cloud library"}
         self.missing: set[str] = set()
         self.load_silently_fails: set[str] = set()
         self.save_fails = False
