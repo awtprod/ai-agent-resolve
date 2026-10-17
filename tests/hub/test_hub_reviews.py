@@ -274,3 +274,31 @@ def test_a_decided_review_cannot_be_reopened_even_by_a_human(hub: Hub) -> None:
     node = graph.node(review.id)
     assert node is not None and node.status == "failed"
     assert forged.id in {item.event_id for item in graph.skipped()}
+
+
+def test_a_retry_key_reused_by_a_different_actor_conflicts(hub: Hub) -> None:
+    # Identical requests under one key, differing only in who sends them: the second
+    # sender must not be handed the first sender's event as if it were their own.
+    review = hub.request()
+    reviews.add_note(hub.log, hub.project, review.id, 24, "trim", AGENT, idempotency_key="note-k")
+    with pytest.raises(IdempotencyConflict):
+        reviews.add_note(
+            hub.log,
+            hub.project,
+            review.id,
+            24,
+            "trim",
+            Actor("agent", "agent-2"),
+            idempotency_key="note-k",
+        )
+    other = hub.request(title="second")
+    reviews.withdraw(hub.log, hub.project, other.id, "superseded", AGENT, idempotency_key="w-k")
+    with pytest.raises(IdempotencyConflict):
+        reviews.withdraw(hub.log, hub.project, other.id, "superseded", HUMAN, idempotency_key="w-k")
+    reviews.decide(hub.log, hub.project, review.id, "approve", "ok", HUMAN, idempotency_key="d-k")
+    before = hub.log.latest_seq()
+    with pytest.raises(IdempotencyConflict):
+        reviews.decide(
+            hub.log, hub.project, review.id, "approve", "ok", OTHER_HUMAN, idempotency_key="d-k"
+        )
+    assert hub.log.latest_seq() == before

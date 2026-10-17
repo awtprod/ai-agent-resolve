@@ -29,7 +29,6 @@ from aar.hub.events import (
     Actor,
     Event,
     EventLog,
-    IdempotencyConflict,
     Transaction,
     match_or_conflict,
 )
@@ -223,11 +222,15 @@ def _retry(
         return None
     existing = txn.find_by_idempotency_key(idempotency_key)
     if existing is not None:
-        match_or_conflict(existing, event_type, payload, payload.keys())
-        if existing.actor != actor:
-            raise IdempotencyConflict(
-                f"idempotency key {idempotency_key!r} was already used by another actor"
-            )
+        scope = StopScope.parse(payload["scope"])
+        match_or_conflict(
+            existing,
+            event_type,
+            payload,
+            payload.keys(),
+            project_id=_project_of(scope),
+            actor=actor,
+        )
     return existing
 
 

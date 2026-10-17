@@ -621,10 +621,16 @@ def test_a_write_command_does_not_switch_a_foreign_sqlite_file_to_wal(
     conn.close()
     argv = _command_argv("request", tmp_path / "artifacts")
 
+    before = db.read_bytes()
+    siblings = sorted(p.name for p in tmp_path.iterdir())
+
     code, _, err = _run(capsys, "hub", "review", "request", "--db", str(db), *argv)
 
     assert code == 2
     assert err is not None and err["error"]["code"] == "database_unavailable"
+    # Byte-identical, and no -wal/-shm side files: the schema check runs before WAL.
+    assert db.read_bytes() == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == siblings
     conn = sqlite3.connect(db)
     try:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"

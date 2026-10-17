@@ -401,3 +401,12 @@ def test_stopping_a_project_that_is_not_in_the_registry_is_refused(tmp_path: Pat
     assert status(log).running is True
     stop(log, "project:prj_demo", "halt", HUMAN)  # a registered project still stops
     assert status(log).running is False
+
+
+def test_a_stop_key_reused_by_a_different_actor_conflicts(tmp_path: Path) -> None:
+    log = _log(tmp_path)
+    stop(log, "project:prj_demo", "halt", HUMAN, idempotency_key="stop-1")
+    before = log.latest_seq()
+    with pytest.raises(IdempotencyConflict):
+        stop(log, "project:prj_demo", "halt", OTHER_HUMAN, idempotency_key="stop-1")
+    assert log.latest_seq() == before

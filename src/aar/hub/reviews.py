@@ -27,7 +27,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, NoReturn
+from typing import Any
 
 from aar.hub.artifacts import ArtifactStore, InvalidArtifactId
 from aar.hub.common import (
@@ -43,7 +43,6 @@ from aar.hub.events import (
     Actor,
     Event,
     EventLog,
-    IdempotencyConflict,
     Transaction,
     match_or_conflict,
 )
@@ -594,9 +593,14 @@ def add_note(
                 if timecode is not None:
                     expected["timecode"] = timecode
                     compare.append("timecode")
-                match_or_conflict(existing, EVENT_NOTE_ADDED, expected, compare)
-                if existing.actor != actor or existing.project_id != project_id:
-                    _conflict(idempotency_key)
+                match_or_conflict(
+                    existing,
+                    EVENT_NOTE_ADDED,
+                    expected,
+                    compare,
+                    project_id=project_id,
+                    actor=actor,
+                )
                 return _note_from_event(existing)
         review = get_review(log, project_id, review_id)
         if review is None:
@@ -618,12 +622,6 @@ def add_note(
             idempotency_key=idempotency_key,
         )
     return _note_from_event(event)
-
-
-def _conflict(idempotency_key: str) -> NoReturn:
-    raise IdempotencyConflict(
-        f"idempotency key {idempotency_key!r} was already used for a different request"
-    )
 
 
 def _assert_valid(problem: str | None) -> None:
@@ -678,12 +676,14 @@ def decide(
         if idempotency_key is not None:
             existing = txn.find_by_idempotency_key(idempotency_key)
             if existing is not None:
-                match_or_conflict(existing, EVENT_DECIDED, payload, payload.keys())
-                if existing.actor != actor or existing.project_id != project_id:
-                    raise IdempotencyConflict(
-                        f"idempotency key {idempotency_key!r} was already used for a "
-                        "different request"
-                    )
+                match_or_conflict(
+                    existing,
+                    EVENT_DECIDED,
+                    payload,
+                    payload.keys(),
+                    project_id=project_id,
+                    actor=actor,
+                )
                 return _decision_from_event(existing)
         # Built inside the transaction, so it sees every committed event and nothing
         # can change underneath it before the commit.
@@ -742,9 +742,14 @@ def withdraw(
         if idempotency_key is not None:
             existing = txn.find_by_idempotency_key(idempotency_key)
             if existing is not None:
-                match_or_conflict(existing, EVENT_WITHDRAWN, payload, payload.keys())
-                if existing.actor != actor or existing.project_id != project_id:
-                    _conflict(idempotency_key)
+                match_or_conflict(
+                    existing,
+                    EVENT_WITHDRAWN,
+                    payload,
+                    payload.keys(),
+                    project_id=project_id,
+                    actor=actor,
+                )
                 return _withdrawal_from_event(existing)
         review = get_review(log, project_id, review_id)
         if review is None:

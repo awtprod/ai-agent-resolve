@@ -219,9 +219,9 @@ _DB_OPEN_ERRORS = (OSError, ValueError, RuntimeError, sqlite3.Error)
 def _open_existing(db: str, *, read_only: bool = False) -> Any:
     """Open an existing hub database, without creating or modifying anything else.
 
-    A write open is preceded by a read-only one, so a SQLite file that is not a hub
-    database is rejected by the schema check before the write open could switch its
-    journal mode to WAL.
+    The file must already exist (a write-mode SQLite connect would create it).
+    ``EventLog(create=False)`` checks the hub schema before switching to WAL, so a
+    SQLite file that is not a hub database is rejected and left byte-identical.
     """
     from aar.hub.events import EventLog
 
@@ -230,11 +230,7 @@ def _open_existing(db: str, *, read_only: bool = False) -> Any:
         what = "a directory" if path.is_dir() else "missing"
         raise _DatabaseUnavailable(f"no hub database at {db!r} ({what})")
     try:
-        checked = EventLog(db, read_only=True)
-        if read_only:
-            return checked
-        checked.close()
-        return EventLog(db, create=False)
+        return EventLog(db, create=False, read_only=read_only)
     except _DB_OPEN_ERRORS as exc:
         raise _DatabaseUnavailable(f"cannot open hub database {db!r}: {exc}") from exc
 
@@ -243,9 +239,10 @@ def _open_store(root: str, log: Any) -> Any:
     """Open an existing artifact store; a missing directory is an error, never created."""
     from aar.hub.artifacts import ArtifactStore
 
-    if not Path(root).is_dir():
-        raise _StoreUnavailable(f"no artifact store directory at {root!r}")
-    return ArtifactStore(root, log)
+    try:
+        return ArtifactStore(root, log, create=False)
+    except OSError as exc:
+        raise _StoreUnavailable(f"no artifact store directory at {root!r}") from exc
 
 
 def _parse_actor(value: str) -> Any:
