@@ -12,16 +12,16 @@ time-slices them:
   stable ``project_id``, which every submitted op must carry). Queues are keyed by
   ``locator.key``.
 - Leases are keyed by identity, never by name: a project lease by ``project_id``, a timeline
-  lease by ``(project_id, timeline unique id)``. An op that names its timeline by unique id
-  needs that timeline; any other op (no timeline, or a timeline by name only) needs the
-  whole project. Why this never under-blocks: two leases conflict when they share a project
-  id and either is a project lease or both name the same timeline id. Ids do not change on
-  rename and differ between same-named projects or timelines, so an op that touches project
-  P (timeline T) always checks a key that conflicts with every lease on P (on T). The op is
-  then held to that identity: the broker asserts the open project's id and the current
-  timeline's id before it runs, and refuses a ref whose name and id disagree. The cost is an
-  over-block, never an under-block: an op that names its timeline only by name waits for
-  every timeline lease in its project.
+  lease by ``(project_id, timeline unique id)``. An op that carries timeline ids
+  (``timeline_id`` plus ``extra_timeline_ids``) needs each of those timelines; an op that
+  carries none needs the whole project. Why this never under-blocks: two leases conflict
+  when they share a project id and either is a project lease or both name the same timeline
+  id. Ids do not change on rename and differ between same-named projects or timelines, so an
+  op that touches project P (timelines T...) always checks keys that conflict with every
+  lease on P (on each T). The op is then held to that identity: the broker asserts the open
+  project's id and the current timeline's id before it runs, and refuses a ref whose name and
+  id disagree. The op library refuses name-only timeline refs on ops that change Resolve, so
+  ops on different timelines of one project never wait for each other.
 - Before it acts in or switches away from a context it did not create, the broker asks the
   ``PresenceGuard``, checks leases, and snapshots the human's context: the full Deliver
   settings (saved into a temporary render preset), the full Project Manager path the human
@@ -45,6 +45,20 @@ time-slices them:
 - Each op gets its own ``OpResult``. A failing op does not abort the batch unless it is
   flagged ``abort_batch_on_failure``; then the rest of the batch from the same holder is
   cancelled and the batch ends.
+
+Known, intentional, fail-closed behaviour (not bugs):
+
+- ``switch_refused``: the broker will not switch away from the human's open project unless it
+  can locate that project by identity. That fails, and every op for another project fails
+  with ``switch_refused``, when the project's name is in more than one Project Manager folder
+  (and the broker never loaded it itself), when the Project Manager search gives up (a walk
+  of more than 1,000 folders, ``pm_walk_too_large``), or when
+  ``BrokerConfig.snapshot_project_manager_path`` is off (then only a locator the broker loaded
+  and verified itself counts). Ops for the human's own project still run.
+- When a human takes over while the broker holds the context (``restore_abandoned``), the
+  temporary Deliver preset is kept and named in the event, for the human to load: the broker
+  no longer knows which project its settings belong in. A failed restore keeps it only when
+  an op ran in the human's project (``RestoreReport.kept_preset``), else deletes it.
 
 Every decision is emitted to an injectable sink as a ``BrokerEvent``. Kinds: ``submitted``,
 ``skipped``, ``deferred``, ``snapshot``, ``switch``, ``switch_failed``, ``batch_started``,
@@ -129,6 +143,8 @@ class HotOp:
     submitted_at: float | None = None
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     timeline_id: str | None = None
+    extra_timeline_ids: tuple[str, ...] = ()
+    """Other timelines the op reads or writes: leased like ``timeline_id``, not selected."""
 
 
 class OpStatus(StrEnum):
@@ -304,6 +320,8 @@ class Broker:
             raise ValueError("timeline must be a non-empty name or None")
         if op.timeline_id is not None and not op.timeline_id:
             raise ValueError("timeline_id must be a non-empty id or None")
+        if not all(isinstance(t, str) and t for t in op.extra_timeline_ids):
+            raise ValueError("extra_timeline_ids must be non-empty ids")
         if op.page is not None and op.page not in VALID_PAGES:
             raise ValueError(f"page {op.page!r} is not one of {sorted(VALID_PAGES)}")
         if op.submitted_at is None:
@@ -320,6 +338,7 @@ class Broker:
             project_id=op.project.project_id,
             timeline=op.timeline,
             timeline_id=op.timeline_id,
+            extra_timeline_ids=list(op.extra_timeline_ids),
             page=op.page,
             holder=str(op.holder),
             priority=op.priority,
@@ -467,14 +486,19 @@ class Broker:
         """
         project_id = op.project.project_id
         assert project_id is not None  # submit() requires it
-        if op.timeline_id is None:
-            # No timeline, or one known only by name: the op may touch any timeline of the
-            # project, so it needs the whole project (an over-block, never an under-block).
+        timeline_ids = [t for t in (op.timeline_id, *op.extra_timeline_ids) if t is not None]
+        if not timeline_ids:
+            # No timeline id: the op may touch any timeline of the project, so it needs the
+            # whole project (an over-block, never an under-block).
             blocking = self._leases.conflicts_for(op.holder, Scope.PROJECT, project_key(project_id))
         else:
-            blocking = self._leases.conflicts_for(
-                op.holder, Scope.TIMELINE, timeline_key(project_id, op.timeline_id)
-            )
+            blocking = [
+                lease
+                for tid in dict.fromkeys(timeline_ids)
+                for lease in self._leases.conflicts_for(
+                    op.holder, Scope.TIMELINE, timeline_key(project_id, tid)
+                )
+            ]
         return blocking[0].describe() if blocking else None
 
     def _runnable(self, *, notify: bool) -> dict[str, list[HotOp]]:
@@ -617,8 +641,7 @@ class Broker:
             known = self._known.get(ctx.project_id)
             human_project = known if known is not None and known.name == ctx.project else None
         self._snapshot = HumanSnapshot(ctx, now, preset, tuple(warnings), human_project)
-        self._control_since = now
-        self._touched_human_project = False
+        self._control_since = now  # _touched_human_project is already False: see _drop_control
         self._emit(
             "snapshot",
             context=asdict(ctx),

@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from aar.node.ops import submit_op
 
 from .fake_resolve import FakeNode, FakeTimelineItem
-from .ops_support import AGENT, BRANCH, Show, human_settles, media
+from .ops_support import AGENT, Show, human_settles, media
 
 START = 108000
 
@@ -33,16 +33,16 @@ def calls(show: Show, name: str) -> list[tuple[Any, ...]]:
 def test_duplicate_makes_a_verified_copy_and_refuses_a_taken_name() -> None:
     show = Show()
     show.main.place("video", 1, show.cam_a, START, 100)
-    result = show.ok("timeline.duplicate", {"source": {"name": "Main"}, "name": "Main v2"})
+    result = show.ok("timeline.duplicate", {"source": show.ref("Main"), "name": "Main v2"})
     assert result.created and result.timeline.name == "Main v2" and result.timeline_count == 3
     copy = show.project.timeline("Main v2")
     assert result.timeline.unique_id == copy.GetUniqueId()
     assert [(i.start, i.end) for i in copy.items("video")] == [(START, START + 100)]
 
-    taken = show.fails("timeline.duplicate", {"source": {"name": "Main"}, "name": "Main v2"})
+    taken = show.fails("timeline.duplicate", {"source": show.ref("Main"), "name": "Main v2"})
     assert taken.code == "timeline_exists"
     reused = show.ok(
-        "timeline.duplicate", {"source": {"name": "Main"}, "name": "Main v2", "if_exists": "reuse"}
+        "timeline.duplicate", {"source": show.ref("Main"), "name": "Main v2", "if_exists": "reuse"}
     )
     assert not reused.created and reused.timeline.unique_id == copy.GetUniqueId()
     assert len(calls(show, "DuplicateTimeline")) == 1
@@ -53,7 +53,7 @@ def test_duplicate_with_custom_resolution_keeps_the_colour_science() -> None:
     result = show.ok(
         "timeline.duplicate",
         {
-            "source": {"name": "Main"},
+            "source": show.ref("Main"),
             "name": "Main 9x16",
             "resolution": {"width": 1080, "height": 1920},
         },
@@ -81,7 +81,7 @@ def test_gain_uses_audio_volume_and_reads_it_back() -> None:
     sound = show.main.place("audio", 1, show.cam_a, START, 100)
     result = show.ok(
         "item.set_audio_gain",
-        {"timeline": {"name": "Main"}, "targets": [{"item": ref(sound), "gain_db": -6.0}]},
+        {"timeline": show.ref("Main"), "targets": [{"item": ref(sound), "gain_db": -6.0}]},
     )
     change = result.changes[0]
     assert (change.before_db, change.after_db, change.page_bounced) == (0.0, -6.0, False)
@@ -98,7 +98,7 @@ def test_gain_bounces_the_page_when_setters_jam_after_color() -> None:
     human_settles(show)
     result = show.ok(
         "item.set_audio_gain",
-        {"timeline": {"name": "Main"}, "targets": [{"item": ref(sound), "gain_db": -3.0}]},
+        {"timeline": show.ref("Main"), "targets": [{"item": ref(sound), "gain_db": -3.0}]},
     )
     assert result.changes[0].page_bounced and result.changes[0].after_db == -3.0
     assert [(n.code, n.trap_id) for n in result.notes] == [
@@ -113,7 +113,7 @@ def test_gain_refuses_video_items() -> None:
     picture = show.main.place("video", 1, show.cam_a, START, 100)
     error = show.fails(
         "item.set_audio_gain",
-        {"timeline": {"name": "Main"}, "targets": [{"item": ref(picture), "gain_db": -3.0}]},
+        {"timeline": show.ref("Main"), "targets": [{"item": ref(picture), "gain_db": -3.0}]},
     )
     assert (error.code, error.detail["trap_id"]) == ("not_audio_item", "volume-key")
     assert calls(show, "SetProperties") == []
@@ -125,7 +125,7 @@ def test_gain_refuses_video_items() -> None:
 def test_fades_are_set_read_back_and_idempotent() -> None:
     show = Show()
     item = show.main.place("video", 1, show.cam_a, START, 100)
-    params = {"timeline": {"name": "Main"}, "targets": [{"item": ref(item), "fade_in": 10}]}
+    params = {"timeline": show.ref("Main"), "targets": [{"item": ref(item), "fade_in": 10}]}
     first = show.ok("item.set_fades", params)
     change = first.changes[0]
     assert (change.before_in, change.after_in, change.after_out) == (0, 10, 0)
@@ -133,7 +133,7 @@ def test_fades_are_set_read_back_and_idempotent() -> None:
     assert len(calls(show, "SetFades")) == 1
     too_long = show.fails(
         "item.set_fades",
-        {"timeline": {"name": "Main"}, "targets": [{"item": ref(item), "fade_out": 500}]},
+        {"timeline": show.ref("Main"), "targets": [{"item": ref(item), "fade_out": 500}]},
     )
     assert too_long.code == "fades_too_long"
     assert len(calls(show, "SetFades")) == 1  # refused before calling Resolve
@@ -154,16 +154,20 @@ def _graded_world() -> tuple[Show, FakeTimelineItem, list[FakeTimelineItem]]:
     return show, reference, targets
 
 
+def tl_ref(timeline: Any) -> dict[str, str]:
+    return {"name": timeline.GetName(), "unique_id": timeline.GetUniqueId()}
+
+
 def _grades_params(
     reference: FakeTimelineItem, targets: list[FakeTimelineItem], **kw: Any
 ) -> dict[str, Any]:
     return {
-        "timeline": BRANCH,
+        "timeline": tl_ref(targets[0].timeline),
         "groups": [
             {
                 "camera": "A",
                 "reference": ref(reference),
-                "reference_timeline": {"name": "Main"},
+                "reference_timeline": tl_ref(reference.timeline),
                 "targets": [ref(t) for t in targets],
             }
         ],
@@ -230,7 +234,7 @@ def test_grades_errors_carry_the_groups_already_done() -> None:
         {
             "camera": "B",
             "reference": ref(second_ref),
-            "reference_timeline": {"name": "Main"},
+            "reference_timeline": show.ref("Main"),
             "targets": [ref(third)],
         }
     )
@@ -309,7 +313,7 @@ def test_input_colour_space_refuses_media_without_its_own_picture() -> None:
 def test_markers_are_added_read_back_and_rerun_safely() -> None:
     show = Show()
     params = {
-        "timeline": {"name": "Main"},
+        "timeline": show.ref("Main"),
         "markers": [
             {"frame": 30, "color": "Red", "name": "laugh", "note": "big"},
             {"frame": 90, "color": "Green", "duration": 5, "custom_data": "aar:review:1"},
@@ -325,7 +329,7 @@ def test_markers_are_added_read_back_and_rerun_safely() -> None:
     assert [m.status for m in again.markers] == ["present", "present"]
     assert len(calls(show, "AddMarker")) == 2
     conflict = show.fails(
-        "markers.add", {"timeline": {"name": "Main"}, "markers": [{"frame": 30, "name": "other"}]}
+        "markers.add", {"timeline": show.ref("Main"), "markers": [{"frame": 30, "name": "other"}]}
     )
     assert conflict.code == "marker_conflict"
     assert len(calls(show, "AddMarker")) == 2
@@ -340,7 +344,7 @@ def test_gain_that_does_not_stick_is_caught() -> None:
     show.fake.faults.add("SetProperties:no-op")
     error = show.fails(
         "item.set_audio_gain",
-        {"timeline": {"name": "Main"}, "targets": [{"item": ref(sound), "gain_db": -6.0}]},
+        {"timeline": show.ref("Main"), "targets": [{"item": ref(sound), "gain_db": -6.0}]},
     )
     assert (error.code, error.detail["trap_id"]) == ("gain_unverified", "volume-key")
 
@@ -351,7 +355,7 @@ def test_fades_that_do_not_stick_are_caught() -> None:
     show.fake.faults.add("SetFades:no-op")
     error = show.fails(
         "item.set_fades",
-        {"timeline": {"name": "Main"}, "targets": [{"item": ref(item), "fade_in": 10}]},
+        {"timeline": show.ref("Main"), "targets": [{"item": ref(item), "fade_in": 10}]},
     )
     assert error.code == "fades_unverified"
 
@@ -398,7 +402,7 @@ def test_a_colour_space_already_set_is_not_written_again() -> None:
 def test_a_duplicate_that_is_not_in_the_project_is_caught() -> None:
     show = Show()
     show.fake.faults.add("DuplicateTimeline:detached")
-    error = show.fails("timeline.duplicate", {"source": {"name": "Main"}, "name": "Main v2"})
+    error = show.fails("timeline.duplicate", {"source": show.ref("Main"), "name": "Main v2"})
     assert error.code == "duplicate_unverified"
 
 
@@ -417,7 +421,7 @@ def test_fades_bounce_the_page_when_the_setter_jams() -> None:
     _after_color(show)
     result = show.ok(
         "item.set_fades",
-        {"timeline": {"name": "Main"}, "targets": [{"item": ref(item), "fade_in": 10}]},
+        {"timeline": show.ref("Main"), "targets": [{"item": ref(item), "fade_in": 10}]},
     )
     assert result.changes[0].after_in == 10
     assert [(n.code, n.trap_id) for n in result.notes] == [
@@ -441,11 +445,11 @@ def test_a_jam_a_bounce_cannot_clear_fails_with_the_trap_and_its_fix(op_name: st
     _after_color(show)
     params = {
         "item.set_fades": {
-            "timeline": {"name": "Main"},
+            "timeline": show.ref("Main"),
             "targets": [{"item": ref(reference), "fade_in": 10}],
         },
         "item.set_audio_gain": {
-            "timeline": {"name": "Main"},
+            "timeline": show.ref("Main"),
             "targets": [{"item": ref(sound), "gain_db": -2.0}],
         },
         "grades.copy": _grades_params(reference, targets),
@@ -465,7 +469,7 @@ def test_reuse_never_picks_the_source_itself() -> None:
     error = show.fails(
         "timeline.duplicate",
         {
-            "source": {"name": "Main"},
+            "source": show.ref("Main"),
             "name": "Main",
             "if_exists": "reuse",
             "resolution": {"width": 1080, "height": 1920},
@@ -482,7 +486,7 @@ def test_reuse_refuses_a_timeline_that_differs_and_leaves_it_alone() -> None:
     error = show.fails(
         "timeline.duplicate",
         {
-            "source": {"name": "Main"},
+            "source": show.ref("Main"),
             "name": "Main [agent]",
             "if_exists": "reuse",
             "resolution": {"width": 1080, "height": 1920},
@@ -497,7 +501,7 @@ def test_reuse_refuses_a_timeline_that_differs_and_leaves_it_alone() -> None:
 def test_reuse_picks_up_a_matching_earlier_attempt_unchanged() -> None:
     show = Show()
     params = {
-        "source": {"name": "Main"},
+        "source": show.ref("Main"),
         "name": "Main 9x16",
         "resolution": {"width": 1080, "height": 1920},
     }
@@ -610,7 +614,7 @@ def test_duplicate_marker_frames_are_refused_before_any_marker_is_added() -> Non
             show.broker,
             "markers.add",
             {
-                "timeline": {"name": "Main"},
+                "timeline": show.ref("Main"),
                 "markers": [{"frame": 10, "name": "a"}, {"frame": 10, "name": "b"}, {"frame": 20}],
             },
             target=show.locator(),
@@ -641,3 +645,122 @@ def test_an_unknown_colour_space_is_refused_before_writing() -> None:
     assert (error.code, error.detail["trap_id"]) == ("color_space_unknown", "rcm-input-colorspace")
     assert "Rec.709 (Scene)" in error.detail["known"]
     assert calls(show, "SetClipProperty") == []
+
+
+# -- round 3: pinned test gaps ----------------------------------------------------------------
+
+
+def test_a_lut_jam_that_starts_after_the_copy_is_bounced() -> None:
+    show, reference, targets = _graded_world()
+    show.fake.faults.add("CopyGrades:then-jam")  # CopyGrades works, then SetLUT jams
+    result = show.ok("grades.copy", _grades_params(reference, targets))
+    assert result.groups[0].targets[0].luts_after[1] == "Per clip/brighten.cube"
+    bounced = [n for n in result.notes if n.code == "page_bounced"]
+    assert bounced and all(n.trap_id == "setproperty-after-color" for n in bounced)
+    assert any("SetLUT" in n.message for n in bounced)
+
+
+@pytest.mark.parametrize("fault", ["CopyGrades:drops-label", "CopyGrades:drops-lut"])
+def test_a_copy_that_loses_part_of_the_grade_is_unverified(fault: str) -> None:
+    show, reference, targets = _graded_world()
+    show.fake.faults.add(fault)
+    error = show.fails("grades.copy", _grades_params(reference, targets, reapply_luts=False))
+    assert (error.code, error.detail["trap_id"]) == ("grade_unverified", "append-ungraded")
+
+
+def test_an_unknown_reference_timeline_id_never_falls_back_to_its_name() -> None:
+    show, reference, targets = _graded_world()
+    params = _grades_params(reference, targets)
+    params["groups"][0]["reference_timeline"] = {"name": "Main", "unique_id": "tl-gone"}
+    error = show.fails("grades.copy", params)
+    assert error.code == "timeline_not_found"
+    assert "id 'tl-gone'" in error.message and "'Main' was not used" in error.message
+    assert calls(show, "CopyGrades") == []
+
+
+def test_a_duplicate_that_returns_some_other_timeline_is_caught() -> None:
+    show = Show()
+    show.fake.faults.add("DuplicateTimeline:returns-source")
+    error = show.fails("timeline.duplicate", {"source": show.ref("Main"), "name": "Main v2"})
+    assert error.code == "duplicate_unverified"
+
+
+def _only_one_source(show: Show, source: str) -> tuple[Any, str]:
+    """A Rec.709 graphic, and a colour-space name that only ``source`` vouches for."""
+    pool = show.project.media_pool
+    graphic = pool.import_rec709(("Footage",), "lower third")
+    # Nothing else in the project or the bin uses the names the other sources would give.
+    show.project.settings.update(
+        colorSpaceInput="Space P1", colorSpaceTimeline="Space P2", colorSpaceOutput="Space P3"
+    )
+    for clip in pool.folder("Footage").clips:
+        clip.props["Input Color Space"] = "Space B0"
+    if source == "observed":
+        return graphic, "DaVinci WG/Intermediate"
+    if source == "project":
+        show.project.settings["colorSpaceOutput"] = "Rec.709 Gamma 2.4"
+        return graphic, "Rec.709 Gamma 2.4"
+    neighbour = pool.add_clip(("Footage",), "neighbour")
+    neighbour.props["Input Color Space"] = "Custom Cam Space"
+    return graphic, "Custom Cam Space"
+
+
+@pytest.mark.parametrize("source", ["observed", "project", "bin"])
+def test_each_colour_space_source_is_enough_on_its_own(source: str) -> None:
+    show = Show()
+    graphic, space = _only_one_source(show, source)
+    result = show.ok(
+        "clip.set_input_color_space", {"items": [media(graphic)], "color_space": space}
+    )
+    assert result.changes[0].after == space
+
+
+def test_a_refused_colour_space_says_where_accepted_names_come_from() -> None:
+    show = Show()
+    graphic, _ = _only_one_source(show, "bin")
+    error = show.fails(
+        "clip.set_input_color_space", {"items": [media(graphic)], "color_space": "Nowhere"}
+    )
+    assert error.code == "color_space_unknown"
+    sources = error.detail["known_sources"]
+    assert set(sources) == {"project_colour_keys", "bin_clip_values", "observed_names"}
+    assert "Custom Cam Space" in sources["bin_clip_values"]
+    assert "Space P3" in sources["project_colour_keys"]
+    for words in ("colour settings", "clips in the listed items' bins", "observed"):
+        assert words in error.message
+    assert calls(show, "SetClipProperty") == []
+
+
+@pytest.mark.parametrize(
+    ("op_name", "params"),
+    [
+        (
+            "item.set_audio_gain",
+            {
+                "targets": [
+                    {"item": {"track_type": "audio", "track": 1, "item_id": "x"}, "gain_db": 1.0}
+                ],
+                "tolerance_db": "0.1",
+            },
+        ),
+        ("markers.add", {"markers": [{"frame": True}]}),
+        ("markers.add", {"markers": [{"frame": 1.0}]}),
+        ("markers.add", {"markers": [{"frame": "10"}]}),
+        (
+            "grades.copy",
+            {
+                "groups": [
+                    {
+                        "reference": {"track_type": "video", "track": 1, "item_id": "r"},
+                        "targets": [{"track_type": "video", "track": 1, "item_id": "t"}],
+                    }
+                ],
+                "reapply_luts": "yes",
+            },
+        ),
+    ],
+)
+def test_loose_types_are_refused(op_name: str, params: dict[str, Any]) -> None:
+    show = Show()
+    with pytest.raises(ValidationError):
+        submit_op(show.broker, op_name, params, target=show.locator(), holder=AGENT)

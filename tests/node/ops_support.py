@@ -119,12 +119,14 @@ class Show(OpsWorld):
     def pid(self) -> str:
         return self.project.GetUniqueId()
 
+    def ref(self, timeline: str) -> dict[str, str]:
+        """A timeline ref by unique id, with its name as a cross-check (what writes need)."""
+        return {"name": timeline, "unique_id": self.project.timeline(timeline).GetUniqueId()}
+
 
 def media(clip: FakeMediaPoolItem) -> dict[str, Any]:
     return {"unique_id": clip.GetUniqueId()}
 
-
-BRANCH = {"name": "Main [agent]"}
 
 # Fake calls that change timeline, media or project content (not the broker's context work).
 CONTENT_WRITES = frozenset(

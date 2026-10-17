@@ -43,6 +43,10 @@ FAULTS = frozenset(
         "DuplicateTimeline:detached",  # returns a timeline that is not in the project
         "LoadRenderPreset:drops-codec",  # a preset round trip resets the codec to H264
         "OpenPage:keeps-jam",  # a page bounce does not clear the after-Color setter jam
+        "CopyGrades:then-jam",  # CopyGrades works, then the setters jam (until a bounce)
+        "CopyGrades:drops-label",  # the copy loses the first node's label
+        "CopyGrades:drops-lut",  # the copy loses the LUT of the first node that has one
+        "DuplicateTimeline:returns-source",  # the copy is made, but the source is returned
     }
 )
 _TIMECODE = re.compile(r"^\d{2}:\d{2}:\d{2}[:;]\d{2}$")
@@ -547,6 +551,14 @@ class FakeTimelineItem:
         # target's whole node graph, per-clip LUTs included.
         for target in tgtTimelineItems:
             target.graph = self.graph.copy()
+            if "CopyGrades:drops-label" in self._app.faults and target.graph.nodes:
+                target.graph.nodes[0].label = ""
+            if "CopyGrades:drops-lut" in self._app.faults:
+                lit = [n for n in target.graph.nodes if n.lut]
+                if lit:
+                    lit[0].lut = ""
+        if "CopyGrades:then-jam" in self._app.faults:
+            self._app.props_stuck = True
         return True
 
 
@@ -744,6 +756,8 @@ class FakeTimeline:
         if "DuplicateTimeline:detached" in self._app.faults:
             return twin  # a timeline object the project does not hold
         project.timelines.append(twin)
+        if "DuplicateTimeline:returns-source" in self._app.faults:
+            return self
         return twin
 
     # -- the append model ------------------------------------------------------------------

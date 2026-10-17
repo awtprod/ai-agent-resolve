@@ -8,7 +8,7 @@ from aar.node.ops import make_hot_op
 from aar.node.ops.timebase import converted_length
 
 from .fake_resolve import FakeMediaPoolItem
-from .ops_support import AGENT, BRANCH, Show, media
+from .ops_support import AGENT, Show, media
 
 START = 108000  # the fake timelines start at 01:00:00:00 of a 30-nominal clock
 
@@ -18,7 +18,10 @@ def rng(clip: FakeMediaPoolItem, src_in: int, src_out: int, **kw: Any) -> dict[s
 
 
 def append(show: Show, *ranges: dict[str, Any], **params: Any) -> Any:
-    return show.ok("timeline.append_ranges", {"timeline": BRANCH, "ranges": list(ranges), **params})
+    return show.ok(
+        "timeline.append_ranges",
+        {"timeline": show.ref("Main [agent]"), "ranges": list(ranges), **params},
+    )
 
 
 def spans(show: Show, kind: str = "video", track: int = 1) -> list[tuple[int, int]]:
@@ -68,7 +71,7 @@ def test_without_the_repair_a_short_range_is_an_error_and_leaves_a_gap() -> None
     error = show.fails(
         "timeline.append_ranges",
         {
-            "timeline": BRANCH,
+            "timeline": show.ref("Main [agent]"),
             "ranges": [rng(show.cam_24, 0, 7), rng(show.cam_a, 0, 30)],
             "repair_short": False,
         },
@@ -85,7 +88,10 @@ def test_a_repair_that_overshoots_stops_with_the_item_left_for_inspection() -> N
     # frames land 16.
     error = show.fails(
         "timeline.append_ranges",
-        {"timeline": BRANCH, "ranges": [rng(show.cam_a, 0, 30), rng(show.cam_24, 0, 12)]},
+        {
+            "timeline": show.ref("Main [agent]"),
+            "ranges": [rng(show.cam_a, 0, 30), rng(show.cam_24, 0, 12)],
+        },
     )
     assert error.code == "repair_overshoot"
     assert error.detail["trap_id"] == "append-fps-short"
@@ -125,7 +131,10 @@ def test_stills_are_refused_before_anything_is_appended() -> None:
     show = Show()
     error = show.fails(
         "timeline.append_ranges",
-        {"timeline": BRANCH, "ranges": [rng(show.cam_a, 0, 30), rng(show.still, 0, 48)]},
+        {
+            "timeline": show.ref("Main [agent]"),
+            "ranges": [rng(show.cam_a, 0, 30), rng(show.still, 0, 48)],
+        },
     )
     assert error.code == "still_refused"
     assert error.detail["trap_id"] == "append-still-ignores-range"
@@ -135,7 +144,8 @@ def test_stills_are_refused_before_anything_is_appended() -> None:
 def test_multicam_clips_are_refused() -> None:
     show = Show()
     error = show.fails(
-        "timeline.append_ranges", {"timeline": BRANCH, "ranges": [rng(show.multicam, 0, 30)]}
+        "timeline.append_ranges",
+        {"timeline": show.ref("Main [agent]"), "ranges": [rng(show.multicam, 0, 30)]},
     )
     assert (error.code, error.detail["trap_id"]) == ("multicam_refused", "multicam-angles")
     assert appends(show) == 0
@@ -167,7 +177,8 @@ def test_an_occupied_slot_is_never_overwritten() -> None:
     show = Show()
     show.branch.place("video", 1, show.cam_b, START + 10, 50)
     error = show.fails(
-        "timeline.append_ranges", {"timeline": BRANCH, "ranges": [rng(show.cam_a, 0, 30)]}
+        "timeline.append_ranges",
+        {"timeline": show.ref("Main [agent]"), "ranges": [rng(show.cam_a, 0, 30)]},
     )
     assert error.code == "slot_occupied"
     assert appends(show) == 0
@@ -185,11 +196,12 @@ def test_bad_ranges_are_refused_up_front() -> None:
     show = Show()
     beyond = show.fails(
         "timeline.append_ranges",
-        {"timeline": BRANCH, "ranges": [rng(show.cam_a, 19990, 20010)]},
+        {"timeline": show.ref("Main [agent]"), "ranges": [rng(show.cam_a, 19990, 20010)]},
     )
     assert beyond.code == "range_beyond_media"
     no_track = show.fails(
-        "timeline.append_ranges", {"timeline": BRANCH, "ranges": [rng(show.cam_a, 0, 10, track=3)]}
+        "timeline.append_ranges",
+        {"timeline": show.ref("Main [agent]"), "ranges": [rng(show.cam_a, 0, 10, track=3)]},
     )
     assert no_track.code == "track_missing"
     assert appends(show) == 0
@@ -204,7 +216,10 @@ def test_source_readback_one_frame_off_is_noted_two_frames_is_an_error() -> None
     show.fake.source_readback_skew = 2
     error = show.fails(
         "timeline.append_ranges",
-        {"timeline": BRANCH, "ranges": [rng(show.cam_a, 100, 130), rng(show.cam_a, 500, 530)]},
+        {
+            "timeline": show.ref("Main [agent]"),
+            "ranges": [rng(show.cam_a, 100, 130), rng(show.cam_a, 500, 530)],
+        },
     )
     assert error.code == "source_mismatch" and error.detail["resume_cursor"] == 1
 
@@ -219,7 +234,7 @@ def test_append_leases_and_selects_the_named_timeline() -> None:
     show = Show()
     hot = make_hot_op(
         "timeline.append_ranges",
-        {"timeline": BRANCH, "ranges": [rng(show.cam_a, 0, 30)]},
+        {"timeline": show.ref("Main [agent]"), "ranges": [rng(show.cam_a, 0, 30)]},
         target=show.locator(),
         holder=AGENT,
     )
@@ -242,7 +257,10 @@ def test_ntsc_rates_are_converted_exactly() -> None:
 def test_a_short_range_at_the_end_of_its_media_is_not_deleted_to_be_repaired() -> None:
     show = Show()
     tail = show.project.media_pool.add_clip(("Footage",), "short 24p", fps=24.0, frames=7)
-    error = show.fails("timeline.append_ranges", {"timeline": BRANCH, "ranges": [rng(tail, 0, 7)]})
+    error = show.fails(
+        "timeline.append_ranges",
+        {"timeline": show.ref("Main [agent]"), "ranges": [rng(tail, 0, 7)]},
+    )
     assert (error.code, error.detail["trap_id"]) == ("repair_beyond_media", "append-fps-short")
     assert spans(show) == [(0, 8)]  # the short item stays for the agent to decide
     assert not [c for c in show.fake.calls if c[0] == "DeleteClips"]
@@ -252,7 +270,8 @@ def test_a_short_item_that_will_not_delete_stops_the_repair() -> None:
     show = Show()
     show.fake.faults.add("DeleteClips:no-op")
     error = show.fails(
-        "timeline.append_ranges", {"timeline": BRANCH, "ranges": [rng(show.cam_24, 0, 7)]}
+        "timeline.append_ranges",
+        {"timeline": show.ref("Main [agent]"), "ranges": [rng(show.cam_24, 0, 7)]},
     )
     assert (error.code, error.detail["trap_id"]) == ("repair_delete_failed", "append-fps-short")
     assert spans(show) == [(0, 8)]  # never appended a second copy on top

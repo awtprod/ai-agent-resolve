@@ -481,9 +481,14 @@ class ScriptApiGateway:
         if not matches and name is not None and not (strict and unique_id is not None):
             matches = [t for t in timelines if t.GetName() == name]
         if not matches:
-            raise GatewayError(
-                "timeline_not_found", f"no timeline {label!r} in project {project.GetName()!r}"
-            )
+            if unique_id is not None and (strict or name is None):
+                unused = f"; the name {name!r} was not used to look it up" if name else ""
+                message = (
+                    f"no timeline with id {unique_id!r} in project {project.GetName()!r}{unused}"
+                )
+            else:
+                message = f"no timeline {label!r} in project {project.GetName()!r}"
+            raise GatewayError("timeline_not_found", message)
         if len(matches) > 1:
             raise GatewayError(
                 "timeline_ambiguous",

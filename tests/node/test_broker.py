@@ -961,3 +961,73 @@ def test_a_target_whose_id_does_not_match_fails_closed_and_the_human_comes_back(
     report = world.broker.last_restore
     assert report is not None and report.ok, report
     assert world.gw.get_context().project_id == world.pid("A")
+
+
+# -- round 3: pinned gaps and documented fail-closed behaviour ---------------------------------
+
+
+def test_a_renamed_human_project_is_restored_under_its_new_name() -> None:
+    world = World()
+    world.settle()
+    world.submit("B", "learn")  # the broker loads CCN/B and remembers its verified locator
+    world.broker.run_until_idle()
+    world.fake.human_open_project("B")
+    world.fake.project("B")._name = "B renamed"
+    world.clock.advance(IDLE)
+    world.settle()
+    since = len(world.fake.calls)
+    world.submit("C", "c1")
+    world.broker.run_until_idle()
+
+    report = world.broker.last_restore
+    assert report is not None and report.ok, report
+    ctx = world.gw.get_context()
+    assert (ctx.project, ctx.project_id) == ("B renamed", world.pid("B"))
+    loads = [c[1] for c in world.fake.calls[since:] if c[0] == "LoadProject"]
+    assert loads == ["C", "B renamed"]  # never the old name
+
+
+def test_a_failed_load_forgets_the_locator() -> None:
+    world = World()
+    world.settle()
+    world.submit("B", "learn")
+    world.broker.run_until_idle()
+    assert world.pid("B") in world.broker.known_locators()
+    world.fake.missing.add("B")
+    world.clock.advance(IDLE)
+    world.settle()
+    op_id = world.submit("B", "b2")
+    world.broker.run_until_idle()
+    result = world.broker.result(op_id)
+    assert result is not None and result.error is not None
+    assert result.error.code == "project_unavailable"
+    assert world.pid("B") not in world.broker.known_locators()
+
+
+def test_a_project_manager_too_big_to_search_refuses_the_switch() -> None:
+    fake = FakeResolve(PROJECTS, current="A")
+    for i in range(1001):
+        fake.add_pm_folder((f"Archive {i:04d}",))
+    world = World(fake=fake)
+    world.settle()
+    op_id = world.submit("B", "b1")
+    world.broker.run_until_idle()
+    result = world.broker.result(op_id)
+    assert result is not None and result.error is not None
+    assert result.error.code == "switch_refused"
+    warnings = world.of("snapshot")[0].data["warnings"]
+    assert any("pm_walk_too_large" in w for w in warnings)
+    assert world.gw.get_context(with_pm_path=True).project_manager_path == ("CCN",)
+
+
+def test_without_the_project_manager_snapshot_foreign_switches_are_refused() -> None:
+    world = World(BrokerConfig(restore_delay_seconds=0.0, snapshot_project_manager_path=False))
+    world.settle()
+    own = world.submit("A", "a1")
+    foreign = world.submit("B", "b1")
+    world.broker.run_until_idle()
+    assert world.broker.result(own).status is OpStatus.OK  # type: ignore[union-attr]
+    result = world.broker.result(foreign)
+    assert result is not None and result.error is not None
+    assert result.error.code == "switch_refused"
+    assert world.loads() == []

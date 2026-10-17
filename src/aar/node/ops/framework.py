@@ -16,10 +16,13 @@ mismatch raises ``OpError`` and the body never acts. Op bodies raise
 records its code and detail on the ``OpResult``. Results carry values measured from Resolve
 after each write, never echoes of the inputs.
 
-Timelines are leased by identity: a mutating op whose params name exactly one timeline, by
-unique id, leases that timeline; every other op leases the whole project (see
-``aar.node.broker``). A ``TimelineRef`` that gives both a name and a unique id must name one
-timeline; if they disagree the op is refused.
+Timelines are leased by identity (see ``aar.node.broker``). A mutating op (or one that acts on
+the current timeline) must give every ``TimelineRef`` its ``unique_id``; a name-only ref is
+refused at submit with ``timeline_id_required``. A name may come with the id as a cross-check:
+if it is not that timeline's name the op is refused (``timeline_ref_mismatch``). Such an op
+leases each timeline id it names, so ops on different timelines of one project run side by
+side; an op that names no timeline (it acts on whichever is current) leases the whole project.
+Read-only ops may still name a timeline by name.
 
 Ops are kept short (well under the 60 s cap of a live MCP call) and idempotent: re-running
 one after a timeout finds its own earlier work and reports it instead of doing it twice.
@@ -36,7 +39,7 @@ import functools
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -310,10 +313,16 @@ class OpEnv:
         else:
             matches = [t for t in timelines if t.GetName() == ref.name]
         if not matches:
+            if ref.unique_id is not None:
+                unused = f"; the name {ref.name!r} was not used to look it up" if ref.name else ""
+                message = f"no timeline with id {ref.unique_id!r}{unused}"
+            else:
+                message = f"no timeline named {ref.name!r}"
             raise OpError(
                 "timeline_not_found",
-                f"no timeline matches {ref.model_dump(exclude_none=True)}",
-                "list timelines with timeline.list",
+                message,
+                "list timelines with timeline.list; a timeline's unique_id changes only if it "
+                "is deleted and made again",
             )
         if len(matches) > 1:
             raise OpError(
@@ -477,7 +486,7 @@ def make_hot_op(
             "pm-folder-scoped-load",
         )
     checked = params if isinstance(params, spec.params) else spec.params.model_validate(params)
-    timeline, timeline_id = _lease_timeline(spec, checked)
+    timeline, timeline_id, also_leased = _lease_timeline(spec, checked)
     op_id = uuid.uuid4().hex
 
     def run(gateway: ResolveGateway) -> Any:
@@ -491,6 +500,7 @@ def make_hot_op(
         holder=holder,
         timeline=timeline,
         timeline_id=timeline_id,
+        extra_timeline_ids=also_leased,
         priority=priority,
         abort_batch_on_failure=abort_batch_on_failure,
         label=name,
@@ -513,21 +523,42 @@ def _timeline_refs(value: Any) -> list[TimelineRef]:
     return []
 
 
-def _lease_timeline(spec: OpSpec, params: OpModel) -> tuple[str | None, str | None]:
-    """The timeline (name, unique id) the broker selects and leases for this op.
+def _is_timeline_ref_field(annotation: Any) -> bool:
+    return annotation is TimelineRef or TimelineRef in get_args(annotation)
 
-    A mutating (or current-timeline) op that names exactly one timeline gets it selected; it
-    is leased by itself only when the ref carries its unique id. An op naming no timeline,
-    several, or one by name only leases the whole project (``(None, None)`` leases the
-    project; a name without an id is selected but still leases the project).
+
+def _lease_timeline(
+    spec: OpSpec, params: OpModel
+) -> tuple[str | None, str | None, tuple[str, ...]]:
+    """What the broker selects and leases for this op: ``(name, unique id, other ids)``.
+
+    The top-level ``timeline`` ref is made current and asserted; every timeline id the op
+    names is leased. An op that leaves a top-level timeline ref empty acts on whichever
+    timeline is current, so it leases the whole project (``(None, None, ())``), as does an op
+    that names no timeline at all. Read-only ops lease the whole project and select nothing.
     """
     if not (spec.mutates or spec.needs_current_timeline):
-        return None, None
+        return None, None, ()
+    refs = _timeline_refs(params)
+    name_only = [ref.name for ref in refs if ref.unique_id is None]
+    if name_only:
+        raise OpError(
+            "timeline_id_required",
+            f"op {spec.name} changes Resolve, so every timeline it names needs its unique_id "
+            f"(name-only: {name_only})",
+            "take the ids from timeline.list or timeline.describe; a name may stay as a "
+            "cross-check",
+        )
+    top_level = [
+        n for n, f in type(params).model_fields.items() if _is_timeline_ref_field(f.annotation)
+    ]
+    if not refs or any(getattr(params, n) is None for n in top_level):
+        return None, None, ()
+    ids = sorted({ref.unique_id for ref in refs if ref.unique_id is not None})
     top = getattr(params, "timeline", None)
-    refs = {(ref.name, ref.unique_id) for ref in _timeline_refs(params)}
-    if not isinstance(top, TimelineRef) or len(refs) != 1:
-        return None, None
-    return top.name, top.unique_id
+    if isinstance(top, TimelineRef):
+        return top.name, top.unique_id, tuple(i for i in ids if i != top.unique_id)
+    return None, None, tuple(ids)
 
 
 def submit_op(

@@ -4,6 +4,17 @@ set a clip's input colour space, add markers.
 Each op checks every Resolve return value, reads what it wrote back, and reports the measured
 values. Each is idempotent: a re-run finds its earlier work (``present``) instead of
 repeating it. None of these ops calls a project-level colour setter.
+
+Known, intentional, fail-closed behaviour (not bugs):
+
+- ``timeline.duplicate`` interrupted after ``DuplicateTimeline`` but before its custom
+  resolution and colour settings were applied leaves a timeline that does not match; a rerun
+  with ``if_exists="reuse"`` reports ``reuse_mismatch`` and changes nothing, because the op
+  cannot tell its own half-made copy from a human's timeline. Cleaning it up belongs to the
+  S7 job runner's checkpoints.
+- ``clip.set_input_color_space`` accepts only colour-space names it can see in use: the
+  project's colour settings, clips in the listed items' bins, or ``OBSERVED_COLOR_SPACES``.
+  There is no override; anything else is ``color_space_unknown``.
 """
 
 from __future__ import annotations
@@ -1352,16 +1363,25 @@ class InputColourParams(OpModel):
         return self
 
 
-def _known_colour_spaces(env: OpEnv, bins: set[tuple[str, ...]]) -> set[str]:
-    known = set(OBSERVED_COLOR_SPACES)
+def _known_colour_spaces(env: OpEnv, bins: set[tuple[str, ...]]) -> dict[str, list[str]]:
+    """The colour-space names the op accepts, by where each comes from.
+
+    Fail closed, with no override: a name that is in none of these is refused before any
+    write, because a typo would otherwise be written to the clip.
+    """
     settings = env.project().GetSettings() or {}
-    known |= {str(settings[k]) for k in _PROJECT_COLOUR_KEYS if settings.get(k)}
+    project = {str(settings[k]) for k in _PROJECT_COLOUR_KEYS if settings.get(k)}
+    clips: set[str] = set()
     for path in bins:
         for clip in env.bin(path).GetClipList() or []:
             value = (clip.GetClipProperty() or {}).get("Input Color Space")
             if value:
-                known.add(str(value))
-    return known
+                clips.add(str(value))
+    return {
+        "project_colour_keys": sorted(project),
+        "bin_clip_values": sorted(clips),
+        "observed_names": sorted(OBSERVED_COLOR_SPACES),
+    }
 
 
 class ColourChange(OpModel):
@@ -1412,14 +1432,19 @@ def clip_set_input_color_space(env: OpEnv, params: InputColourParams) -> InputCo
             "list video media files only",
             trap,
         )
-    known = _known_colour_spaces(env, {where for _, where in found.values()})
+    sources = _known_colour_spaces(env, {where for _, where in found.values()})
+    known = {name for names in sources.values() for name in names}
     if params.color_space not in known:
         raise OpError(
             "color_space_unknown",
-            f"{params.color_space!r} is not a colour space this project or its bins use",
-            f"use an exact name from Clip Attributes; known here: {sorted(known)}",
+            f"{params.color_space!r} is not an accepted colour space. Accepted names come from "
+            f"the project's colour settings ({', '.join(_PROJECT_COLOUR_KEYS)}), the 'Input "
+            f"Color Space' of clips in the listed items' bins, and names observed on a live "
+            f"Resolve; none has it",
+            f"use an exact name from one of those sources: {sorted(known)}",
             trap,
             known=sorted(known),
+            known_sources=sources,
         )
     changes = []
     for _, mpi, f in facts:
