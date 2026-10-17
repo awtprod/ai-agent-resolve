@@ -1,7 +1,8 @@
 """The broker's narrow view of a running DaVinci Resolve Studio.
 
 ``ResolveGateway`` is the minimal surface the session broker needs: read the current context
-(project, timeline, page, playhead, Deliver settings, media-pool bin) and put it back.
+(project, timeline, page, playhead, Deliver settings, media-pool bin, Project Manager folder)
+and put it back.
 ``ScriptApiGateway`` implements it on the real scripting objects of Resolve 21.1
 (``Resolve`` / ``ProjectManager`` / ``Project`` / ``Timeline`` / ``MediaPool`` / ``Folder``).
 
@@ -16,6 +17,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass, fields
 from typing import Any, Protocol, runtime_checkable
 
+from aar.node.locator import ProjectLocator
+
 # Page names accepted by ``Resolve.OpenPage`` in the 21.1 API stubs.
 VALID_PAGES: frozenset[str] = frozenset(
     {"media", "photo", "cut", "edit", "fusion", "color", "fairlight", "deliver"}
@@ -24,6 +27,13 @@ VALID_PAGES: frozenset[str] = frozenset(
 # Fields of ``ResolveContext`` that are state rather than a human's working position: they are
 # not restored and a change in them is not a sign of human activity.
 _NON_POSITIONAL_FIELDS: frozenset[str] = frozenset({"rendering"})
+
+# Fields that are only measured on request (reading them navigates the Project Manager). A
+# ``None`` there means "not measured", which is never a difference.
+_MEASURED_ON_REQUEST: frozenset[str] = frozenset({"project_manager_path"})
+
+# Project Manager folders nest; anything deeper than this is treated as a broken walk.
+MAX_PM_DEPTH = 64
 
 
 class GatewayError(Exception):
@@ -68,6 +78,10 @@ class ResolveContext:
     render_mode: int | None = None
     folder: FolderRef | None = None
     project_manager_folder: str | None = None
+    """The current Project Manager folder's name (``GetCurrentFolder``); the root is ``None``."""
+    project_manager_path: tuple[str, ...] | None = None
+    """The full Project Manager path from the root, ``()`` at the root. Only measured on request
+    (``get_context(with_pm_path=True)``), because reading it walks the folder tree."""
     rendering: bool = False
 
     def position(self) -> dict[str, object]:
@@ -80,24 +94,66 @@ class ResolveContext:
 
     def same_position(self, other: ResolveContext) -> bool:
         """True when ``other`` shows the same working position as this context."""
-        return self.position() == other.position()
+        return not self.diff(other)
 
     def diff(self, other: ResolveContext) -> dict[str, tuple[object, object]]:
-        """Position fields that differ, as ``{field: (self_value, other_value)}``."""
+        """Position fields that differ, as ``{field: (self_value, other_value)}``.
+
+        A field measured only on request (the Project Manager path) is compared only when
+        both sides measured it.
+        """
         mine, theirs = self.position(), other.position()
-        return {k: (mine[k], theirs[k]) for k in mine if mine[k] != theirs[k]}
+        return {
+            k: (mine[k], theirs[k])
+            for k in mine
+            if mine[k] != theirs[k]
+            and not (k in _MEASURED_ON_REQUEST and (mine[k] is None or theirs[k] is None))
+        }
+
+
+@dataclass(frozen=True)
+class PMFolderListing:
+    """One Project Manager folder: its path from the root, its projects and its subfolders."""
+
+    path: tuple[str, ...]
+    projects: tuple[str, ...]
+    folders: tuple[str, ...]
 
 
 @runtime_checkable
 class ResolveGateway(Protocol):
     """The minimal Resolve surface the broker needs. Mutators raise ``GatewayError`` on failure."""
 
-    def get_context(self) -> ResolveContext:
-        """Read the current context. Read-only."""
+    def get_context(self, *, with_pm_path: bool = False) -> ResolveContext:
+        """Read the current context. Read-only, except that ``with_pm_path`` walks the Project
+        Manager up to the root and back down to measure ``project_manager_path``."""
         ...
 
-    def load_project(self, name: str) -> None:
-        """Make ``name`` the current project (no-op if it already is)."""
+    def load_project(self, locator: ProjectLocator) -> None:
+        """Make the project at ``locator`` current (no-op if it already is).
+
+        Navigates the Project Manager to ``locator.folder_path`` first, because ``LoadProject``
+        only looks in the current folder, and verifies ``project_id`` after loading.
+        """
+        ...
+
+    def get_project_manager_path(self) -> tuple[str, ...]:
+        """The current Project Manager folder's full path from the root. Ends where it began."""
+        ...
+
+    def open_project_manager_path(self, path: tuple[str, ...]) -> None:
+        """Navigate the Project Manager to ``path`` (from the root)."""
+        ...
+
+    def list_project_manager_folder(self) -> PMFolderListing:
+        """Projects and subfolders of the current Project Manager folder. Read-only."""
+        ...
+
+    def find_project_folders(self, name: str) -> list[tuple[str, ...]]:
+        """Paths of every Project Manager folder holding a project called ``name``.
+
+        Walks the whole tree and returns to the starting folder.
+        """
         ...
 
     def save_project(self) -> None:
@@ -193,15 +249,123 @@ class ScriptApiGateway:
             yield folder
             stack.extend(reversed(folder.GetSubFolderList() or []))
 
+    def _pm_folder_name(self, pm: Any) -> str:
+        name = pm.GetCurrentFolder()
+        return "" if name is None else str(name)
+
+    def _open_child(self, pm: Any, name: str, where: tuple[str, ...]) -> None:
+        if not pm.OpenFolder(name):
+            raise GatewayError(
+                "pm_open_failed", f"OpenFolder({name!r}) returned False in {'/'.join(where)!r}"
+            )
+        actual = self._pm_folder_name(pm)
+        if actual != name:
+            raise GatewayError(
+                "pm_open_failed", f"OpenFolder({name!r}) left the Project Manager in {actual!r}"
+            )
+
+    def _walk_here(
+        self, pm: Any, path: tuple[str, ...], out: list[PMFolderListing], max_folders: int
+    ) -> None:
+        listing = self.list_project_manager_folder()
+        out.append(PMFolderListing(path, listing.projects, listing.folders))
+        for name in listing.folders:
+            if len(out) >= max_folders:
+                raise GatewayError(
+                    "pm_walk_too_large", f"more than {max_folders} Project Manager folders"
+                )
+            if len(path) + 1 > MAX_PM_DEPTH:
+                raise GatewayError("pm_too_deep", f"folders nest deeper than {MAX_PM_DEPTH}")
+            self._open_child(pm, name, path)
+            self._walk_here(pm, (*path, name), out, max_folders)
+            if not pm.GotoParentFolder():
+                raise GatewayError(
+                    "pm_parent_failed", f"GotoParentFolder() failed in {'/'.join((*path, name))!r}"
+                )
+            expected = path[-1] if path else ""
+            if self._pm_folder_name(pm) != expected:
+                raise GatewayError(
+                    "pm_parent_failed", f"GotoParentFolder() did not return to {expected!r}"
+                )
+
+    def walk_project_manager(self, max_folders: int = 1000) -> list[PMFolderListing]:
+        """Every Project Manager folder, depth first from the root. Ends where it began."""
+        pm = self._project_manager()
+        start = self.get_project_manager_path()
+        out: list[PMFolderListing] = []
+        try:
+            if not pm.GotoRootFolder():
+                raise GatewayError("pm_root_failed", "GotoRootFolder() returned False")
+            self._walk_here(pm, (), out, max_folders)
+        finally:
+            # Always try to put the Project Manager back. If this fails too, its error is
+            # raised with the walk's error (if any) chained as its context.
+            self.open_project_manager_path(start)
+        return out
+
     # -- ResolveGateway ----------------------------------------------------------------------
 
-    def get_context(self) -> ResolveContext:
+    def get_project_manager_path(self) -> tuple[str, ...]:
+        # GetCurrentFolder() only returns the current folder's name ("" at the root), so the
+        # path is read by walking up to the root, recording names, and walking back down.
         pm = self._project_manager()
+        start = self._pm_folder_name(pm)
+        if start == "":
+            return ()
+        names: list[str] = []
+        for _ in range(MAX_PM_DEPTH):
+            name = self._pm_folder_name(pm)
+            if name == "":
+                break
+            if not pm.GotoParentFolder():
+                break  # a named folder without a parent: it is the root
+            names.append(name)
+        else:
+            raise GatewayError("pm_too_deep", f"folders nest deeper than {MAX_PM_DEPTH}")
+        path = tuple(reversed(names))
+        here: tuple[str, ...] = ()
+        for name in path:
+            self._open_child(pm, name, here)
+            here = (*here, name)
+        if self._pm_folder_name(pm) != start:
+            raise GatewayError(
+                "pm_path_unverified",
+                f"walked {'/'.join(path)!r} but ended in {self._pm_folder_name(pm)!r}, "
+                f"not {start!r}",
+            )
+        return path
+
+    def open_project_manager_path(self, path: tuple[str, ...]) -> None:
+        pm = self._project_manager()
+        if not pm.GotoRootFolder():
+            raise GatewayError("pm_root_failed", "GotoRootFolder() returned False")
+        here: tuple[str, ...] = ()
+        for name in path:
+            self._open_child(pm, name, here)
+            here = (*here, name)
+
+    def list_project_manager_folder(self) -> PMFolderListing:
+        pm = self._project_manager()
+        projects = tuple(str(p) for p in (pm.GetProjectListInCurrentFolder() or []))
+        folders = tuple(str(f) for f in (pm.GetFolderListInCurrentFolder() or []))
+        return PMFolderListing((), projects, folders)
+
+    def find_project_folders(self, name: str) -> list[tuple[str, ...]]:
+        return [listing.path for listing in self.walk_project_manager() if name in listing.projects]
+
+    def get_context(self, *, with_pm_path: bool = False) -> ResolveContext:
+        pm = self._project_manager()
+        pm_path = self.get_project_manager_path() if with_pm_path else None
         page = _str_or_none(self.resolve.GetCurrentPage())
         pm_folder = _str_or_none(pm.GetCurrentFolder())
         project = pm.GetCurrentProject()
         if project is None:
-            return ResolveContext(project=None, page=page, project_manager_folder=pm_folder)
+            return ResolveContext(
+                project=None,
+                page=page,
+                project_manager_folder=pm_folder,
+                project_manager_path=pm_path,
+            )
         timeline = project.GetCurrentTimeline()
         fmt = project.GetCurrentRenderFormatAndCodec() or {}
         mode = project.GetCurrentRenderMode()
@@ -223,25 +387,39 @@ class ScriptApiGateway:
                 else None
             ),
             project_manager_folder=pm_folder,
+            project_manager_path=pm_path,
             rendering=bool(project.IsRenderingInProgress()),
         )
 
-    def load_project(self, name: str) -> None:
+    def load_project(self, locator: ProjectLocator) -> None:
         pm = self._project_manager()
         current = pm.GetCurrentProject()
-        if current is not None and current.GetName() == name:
+        if current is not None and locator.matches(
+            _str_or_none(current.GetName()), _str_or_none(current.GetUniqueId())
+        ):
             return
+        # LoadProject resolves the name in the current Project Manager folder only
+        # (trap pm-folder-scoped-load), so go to the project's folder first.
+        self.open_project_manager_path(locator.folder_path)
+        name = locator.name
         if pm.LoadProject(name) is None:
             raise GatewayError(
                 "project_not_found",
-                f"LoadProject({name!r}) returned None; is it in the current project-manager "
-                f"folder {pm.GetCurrentFolder()!r}?",
+                f"LoadProject({name!r}) returned None in project-manager folder "
+                f"{'/'.join(locator.folder_path) or '<root>'!r}",
             )
         current = pm.GetCurrentProject()
         actual = current.GetName() if current is not None else None
         if actual != name:
             raise GatewayError(
                 "project_load_failed", f"asked for project {name!r} but {actual!r} is open"
+            )
+        actual_id = _str_or_none(current.GetUniqueId()) if current is not None else None
+        if locator.project_id is not None and actual_id != locator.project_id:
+            raise GatewayError(
+                "project_id_mismatch",
+                f"loaded {name!r} from {'/'.join(locator.folder_path) or '<root>'!r} but its id "
+                f"is {actual_id!r}, not {locator.project_id!r}",
             )
 
     def save_project(self) -> None:

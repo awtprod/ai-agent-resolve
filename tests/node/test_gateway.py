@@ -7,10 +7,12 @@ import pytest
 from aar.node.gateway import (
     FolderRef,
     GatewayError,
+    PMFolderListing,
     ResolveContext,
     ResolveGateway,
     ScriptApiGateway,
 )
+from aar.node.locator import ProjectLocator
 
 from .fake_resolve import FakeResolve
 
@@ -23,6 +25,11 @@ def fake() -> FakeResolve:
 @pytest.fixture
 def gw(fake: FakeResolve) -> ScriptApiGateway:
     return ScriptApiGateway(fake)
+
+
+def loc(fake: FakeResolve, name: str) -> ProjectLocator:
+    project = fake.project(name)
+    return ProjectLocator(project.folder, name, project.GetUniqueId())
 
 
 def test_gateway_satisfies_protocol(gw: ScriptApiGateway) -> None:
@@ -69,16 +76,16 @@ def test_get_context_with_no_project_open(fake: FakeResolve, gw: ScriptApiGatewa
 def test_load_project_switches_and_is_a_noop_when_already_current(
     fake: FakeResolve, gw: ScriptApiGateway
 ) -> None:
-    gw.load_project("A")
-    assert "LoadProject" not in fake.call_names()
-    gw.load_project("B")
+    gw.load_project(loc(fake, "A"))
+    assert fake.calls == []
+    gw.load_project(loc(fake, "B"))
     assert gw.get_context().project == "B"
-    assert fake.call_names() == ["LoadProject"]
+    assert fake.calls == [("GotoRootFolder",), ("OpenFolder", "CCN"), ("LoadProject", "B")]
 
 
 def test_load_project_unknown_raises_project_not_found(gw: ScriptApiGateway) -> None:
     with pytest.raises(GatewayError) as err:
-        gw.load_project("Nope")
+        gw.load_project(ProjectLocator(("CCN",), "Nope"))
     assert err.value.code == "project_not_found"
 
 
@@ -87,9 +94,120 @@ def test_load_project_verifies_the_project_really_changed(
 ) -> None:
     fake.load_silently_fails.add("B")
     with pytest.raises(GatewayError) as err:
-        gw.load_project("B")
+        gw.load_project(loc(fake, "B"))
     assert err.value.code == "project_load_failed"
     assert gw.get_context().project == "A"
+
+
+# -- Project Manager folders (trap pm-folder-scoped-load) ---------------------------------------
+
+
+@pytest.fixture
+def library() -> FakeResolve:
+    """Same-named projects in two folders; the human sits in one of them."""
+    fake = FakeResolve(
+        {"Desk": ["Desk main"]},
+        current="Desk",
+        folder=("Shows", "Season 2"),
+    )
+    fake.add_project("Episode 1", ["E1 main"], ("Shows", "Season 1"))
+    fake.add_project("Episode 1", ["E1 main"], ("Shows", "Season 2"))
+    fake.add_pm_folder(("Archive",))
+    fake.calls.clear()
+    return fake
+
+
+def test_pm_path_at_the_root_reads_without_navigating(fake: FakeResolve) -> None:
+    fake.human_browse_project_manager(())
+    assert ScriptApiGateway(fake).get_project_manager_path() == ()
+    assert fake.calls == []
+
+
+def test_pm_path_walks_up_and_back_to_where_it_began(library: FakeResolve) -> None:
+    gw = ScriptApiGateway(library)
+    assert gw.get_project_manager_path() == ("Shows", "Season 2")
+    assert library.pm_path == ("Shows", "Season 2")
+    assert library.call_names() == [
+        "GotoParentFolder",
+        "GotoParentFolder",
+        "OpenFolder",
+        "OpenFolder",
+    ]
+
+
+def test_pm_path_reports_a_walk_that_cannot_get_back(library: FakeResolve) -> None:
+    pm = library.GetProjectManager()
+    real_open = pm.OpenFolder
+    pm.OpenFolder = lambda name: False if name == "Season 2" else real_open(name)  # type: ignore[method-assign]
+    with pytest.raises(GatewayError) as err:
+        ScriptApiGateway(library).get_project_manager_path()
+    assert err.value.code == "pm_open_failed"
+
+
+def test_open_pm_path_and_listing(library: FakeResolve) -> None:
+    gw = ScriptApiGateway(library)
+    gw.open_project_manager_path(("Shows", "Season 1"))
+    assert library.pm_path == ("Shows", "Season 1")
+    assert gw.list_project_manager_folder() == PMFolderListing((), ("Episode 1",), ())
+    gw.open_project_manager_path(())
+    assert gw.list_project_manager_folder().folders == ("Archive", "Shows")
+    with pytest.raises(GatewayError) as err:
+        gw.open_project_manager_path(("Shows", "Season 9"))
+    assert err.value.code == "pm_open_failed"
+
+
+def test_walk_lists_every_folder_and_restores_the_path(library: FakeResolve) -> None:
+    gw = ScriptApiGateway(library)
+    listings = gw.walk_project_manager()
+    assert [(x.path, x.projects) for x in listings] == [
+        ((), ()),
+        (("Archive",), ()),
+        (("Shows",), ()),
+        (("Shows", "Season 1"), ("Episode 1",)),
+        (("Shows", "Season 2"), ("Desk", "Episode 1")),
+    ]
+    assert library.pm_path == ("Shows", "Season 2")
+    assert gw.find_project_folders("Episode 1") == [("Shows", "Season 1"), ("Shows", "Season 2")]
+
+
+def test_load_project_navigates_to_the_locator_folder_and_checks_the_id(
+    library: FakeResolve,
+) -> None:
+    season1 = next(p for p in library.all_projects if p.folder == ("Shows", "Season 1"))
+    gw = ScriptApiGateway(library)
+    # The Project Manager sits in Season 2, which has its own "Episode 1": a load by name from
+    # here would open the wrong one.
+    gw.load_project(ProjectLocator(("Shows", "Season 1"), "Episode 1", season1.GetUniqueId()))
+    ctx = gw.get_context(with_pm_path=True)
+    assert ctx.project_id == season1.GetUniqueId()
+    assert ctx.project_manager_path == ("Shows", "Season 1")
+
+
+def test_load_project_refuses_a_project_whose_id_differs(library: FakeResolve) -> None:
+    gw = ScriptApiGateway(library)
+    with pytest.raises(GatewayError) as err:
+        gw.load_project(ProjectLocator(("Shows", "Season 2"), "Episode 1", "proj-from-elsewhere"))
+    assert err.value.code == "project_id_mismatch"
+
+
+def test_locator_matches_by_id_when_it_has_one() -> None:
+    by_id = ProjectLocator(("CCN",), "Show", "id-1")
+    assert by_id.matches("Renamed show", "id-1")
+    assert not by_id.matches("Show", "id-2")
+    by_name = ProjectLocator(("CCN",), "Show")
+    assert by_name.matches("Show", "anything")
+    assert ProjectLocator(("a/b",), "c").key != ProjectLocator(("a",), "b/c").key
+    assert ProjectLocator.from_dict(by_id.to_dict()) == by_id
+    with pytest.raises(ValueError):
+        ProjectLocator(("",), "Show")
+
+
+def test_context_diff_compares_pm_paths_only_when_both_are_measured() -> None:
+    a = ResolveContext(project="A", project_manager_path=("CCN",))
+    assert a.diff(ResolveContext(project="A", project_manager_path=("Archive",))) == {
+        "project_manager_path": (("CCN",), ("Archive",))
+    }
+    assert a.same_position(ResolveContext(project="A"))  # not measured is not a difference
 
 
 def test_set_current_timeline_by_name_and_by_unique_id(

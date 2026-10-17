@@ -17,6 +17,7 @@ from aar.node.broker import (
 )
 from aar.node.gateway import ResolveGateway, ScriptApiGateway
 from aar.node.leases import Holder, LeaseManager, Scope, instance_key, project_key, timeline_key
+from aar.node.locator import ProjectLocator
 from aar.node.presence import PresenceGuard
 
 from .fake_resolve import DeliverState, FakeClock, FakeResolve
@@ -41,8 +42,9 @@ class World:
         self,
         config: BrokerConfig = TEST_CONFIG,
         on_event: Callable[[World, BrokerEvent], None] | None = None,
+        fake: FakeResolve | None = None,
     ) -> None:
-        self.fake = FakeResolve(
+        self.fake = fake or FakeResolve(
             {"A": ["A main", "A alt"], "B": ["B main", "B alt"], "C": ["C main"]}, current="A"
         )
         a = self.fake.project("A")
@@ -82,9 +84,18 @@ class World:
         self.presence.observe(self.gw.get_context(), self.clock())
         self.clock.advance(IDLE)
 
+    def loc(self, project: str | ProjectLocator) -> ProjectLocator:
+        """A locator with the project's real folder and id (none for unknown projects)."""
+        if isinstance(project, ProjectLocator):
+            return project
+        known = self.fake.projects.get(project)
+        if known is None:
+            return ProjectLocator(("CCN",), project)
+        return ProjectLocator(known.folder, project, known.GetUniqueId())
+
     def op(
         self,
-        project: str,
+        project: str | ProjectLocator,
         name: str,
         *,
         cost: float = 0.0,
@@ -100,9 +111,9 @@ class World:
                 action(gw)
             return name
 
-        return HotOp(project=project, fn=fn, holder=holder, label=name, **kwargs)
+        return HotOp(project=self.loc(project), fn=fn, holder=holder, label=name, **kwargs)
 
-    def submit(self, project: str, name: str, **kwargs: Any) -> str:
+    def submit(self, project: str | ProjectLocator, name: str, **kwargs: Any) -> str:
         return self.broker.submit(self.op(project, name, **kwargs))
 
     def names(self) -> list[str]:
@@ -160,7 +171,9 @@ def test_human_context_round_trips_through_snapshot_and_restore(world: World) ->
     snapshot_events = world.of("snapshot")
     assert len(snapshot_events) == 1
     assert snapshot_events[0].data["context"]["playhead"] == "01:00:10:00"
-    assert [(e.data["source"], e.data["target"]) for e in world.of("switch")] == [("A", "B")]
+    assert snapshot_events[0].data["context"]["project_manager_path"] == ("CCN",)
+    assert snapshot_events[0].data["project_locator"] == world.loc("A").to_dict()
+    assert [(e.data["source"], e.data["target"]) for e in world.of("switch")] == [("A", "CCN/B")]
     # the human's project was saved before the broker moved away from it
     names = world.fake.call_names()
     assert names.index("SaveProject") < names.index("LoadProject")
@@ -327,7 +340,7 @@ def test_human_takeover_mid_batch_stops_the_batch() -> None:
 
 def test_op_never_runs_against_the_wrong_project(world: World) -> None:
     def wander_off(gw: ResolveGateway) -> None:
-        gw.load_project("C")
+        gw.load_project(world.loc("C"))
         world.fake.load_silently_fails.add("B")  # and B can no longer be re-selected
 
     world.settle()
@@ -343,12 +356,13 @@ def test_op_never_runs_against_the_wrong_project(world: World) -> None:
     assert result.error.detail["expected"] == "B"
     assert result.error.detail["actual"] == "C"
     assert result.error.detail["gateway_code"] == "project_load_failed"
-    assert [e.data["expected"] for e in world.of("reselect")] == ["B"]
+    assert result.error.detail["expected_id"] == world.loc("B").project_id
+    assert [e.data["expected"] for e in world.of("reselect")] == ["CCN/B"]
 
 
 def test_reselects_the_project_after_an_op_wanders_off(world: World) -> None:
     world.settle()
-    world.submit("B", "b1", action=lambda gw: gw.load_project("C"))
+    world.submit("B", "b1", action=lambda gw: gw.load_project(world.loc("C")))
     world.submit("B", "b2")
     world.broker.run_until_idle()
     assert world.ran == [("b1", "B", "B main"), ("b2", "B", "B main")]
@@ -368,7 +382,7 @@ def test_unloadable_project_fails_its_ops_with_a_structured_error(world: World) 
     assert result.error.detail["gateway_code"] == "project_not_found"
     assert world.names() == ["b1"]
     assert world.broker.pending() == []
-    assert world.of("switch_failed")[0].data["target"] == "Ghost"
+    assert world.of("switch_failed")[0].data["target"] == "CCN/Ghost"
 
 
 def test_timeline_is_asserted_before_the_op(world: World) -> None:
@@ -492,7 +506,7 @@ def test_starvation_is_bounded_by_max_wait(world: World) -> None:
     assert result is not None and result.started_at is not None
     submitted = next(e.at for e in world.of("submitted") if e.data["op_id"] == waiting)
     assert result.started_at - submitted <= config.max_wait_seconds + 30
-    assert world.of("batch_yielded")[0].data == {"project": "A", "to": "B"}
+    assert world.of("batch_yielded")[0].data == {"project": "CCN/A", "to": "CCN/B"}
     assert world.of("batch_started")[1].data["why"] == "starved"
 
 
@@ -521,7 +535,7 @@ def test_lease_blocked_op_waits_while_others_run(world: World) -> None:
     ]
     assert outcomes[-2].kind is TickKind.RESTORED  # blocked ops do not hold the human hostage
     skipped = {e.data["project"] for e in world.of("skipped")}
-    assert skipped == {"B", "C"}
+    assert skipped == {"CCN/B", "CCN/C"}
 
     world.leases.release(held.id, OTHER_AGENT)
     world.clock.advance(IDLE)
@@ -576,8 +590,8 @@ def test_human_preempting_the_instance_lease_pauses_the_restore(world: World) ->
 class TrustingGateway(ScriptApiGateway):
     """A gateway that takes ``LoadProject``'s word for it, as a naive one would."""
 
-    def load_project(self, name: str) -> None:
-        self.resolve.GetProjectManager().LoadProject(name)
+    def load_project(self, locator: ProjectLocator) -> None:
+        self.resolve.GetProjectManager().LoadProject(locator.name)
 
 
 def test_broker_asserts_the_project_itself_and_does_not_trust_the_gateway() -> None:
@@ -601,3 +615,102 @@ def test_broker_asserts_the_project_itself_and_does_not_trust_the_gateway() -> N
     assert result is not None and result.error is not None
     assert result.error.code == "wrong_project"
     assert (result.error.detail["expected"], result.error.detail["actual"]) == ("B", "A")
+
+
+# -- Project Manager folders and same-named projects (trap pm-folder-scoped-load) ------------
+
+PROJECTS = {"A": ["A main", "A alt"], "B": ["B main", "B alt"], "C": ["C main"]}
+
+
+def test_restore_puts_the_project_manager_back_in_the_humans_folder() -> None:
+    fake = FakeResolve(PROJECTS, current="A", folders={"B": ("Clients", "Acme")})
+    fake.add_pm_folder(("Archive", "2024"))
+    fake.human_browse_project_manager(("Archive", "2024"))  # browsed away after opening A
+    world = World(fake=fake)
+    before = world.gw.get_context(with_pm_path=True)
+    world.settle()
+    world.submit("B", "b1")
+    outcomes = world.broker.run_until_idle()
+
+    assert [o.kind for o in outcomes] == [TickKind.RAN, TickKind.RESTORED, TickKind.IDLE]
+    assert world.ran == [("b1", "B", "B main")]
+    # A is not in the human's PM folder, so the snapshot found it by walking the tree.
+    assert world.of("snapshot")[0].data["project_locator"] == world.loc("A").to_dict()
+    report = world.broker.last_restore
+    assert report is not None and report.ok, report
+    assert report.final.project_manager_path == ("Archive", "2024")
+    assert world.gw.get_context(with_pm_path=True) == before
+
+
+def test_restore_reports_a_project_manager_path_it_could_not_restore() -> None:
+    fake = FakeResolve(PROJECTS, current="A", folders={"B": ("Clients", "Acme")})
+    fake.add_pm_folder(("Archive", "2024"))
+    fake.human_browse_project_manager(("Archive", "2024"))
+    world = World(fake=fake)
+    world.settle()
+    world.submit("B", "b1", action=lambda gw: fake.pm_extra_folders.clear())  # folder gone
+    world.broker.run_until_idle()
+
+    report = world.broker.last_restore
+    assert report is not None and not report.ok
+    assert report.errors["project_manager_path"].startswith("pm_open_failed")
+    assert report.mismatches["project_manager_path"] == (("Archive", "2024"), ())
+    assert world.gw.get_context().project == "A"  # the project itself came back
+
+
+def test_same_named_project_in_another_folder_is_switched_to_by_id() -> None:
+    fake = FakeResolve(PROJECTS, current="A")
+    twin = fake.add_project("A", ["A main", "A alt"], ("Clients", "Acme"))
+    world = World(fake=fake)
+    human_id = fake.project("A").GetUniqueId()
+    seen: list[str | None] = []
+    world.settle()
+    world.submit(
+        ProjectLocator(("Clients", "Acme"), "A", twin.GetUniqueId()),
+        "twin",
+        action=lambda gw: seen.append(gw.get_context().project_id),
+    )
+    world.broker.run_until_idle()
+
+    assert seen == [twin.GetUniqueId()]  # a name-only match would have run it in the human's A
+    assert world.loads() == ["A", "A"]
+    assert world.gw.get_context().project_id == human_id
+    report = world.broker.last_restore
+    assert report is not None and report.ok
+
+
+def test_unlocatable_human_project_is_reported_not_guessed() -> None:
+    fake = FakeResolve(PROJECTS, current="A")
+    fake.add_project("A", ["A main"], ("Clients", "Acme"))
+    fake.add_pm_folder(("Archive",))
+    fake.human_browse_project_manager(("Archive",))  # and there are two projects named A
+    world = World(fake=fake)
+    world.settle()
+    world.submit("B", "b1")
+    world.broker.run_until_idle()
+
+    snapshot_warnings = world.of("snapshot")[0].data["warnings"]
+    assert any("cannot be reloaded on restore" in w for w in snapshot_warnings)
+    report = world.broker.last_restore
+    assert report is not None and not report.ok
+    assert report.errors["project"].startswith("human_project_unlocated")
+    assert world.loads() == ["B"]  # never loaded a guessed "A"
+    assert world.gw.get_context().project == "B"
+
+
+def test_pm_path_snapshot_can_be_turned_off_for_read_only_use() -> None:
+    config = BrokerConfig(
+        restore_delay_seconds=0.0,
+        snapshot_deliver_preset=False,
+        snapshot_project_manager_path=False,
+        save_before_switch=False,
+    )
+    world = World(config)
+    world.settle()
+    world.submit("A", "a1")
+    world.broker.tick()
+    names = world.fake.call_names()
+    assert not {"GotoParentFolder", "GotoRootFolder", "OpenFolder"} & set(names)
+    assert "SaveAsNewRenderPreset" not in names
+    snapshot = world.broker.snapshot
+    assert snapshot is not None and snapshot.context.project_manager_path is None
