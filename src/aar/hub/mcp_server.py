@@ -20,16 +20,20 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 
+from aar.hub import approvals, control, reviews
 from aar.hub.artifacts import ArtifactStore
+from aar.hub.common import Clock, utcnow
 from aar.hub.events import Event, EventLog
 from aar.hub.graph import WorkGraph
+from aar.hub.leaseboard import lease_board as project_lease_board
 from aar.hub.registry import Registry
 
 SERVER_INSTRUCTIONS = (
     "Shared memory for humans and AI agents working on DaVinci Resolve projects. "
     "Use it to discover which projects exist and where, what has happened (the event "
     "log), what work is planned or in flight (the work graph), and what has been "
-    "produced (artifacts). This surface is read-only."
+    "produced (artifacts). Call control_status before hot work: if it reports a stop, "
+    "do not touch Resolve. This surface is read-only."
 )
 
 # Every tool here only reads; advertise that to clients (SEP tool annotations).
@@ -58,8 +62,12 @@ def build_server(
     artifacts: ArtifactStore,
     *,
     name: str = "aar-hub",
+    clock: Clock = utcnow,
 ) -> MCPServer:
-    """Build the read-only hub MCP server over the given hub components."""
+    """Build the read-only hub MCP server over the given hub components.
+
+    ``clock`` decides what has expired (leases, presence, approval tokens).
+    """
     server: MCPServer = MCPServer(name=name, instructions=SERVER_INSTRUCTIONS)
 
     @server.tool(
@@ -150,5 +158,84 @@ def build_server(
         if meta is None:
             return {"found": False, "artifact_id": artifact_id}
         return {"found": True, "meta": meta.to_dict()}
+
+    @server.tool(
+        name="reviews_pending",
+        description=(
+            "List open review requests (renders waiting for a human to approve or reject). "
+            'Returns {"reviews": [...]}, oldest first, each with id, project_id, title, '
+            "status, subject (the work-graph node under review), renders (artifact ids), "
+            "timeline, fps, notes at their frames/timecodes, and decision (null while "
+            "open). Omit project_id for every project."
+        ),
+        annotations=_READ_ONLY,
+    )
+    def reviews_pending(project_id: str | None = None) -> dict[str, Any]:
+        found = reviews.list_reviews(log, project_id, pending_only=True)
+        return {"reviews": [review.to_dict() for review in found]}
+
+    @server.tool(
+        name="review_get",
+        description=(
+            'Get one review by project id and review id. Returns {"found": true, '
+            '"review": {...}} with its status, renders, notes (frame, timecode, text, '
+            "author) and decision ({decision: approve|reject, reason, by, ts} once a "
+            'human decided, else null), or {"found": false}. A review is approved only '
+            "when decision.decision is 'approve'."
+        ),
+        annotations=_READ_ONLY,
+    )
+    def review_get(project_id: str, review_id: str) -> dict[str, Any]:
+        review = reviews.get_review(log, project_id, review_id)
+        if review is None:
+            return {"found": False, "project_id": project_id, "review_id": review_id}
+        return {"found": True, "review": review.to_dict()}
+
+    @server.tool(
+        name="control_status",
+        description=(
+            'Emergency-stop status. Returns {"running": bool, "stops": [...]}; each stop '
+            "has scope ('all', 'project:<id>' or 'node:<id>'), reason, by and at. If any "
+            "stop covers your project or node, do no hot work until a human resumes it."
+        ),
+        annotations=_READ_ONLY,
+    )
+    def control_status() -> dict[str, Any]:
+        return control.status(log).to_dict()
+
+    @server.tool(
+        name="lease_board",
+        description=(
+            "Who holds what on each Resolve node, and where a human is working. Returns "
+            '{"as_of": ts, "leases": [...], "presence": [...]}. A lease has node_id, scope '
+            "(instance, project, timeline), key, holder {kind: human|agent, id}, since and "
+            "expires_at; expired leases are already left out. Presence entries mean a "
+            "human is active on that node since the given time."
+        ),
+        annotations=_READ_ONLY,
+    )
+    def lease_board() -> dict[str, Any]:
+        return project_lease_board(log, clock=clock).to_dict()
+
+    @server.tool(
+        name="approvals_list",
+        description=(
+            "List human approval tokens (metadata only; agents cannot grant). Returns "
+            '{"approvals": [...]}, newest first, each with token_id, scope (db.switch, '
+            "project.load, project.write, cloud.create, cloud.restore, switch.force), "
+            "target, reason, state (active, expired, revoked, consumed), who granted it "
+            "and when it expires. Set include_inactive to also list used or dead tokens."
+        ),
+        annotations=_READ_ONLY,
+    )
+    def approvals_list(include_inactive: bool = False) -> dict[str, Any]:
+        now = clock()
+        tokens = approvals.list_approvals(log)
+        listed = [
+            token.to_dict(now)
+            for token in tokens
+            if include_inactive or token.state(now) == "active"
+        ]
+        return {"approvals": listed}
 
     return server

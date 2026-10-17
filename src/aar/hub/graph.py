@@ -410,6 +410,38 @@ class WorkGraph:
         """Return all edges, ordered by creation."""
         return sorted(self._state.edges.values(), key=lambda e: (e.created or "", e.id))
 
+    # -- composition --------------------------------------------------------
+
+    def set_status_in(self, txn: Transaction, node_id: str, new_status: str, actor: Actor) -> Event:
+        """Append a validated status change inside a caller-owned transaction.
+
+        For callers that must change a node's status atomically with events of their
+        own (a review decision moves its review node in the same ``BEGIN IMMEDIATE``
+        transaction that records the decision). The transition is checked against the
+        state as of ``txn``. Idempotency is the caller's job. Use a ``WorkGraph`` built
+        for this one transaction: if the caller rolls back, its live state is stale.
+        """
+        if txn._log is not self._log:
+            raise ValueError("transaction belongs to a different event log")
+        if new_status not in STATUSES:
+            raise ValueError(f"status must be one of {sorted(STATUSES)}, got {new_status!r}")
+        self._catch_up(txn)
+        node = self._state.nodes.get(node_id)
+        if node is None:
+            raise KeyError(f"unknown node: {node_id!r}")
+        if new_status not in allowed_transitions(node.status):
+            raise IllegalTransition(
+                f"cannot move node {node_id} from {node.status!r} to {new_status!r}"
+            )
+        event = txn.append(
+            EVENT_NODE_STATUS_CHANGED,
+            actor,
+            {"node_id": node_id, "to": new_status},
+            project_id=self._project_id,
+        )
+        self._apply(event)
+        return event
+
     # -- internals ----------------------------------------------------------
 
     def _catch_up(self, txn: Transaction) -> None:
