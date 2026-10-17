@@ -13,7 +13,8 @@ dependencies = ["pydantic>=2"]
 [project.optional-dependencies]
 # zstd blobs with compressed blocks need zstandard; everything else in aar.drp is stdlib-only.
 drp = ["zstandard>=0.22"]
-dev = ["pytest", "ruff", "zstandard>=0.22"]
+hub = ["mcp>=2.3,<3"]
+dev = ["pytest", "ruff", "ai-agent-resolve[drp,hub]"]
 
 [project.scripts]
 aar = "aar.cli:main"

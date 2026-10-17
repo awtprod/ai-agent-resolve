@@ -1,0 +1,92 @@
+"""Tests for the ``aar hub`` CLI wiring (the serve entry point, not a bound server)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from aar.cli import main
+from aar.hub.events import EventLog
+
+
+def _hub_db(tmp_path: Path) -> Path:
+    """Create an initialised (empty) hub database the read-only server can open."""
+    db = tmp_path / "hub.db"
+    EventLog(db).close()
+    return db
+
+
+def _stub_run(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    """Replace MCPServer.run so serve never binds a socket; record its kwargs instead."""
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "aar.hub.mcp_server.MCPServer.run",
+        lambda self, **kwargs: calls.append(kwargs),
+        raising=True,
+    )
+    return calls
+
+
+def _serve_args(tmp_path: Path, *extra: str) -> list[str]:
+    return [
+        "hub",
+        "serve",
+        "--db",
+        str(tmp_path / "hub.db"),
+        "--artifacts",
+        str(tmp_path / "artifacts"),
+        *extra,
+    ]
+
+
+def test_serve_accepts_loopback_hosts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _hub_db(tmp_path)
+    calls = _stub_run(monkeypatch)
+    for host in ("127.0.0.1", "localhost", "::1"):
+        calls.clear()
+        assert main(_serve_args(tmp_path, "--host", host)) == 0
+        assert calls[-1]["host"] == host
+        assert calls[-1]["transport"] == "streamable-http"
+
+
+def test_serve_accepts_non_loopback_with_allow_remote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _hub_db(tmp_path)
+    calls = _stub_run(monkeypatch)
+    assert main(_serve_args(tmp_path, "--host", "0.0.0.0", "--allow-remote")) == 0
+    assert calls[-1]["host"] == "0.0.0.0"
+
+
+def test_serve_refuses_non_loopback_without_allow_remote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = _stub_run(monkeypatch)
+    code = main(_serve_args(tmp_path, "--host", "0.0.0.0"))
+    assert code == 2
+    assert "allow-remote" in capsys.readouterr().err
+    # The guard returns before serving or touching the filesystem.
+    assert calls == []
+    assert not (tmp_path / "hub.db").exists()
+
+
+def test_serve_reports_a_missing_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = _stub_run(monkeypatch)
+    # No hub.db was created, so the read-only open must fail cleanly.
+    code = main(_serve_args(tmp_path, "--host", "127.0.0.1"))
+    assert code == 2
+    assert "hub database" in capsys.readouterr().err
+    assert calls == []
+    assert not (tmp_path / "hub.db").exists()  # nothing was created
+
+
+def test_hub_requires_a_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["hub"]) == 2
+    assert "usage: aar hub" in capsys.readouterr().err
+
+
+def test_top_level_still_prints_version() -> None:
+    assert main(["--version"]) == 0

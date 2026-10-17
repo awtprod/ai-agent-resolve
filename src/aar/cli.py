@@ -6,6 +6,7 @@ import argparse
 
 from aar import __version__
 from aar.drp import cli as drp_cli
+from aar.hub import cli as hub_cli
 from aar.plan import cli as plan_cli
 
 
@@ -22,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     groups = parser.add_subparsers(dest="group", metavar="GROUP")
     plan_cli.register(groups)
     drp_cli.register(groups)
+    hub_cli.register(groups)
     return parser
 
 
