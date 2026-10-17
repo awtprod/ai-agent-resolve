@@ -4,6 +4,14 @@ from __future__ import annotations
 
 import struct
 
+import pytest
+
+from aar.drp import blobs
+
+ZSTD_REASON = "needs the optional zstandard package (pip install 'ai-agent-resolve[drp]')"
+needs_zstandard = pytest.mark.skipif(blobs.zstd_backend() is None, reason=ZSTD_REASON)
+"""For tests that decode compressed zstd blobs (the templates' Clip and SetupBA blobs)."""
+
 HEADER = '<?xml version="1.0" encoding="UTF-8"?>\n<!--DbAppVer="{app}" DbPrjVer="{prj}"-->\n'
 
 

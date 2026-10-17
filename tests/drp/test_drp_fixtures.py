@@ -8,6 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from drp_helpers import needs_zstandard
 
 from aar.drp import blobs
 from aar.drp.model import DrpFile, Provenance
@@ -25,6 +26,7 @@ def span_bytes(path: Path, prov: Provenance) -> bytes:
         return zf.read(prov.member)[prov.start : prov.end]
 
 
+@needs_zstandard
 @pytest.mark.parametrize(
     ("name", "app", "prj", "project"),
     [
@@ -74,6 +76,7 @@ def _video_clip(drp: DrpFile):  # type: ignore[no-untyped-def]
     return clips[0]
 
 
+@needs_zstandard
 def test_media_clip_h264_media_pool(fixture_path: FixturePath) -> None:
     path = fixture_path("media-clip-h264.drp")
     drp = read_drp(path)
@@ -99,6 +102,7 @@ def test_media_clip_h264_media_pool(fixture_path: FixturePath) -> None:
     assert any(i.code == "stale-media-file-path" for i in drp.issues)
 
 
+@needs_zstandard
 def test_media_clip_h264_timeline(fixture_path: FixturePath) -> None:
     path = fixture_path("media-clip-h264.drp")
     drp = read_drp(path)
@@ -170,10 +174,13 @@ def test_without_zstd_library_raw_block_blobs_still_decode(
     monkeypatch.setattr(blobs, "_zstd_backend", lambda: (None, None))
     drp = read_drp(fixture_path("media-clip-h264.drp"))
     clip = _video_clip(drp)
-    assert clip.path_source == "media_pool_blob"
-    assert hashlib.sha256((clip.path or "").encode()).hexdigest() == H264_BLOB_PATH_SHA256
-    assert clip.codec == "AAC"  # only the audio Clip blob could be read
+    # Nothing is borrowed from the audio stream: not its codec, and not its Clip blob path
+    # (here it names the same file, but for synced audio it would not). The path falls back to
+    # the video item's <MediaFilePath>, labelled as such.
+    assert (clip.path, clip.path_source) == ("/Media/sample.mp4", "timeline_item")
+    assert clip.blob_path is None and clip.linked_paths == []
+    assert clip.codec is None
     assert clip.frames == 4576  # keyed dicts need no zstd
-    unavailable = [i for i in drp.issues if i.code == "zstd-unavailable"]
-    assert any("video Clip blob" in i.message and "zstandard" in i.message for i in unavailable)
+    [unavailable] = [i for i in drp.issues if i.code == "zstd-unavailable"]
+    assert "zstandard" in unavailable.message
     assert drp.zstd_backend is None

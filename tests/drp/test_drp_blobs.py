@@ -6,7 +6,7 @@ import struct
 import zlib
 
 import pytest
-from drp_helpers import envelope, kd, pb_len, pb_var, qstr, varint, zstd_raw_frame
+from drp_helpers import ZSTD_REASON, envelope, kd, pb_len, pb_var, qstr, varint, zstd_raw_frame
 
 from aar.drp import blobs
 from aar.drp.errors import BlobError, ZstdUnavailableError
@@ -190,7 +190,7 @@ def test_raw_block_zstd_decodes_without_a_library(no_zstd_library: None) -> None
 
 
 def test_compressed_zstd_without_a_library_says_what_to_install(no_zstd_library: None) -> None:
-    zstandard = pytest.importorskip("zstandard")
+    zstandard = pytest.importorskip("zstandard", reason=ZSTD_REASON)
     frame = zstandard.ZstdCompressor().compress(b"resolve " * 64)
     with pytest.raises(ZstdUnavailableError, match="zstandard"):
         blobs.zstd_decompress(frame)
@@ -200,7 +200,7 @@ def test_compressed_zstd_without_a_library_says_what_to_install(no_zstd_library:
 
 
 def test_compressed_zstd_with_library_and_output_bound() -> None:
-    zstandard = pytest.importorskip("zstandard")
+    zstandard = pytest.importorskip("zstandard", reason=ZSTD_REASON)
     frame = zstandard.ZstdCompressor().compress(b"x" * 5000)
     assert blobs.zstd_decompress(frame) == b"x" * 5000
     with pytest.raises(BlobError, match="limit"):
@@ -208,7 +208,7 @@ def test_compressed_zstd_with_library_and_output_bound() -> None:
 
 
 def test_zstd_output_bound_when_size_is_not_declared() -> None:
-    zstandard = pytest.importorskip("zstandard")
+    zstandard = pytest.importorskip("zstandard", reason=ZSTD_REASON)
     cctx = zstandard.ZstdCompressor(write_content_size=False)
     frame = cctx.compress(b"y" * 5000)
     with pytest.raises(BlobError, match="exceeds"):

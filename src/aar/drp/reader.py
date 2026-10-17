@@ -18,7 +18,7 @@ from aar.drp.container import (
     open_container,
     parse_version_header,
 )
-from aar.drp.errors import BlobError, ContainerError, ZstdUnavailableError
+from aar.drp.errors import BlobError, BudgetExceededError, ContainerError, ZstdUnavailableError
 from aar.drp.model import (
     AudioTrackInfo,
     Bin,
@@ -36,9 +36,23 @@ from aar.drp.model import (
     Track,
     VersionInfo,
 )
-from aar.drp.scan import Document, Element, scan
+from aar.drp.scan import Document, Element, parse_int, scan
 
-__all__ = ["MARKER_COLORS", "read_drp"]
+__all__ = [
+    "DEFAULT_MAX_ELEMENTS",
+    "DEFAULT_MAX_ISSUES_PER_CODE",
+    "DEFAULT_MAX_TOTAL_XML_BYTES",
+    "MARKER_COLORS",
+    "join_clip_path",
+    "read_drp",
+]
+
+# Per-file budgets. The private corpus maxima are 311,727 elements and 30.95 MB of XML in one
+# file (and 20.8 MB of decompressed blobs, see blobs.DEFAULT_MAX_TOTAL_OUTPUT); each budget is
+# about 20 times that. A scanned element costs roughly 450 bytes of memory.
+DEFAULT_MAX_ELEMENTS = 6_000_000
+DEFAULT_MAX_TOTAL_XML_BYTES = 600 * 1024 * 1024
+DEFAULT_MAX_ISSUES_PER_CODE = 100
 
 # Marker colour bits, from drp-format's timeline-markers-blob.js (measured there on 19.1.3.7).
 MARKER_COLORS = {
@@ -86,15 +100,26 @@ def read_drp(
     check_blobs: bool = False,
     max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES,
     max_blob_output: int = blobs.DEFAULT_MAX_OUTPUT,
+    max_total_blob_output: int = blobs.DEFAULT_MAX_TOTAL_OUTPUT,
+    max_elements: int = DEFAULT_MAX_ELEMENTS,
+    max_total_xml_bytes: int = DEFAULT_MAX_TOTAL_XML_BYTES,
 ) -> DrpFile:
     """Read a ``.drp``/``.drt``/``.drb`` file into a :class:`DrpFile`.
 
     Raises :class:`~aar.drp.errors.ContainerError` only when the file itself cannot be read.
     Everything inside it that cannot be understood becomes an :class:`Issue` instead.
     ``check_blobs`` fully decodes every hex blob to fill :attr:`DrpFile.blob_stats` (slower).
+
+    Memory and work are bounded per file: at most ``max_total_xml_bytes`` of XML is read,
+    at most ``max_elements`` elements are scanned and at most ``max_total_blob_output`` bytes
+    are decompressed. Hitting a budget is reported as an issue; the rest is read best effort.
     """
     with open_container(path, max_member_bytes=max_member_bytes) as container:
-        return _Reader(container, check_blobs, max_blob_output).run()
+        reader = _Reader(container, check_blobs, max_blob_output)
+        reader.budget = blobs.DecodeBudget(max_total_blob_output)
+        reader.elements_left = max_elements
+        reader.xml_bytes_left = max_total_xml_bytes
+        return reader.run()
 
 
 def member_role(name: str) -> str:
@@ -118,6 +143,16 @@ def member_role(name: str) -> str:
 
 
 _INTERPRETED_ROLES = frozenset({"project", "bin", "timeline"})
+_CONTAINER_TYPES = frozenset({"timeline", "compound", "multicam"})
+
+
+def _main_stream(element: str) -> str:
+    """The stream a media-pool clip's path and codec come from, by element type."""
+    return "audio" if element == "Sm2MpAudioClip" else "video"
+
+
+class _BudgetRefused(Exception):
+    """A member was not read because the file's XML budget is used up (internal)."""
 
 
 def _text_prov(member: str, el: Element) -> Provenance:
@@ -145,7 +180,7 @@ def _iter_skipping(el: Element, skip: frozenset[str]) -> Iterator[Element]:
             stack.extend(reversed(node.children))
 
 
-def _join_path(directory: str | None, filename: str | None) -> str | None:
+def join_clip_path(directory: str | None, filename: str | None) -> str | None:
     """Join the Clip blob's directory and file name with the separator the directory uses."""
     if not filename:
         return directory or None
@@ -155,6 +190,9 @@ def _join_path(directory: str | None, filename: str | None) -> str | None:
         return directory + filename
     sep = "\\" if "\\" in directory and "/" not in directory else "/"
     return directory + sep + filename
+
+
+_join_path = join_clip_path  # former private name
 
 
 class _Reader:
@@ -170,13 +208,68 @@ class _Reader:
         self.sequences: dict[str, tuple[MediaClip, Element | None, Element, str]] = {}
         self.markers: dict[str, list[Marker]] = defaultdict(list)
         self.stale_paths = 0
+        # Members that failed to read; each is reported once and never read again.
+        self.unreadable: set[str] = set()
+        # Blobs that need a real zstd decompressor: counted, reported once per file.
+        self.zstd_missing = 0
+        self.zstd_first: tuple[str, Provenance] | None = None
+        # Per media clip while it is read: which stream is the main one, and whether its
+        # Clip blob failed to decode (then the codec is unknown, never another stream's).
+        self.primary_stream = "video"
+        self.primary_failed = False
+        self.codec_unknown = 0
+        self.no_main_stream = 0
+        self.later_stream_path = 0
+        # Budgets (set by read_drp) and what they refused.
+        self.budget = blobs.DecodeBudget()
+        self.elements_left = DEFAULT_MAX_ELEMENTS
+        self.xml_bytes_left = DEFAULT_MAX_TOTAL_XML_BYTES
+        self.xml_refused = 0
+        self.member_sizes: dict[str, int] = {}
+        # Issues kept per code; the rest are counted and summarised as issues-truncated.
+        self.issue_counts: Counter[str] = Counter()
 
     # ------------------------------------------------------------------ helpers
 
     def issue(
         self, severity: str, code: str, message: str, where: Provenance | None = None
     ) -> None:
-        self.issues.append(Issue(severity, code, message, where))
+        self.issue_counts[code] += 1
+        if self.issue_counts[code] <= DEFAULT_MAX_ISSUES_PER_CODE:
+            self.issues.append(Issue(severity, code, message, where))
+
+    def _truncation_summaries(self) -> None:
+        for code, count in sorted(self.issue_counts.items()):
+            if count > DEFAULT_MAX_ISSUES_PER_CODE:
+                more = count - DEFAULT_MAX_ISSUES_PER_CODE
+                msg = f"{more} more {code} issue(s) not listed"
+                self.issues.append(Issue("info", "issues-truncated", msg))
+
+    def read_member(self, name: str) -> bytes:
+        """Read a member within the per-file XML budget (raises ContainerError)."""
+        if not self.member_sizes:
+            self.member_sizes = {m.name: m.size for m in self.c.members}
+        size = self.member_sizes.get(name, 0)
+        if self.xml_bytes_left <= 0 or size > self.xml_bytes_left:
+            self.xml_refused += 1
+            raise _BudgetRefused(name)
+        data = self.c.read(name, max_bytes=self.xml_bytes_left)
+        self.xml_bytes_left -= len(data)
+        return data
+
+    def scan_member(self, data: bytes, name: str) -> Document:
+        doc = scan(data, name, max_elements=max(self.elements_left, 0))
+        self.elements_left -= doc.element_count
+        if doc.stopped_at is not None:
+            where = Provenance(name, doc.stopped_at, doc.stopped_at, "offset")
+            self.issue(
+                "warning",
+                "scan-budget-exceeded",
+                f"{name}: the file's element budget is used up; the rest of this member "
+                "is not read",
+                where,
+            )
+        return doc
 
     def text(self, member: str, el: Element, tag: str, spans: Spans, key: str) -> str | None:
         child = el.find(tag)
@@ -190,11 +283,10 @@ class _Reader:
         raw = self.text(member, el, tag, spans, key)
         if raw is None:
             return None
-        try:
-            return int(raw.strip())
-        except ValueError:
+        value = parse_int(raw)
+        if value is None:
             self.issue("warning", "bad-integer", f"<{tag}> is not an integer", spans[key])
-            return None
+        return value
 
     def frames(
         self,
@@ -249,9 +341,13 @@ class _Reader:
 
     def message(self, member: str, el: Element, data: bytes, what: str) -> bytes | None:
         try:
-            return blobs.unwrap_message(data, max_output=self.max_out)
-        except ZstdUnavailableError as exc:
-            self.issue("warning", "zstd-unavailable", f"{what}: {exc}", _text_prov(member, el))
+            return blobs.unwrap_message(data, max_output=self.max_out, budget=self.budget)
+        except BudgetExceededError:
+            pass  # counted by the budget; reported once at the end
+        except ZstdUnavailableError:
+            self.zstd_missing += 1
+            if self.zstd_first is None:
+                self.zstd_first = (what, _text_prov(member, el))
         except BlobError as exc:
             self.issue("warning", "blob-decode", f"{what}: {exc}", _text_prov(member, el))
         return None
@@ -288,7 +384,12 @@ class _Reader:
             if m.interpreted:
                 self._load(m.name)
         versions = self._versions(members) if c.is_zip else None
-        if c.is_zip and c.kind in ("drp", "drt") and "project.xml" not in self.docs:
+        if (
+            c.is_zip
+            and c.kind in ("drp", "drt")
+            and "project.xml" not in self.docs
+            and "project.xml" not in self.unreadable
+        ):
             self.issue("error", "missing-member", "project.xml is missing")
         if c.kind in ("drp", "drt") and not any(m.role == "bin" for m in members):
             self.issue("warning", "missing-member", "no MediaPool/.../MpFolder.xml member")
@@ -303,6 +404,51 @@ class _Reader:
         timelines = self._timelines(project)
         self._finish_media(timelines)
         stats = self._blob_stats() if self.check_blobs else BlobStats(checked=False)
+        if self.zstd_missing and self.zstd_first is not None:
+            what, where = self.zstd_first
+            self.issue(
+                "warning",
+                "zstd-unavailable",
+                f"{self.zstd_missing} blob(s) need a zstd decompressor and were not decoded "
+                f"(first: {what}); install the optional dependency 'zstandard' "
+                "(pip install 'ai-agent-resolve[drp]')",
+                where,
+            )
+        if self.budget.refused:
+            self.issue(
+                "warning",
+                "blob-budget-exceeded",
+                f"{self.budget.refused} blob(s) not decompressed: the file's decompression "
+                f"budget of {self.budget.limit} bytes was used up",
+            )
+        if self.xml_refused:
+            self.issue(
+                "warning",
+                "xml-budget-exceeded",
+                f"{self.xml_refused} member(s) not read: the file's XML budget was used up",
+            )
+        if self.no_main_stream:
+            self.issue(
+                "warning",
+                "no-main-stream",
+                f"{self.no_main_stream} media clip(s) have no Clip blob for their main stream "
+                "(other streams' files are not used as the clip's path)",
+            )
+        if self.later_stream_path:
+            self.issue(
+                "warning",
+                "path-from-later-stream",
+                f"{self.later_stream_path} media clip(s) took their path from a later "
+                "main-stream Clip blob because the first one could not be read",
+            )
+        if self.codec_unknown:
+            self.issue(
+                "warning",
+                "codec-unknown",
+                f"{self.codec_unknown} media clip(s): codec unknown because the Clip blob of "
+                "their main stream was not decoded",
+            )
+        self._truncation_summaries()
         return DrpFile(
             path=str(c.path),
             kind=c.kind,
@@ -327,13 +473,19 @@ class _Reader:
 
     def _load(self, name: str) -> None:
         try:
-            data = self.c.read(name)
+            data = self.read_member(name)
+        except _BudgetRefused:
+            self.unreadable.add(name)
+            return
         except ContainerError as exc:
+            self.unreadable.add(name)
             self.issue("error", "unreadable-member", str(exc))
             return
-        doc = scan(data, name)
+        doc = self.scan_member(data, name)
         self.docs[name] = doc
         for si in doc.issues:
+            if si.code == "budget-exceeded":
+                continue  # reported by scan_member
             where = Provenance(name, si.offset, si.offset, "offset")
             self.issue("warning", f"scan-{si.code}", si.message, where)
         if doc.root is None:
@@ -344,10 +496,13 @@ class _Reader:
         for m in members:
             if m.role == "directory" or not m.name.lower().endswith(".xml"):
                 continue
+            if m.name in self.unreadable:
+                continue
             doc = self.docs.get(m.name)
             try:
                 head = doc.data[:1024] if doc is not None else self.c.head(m.name)
             except ContainerError as exc:
+                self.unreadable.add(m.name)
                 self.issue("warning", "unreadable-member", str(exc))
                 continue
             v = parse_version_header(head, m.name)
@@ -511,9 +666,6 @@ class _Reader:
             clip = self._media_clip(member, el, bin_id)
             if clip is None:
                 continue
-            if clip.id in self.media:
-                self.issue("warning", "duplicate-id", f"media {clip.id} appears twice", clip.source)
-                continue
             self.media[clip.id] = clip
             b.clip_ids.append(clip.id)
 
@@ -545,6 +697,12 @@ class _Reader:
         if not clip_id:
             self.issue("warning", "missing-id", f"<{el.tag}> without DbId", _el_prov(member, el))
             return None
+        if clip_id in self.media:
+            # Rejected before anything about it is recorded.
+            self.issue(
+                "warning", "duplicate-id", f"media {clip_id} appears twice", _el_prov(member, el)
+            )
+            return None
         folder = self.text(member, el, "MpFolder", spans, "bin_id")
         clip = MediaClip(
             id=clip_id,
@@ -569,11 +727,24 @@ class _Reader:
             spans=spans,
         )
         skip = frozenset({"Sequence", "TimelineSharedHandle"})
-        for node in _iter_skipping(el, skip):
+        nodes = [n for n in _iter_skipping(el, skip) if n.tag in ("BtVideoInfo", "BtAudioInfo")]
+        # The main stream follows from the element type, never from which nodes happen to exist.
+        self.primary_stream = _main_stream(el.tag)
+        self.primary_failed = False
+        main_tag = "BtAudioInfo" if self.primary_stream == "audio" else "BtVideoInfo"
+        # Main stream first (document order kept within each group), so its first Clip blob
+        # decides blob_path and the other streams are compared with it.
+        nodes.sort(key=lambda n: n.tag != main_tag)
+        if clip.type not in _CONTAINER_TYPES and not any(n.tag == main_tag for n in nodes):
+            self.primary_failed = True
+            self.no_main_stream += 1
+        for node in nodes:
             if node.tag == "BtVideoInfo":
                 self._video_info(member, node, clip)
-            elif node.tag == "BtAudioInfo":
+            else:
                 self._audio_info(member, node, clip)
+        if self.primary_failed and clip.codec is None:
+            self.codec_unknown += 1
         seq = el.path("TimelineSharedHandle", "Sm2Timeline", "Sequence", "Sm2Sequence")
         timeline_el = el.path("TimelineSharedHandle", "Sm2Timeline")
         if seq is None:
@@ -590,34 +761,49 @@ class _Reader:
 
     def _clip_blob(self, member: str, info: Element, clip: MediaClip, what: str) -> None:
         clip_el = info.find("Clip")
-        data = self.blob(member, clip_el)
-        if data is None or clip_el is None:
+        primary = what == self.primary_stream
+        if clip_el is None or not clip_el.text:
+            self.primary_failed |= primary
             return
-        payload = self.message(member, clip_el, data, f"{clip.element} {what} Clip blob")
+        data = self.blob(member, clip_el)
+        payload = None
+        if data is not None:
+            payload = self.message(member, clip_el, data, f"{clip.element} {what} Clip blob")
         if payload is None:
+            self.primary_failed |= primary
             return
         try:
             fields = blobs.decode_protobuf(payload, nested_depth=0)
         except BlobError as exc:
             self.issue("warning", "blob-decode", f"Clip blob: {exc}", _text_prov(member, clip_el))
+            self.primary_failed |= primary
             return
         first = {}
         for f in fields:
             first.setdefault(f.number, f)
         directory = first[1].as_text if 1 in first else None
         filename = first[2].as_text if 2 in first else None
-        path = _join_path(directory, filename)
-        if path and clip.blob_path is None:
+        path = join_clip_path(directory, filename)
+        # Only the main stream's Clip blob gives the clip's path. Another stream's blob may
+        # name a different file (synced external audio), so it is never used in its place;
+        # it is listed in linked_paths only when the main path is known and differs.
+        if primary and path and clip.blob_path is None:
             clip.blob_path = path
             clip.spans["blob_path"] = _blob_prov(
                 member, clip_el, f"{what}/Clip>message>protobuf#1+#2"
             )
-        elif path and path != clip.blob_path and path not in clip.linked_paths:
+            if self.primary_failed:
+                # An earlier Clip blob of the main stream could not be read.
+                self.later_stream_path += 1
+        elif primary and not path and clip.blob_path is None:
+            self.primary_failed = True
+        elif path and clip.blob_path and path != clip.blob_path and path not in clip.linked_paths:
             clip.linked_paths.append(path)
             clip.spans[f"linked_paths[{len(clip.linked_paths) - 1}]"] = _blob_prov(
                 member, clip_el, f"{what}/Clip>message>protobuf#1+#2"
             )
-        if clip.codec is None and 5 in first and first[5].as_text:
+        # The codec comes from the main stream only (video if the clip has video).
+        if primary and clip.codec is None and 5 in first and first[5].as_text:
             clip.codec = first[5].as_text
             clip.spans["codec"] = _blob_prov(member, clip_el, f"{what}/Clip>message>protobuf#5")
 
@@ -944,6 +1130,8 @@ class _Reader:
 
     def _finish_media(self, timelines: list[Timeline]) -> None:
         unresolved = Counter()
+        same_stream_path: dict[str, str] = {}
+        path_conflicts: set[str] = set()
         for tl in timelines:
             for track in tl.tracks:
                 for item in track.items:
@@ -960,13 +1148,45 @@ class _Reader:
                     item.media_clip_id = clip.id
                     if item.media_file_path and item.media_file_path not in clip.timeline_paths:
                         clip.timeline_paths.append(item.media_file_path)
+                    # Fallback path: only from items of the clip's main stream (a synced
+                    # clip's audio items point at the external audio file). The first such
+                    # item wins; disagreement is reported below.
+                    if (
+                        item.media_file_path
+                        and clip.type not in _CONTAINER_TYPES
+                        and item.kind == _main_stream(clip.element)
+                    ):
+                        first = same_stream_path.setdefault(clip.id, item.media_file_path)
+                        if first != item.media_file_path:
+                            path_conflicts.add(clip.id)
+        no_path = 0
+        conflicting = 0
         for clip in self.media.values():
             if clip.blob_path:
                 clip.path, clip.path_source = clip.blob_path, "media_pool_blob"
                 if any(p != clip.blob_path for p in clip.timeline_paths):
                     self.stale_paths += 1
-            elif clip.timeline_paths:
-                clip.path, clip.path_source = clip.timeline_paths[0], "timeline_item"
+            elif clip.id in same_stream_path:
+                clip.path, clip.path_source = same_stream_path[clip.id], "timeline_item"
+                if clip.id in path_conflicts:
+                    conflicting += 1
+            elif clip.type in ("video", "audio", "still", "other"):
+                no_path += 1
+        if conflicting:
+            self.issue(
+                "warning",
+                "timeline-path-conflict",
+                f"{conflicting} media clip(s) use a timeline <MediaFilePath> as their path but "
+                "their timeline items name different files (the first is used; all are in "
+                "timeline_paths)",
+            )
+        if no_path:
+            self.issue(
+                "warning",
+                "path-unknown",
+                f"{no_path} media clip(s) have no path: their main stream's Clip blob was not "
+                "read and no timeline item of that stream names a file",
+            )
         for tl in timelines:
             for track in tl.tracks:
                 for item in track.items:
@@ -1012,11 +1232,17 @@ class _Reader:
         failures: Counter[str] = Counter()
         undecoded: Counter[str] = Counter()
         for name in self.c.xml_members():
+            if name in self.unreadable:
+                continue
             doc = self.docs.get(name)
             if doc is None:
                 try:
-                    doc = scan(self.c.read(name), name)
+                    doc = self.scan_member(self.read_member(name), name)
+                except _BudgetRefused:
+                    self.unreadable.add(name)
+                    continue
                 except ContainerError as exc:
+                    self.unreadable.add(name)
                     self.issue("warning", "unreadable-member", str(exc))
                     continue
             if doc.root is None:
@@ -1034,7 +1260,7 @@ class _Reader:
                     by_tag[el.tag][blobs.BlobKind.INVALID_HEX] += 1
                     failures[f"{el.tag}: {_generic(str(exc))}"] += 1
                     continue
-                result = blobs.check(el.tag, data, max_output=self.max_out)
+                result = blobs.check(el.tag, data, max_output=self.max_out, budget=self.budget)
                 by_tag[el.tag][result.kind] += 1
                 if result.undecoded:
                     undecoded[el.tag] += 1
@@ -1085,7 +1311,8 @@ def _decode_markers(payload: bytes, owner: str, owner_kind: str, prov: Provenanc
             strings = [f.value for f in fields if f.number == 3 and isinstance(f.value, bytes)]
             custom = next((f.value for f in fields if f.number == 6 and f.wire == 2), b"")
             texts = [s.decode("utf-8", "replace") for s in strings] + ["", "", ""]
-            duration = int(texts[1]) if texts[1].strip().isdigit() else None
+            parsed = parse_int(texts[1])
+            duration = parsed if parsed is not None and parsed >= 0 else None
             markers.append(
                 Marker(
                     owner_id=owner,

@@ -16,24 +16,46 @@ import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
-__all__ = ["Document", "Element", "ScanIssue", "scan", "unescape"]
+__all__ = ["Document", "Element", "ScanIssue", "parse_int", "scan", "unescape"]
 
-_TOKEN = re.compile(
+# Start and end tags are matched with anchored regexes; comments, CDATA, processing
+# instructions and declarations are found with bytes.find so a hostile member (for example
+# thousands of unterminated "<!--") is scanned in linear time.
+_START = re.compile(
     rb"""
-      <!--(?P<comment>.*?)-->
-    | <!\[CDATA\[(?P<cdata>.*?)\]\]>
-    | <\?(?P<pi>.*?)\?>
-    | <!(?P<decl>[^>]*)>
-    | </(?P<end>[^\s<>]+)\s*>
-    | <(?P<start>[^\s<>/!?][^\s<>/]*)
-       (?P<attrs>(?:\s+[^\s<>=/]+\s*=\s*(?:"[^"]*"|'[^']*'))*)
-       \s*(?P<close>/?)>
+    <(?P<start>[^\s<>/!?][^\s<>/]*)
+     (?P<attrs>(?:\s+[^\s<>=/]+\s*=\s*(?:"[^"]*"|'[^']*'))*)
+     \s*(?P<close>/?)>
     """,
-    re.S | re.X,
+    re.X,
 )
+_END = re.compile(rb"</(?P<end>[^\s<>]+)\s*>")
+_DELIMITED: tuple[tuple[bytes, bytes, str], ...] = (
+    (b"<!--", b"-->", "comment"),
+    (b"<![CDATA[", b"]]>", "cdata"),
+    (b"<?", b"?>", "pi"),
+    (b"<!", b">", "decl"),
+)
+_MAX_INT_DIGITS = 20
+_MAX_ISSUES_PER_CODE = 100
 _ATTR = re.compile(rb"""([^\s<>=/]+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
 _ENTITY = re.compile(r"&(lt|gt|amp|quot|apos|#[0-9]+|#x[0-9a-fA-F]+);")
 _NAMED = {"lt": "<", "gt": ">", "amp": "&", "quot": '"', "apos": "'"}
+
+
+def parse_int(text: str, *, max_digits: int = _MAX_INT_DIGITS) -> int | None:
+    """Parse a decimal integer the way Resolve writes them, or return ``None``.
+
+    Accepts optional surrounding whitespace and a leading ``-``, then ASCII digits only, at
+    most ``max_digits`` of them. ``int()`` alone is too lenient (it accepts ``"1_000"`` and
+    non-ASCII digits) and ``str.isdigit()`` is wrong (it accepts ``"²"``, which ``int()``
+    rejects). Never raises.
+    """
+    body = text.strip()
+    digits = body[1:] if body.startswith("-") else body
+    if not digits or len(digits) > max_digits or not (digits.isascii() and digits.isdigit()):
+        return None
+    return int(body)
 
 
 def unescape(text: str) -> str:
@@ -152,17 +174,39 @@ class Element:
                 yield from wrapper.children
 
 
+def _delimited(data: bytes, lt: int) -> tuple[str, int, int, int] | None:
+    """If a comment/CDATA/PI/declaration starts at ``lt``: (kind, inner start, inner end, end).
+
+    An unterminated construct runs to the end of ``data`` and its kind gets a ``!`` suffix.
+    """
+    for opener, closer, kind in _DELIMITED:
+        if data.startswith(opener, lt):
+            inner = lt + len(opener)
+            close = data.find(closer, inner)
+            if close < 0:
+                return kind + "!", inner, len(data), len(data)
+            return kind, inner, close, close + len(closer)
+    return None
+
+
 def _strip_markup(raw: bytes) -> bytes:
-    """Keep CDATA content and drop comments/PIs inside a leaf's raw bytes."""
+    """Keep CDATA content and drop comments/PIs inside a leaf's raw bytes (linear time)."""
     out = bytearray()
     pos = 0
-    for m in _TOKEN.finditer(raw):
-        out += raw[pos : m.start()]
-        if m.group("cdata") is not None:
-            out += m.group("cdata")
-        pos = m.end()
-    out += raw[pos:]
-    return bytes(out)
+    while True:
+        lt = raw.find(b"<", pos)
+        if lt < 0:
+            out += raw[pos:]
+            return bytes(out)
+        out += raw[pos:lt]
+        found = _delimited(raw, lt)
+        if found is None:
+            out += b"<"
+            pos = lt + 1
+            continue
+        kind, inner, inner_end, pos = found
+        if kind.startswith("cdata"):
+            out += raw[inner:inner_end]
 
 
 @dataclass(eq=False, slots=True)
@@ -174,6 +218,12 @@ class Document:
     roots: list[Element]
     comments: list[tuple[int, int, str]]
     issues: list[ScanIssue]
+    element_count: int = 0
+    """Elements created (all levels)."""
+    work: int = 0
+    """Bytes examined plus tag-match attempts: a deterministic measure of scanning effort."""
+    stopped_at: int | None = None
+    """Offset where scanning stopped because the element budget ran out, else ``None``."""
 
     @property
     def root(self) -> Element | None:
@@ -191,9 +241,43 @@ def _decode_attrs(blob: bytes, offset: int, issues: list[ScanIssue]) -> dict[str
     return attrs
 
 
-def scan(data: bytes, member: str = "") -> Document:
-    """Scan one XML member into a :class:`Document` without ever raising on malformed input."""
-    issues: list[ScanIssue] = []
+class _IssueLog(list[ScanIssue]):
+    """Keeps at most ``_MAX_ISSUES_PER_CODE`` issues per code; counts the rest."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.counts: dict[str, int] = {}
+        self.first_dropped: dict[str, int] = {}
+
+    def append(self, issue: ScanIssue) -> None:
+        n = self.counts.get(issue.code, 0) + 1
+        self.counts[issue.code] = n
+        if n <= _MAX_ISSUES_PER_CODE:
+            super().append(issue)
+        else:
+            self.first_dropped.setdefault(issue.code, issue.offset)
+
+    def finish(self) -> list[ScanIssue]:
+        out = list(self)
+        for code, offset in self.first_dropped.items():
+            more = self.counts[code] - _MAX_ISSUES_PER_CODE
+            out.append(
+                ScanIssue("issues-truncated", offset, f"{more} more {code} issue(s) not listed")
+            )
+        return out
+
+
+def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> Document:
+    """Scan one XML member into a :class:`Document` without ever raising on malformed input.
+
+    Scanning stops with a ``budget-exceeded`` issue before element number ``max_elements + 1``
+    is created; what was scanned so far is kept and open elements are closed at the end of the
+    member. The scan is linear in ``len(data)``; ``Document.work`` measures it.
+    """
+    issues = _IssueLog()
+    work = 0
+    element_count = 0
+    stopped_at: int | None = None
     comments: list[tuple[int, int, str]] = []
     roots: list[Element] = []
     stack: list[Element] = []
@@ -206,8 +290,10 @@ def scan(data: bytes, member: str = "") -> Document:
         issues.append(ScanIssue("invalid-utf8", exc.start, f"member is not valid UTF-8: {exc}"))
 
     def gap(start: int, end: int) -> None:
+        nonlocal work
         if start >= end:
             return
+        work += end - start
         chunk = data[start:end]
         if b"<" in chunk:
             at = start + chunk.index(b"<")
@@ -218,36 +304,79 @@ def scan(data: bytes, member: str = "") -> Document:
             else:
                 issues.append(ScanIssue("text-outside-root", start, "text outside any element"))
 
-    pos = 0
-    for m in _TOKEN.finditer(data):
-        gap(pos, m.start())
-        pos = m.end()
-        if m.group("comment") is not None:
-            comments.append((m.start(), m.end(), m.group("comment").decode("utf-8", "replace")))
-            continue
-        if m.group("cdata") is not None:
-            if stack:
+    open_tags: dict[str, int] = {}
+
+    def push(el: Element) -> None:
+        stack.append(el)
+        text_seen.append(False)
+        open_tags[el.tag] = open_tags.get(el.tag, 0) + 1
+
+    def pop() -> tuple[Element, bool]:
+        el = stack.pop()
+        open_tags[el.tag] -= 1
+        return el, text_seen.pop()
+
+    pos = 0  # end of the last construct; text from here on is not yet accounted for
+    cursor = 0  # where to look for the next "<"
+    while True:
+        lt = data.find(b"<", cursor)
+        if lt < 0:
+            work += len(data) - cursor
+            break
+        work += lt - cursor + 1
+        nxt = data[lt + 1 : lt + 2]
+        found = _delimited(data, lt) if nxt in (b"!", b"?") else None
+        if found is not None:
+            gap(pos, lt)
+            kind, inner, inner_end, pos = found
+            work += pos - lt
+            cursor = pos
+            if kind.endswith("!"):
+                kind = kind[:-1]
+                issues.append(
+                    ScanIssue(
+                        f"unterminated-{kind}", lt, f"{kind} never closed; rest of member skipped"
+                    )
+                )
+            elif kind == "comment":
+                comments.append((lt, pos, data[inner:inner_end].decode("utf-8", "replace")))
+            if kind == "cdata" and stack:
                 text_seen[-1] = True
             continue
-        if m.group("pi") is not None or m.group("decl") is not None:
+        m = _END.match(data, lt) if nxt == b"/" else _START.match(data, lt)
+        work += 1 if m is None else m.end() - lt
+        if m is None:
+            # Not markup the scanner understands. Leave it in the pending text, so the next
+            # gap() reports a run of such "<" once rather than once per character.
+            cursor = lt + 1
             continue
-        end_name = m.group("end")
+        gap(pos, m.start())
+        pos = cursor = m.end()
+        end_name = m.group("end") if m.re is _END else None
         if end_name is not None:
             tag = end_name.decode("utf-8", errors="replace")
             if stack and stack[-1].tag == tag:
-                _close(stack.pop(), text_seen.pop(), m.start(), m.end(), issues)
-            elif any(el.tag == tag for el in stack):
+                el, had_text = pop()
+                _close(el, had_text, m.start(), m.end(), issues)
+            elif open_tags.get(tag):
                 while stack and stack[-1].tag != tag:
-                    el = stack.pop()
-                    text_seen.pop()
+                    el, _ = pop()
                     issues.append(ScanIssue("unclosed-element", el.start, f"<{el.tag}> not closed"))
                     _close(el, False, m.start(), m.start(), issues)
-                _close(stack.pop(), text_seen.pop(), m.start(), m.end(), issues)
+                el, had_text = pop()
+                _close(el, had_text, m.start(), m.end(), issues)
             else:
                 msg = f"</{tag}> has no open element"
                 issues.append(ScanIssue("stray-end-tag", m.start(), msg))
             continue
         # Start or self-closing tag.
+        if max_elements is not None and element_count >= max_elements:
+            stopped_at = m.start()
+            msg = f"element budget of {max_elements} reached; the rest of the member is not read"
+            issues.append(ScanIssue("budget-exceeded", m.start(), msg))
+            pos = len(data)
+            break
+        element_count += 1
         tag = m.group("start").decode("utf-8", errors="replace")
         attrs = _decode_attrs(m.group("attrs"), m.start(), issues) if m.group("attrs") else {}
         closed = m.group("close") == b"/"
@@ -267,15 +396,24 @@ def scan(data: bytes, member: str = "") -> Document:
                 issues.append(ScanIssue("extra-root", m.start(), f"second root element <{tag}>"))
             roots.append(el)
         if not closed:
-            stack.append(el)
-            text_seen.append(False)
+            push(el)
     gap(pos, len(data))
     while stack:
-        el = stack.pop()
-        text_seen.pop()
-        issues.append(ScanIssue("truncated", el.start, f"<{el.tag}> still open at end of member"))
+        el, _ = pop()
+        if stopped_at is None:
+            msg = f"<{el.tag}> still open at end of member"
+            issues.append(ScanIssue("truncated", el.start, msg))
         _close(el, False, len(data), len(data), issues)
-    return Document(member=member, data=data, roots=roots, comments=comments, issues=issues)
+    return Document(
+        member=member,
+        data=data,
+        roots=roots,
+        comments=comments,
+        issues=issues.finish(),
+        element_count=element_count,
+        work=work,
+        stopped_at=stopped_at,
+    )
 
 
 def _close(

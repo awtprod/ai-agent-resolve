@@ -6,12 +6,14 @@ import json
 from pathlib import Path
 
 import pytest
+from drp_helpers import needs_zstandard
 
 from aar.cli import main
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "drp"
 
 
+@needs_zstandard
 def test_describe_prints_timeline_and_items(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["drp", "describe", str(FIXTURES / "media-clip-h264.drp")]) == 0
     out = capsys.readouterr().out
@@ -53,6 +55,7 @@ def test_inspect_json_is_the_full_model(capsys: pytest.CaptureFixture[str]) -> N
     assert {b["path"] for b in data["bins"]} == {"Master", "Master/Archive"}
 
 
+@needs_zstandard
 def test_inspect_with_blob_stats(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["drp", "inspect", "--blobs", str(FIXTURES / "media-clip-h264.drp")]) == 0
     out = capsys.readouterr().out

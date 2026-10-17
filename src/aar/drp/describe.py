@@ -7,10 +7,36 @@ from collections.abc import Callable
 
 from aar.drp.model import DrpFile, Marker, MediaClip, Timeline, TimelineItem
 
-__all__ = ["describe", "frames_to_timecode"]
+__all__ = ["describe", "frames_to_timecode", "printable"]
 
 DEFAULT_MAX_ITEMS = 200
 _MAX_ISSUES = 25
+
+
+def printable(text: str) -> str:
+    """Escape characters a terminal would act on rather than show.
+
+    Names and paths come from the file, so they can hold NUL, ESC (terminal control
+    sequences), bidi overrides such as U+202E, line separators or lone surrogates. Every
+    character for which ``str.isprintable()`` is false, other than an ordinary space, becomes
+    a ``\\xNN``, ``\\uNNNN`` or ``\\UNNNNNNNN`` escape.
+    """
+    if text.isprintable():
+        return text
+    out = []
+    for ch in text:
+        if ch.isprintable() or ch == " ":
+            out.append(ch)
+        else:
+            code = ord(ch)
+            out.append(
+                f"\\x{code:02x}"
+                if code < 0x100
+                else f"\\u{code:04x}"
+                if code < 0x10000
+                else f"\\U{code:08x}"
+            )
+    return "".join(out)
 
 
 def frames_to_timecode(frame: int, fps: float | None) -> str:
@@ -86,10 +112,11 @@ def describe(drp: DrpFile, *, max_items: int = DEFAULT_MAX_ITEMS) -> str:
         if len(problems) > _MAX_ISSUES:
             out(f"  ... and {len(problems) - _MAX_ISSUES} more (see inspect --json)")
     if drp.raw_members:
-        roles = Counter(m.role for m in drp.members if m.name in set(drp.raw_members))
+        raw = set(drp.raw_members)  # built once: members can number in the tens of thousands
+        roles = Counter(m.role for m in drp.members if m.name in raw)
         summary = ", ".join(f"{n} {r}" for r, n in sorted(roles.items()))
         out(f"not interpreted (kept raw): {len(drp.raw_members)} member(s): {summary}")
-    return "\n".join(lines) + "\n"
+    return "\n".join(printable(line) for line in lines) + "\n"
 
 
 def _media_line(clip: MediaClip) -> str:
@@ -103,6 +130,8 @@ def _media_line(clip: MediaClip) -> str:
         bits.append(f"audio {len(clip.audio_tracks)} trk {a.sample_rate or '?'} Hz {a.channels}ch")
     if clip.codec:
         bits.append(f"codec {clip.codec}")
+    elif clip.type in ("video", "audio"):
+        bits.append("codec unknown")
     bits.append(f"path {clip.path or '(none)'} [{clip.path_source}]")
     return "; ".join(bits)
 

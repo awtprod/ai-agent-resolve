@@ -14,4 +14,4 @@ commit.
 | `media-clip-r19.drp` | `4e0a34380e42aaa269985ebb95731a6b0c3f00f6` | 19.1.3.0007, DbPrjVer 14 |
 
 Real project files must not be added here. They go in the git-ignored `corpus/` directory or
-in `$AAR_DRP_CORPUS`, which `tests/drp/test_corpus.py` reads when it is set.
+in `$AAR_DRP_CORPUS`, which `tests/drp/test_drp_corpus.py` reads when it is set.

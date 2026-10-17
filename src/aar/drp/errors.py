@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__all__ = ["BlobError", "ContainerError", "DrpError", "ZstdUnavailableError"]
+__all__ = ["BlobError", "BudgetExceededError", "ContainerError", "DrpError", "ZstdUnavailableError"]
 
 
 class DrpError(Exception):
@@ -19,3 +19,7 @@ class BlobError(DrpError):
 
 class ZstdUnavailableError(BlobError):
     """A zstd blob needs a real decompressor and none is installed."""
+
+
+class BudgetExceededError(BlobError):
+    """A blob was not decompressed because the file's decompression budget is used up."""

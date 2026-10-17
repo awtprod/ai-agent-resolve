@@ -40,12 +40,14 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from aar.drp.errors import BlobError, ZstdUnavailableError
+from aar.drp.errors import BlobError, BudgetExceededError, ZstdUnavailableError
+from aar.drp.scan import parse_int
 
 __all__ = [
     "DEFAULT_MAX_OUTPUT",
     "BlobCheck",
     "BlobKind",
+    "DecodeBudget",
     "Envelope",
     "KdEntry",
     "KeyedDict",
@@ -71,6 +73,46 @@ __all__ = [
 
 DEFAULT_MAX_OUTPUT = 64 * 1024 * 1024
 """Upper bound for any single decompressed blob (bytes)."""
+
+DEFAULT_MAX_TOTAL_OUTPUT = 400 * 1024 * 1024
+"""Default budget for all decompression in one file (bytes).
+
+The largest total in the private corpus is 20.8 MB (reader plus ``--blobs``); this is about
+20 times that.
+"""
+
+
+@dataclass(slots=True)
+class DecodeBudget:
+    """Bytes that all decompressions for one file may still produce.
+
+    Every zstd or qCompress decode charges what it produced, including a decode that failed
+    after producing output. Once the budget is used up, further decodes raise
+    :class:`~aar.drp.errors.BudgetExceededError` without decompressing anything, and
+    ``refused`` counts them.
+    """
+
+    limit: int = DEFAULT_MAX_TOTAL_OUTPUT
+    used: int = 0
+    refused: int = 0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.limit - self.used)
+
+    def cap(self, max_output: int) -> tuple[int, bool]:
+        """The output limit for one decode, and whether the budget (not the blob limit) sets it."""
+        if self.remaining <= 0:
+            self.refused += 1
+            raise BudgetExceededError(f"decompression budget of {self.limit} bytes used up")
+        if self.remaining < max_output:
+            return self.remaining, True
+        return max_output, False
+
+    def refuse(self) -> BudgetExceededError:
+        self.refused += 1
+        return BudgetExceededError(f"decompression budget of {self.limit} bytes used up")
+
 
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 CODEC_PROTOBUF = 0x80
@@ -116,10 +158,9 @@ def parse_frames(text: str) -> tuple[int, float | None]:
     hex is a little-endian double in ``[0, 1)``. Raises :class:`BlobError` on anything else.
     """
     whole, sep, frac = text.strip().partition("|")
-    try:
-        frames = int(whole)
-    except ValueError as exc:
-        raise BlobError(f"not a frame count: {text.strip()[:40]!r}") from exc
+    frames = parse_int(whole)
+    if frames is None:
+        raise BlobError(f"not a frame count: {text.strip()[:40]!r}")
     if not sep:
         return frames, None
     try:
@@ -540,55 +581,107 @@ def _zstd_raw_only(frame: bytes, max_output: int) -> bytes:
             return bytes(out)
 
 
-def zstd_decompress(frame: bytes, *, max_output: int = DEFAULT_MAX_OUTPUT) -> bytes:
-    """Decompress one zstd frame, refusing to produce more than ``max_output`` bytes."""
+def zstd_decompress(
+    frame: bytes, *, max_output: int = DEFAULT_MAX_OUTPUT, budget: DecodeBudget | None = None
+) -> bytes:
+    """Decompress one zstd frame, refusing to produce more than ``max_output`` bytes.
+
+    With a ``budget``, the output is also limited to what the budget has left, and everything
+    produced is charged to it, also when the frame turns out to be corrupt or too large.
+    """
     _, declared = _frame_header(frame)
     if declared is not None and declared > max_output:
         raise BlobError(f"zstd frame declares {declared} bytes, over the {max_output} limit")
+    blob_limit = max_output
+    by_budget = False
+    if budget is not None:
+        if declared is not None and declared > budget.remaining:
+            raise budget.refuse()
+        max_output, by_budget = budget.cap(max_output)
+    produced = [0]
+    try:
+        out = _zstd_decode(frame, max_output, produced)
+    finally:
+        if budget is not None:
+            budget.used += min(produced[0], max_output)
+    if len(out) > max_output:
+        if by_budget and budget is not None:
+            raise budget.refuse()
+        raise BlobError(f"zstd output exceeds {blob_limit} bytes")
+    return out
+
+
+def _zstd_decode(frame: bytes, max_output: int, produced: list[int]) -> bytes:
+    """Decode at most ``max_output + 1`` bytes of ``frame``; ``produced[0]`` counts the output."""
     name, lib = _zstd_backend()
     if name == "zstandard":
         reader = lib.ZstdDecompressor().stream_reader(io.BytesIO(frame), read_across_frames=False)
         chunks: list[bytes] = []
-        total = 0
         try:
-            while total <= max_output:
-                chunk = reader.read(min(1 << 20, max_output + 1 - total))
+            while produced[0] <= max_output:
+                chunk = reader.read(min(1 << 20, max_output + 1 - produced[0]))
                 if not chunk:
                     break
                 chunks.append(chunk)
-                total += len(chunk)
+                produced[0] += len(chunk)
         except lib.ZstdError as exc:
             raise BlobError(f"zstd: {exc}") from exc
         finally:
             reader.close()
-        out = b"".join(chunks)
-    elif name == "compression.zstd":
+        return b"".join(chunks)
+    if name == "compression.zstd":
         dec = lib.ZstdDecompressor()
         try:
             out = dec.decompress(frame, max_length=max_output + 1)
         except lib.ZstdError as exc:
+            produced[0] = max_output  # amount unknown: charge the most it could have been
             raise BlobError(f"zstd: {exc}") from exc
-    else:
-        out = _zstd_raw_only(frame, max_output)
-    if len(out) > max_output:
-        raise BlobError(f"zstd output exceeds {max_output} bytes")
+        produced[0] = len(out)
+        return bytes(out)
+    out = _zstd_raw_only(frame, max_output)
+    produced[0] = len(out)
     return out
 
 
-def qcompress_decompress(data: bytes, *, max_output: int = DEFAULT_MAX_OUTPUT) -> bytes:
-    """Decode Qt ``qCompress`` output: ``[u32 BE size][zlib]``, bounded by ``max_output``."""
+def qcompress_decompress(
+    data: bytes, *, max_output: int = DEFAULT_MAX_OUTPUT, budget: DecodeBudget | None = None
+) -> bytes:
+    """Decode Qt ``qCompress`` output: ``[u32 BE size][zlib]``, bounded by ``max_output``.
+
+    With a ``budget``, the output is also limited to what the budget has left, and charged to it.
+    """
     if len(data) < 6:
         raise BlobError("qCompress blob too short")
     (declared,) = struct.unpack_from(">I", data, 0)
     if declared > max_output:
         raise BlobError(f"qCompress declares {declared} bytes, over the {max_output} limit")
+    blob_limit = max_output
+    by_budget = False
+    if budget is not None:
+        if declared > budget.remaining:
+            raise budget.refuse()
+        max_output, by_budget = budget.cap(max_output)
     dec = zlib.decompressobj()
+    src = memoryview(data)[4:]
+    buf = bytearray()
     try:
-        out = dec.decompress(data[4:], max_output + 1)
+        # Feed the input in pieces so the output produced so far is known even on error.
+        for i in range(0, len(src), 1 << 16):
+            buf += dec.decompress(src[i : i + (1 << 16)], max_output + 1 - len(buf))
+            if len(buf) > max_output:
+                break
+        else:
+            buf += dec.flush()
     except zlib.error as exc:
         raise BlobError(f"qCompress: {exc}") from exc
+    finally:
+        if budget is not None:
+            budget.used += min(len(buf), max_output)
+    out = bytes(buf)
     if len(out) > max_output:
-        raise BlobError(f"qCompress output exceeds {max_output} bytes")
+        if by_budget and budget is not None:
+            raise budget.refuse()
+        raise BlobError(f"qCompress output exceeds {blob_limit} bytes")
     if len(out) != declared:
         raise BlobError(f"qCompress size mismatch: declared {declared}, got {len(out)}")
     return out
@@ -632,13 +725,15 @@ def parse_envelope(data: bytes) -> Envelope | None:
     return None
 
 
-def unwrap_message(data: bytes, *, max_output: int = DEFAULT_MAX_OUTPUT) -> bytes:
+def unwrap_message(
+    data: bytes, *, max_output: int = DEFAULT_MAX_OUTPUT, budget: DecodeBudget | None = None
+) -> bytes:
     """Return the protobuf bytes inside an envelope, decompressing zstd when needed."""
     env = parse_envelope(data)
     if env is None:
         raise BlobError("not an envelope or flagged message")
     if env.codec == "zstd":
-        return zstd_decompress(env.payload, max_output=max_output)
+        return zstd_decompress(env.payload, max_output=max_output, budget=budget)
     return env.payload
 
 
@@ -830,7 +925,13 @@ class BlobCheck:
 _MAX_NESTING = 4
 
 
-def check(tag: str, data: bytes, *, max_output: int = DEFAULT_MAX_OUTPUT) -> BlobCheck:
+def check(
+    tag: str,
+    data: bytes,
+    *,
+    max_output: int = DEFAULT_MAX_OUTPUT,
+    budget: DecodeBudget | None = None,
+) -> BlobCheck:
     """Classify and then fully decode a blob as far as its kind allows.
 
     Keyed dicts are decoded strictly, and their byte values that are themselves keyed dicts,
@@ -838,8 +939,10 @@ def check(tag: str, data: bytes, *, max_output: int = DEFAULT_MAX_OUTPUT) -> Blo
     """
     kind = classify(tag, data)
     try:
-        if not _check(tag, kind, data, max_output, 0):
+        if not _check(tag, kind, data, max_output, 0, budget):
             return BlobCheck(kind, True, undecoded=True)
+    except BudgetExceededError as exc:
+        return BlobCheck(kind, False, f"budget-exceeded: {exc}")
     except ZstdUnavailableError as exc:
         return BlobCheck(kind, False, f"zstd-unavailable: {exc}")
     except BlobError as exc:
@@ -847,12 +950,20 @@ def check(tag: str, data: bytes, *, max_output: int = DEFAULT_MAX_OUTPUT) -> Blo
     return BlobCheck(kind, True)
 
 
-def _check(tag: str, kind: BlobKind, data: bytes, max_output: int, depth: int) -> bool:
+def _check(
+    tag: str,
+    kind: BlobKind,
+    data: bytes,
+    max_output: int,
+    depth: int,
+    budget: DecodeBudget | None = None,
+) -> bool:
     """Decode ``data`` as ``kind``; False when the layout is not interpreted. Raises BlobError."""
     if kind in _MESSAGE_KINDS:
-        decode_protobuf(unwrap_message(data, max_output=max_output), nested_depth=0)
+        payload = unwrap_message(data, max_output=max_output, budget=budget)
+        decode_protobuf(payload, nested_depth=0)
     elif kind == BlobKind.QCOMPRESS:
-        qcompress_decompress(data, max_output=max_output)
+        qcompress_decompress(data, max_output=max_output, budget=budget)
     elif kind == BlobKind.TIMEMAP_COMPACT:
         decode_timemap(data)
     elif kind == BlobKind.FIXED16:
@@ -875,7 +986,7 @@ def _check(tag: str, kind: BlobKind, data: bytes, max_output: int, depth: int) -
                 inner = classify(entry.key, entry.value)
                 if inner in _NESTED_CHECKED:
                     try:
-                        _check(entry.key, inner, entry.value, max_output, depth + 1)
+                        _check(entry.key, inner, entry.value, max_output, depth + 1, budget)
                     except ZstdUnavailableError:
                         raise
                     except BlobError as exc:

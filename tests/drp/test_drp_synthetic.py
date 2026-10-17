@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from drp_helpers import envelope, kd, pb_len, pb_var, qstr, xml
+from drp_helpers import ZSTD_REASON, envelope, kd, pb_len, pb_var, qstr, xml
 
 from aar.drp import blobs
 from aar.drp.describe import describe
@@ -182,7 +182,7 @@ def test_container_without_media_pool_sequence_is_kept_as_orphan(make_zip: MakeZ
 def test_compressed_clip_blob_without_zstd_falls_back_to_timeline_path(
     make_zip: MakeZip, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    zstandard = pytest.importorskip("zstandard")
+    zstandard = pytest.importorskip("zstandard", reason=ZSTD_REASON)
     message = pb_len(1, b"D:\\Footage") + pb_len(2, b"a.mov") + pb_len(3, b"padding " * 20)
     compressed = envelope(2, 0x81, zstandard.ZstdCompressor().compress(message)).hex()
     m = members()

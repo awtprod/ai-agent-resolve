@@ -11,11 +11,20 @@ from __future__ import annotations
 import hashlib
 import re
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
 
 from aar.drp.errors import ContainerError
+from aar.drp.scan import parse_int
+
+try:
+    import lzma
+
+    _LZMA_ERRORS: tuple[type[Exception], ...] = (lzma.LZMAError,)
+except ImportError:  # Python built without lzma; zipfile then cannot open LZMA members either
+    _LZMA_ERRORS = ()
 
 __all__ = [
     "DEFAULT_MAX_MEMBERS",
@@ -33,6 +42,21 @@ _HEADER_SCAN_BYTES = 1024
 _HEADER_RE = re.compile(rb"<!--\s*(DbAppVer\s*=\s*\"[^\"]*\"[^>]*?)\s*-->")
 _ATTR_RE = re.compile(rb'(\w+)\s*=\s*"([^"]*)"')
 _SUFFIX_KINDS = {".drp": "drp", ".drt": "drt", ".drb": "drb"}
+
+# What zipfile raises while opening or inflating a damaged member: bad headers or CRC
+# (BadZipFile), corrupt deflate data (zlib.error), an encrypted member (RuntimeError), an
+# unsupported compression method or flag (NotImplementedError), truncation (EOFError), and
+# I/O or bz2/lzma stream errors.
+_MEMBER_ERRORS: tuple[type[Exception], ...] = (
+    zipfile.BadZipFile,
+    zlib.error,
+    RuntimeError,
+    NotImplementedError,
+    EOFError,
+    OSError,
+    ValueError,
+    *_LZMA_ERRORS,
+)
 
 # Leading bytes of things a .drb (or a damaged file) might turn out to be.
 _SIGNATURES: tuple[tuple[bytes, str], ...] = (
@@ -69,7 +93,7 @@ def parse_version_header(data: bytes, member: str = "") -> Versions | None:
     prj = attrs.get("DbPrjVer")
     return Versions(
         app_version=attrs.get("DbAppVer"),
-        project_version=int(prj) if prj is not None and prj.isdigit() else None,
+        project_version=parse_int(prj) if prj is not None else None,
         raw=m.group(1).decode("utf-8", "replace"),
         member=member,
         offset=m.start(),
@@ -86,6 +110,14 @@ class MemberInfo:
     compressed_size: int
     crc: int
     is_dir: bool
+
+
+def _member_error(name: str, exc: BaseException) -> str:
+    cls = type(exc)
+    kind = (
+        cls.__qualname__ if cls.__module__ == "builtins" else f"{cls.__module__}.{cls.__qualname__}"
+    )
+    return f"cannot read member {name!r} ({kind}): {exc}"
 
 
 def _sniff_signature(head: bytes) -> str | None:
@@ -133,26 +165,31 @@ class Container:
     def xml_members(self) -> list[str]:
         return [n for n in self.names() if n.lower().endswith(".xml")]
 
-    def read(self, name: str) -> bytes:
-        """Read one member, refusing anything larger than ``max_member_bytes``."""
+    def read(self, name: str, *, max_bytes: int | None = None) -> bytes:
+        """Read one member, refusing anything larger than ``max_member_bytes``.
+
+        ``max_bytes`` lowers that limit for this call (used for per-file budgets).
+        """
         if self._zip is None:
             raise ContainerError(f"{self.path.name} is not a zip archive; it has no members")
         try:
             info = self._zip.getinfo(name)
         except KeyError as exc:
             raise ContainerError(f"no member {name!r}") from exc
-        if info.file_size > self.max_member_bytes:
+        limit = (
+            self.max_member_bytes if max_bytes is None else min(max_bytes, self.max_member_bytes)
+        )
+        if info.file_size > limit:
             raise ContainerError(
-                f"member {name!r} is {info.file_size} bytes, over the "
-                f"{self.max_member_bytes}-byte limit"
+                f"member {name!r} is {info.file_size} bytes, over the {limit}-byte limit"
             )
         try:
             with self._zip.open(info) as fh:
-                data = fh.read(self.max_member_bytes + 1)
-        except (zipfile.BadZipFile, OSError, EOFError, ValueError) as exc:
-            raise ContainerError(f"cannot read member {name!r}: {exc}") from exc
-        if len(data) > self.max_member_bytes:
-            raise ContainerError(f"member {name!r} inflates past the size limit")
+                data = fh.read(limit + 1)
+        except _MEMBER_ERRORS as exc:
+            raise ContainerError(_member_error(name, exc)) from exc
+        if len(data) > limit:
+            raise ContainerError(f"member {name!r} inflates past the {limit}-byte limit")
         return data
 
     def versions(self) -> Versions | None:
@@ -174,8 +211,10 @@ class Container:
         try:
             with self._zip.open(name) as fh:
                 return fh.read(_HEADER_SCAN_BYTES)
-        except (zipfile.BadZipFile, OSError, EOFError, ValueError, KeyError) as exc:
-            raise ContainerError(f"cannot read member {name!r}: {exc}") from exc
+        except KeyError as exc:
+            raise ContainerError(f"no member {name!r}") from exc
+        except _MEMBER_ERRORS as exc:
+            raise ContainerError(_member_error(name, exc)) from exc
 
     def close(self) -> None:
         if self._zip is not None:
