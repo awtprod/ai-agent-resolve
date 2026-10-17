@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "Companion app for DaVinci Resolve Studio, built mainly for AI agents to use."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["pydantic>=2"]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
