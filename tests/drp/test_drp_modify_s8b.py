@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 import struct
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,7 @@ from drp_edit import add_carrier, carrier, edit_zip, marker_entry
 from drp_helpers import kd, needs_zstandard, pb_len, zstd_raw_frame
 
 from aar.drp import blobs
-from aar.drp.modify import encode, parse_plan
+from aar.drp.modify import compare_round_trip, encode, parse_plan
 from aar.drp.modify.encode import EncodeError
 from aar.drp.modify.write import edit_file
 from aar.drp.reader import read_drp
@@ -147,3 +148,87 @@ def test_fa_compressed_frames_are_walked_by_block_size() -> None:
     assert encode.check_single_frame(frame) == len(frame)
     with pytest.raises(EncodeError, match="trailing"):
         encode.check_single_frame(frame + frame)
+
+
+# --------------------------------------------------------------------------- F-G
+
+
+def _settings_edit(change: Callable[[bytes, blobs.KeyedDict], bytes]) -> Callable[[bytes], bytes]:
+    """Rewrite SM_Config's FieldsBlob keyed dict with ``change(kd_bytes, decoded)``."""
+
+    def run_edit(data: bytes) -> bytes:
+        start = data.index(b"<FieldsBlob>", data.index(b"<SM_Config")) + len(b"<FieldsBlob>")
+        end = data.index(b"</FieldsBlob>", start)
+        kd_bytes = blobs.parse_hex(data[start:end].decode())
+        new = change(kd_bytes, blobs.decode_keyed_dict(kd_bytes, strict=True))
+        return data[:start] + new.hex().encode() + data[end:]
+
+    return run_edit
+
+
+def _new_save_date(kd_bytes: bytes, kd_: blobs.KeyedDict, *, pad: int | None = None) -> bytes:
+    """SetupBA with field 124 set to another date; ``pad`` re-encodes that varint field padded."""
+    entry = kd_.entry("SetupBA")
+    assert entry is not None and isinstance(entry.value, bytes)
+    payload = blobs.unwrap_message(entry.value)
+    fields = blobs.decode_protobuf(payload, nested_depth=0)
+    date = next(f for f in fields if f.number == 124)
+    payload = encode.replace_field(payload, date, b"Jan 19 2026 00:17:51")
+    if pad is not None:
+        f = next(x for x in blobs.decode_protobuf(payload, nested_depth=0) if x.number == pad)
+        assert f.wire == 0 and isinstance(f.value, int) and f.value < 128
+        padded = encode.pb_key(f.number, 0) + bytes([f.value | 0x80, 0x00])
+        payload = payload[: f.offset] + padded + payload[f.end :]
+    return encode.replace_kd_bytes(kd_bytes, entry, encode.envelope(entry.value, payload))
+
+
+def _header_word_2(kd_bytes: bytes, kd_: blobs.KeyedDict) -> bytes:
+    data = _new_save_date(kd_bytes, kd_)
+    return struct.pack(">I", 2) + data[4:]
+
+
+def _setup_null_flag(kd_bytes: bytes, kd_: blobs.KeyedDict) -> bytes:
+    data = _new_save_date(kd_bytes, kd_)
+    entry = blobs.decode_keyed_dict(data, strict=True).entry("SetupBA")
+    assert entry is not None and entry.subtype == 0
+    (klen,) = struct.unpack_from(">I", data, entry.offset)
+    flag_at = entry.offset + 4 + klen + 4
+    return data[:flag_at] + b"\x01" + data[flag_at + 1 :]
+
+
+def _pad_field_8(kd_bytes: bytes, kd_: blobs.KeyedDict) -> bytes:
+    return _new_save_date(kd_bytes, kd_, pad=8)
+
+
+@needs_zstandard
+@pytest.mark.parametrize(
+    "change",
+    [_header_word_2, _setup_null_flag, _pad_field_8],
+    ids=["kd-header-word", "setupba-null-flag", "setupba-padded-varint"],
+)
+def test_fg_settings_rule_covers_the_whole_blob(tmp_path: Path, change: Any) -> None:
+    ok = edit_zip(H264, tmp_path / "ok.drp", {"project.xml": _settings_edit(_new_save_date)})
+    assert compare_round_trip(H264, ok).ok
+    bad = edit_zip(H264, tmp_path / "bad.drp", {"project.xml": _settings_edit(change)})
+    result = compare_round_trip(H264, bad)
+    assert [r.code for r in result.refusals] == ["unexplained-opaque"]
+    assert "settings-save-date" not in [rule for rule, _ in result.allowed]
+
+
+def test_fg_bin_rule_compares_field_bytes(tmp_path: Path) -> None:
+    def blob(stamp: int, field_5: bytes = encode.pb_varint(5, 1)) -> bytes:
+        payload = encode.pb_varint(4, stamp) + field_5
+        return (struct.pack(">II", 2, len(payload) + 1) + b"\x80" + payload).hex().encode()
+
+    def with_blob(b: bytes) -> Callable[[bytes], bytes]:
+        return lambda d: d.replace(b"<FieldsBlob/>", b"<FieldsBlob>" + b + b"</FieldsBlob>", 1)
+
+    a = edit_zip(H264, tmp_path / "a.drp", {POOL: with_blob(blob(300))})
+    (tmp_path / "b").mkdir()
+    b = edit_zip(H264, tmp_path / "b" / "b.drp", {POOL: with_blob(blob(301))})
+    assert compare_round_trip(a, b).ok
+    padded_5 = encode.pb_key(5, 0) + b"\x81\x00"  # field 5 = 1, written in two bytes
+    (tmp_path / "c").mkdir()
+    c = edit_zip(H264, tmp_path / "c" / "c.drp", {POOL: with_blob(blob(301, padded_5))})
+    assert blobs.decode_protobuf(padded_5, nested_depth=0)[0].value == 1
+    assert [r.code for r in compare_round_trip(a, c).refusals] == ["unexplained-opaque"]
