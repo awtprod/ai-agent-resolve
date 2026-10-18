@@ -35,6 +35,7 @@ from aar.hub.common import (
     SkippedEvent,
     actor_dict,
     clean_text,
+    is_member,
     is_text,
     is_ts,
     iso,
@@ -168,7 +169,7 @@ def _grant_problem(actor: Actor, payload: Any) -> str | None:
         return "payload is not an object"
     if not is_text(payload.get("token_id"), MAX_TOKEN_ID):
         return "token_id is not an id"
-    if payload.get("scope") not in _SCOPE_VALUES:
+    if not is_member(payload.get("scope"), _SCOPE_VALUES):
         return "scope is not an approval scope"
     if not is_text(payload.get("target"), MAX_TARGET):
         return f"target is not 1-{MAX_TARGET} characters"
@@ -336,14 +337,13 @@ def grant(
         if idempotency_key is not None:
             existing = txn.find_by_idempotency_key(idempotency_key)
             if existing is not None:
-                match_or_conflict(existing, EVENT_GRANTED, request, request.keys())
-                if existing.actor != by:
+                match_or_conflict(existing, EVENT_GRANTED, request, request.keys(), actor=by)
+                stored_id = existing.payload.get("token_id")
+                token = _token_in(txn, stored_id) if isinstance(stored_id, str) else None
+                if token is None:
                     raise IdempotencyConflict(
-                        f"idempotency key {idempotency_key!r} was already used by another actor"
+                        f"idempotency key {idempotency_key!r} names a grant that is not a token"
                     )
-                token = _token_in(txn, existing.payload["token_id"])
-                if token is None:  # pragma: no cover - the grant event is the token
-                    raise ApprovalNotFound(existing.payload["token_id"], "granted token vanished")
                 return token
         now = clock()
         token_id = "apv_" + secrets.token_hex(16)
@@ -381,11 +381,7 @@ def revoke(
         if idempotency_key is not None:
             existing = txn.find_by_idempotency_key(idempotency_key)
             if existing is not None:
-                match_or_conflict(existing, EVENT_REVOKED, request, request.keys())
-                if existing.actor != by:
-                    raise IdempotencyConflict(
-                        f"idempotency key {idempotency_key!r} was already used by another actor"
-                    )
+                match_or_conflict(existing, EVENT_REVOKED, request, request.keys(), actor=by)
                 token = _token_in(txn, token_id)
                 if token is None:  # pragma: no cover - a revoke implies a grant
                     raise ApprovalNotFound(token_id, f"no approval token {token_id!r}")

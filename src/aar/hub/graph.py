@@ -14,12 +14,21 @@ insert are therefore atomic.
 
 from __future__ import annotations
 
+import json
 import secrets
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from aar.hub.common import SkippedEvent
-from aar.hub.events import Actor, Event, EventLog, Transaction, match_or_conflict
+from aar.hub.common import SkippedEvent, is_member
+from aar.hub.events import (
+    Actor,
+    Event,
+    EventLog,
+    IdempotencyConflict,
+    Transaction,
+    match_or_conflict,
+)
 
 NODE_KINDS = frozenset({"brief", "plan", "op", "artifact", "review"})
 EDGE_TYPES = frozenset({"derives_from", "produces", "reviews", "blocks"})
@@ -51,6 +60,10 @@ EVENT_NODE_STATUS_CHANGED = "graph.node_status_changed"
 EVENT_EDGE_ADDED = "graph.edge_added"
 
 _GRAPH_TYPES = (EVENT_NODE_ADDED, EVENT_NODE_STATUS_CHANGED, EVENT_EDGE_ADDED)
+
+# Writers refuse longer titles (they are shown in every listing). The fold still
+# accepts what is already in the log, so old data never disappears from projections.
+MAX_TITLE_CHARS = 1000
 
 
 class IllegalTransition(ValueError):
@@ -141,6 +154,9 @@ class GraphState:
     edges: dict[str, Edge] = field(default_factory=dict)
     skipped: list[SkippedEvent] = field(default_factory=list)
     creators: dict[str, Actor] = field(default_factory=dict)
+    # The last folded status change per node: (seq, actor, new status). Reviews use it
+    # to credit a decision or withdrawal only to the change it was written with.
+    last_change: dict[str, tuple[int, Actor, str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -193,9 +209,9 @@ def _problem(state: GraphState, event: Event) -> str | None:
             return "node_id is not a valid id"
         if node_id in state.nodes:
             return f"node {node_id} already exists"
-        if payload.get("kind") not in NODE_KINDS:
+        if not is_member(payload.get("kind"), NODE_KINDS):
             return "kind is not a node kind"
-        if payload.get("status") not in STATUSES:
+        if not is_member(payload.get("status"), STATUSES):
             return "status is not a status"
         title = payload.get("title")
         if title is not None and not isinstance(title, str):
@@ -206,7 +222,7 @@ def _problem(state: GraphState, event: Event) -> str | None:
         if node is None:
             return "status change for an unknown node"
         to = payload.get("to")
-        if to not in STATUSES or to not in allowed_transitions(node.status):
+        if not is_member(to, STATUSES) or to not in allowed_transitions(node.status):
             return f"illegal transition from {node.status!r} to {to!r}"
         if node.kind == "review" and not review_status_change_allowed(
             event.actor, state.creators.get(node.id), node.status, to
@@ -218,7 +234,7 @@ def _problem(state: GraphState, event: Event) -> str | None:
         if not _is_id(edge_id) or edge_id in state.edges:
             return "edge_id is missing or already used"
         edge_type = payload.get("type")
-        if edge_type not in EDGE_TYPES:
+        if not is_member(edge_type, EDGE_TYPES):
             return "type is not an edge type"
         src = state.nodes.get(payload.get("src")) if _is_id(payload.get("src")) else None
         dst = state.nodes.get(payload.get("dst")) if _is_id(payload.get("dst")) else None
@@ -240,6 +256,9 @@ def _fold(state: GraphState, event: Event) -> None:
         return
     if event.type == EVENT_NODE_ADDED:
         state.creators[event.payload["node_id"]] = event.actor
+    elif event.type == EVENT_NODE_STATUS_CHANGED:
+        node_id = event.payload["node_id"]
+        state.last_change[node_id] = (event.seq, event.actor, event.payload["to"])
     _reduce(state, event.type, event.payload, event.ts)
 
 
@@ -301,9 +320,30 @@ class WorkGraph:
         ``_last_seq`` comes from the events actually folded, never from a separate
         ``latest_seq()`` read that could jump past events appended since the rebuild.
         """
+        self._load(self._log.iter_events(project_id=self._project_id, types=_GRAPH_TYPES))
+
+    @classmethod
+    def from_events(cls, log: EventLog, project_id: str, events: Iterable[Event]) -> WorkGraph:
+        """A graph folded from ``events`` instead of a fresh read of the log.
+
+        Lets a caller fold the graph and its own events from one read, so a commit
+        landing between two reads can never show it half of a transaction. Events of
+        other projects or types are ignored; ``events`` must be in ``seq`` order.
+        """
+        graph = cls.__new__(cls)
+        graph._log = log
+        graph._project_id = project_id
+        graph._load(
+            event
+            for event in events
+            if event.project_id == project_id and event.type in _GRAPH_TYPES
+        )
+        return graph
+
+    def _load(self, events: Iterable[Event]) -> None:
         state = GraphState()
         last_seq = 0
-        for event in self._log.iter_events(project_id=self._project_id, types=_GRAPH_TYPES):
+        for event in events:
             _fold(state, event)
             last_seq = event.seq
         self._state = state
@@ -335,9 +375,9 @@ class WorkGraph:
         An explicit ``node_id`` that already exists is rejected with
         :class:`DuplicateNodeId`, unless the same ``idempotency_key`` created it.
         """
-        if kind not in NODE_KINDS:
+        if not is_member(kind, NODE_KINDS):
             raise ValueError(f"node kind must be one of {sorted(NODE_KINDS)}, got {kind!r}")
-        if status not in STATUSES:
+        if not is_member(status, STATUSES):
             raise ValueError(f"status must be one of {sorted(STATUSES)}, got {status!r}")
         with self._log.transaction() as txn:
             self._catch_up(txn)
@@ -362,7 +402,7 @@ class WorkGraph:
                         project_id=self._project_id,
                         actor=actor,
                     )
-                    return self._state.nodes[existing.payload["node_id"]]
+                    return self._retried(self._state.nodes, existing, "node_id")
             nid = node_id or new_node_id()
             if nid in self._state.nodes:
                 raise DuplicateNodeId(f"node id already exists: {nid!r}")
@@ -373,6 +413,7 @@ class WorkGraph:
                 "title": title,
                 "data": data or {},
             }
+            self._refuse_unless_foldable(EVENT_NODE_ADDED, actor, payload)
             event = txn.append(
                 EVENT_NODE_ADDED,
                 actor,
@@ -391,7 +432,7 @@ class WorkGraph:
         A retry with the same ``idempotency_key`` returns the existing node without
         re-checking the transition, so an idempotent retry never raises.
         """
-        if new_status not in STATUSES:
+        if not is_member(new_status, STATUSES):
             raise ValueError(f"status must be one of {sorted(STATUSES)}, got {new_status!r}")
         with self._log.transaction() as txn:
             self._catch_up(txn)
@@ -419,10 +460,12 @@ class WorkGraph:
                 raise IllegalTransition(
                     f"cannot move node {node_id} from {node.status!r} to {new_status!r}"
                 )
+            payload = {"node_id": node_id, "to": new_status}
+            self._refuse_unless_foldable(EVENT_NODE_STATUS_CHANGED, actor, payload)
             event = txn.append(
                 EVENT_NODE_STATUS_CHANGED,
                 actor,
-                {"node_id": node_id, "to": new_status},
+                payload,
                 project_id=self._project_id,
                 idempotency_key=idempotency_key,
             )
@@ -441,7 +484,7 @@ class WorkGraph:
         idempotency_key: str | None = None,
     ) -> Edge:
         """Connect two existing nodes with a typed edge."""
-        if edge_type not in EDGE_TYPES:
+        if not is_member(edge_type, EDGE_TYPES):
             raise ValueError(f"edge type must be one of {sorted(EDGE_TYPES)}, got {edge_type!r}")
         with self._log.transaction() as txn:
             self._catch_up(txn)
@@ -466,7 +509,7 @@ class WorkGraph:
                         project_id=self._project_id,
                         actor=actor,
                     )
-                    return self._state.edges[existing.payload["edge_id"]]
+                    return self._retried(self._state.edges, existing, "edge_id")
             src_node = self._state.nodes.get(src)
             dst_node = self._state.nodes.get(dst)
             if src_node is None:
@@ -495,6 +538,7 @@ class WorkGraph:
                 "dst": dst,
                 "data": data or {},
             }
+            self._refuse_unless_foldable(EVENT_EDGE_ADDED, actor, payload)
             event = txn.append(
                 EVENT_EDGE_ADDED,
                 actor,
@@ -532,7 +576,7 @@ class WorkGraph:
         """
         if txn._log is not self._log:
             raise ValueError("transaction belongs to a different event log")
-        if new_status not in STATUSES:
+        if not is_member(new_status, STATUSES):
             raise ValueError(f"status must be one of {sorted(STATUSES)}, got {new_status!r}")
         self._catch_up(txn)
         node = self._state.nodes.get(node_id)
@@ -549,10 +593,12 @@ class WorkGraph:
                 f"{actor.kind}:{actor.id} may not move review {node_id} to {new_status!r}: "
                 "only a human decides, and only the requester may withdraw"
             )
+        payload = {"node_id": node_id, "to": new_status}
+        self._refuse_unless_foldable(EVENT_NODE_STATUS_CHANGED, actor, payload)
         event = txn.append(
             EVENT_NODE_STATUS_CHANGED,
             actor,
-            {"node_id": node_id, "to": new_status},
+            payload,
             project_id=self._project_id,
         )
         self._apply(event)
@@ -562,7 +608,45 @@ class WorkGraph:
         """Events the live projection could not use (malformed or forged)."""
         return tuple(self._state.skipped)
 
+    def last_status_change(self, node_id: str) -> tuple[int, Actor, str] | None:
+        """The last status change folded for ``node_id``: ``(seq, actor, new status)``."""
+        return self._state.last_change.get(node_id)
+
     # -- internals ----------------------------------------------------------
+
+    def _refuse_unless_foldable(
+        self, event_type: str, actor: Actor, payload: dict[str, Any]
+    ) -> None:
+        """Refuse, before writing, an event this projection's own fold would skip.
+
+        Otherwise the event commits and the writer then fails to find what it wrote.
+        The payload is checked as it will be stored (after a JSON round trip).
+        """
+        title = payload.get("title")
+        if isinstance(title, str) and len(title) > MAX_TITLE_CHARS:
+            raise ValueError(
+                f"refused before writing {event_type}: title is over {MAX_TITLE_CHARS}"
+            )
+        stored = json.loads(json.dumps(payload, allow_nan=False))
+        probe = Event(0, "", self._project_id, event_type, actor, "", stored)
+        problem = _problem(self._state, probe)
+        if problem is not None:
+            raise ValueError(f"refused before writing {event_type}: {problem}")
+
+    @staticmethod
+    def _retried(found: dict[str, Any], existing: Event, field: str) -> Any:
+        """The entity an idempotent retry refers to, or a conflict if there is none.
+
+        The stored event matched the request, but if it was forged or malformed the
+        projection never folded it; that is a conflict, not a KeyError.
+        """
+        entity = found.get(existing.payload.get(field))
+        if entity is None:
+            raise IdempotencyConflict(
+                f"idempotency key {existing.idempotency_key!r} names an event the graph "
+                "could not use"
+            )
+        return entity
 
     def _catch_up(self, txn: Transaction) -> None:
         for event in txn.read(self._last_seq, project_id=self._project_id, types=_GRAPH_TYPES):

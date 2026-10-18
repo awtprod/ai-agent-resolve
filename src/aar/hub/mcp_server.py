@@ -41,6 +41,26 @@ SERVER_INSTRUCTIONS = (
 _READ_ONLY = ToolAnnotations(read_only_hint=True)
 
 _MAX_TAIL = 1000
+# Deeper values are elided from tool results: the MCP serializer fails on nesting
+# past about 250 levels, and no agent needs a payload that deep.
+MAX_RESULT_DEPTH = 64
+ELIDED = "<elided: nested deeper than 64 levels>"
+
+
+def _bounded(value: Any, depth: int = 0) -> Any:
+    """``value`` with anything nested deeper than ``MAX_RESULT_DEPTH`` replaced by a marker.
+
+    It recurses, but never past the cap, so it cannot itself hit the recursion limit.
+    """
+    if isinstance(value, dict):
+        if depth >= MAX_RESULT_DEPTH:
+            return ELIDED
+        return {key: _bounded(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        if depth >= MAX_RESULT_DEPTH:
+            return ELIDED
+        return [_bounded(item, depth + 1) for item in value]
+    return value
 
 
 def _event_dict(event: Event) -> dict[str, Any]:
@@ -83,10 +103,12 @@ def build_server(
     )
     def projects_list() -> dict[str, Any]:
         registry.refresh()
-        return {
-            "projects": [project.to_dict() for project in registry.list()],
-            "skipped": skipped_summary(registry.skipped()),
-        }
+        return _bounded(
+            {
+                "projects": [project.to_dict() for project in registry.list()],
+                "skipped": skipped_summary(registry.skipped()),
+            }
+        )
 
     @server.tool(
         name="project_get",
@@ -103,7 +125,7 @@ def build_server(
         skipped = skipped_summary(registry.skipped())
         if project is None:
             return {"found": False, "project_id": project_id, "skipped": skipped}
-        return {"found": True, "project": project.to_dict(), "skipped": skipped}
+        return _bounded({"found": True, "project": project.to_dict(), "skipped": skipped})
 
     @server.tool(
         name="events_tail",
@@ -128,7 +150,7 @@ def build_server(
         limit = min(_MAX_TAIL, limit)
         events = log.read(since_seq, project_id=project_id, limit=limit)
         next_seq = events[-1].seq if events else since_seq
-        return {"events": [_event_dict(event) for event in events], "next_seq": next_seq}
+        return _bounded({"events": [_event_dict(event) for event in events], "next_seq": next_seq})
 
     @server.tool(
         name="work_graph",
@@ -146,7 +168,9 @@ def build_server(
         if registry.get(project_id) is None:
             return {"found": False, "project_id": project_id}
         graph = WorkGraph(log, project_id)
-        return {"found": True, **graph.to_dict(), "skipped": skipped_summary(graph.skipped())}
+        return _bounded(
+            {"found": True, **graph.to_dict(), "skipped": skipped_summary(graph.skipped())}
+        )
 
     @server.tool(
         name="artifact_meta",
@@ -162,7 +186,7 @@ def build_server(
         meta = artifacts.get_meta(artifact_id)
         if meta is None:
             return {"found": False, "artifact_id": artifact_id}
-        return {"found": True, "meta": meta.to_dict()}
+        return _bounded({"found": True, "meta": meta.to_dict()})
 
     @server.tool(
         name="reviews_pending",

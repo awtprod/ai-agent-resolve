@@ -43,8 +43,10 @@ from aar.hub.events import (
     Actor,
     Event,
     EventLog,
-    Transaction,
     match_or_conflict,
+)
+from aar.hub.graph import (
+    EVENT_EDGE_ADDED as _EVENT_EDGE_ADDED,
 )
 from aar.hub.graph import (
     EVENT_NODE_ADDED,
@@ -53,12 +55,22 @@ from aar.hub.graph import (
     ProtectedNode,
     WorkGraph,
 )
+from aar.hub.graph import (
+    EVENT_NODE_STATUS_CHANGED as _EVENT_NODE_STATUS_CHANGED,
+)
 from aar.hub.registry import Registry
 
 EVENT_NOTE_ADDED = "review.note_added"
 EVENT_DECIDED = "review.decided"
 EVENT_WITHDRAWN = "review.withdrawn"
 _REVIEW_EVENT_TYPES = (EVENT_NOTE_ADDED, EVENT_DECIDED, EVENT_WITHDRAWN)
+_SNAPSHOT_TYPES = (
+    EVENT_NODE_ADDED,
+    _EVENT_NODE_STATUS_CHANGED,
+    _EVENT_EDGE_ADDED,
+    *_REVIEW_EVENT_TYPES,
+)
+_NO_LIMIT = -1  # SQLite: LIMIT -1 is no limit, so the read is one statement
 
 DECISIONS = ("approve", "reject")
 DECISION_STATUS = {"approve": "done", "reject": "failed"}
@@ -73,7 +85,16 @@ MAX_RENDERS = 16
 MAX_FRAME = 10**9
 MAX_FPS = 1000.0
 
-_TIMECODE_RE = re.compile(r"^\d{2}:[0-5]\d:[0-5]\d[:;]\d{2}$")
+TIMECODE_RE = re.compile(r"^\d{2}:[0-5]\d:[0-5]\d[:;]\d{2}$")
+"""A display timecode, ``HH:MM:SS:FF`` (``;`` before the frames for drop-frame)."""
+_TIMECODE_RE = TIMECODE_RE  # kept: S11 imports the private name
+
+
+def is_timecode(value: Any) -> bool:
+    """Whether ``value`` is a display timecode string (``HH:MM:SS:FF``)."""
+    return isinstance(value, str) and TIMECODE_RE.fullmatch(value) is not None
+
+
 _ARTIFACT_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -320,6 +341,27 @@ def _withdrawal_problem(payload: Any) -> str | None:
     return None
 
 
+def _attribution_problem(graph: WorkGraph, event: Event) -> str | None:
+    """Whether a decision or withdrawal was written with the status change it records.
+
+    ``decide`` and ``withdraw`` append the review's status change and then this event
+    in one transaction, so the genuine event is the very next one, by the same actor,
+    and the status it implies is the one the graph holds. Anything else (appended
+    straight to the log, or by someone else) would credit the wrong person and is
+    skipped.
+    """
+    payload = event.payload
+    decided = event.type == EVENT_DECIDED
+    expected = DECISION_STATUS[payload["decision"]] if decided else "cancelled"
+    change = graph.last_status_change(payload["review_id"])
+    if change is None or change != (event.seq - 1, event.actor, expected):
+        return (
+            f"not written with the review's move to {expected!r}: it would credit "
+            f"{event.actor.kind}:{event.actor.id} with an act the graph does not record"
+        )
+    return None
+
+
 def _note_from_event(event: Event) -> Note:
     payload = event.payload
     return Note(
@@ -415,14 +457,22 @@ class ReviewScan:
 def _project_reviews(
     log: EventLog, project_id: str
 ) -> tuple[dict[str, Review], list[SkippedEvent]]:
-    """Every review in one project, keyed by id, and the events skipped building them."""
-    graph = WorkGraph(log, project_id)
+    """Every review in one project, keyed by id, and the events skipped building them.
+
+    The graph and the review events come from ONE read (one SQL statement, so one
+    snapshot). Two reads could straddle a commit and see a decision without the
+    status change it was written with, which would look forged.
+    """
+    snapshot = log.read(0, project_id=project_id, types=_SNAPSHOT_TYPES, limit=_NO_LIMIT)
+    graph = WorkGraph.from_events(log, project_id, snapshot)
     skipped = list(graph.skipped())
     review_nodes = {node.id: node for node in graph.nodes() if node.kind == "review"}
     notes: dict[str, list[Note]] = {}
     decisions: dict[str, Decision] = {}
     withdrawals: dict[str, Withdrawal] = {}
-    for event in log.iter_events(project_id=project_id, types=_REVIEW_EVENT_TYPES):
+    for event in snapshot:
+        if event.type not in _REVIEW_EVENT_TYPES:
+            continue
         if event.type == EVENT_NOTE_ADDED:
             problem = _note_problem(event.payload)
         elif event.type == EVENT_DECIDED:
@@ -434,6 +484,8 @@ def _project_reviews(
             problem = f"no review {review_id!r} in this project"
         if problem is None and event.type == EVENT_DECIDED and review_id in decisions:
             problem = "a second decision; the first one stands"
+        if problem is None and event.type != EVENT_NOTE_ADDED:
+            problem = _attribution_problem(graph, event)
         if problem is not None:
             skipped.append(SkippedEvent.of(event, problem))
         elif event.type == EVENT_NOTE_ADDED:
@@ -640,16 +692,6 @@ def _require_open(review: Review) -> None:
         raise ReviewNotOpen(f"review {review.id} is {review.status!r}; it takes no more input")
 
 
-def _existing_decision(txn: Transaction, project_id: str, review_id: str) -> Decision | None:
-    for event in txn.read(0, project_id=project_id, types=[EVENT_DECIDED]):
-        if (
-            _decision_problem(event.actor, event.payload) is None
-            and event.payload["review_id"] == review_id
-        ):
-            return _decision_from_event(event)
-    return None
-
-
 def decide(
     log: EventLog,
     project_id: str,
@@ -687,13 +729,15 @@ def decide(
                 return _decision_from_event(existing)
         # Built inside the transaction, so it sees every committed event and nothing
         # can change underneath it before the commit.
+        current = get_review(log, project_id, review_id)
+        if current is None:
+            raise ReviewNotFound(f"no review {review_id!r} in project {project_id!r}")
+        if current.decision is not None:
+            raise ReviewAlreadyDecided(current.decision)
         graph = WorkGraph(log, project_id)
         node = graph.node(review_id)
-        if node is None or node.kind != "review":
+        if node is None:  # pragma: no cover - get_review found it in this transaction
             raise ReviewNotFound(f"no review {review_id!r} in project {project_id!r}")
-        prior = _existing_decision(txn, project_id, review_id)
-        if prior is not None:
-            raise ReviewAlreadyDecided(prior)
         subject_id = node.payload.get("subject") if isinstance(node.payload, dict) else None
         subject = graph.node(subject_id) if isinstance(subject_id, str) else None
         if decision == "approve" and subject is not None and subject.status == "cancelled":
@@ -706,7 +750,7 @@ def decide(
             if node.status in ("pending", "blocked"):
                 graph.set_status_in(txn, review_id, "active", actor)
             graph.set_status_in(txn, review_id, DECISION_STATUS[decision], actor)
-        except IllegalTransition as exc:
+        except (IllegalTransition, ProtectedNode) as exc:
             raise ReviewNotOpen(
                 f"review {review_id} is {node.status!r} and can no longer be decided"
             ) from exc

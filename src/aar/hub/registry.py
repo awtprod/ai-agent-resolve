@@ -14,14 +14,26 @@ reused explicit id is rejected rather than silently overwriting.
 
 from __future__ import annotations
 
+import json
 import secrets
 from dataclasses import dataclass, field
 from typing import Any
 
-from aar.hub.common import SkippedEvent
-from aar.hub.events import Actor, Event, EventLog, Transaction, match_or_conflict
+from aar.hub.common import SkippedEvent, is_member
+from aar.hub.events import (
+    Actor,
+    Event,
+    EventLog,
+    IdempotencyConflict,
+    Transaction,
+    match_or_conflict,
+)
 
 SOURCE_KINDS = frozenset({"cloud_library", "local_db", "drp_file", "drt_file"})
+
+# Writers refuse longer names and aliases; the fold still accepts what is already
+# in the log, so old data never disappears from projections.
+MAX_NAME_CHARS = 500
 
 EVENT_PROJECT_CREATED = "project.created"
 EVENT_PROJECT_RENAMED = "project.renamed"
@@ -54,7 +66,7 @@ class ProjectSource:
     host: str | None = None
 
     def __post_init__(self) -> None:
-        if self.kind not in SOURCE_KINDS:
+        if not is_member(self.kind, SOURCE_KINDS):
             raise ValueError(
                 f"source kind must be one of {sorted(SOURCE_KINDS)}, got {self.kind!r}"
             )
@@ -117,7 +129,7 @@ def _reduce(
 def _source_ok(value: Any) -> bool:
     return (
         isinstance(value, dict)
-        and value.get("kind") in SOURCE_KINDS
+        and is_member(value.get("kind"), SOURCE_KINDS)
         and isinstance(value.get("locator"), dict)
         and (value.get("host") is None or isinstance(value.get("host"), str))
     )
@@ -249,7 +261,13 @@ class Registry:
                         project_id=project_id,
                         actor=actor,
                     )
-                    return self._projects[existing.payload["project_id"]]
+                    project = self._projects.get(existing.payload.get("project_id"))
+                    if project is None:
+                        raise IdempotencyConflict(
+                            f"idempotency key {idempotency_key!r} names an event the "
+                            "registry could not use"
+                        )
+                    return project
             pid = project_id or new_project_id()
             if pid in self._projects:
                 raise DuplicateProjectId(f"project id already exists: {pid!r}")
@@ -259,6 +277,7 @@ class Registry:
                 "sources": source_dicts,
                 "aliases": alias_list,
             }
+            self._refuse_unless_foldable(EVENT_PROJECT_CREATED, actor, payload)
             event = txn.append(
                 EVENT_PROJECT_CREATED,
                 actor,
@@ -374,6 +393,7 @@ class Registry:
                         actor=actor,
                     )
                     return self._projects[project_id]
+            self._refuse_unless_foldable(event_type, actor, payload)
             event = txn.append(
                 event_type,
                 actor,
@@ -383,6 +403,24 @@ class Registry:
             )
         self._apply(event)
         return self._projects[project_id]
+
+    def _refuse_unless_foldable(
+        self, event_type: str, actor: Actor, payload: dict[str, Any]
+    ) -> None:
+        """Refuse, before writing, an event the fold would skip (a silent no-op or a
+        KeyError after the commit otherwise). Checked as stored, after a JSON round trip.
+        """
+        for name_field in ("name", "alias"):
+            value = payload.get(name_field)
+            if isinstance(value, str) and len(value) > MAX_NAME_CHARS:
+                raise ValueError(
+                    f"refused before writing {event_type}: {name_field} is over {MAX_NAME_CHARS}"
+                )
+        stored = json.loads(json.dumps(payload, allow_nan=False))
+        probe = Event(0, "", stored.get("project_id"), event_type, actor, "", stored)
+        problem = _problem(self._projects, probe)
+        if problem is not None:
+            raise ValueError(f"refused before writing {event_type}: {problem}")
 
     def _catch_up(self, txn: Transaction) -> None:
         for event in txn.read(self._last_seq, types=_REGISTRY_TYPES):
