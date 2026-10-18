@@ -140,12 +140,14 @@ def test_op_code_cannot_run_outside_the_broker() -> None:
 
 
 def _marker(show: Show, ref: dict[str, Any], frame: int = 30) -> str:
+    # These tests exercise broker leasing, not the branch guard, so they opt out of it.
     return submit_op(
         show.broker,
         "markers.add",
         {"timeline": ref, "markers": [{"frame": frame, "name": "m"}]},
         target=show.locator(),
         holder=AGENT,
+        require_branch=False,
     )
 
 
@@ -243,6 +245,7 @@ def test_holders_of_two_timelines_of_one_project_both_get_to_work() -> None:
             {"timeline": show.ref(name), "markers": [{"frame": 50, "name": who}]},
             target=show.locator(),
             holder=holder,
+            require_branch=False,
         )
         for name, who, holder in (("Main", "a", a), ("Main [agent]", "b", b))
     ]
@@ -328,6 +331,7 @@ def test_an_op_naming_two_timelines_leases_each_of_them() -> None:
             _two_timeline_grades(world),
             target=world.locator(),
             holder=AGENT,
+            require_branch=False,
         )
         world.broker.run_until_idle()
         assert world.broker.result(op_id) is None, leased.GetName()
@@ -341,6 +345,7 @@ def test_an_op_naming_two_timelines_leases_each_of_them() -> None:
         _two_timeline_grades(world),
         target=world.locator(),
         holder=AGENT,
+        require_branch=False,
     )
     world.broker.run_until_idle()
     result = world.broker.result(op_id)
@@ -449,7 +454,14 @@ def test_no_lease_and_ref_combination_under_blocks() -> None:
                     with pytest.raises(OpError, match="timeline_id_required"):
                         submit_op(show.broker, "markers.add", params, target=target, holder=AGENT)
                     continue
-                op_id = submit_op(show.broker, "markers.add", params, target=target, holder=AGENT)
+                op_id = submit_op(
+                    show.broker,
+                    "markers.add",
+                    params,
+                    target=target,
+                    holder=AGENT,
+                    require_branch=False,
+                )
                 show.broker.run_until_idle()
                 wrote = bool(show.main.GetMarkers())
                 if lease_scope in ("project", "main"):
