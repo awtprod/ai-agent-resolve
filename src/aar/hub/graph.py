@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -319,9 +320,30 @@ class WorkGraph:
         ``_last_seq`` comes from the events actually folded, never from a separate
         ``latest_seq()`` read that could jump past events appended since the rebuild.
         """
+        self._load(self._log.iter_events(project_id=self._project_id, types=_GRAPH_TYPES))
+
+    @classmethod
+    def from_events(cls, log: EventLog, project_id: str, events: Iterable[Event]) -> WorkGraph:
+        """A graph folded from ``events`` instead of a fresh read of the log.
+
+        Lets a caller fold the graph and its own events from one read, so a commit
+        landing between two reads can never show it half of a transaction. Events of
+        other projects or types are ignored; ``events`` must be in ``seq`` order.
+        """
+        graph = cls.__new__(cls)
+        graph._log = log
+        graph._project_id = project_id
+        graph._load(
+            event
+            for event in events
+            if event.project_id == project_id and event.type in _GRAPH_TYPES
+        )
+        return graph
+
+    def _load(self, events: Iterable[Event]) -> None:
         state = GraphState()
         last_seq = 0
-        for event in self._log.iter_events(project_id=self._project_id, types=_GRAPH_TYPES):
+        for event in events:
             _fold(state, event)
             last_seq = event.seq
         self._state = state

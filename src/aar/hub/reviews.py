@@ -46,7 +46,9 @@ from aar.hub.events import (
     match_or_conflict,
 )
 from aar.hub.graph import (
+    EVENT_EDGE_ADDED,
     EVENT_NODE_ADDED,
+    EVENT_NODE_STATUS_CHANGED,
     GraphNode,
     IllegalTransition,
     ProtectedNode,
@@ -58,6 +60,13 @@ EVENT_NOTE_ADDED = "review.note_added"
 EVENT_DECIDED = "review.decided"
 EVENT_WITHDRAWN = "review.withdrawn"
 _REVIEW_EVENT_TYPES = (EVENT_NOTE_ADDED, EVENT_DECIDED, EVENT_WITHDRAWN)
+_SNAPSHOT_TYPES = (
+    EVENT_NODE_ADDED,
+    EVENT_NODE_STATUS_CHANGED,
+    EVENT_EDGE_ADDED,
+    *_REVIEW_EVENT_TYPES,
+)
+_NO_LIMIT = -1  # SQLite: LIMIT -1 is no limit, so the read is one statement
 
 DECISIONS = ("approve", "reject")
 DECISION_STATUS = {"approve": "done", "reject": "failed"}
@@ -444,14 +453,22 @@ class ReviewScan:
 def _project_reviews(
     log: EventLog, project_id: str
 ) -> tuple[dict[str, Review], list[SkippedEvent]]:
-    """Every review in one project, keyed by id, and the events skipped building them."""
-    graph = WorkGraph(log, project_id)
+    """Every review in one project, keyed by id, and the events skipped building them.
+
+    The graph and the review events come from ONE read (one SQL statement, so one
+    snapshot). Two reads could straddle a commit and see a decision without the
+    status change it was written with, which would look forged.
+    """
+    snapshot = log.read(0, project_id=project_id, types=_SNAPSHOT_TYPES, limit=_NO_LIMIT)
+    graph = WorkGraph.from_events(log, project_id, snapshot)
     skipped = list(graph.skipped())
     review_nodes = {node.id: node for node in graph.nodes() if node.kind == "review"}
     notes: dict[str, list[Note]] = {}
     decisions: dict[str, Decision] = {}
     withdrawals: dict[str, Withdrawal] = {}
-    for event in log.iter_events(project_id=project_id, types=_REVIEW_EVENT_TYPES):
+    for event in snapshot:
+        if event.type not in _REVIEW_EVENT_TYPES:
+            continue
         if event.type == EVENT_NOTE_ADDED:
             problem = _note_problem(event.payload)
         elif event.type == EVENT_DECIDED:
