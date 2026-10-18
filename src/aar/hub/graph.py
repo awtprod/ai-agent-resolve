@@ -149,6 +149,9 @@ class GraphState:
     edges: dict[str, Edge] = field(default_factory=dict)
     skipped: list[SkippedEvent] = field(default_factory=list)
     creators: dict[str, Actor] = field(default_factory=dict)
+    # The last folded status change per node: (seq, actor, new status). Reviews use it
+    # to credit a decision or withdrawal only to the change it was written with.
+    last_change: dict[str, tuple[int, Actor, str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -248,6 +251,9 @@ def _fold(state: GraphState, event: Event) -> None:
         return
     if event.type == EVENT_NODE_ADDED:
         state.creators[event.payload["node_id"]] = event.actor
+    elif event.type == EVENT_NODE_STATUS_CHANGED:
+        node_id = event.payload["node_id"]
+        state.last_change[node_id] = (event.seq, event.actor, event.payload["to"])
     _reduce(state, event.type, event.payload, event.ts)
 
 
@@ -575,6 +581,10 @@ class WorkGraph:
     def skipped(self) -> tuple[SkippedEvent, ...]:
         """Events the live projection could not use (malformed or forged)."""
         return tuple(self._state.skipped)
+
+    def last_status_change(self, node_id: str) -> tuple[int, Actor, str] | None:
+        """The last status change folded for ``node_id``: ``(seq, actor, new status)``."""
+        return self._state.last_change.get(node_id)
 
     # -- internals ----------------------------------------------------------
 

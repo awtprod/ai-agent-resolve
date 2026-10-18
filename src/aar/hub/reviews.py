@@ -43,7 +43,6 @@ from aar.hub.events import (
     Actor,
     Event,
     EventLog,
-    Transaction,
     match_or_conflict,
 )
 from aar.hub.graph import (
@@ -320,6 +319,27 @@ def _withdrawal_problem(payload: Any) -> str | None:
     return None
 
 
+def _attribution_problem(graph: WorkGraph, event: Event) -> str | None:
+    """Whether a decision or withdrawal was written with the status change it records.
+
+    ``decide`` and ``withdraw`` append the review's status change and then this event
+    in one transaction, so the genuine event is the very next one, by the same actor,
+    and the status it implies is the one the graph holds. Anything else (appended
+    straight to the log, or by someone else) would credit the wrong person and is
+    skipped.
+    """
+    payload = event.payload
+    decided = event.type == EVENT_DECIDED
+    expected = DECISION_STATUS[payload["decision"]] if decided else "cancelled"
+    change = graph.last_status_change(payload["review_id"])
+    if change is None or change != (event.seq - 1, event.actor, expected):
+        return (
+            f"not written with the review's move to {expected!r}: it would credit "
+            f"{event.actor.kind}:{event.actor.id} with an act the graph does not record"
+        )
+    return None
+
+
 def _note_from_event(event: Event) -> Note:
     payload = event.payload
     return Note(
@@ -434,6 +454,8 @@ def _project_reviews(
             problem = f"no review {review_id!r} in this project"
         if problem is None and event.type == EVENT_DECIDED and review_id in decisions:
             problem = "a second decision; the first one stands"
+        if problem is None and event.type != EVENT_NOTE_ADDED:
+            problem = _attribution_problem(graph, event)
         if problem is not None:
             skipped.append(SkippedEvent.of(event, problem))
         elif event.type == EVENT_NOTE_ADDED:
@@ -640,16 +662,6 @@ def _require_open(review: Review) -> None:
         raise ReviewNotOpen(f"review {review.id} is {review.status!r}; it takes no more input")
 
 
-def _existing_decision(txn: Transaction, project_id: str, review_id: str) -> Decision | None:
-    for event in txn.read(0, project_id=project_id, types=[EVENT_DECIDED]):
-        if (
-            _decision_problem(event.actor, event.payload) is None
-            and event.payload["review_id"] == review_id
-        ):
-            return _decision_from_event(event)
-    return None
-
-
 def decide(
     log: EventLog,
     project_id: str,
@@ -687,13 +699,15 @@ def decide(
                 return _decision_from_event(existing)
         # Built inside the transaction, so it sees every committed event and nothing
         # can change underneath it before the commit.
+        current = get_review(log, project_id, review_id)
+        if current is None:
+            raise ReviewNotFound(f"no review {review_id!r} in project {project_id!r}")
+        if current.decision is not None:
+            raise ReviewAlreadyDecided(current.decision)
         graph = WorkGraph(log, project_id)
         node = graph.node(review_id)
-        if node is None or node.kind != "review":
+        if node is None:  # pragma: no cover - get_review found it in this transaction
             raise ReviewNotFound(f"no review {review_id!r} in project {project_id!r}")
-        prior = _existing_decision(txn, project_id, review_id)
-        if prior is not None:
-            raise ReviewAlreadyDecided(prior)
         subject_id = node.payload.get("subject") if isinstance(node.payload, dict) else None
         subject = graph.node(subject_id) if isinstance(subject_id, str) else None
         if decision == "approve" and subject is not None and subject.status == "cancelled":
@@ -706,7 +720,7 @@ def decide(
             if node.status in ("pending", "blocked"):
                 graph.set_status_in(txn, review_id, "active", actor)
             graph.set_status_in(txn, review_id, DECISION_STATUS[decision], actor)
-        except IllegalTransition as exc:
+        except (IllegalTransition, ProtectedNode) as exc:
             raise ReviewNotOpen(
                 f"review {review_id} is {node.status!r} and can no longer be decided"
             ) from exc
