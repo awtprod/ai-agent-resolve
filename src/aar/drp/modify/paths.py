@@ -151,9 +151,9 @@ class PathMapper:
         best: _Entry | None = None
         for e in self.entries:
             n = len(e.win.parts)
-            if e.win.unc == w.unc and w.key()[: n + 1] == e.win.key():
-                if best is None or n > len(best.win.parts):
-                    best = e
+            matches = e.win.unc == w.unc and w.key()[: n + 1] == e.win.key()
+            if matches and (best is None or n > len(best.win.parts)):
+                best = e
         if best is None:
             return MapResult(None, "unc-not-mapped" if w.unc else "no-mapping")
         rest = w.parts[len(best.win.parts) :]

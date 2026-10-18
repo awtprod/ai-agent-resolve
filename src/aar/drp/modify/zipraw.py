@@ -73,7 +73,7 @@ def _parse(data: bytes) -> _Layout:
     end = data.rfind(struct.pack("<I", _END_SIG), max(0, len(data) - 22 - 0xFFFF))
     if end < 0 or end + 22 > len(data):
         raise ZipLayoutError("no end-of-central-directory record")
-    sig, disk, cd_disk, here, total, cd_size, cd_off, clen = _END.unpack_from(data, end)
+    _sig, disk, cd_disk, here, total, cd_size, cd_off, clen = _END.unpack_from(data, end)
     if end + 22 + clen != len(data):
         raise ZipLayoutError("bytes after the end record (or a bad comment length)")
     if disk or cd_disk or here != total:
@@ -155,7 +155,9 @@ def _local(
         if body + 12 > len(data):
             raise ZipLayoutError(f"truncated data descriptor for {name_raw!r}")
         if struct.unpack_from("<III", data, body) != (crc, csize, usize):
-            raise ZipLayoutError(f"data descriptor disagrees with the central record of {name_raw!r}")
+            raise ZipLayoutError(
+                f"data descriptor disagrees with the central record of {name_raw!r}"
+            )
         local_end = body + 12
     try:
         name = name_raw.decode("utf-8" if flags & 0x800 else "cp437")
