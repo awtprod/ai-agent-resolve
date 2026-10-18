@@ -318,3 +318,38 @@ def test_fc_leftover_temp_files_are_reported_not_deleted(tmp_path: Path) -> None
     assert outcome.status == "written"
     assert outcome.to_dict()["leftovers"] == sorted(str(p) for p in stale)
     assert all(p.exists() for p in stale + unrelated)
+
+
+# --------------------------------------------------------------------------- F-B
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"op": "rename", "target": "project", "new_name": "_media_tmpl"},
+        {"op": "rename", "target": "clip", "id": CLIP, "new_name": "sample.mp4"},
+        {"op": "rename", "target": "timeline", "id": TIMELINE, "new_name": "MediaTemplate"},
+    ],
+    ids=["project", "clip", "timeline"],
+)
+def test_fb_renaming_to_the_current_name_is_a_reported_no_op(
+    tmp_path: Path, edit: dict[str, Any]
+) -> None:
+    outcome, out = run(H264, tmp_path, edit)
+    assert outcome.status == "written", outcome.to_dict()["refusals"]
+    assert outcome.changes == [] and outcome.expected == []
+    [report] = outcome.report
+    assert report["unchanged"] is True and report["old"] == report["new"] == edit["new_name"]
+    assert out.read_bytes() == H264.read_bytes()
+
+
+def test_fb_a_no_op_rename_beside_a_real_one(tmp_path: Path) -> None:
+    outcome, _ = run(
+        H264,
+        tmp_path,
+        {"op": "rename", "target": "project", "new_name": "_media_tmpl"},
+        {"op": "rename", "target": "clip", "id": CLIP, "new_name": "Interview"},
+    )
+    assert outcome.status == "written", outcome.to_dict()["refusals"]
+    assert [(c["object_kind"], c["new"]) for c in outcome.changes] == [("media", "Interview")]
+    assert [r.get("unchanged", False) for r in outcome.report] == [True, False]
