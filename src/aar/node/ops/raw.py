@@ -79,6 +79,102 @@ def read_media(mpi: Any) -> dict[str, Any]:
     return out
 
 
+# The per-clip 'Cloud Sync' property is one of these resolve.CLOUD_SYNC_* status codes (21.1
+# stubs). Observed live 2026-10-17: the constants are floats (DEFAULT -1.0 .. SUCCESS 10.0) but
+# the clip property reads back as a string (e.g. "-1"), so codes are matched numerically. The
+# sync-MODE constants (CLOUD_SYNC_NONE/PROXY_ONLY/PROXY_AND_ORIG) reuse these numeric values and
+# are deliberately absent here: a status code must never be matched against a mode code.
+CLOUD_SYNC_STATUS_CONSTANTS = (
+    "CLOUD_SYNC_DEFAULT",
+    "CLOUD_SYNC_DOWNLOAD_IN_QUEUE",
+    "CLOUD_SYNC_DOWNLOAD_IN_PROGRESS",
+    "CLOUD_SYNC_DOWNLOAD_SUCCESS",
+    "CLOUD_SYNC_DOWNLOAD_FAIL",
+    "CLOUD_SYNC_DOWNLOAD_NOT_FOUND",
+    "CLOUD_SYNC_UPLOAD_IN_QUEUE",
+    "CLOUD_SYNC_UPLOAD_IN_PROGRESS",
+    "CLOUD_SYNC_UPLOAD_SUCCESS",
+    "CLOUD_SYNC_UPLOAD_FAIL",
+    "CLOUD_SYNC_UPLOAD_NOT_FOUND",
+    "CLOUD_SYNC_SUCCESS",
+)
+
+
+def _as_number(value: Any) -> float | None:
+    """``value`` as a float, or ``None`` if it is not numeric. '-1', '-1.0' and -1.0 give -1.0."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_resolution(value: str) -> bool:
+    """True for a 'WxH' resolution such as '1920x1080'; False for '', 'None' or 'Offline'."""
+    parts = value.split("x")
+    return len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit()
+
+
+def cloud_sync_labels(resolve: Any) -> dict[float, str]:
+    """Map each cloud-sync status code (as a float) to its ``resolve.CLOUD_SYNC_*`` name.
+
+    Keyed numerically because the clip property reads back as a string while the constants are
+    floats. Only the status constants are read, never the colliding sync-MODE constants.
+    """
+    labels: dict[float, str] = {}
+    for name in CLOUD_SYNC_STATUS_CONSTANTS:
+        number = _as_number(getattr(resolve, name, None))
+        if number is not None:
+            labels[number] = name
+    return labels
+
+
+def classify_cloud_sync(props: dict[str, Any], labels: dict[float, str]) -> dict[str, Any]:
+    """Cloud-sync facts of one clip from its ``GetClipProperty()`` dict and a label map.
+
+    A playable proxy is a resolution in 'Proxy'; 'Offline' means the proxy file itself is
+    offline, so it is not playable. ``proxy_only`` (trap ``cloud-proxy-only-no-audio``) is a
+    playable proxy with the original offline, so a build uses the audio-less proxy;
+    ``fully_offline`` is an offline original with no playable proxy, so a build renders nothing.
+    An unparseable status stays raw (in ``cloud_sync_raw``) and is labelled 'unknown', never
+    swallowed.
+    """
+    raw_value = props.get("Cloud Sync")
+    raw_str = "" if raw_value is None else str(raw_value)
+    number = _as_number(raw_value)
+    label = labels.get(number) if number is not None else None
+    proxy = str(props.get("Proxy") or "")
+    online = str(props.get("Online Status") or "")
+    has_proxy = _is_resolution(proxy)
+    original_offline = online not in ("", "Online")
+    return {
+        "cloud_sync": label if label is not None else "unknown",
+        "cloud_sync_raw": raw_str,
+        "proxy": proxy,
+        "has_proxy": has_proxy,
+        "proxy_offline": proxy == "Offline",
+        "online_status": online,
+        "original_offline": original_offline,
+        "proxy_only": has_proxy and original_offline,
+        "fully_offline": original_offline and not has_proxy,
+    }
+
+
+def read_cloud_sync(mpi: Any, labels: dict[float, str]) -> dict[str, Any]:
+    """Identity and cloud-sync facts of one ``MediaPoolItem``."""
+    props = mpi.GetClipProperty() or {}
+    media = classify_media(props)
+    out = classify_cloud_sync(props, labels)
+    out["media_id"] = str(mpi.GetUniqueId())
+    out["name"] = str(mpi.GetName())
+    out["type"] = media["type"]
+    out["has_audio"] = media["has_audio"]
+    return out
+
+
 def read_item(item: Any, timeline_start: int) -> dict[str, Any]:
     """Positions, source range, fades and gain of one ``TimelineItem``."""
     start = int(item.GetStart())

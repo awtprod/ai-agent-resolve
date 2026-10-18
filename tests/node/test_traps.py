@@ -32,6 +32,7 @@ LISTED = {
     "render-uses-original-media",
     "pm-folder-scoped-load",
     "source-frame-readback-rounding",
+    "cloud-proxy-only-no-audio",
 }
 
 
@@ -224,6 +225,24 @@ def _source_readback() -> None:
     assert item.GetSourceStartFrame() == 99
 
 
+def _cloud_proxy_only() -> None:
+    fake, _ = _world()
+    pool = fake.project("Show").media_pool
+    # Proxy-only: a resolution proxy is present while the original reads offline, so a build
+    # uses the (audio-less) proxy.
+    proxy_only = pool.add_clip((), "cam", online="Offline", proxy="1920x1080")
+    props = proxy_only.GetClipProperty()
+    assert (props["Online Status"], props["Proxy"]) == ("Offline", "1920x1080")
+    # The status constants are floats, but the clip property reads back as the string "-1".
+    assert fake.CLOUD_SYNC_DEFAULT == -1.0 and props["Cloud Sync"] == "-1"
+    # A proxy that is itself "Offline" is not a playable proxy (so not the proxy-only case).
+    proxy_gone = pool.add_clip((), "cam2", online="Offline", proxy="Offline")
+    assert proxy_gone.GetClipProperty()["Proxy"] == "Offline"
+    # A fully-synced clip is neither.
+    good = pool.add_clip((), "ok", online="Online")
+    assert good.GetClipProperty()["Online Status"] == "Online"
+
+
 BEHAVIOUR: dict[str, Callable[[], None]] = {
     "append-endframe-exclusive": _endframe_exclusive,
     "append-fps-short": _fps_short,
@@ -239,6 +258,7 @@ BEHAVIOUR: dict[str, Callable[[], None]] = {
     "render-uses-original-media": _original_media,
     "pm-folder-scoped-load": _pm_scoped_load,
     "source-frame-readback-rounding": _source_readback,
+    "cloud-proxy-only-no-audio": _cloud_proxy_only,
 }
 
 

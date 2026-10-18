@@ -106,3 +106,33 @@ def test_live_project_find_current_folder(resolve: Any) -> None:
     assert result.project_manager_path == ()
     assert all(p.locator.folder_path == () for p in result.projects)
     assert result.open_project_id == _identity(resolve)[1]
+
+
+def test_live_cloud_read_ops(resolve: Any) -> None:
+    """The read-only S10 cloud ops against the live instance: list, sync status, freshness.
+
+    Strictly read-only: no LoadProject, no Project Manager navigation (``_run`` skips unless
+    at the root), no media-pool folder change, no RefreshFolders, no Set*/Import*/Restore*.
+    """
+    open_id = _identity(resolve)[1]
+
+    projects = _run(resolve, "cloud.projects", {})
+    assert projects.open_project_id == open_id
+    assert projects.database.db_name  # some current database is reported
+    assert any(p.is_open and p.unique_id == open_id for p in projects.projects)
+
+    sync = _run(resolve, "cloud.sync_status", {"max_clips": 500})
+    assert sync.scanned == len(sync.clips) <= sync.total_clips
+    assert sum(sync.status_counts.values()) == sync.scanned
+    for clip in sync.clips:
+        assert clip.media_id and clip.cloud_sync
+        assert clip.proxy_only == (clip.has_proxy and clip.original_offline)
+        assert clip.fully_offline == (clip.original_offline and not clip.has_proxy)
+        assert not (clip.proxy_only and clip.fully_offline)
+    # Report proxy-only media (the audio-loss case) and the raw status codes seen live.
+    print("cloud sync codes:", sync.status_counts)
+    print("proxy-only:", sync.proxy_only, "fully-offline:", sync.fully_offline)
+
+    fresh = _run(resolve, "cloud.freshness", {})
+    assert fresh.folder_count == len(fresh.folders)
+    assert fresh.stale_count == sum(f.stale for f in fresh.folders)

@@ -150,6 +150,21 @@ _KIND_TYPE = {
 }
 
 
+def _cloud_sync_prop(value: int | float | str | None) -> str:
+    """The 'Cloud Sync' clip property as Resolve returns it: the code as an integer-form string.
+
+    Observed live 2026-10-17: every clip on a cloud library read "-1" (CLOUD_SYNC_DEFAULT); the
+    string form of the other codes was not seen, so it is modelled as the integer form here.
+    """
+    if value is None:
+        return "-1"
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int | float):
+        return str(int(value))
+    return str(value)
+
+
 class FakeMediaPoolItem:
     """A media-pool clip. ``kind`` is one of ``_KIND_TYPE``; ``braw`` marks Blackmagic RAW."""
 
@@ -165,6 +180,7 @@ class FakeMediaPoolItem:
         input_color_space: str | None = None,
         online: str = "Online",
         proxy: str = "None",
+        cloud_sync: int | str | None = None,
     ) -> None:
         if kind not in _KIND_TYPE:
             raise ValueError(f"unknown clip kind {kind!r}")
@@ -200,6 +216,11 @@ class FakeMediaPoolItem:
             # can read "Offline" while a linked proxy ("Proxy" is its size) still plays.
             "Online Status": online,
             "Proxy": proxy,
+            # Blackmagic Cloud per-clip sync status (CloudSyncStatus), read back as a string
+            # ("-1" = DEFAULT, observed live). The op labels it from the float CLOUD_SYNC_*
+            # constants by matching numerically, so a string here against a float constant is
+            # the real shape, not a mismatch.
+            "Cloud Sync": _cloud_sync_prop(cloud_sync),
             "Audio Ch": "2" if kind in ("av", "audio") else "0",
         }  # fmt: skip
 
@@ -249,11 +270,13 @@ class FakeFolder:
         uid: str,
         subfolders: list[FakeFolder] | None = None,
         clips: list[FakeMediaPoolItem] | None = None,
+        stale: bool = False,
     ) -> None:
         self._name = name
         self._uid = uid
         self.subfolders = subfolders or []
         self.clips = clips or []
+        self.stale = stale
 
     def GetName(self) -> str:
         return self._name
@@ -263,6 +286,10 @@ class FakeFolder:
 
     def GetSubFolderList(self) -> list[FakeFolder]:
         return list(self.subfolders)
+
+    def GetIsFolderStale(self) -> bool:
+        # collaboration freshness (read-only); the write side is MediaPool.RefreshFolders.
+        return self.stale
 
     def GetClipList(self) -> list[FakeMediaPoolItem]:
         return list(self.clips)
@@ -890,6 +917,13 @@ class FakeProject:
         self._uid = f"proj-{next(app.ids)}"
         self.folder = tuple(folder)
         self.settings: dict[str, Any] = dict(_PROJECT_SETTINGS)
+        # ProjectAttributes as ProjectManager.GetProjectAttributesInCurrentFolder returns them.
+        self.attributes: dict[str, str] = {
+            "liveCollaborationMode": "single_user",
+            "lastModifiedDate": "2026-10-17T00:00:00+00:00",
+            "creationDate": "2026-10-01T00:00:00+00:00",
+            "notes": "",
+        }
         self.timelines = [FakeTimeline(app, t, f"tl-{next(app.ids)}", self) for t in timelines]
         self.current_timeline: FakeTimeline | None = self.timelines[0] if self.timelines else None
         ids = app.ids
@@ -1045,6 +1079,16 @@ class FakeProjectManager:
     def GetProjectListInCurrentFolder(self) -> list[str]:
         return [p.GetName() for p in self._app.all_projects if p.folder == self._app.pm_path]
 
+    def GetProjectAttributesInCurrentFolder(self) -> dict[str, dict[str, str]]:
+        return {
+            p.GetName(): dict(p.attributes)
+            for p in self._app.all_projects
+            if p.folder == self._app.pm_path
+        }
+
+    def GetCurrentDatabase(self) -> dict[str, str]:
+        return dict(self._app.database)
+
     def LoadProject(self, projectName: str) -> FakeProject | None:
         self._app.calls.append(("LoadProject", projectName))
         # trap: pm-folder-scoped-load: the name is looked up in the current folder only.
@@ -1079,6 +1123,23 @@ class FakeResolve:
     projects in other folders. The Project Manager starts in the current project's folder.
     """
 
+    # resolve.CLOUD_SYNC_* status codes (CloudSyncStatus), observed live 2026-10-17 as floats.
+    # The clip property reads them back as strings (e.g. "-1"), so the op matches numerically.
+    # The sync-MODE codes (NONE 0.0, PROXY_ONLY 1.0, PROXY_AND_ORIG 2.0) collide with these, so
+    # they are kept out of the status map; they are not modelled here (no op reads the mode).
+    CLOUD_SYNC_DEFAULT = -1.0
+    CLOUD_SYNC_DOWNLOAD_IN_QUEUE = 0.0
+    CLOUD_SYNC_DOWNLOAD_IN_PROGRESS = 1.0
+    CLOUD_SYNC_DOWNLOAD_SUCCESS = 2.0
+    CLOUD_SYNC_DOWNLOAD_FAIL = 3.0
+    CLOUD_SYNC_DOWNLOAD_NOT_FOUND = 4.0
+    CLOUD_SYNC_UPLOAD_IN_QUEUE = 5.0
+    CLOUD_SYNC_UPLOAD_IN_PROGRESS = 6.0
+    CLOUD_SYNC_UPLOAD_SUCCESS = 7.0
+    CLOUD_SYNC_UPLOAD_FAIL = 8.0
+    CLOUD_SYNC_UPLOAD_NOT_FOUND = 9.0
+    CLOUD_SYNC_SUCCESS = 10.0
+
     def __init__(
         self,
         projects: dict[str, list[str]],
@@ -1103,6 +1164,16 @@ class FakeResolve:
             "YouTube 1080p": DeliverState(
                 "mp4", "H265", 1, {"TargetDir": "C:/Exports", "CustomName": "yt"}
             )
+        }
+        # ProjectManager.GetCurrentDatabase. Observed live 2026-10-17: a Blackmagic Cloud library
+        # reports DbType "PostgreSQL" with an IpAddress (GetDatabaseList does not list it,
+        # DESIGN F2). The name and IP here are placeholders ("198.51.100.10" is an RFC 5737
+        # documentation address): no real host goes in the repo, and the op must drop IpAddress.
+        # Tests set this to the local database to exercise the local_database note.
+        self.database: dict[str, str] = {
+            "DbType": "PostgreSQL",
+            "DbName": "acme cloud library",
+            "IpAddress": "198.51.100.10",
         }
         self.missing: set[str] = set()
         self.load_silently_fails: set[str] = set()

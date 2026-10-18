@@ -253,6 +253,31 @@ _ALL: tuple[Trap, ...] = (
         ),
         presumed="that the error is never more than 1 frame",
     ),
+    Trap(
+        id="cloud-proxy-only-no-audio",
+        title="Proxy-only cloud media loses audio on a build",
+        symptom="A build (render) of a cloud project whose originals are not synced uses the "
+        "local proxies and comes out with no audio.",
+        cause="In this setup the Blackmagic Cloud proxies carry video only, so a proxy-only "
+        "cloud sync leaves the originals (and their audio) in the cloud. The scripting API "
+        "reads each clip's 'Cloud Sync' status and its 'Proxy'/'Online Status', but not the "
+        "project's cloud sync mode (CloudSyncMode is only a write-time CloudSettings input, "
+        "with no getter).",
+        fix="Before a build, sync the originals (proxy and original) for every clip whose "
+        "original is offline while a proxy is present; do not render while any clip is "
+        "proxy-only.",
+        confirmed=(
+            "the cloud proxies in this setup carry no audio, so a proxy-only build loses audio "
+            f"({REPORTED}); the resolve.CLOUD_SYNC_* status codes are floats (DEFAULT -1.0) while "
+            "the 'Cloud Sync' clip property reads back as a string, 'Proxy' is a resolution, "
+            "'None', '' or 'Offline' (the proxy file itself offline), and a resolution proxy "
+            f"with the original 'Online Status' offline is a common state ({PROBED})"
+        ),
+        presumed=(
+            "the string the 'Cloud Sync' property takes for statuses other than "
+            "CLOUD_SYNC_DEFAULT; every clip seen live read '-1'"
+        ),
+    ),
 )
 
 TRAPS: dict[str, Trap] = {trap.id: trap for trap in _ALL}
