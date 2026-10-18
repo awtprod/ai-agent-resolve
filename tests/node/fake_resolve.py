@@ -1037,6 +1037,8 @@ class FakeProject:
         self.render_complete_after = 2
         self.render_time_ms = 5000
         self.render_error = "render failed: frames offline"
+        # Live 21.1 appends the container extension to the output file name; set this to model it.
+        self.render_output_extension = ""
 
     def GetName(self) -> str:
         return self._name
@@ -1146,12 +1148,13 @@ class FakeProject:
             mark_in = int(settings.get("MarkIn", 0))
             mark_out = int(settings.get("MarkOut", mark_in))
         job_id = f"rj-{next(self._app.ids)}"
+        output_filename = str(settings.get("CustomName", "")) + self.render_output_extension
         info: dict[str, Any] = {
             "JobId": job_id,
             "RenderJobName": str(settings.get("CustomName", "")) or job_id,
             "TimelineName": timeline.GetName() if timeline is not None else "",
             "TargetDir": str(settings.get("TargetDir", "")),
-            "OutputFilename": str(settings.get("CustomName", "")),
+            "OutputFilename": output_filename,
             "FormatWidth": int(settings.get("FormatWidth", 1920)),
             "FormatHeight": int(settings.get("FormatHeight", 1080)),
             "FrameRate": f"{fps:g}" if fps is not None else "",
@@ -1184,6 +1187,10 @@ class FakeProject:
         if len(targets) != len(set(ids)) or not targets:
             return False
         if any(job.status not in ("Ready", "Ready for background render") for job in targets):
+            return False
+        # Resolve renders one job at a time: starting a render while another is in progress
+        # fails. The node must serialise renders per project.
+        if any(job.status == "Rendering" and job.job_id not in ids for job in self.render_jobs):
             return False
         for job in targets:
             job.status = "Rendering"
