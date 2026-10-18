@@ -126,14 +126,27 @@ def _load_pins() -> dict[str, dict[str, list[list[object]]]]:
     return files
 
 
+def _row_key(row: list[object]) -> tuple[tuple[bool, object], ...]:
+    """A sort key that orders rows without comparing ``None`` against ``str``/``int``.
+
+    A marker's colour (unknown bit) or duration can be ``None``, and ``sorted`` on raw rows
+    then raises ``TypeError`` when a ``None`` meets a value at the same position.
+    """
+    return tuple((v is None, v) for v in row)
+
+
 def _marker_rows(markers: list, width: int) -> list[list[object]]:  # type: ignore[type-arg]
     fields = _MARKER_FIELDS[:width]
-    return sorted([getattr(m, f) for f in fields] for m in markers)
+    return sorted(([getattr(m, f) for f in fields] for m in markers), key=_row_key)
 
 
 def _pin_width(rows: list[list[object]]) -> int:
-    """How many marker fields this pins file records (4 for the original form, 6 richer)."""
-    return len(rows[0]) if rows else 4
+    """How many marker fields this pins file records (4 for the original form, 6 richer).
+
+    Taken as the widest row, not the first one, so a richer row is never under-compared when a
+    plainer one happens to come first.
+    """
+    return max((len(row) for row in rows), default=4)
 
 
 @pytest.mark.skipif(not CORPUS, reason="set AAR_DRP_CORPUS to run the corpus checks")
@@ -152,9 +165,11 @@ def test_corpus_markers_match_pinned_values() -> None:
             m for t in drp.timelines for tr in t.tracks for i in tr.items for m in i.markers
         ]
         assert _marker_rows(timeline_markers, _pin_width(pin["timeline"])) == sorted(
-            pin["timeline"]
+            pin["timeline"], key=_row_key
         )
-        assert _marker_rows(item_markers, _pin_width(pin["items"])) == sorted(pin["items"])
+        assert _marker_rows(item_markers, _pin_width(pin["items"])) == sorted(
+            pin["items"], key=_row_key
+        )
         assert all(m.frame_space == "timeline-relative" for m in timeline_markers)
         assert all(m.owner_kind == "item" for m in item_markers)
         assert not any(i.code in ("marker-decode", "orphan-markers") for i in drp.issues)

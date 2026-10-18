@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
 
+from aar import cli_io
 from aar.plan.inputs import LaughMap, Transcript, load_laughs, load_transcript
 from aar.plan.lint import Finding, LintReport, Ref, lint
 from aar.plan.model import EditPlan
 from aar.plan.profile import ProfileError, load_profile
 
+_PROG = "aar plan"
 EXIT_OK = 0
 EXIT_ERRORS = 1  # the plan was linted and has error findings
 EXIT_INPUT = 2  # a file could not be read or parsed, or the profile is invalid
@@ -42,19 +43,17 @@ def register(subparsers: Any) -> None:
 
 
 def _cmd_schema(args: argparse.Namespace) -> int:
-    print(json.dumps(EditPlan.model_json_schema(), indent=2))
-    return EXIT_OK
+    return cli_io.emit(_PROG, json.dumps(EditPlan.model_json_schema(), indent=2) + "\n")
 
 
 def _input_error(kind: str, message: str, details: list[Any], as_json: bool) -> int:
     if as_json:
         body = {"ok": False, "error": {"type": kind, "message": message, "details": details}}
-        print(json.dumps(body, indent=2))
-    else:
-        print(f"error: {message}", file=sys.stderr)
-        for detail in details:
-            where = ".".join(str(part) for part in detail["loc"])
-            print(f"  {where}: {detail['msg']}", file=sys.stderr)
+        return cli_io.emit(_PROG, json.dumps(body, indent=2) + "\n") or EXIT_INPUT
+    cli_io.warn(f"error: {message}")
+    for detail in details:
+        where = ".".join(str(part) for part in detail["loc"])
+        cli_io.warn(f"  {where}: {detail['msg']}")
     return EXIT_INPUT
 
 
@@ -78,10 +77,12 @@ def _cmd_lint(args: argparse.Namespace) -> int:
         )
     except (OSError, json.JSONDecodeError, ProfileError) as exc:
         return _input_error(type(exc).__name__, str(exc), [], as_json)
-    if as_json:
-        print(report.model_dump_json(indent=2))
-    else:
-        print(_format_report(report, len(plan.segments)))
+    out = (
+        report.model_dump_json(indent=2) if as_json else _format_report(report, len(plan.segments))
+    )
+    written = cli_io.emit(_PROG, out + "\n")
+    if written != EXIT_OK:
+        return written
     return EXIT_OK if report.ok else EXIT_ERRORS
 
 

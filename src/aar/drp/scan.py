@@ -219,7 +219,9 @@ class Document:
     comments: list[tuple[int, int, str]]
     issues: list[ScanIssue]
     element_count: int = 0
-    """Elements created (all levels)."""
+    """Scanner nodes materialised at all levels: start/self-closing and end tags, comments,
+    PIs, CDATA, declarations and lone ``<``. The per-file budget is charged against this, so
+    hostile input made only of close tags or comments is bounded too."""
     work: int = 0
     """Bytes examined plus tag-match attempts: a deterministic measure of scanning effort."""
     stopped_at: int | None = None
@@ -270,9 +272,10 @@ class _IssueLog(list[ScanIssue]):
 def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> Document:
     """Scan one XML member into a :class:`Document` without ever raising on malformed input.
 
-    Scanning stops with a ``budget-exceeded`` issue before element number ``max_elements + 1``
-    is created; what was scanned so far is kept and open elements are closed at the end of the
-    member. The scan is linear in ``len(data)``; ``Document.work`` measures it.
+    Scanning stops with a ``budget-exceeded`` issue before node number ``max_elements + 1`` is
+    materialised (``max_elements`` counts every token, not only start elements; see
+    ``Document.element_count``); what was scanned so far is kept and open elements are closed at
+    the end of the member. The scan is linear in ``len(data)``; ``Document.work`` measures it.
     """
     issues = _IssueLog()
     work = 0
@@ -323,6 +326,15 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
         if lt < 0:
             work += len(data) - cursor
             break
+        # Every token the scanner materialises is charged, so a member that is all close tags,
+        # comments or lone "<" trips the budget too, not only one full of start elements. The
+        # check sits at the top so it bounds the work and memory of any token kind.
+        if max_elements is not None and element_count >= max_elements:
+            stopped_at = lt
+            msg = f"node budget of {max_elements} reached; the rest of the member is not read"
+            issues.append(ScanIssue("budget-exceeded", lt, msg))
+            pos = len(data)
+            break
         work += lt - cursor + 1
         nxt = data[lt + 1 : lt + 2]
         found = _delimited(data, lt) if nxt in (b"!", b"?") else None
@@ -331,6 +343,7 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
             kind, inner, inner_end, pos = found
             work += pos - lt
             cursor = pos
+            element_count += 1
             if kind.endswith("!"):
                 kind = kind[:-1]
                 issues.append(
@@ -346,12 +359,14 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
         m = _END.match(data, lt) if nxt == b"/" else _START.match(data, lt)
         work += 1 if m is None else m.end() - lt
         if m is None:
-            # Not markup the scanner understands. Leave it in the pending text, so the next
-            # gap() reports a run of such "<" once rather than once per character.
+            # Not markup the scanner understands. Charge it, then leave it in the pending text
+            # so the next gap() reports a run of such "<" once rather than once per character.
+            element_count += 1
             cursor = lt + 1
             continue
         gap(pos, m.start())
         pos = cursor = m.end()
+        element_count += 1
         end_name = m.group("end") if m.re is _END else None
         if end_name is not None:
             tag = end_name.decode("utf-8", errors="replace")
@@ -370,13 +385,6 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
                 issues.append(ScanIssue("stray-end-tag", m.start(), msg))
             continue
         # Start or self-closing tag.
-        if max_elements is not None and element_count >= max_elements:
-            stopped_at = m.start()
-            msg = f"element budget of {max_elements} reached; the rest of the member is not read"
-            issues.append(ScanIssue("budget-exceeded", m.start(), msg))
-            pos = len(data)
-            break
-        element_count += 1
         tag = m.group("start").decode("utf-8", errors="replace")
         attrs = _decode_attrs(m.group("attrs"), m.start(), issues) if m.group("attrs") else {}
         closed = m.group("close") == b"/"

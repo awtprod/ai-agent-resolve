@@ -76,6 +76,7 @@ from aar.drp.model import (
     TimelineItem,
     Track,
 )
+from aar.drp.reader import DEFAULT_MAX_ELEMENTS, DEFAULT_MAX_TOTAL_XML_BYTES
 
 __all__ = [
     "SECTIONS",
@@ -91,7 +92,14 @@ T = TypeVar("T")
 Key = tuple[Any, ...]
 
 
-def diff_projects(a: DrpFile, b: DrpFile, *, gate: bool = False) -> ProjectDiff:
+def diff_projects(
+    a: DrpFile,
+    b: DrpFile,
+    *,
+    gate: bool = False,
+    max_elements: int = DEFAULT_MAX_ELEMENTS,
+    max_total_xml_bytes: int = DEFAULT_MAX_TOTAL_XML_BYTES,
+) -> ProjectDiff:
     """Compare ``a`` (before) with ``b`` (after).
 
     Both files are reopened to compare what the model does not decode; they must not have
@@ -99,11 +107,13 @@ def diff_projects(a: DrpFile, b: DrpFile, *, gate: bool = False) -> ProjectDiff:
     :class:`~aar.drp.diff_model.DiffError` when either file cannot be read whole, when they
     cannot be reopened, or when they have changed. ``gate=True`` asks for the S8 gate: no
     heuristic marker pairing, and the verdict shown in the text rendering (``ProjectDiff.gate``
-    is computed either way).
+    is computed either way). ``max_elements`` and ``max_total_xml_bytes`` bound the re-read and
+    re-scan the opaque compare does, with the reader's defaults; a member past either raises
+    :class:`~aar.drp.diff_model.DiffError`.
     """
     _check_readable("A", a)
     _check_readable("B", b)
-    return _Differ(a, b, gate).run()
+    return _Differ(a, b, gate, max_elements, max_total_xml_bytes).run()
 
 
 def _check_readable(side: str, drp: DrpFile) -> None:
@@ -302,9 +312,18 @@ class _Placed:
 
 
 class _Differ:
-    def __init__(self, a: DrpFile, b: DrpFile, gate: bool = False) -> None:
+    def __init__(
+        self,
+        a: DrpFile,
+        b: DrpFile,
+        gate: bool = False,
+        max_elements: int = DEFAULT_MAX_ELEMENTS,
+        max_total_xml_bytes: int = DEFAULT_MAX_TOTAL_XML_BYTES,
+    ) -> None:
         self.a, self.b = a, b
         self.gate = gate
+        self.max_elements = max_elements
+        self.max_total_xml_bytes = max_total_xml_bytes
         self.duplicates: list[str] = []
         self.relocated: set[Key] = set()
         # media clip id -> the bin whose MediaVec lists it (its actual container)
@@ -348,7 +367,11 @@ class _Differ:
             self.timeline_rank[pair.key] = rank
             self._timeline(pair)
         self._bin_orders(bin_pairs)
-        sources = (Source(self.a, "A"), Source(self.b, "B"))
+        budgets = {
+            "max_elements": self.max_elements,
+            "max_total_xml_bytes": self.max_total_xml_bytes,
+        }
+        sources = (Source(self.a, "A", **budgets), Source(self.b, "B", **budgets))
         try:
             engine = OpaqueEngine(
                 sources,

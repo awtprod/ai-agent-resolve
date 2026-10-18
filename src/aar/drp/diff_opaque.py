@@ -56,7 +56,12 @@ from aar.drp.container import Container, open_container, parse_version_header
 from aar.drp.diff_model import REPORTED_FIELDS, Change, Ctx, DiffError, same_value
 from aar.drp.errors import BlobError, ContainerError
 from aar.drp.model import DrpFile, MediaClip, Provenance
-from aar.drp.reader import MARKER_COLORS, join_clip_path
+from aar.drp.reader import (
+    DEFAULT_MAX_ELEMENTS,
+    DEFAULT_MAX_TOTAL_XML_BYTES,
+    MARKER_COLORS,
+    join_clip_path,
+)
 from aar.drp.scan import Document, Element, scan
 
 __all__ = ["Cover", "OpaqueEngine", "Source", "Unit", "member_root"]
@@ -73,6 +78,20 @@ _FRAME_RATE_HINT = re.compile(r"\d+(\.\d+)?")
 _PATH_SEP = re.compile(r"[\\/]")
 _APP_VALUE = re.compile(rb'(\bDbAppVer\s*=\s*")[^"]*(")')
 _PRJ_VALUE = re.compile(rb'(\bDbPrjVer\s*=\s*")[^"]*(")')
+
+
+def _mask_last(pattern: re.Pattern[bytes], data: bytes) -> bytes:
+    """Blank the value of only the *last* match of ``pattern`` in ``data``.
+
+    The header section compares a stamp attribute through an attribute dict, so a repeated
+    ``DbAppVer``/``DbPrjVer`` resolves to its last value. Masking only that occurrence here
+    leaves any earlier duplicate in the byte comparison, so editing it is still reported.
+    """
+    matches = list(pattern.finditer(data))
+    if not matches:
+        return data
+    m = matches[-1]
+    return data[: m.start()] + m.group(1) + m.group(2) + data[m.end() :]
 
 
 def member_root(member: str) -> Provenance:
@@ -131,11 +150,25 @@ class Source:
     never a difference.
     """
 
-    def __init__(self, drp: DrpFile, side: str = "A") -> None:
+    def __init__(
+        self,
+        drp: DrpFile,
+        side: str = "A",
+        *,
+        max_elements: int = DEFAULT_MAX_ELEMENTS,
+        max_total_xml_bytes: int = DEFAULT_MAX_TOTAL_XML_BYTES,
+    ) -> None:
         self.drp = drp
         self.side = side
         self._raw: dict[str, bytes] = {}
         self._docs: dict[str, Document] = {}
+        # Re-reading and re-scanning for the opaque compare uses the same per-file budgets as
+        # the reader, charged cumulatively, so a hostile member cannot be read or scanned whole
+        # here even though the reader already bounded its own pass.
+        self._max_elements = max_elements
+        self._elements_left = max_elements
+        self._xml_bytes_left = max_total_xml_bytes
+        self._member_sizes = {m.name: m.size for m in drp.members}
         try:
             self.container: Container = open_container(drp.path)
         except ContainerError as exc:
@@ -146,15 +179,30 @@ class Source:
 
     def data(self, name: str) -> bytes:
         if name not in self._raw:
+            size = self._member_sizes.get(name, 0)
+            if self._xml_bytes_left <= 0 or size > self._xml_bytes_left:
+                raise DiffError(
+                    f"{self.side}: member {name} ({size} bytes) exceeds the remaining XML "
+                    f"budget ({self._xml_bytes_left} bytes); raise max_total_xml_bytes to compare"
+                )
             try:
-                self._raw[name] = self.container.read(name)
+                raw = self.container.read(name, max_bytes=self._xml_bytes_left)
             except ContainerError as exc:
                 raise DiffError(f"{self.side}: member {name} cannot be read: {exc}") from exc
+            self._xml_bytes_left -= len(raw)
+            self._raw[name] = raw
         return self._raw[name]
 
     def doc(self, name: str) -> Document:
         if name not in self._docs:
-            self._docs[name] = scan(self.data(name), name)
+            doc = scan(self.data(name), name, max_elements=max(self._elements_left, 0))
+            self._elements_left -= doc.element_count
+            if doc.stopped_at is not None:
+                raise DiffError(
+                    f"{self.side}: member {name} exceeds the element budget of "
+                    f"{self._max_elements} nodes; raise max_elements to compare"
+                )
+            self._docs[name] = doc
         return self._docs[name]
 
     def whole(self) -> bytes:
@@ -578,9 +626,11 @@ class OpaqueEngine:
             versions.append(v)
             stamps.append((v.app_version, v.project_version) if v is not None else None)
         va, vb = versions
-        # DbAppVer is always owned by the header (it compares the raw text), so its value is
-        # always masked. DbPrjVer is masked only for a genuine int change, which the header
-        # reports too; otherwise its raw bytes stay in for the comparison below.
+        # DbAppVer is owned by the header (it compares the raw text), so its value is masked.
+        # DbPrjVer is masked only for a genuine int change, which the header reports too;
+        # otherwise its raw bytes stay in for the comparison below. Only the *last* occurrence
+        # of each is masked (the one the header's attribute dict compares), so an edited earlier
+        # duplicate is still caught here.
         mask_prj = (
             va is not None
             and vb is not None
@@ -593,9 +643,9 @@ class OpaqueEngine:
             if v is None:
                 masked.append(head)
                 continue
-            comment = _APP_VALUE.sub(rb"\1\2", head[v.offset : v.end])
+            comment = _mask_last(_APP_VALUE, head[v.offset : v.end])
             if mask_prj:
-                comment = _PRJ_VALUE.sub(rb"\1\2", comment)
+                comment = _mask_last(_PRJ_VALUE, comment)
             masked.append(head[: v.offset] + comment + head[v.end :])
         if masked[0] != masked[1]:
             count, _ = _diff_size(heads[0], heads[1])
