@@ -232,3 +232,36 @@ def test_fg_bin_rule_compares_field_bytes(tmp_path: Path) -> None:
     c = edit_zip(H264, tmp_path / "c" / "c.drp", {POOL: with_blob(blob(301, padded_5))})
     assert blobs.decode_protobuf(padded_5, nested_depth=0)[0].value == 1
     assert [r.code for r in compare_round_trip(a, c).refusals] == ["unexplained-opaque"]
+
+
+# --------------------------------------------------------------------------- F-F
+
+
+@pytest.mark.parametrize(
+    ("row", "path", "mapped"),
+    [
+        ("E:\\Straße", "E:\\STRASSE\\a.mov", None),  # full case folding would match these
+        ("E:\\STRASSE", "e:\\straße\\a.mov", None),
+        ("E:\\ﬁles", "E:\\FILES\\a.mov", None),  # the fi ligature folds to "fi"
+        ("E:\\\u212a", "E:\\k\\a.mov", None),  # KELVIN SIGN folds to "k"; NTFS keeps it apart
+        ("E:\\Straße", "E:\\STRAßE\\a.mov", "/Volumes/M/a.mov"),  # ß has no simple uppercase
+        ("E:\\Ärger", "e:\\äRGER\\a.mov", "/Volumes/M/a.mov"),
+        ("E:\\Σίσυφος", "E:\\ΣΊΣΥΦΟΣ\\a.mov", "/Volumes/M/a.mov"),
+    ],
+    ids=["sharp-s-row", "sharp-s-path", "ligature", "kelvin", "sharp-s-kept", "umlaut", "greek"],
+)
+def test_ff_windows_names_compare_like_ntfs(row: str, path: str, mapped: str | None) -> None:
+    from aar.drp.modify.paths import PathMapper
+
+    result = PathMapper("windows_to_mac", [(row, "/Volumes/M")]).map(path)
+    assert result.new == mapped
+    if mapped is None:
+        assert result.reason == "no-mapping"
+
+
+def test_ff_rows_that_differ_only_under_full_folding_are_distinct() -> None:
+    from aar.drp.modify.paths import PathMapper
+
+    m = PathMapper("windows_to_mac", [("E:\\Straße", "/Volumes/A"), ("E:\\STRASSE", "/Volumes/B")])
+    assert m.map("E:\\straße\\x").new == "/Volumes/A/x"
+    assert m.map("E:\\strasse\\x").new == "/Volumes/B/x"

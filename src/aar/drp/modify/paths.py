@@ -5,8 +5,9 @@ Mac prefix (``/Volumes/Media``, or any absolute POSIX prefix). Matching is by wh
 components, and the longest matching prefix wins:
 
 * Windows side: separators ``\\`` and ``/`` are both accepted, and every component is compared
-  case-insensitively (drive letters included), because Windows file names are. The rest of the
-  path keeps its own spelling; drive letters are written upper-case.
+  case-insensitively the way NTFS does it (:func:`ntfs_upper`: a simple one-to-one uppercase
+  mapping, so ``Straße`` is not ``STRASSE``), drive letters included. The rest of the path
+  keeps its own spelling; drive letters are written upper-case.
 * Mac side: compared exactly (case-sensitively), because Mac volumes can be case-sensitive.
 
 UNC paths are mapped only by an entry whose Windows side is a UNC prefix; a UNC path no entry
@@ -22,7 +23,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
-__all__ = ["Direction", "MapResult", "PathMapper", "TableError"]
+__all__ = ["Direction", "MapResult", "PathMapper", "TableError", "ntfs_upper"]
 
 Direction = Literal["windows_to_mac", "mac_to_windows"]
 
@@ -49,7 +50,7 @@ class _Win:
     trailing_sep: bool
 
     def key(self) -> tuple[str, ...]:
-        return (self.root.casefold(), *(p.casefold() for p in self.parts))
+        return (ntfs_upper(self.root), *(ntfs_upper(p) for p in self.parts))
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +65,21 @@ class MapResult:
 
     new: str | None
     reason: str | None = None
+
+
+def ntfs_upper(name: str) -> str:
+    """``name`` upper-cased one character at a time, the way NTFS compares names.
+
+    NTFS maps each UTF-16 unit through its upcase table (a simple, one-to-one mapping), so
+    ``Straße`` and ``STRASSE`` are different names, and so are ``k`` and the Kelvin sign.
+    Python's ``casefold`` and ``upper`` use full mappings (``ß`` -> ``ss``/``SS``), which would
+    call them equal. A character whose full uppercase is not one character keeps its spelling.
+    """
+    out = []
+    for ch in name:
+        up = ch.upper()
+        out.append(up if len(up) == 1 else ch)
+    return "".join(out)
 
 
 def _parse_win(path: str) -> _Win | None:
