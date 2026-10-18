@@ -48,6 +48,11 @@ _MAX_TAIL = 1000
 MAX_RESULT_DEPTH = 64
 ELIDED = "<elided: nested deeper than 64 levels>"
 
+_MAX_PROJECT_ID = 256
+_MAX_BOARD_ROWS = 500
+_MAX_BRANCHES_PAGE = 100
+_MAX_BRANCHES_LIMIT = 500
+
 
 def _bounded(value: Any, depth: int = 0) -> Any:
     """``value`` with anything nested deeper than ``MAX_RESULT_DEPTH`` replaced by a marker.
@@ -271,8 +276,13 @@ def build_server(
         annotations=_READ_ONLY,
     )
     def project_board(project_id: str) -> dict[str, Any]:
+        if not isinstance(project_id, str) or not 0 < len(project_id) <= _MAX_PROJECT_ID:
+            raise ToolError(f"project_id must be 1 to {_MAX_PROJECT_ID} characters")
         board = collab_project_board(log, project_id, clock=clock)
-        return {**board.to_dict(), "skipped": skipped_summary(board.skipped)}
+        data = board.to_dict()
+        data["leases"] = data["leases"][:_MAX_BOARD_ROWS]
+        data["presence"] = data["presence"][:_MAX_BOARD_ROWS]
+        return {**data, "skipped": skipped_summary(board.skipped)}
 
     @server.tool(
         name="agent_branches",
@@ -280,13 +290,25 @@ def build_server(
             "List the agent branch timelines recorded for a project. Each entry has the "
             "source timeline (id, name), the owning agent_id, the branch timeline (id, name), "
             "its version, and a handoff note (merging back is a human step: Compare "
-            "Timelines). Omit project_id for every project."
+            'Timelines). Returns {"branches": [...], "next_cursor": N|null}; pass next_cursor '
+            "back as cursor to page. Omit project_id for every project."
         ),
         annotations=_READ_ONLY,
     )
-    def agent_branches(project_id: str | None = None) -> dict[str, Any]:
+    def agent_branches(
+        project_id: str | None = None, cursor: int = 0, limit: int = _MAX_BRANCHES_PAGE
+    ) -> dict[str, Any]:
+        if project_id is not None and (
+            not isinstance(project_id, str) or not 0 < len(project_id) <= _MAX_PROJECT_ID
+        ):
+            raise ToolError(f"project_id must be 1 to {_MAX_PROJECT_ID} characters")
+        if cursor < 0:
+            raise ToolError("cursor must not be negative")
+        limit = max(1, min(_MAX_BRANCHES_LIMIT, limit))
         found = collab_branches(log, project_id)
-        return {"branches": [branch.to_dict() for branch in found]}
+        page = found[cursor : cursor + limit]
+        next_cursor = cursor + limit if cursor + limit < len(found) else None
+        return {"branches": [branch.to_dict() for branch in page], "next_cursor": next_cursor}
 
     @server.tool(
         name="approvals_list",

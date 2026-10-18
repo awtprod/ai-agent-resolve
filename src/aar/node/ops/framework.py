@@ -43,7 +43,7 @@ from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from aar.node.branches import is_agent_branch
+from aar.node.branch_registry import BranchRegistry
 from aar.node.broker import Broker, HotOp, HotOpFailure, running_op_id
 from aar.node.gateway import GatewayError, ResolveGateway
 from aar.node.leases import Holder
@@ -153,6 +153,9 @@ class OpSpec:
     traps: tuple[str, ...] = ()
     needs_current_timeline: bool = False
     """The op acts on Resolve's current timeline (e.g. ``AppendToTimeline``)."""
+    creates_timeline: bool = False
+    """The op builds a timeline from a ``source`` (``timeline.duplicate``, ``timeline.branch``),
+    so the branch guard exempts it: branching off a human timeline must stay allowed."""
     _body: OpFn = field(default=lambda env, params: None, repr=False, compare=False)
 
     def describe(self) -> dict[str, Any]:
@@ -178,6 +181,7 @@ def op(
     hot: bool = True,
     traps: tuple[str, ...] = (),
     needs_current_timeline: bool = False,
+    creates_timeline: bool = False,
 ) -> Callable[[OpFn], OpFn]:
     """Register an op body under ``name``."""
     for trap_id in traps:
@@ -204,6 +208,7 @@ def op(
             summary,
             traps,
             needs_current_timeline,
+            creates_timeline,
             _body=guarded,
         )
         return guarded
@@ -231,7 +236,14 @@ class OpEnv:
     Only the broker's run of an op can build one.
     """
 
-    def __init__(self, gateway: ResolveGateway, target: ProjectLocator) -> None:
+    def __init__(
+        self,
+        gateway: ResolveGateway,
+        target: ProjectLocator,
+        *,
+        holder: Holder | None = None,
+        branch_registry: BranchRegistry | None = None,
+    ) -> None:
         op_id = running_op_id()
         if op_id is None:
             raise _outside_broker("OpEnv")
@@ -246,6 +258,10 @@ class OpEnv:
         self.gateway = gateway
         self.resolve = resolve
         self.target = target
+        self.holder = holder
+        """The lease holder this op runs for; agent branches are owned by this holder's id."""
+        self.branch_registry = branch_registry
+        """The node's owner registry; ``timeline.branch`` writes it, the guard reads it."""
 
     # -- project -------------------------------------------------------------------------
 
@@ -457,30 +473,50 @@ class OpEnv:
         return other
 
 
-def _assert_branch(env: OpEnv, spec: OpSpec, params: OpModel) -> None:
-    """Refuse an editing op aimed at a timeline that is not an agent branch.
+_BRANCH_FIX = (
+    "branch the timeline with timeline.branch and edit the copy you own, or request a "
+    "project.write approval so the runner may override the guard"
+)
 
-    Agents edit a branch (``timeline.branch``), never a human's timeline (DESIGN R3). The
-    guard is here, in the one choke point every op body passes, because this is where the
-    open project is already asserted and the op's real, current timeline can be read by
-    identity. It fires only for a mutating op that names a ``timeline`` it edits; ops that
-    build a copy from a ``source`` (``timeline.duplicate``, ``timeline.branch``) carry no
-    ``timeline`` field, so branching off a human timeline is never blocked, and
-    ``grades.copy`` may still read a grade from a human ``reference_timeline``.
+
+def _assert_branch(env: OpEnv, spec: OpSpec, params: OpModel) -> None:
+    """Refuse a mutating op that does not edit an agent branch owned by the caller.
+
+    Agents edit a branch they made, never a human's timeline nor shared project state
+    (DESIGN R3). The guard is here, the one choke point every op body passes, because the
+    open project is already asserted and the op's real timeline can be read by identity.
+
+    - ``timeline.duplicate`` / ``timeline.branch`` build a copy from a ``source`` and are
+      exempt (``creates_timeline``): branching off a human timeline must stay allowed.
+    - An op that edits a ``timeline`` must target one registered to the calling agent in the
+      node's :class:`~aar.node.branch_registry.BranchRegistry`. Ownership is by unique id,
+      never by name, so a human timeline that looks like a branch, or a copy of a branch
+      (which gets a fresh id), never passes.
+    - Any other mutating op (e.g. ``clip.set_input_color_space``) changes state every human
+      timeline shares; it is refused unless the approval override is set.
     """
-    if not (spec.mutates and "timeline" in type(params).model_fields):
+    if not spec.mutates or spec.creates_timeline:
         return
+    holder = env.holder
+    agent_id = holder.id if holder is not None and not holder.is_human else None
+    registry = env.branch_registry
+    if "timeline" not in type(params).model_fields:
+        raise OpError(
+            "requires_approval",
+            f"op {spec.name} changes shared project state, not an agent branch",
+            _BRANCH_FIX,
+        )
     timeline = env.timeline(params.timeline)
     name = str(timeline.GetName())
-    if not is_agent_branch(name):
+    uid = str(timeline.GetUniqueId())
+    if registry is None or agent_id is None or not registry.owned_by(uid, agent_id):
         raise OpError(
             "not_an_agent_branch",
-            f"op {spec.name} edits timeline {name!r}, which is not an agent branch; agents "
-            f"must not edit a human's timeline",
-            "branch it first with timeline.branch and edit the copy, or pass "
-            "require_branch=False to edit a production timeline deliberately",
+            f"op {spec.name} edits timeline {name!r} [{uid}], which is not an agent branch "
+            f"owned by {holder}; agents must not edit a human's timeline",
+            _BRANCH_FIX,
             timeline=name,
-            timeline_id=str(timeline.GetUniqueId()),
+            timeline_id=uid,
         )
 
 
@@ -490,10 +526,12 @@ def _execute(
     target: ProjectLocator,
     params: OpModel,
     *,
-    require_branch: bool = False,
+    require_branch: bool = True,
+    holder: Holder | None = None,
+    branch_registry: BranchRegistry | None = None,
 ) -> Any:
     """Run one op body after asserting the open project. Only the broker gets here."""
-    env = OpEnv(gateway, target)
+    env = OpEnv(gateway, target, holder=holder, branch_registry=branch_registry)
     env.assert_project()
     if require_branch:
         _assert_branch(env, spec, params)
@@ -514,13 +552,16 @@ def make_hot_op(
     holder: Holder,
     priority: int = 0,
     abort_batch_on_failure: bool = False,
-    require_branch: bool = False,
+    require_branch: bool = True,
+    branch_registry: BranchRegistry | None = None,
 ) -> HotOp:
     """Validate ``params`` and wrap op ``name`` in a broker ``HotOp`` aimed at ``target``.
 
-    ``require_branch`` refuses an editing op whose timeline is not an agent branch (DESIGN
-    R3). It is off by default so the verified op library keeps its own behaviour; the
-    agent-facing path (the S7 runner) sets it, and the override is ``require_branch=False``.
+    ``require_branch`` is on by default: a mutating op must edit an agent branch the
+    ``holder`` owns (see :func:`_assert_branch`), so an agent never touches a human's
+    timeline or shared project state by accident. The only way past it is an explicit
+    ``require_branch=False``, which the S7 runner sets after it has consumed a
+    ``project.write`` approval token. ``branch_registry`` is the node's owner registry.
     """
     spec = get_op(name)
     if not spec.hot:
@@ -539,7 +580,15 @@ def make_hot_op(
     def run(gateway: ResolveGateway) -> Any:
         if running_op_id() != op_id:
             raise _outside_broker(f"op {name}")
-        return _execute(spec, gateway, target, checked, require_branch=require_branch)
+        return _execute(
+            spec,
+            gateway,
+            target,
+            checked,
+            require_branch=require_branch,
+            holder=holder,
+            branch_registry=branch_registry,
+        )
 
     return HotOp(
         project=target,
@@ -617,12 +666,13 @@ def submit_op(
     holder: Holder,
     priority: int = 0,
     abort_batch_on_failure: bool = False,
-    require_branch: bool = False,
+    require_branch: bool = True,
+    branch_registry: BranchRegistry | None = None,
 ) -> str:
     """Queue op ``name`` on ``broker``; returns the broker op id (see ``Broker.result``).
 
-    ``require_branch`` refuses an editing op on a non-branch timeline (see
-    :func:`make_hot_op`).
+    ``require_branch`` is on by default: a mutating op must edit an agent branch the holder
+    owns (see :func:`make_hot_op`). ``branch_registry`` is the node's owner registry.
     """
     return broker.submit(
         make_hot_op(
@@ -633,5 +683,6 @@ def submit_op(
             priority=priority,
             abort_batch_on_failure=abort_batch_on_failure,
             require_branch=require_branch,
+            branch_registry=branch_registry,
         )
     )
