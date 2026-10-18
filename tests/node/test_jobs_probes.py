@@ -57,6 +57,39 @@ def test_l5_approval_policy_fails_closed_and_rejects_a_string() -> None:
         ApprovalPolicy(live=True, sandbox_exempt="p1")  # type: ignore[arg-type]
 
 
+def test_r01_approval_policy_defaults_to_production() -> None:
+    assert ApprovalPolicy().live is True  # fail closed by default
+    assert ApprovalPolicy().is_production("any-project") is True
+
+
+# -- R19: a stalled project still stops scheduling after a restart -----------------------------
+
+
+def test_r19_stalled_project_blocks_scheduling_across_restart(tmp_path: Path) -> None:
+    from aar.node.leases import Holder, Scope, project_key
+
+    world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=10.0)))
+    lease = world.leases.acquire(
+        Holder.human("andrew"), Scope.PROJECT, project_key(world.pid()), None
+    )
+    a = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    world.runner.pump()
+    world.clock.advance(15.0)
+    world.runner.pump()
+    assert world.runner.get(a).state == JobState.STALLED.value
+    world.leases.release(lease.id, Holder.human("andrew"))
+
+    runner = world.restart(watchdog=Watchdog(WatchdogConfig(op_timeout=10.0)))
+    assert runner.get(a).state == JobState.STALLED.value
+    b = runner.submit("ops.sequence", _markers(200), world.locator())
+    runner.pump()
+    assert runner.get(b).state == JobState.QUEUED.value  # the stalled project blocks it
+    runner.resume(a)
+    runner.run_until_settled()
+    assert runner.get(a).state == JobState.SUCCEEDED.value
+    assert runner.get(b).state == JobState.SUCCEEDED.value
+
+
 def _markers(frame: int) -> dict:
     return {"steps": [{"op": "markers.add", "params": {"markers": [{"frame": frame}]}}]}
 
