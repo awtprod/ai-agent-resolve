@@ -30,6 +30,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import stat
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -250,10 +252,16 @@ def _read_input(path: Path, max_bytes: int) -> bytes:
     return data
 
 
-def _temp(directory: Path, name: str, data: bytes) -> Path:
-    # The temporary file keeps the final suffix, so it reads exactly as the final file will.
+def _temp(directory: Path, name: str, data: bytes, mode: int | None = None) -> Path:
+    """Write ``data`` to a new temporary file next to its final ``name``.
+
+    The temporary file keeps the final suffix, so it reads exactly as the final file will.
+    ``mode`` sets its permission bits (mkstemp creates files 0600).
+    """
     fd, tmp = tempfile.mkstemp(prefix=f".{name}.", suffix=f".tmp{Path(name).suffix}", dir=directory)
     try:
+        if mode is not None:
+            os.chmod(tmp, mode)
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
             fh.flush()
@@ -262,6 +270,25 @@ def _temp(directory: Path, name: str, data: bytes) -> Path:
         Path(tmp).unlink(missing_ok=True)
         raise
     return Path(tmp)
+
+
+def _backup(directory: Path, sidecar: Path) -> Path | None:
+    """A hard link (else a copy) of an existing label, named like our temporary files."""
+    if not sidecar.is_file():
+        return None
+    fd, name = tempfile.mkstemp(prefix=f".{sidecar.name}.", suffix=".tmp.json", dir=directory)
+    os.close(fd)
+    backup = Path(name)
+    try:
+        backup.unlink()
+        try:
+            os.link(sidecar, backup)
+        except OSError:
+            shutil.copy2(sidecar, backup)
+    except BaseException:
+        backup.unlink(missing_ok=True)
+        raise
+    return backup
 
 
 def _place(tmp: Path, dest: Path, force: bool) -> None:
@@ -308,6 +335,8 @@ def edit_file(
     if outcome.refusals:
         return outcome
     original = _read_input(path, max_input_bytes)
+    # Outputs get the input's permission bits (execute and special bits dropped).
+    mode = stat.S_IMODE(path.stat().st_mode) & 0o666
     if hashlib.sha256(original).hexdigest() != drp.sha256:
         outcome.refusals = [Refusal("input-changed", "the input changed on disk while it was read")]
         return outcome
@@ -330,7 +359,7 @@ def edit_file(
             name = (out_path.name if out_path else path.name) or "out.drp"
         else:
             directory, name = out_path.parent, out_path.name
-        tmp = _temp(directory, name, new_bytes)
+        tmp = _temp(directory, name, new_bytes, mode)
         stack.callback(tmp.unlink, missing_ok=True)
         check = verify_write(path, tmp, prepared.expected, prepared.members())
         if check.diff is not None:
@@ -357,14 +386,21 @@ def edit_file(
         record = outcome.to_dict()
         record["status"] = LABEL
         label = json.dumps(record, indent=1, ensure_ascii=True, allow_nan=False) + "\n"
-        side_tmp = _temp(directory, sidecar.name, label.encode("ascii"))
+        side_tmp = _temp(directory, sidecar.name, label.encode("ascii"), mode)
         stack.callback(side_tmp.unlink, missing_ok=True)
+        # With --force, the label being replaced is kept until the new file is in place.
+        backup = _backup(directory, sidecar) if force else None
+        if backup is not None:
+            stack.callback(backup.unlink, missing_ok=True)
         try:
             _place(side_tmp, sidecar, force)
             try:
                 _place(tmp, out_path, force)
             except BaseException:
-                sidecar.unlink(missing_ok=True)
+                if backup is not None:
+                    os.replace(backup, sidecar)
+                else:
+                    sidecar.unlink(missing_ok=True)
                 raise
         except FileExistsError as exc:
             outcome.status = "refused"

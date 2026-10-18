@@ -22,6 +22,7 @@ from aar.drp import blobs
 from aar.drp.modify import compare_round_trip, encode, parse_plan
 from aar.drp.modify.encode import EncodeError
 from aar.drp.modify.write import SIDECAR_SUFFIX, edit_file
+from aar.drp.modify.write import leftovers as stale_temp_files
 from aar.drp.reader import read_drp
 
 MAC_DIR = "/Users/samuelgursky/Desktop"
@@ -35,10 +36,6 @@ def plan(*edits: dict[str, Any], **top: Any) -> Any:
 def run(src: Path, tmp_path: Path, *edits: dict[str, Any], **kw: Any) -> Any:
     out = tmp_path / "out.drp"
     return edit_file(src, plan(*edits), out, **kw), out
-
-
-def leftovers(directory: Path) -> list[str]:
-    return sorted(p.name for p in directory.iterdir() if p.name.startswith("."))
 
 
 # --------------------------------------------------------------------------- F-A
@@ -404,3 +401,55 @@ def test_fh_multi_field_update_keeps_undecoded_fields(tmp_path: Path) -> None:
     assert (m.frame, m.name, m.note, m.color, m.custom_data) == (12, "Big", "n", "Red", "agent:7")
     with zipfile.ZipFile(out) as zf:
         assert UNDECODED.hex().encode() in zf.read("project.xml")
+
+
+# --------------------------------------------------------------------------- F-E
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o640, 0o600, 0o444])
+def test_fe_output_and_sidecar_take_the_input_mode(tmp_path: Path, mode: int) -> None:
+    src = tmp_path / "in.drp"
+    src.write_bytes(H264.read_bytes())
+    src.chmod(mode)
+    (tmp_path / "o").mkdir()
+    out = tmp_path / "o" / "out.drp"
+    outcome = edit_file(src, plan(RENAME), out)
+    assert outcome.status == "written"
+    sidecar = Path(str(out) + SIDECAR_SUFFIX)
+    assert (out.stat().st_mode & 0o777, sidecar.stat().st_mode & 0o777) == (mode, mode)
+
+
+def _fail_placing(monkeypatch: pytest.MonkeyPatch, target_suffix: str) -> None:
+    from aar.drp.modify import write
+
+    real = write._place
+
+    def place(tmp: Path, dest: Path, force: bool) -> None:
+        if dest.name.endswith(target_suffix):
+            raise OSError(28, "No space left on device")
+        real(tmp, dest, force)
+
+    monkeypatch.setattr(write, "_place", place)
+
+
+def test_fe_force_keeps_the_old_sidecar_when_placing_the_file_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, out = run(H264, tmp_path, RENAME)
+    assert first.status == "written"
+    sidecar = Path(str(out) + SIDECAR_SUFFIX)
+    old_label, old_file = sidecar.read_bytes(), out.read_bytes()
+    _fail_placing(monkeypatch, ".drp")
+    with pytest.raises(OSError, match="No space"):
+        edit_file(H264, plan({**RENAME, "new_name": "y"}), out, force=True)
+    assert sidecar.read_bytes() == old_label and out.read_bytes() == old_file
+    assert stale_temp_files(out) == []
+
+
+def test_fe_a_failed_placement_removes_the_new_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fail_placing(monkeypatch, ".drp")
+    with pytest.raises(OSError, match="No space"):
+        run(H264, tmp_path, RENAME)
+    assert list(tmp_path.iterdir()) == []
