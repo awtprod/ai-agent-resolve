@@ -39,9 +39,10 @@ def test_element_budget_charges_cumulatively_across_members(tmp_path: Path) -> N
     # (the bug this guards against) would read both whole and trip nothing.
     path = small_drp(tmp_path / "c.drp")
     with zipfile.ZipFile(path, "a", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("GalA.xml", xml("<G>" + "<a/>" * 40 + "</G>"))  # 41 elements
-        zf.writestr("GalB.xml", xml("<G>" + "<a/>" * 40 + "</G>"))  # 41 elements
-    drp = read_drp(path, check_blobs=True, max_elements=60)
+        zf.writestr("GalA.xml", xml("<G>" + "<a/>" * 40 + "</G>"))  # 44 tokens (incl. prolog)
+        zf.writestr("GalB.xml", xml("<G>" + "<a/>" * 40 + "</G>"))  # 44 tokens
+    # 80 holds the small members plus GalA but not GalB; a per-member budget would read both.
+    drp = read_drp(path, check_blobs=True, max_elements=80)
     [stop] = issues(drp, "scan-budget-exceeded")
     assert stop.message.startswith("1 member(s)")
 
