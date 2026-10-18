@@ -151,7 +151,9 @@ def test_corpus_markers_match_pinned_values() -> None:
         item_markers = [
             m for t in drp.timelines for tr in t.tracks for i in tr.items for m in i.markers
         ]
-        assert _marker_rows(timeline_markers, _pin_width(pin["timeline"])) == sorted(pin["timeline"])
+        assert _marker_rows(timeline_markers, _pin_width(pin["timeline"])) == sorted(
+            pin["timeline"]
+        )
         assert _marker_rows(item_markers, _pin_width(pin["items"])) == sorted(pin["items"])
         assert all(m.frame_space == "timeline-relative" for m in timeline_markers)
         assert all(m.owner_kind == "item" for m in item_markers)

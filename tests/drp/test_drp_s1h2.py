@@ -139,14 +139,12 @@ def test_non_finite_retime_speed_is_rejected_by_the_decoder() -> None:
 def test_non_finite_retime_speed_stays_null_and_valid_json(make_zip) -> None:  # type: ignore[no-untyped-def]
     extra = (
         '<Element><Sm2TiVideoClip DbId="i9"><Name>retimed</Name><Start>0</Start>'
-        '<Duration>10</Duration><In>0</In><MediaRef>clip1</MediaRef>'
+        "<Duration>10</Duration><In>0</In><MediaRef>clip1</MediaRef>"
         f"<MediaTimemapBA>{_retimed_timemap(1.0, float('inf'))}</MediaTimemapBA>"
         "</Sm2TiVideoClip></Element>"
     )
     drp = read_drp(make_zip("tm.drp", members(extra_item=extra)))
-    item = next(
-        i for t in drp.timelines for tr in t.tracks for i in tr.items if i.id == "i9"
-    )
+    item = next(i for t in drp.timelines for tr in t.tracks for i in tr.items if i.id == "i9")
     assert item.speed is None  # null, not inf
     assert any(i.code == "blob-decode" and "MediaTimemapBA" in i.message for i in drp.issues)
     text = json.dumps(drp.to_dict(), ensure_ascii=True)
@@ -197,7 +195,10 @@ def test_hostile_input_in_each_budgeted_class_stays_bounded(tmp_path: Path, kind
         blob = _qcompress(2 * 1024 * 1024, 1024).hex()
         with zipfile.ZipFile(path, "a", zipfile.ZIP_DEFLATED) as zf:
             cache = f"<X><RenderCacheBA>{blob}</RenderCacheBA></X>" * 50
-            zf.writestr("MediaPool/Master/Bomb/MpFolder.xml", xml(f"<Sm2MpFolder DbId='z'>{cache}</Sm2MpFolder>"))
+            zf.writestr(
+                "MediaPool/Master/Bomb/MpFolder.xml",
+                xml(f"<Sm2MpFolder DbId='z'>{cache}</Sm2MpFolder>"),
+            )
         kwargs = {"check_blobs": True, "max_total_blob_output": 1024 * 1024}
         code = "blob-budget-exceeded"
     start = time.perf_counter()
@@ -249,7 +250,8 @@ def test_dbprjver_spelling_change_is_opaque_and_fails_the_gate(
 
 
 def test_dbprjver_non_ascii_digits_fail_the_gate(tmp_path: Path) -> None:
-    b = edited(tmp_path, "b.drp", {SEQ_MEMBER: once(b'DbPrjVer="17"', 'DbPrjVer="١٧"'.encode())})
+    arabic = b'DbPrjVer="\xd9\xa1\xd9\xa7"'  # Arabic-Indic 17 (U+0661 U+0667); parse_int rejects it
+    b = edited(tmp_path, "b.drp", {SEQ_MEMBER: once(b'DbPrjVer="17"', arabic)})
     d = assert_mirrors(H264, b)
     assert any(c.section == "opaque" and c.field_name == SEQ_MEMBER for c in d.changes)
     assert not diff(H264, b, gate=True).gate.passed
@@ -273,7 +275,9 @@ def test_diff_broken_stderr_never_exits_120(tmp_path: Path) -> None:
     r19 = H264.parent / "media-clip-r19.drp"
     # (1) stdout full, stderr closed: an output error, exit 74, never 120.
     with open("/dev/full", "wb") as full:
-        proc = _run(["drp", "diff", str(r19), str(H264)], stdout=full, stderr=None, close_stderr=True)
+        proc = _run(
+            ["drp", "diff", str(r19), str(H264)], stdout=full, stderr=None, close_stderr=True
+        )
     assert proc.returncode == 74
     # (2) missing input with stderr full: a usage/input error, exit 2, never 120.
     with open("/dev/full", "wb") as full:
@@ -307,7 +311,9 @@ def test_short_id_of_a_one_character_project_id_change_is_legible(tmp_path: Path
     assert pid and len(pid) > 12
     flipped = pid[:-1] + ("0" if pid[-1] != "0" else "1")
     b = edited(
-        tmp_path, "b.drp", {"project.xml": once(f'DbId="{pid}"'.encode(), f'DbId="{flipped}"'.encode())}
+        tmp_path,
+        "b.drp",
+        {"project.xml": once(f'DbId="{pid}"'.encode(), f'DbId="{flipped}"'.encode())},
     )
     c = only_change(H264, b)
     assert (c.section, c.field_name) == ("header", "id")
