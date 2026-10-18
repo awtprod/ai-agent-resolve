@@ -6,7 +6,10 @@ import argparse
 import json
 from typing import Any
 
+from aar import cli_io
 from aar.node.ops import list_ops
+
+_PROG = "aar node"
 
 
 def register(subparsers: Any) -> None:
@@ -29,13 +32,13 @@ def _params(schema: dict[str, Any]) -> str:
 def _cmd_ops(args: argparse.Namespace) -> int:
     described = [spec.describe() for spec in list_ops()]
     if args.json:
-        print(json.dumps(described, indent=2))
-        return 0
+        return cli_io.emit(_PROG, json.dumps(described, indent=2) + "\n")
     width = max(len(d["name"]) for d in described)
+    lines: list[str] = []
     for d in described:
         flags = f"{'hot' if d['hot'] else 'cold'} {'mutates' if d['mutates'] else 'read'}"
-        print(f"{d['name']:<{width}}  {flags:<12} {d['summary']}")
-        print(f"{'':<{width}}  params: {_params(d['params_schema'])}")
+        lines.append(f"{d['name']:<{width}}  {flags:<12} {d['summary']}")
+        lines.append(f"{'':<{width}}  params: {_params(d['params_schema'])}")
         if d["traps"]:
-            print(f"{'':<{width}}  traps: {', '.join(d['traps'])}")
-    return 0
+            lines.append(f"{'':<{width}}  traps: {', '.join(d['traps'])}")
+    return cli_io.emit(_PROG, "\n".join(lines) + "\n")

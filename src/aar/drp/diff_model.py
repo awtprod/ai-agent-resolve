@@ -108,9 +108,11 @@ def short_id_pair(a: str | None, b: str | None) -> tuple[str, str]:
     sa, sb = short_id(a), short_id(b)
     if not a or not b or sa != sb:
         return sa, sb
-    diff = next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), -1)
-    if diff < 0:  # identical, or one is a prefix of the other (sa != sb would have caught it)
-        return sa, sb
+    # a and b share the leading 8 characters and both render as "{a[:8]}…". Diverge at the
+    # first differing character, or at the end of the shorter when one merely extends the other
+    # (a prefix extension), so the two windows differ whenever the ids do.
+    limit = min(len(a), len(b))
+    diff = next((i for i in range(limit) if a[i] != b[i]), limit)
     return f"{a[:8]}…{a[diff : diff + 4]}", f"{b[:8]}…{b[diff : diff + 4]}"
 
 

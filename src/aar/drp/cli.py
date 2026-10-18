@@ -150,8 +150,13 @@ def _inspect(args: argparse.Namespace) -> int:
     if drp is None:
         return EXIT_NOTHING_READ
     if args.json:
-        # ASCII-only JSON is valid in every output encoding (cp1252 pipes on Windows).
-        text = json.dumps(drp.to_dict(), indent=1, ensure_ascii=True) + "\n"
+        # ASCII-only JSON is valid in every output encoding (cp1252 pipes on Windows), and
+        # allow_nan=False fails closed rather than emit the invalid tokens Infinity/NaN.
+        try:
+            text = json.dumps(drp.to_dict(), indent=1, ensure_ascii=True, allow_nan=False) + "\n"
+        except ValueError as exc:  # a non-finite value slipped the decoders; never emit bad JSON
+            _warn(f"aar drp: cannot encode JSON: {exc}")
+            return EXIT_OUTPUT_ERROR
         return _status(drp, _emit(text))
     v = drp.versions
     lines = [

@@ -805,16 +805,19 @@ def decode_timemap(data: bytes) -> TimeMap:
         record = kd.get("XMax")
         source = kd.get("LastValidYOffset")
         speed = None
-        if isinstance(record, float) and isinstance(source, float) and record > 0:
-            # A non-finite ratio (an infinite/NaN XMax or LastValidYOffset, or an overflow of
-            # the division) would reach the model as a float that json.dumps writes as the
-            # invalid token Infinity/NaN. Reject it like decode_rate/decode_extents do, so the
-            # reader turns it into an issue and leaves speed null. See DESIGN R1 and blobs.py.
+        if isinstance(record, float) and isinstance(source, float):
+            # Reject a non-finite XMax/LastValidYOffset (NaN, inf) up front, outside the
+            # ``record > 0`` guard, so a NaN record does not slip through unchecked (NaN > 0 is
+            # False). A non-finite value, or an overflowing ratio, would otherwise reach the
+            # model as a float json.dumps writes as the invalid token Infinity/NaN. Reject it
+            # like decode_rate/decode_extents so the reader turns it into an issue. A negative
+            # record is finite and left alone: reverse maps are not decoded, so speed stays null.
             if not (math.isfinite(record) and math.isfinite(source)):
                 raise BlobError("retimed timemap has a non-finite XMax or LastValidYOffset")
-            speed = source / record
-            if not math.isfinite(speed):
-                raise BlobError(f"retimed timemap speed {speed!r} is not finite")
+            if record > 0:
+                speed = source / record
+                if not math.isfinite(speed):
+                    raise BlobError(f"retimed timemap speed {speed!r} is not finite")
         return TimeMap(
             form="retimed",
             speed=speed,

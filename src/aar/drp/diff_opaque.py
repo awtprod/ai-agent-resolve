@@ -80,6 +80,20 @@ _APP_VALUE = re.compile(rb'(\bDbAppVer\s*=\s*")[^"]*(")')
 _PRJ_VALUE = re.compile(rb'(\bDbPrjVer\s*=\s*")[^"]*(")')
 
 
+def _mask_last(pattern: re.Pattern[bytes], data: bytes) -> bytes:
+    """Blank the value of only the *last* match of ``pattern`` in ``data``.
+
+    The header section compares a stamp attribute through an attribute dict, so a repeated
+    ``DbAppVer``/``DbPrjVer`` resolves to its last value. Masking only that occurrence here
+    leaves any earlier duplicate in the byte comparison, so editing it is still reported.
+    """
+    matches = list(pattern.finditer(data))
+    if not matches:
+        return data
+    m = matches[-1]
+    return data[: m.start()] + m.group(1) + m.group(2) + data[m.end() :]
+
+
 def member_root(member: str) -> Provenance:
     """Placeholder provenance meaning "the root element of ``member``"."""
     return Provenance(member, 0, 0, "member-root")
@@ -612,9 +626,11 @@ class OpaqueEngine:
             versions.append(v)
             stamps.append((v.app_version, v.project_version) if v is not None else None)
         va, vb = versions
-        # DbAppVer is always owned by the header (it compares the raw text), so its value is
-        # always masked. DbPrjVer is masked only for a genuine int change, which the header
-        # reports too; otherwise its raw bytes stay in for the comparison below.
+        # DbAppVer is owned by the header (it compares the raw text), so its value is masked.
+        # DbPrjVer is masked only for a genuine int change, which the header reports too;
+        # otherwise its raw bytes stay in for the comparison below. Only the *last* occurrence
+        # of each is masked (the one the header's attribute dict compares), so an edited earlier
+        # duplicate is still caught here.
         mask_prj = (
             va is not None
             and vb is not None
@@ -627,9 +643,9 @@ class OpaqueEngine:
             if v is None:
                 masked.append(head)
                 continue
-            comment = _APP_VALUE.sub(rb"\1\2", head[v.offset : v.end])
+            comment = _mask_last(_APP_VALUE, head[v.offset : v.end])
             if mask_prj:
-                comment = _PRJ_VALUE.sub(rb"\1\2", comment)
+                comment = _mask_last(_PRJ_VALUE, comment)
             masked.append(head[: v.offset] + comment + head[v.end :])
         if masked[0] != masked[1]:
             count, _ = _diff_size(heads[0], heads[1])

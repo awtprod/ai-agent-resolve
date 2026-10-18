@@ -81,9 +81,10 @@ def _diff(args: argparse.Namespace) -> int:
         result = diff_projects(a, b, gate=args.gate)
         if args.only:
             result = result.only(args.only)
-        # JSON is pure ASCII (\\u escapes), so it stays valid JSON in any output encoding.
+        # JSON is pure ASCII (\\u escapes), so it stays valid JSON in any output encoding;
+        # allow_nan=False fails closed rather than emit the invalid tokens Infinity/NaN.
         text = (
-            json.dumps(result.to_dict(), indent=1, ensure_ascii=True) + "\n"
+            json.dumps(result.to_dict(), indent=1, ensure_ascii=True, allow_nan=False) + "\n"
             if args.json
             else result.to_text()
         )
