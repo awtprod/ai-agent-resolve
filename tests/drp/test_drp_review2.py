@@ -252,8 +252,13 @@ def test_element_budget_is_per_file(tmp_path: Path) -> None:
         zf.writestr("Gallery3.xml", xml("<G>" + "<a/>" * 500_000 + "</G>"))
     assert path.stat().st_size < 50_000
     drp = read_drp(path, check_blobs=True, max_elements=1_000)
-    stops = issues(drp, "scan-budget-exceeded")
-    assert [i.where.member for i in stops if i.where] == ["Gallery2.xml", "Gallery3.xml"]
+    # One trip of the shared budget, so one issue (not one per member); it counts both bombs
+    # and points at the first one cut short.
+    [stop] = issues(drp, "scan-budget-exceeded")
+    assert (
+        stop.message == "2 member(s) not fully read: the file's element budget of 1000 was used up"
+    )
+    assert stop.where is not None and stop.where.member == "Gallery2.xml"
     assert drp.project is not None and drp.project.name == "P"
 
 

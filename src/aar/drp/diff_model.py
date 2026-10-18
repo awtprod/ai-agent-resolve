@@ -32,6 +32,7 @@ __all__ = [
     "ProjectDiff",
     "same_value",
     "short_id",
+    "short_id_pair",
 ]
 
 SECTIONS: tuple[str, ...] = ("header", "media", "timelines", "markers", "opaque")
@@ -95,6 +96,22 @@ def short_id(value: str | None) -> str:
     if not value:
         return "?"
     return value if len(value) <= 12 else value[:8] + "…"
+
+
+def short_id_pair(a: str | None, b: str | None) -> tuple[str, str]:
+    """Shorten two DbIds for text output so a difference between them stays visible.
+
+    Each is shortened like :func:`short_id`, but when both would render identically (they
+    share the leading 8 characters) a window from the first differing character is appended to
+    each, so a one-character change does not read as ``0f98e18c… → 0f98e18c…``.
+    """
+    sa, sb = short_id(a), short_id(b)
+    if not a or not b or sa != sb:
+        return sa, sb
+    diff = next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), -1)
+    if diff < 0:  # identical, or one is a prefix of the other (sa != sb would have caught it)
+        return sa, sb
+    return f"{a[:8]}…{a[diff : diff + 4]}", f"{b[:8]}…{b[diff : diff + 4]}"
 
 
 @dataclass(frozen=True, slots=True)
