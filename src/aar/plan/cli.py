@@ -77,7 +77,9 @@ def _cmd_lint(args: argparse.Namespace) -> int:
         )
     except (OSError, json.JSONDecodeError, ProfileError) as exc:
         return _input_error(type(exc).__name__, str(exc), [], as_json)
-    out = report.model_dump_json(indent=2) if as_json else _format_report(report, len(plan.segments))
+    out = (
+        report.model_dump_json(indent=2) if as_json else _format_report(report, len(plan.segments))
+    )
     written = cli_io.emit(_PROG, out + "\n")
     if written != EXIT_OK:
         return written
