@@ -31,9 +31,11 @@ from aar.hub.events import (
 
 SOURCE_KINDS = frozenset({"cloud_library", "local_db", "drp_file", "drt_file"})
 
-# Writers refuse longer names and aliases; the fold still accepts what is already
-# in the log, so old data never disappears from projections.
+# Writers refuse longer names and aliases, and more aliases than MAX_ALIASES on one
+# project; the fold still accepts what is already in the log, so old data never
+# disappears from projections.
 MAX_NAME_CHARS = 500
+MAX_ALIASES = 64
 
 EVENT_PROJECT_CREATED = "project.created"
 EVENT_PROJECT_RENAMED = "project.renamed"
@@ -415,6 +417,27 @@ class Registry:
             if isinstance(value, str) and len(value) > MAX_NAME_CHARS:
                 raise ValueError(
                     f"refused before writing {event_type}: {name_field} is over {MAX_NAME_CHARS}"
+                )
+        aliases = payload.get("aliases")
+        if isinstance(aliases, list):
+            if len(aliases) > MAX_ALIASES:
+                raise ValueError(
+                    f"refused before writing {event_type}: too many aliases (over {MAX_ALIASES})"
+                )
+            if any(isinstance(a, str) and len(a) > MAX_NAME_CHARS for a in aliases):
+                raise ValueError(
+                    f"refused before writing {event_type}: alias is over {MAX_NAME_CHARS}"
+                )
+        if event_type == EVENT_ALIAS_ADDED:
+            # One alias per event, so the cap is on what the project would hold.
+            project = self._projects.get(payload.get("project_id"))
+            if (
+                project is not None
+                and len(project.aliases) >= MAX_ALIASES
+                and payload.get("alias") not in project.aliases
+            ):
+                raise ValueError(
+                    f"refused before writing {event_type}: too many aliases (over {MAX_ALIASES})"
                 )
         stored = json.loads(json.dumps(payload, allow_nan=False))
         probe = Event(0, "", stored.get("project_id"), event_type, actor, "", stored)
