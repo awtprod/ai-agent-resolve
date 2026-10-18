@@ -11,7 +11,7 @@ See ``framework`` for the contract every op follows.
 
 from __future__ import annotations
 
-from aar.node.ops import cloud, collab, read, write
+from aar.node.ops import cloud, collab, read, render, write
 from aar.node.ops.framework import (
     ItemRef,
     MediaRef,
@@ -44,6 +44,7 @@ __all__ = [
     "list_ops",
     "make_hot_op",
     "read",
+    "render",
     "submit_op",
     "write",
 ]

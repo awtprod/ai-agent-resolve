@@ -138,6 +138,28 @@ class DeliverState:
         return DeliverState(self.format, self.codec, self.mode, dict(self.settings))
 
 
+@dataclass
+class FakeRenderJob:
+    """A queued render job, as ``GetRenderJobList`` / ``GetRenderJobStatus`` would report it.
+
+    ``outcome`` drives the progression once rendering: ``complete`` finishes after
+    ``complete_after`` polls, ``fail`` ends with ``fail_error``, ``hang`` never finishes (for
+    the watchdog). Each ``GetRenderJobStatus`` call while rendering advances the job.
+    """
+
+    job_id: str
+    info: dict[str, Any]
+    status: str = "Ready"
+    completion: int = 0
+    polls: int = 0
+    time_ms: int = 0
+    error: str = ""
+    outcome: str = "complete"
+    complete_after: int = 2
+    result_time_ms: int = 5000
+    fail_error: str = "render failed: frames offline"
+
+
 # -- media pool ------------------------------------------------------------------------------
 
 _KIND_TYPE = {
@@ -1008,6 +1030,13 @@ class FakeProject:
         self.deliver = DeliverState()
         self.rendering = False
         self.saves = 0
+        # Render queue and the knobs a test uses to drive a render's outcome.
+        self.render_jobs: list[FakeRenderJob] = []
+        self.render_add_fails = False
+        self.render_outcome = "complete"  # "complete" | "fail" | "hang"
+        self.render_complete_after = 2
+        self.render_time_ms = 5000
+        self.render_error = "render failed: frames offline"
 
     def GetName(self) -> str:
         return self._name
@@ -1098,6 +1127,111 @@ class FakeProject:
 
     def IsRenderingInProgress(self) -> bool:
         return self.rendering
+
+    # -- render queue ----------------------------------------------------------------------
+
+    def AddRenderJob(self) -> str:
+        self._app.calls.append(("AddRenderJob",))
+        if self.render_add_fails:
+            return ""  # Resolve returns an empty id when a job cannot be added
+        settings = self.deliver.settings
+        timeline = self.current_timeline
+        fps = timeline.fps() if timeline is not None else None
+        if settings.get("SelectAllFrames", True):
+            span = (
+                (timeline.GetEndFrame() - timeline.GetStartFrame()) if timeline is not None else 0
+            )
+            mark_in, mark_out = 0, max(span - 1, 0)
+        else:
+            mark_in = int(settings.get("MarkIn", 0))
+            mark_out = int(settings.get("MarkOut", mark_in))
+        job_id = f"rj-{next(self._app.ids)}"
+        info: dict[str, Any] = {
+            "JobId": job_id,
+            "RenderJobName": str(settings.get("CustomName", "")) or job_id,
+            "TimelineName": timeline.GetName() if timeline is not None else "",
+            "TargetDir": str(settings.get("TargetDir", "")),
+            "OutputFilename": str(settings.get("CustomName", "")),
+            "FormatWidth": int(settings.get("FormatWidth", 1920)),
+            "FormatHeight": int(settings.get("FormatHeight", 1080)),
+            "FrameRate": f"{fps:g}" if fps is not None else "",
+            "MarkIn": mark_in,
+            "MarkOut": mark_out,
+            "VideoFormat": self.deliver.format,
+            "VideoCodec": self.deliver.codec,
+            "RenderMode": "Single clip" if self.deliver.mode == 1 else "Individual clips",
+            "PresetName": "",
+        }
+        self.render_jobs.append(
+            FakeRenderJob(
+                job_id,
+                info,
+                outcome=self.render_outcome,
+                complete_after=self.render_complete_after,
+                result_time_ms=self.render_time_ms,
+                fail_error=self.render_error,
+            )
+        )
+        return job_id
+
+    def GetRenderJobList(self) -> list[dict[str, Any]]:
+        return [dict(job.info) for job in self.render_jobs]
+
+    def StartRendering(self, jobIds: list[str], isInteractiveMode: bool = False) -> bool:
+        self._app.calls.append(("StartRendering", list(jobIds), isInteractiveMode))
+        ids = list(jobIds)
+        targets = [job for job in self.render_jobs if job.job_id in ids]
+        if len(targets) != len(set(ids)) or not targets:
+            return False
+        if any(job.status not in ("Ready", "Ready for background render") for job in targets):
+            return False
+        for job in targets:
+            job.status = "Rendering"
+            job.completion = 0
+            job.polls = 0
+        self.rendering = True
+        return True
+
+    def _settle_rendering(self) -> None:
+        self.rendering = any(job.status == "Rendering" for job in self.render_jobs)
+
+    def GetRenderJobStatus(self, jobId: str) -> dict[str, Any]:
+        job = next((j for j in self.render_jobs if j.job_id == jobId), None)
+        if job is None:
+            return {}  # unknown job
+        if job.status == "Rendering":
+            job.polls += 1
+            if job.outcome == "hang":
+                job.completion = min(90, job.completion + 5)
+            elif job.polls >= job.complete_after:
+                if job.outcome == "fail":
+                    job.status, job.error = "Failed", job.fail_error
+                else:
+                    job.status, job.completion, job.time_ms = "Complete", 100, job.result_time_ms
+                self._settle_rendering()
+            else:
+                job.completion = min(95, int(100 * job.polls / max(job.complete_after, 1)))
+        out: dict[str, Any] = {"JobStatus": job.status, "CompletionPercentage": job.completion}
+        if job.status == "Complete":
+            out["TimeTakenToRenderInMs"] = job.time_ms
+        elif job.status == "Rendering":
+            out["EstimatedTimeRemainingInMs"] = 1000
+        elif job.status == "Failed" and job.error:
+            out["Error"] = job.error
+        return out
+
+    def DeleteRenderJob(self, jobId: str) -> bool:
+        self._app.calls.append(("DeleteRenderJob", jobId))
+        before = len(self.render_jobs)
+        self.render_jobs = [job for job in self.render_jobs if job.job_id != jobId]
+        self._settle_rendering()
+        return len(self.render_jobs) < before
+
+    def DeleteAllRenderJobs(self) -> bool:
+        self._app.calls.append(("DeleteAllRenderJobs",))
+        self.render_jobs = []
+        self.rendering = False
+        return True
 
     def timeline(self, name: str) -> FakeTimeline:
         return next(t for t in self.timelines if t.GetName() == name)
