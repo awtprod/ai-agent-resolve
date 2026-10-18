@@ -183,6 +183,7 @@ class MarkerList:
         blob_data = entry.value
         if blobs.parse_envelope(blob_data) is None:
             raise EncodeError("BlobData is not an envelope")
+        encode.check_envelope_payload(blob_data)
         payload = blobs.unwrap_message(blob_data, budget=budget)
         top = blobs.decode_protobuf(payload, nested_depth=0)
         if len(top) != 1 or top[0].number != 2 or not isinstance(top[0].value, bytes):
