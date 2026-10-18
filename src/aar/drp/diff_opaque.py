@@ -56,7 +56,12 @@ from aar.drp.container import Container, open_container, parse_version_header
 from aar.drp.diff_model import REPORTED_FIELDS, Change, Ctx, DiffError, same_value
 from aar.drp.errors import BlobError, ContainerError
 from aar.drp.model import DrpFile, MediaClip, Provenance
-from aar.drp.reader import MARKER_COLORS, join_clip_path
+from aar.drp.reader import (
+    DEFAULT_MAX_ELEMENTS,
+    DEFAULT_MAX_TOTAL_XML_BYTES,
+    MARKER_COLORS,
+    join_clip_path,
+)
 from aar.drp.scan import Document, Element, scan
 
 __all__ = ["Cover", "OpaqueEngine", "Source", "Unit", "member_root"]
@@ -131,11 +136,25 @@ class Source:
     never a difference.
     """
 
-    def __init__(self, drp: DrpFile, side: str = "A") -> None:
+    def __init__(
+        self,
+        drp: DrpFile,
+        side: str = "A",
+        *,
+        max_elements: int = DEFAULT_MAX_ELEMENTS,
+        max_total_xml_bytes: int = DEFAULT_MAX_TOTAL_XML_BYTES,
+    ) -> None:
         self.drp = drp
         self.side = side
         self._raw: dict[str, bytes] = {}
         self._docs: dict[str, Document] = {}
+        # Re-reading and re-scanning for the opaque compare uses the same per-file budgets as
+        # the reader, charged cumulatively, so a hostile member cannot be read or scanned whole
+        # here even though the reader already bounded its own pass.
+        self._max_elements = max_elements
+        self._elements_left = max_elements
+        self._xml_bytes_left = max_total_xml_bytes
+        self._member_sizes = {m.name: m.size for m in drp.members}
         try:
             self.container: Container = open_container(drp.path)
         except ContainerError as exc:
@@ -146,15 +165,30 @@ class Source:
 
     def data(self, name: str) -> bytes:
         if name not in self._raw:
+            size = self._member_sizes.get(name, 0)
+            if self._xml_bytes_left <= 0 or size > self._xml_bytes_left:
+                raise DiffError(
+                    f"{self.side}: member {name} ({size} bytes) exceeds the remaining XML "
+                    f"budget ({self._xml_bytes_left} bytes); raise max_total_xml_bytes to compare"
+                )
             try:
-                self._raw[name] = self.container.read(name)
+                raw = self.container.read(name, max_bytes=self._xml_bytes_left)
             except ContainerError as exc:
                 raise DiffError(f"{self.side}: member {name} cannot be read: {exc}") from exc
+            self._xml_bytes_left -= len(raw)
+            self._raw[name] = raw
         return self._raw[name]
 
     def doc(self, name: str) -> Document:
         if name not in self._docs:
-            self._docs[name] = scan(self.data(name), name)
+            doc = scan(self.data(name), name, max_elements=max(self._elements_left, 0))
+            self._elements_left -= doc.element_count
+            if doc.stopped_at is not None:
+                raise DiffError(
+                    f"{self.side}: member {name} exceeds the element budget of "
+                    f"{self._max_elements} nodes; raise max_elements to compare"
+                )
+            self._docs[name] = doc
         return self._docs[name]
 
     def whole(self) -> bytes:
