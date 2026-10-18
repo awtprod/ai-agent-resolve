@@ -98,7 +98,11 @@ def _restore_deliver(
             "load the preset by hand on the Deliver page",
             "deliver-clobber",
         )
-    if fmt is not None and codec is not None and not project.SetCurrentRenderFormatAndCodec(fmt, codec):
+    if (
+        fmt is not None
+        and codec is not None
+        and not project.SetCurrentRenderFormatAndCodec(fmt, codec)
+    ):
         raise OpError(
             "render_format_failed",
             f"SetCurrentRenderFormatAndCodec({fmt!r}, {codec!r}) returned False while restoring",
@@ -229,7 +233,9 @@ def render_build(env: OpEnv, params: BuildParams) -> BuildResult:
         if (
             params.render_format is not None
             and params.render_codec is not None
-            and not project.SetCurrentRenderFormatAndCodec(params.render_format, params.render_codec)
+            and not project.SetCurrentRenderFormatAndCodec(
+                params.render_format, params.render_codec
+            )
         ):
             raise OpError(
                 "render_format_failed",

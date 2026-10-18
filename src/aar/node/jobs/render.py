@@ -127,8 +127,17 @@ class RenderStep(Step):
                 return Fail(out.error)  # build restored Deliver in its finally; nothing to undo
             v = out.value_dict()
             cur["render_job_id"] = v["render_job_id"]
-            cur["base"] = {k: v.get(k) for k in ("output_path", "target_dir", "output_filename",
-                                                 "frame_count", "frame_rate", "duration_seconds")}
+            cur["base"] = {
+                k: v.get(k)
+                for k in (
+                    "output_path",
+                    "target_dir",
+                    "output_filename",
+                    "frame_count",
+                    "frame_rate",
+                    "duration_seconds",
+                )
+            }
             cur["phase"] = "poll"
             return Submit("render.poll", {"render_job_id": cur["render_job_id"]}, key="poll")
 

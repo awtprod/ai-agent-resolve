@@ -1,16 +1,23 @@
 """The node-side job store: a single SQLite database that survives a process restart.
 
-The store is the source of truth for job state. The runner holds no job state that is not
-here, so a fresh runner opened on the same file resumes every job from its last checkpoint. A
-checkpoint is one transaction: the ``jobs`` row (current state, step and cursor) is upserted
-and any transition events are appended together, so a reader never sees a half-written job.
+The store is the source of truth for job state. The runner holds no durable job state, so a
+fresh runner opened on the same file resumes every job from its last checkpoint. A checkpoint
+is one transaction: the ``jobs`` row (state, step, cursor and the remaining step deadline) is
+upserted and any transition events are appended together.
 
-``jobs`` is mutable (state advances); ``job_events`` is append-only, enforced by triggers like
-the hub's event log, so a job's history cannot be rewritten.
+Safety properties:
+
+- **Single writer** (M6): opening a store takes an exclusive OS lock on a side file, so two
+  runners can never drive the same jobs and double-execute them. ``load_all`` is further
+  scoped to one ``node_id``.
+- **Schema version** (L4): the version is stored and checked on open; an unknown version is
+  refused rather than silently mis-read.
+- ``job_events`` is append-only, enforced by triggers.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import sqlite3
 import threading
@@ -23,27 +30,33 @@ from aar.node.locator import ProjectLocator
 
 from .model import JobState, StructuredError, WaitReason
 
+SCHEMA_VERSION = 1
+
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
 CREATE TABLE IF NOT EXISTS jobs (
-    job_id            TEXT PRIMARY KEY,
-    kind              TEXT NOT NULL,
-    node_id           TEXT NOT NULL,
-    target            TEXT NOT NULL,
-    params            TEXT NOT NULL,
-    state             TEXT NOT NULL,
-    current_step      INTEGER NOT NULL,
-    cursor            TEXT NOT NULL,
-    results           TEXT NOT NULL,
-    error             TEXT,
-    waiting           TEXT,
-    stall             TEXT,
-    approval_token    TEXT,
-    approval_consumed INTEGER NOT NULL DEFAULT 0,
-    priority          INTEGER NOT NULL DEFAULT 0,
-    created_at        REAL NOT NULL,
-    updated_at        REAL NOT NULL
+    job_id             TEXT PRIMARY KEY,
+    kind               TEXT NOT NULL,
+    node_id            TEXT NOT NULL,
+    target             TEXT NOT NULL,
+    params             TEXT NOT NULL,
+    state              TEXT NOT NULL,
+    current_step       INTEGER NOT NULL,
+    cursor             TEXT NOT NULL,
+    results            TEXT NOT NULL,
+    error              TEXT,
+    waiting            TEXT,
+    stall              TEXT,
+    approval_token     TEXT,
+    approval_consumed  INTEGER NOT NULL DEFAULT 0,
+    approval_pending   TEXT,
+    step_deadline      REAL,
+    priority           INTEGER NOT NULL DEFAULT 0,
+    created_at         REAL NOT NULL,
+    updated_at         REAL NOT NULL
 );
-CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state);
+CREATE INDEX IF NOT EXISTS jobs_node_state ON jobs(node_id, state);
 
 CREATE TABLE IF NOT EXISTS job_events (
     seq     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,6 +83,14 @@ END;
 _REQUIRED_TRIGGERS = frozenset({"job_events_no_update", "job_events_no_delete"})
 
 
+class JobStoreLocked(RuntimeError):
+    """Another process already holds the store's single-writer lock."""
+
+
+class JobStoreVersionError(RuntimeError):
+    """The store was written by an incompatible schema version."""
+
+
 @dataclass
 class JobRecord:
     """The persisted state of one job. Mutated by the runner, then saved."""
@@ -88,6 +109,10 @@ class JobRecord:
     stall: StructuredError | None = None
     approval_token: str | None = None
     approval_consumed: bool = False
+    approval_pending: str | None = None
+    """The token id a consume was started with but not yet confirmed (crash-safety, L2)."""
+    step_deadline: float | None = None
+    """Seconds the current step may still run; counts down only while the job is running."""
     priority: int = 0
     created_at: float = 0.0
     updated_at: float = 0.0
@@ -127,6 +152,8 @@ def _record_from_row(row: sqlite3.Row) -> JobRecord:
         stall=StructuredError.from_dict(json.loads(row["stall"])) if row["stall"] else None,
         approval_token=row["approval_token"],
         approval_consumed=bool(row["approval_consumed"]),
+        approval_pending=row["approval_pending"],
+        step_deadline=row["step_deadline"],
         priority=row["priority"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -136,41 +163,89 @@ def _record_from_row(row: sqlite3.Row) -> JobRecord:
 _UPSERT = """
 INSERT INTO jobs (
     job_id, kind, node_id, target, params, state, current_step, cursor, results,
-    error, waiting, stall, approval_token, approval_consumed, priority, created_at, updated_at
+    error, waiting, stall, approval_token, approval_consumed, approval_pending,
+    step_deadline, priority, created_at, updated_at
 ) VALUES (
     :job_id, :kind, :node_id, :target, :params, :state, :current_step, :cursor, :results,
-    :error, :waiting, :stall, :approval_token, :approval_consumed, :priority,
-    :created_at, :updated_at
+    :error, :waiting, :stall, :approval_token, :approval_consumed, :approval_pending,
+    :step_deadline, :priority, :created_at, :updated_at
 )
 ON CONFLICT(job_id) DO UPDATE SET
     state=excluded.state, current_step=excluded.current_step, cursor=excluded.cursor,
     results=excluded.results, error=excluded.error, waiting=excluded.waiting,
     stall=excluded.stall, approval_token=excluded.approval_token,
-    approval_consumed=excluded.approval_consumed, priority=excluded.priority,
+    approval_consumed=excluded.approval_consumed, approval_pending=excluded.approval_pending,
+    step_deadline=excluded.step_deadline, priority=excluded.priority,
     updated_at=excluded.updated_at
 """
 
 
 class JobStore:
-    """An SQLite-backed job store (WAL mode) with checkpoint-and-event transactions."""
+    """An SQLite-backed job store (WAL mode), single-writer, with checkpoint transactions."""
 
     def __init__(self, db_path: str | PathLike[str], *, create: bool = True) -> None:
         self._path = str(db_path)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self._path, check_same_thread=False)
+        self._lock_fd = self._take_file_lock()
         try:
+            self._conn = sqlite3.connect(self._path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._conn.isolation_level = None
             self._conn.execute("PRAGMA recursive_triggers=ON")
             if create:
                 self._conn.execute("PRAGMA journal_mode=WAL")
                 self._conn.executescript(_SCHEMA)
+                self._init_version()
             else:
                 self._assert_schema()
                 self._conn.execute("PRAGMA journal_mode=WAL")
+                self._check_version()
         except BaseException:
-            self._conn.close()
+            self.close()
             raise
+
+    def _take_file_lock(self) -> int:
+        import os
+
+        fd = os.open(self._path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            raise JobStoreLocked(
+                f"another process holds the job store lock for {self._path!r}"
+            ) from exc
+        return fd
+
+    def _init_version(self) -> None:
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
+                    (str(SCHEMA_VERSION),),
+                )
+            elif int(row["value"]) != SCHEMA_VERSION:
+                raise JobStoreVersionError(
+                    f"job store at {self._path!r} is schema version {row['value']}, "
+                    f"not {SCHEMA_VERSION}"
+                )
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        else:
+            self._conn.execute("COMMIT")
+
+    def _check_version(self) -> None:
+        row = self._conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        version = int(row["value"]) if row is not None else 0
+        if version != SCHEMA_VERSION:
+            raise JobStoreVersionError(
+                f"job store at {self._path!r} is schema version {version}, not {SCHEMA_VERSION}"
+            )
 
     def _assert_schema(self) -> None:
         rows = self._conn.execute(
@@ -183,8 +258,19 @@ class JobStore:
             )
 
     def close(self) -> None:
+        import os
+
         with self._lock:
-            self._conn.close()
+            conn = getattr(self, "_conn", None)
+            if conn is not None:
+                conn.close()
+            fd = getattr(self, "_lock_fd", None)
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+                self._lock_fd = None
 
     # -- writes ----------------------------------------------------------------------------
 
@@ -207,6 +293,8 @@ class JobStore:
             "stall": _dumps(record.stall.to_dict()) if record.stall is not None else None,
             "approval_token": record.approval_token,
             "approval_consumed": 1 if record.approval_consumed else 0,
+            "approval_pending": record.approval_pending,
+            "step_deadline": record.step_deadline,
             "priority": record.priority,
             "created_at": record.created_at,
             "updated_at": record.updated_at,
@@ -229,12 +317,18 @@ class JobStore:
 
     # -- reads -----------------------------------------------------------------------------
 
-    def load_all(self) -> list[JobRecord]:
-        """Every job, oldest first (by creation, then id)."""
+    def load_all(self, node_id: str | None = None) -> list[JobRecord]:
+        """Every job for ``node_id`` (or all, when ``None``), oldest first."""
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM jobs ORDER BY created_at ASC, job_id ASC"
-            ).fetchall()
+            if node_id is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM jobs ORDER BY created_at ASC, job_id ASC"
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM jobs WHERE node_id = ? ORDER BY created_at ASC, job_id ASC",
+                    (node_id,),
+                ).fetchall()
         return [_record_from_row(row) for row in rows]
 
     def get(self, job_id: str) -> JobRecord | None:

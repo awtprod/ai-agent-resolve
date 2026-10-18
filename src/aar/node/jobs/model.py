@@ -214,6 +214,8 @@ class Step(ABC):
     name: str
     timeout: float
     """Wall-clock seconds the step may take before the watchdog calls it stalled."""
+    renders_project: bool = False
+    """True for a step that drives a render; the runner serialises these per project."""
 
     @abstractmethod
     def advance(self, ctx: StepContext) -> StepAction:

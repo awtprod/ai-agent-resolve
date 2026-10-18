@@ -6,9 +6,9 @@ Mirrors ``tests/node/ops_support`` for the job runner: a real broker over a real
 only Resolve is faked. ``restart`` models a node restart: a fresh broker and runner reopen the
 same store and hub log against the same (persistent) Resolve.
 
-The broker uses a very large restore delay so it holds the instance for the whole test instead
-of restoring the borrowed context between a job's ops (in production the default 15 s delay
-does the same while work is pending).
+The broker uses the production restore delay (15 s). With a frozen clock it therefore holds the
+borrowed context for the test (nothing to restore), and a test that advances the clock past the
+delay sees the real restore -- the behaviour production has while work is pending.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ JOB_CONFIG = BrokerConfig(
     batch_max_ops=50,
     batch_max_seconds=1e6,
     max_wait_seconds=1e6,
-    restore_delay_seconds=1e6,
+    restore_delay_seconds=15.0,  # the production default, not a test-only value
 )
 
 

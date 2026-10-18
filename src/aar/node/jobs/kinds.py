@@ -91,7 +91,7 @@ class OpStepSpec(BaseModel):
     op: str = Field(min_length=1)
     params: dict[str, Any] = Field(default_factory=dict)
     name: str | None = None
-    timeout: float | None = Field(default=None, gt=0)
+    timeout: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
 
 class OpSequenceParams(BaseModel):
