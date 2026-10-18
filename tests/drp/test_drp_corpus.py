@@ -98,10 +98,13 @@ def test_corpus_file(path: Path) -> None:
 
 
 # Marker pins live in the corpus, never in the repo: $AAR_DRP_CORPUS/marker_pins.json maps
-# a file's sha256 to its decoded markers, each [frame, colour, name, duration], sorted. The
-# pinned values were cross-checked against an independent decoder (drp-format's
+# a file's sha256 to its decoded markers, each row [frame, colour, name, duration] and, in the
+# richer form, also [note, custom_data], sorted. The pin's own row width decides how many
+# fields are checked, so a 4-field pins file and a 6-field one both work. The frame/colour/
+# name/duration values were cross-checked against an independent decoder (drp-format's
 # timeline-markers-blob.js, run under node), which agreed on every one.
 PINS_FILE = "marker_pins.json"
+_MARKER_FIELDS = ("frame", "color", "name", "duration", "note", "custom_data")
 
 
 def _sha256(path: Path) -> str:
@@ -123,8 +126,14 @@ def _load_pins() -> dict[str, dict[str, list[list[object]]]]:
     return files
 
 
-def _marker_rows(markers: list) -> list[list[object]]:  # type: ignore[type-arg]
-    return sorted([m.frame, m.color, m.name, m.duration] for m in markers)
+def _marker_rows(markers: list, width: int) -> list[list[object]]:  # type: ignore[type-arg]
+    fields = _MARKER_FIELDS[:width]
+    return sorted([getattr(m, f) for f in fields] for m in markers)
+
+
+def _pin_width(rows: list[list[object]]) -> int:
+    """How many marker fields this pins file records (4 for the original form, 6 richer)."""
+    return len(rows[0]) if rows else 4
 
 
 @pytest.mark.skipif(not CORPUS, reason="set AAR_DRP_CORPUS to run the corpus checks")
@@ -142,8 +151,8 @@ def test_corpus_markers_match_pinned_values() -> None:
         item_markers = [
             m for t in drp.timelines for tr in t.tracks for i in tr.items for m in i.markers
         ]
-        assert _marker_rows(timeline_markers) == pin["timeline"]
-        assert _marker_rows(item_markers) == pin["items"]
+        assert _marker_rows(timeline_markers, _pin_width(pin["timeline"])) == sorted(pin["timeline"])
+        assert _marker_rows(item_markers, _pin_width(pin["items"])) == sorted(pin["items"])
         assert all(m.frame_space == "timeline-relative" for m in timeline_markers)
         assert all(m.owner_kind == "item" for m in item_markers)
         assert not any(i.code in ("marker-decode", "orphan-markers") for i in drp.issues)
