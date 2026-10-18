@@ -601,7 +601,7 @@ class _Planner:
             raise _Refuse("no-marker-list", f"{kind} {owner}: the marker blob is empty", i)
         try:
             ml = MarkerList.decode(blobs.parse_hex(fb.text or ""), self.src.budget)
-        except EncodeError as exc:
+        except (EncodeError, BlobError) as exc:
             raise _Refuse("no-marker-list", f"{kind} {owner}: {exc}", i) from exc
         prov = Provenance("project.xml", fb.inner_start, fb.inner_end, "text")
         self.marker_lists[key] = (prov, ml, [i])

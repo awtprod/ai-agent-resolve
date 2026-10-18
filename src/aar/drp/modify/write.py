@@ -143,6 +143,14 @@ def _precheck(
         if not dry_run:
             refusals.append(Refusal("no-output", "--out is required unless --dry-run is given"))
         return refusals
+    if out.suffix.lower() != f".{drp.kind}":
+        refusals.append(
+            Refusal(
+                "out-suffix",
+                f"the output must end in .{drp.kind} like the input; Resolve and the reader "
+                "decide what a file is from its suffix",
+            )
+        )
     sidecar = Path(str(out) + SIDECAR_SUFFIX)
     if _same_file(path, out) or _same_file(path, sidecar):
         refusals.append(Refusal("out-is-input", "the output must be a new file, not the input"))
@@ -177,7 +185,8 @@ def _read_input(path: Path, max_bytes: int) -> bytes:
 
 
 def _temp(directory: Path, name: str, data: bytes) -> Path:
-    fd, tmp = tempfile.mkstemp(prefix=f".{name}.", suffix=".tmp", dir=directory)
+    # The temporary file keeps the final suffix, so it reads exactly as the final file will.
+    fd, tmp = tempfile.mkstemp(prefix=f".{name}.", suffix=f".tmp{Path(name).suffix}", dir=directory)
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)

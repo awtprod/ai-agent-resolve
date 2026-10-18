@@ -64,7 +64,7 @@ def members_differing(a: Path, b: Path) -> set[str]:
 
 
 def no_temp_files(directory: Path) -> bool:
-    return not [p for p in directory.iterdir() if p.name.startswith(".") and p.suffix == ".tmp"]
+    return not [p for p in directory.iterdir() if p.name.startswith(".") and ".tmp" in p.name]
 
 
 # --------------------------------------------------------------------------- rename
@@ -782,3 +782,9 @@ def test_blob_hex_case_survives_an_edit(tmp_path: Path) -> None:
     start = data.index(b"<FieldsBlob>", data.index(b"0b0b0b0b-1111")) + len(b"<FieldsBlob>")
     text = data[start : data.index(b"</FieldsBlob>", start)]
     assert text == text.upper() and blobs.parse_hex(text.decode())
+
+
+def test_output_suffix_must_match_the_input_kind(tmp_path: Path) -> None:
+    outcome = edit_file(H264, plan(), tmp_path / "out.drt")
+    assert [r.code for r in outcome.refusals] == ["out-suffix"]
+    assert list(tmp_path.iterdir()) == []
