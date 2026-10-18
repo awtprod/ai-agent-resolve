@@ -14,7 +14,7 @@ import os
 import sys
 from typing import TextIO
 
-__all__ = ["EXIT_OUTPUT_ERROR", "EXIT_PIPE_CLOSED", "emit", "warn"]
+__all__ = ["EXIT_OUTPUT_ERROR", "EXIT_PIPE_CLOSED", "emit", "finalize", "warn"]
 
 EXIT_OUTPUT_ERROR = 74  # EX_IOERR from sysexits.h: stdout is closed, full or failing
 EXIT_PIPE_CLOSED = 141  # 128 + SIGPIPE, what a shell reports for a reader that went away
@@ -69,3 +69,28 @@ def emit(prog: str, text: str) -> int:
         warn(f"{prog}: cannot write output: {exc}")
         return EXIT_OUTPUT_ERROR
     return 0
+
+
+def _flush(stream: TextIO | None) -> int:
+    """Flush a std stream; return 0, 141 (broken pipe) or 74 (closed/full/failing). Silences
+    the stream on failure so the interpreter's own exit-time flush cannot fail (exit 120)."""
+    if stream is None:
+        return EXIT_OUTPUT_ERROR
+    try:
+        stream.flush()
+    except BrokenPipeError:
+        _silence(stream)
+        return EXIT_PIPE_CLOSED
+    except (OSError, ValueError):
+        _silence(stream)
+        return EXIT_OUTPUT_ERROR
+    return 0
+
+
+def finalize(code: int) -> int:
+    """Flush stdout and stderr after a path that wrote with bare ``print`` (argparse help,
+    usage and version). A failed stdout flush overrides the exit code with 74/141; a failed
+    stderr flush is silenced but leaves the code. Either way no exit-120 flush failure."""
+    out = _flush(sys.stdout)
+    _flush(sys.stderr)
+    return out or code

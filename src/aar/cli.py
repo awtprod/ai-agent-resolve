@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from aar import __version__
+from aar import __version__, cli_io
 from aar.drp import cli as drp_cli
 from aar.hub import cli as hub_cli
 from aar.node import cli as node_cli
@@ -35,12 +35,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
-        # argparse exits for --version, --help and usage errors; surface its code as a return value.
-        if exc.code is None:
-            return 0
-        return exc.code if isinstance(exc.code, int) else 1
+        # argparse printed --version, --help or a usage error with bare print and is exiting;
+        # flush the std streams safely so a full/closed/broken one gives 74/141 (never 120).
+        code = 0 if exc.code is None else (exc.code if isinstance(exc.code, int) else 1)
+        return cli_io.finalize(code)
     func = getattr(args, "func", None)
     if func is not None:
         return int(func(args))
     parser.print_help()
-    return 0
+    return cli_io.finalize(0)

@@ -10,10 +10,12 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
-import sys
 from pathlib import Path
 from typing import Any
 
+from aar import cli_io
+
+_PROG = "aar hub"
 _LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
 _WILDCARD = frozenset({"0.0.0.0", "::"})
 
@@ -157,10 +159,9 @@ def _add_actor(parser: argparse.ArgumentParser) -> None:
 
 def _serve(args: argparse.Namespace) -> int:
     if args.host not in _LOOPBACK and not args.allow_remote:
-        print(
+        cli_io.warn(
             f"refusing to bind to {args.host!r} without --allow-remote: the v1 hub has no auth "
-            "and is tailnet-only (default bind is 127.0.0.1)",
-            file=sys.stderr,
+            "and is tailnet-only (default bind is 127.0.0.1)"
         )
         return 2
 
@@ -178,13 +179,13 @@ def _serve(args: argparse.Namespace) -> int:
         log = EventLog(args.db, read_only=True)
     except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
         # The exception message already names the path and the reason; don't re-prefix.
-        print(f"aar hub serve: {exc}", file=sys.stderr)
+        cli_io.warn(f"aar hub serve: {exc}")
         return 2
     try:
         artifacts = ArtifactStore(args.artifacts, log, create=False)
     except OSError as exc:
         log.close()  # release the DB handle we just opened before bailing out
-        print(f"aar hub serve: {exc}", file=sys.stderr)
+        cli_io.warn(f"aar hub serve: {exc}")
         return 2
     registry = Registry(log)
     server = build_server(log, registry, artifacts)
@@ -193,12 +194,13 @@ def _serve(args: argparse.Namespace) -> int:
 
 
 def _fail(code: str, message: str, status: int = 2) -> int:
-    print(json.dumps({"error": {"code": code, "message": message}}), file=sys.stderr)
+    cli_io.warn(json.dumps({"error": {"code": code, "message": message}}))
     return status
 
 
-def _print(value: Any) -> None:
-    print(json.dumps(value, indent=2, sort_keys=True))
+def _print(value: Any) -> int:
+    """Write ``value`` as JSON to stdout; return 0 or an output-error code (74/141)."""
+    return cli_io.emit(_PROG, json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
 class _DatabaseUnavailable(Exception):
@@ -290,9 +292,9 @@ def _console(args: argparse.Namespace) -> int:
 
     app = build_app(log, store, config)
     if config.operator is None and not config.trust_tailscale_headers:
-        print("console is read-only: no --operator and no trusted headers", file=sys.stderr)
+        cli_io.warn("console is read-only: no --operator and no trusted headers")
     for warning in _console_warnings(args):
-        print(f"WARNING: {warning}", file=sys.stderr)
+        cli_io.warn(f"WARNING: {warning}")
     # proxy_headers=False: the peer address must be the real TCP peer, because trusting
     # Tailscale headers depends on it being loopback.
     uvicorn.run(
@@ -371,8 +373,7 @@ def _review_request(args: argparse.Namespace) -> int:
         )
     finally:
         log.close()
-    _print(review.to_dict())
-    return 0
+    return _print(review.to_dict())
 
 
 @_with_review_errors
@@ -394,8 +395,7 @@ def _review_note(args: argparse.Namespace) -> int:
         )
     finally:
         log.close()
-    _print(note.to_dict())
-    return 0
+    return _print(note.to_dict())
 
 
 @_with_review_errors
@@ -415,8 +415,7 @@ def _review_withdraw(args: argparse.Namespace) -> int:
         )
     finally:
         log.close()
-    _print(withdrawal.to_dict())
-    return 0
+    return _print(withdrawal.to_dict())
 
 
 @_with_review_errors
@@ -428,8 +427,7 @@ def _review_list(args: argparse.Namespace) -> int:
         found = list_reviews(log, args.project, pending_only=not args.all)
     finally:
         log.close()
-    _print({"reviews": [review.to_dict() for review in found]})
-    return 0
+    return _print({"reviews": [review.to_dict() for review in found]})
 
 
 @_with_review_errors
@@ -443,5 +441,4 @@ def _review_show(args: argparse.Namespace) -> int:
         log.close()
     if review is None:
         return _fail("review_not_found", f"no review {args.review_id!r} in {args.project!r}", 1)
-    _print(review.to_dict())
-    return 0
+    return _print(review.to_dict())
