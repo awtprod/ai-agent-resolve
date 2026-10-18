@@ -46,13 +46,17 @@ from aar.hub.events import (
     match_or_conflict,
 )
 from aar.hub.graph import (
-    EVENT_EDGE_ADDED,
+    EVENT_EDGE_ADDED as _EVENT_EDGE_ADDED,
+)
+from aar.hub.graph import (
     EVENT_NODE_ADDED,
-    EVENT_NODE_STATUS_CHANGED,
     GraphNode,
     IllegalTransition,
     ProtectedNode,
     WorkGraph,
+)
+from aar.hub.graph import (
+    EVENT_NODE_STATUS_CHANGED as _EVENT_NODE_STATUS_CHANGED,
 )
 from aar.hub.registry import Registry
 
@@ -62,8 +66,8 @@ EVENT_WITHDRAWN = "review.withdrawn"
 _REVIEW_EVENT_TYPES = (EVENT_NOTE_ADDED, EVENT_DECIDED, EVENT_WITHDRAWN)
 _SNAPSHOT_TYPES = (
     EVENT_NODE_ADDED,
-    EVENT_NODE_STATUS_CHANGED,
-    EVENT_EDGE_ADDED,
+    _EVENT_NODE_STATUS_CHANGED,
+    _EVENT_EDGE_ADDED,
     *_REVIEW_EVENT_TYPES,
 )
 _NO_LIMIT = -1  # SQLite: LIMIT -1 is no limit, so the read is one statement
