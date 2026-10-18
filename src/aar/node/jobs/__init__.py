@@ -28,7 +28,14 @@ from .model import (
 )
 from .render import DEFAULT_RENDER_TIMEOUT, RenderParams, RenderStep, _build_render
 from .runner import ApprovalPolicy, JobRunner, JobView, PumpOutcome
-from .store import JobEvent, JobRecord, JobStore
+from .store import (
+    SCHEMA_VERSION,
+    JobEvent,
+    JobRecord,
+    JobStore,
+    JobStoreLocked,
+    JobStoreVersionError,
+)
 from .watchdog import Watchdog, WatchdogConfig
 
 # Register the render kind here, so render.py need not import the kind registry.
@@ -38,6 +45,7 @@ __all__ = [
     "DEFAULT_RENDER_TIMEOUT",
     "DEFAULT_STEP_TIMEOUT",
     "RENDER_KIND",
+    "SCHEMA_VERSION",
     "ApprovalPolicy",
     "JobEvent",
     "JobKind",
@@ -45,6 +53,8 @@ __all__ = [
     "JobRunner",
     "JobState",
     "JobStore",
+    "JobStoreLocked",
+    "JobStoreVersionError",
     "JobView",
     "OpSequenceParams",
     "OpStep",

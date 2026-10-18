@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from aar.hub import control
 from aar.hub.approvals import ApprovalScope, grant
 from aar.hub.events import Actor
 from aar.node.jobs import ApprovalPolicy, JobState, Watchdog, WatchdogConfig
@@ -378,3 +379,52 @@ def test_p21_long_render_does_not_stall_another_project(tmp_path: Path) -> None:
         world.clock.advance(10.0)
         world.runner.pump()
     assert world.runner.get(other).state != JobState.STALLED.value
+
+
+# -- P3b: an emergency stop stops a render before it starts ------------------------------------
+
+
+def test_p3b_stop_before_build_never_starts_the_render(tmp_path: Path) -> None:
+    world = JobWorld(tmp_path)
+    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.pump()  # the build op is queued, not yet run
+    assert _calls(world, "AddRenderJob") == []
+    control.stop(world.log, control.StopScope.all(), "STOP NOW", HUMAN)
+    world.runner.pump()
+    assert world.runner.get(job_id).state == JobState.WAITING.value
+    assert _calls(world, "StartRendering") == [] and world.project.render_jobs == []
+
+
+# -- P5: a render's step deadline survives a restart while waiting ------------------------------
+
+
+def test_p5_step_deadline_survives_restart_while_waiting(tmp_path: Path) -> None:
+    world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1e6)))
+    world.project.render_outcome = "hang"
+    job_id = world.runner.submit(
+        "render", _render_params(world, timeout_seconds=30.0), world.locator()
+    )
+    control.stop(world.log, control.StopScope.all(), "pause", HUMAN)
+    world.runner.run_until_settled()
+    runner = world.restart(watchdog=Watchdog(WatchdogConfig(op_timeout=1e6)))
+    control.resume(world.log, control.StopScope.all(), "go", HUMAN)
+    for _ in range(40):
+        runner.pump()
+    for _ in range(20):
+        world.clock.advance(1000.0)  # far past the 30 s render deadline
+        runner.pump()
+    assert runner.get(job_id).state == JobState.STALLED.value  # the deadline was enforced
+
+
+# -- P22: the event log does not grow per poll during a long render ----------------------------
+
+
+def test_p22_long_render_event_log_is_bounded(tmp_path: Path) -> None:
+    world = JobWorld(tmp_path)
+    world.project.render_complete_after = 120  # a long render, polled many times
+    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.run_until_settled()
+    view = world.runner.get(job_id)
+    assert view.state == JobState.SUCCEEDED.value
+    # Transitions, not polls: the log is bounded by the steps, far below the poll count.
+    assert len(view.events) < 20
