@@ -97,6 +97,7 @@ def test_writer_check_never_uses_the_allow_list(tmp_path: Path) -> None:
             once(b"<ProjectAgeInMs>99</ProjectAgeInMs>", b"<ProjectAgeInMs>-9</ProjectAgeInMs>"),
         ),
         ("project.xml", once(b"<Notes/>", b"<Notes>agent was here</Notes>")),
+        ("project.xml", once(b"<DbSavedTime>105299999</DbSavedTime>", b"<DbSavedTime/>")),
     ],
     ids=[
         "saved-time-not-decimal",
@@ -104,6 +105,7 @@ def test_writer_check_never_uses_the_allow_list(tmp_path: Path) -> None:
         "preset-attribute",
         "age-negative",
         "other-leaf",
+        "saved-time-emptied",
     ],
 )
 def test_anything_else_still_fails(tmp_path: Path, member: str, edit: Edit) -> None:
@@ -224,3 +226,41 @@ def test_unreadable_side_is_refused(tmp_path: Path) -> None:
     junk.write_bytes(b"not a zip")
     assert [r.code for r in compare_round_trip(H264, junk).refusals] == ["verify-unreadable"]
     assert zipfile.is_zipfile(H264)
+
+
+def test_ptzr_rule_masks_only_the_dbid(tmp_path: Path) -> None:
+    with_x = PTZR[:-1] + b' X="1">'
+    a = edit_zip(H264, tmp_path / "a.drp", {POOL: once(PTZR, with_x)})
+    new_id = b'<SmPTZRPreset DbId="11111111-2222-3333-4444-555555555555"'
+    (tmp_path / "b").mkdir()
+    same_x = edit_zip(a, tmp_path / "b" / "b.drp", {POOL: once(with_x, new_id + b' X="1">')})
+    assert compare_round_trip(a, same_x).ok
+    (tmp_path / "c").mkdir()
+    other_x = edit_zip(a, tmp_path / "c" / "c.drp", {POOL: once(with_x, new_id + b' X="2">')})
+    assert [r.code for r in compare_round_trip(a, other_x).refusals] == ["unexplained-opaque"]
+
+
+def test_bin_rule_accepts_only_field_4(tmp_path: Path) -> None:
+    def with_blob(blob: bytes) -> Edit:
+        return lambda d: d.replace(b"<FieldsBlob/>", b"<FieldsBlob>" + blob + b"</FieldsBlob>", 1)
+
+    def blob(stamp: int, other: int) -> bytes:
+        payload = pb_var(4, stamp) + pb_var(5, other)
+        return (struct.pack(">II", 2, len(payload) + 1) + b"\x80" + payload).hex().encode()
+
+    a = edit_zip(H264, tmp_path / "a.drp", {POOL: with_blob(blob(1, 1))})
+    (tmp_path / "b").mkdir()
+    b = edit_zip(a, tmp_path / "b" / "b.drp", {POOL: once(blob(1, 1), blob(1, 2))})
+    assert [r.code for r in compare_round_trip(a, b).refusals] == ["unexplained-opaque"]
+
+
+def test_other_gate_reasons_still_fail(tmp_path: Path) -> None:
+    """Both files read with a warning: no change at all, yet the gate cannot vouch for them."""
+    bad = once(b"<CurrentTimelineIndex>0<", b"<CurrentTimelineIndex>x<")
+    a = edit_zip(H264, tmp_path / "a.drp", {"project.xml": bad})
+    (tmp_path / "b").mkdir()
+    b = edit_zip(a, tmp_path / "b" / "b.drp", {"project.xml": once(b"<Notes/>", b"<Notes/>")})
+    result = compare_round_trip(a, b)
+    assert result.diff is not None and result.diff.changes == []
+    assert [r.code for r in result.refusals] == ["gate-failed"]
+    assert "bad-integer" in result.refusals[0].message

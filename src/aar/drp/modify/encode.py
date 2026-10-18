@@ -162,9 +162,12 @@ def replace_kd_bytes(data: bytes, entry: blobs.KdEntry, new: bytes) -> bytes:
     """
     if entry.type != blobs.KD_BYTES or not isinstance(entry.value, bytes):
         raise EncodeError(f"keyed-dict entry {entry.key!r} is not a byte array")
-    (klen,) = struct.unpack_from(">I", data, entry.offset)
-    value_at = entry.offset + 4 + klen + 5
-    (old_len,) = struct.unpack_from(">I", data, value_at)
+    try:
+        (klen,) = struct.unpack_from(">I", data, entry.offset)
+        value_at = entry.offset + 4 + klen + 5
+        (old_len,) = struct.unpack_from(">I", data, value_at)
+    except struct.error as exc:
+        raise EncodeError(f"keyed-dict entry {entry.key!r} is not inside this blob") from exc
     if old_len != len(entry.value) or value_at + 4 + old_len != entry.end:
         raise EncodeError(f"keyed-dict entry {entry.key!r} does not have the expected layout")
     if len(new) >= _U32_MAX:

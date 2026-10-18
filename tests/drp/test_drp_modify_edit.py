@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import struct
 import zipfile
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -788,3 +790,112 @@ def test_output_suffix_must_match_the_input_kind(tmp_path: Path) -> None:
     outcome = edit_file(H264, plan(), tmp_path / "out.drt")
     assert [r.code for r in outcome.refusals] == ["out-suffix"]
     assert list(tmp_path.iterdir()) == []
+
+
+# --------------------------------------------------------------------------- guards (S8 mutants)
+
+
+def test_bin_without_a_dbid_is_refused(tmp_path: Path) -> None:
+    member = "MediaPool/Master/000_Archive/MpFolder.xml"
+    src = edit_zip(
+        R19,
+        tmp_path / "no-dbid.drp",
+        {member: once(f'<Sm2MpFolder DbId="{R19_ARCHIVE}">'.encode(), b"<Sm2MpFolder>")},
+    )
+    outcome, out = run(
+        src, tmp_path, {"op": "rename", "target": "bin", "name": "Archive", "new_name": "x"}
+    )
+    assert [r.code for r in outcome.refusals] == ["no-dbid"]
+    assert not out.exists()
+
+
+def _video_block(data: bytes) -> bytes:
+    start = data.index(b"<Video>")
+    return data[start : data.index(b"</Video>", start) + len(b"</Video>")]
+
+
+@needs_zstandard
+def test_container_clip_paths_are_reported_not_mapped(tmp_path: Path) -> None:
+    """A timeline's pool entry with a Clip blob path is left alone and listed as unmapped."""
+
+    def give_timeline_a_clip(data: bytes) -> bytes:
+        block = _video_block(data).replace(b'DbId="3f5420f0', b'DbId="3f5420ff', 1)
+        anchor = b"<TimelineSharedHandle>"
+        return once(anchor, block + b"\n    " + anchor)(data)
+
+    src = edit_zip(H264, tmp_path / "container.drp", {POOL: give_timeline_a_clip})
+    assert read_drp(src).media_by_id()[H264_POOL_TIMELINE].blob_path == MAC_PATH
+    table = [{"windows": "E:", "mac": "/Users/samuelgursky/Desktop"}]
+    outcome, out = run(
+        src, tmp_path, {"op": "path_map", "direction": "mac_to_windows", "table": table}
+    )
+    assert outcome.status == "written", outcome.to_dict()["refusals"]
+    [report] = outcome.report
+    skipped = [u for u in report["unmapped"] if u["id"] == H264_POOL_TIMELINE]
+    assert skipped and {u["reason"] for u in skipped} == {"container-clip"}
+    assert read_drp(out).media_by_id()[H264_POOL_TIMELINE].blob_path == MAC_PATH
+
+
+@needs_zstandard
+def test_clip_directory_with_a_trailing_separator_keeps_it(tmp_path: Path) -> None:
+    from drp_edit import rewrite_clip_blobs, set_fields
+
+    src = edit_zip(
+        H264,
+        tmp_path / "trailing.drp",
+        {POOL: rewrite_clip_blobs(set_fields({1: b"/Users/samuelgursky/Desktop/20260410/"}))},
+    )
+    assert read_drp(src).media_by_id()[CLIP].path == MAC_PATH
+    table = [{"windows": "E:\\Footage", "mac": "/Users/samuelgursky/Desktop"}]
+    outcome, out = run(
+        src, tmp_path, {"op": "path_map", "direction": "mac_to_windows", "table": table}
+    )
+    assert outcome.status == "written", outcome.to_dict()["refusals"]
+    with zipfile.ZipFile(out) as zf:
+        data = zf.read(POOL)
+    start = data.index(b"<Clip>") + len(b"<Clip>")
+    raw = blobs.parse_hex(data[start : data.index(b"</Clip>", start)].decode())
+    fields = blobs.decode_protobuf(blobs.unwrap_message(raw), nested_depth=0)
+    assert next(f.as_text for f in fields if f.number == 1) == "E:\\Footage\\20260410\\"
+
+
+def test_clip_pathed_by_timeline_items_is_predicted_as_relinked(tmp_path: Path) -> None:
+    """Without Clip blobs the clip's path is its items' MediaFilePath; mapping the items relinks
+    it. Such a file reads with a codec-unknown warning, so ``edit_file`` refuses it; the engine's
+    prediction is still checked against the diff here."""
+    src = edit_zip(
+        H264,
+        tmp_path / "item-path.drp",
+        {POOL: lambda d: re.sub(rb"<Clip>[0-9a-f]+</Clip>", b"<Clip/>", d)},
+    )
+    drp = read_drp(src)
+    clip = drp.media_by_id()[CLIP]
+    assert (clip.path, clip.path_source) == ("/Media/sample.mp4", "timeline_item")
+    spec = plan(
+        {
+            "op": "path_map",
+            "direction": "mac_to_windows",
+            "table": [{"windows": "F:", "mac": "/Media"}],
+        }
+    )
+    prepared = engine.prepare(drp, src, spec)
+    keys = Counter(e.key() for e in prepared.expected)
+    assert (
+        "media",
+        "relinked",
+        "media",
+        CLIP,
+        "path",
+        _j("/Media/sample.mp4"),
+        _j("F:\\sample.mp4"),
+    ) in keys
+    new = write.zipraw.rewrite(
+        src.read_bytes(), engine.apply(prepared.member_data, prepared.splices)
+    )
+    out = tmp_path / "out.drp"
+    out.write_bytes(new)
+    d = diff_projects(drp, read_drp(out), gate=True)
+    assert Counter(engine.change_key(c) for c in d.changes) == keys
+    assert [r.code for r in edit_file(src, spec, tmp_path / "o.drp").refusals] == [
+        "input-has-warnings"
+    ]

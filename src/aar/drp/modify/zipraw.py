@@ -136,7 +136,7 @@ def _local(
     flags, method, crc, csize, usize = central
     if offset + 30 > len(data):
         raise ZipLayoutError(f"local header of {name_raw!r} is past the end")
-    lsig, _need, lflags, lmethod, _t, _d, _crc, _cs, _us, nlen, xlen = _LOCAL.unpack_from(
+    lsig, _need, lflags, lmethod, _t, _d, lcrc, lcs, lus, nlen, xlen = _LOCAL.unpack_from(
         data, offset
     )
     if lsig != _LOCAL_SIG:
@@ -145,6 +145,11 @@ def _local(
         raise ZipLayoutError(f"local and central names differ for {name_raw!r}")
     if (lflags, lmethod) != (flags, method):
         raise ZipLayoutError(f"local and central headers disagree for {name_raw!r}")
+    sizes = (lcrc, lcs, lus)
+    # Resolve fills the local CRC and sizes even when a data descriptor follows (every corpus
+    # member does); zeros are accepted only with a descriptor, as the zip format allows.
+    if sizes != (crc, csize, usize) and not (flags & _FLAG_DESCRIPTOR and sizes == (0, 0, 0)):
+        raise ZipLayoutError(f"local CRC or sizes disagree with the central record of {name_raw!r}")
     data_start = offset + 30 + nlen + xlen
     data_end = data_start + csize
     local_end = data_end

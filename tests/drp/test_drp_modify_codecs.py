@@ -138,6 +138,15 @@ def test_replace_kd_bytes_rewrites_only_one_value() -> None:
     dec = blobs.decode_keyed_dict(blob, strict=True)
     entry = dec.entry("BlobData")
     assert entry is not None
+    # An entry decoded from another blob does not fit this one, and is refused.
+    short = kd([("BlobData", 0x0C, struct.pack(">I", 3) + b"abc")])
+    longer = kd([("BlobData", 0x0C, struct.pack(">I", 5) + b"abcde")])
+    short_entry = blobs.decode_keyed_dict(short, strict=True).entry("BlobData")
+    assert short_entry is not None
+    with pytest.raises(EncodeError, match="layout"):
+        encode.replace_kd_bytes(longer, short_entry, b"x")
+    with pytest.raises(EncodeError, match="not inside"):
+        encode.replace_kd_bytes(b"\0" * 8, entry, b"x")
     out = encode.replace_kd_bytes(blob, entry, b"0123456789")
     again = blobs.decode_keyed_dict(out, strict=True)
     assert [(e.key, e.value) for e in again.entries] == [
@@ -322,6 +331,37 @@ def test_layout_refuses_duplicate_names_and_gaps() -> None:
     gap = _patch(gap, end + 4 + 16, "<I", cd_off + 4)
     with pytest.raises(zipraw.ZipLayoutError, match="between"):
         zipraw.parse_layout(gap)
+
+
+def test_layout_refuses_a_gap_between_members() -> None:
+    good = _zip([("a.xml", b"a" * 50), ("b.xml", b"b" * 50)])
+    first, second = zipraw.parse_layout(good)
+    end = good.rfind(b"PK\x05\x06")
+    cd_off = struct.unpack_from("<I", good, end + 16)[0]
+    junk = b"JUNK"
+    data = good[: first.local_end] + junk + good[first.local_end :]
+    shift = len(junk)
+    data = _patch(data, second.central_start + shift + 42, "<I", second.local_start + shift)
+    data = _patch(data, end + shift + 16, "<I", cd_off + shift)
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:  # zipfile itself reads past the junk
+        assert zf.read("b.xml") == b"b" * 50
+    with pytest.raises(zipraw.ZipLayoutError, match="gap or overlap"):
+        zipraw.parse_layout(data)
+
+
+def test_layout_refuses_local_sizes_that_disagree() -> None:
+    good = _zip([("a.xml", b"a" * 50)])
+    with pytest.raises(zipraw.ZipLayoutError, match="CRC or sizes"):
+        zipraw.parse_layout(_patch(good, 14, "<I", 0x12345678))
+
+
+@pytest.mark.parametrize("path", ALL, ids=[p.name for p in ALL])
+def test_rewrite_updates_the_local_header_of_a_replaced_member(path: Path) -> None:
+    out = zipraw.rewrite(path.read_bytes(), {"project.xml": b"<x/>"})
+    entry = next(e for e in zipraw.parse_layout(out) if e.name == "project.xml")
+    crc, csize, usize = struct.unpack_from("<III", out, entry.local_start + 14)
+    assert (crc, usize) == (zlib.crc32(b"<x/>"), 4)
+    assert csize == entry.data_end - entry.data_start
 
 
 def test_layout_refuses_mismatched_local_headers() -> None:
