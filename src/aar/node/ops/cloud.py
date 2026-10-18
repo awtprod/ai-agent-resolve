@@ -155,7 +155,11 @@ class CloudSyncParams(OpModel):
     bin_path: tuple[str, ...] = Field(default=(), description="Bin below the media-pool root.")
     recursive: bool = Field(default=True, strict=True)
     cursor: int = Field(
-        strict=True, default=0, ge=0, description="Index of the first clip to read."
+        strict=True,
+        default=0,
+        ge=0,
+        description="Index of the first clip to read. cursor == total_clips is a legal resume "
+        "point and returns an empty, done page; a cursor past that is an error.",
     )
     max_clips: int = Field(strict=True, default=200, ge=1, le=5000, description="Clips per call.")
 
@@ -173,8 +177,10 @@ class ClipSync(OpModel):
     has_proxy: bool
     """A playable proxy (a resolution in 'Proxy'); 'Offline'/'None'/'' are not playable."""
     proxy_offline: bool
+    """The proxy file itself is offline ('Proxy' == 'Offline'); not a playable proxy."""
     online_status: str
     original_offline: bool
+    """The original media is offline ('Online Status' is neither 'Online' nor blank)."""
     proxy_only: bool
     """A playable proxy with the original offline: a build uses it and loses audio."""
     fully_offline: bool

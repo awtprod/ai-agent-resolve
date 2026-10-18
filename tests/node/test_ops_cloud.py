@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from aar.node.ops import get_op
+from aar.node.ops import get_op, raw
 from aar.node.ops.framework import OpModel
 
 from .fake_resolve import FakeResolve
@@ -244,3 +244,75 @@ def test_cloud_ops_target_a_folder_that_is_not_the_root() -> None:
     assert result.current_folder == "Shows"
     assert {p.name for p in result.projects} == {"Show"}
     assert isinstance(result, OpModel)
+
+
+# -- round-3 pins (surviving-mutant coverage, folded from the validator's repros) -------------
+
+
+def test_as_number_rejects_bool() -> None:
+    # Mutant A2 (drop the isinstance(value, bool) guard): a bool Cloud Sync would read as
+    # 1.0/0.0 and be mislabelled instead of staying unparseable.
+    assert raw._as_number(True) is None
+    assert raw._as_number(False) is None
+
+
+def test_is_resolution_rejects_three_parts() -> None:
+    # Mutant B1 (len == 2 -> >= 2): "WxHxN" must not read as a playable proxy.
+    assert raw._is_resolution("1920x1080x30") is False
+
+
+def test_is_resolution_rejects_nonnumeric_width() -> None:
+    # Mutant B5 (drop parts[0].isdigit()): a non-numeric width must be rejected.
+    assert raw._is_resolution("ABCx1080") is False
+    assert raw._is_resolution("1920x1080") is True  # control
+
+
+def test_empty_online_status_is_not_offline() -> None:
+    # Mutant C3 (online not in ("Online",)): an Online Status of "" is a real live value (132
+    # live clips) and must read as present, so it is neither proxy_only nor fully_offline.
+    labels = raw.cloud_sync_labels(FakeResolve)
+    facts = raw.classify_cloud_sync({"Online Status": "", "Proxy": "", "Cloud Sync": "-1"}, labels)
+    assert facts["original_offline"] is False
+    assert facts["fully_offline"] is False
+    assert facts["proxy_only"] is False
+
+
+def test_missing_cloud_sync_raw_is_empty_not_none_string() -> None:
+    # Mutant C10 (raw_str = str(raw_value)): a clip with no 'Cloud Sync' key must echo "" in
+    # cloud_sync_raw, not the literal string "None".
+    labels = raw.cloud_sync_labels(FakeResolve)
+    facts = raw.classify_cloud_sync({"Online Status": "Online", "Proxy": ""}, labels)
+    assert facts["cloud_sync_raw"] == ""
+    assert facts["cloud_sync"] == "unknown"
+
+
+def test_sync_status_surfaces_type_and_has_audio() -> None:
+    # Mutants I1 (has_audio -> False) and I2 (type -> ""): the per-clip type and has_audio must
+    # be carried through read_cloud_sync.
+    show = Show()
+    result = show.ok("cloud.sync_status", {})
+    music = next(c for c in result.clips if c.name == "theme")
+    assert music.has_audio is True  # kills I1
+    assert music.type != ""  # kills I2
+    assert content_writes(show.fake) == []
+
+
+def test_projects_unknown_collaboration_bucket() -> None:
+    # Mutant H1 (key = mode, dropping the "unknown" fallback): a project whose attributes omit
+    # liveCollaborationMode (the keys are total=False) must bucket under "unknown", not vanish.
+    show = Show()
+    del show.fake.project("Other").attributes["liveCollaborationMode"]
+    result = show.ok("cloud.projects", {})
+    assert result.by_collaboration.get("unknown", 0) >= 1
+    other = next(p for p in result.projects if p.name == "Other")
+    assert other.live_collaboration_mode is None
+
+
+def test_cursor_equal_total_returns_empty_done_page() -> None:
+    # Mutant E1 (cursor > total -> >=): cursor == total is a legal resume point and must return
+    # an empty, done page rather than raising cursor_past_end (as the cursor docstring promises).
+    show = Show()
+    total = show.ok("cloud.sync_status", {}).total_clips
+    page = show.ok("cloud.sync_status", {"cursor": total})
+    assert page.scanned == 0 and page.clips == []
+    assert page.done and page.next_cursor is None
