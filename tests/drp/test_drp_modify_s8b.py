@@ -453,3 +453,31 @@ def test_fe_a_failed_placement_removes_the_new_sidecar(
     with pytest.raises(OSError, match="No space"):
         run(H264, tmp_path, RENAME)
     assert list(tmp_path.iterdir()) == []
+
+
+# --------------------------------------------------------------------------- F-D, F-J
+
+
+def test_fd_stdout_closed_after_a_write_exits_74_with_the_file_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from aar.cli import main
+
+    plan_file = tmp_path / "plan.json"
+    plan_file.write_text(json.dumps({"edits": [RENAME]}))
+    out = tmp_path / "out.drp"
+    monkeypatch.setattr("sys.stdout", None)
+    code = main(["drp", "edit", str(H264), "--plan", str(plan_file), "--out", str(out)])
+    assert code == 74
+    assert "stdout is closed" in capsys.readouterr().err
+    label = json.loads(Path(str(out) + SIDECAR_SUFFIX).read_text())
+    assert label["status"] == "unverified" and read_drp(out).project.name == "x"
+
+
+def test_fj_path_map_report_states_its_scope(tmp_path: Path) -> None:
+    table = [{"windows": "E:", "mac": MAC_DIR}]
+    outcome = edit_file(
+        H264, plan({"op": "path_map", "direction": "mac_to_windows", "table": table}), dry_run=True
+    )
+    [report] = outcome.report
+    assert "project settings" in report["scope"] and "GalleryPath" in report["scope"]

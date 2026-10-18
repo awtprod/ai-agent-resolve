@@ -2,7 +2,10 @@
 
 ``aar drp edit-schema`` prints the JSON Schema of :class:`DrpEditPlan`. Every edit names its
 target by DbId (``id``, as ``aar drp inspect --json`` shows it), or by its current name when that
-name is unique. Edits apply in order; a plan whose edits touch the same value twice is refused.
+name is unique. Edits apply in order. Two edits that rewrite the same bytes (two renames of one
+object) are refused, and so is a second ``path_map`` (put every row in one table). Marker edits
+on one owner apply one after another to the same list, so an update and then a delete of one
+marker is allowed; edits of different values are independent.
 
 Whitelisted ``op`` values: ``rename``, ``path_map``, ``marker_add``, ``marker_update`` and
 ``marker_delete``. ``metadata`` and ``fader_keyframes`` are known but deferred (see

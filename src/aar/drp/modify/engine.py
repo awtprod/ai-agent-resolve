@@ -57,6 +57,12 @@ _INFO_TAGS = frozenset({"BtVideoInfo", "BtAudioInfo"})
 _INFO_SKIP = frozenset({"Sequence", "TimelineSharedHandle"})
 _CARRIERS = {"timeline": "Sm2SequenceLockableBlob", "item": "Sm2TiItemLockableBlob"}
 _TAG = re.compile(rb"^<([^\s/>]+)")
+PATH_MAP_SCOPE = (
+    "maps media pool Clip blob paths and timeline item <MediaFilePath> text only; paths "
+    "elsewhere stay as they are: project settings in project.xml (the SM_Config settings blob, "
+    "e.g. cache and capture locations), gallery stills (stills/*.xml <GalleryPath>), proxy and "
+    "render-cache locations, and anything inside blobs the reader does not decode"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,6 +490,7 @@ class _Planner:
                 "direction": e.direction,
                 "touched": touched,
                 "unmapped": unmapped,
+                "scope": PATH_MAP_SCOPE,
             }
         )
 

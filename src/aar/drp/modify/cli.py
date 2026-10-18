@@ -38,8 +38,10 @@ exit status:
   0    edited and verified (written, or with --dry-run checked and not written)
   1    refused: the plan, the input or the written file failed a check; nothing was written
   2    error: the input or the plan file cannot be read, usage error, or an internal error
-  74   the output could not be written (the --out file, or stdout)
+  74   the output could not be written: the --out file (then nothing was placed), or stdout
   141  the output pipe was closed early (for example by `head`)
+With 74 or 141 from stdout, the edit may still have completed: the file and its label
+<out>.aar.json are in place if the label exists; read it for the result.
 Every written file is labelled "unverified" (see <out>.aar.json) until the Resolve sandbox
 round trip exists.
 """
