@@ -271,6 +271,36 @@ def test_p15_hung_gateway_call_does_not_block_the_pump(tmp_path: Path) -> None:
     assert world.runner.get(job_id).stall["code"] == "watchdog_op_timeout"
 
 
+# -- P17: a run-time op failure fails the job (and burns the token already spent on it) --------
+
+
+def test_p17_runtime_op_failure_fails_the_job_and_burns_the_token(tmp_path: Path) -> None:
+    world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
+    job_id = world.runner.submit(
+        "ops.sequence",
+        {
+            "steps": [
+                {
+                    "op": "markers.add",
+                    "params": {
+                        "timeline": {"unique_id": "tl-does-not-exist"},
+                        "markers": [{"frame": 100}],
+                    },
+                }
+            ]
+        },
+        world.locator(),
+    )
+    world.runner.run_until_settled()
+    token = grant(world.log, ApprovalScope.PROJECT_WRITE, world.pid(), 3600, "ok", HUMAN)
+    world.runner.approve(job_id, token.token_id, HUMAN)
+    world.runner.run_until_settled()
+    view = world.runner.get(job_id)
+    assert view.state == JobState.FAILED.value  # a failed op is NOT reported as done
+    assert view.error["code"] == "timeline_unavailable"  # the missing timeline, structured
+    assert view.approval_consumed  # the token was spent at the write and is not refunded
+
+
 # -- P18: a project-scope stop reaches the job via the registry id -----------------------------
 
 
