@@ -8,13 +8,14 @@ from __future__ import annotations
 import json
 import re
 import struct
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 from diff_testing import CLIP, H264, POOL, SEQUENCE, TIMELINE
-from drp_edit import add_carrier, carrier, edit_zip, marker_entry
+from drp_edit import add_carrier, carrier, edit_zip, marker_entry, markers_fields_blob
 from drp_helpers import kd, needs_zstandard, pb_len, zstd_raw_frame
 
 from aar.drp import blobs
@@ -353,3 +354,53 @@ def test_fb_a_no_op_rename_beside_a_real_one(tmp_path: Path) -> None:
     assert outcome.status == "written", outcome.to_dict()["refusals"]
     assert [(c["object_kind"], c["new"]) for c in outcome.changes] == [("media", "Interview")]
     assert [r.get("unchanged", False) for r in outcome.report] == [True, False]
+
+
+# --------------------------------------------------------------------------- F-H
+
+UNDECODED = struct.pack("B", 7 << 3) + b"\x05"  # a varint field 7 the reader does not decode
+
+
+def _odd_marker_src(tmp_path: Path, **kw: Any) -> Path:
+    entries = [marker_entry(10, BLUE, "Intro", extra=UNDECODED, **kw), marker_entry(20, BLUE, "B")]
+    element = carrier(
+        "0b0b0b0b-1111-2222-3333-444444444444", SEQUENCE, markers_fields_blob(*entries)
+    )
+    return edit_zip(H264, tmp_path / "odd.drp", {"project.xml": add_carrier(element)})
+
+
+def _marker(edit: dict[str, Any]) -> dict[str, Any]:
+    return {"owner": "timeline", "owner_id": TIMELINE, **edit}
+
+
+def test_fh_deleting_a_marker_with_undecoded_fields_is_refused_before_the_gate(
+    tmp_path: Path,
+) -> None:
+    src = _odd_marker_src(tmp_path)
+    outcome, out = run(src, tmp_path, _marker({"op": "marker_delete", "frame": 10}))
+    assert [r.code for r in outcome.refusals] == ["marker-undecoded"]
+    assert outcome.gate is None  # refused at apply time; nothing was written or diffed
+    assert not out.exists()
+    plain, _ = run(src, tmp_path, _marker({"op": "marker_delete", "frame": 20}))
+    assert plain.status == "written", plain.to_dict()["refusals"]
+
+
+def test_fh_an_update_that_would_rewrite_undecoded_bytes_is_refused(tmp_path: Path) -> None:
+    src = _odd_marker_src(tmp_path, duration=b"01")  # "01" is kept raw: not Resolve's spelling
+    assert read_drp(src).timelines[0].markers[0].duration == 1
+    outcome, out = run(
+        src, tmp_path, _marker({"op": "marker_update", "frame": 10, "set": {"duration": 24}})
+    )
+    assert [r.code for r in outcome.refusals] == ["marker-undecoded"]
+    assert not out.exists()
+
+
+def test_fh_multi_field_update_keeps_undecoded_fields(tmp_path: Path) -> None:
+    src = _odd_marker_src(tmp_path)
+    change = {"name": "Big", "note": "n", "color": "Red", "custom_data": "agent:7", "frame": 12}
+    outcome, out = run(src, tmp_path, _marker({"op": "marker_update", "frame": 10, "set": change}))
+    assert outcome.status == "written", outcome.to_dict()["refusals"]
+    [m, _] = read_drp(out).timelines[0].markers
+    assert (m.frame, m.name, m.note, m.color, m.custom_data) == (12, "Big", "n", "Red", "agent:7")
+    with zipfile.ZipFile(out) as zf:
+        assert UNDECODED.hex().encode() in zf.read("project.xml")

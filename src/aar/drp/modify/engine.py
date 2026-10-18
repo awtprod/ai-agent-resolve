@@ -652,16 +652,31 @@ class _Planner:
             raise _Refuse("marker-not-found", f"no marker at frame {e.frame}", i)
         if len(at) > 1:
             raise _Refuse("marker-ambiguous", f"{len(at)} markers sit at frame {e.frame}", i)
+        current = ml.entries[at[0]]
         if isinstance(e, MarkerDelete):
+            if current.odd is not None:
+                raise _Refuse(
+                    "marker-undecoded",
+                    f"the marker at frame {e.frame} holds data the reader does not decode; "
+                    "deleting it would drop that data, which the post-write gate cannot vouch for",
+                    i,
+                )
             del ml.entries[at[0]]
             return
         changes = e.set.model_dump(exclude_unset=True)
-        current = ml.entries[at[0]]
         moved_to = changes.get("frame", e.frame)
         if moved_to != e.frame and any(m.values["frame"] == moved_to for m in ml.entries):
             raise _Refuse("marker-exists", f"a marker already sits at frame {moved_to}", i)
         _check_marker_text(i, {**current.values, **changes})
-        ml.entries[at[0]] = current.updated(changes)
+        updated = current.updated(changes)
+        if updated.odd != current.odd:
+            raise _Refuse(
+                "marker-undecoded",
+                f"updating the marker at frame {e.frame} would rewrite data the reader does not "
+                "decode (for example a duration not spelled the way Resolve writes it)",
+                i,
+            )
+        ml.entries[at[0]] = updated
 
     def _finish_markers(self) -> None:
         for key, (prov, ml, edits) in self.marker_lists.items():
