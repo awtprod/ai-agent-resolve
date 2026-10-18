@@ -20,7 +20,7 @@ from drp_helpers import kd, needs_zstandard, pb_len, zstd_raw_frame
 from aar.drp import blobs
 from aar.drp.modify import compare_round_trip, encode, parse_plan
 from aar.drp.modify.encode import EncodeError
-from aar.drp.modify.write import edit_file
+from aar.drp.modify.write import SIDECAR_SUFFIX, edit_file
 from aar.drp.reader import read_drp
 
 MAC_DIR = "/Users/samuelgursky/Desktop"
@@ -265,3 +265,56 @@ def test_ff_rows_that_differ_only_under_full_folding_are_distinct() -> None:
     m = PathMapper("windows_to_mac", [("E:\\Straße", "/Volumes/A"), ("E:\\STRASSE", "/Volumes/B")])
     assert m.map("E:\\straße\\x").new == "/Volumes/A/x"
     assert m.map("E:\\strasse\\x").new == "/Volumes/B/x"
+
+
+# --------------------------------------------------------------------------- F-C
+
+RENAME = {"op": "rename", "target": "project", "new_name": "x"}
+
+
+def _interrupted_run(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """What a hard kill between placing the label and placing the file leaves behind."""
+    outcome, out = run(H264, tmp_path, RENAME)
+    assert outcome.status == "written"
+    sidecar = Path(str(out) + SIDECAR_SUFFIX)
+    out.unlink()  # the file was never moved into place
+    stale = tmp_path / ".out.drp.k3j9x_2a.tmp.drp"  # its verified temp copy stayed behind
+    stale.write_bytes(b"partial")
+    return out, sidecar, stale
+
+
+def test_fc_orphan_sidecar_gets_a_specific_refusal(tmp_path: Path) -> None:
+    out, sidecar, stale = _interrupted_run(tmp_path)
+    outcome = edit_file(H264, plan(RENAME), out)
+    assert [r.code for r in outcome.refusals] == ["orphan-sidecar"]
+    details = outcome.refusals[0].details
+    assert details["remove"] == [str(sidecar), str(stale)]
+    assert str(sidecar) in outcome.refusals[0].message
+    assert sidecar.exists() and stale.exists() and not out.exists()  # nothing deleted
+    sidecar.unlink()
+    stale.unlink()
+    assert edit_file(H264, plan(RENAME), out).status == "written"
+
+
+def test_fc_a_sidecar_we_did_not_write_is_plain_out_exists(tmp_path: Path) -> None:
+    out = tmp_path / "out.drp"
+    sidecar = Path(str(out) + SIDECAR_SUFFIX)
+    for text in ("{}", "not json", json.dumps({"tool": "aar 0", "label": "unverified"})):
+        sidecar.write_text(text)
+        outcome = edit_file(H264, plan(RENAME), out)
+        assert [r.code for r in outcome.refusals] == ["out-exists"], text
+        assert sidecar.read_text() == text
+
+
+def test_fc_leftover_temp_files_are_reported_not_deleted(tmp_path: Path) -> None:
+    stale = [
+        tmp_path / ".out.drp.abcd1234.tmp.drp",
+        tmp_path / ".out.drp.aar.json.zz_9yy1q.tmp.json",
+    ]
+    unrelated = [tmp_path / ".out.drp.notours.txt", tmp_path / ".other.drp.abcd1234.tmp.drp"]
+    for p in stale + unrelated:
+        p.write_bytes(b"x")
+    outcome, _ = run(H264, tmp_path, RENAME)
+    assert outcome.status == "written"
+    assert outcome.to_dict()["leftovers"] == sorted(str(p) for p in stale)
+    assert all(p.exists() for p in stale + unrelated)

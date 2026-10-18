@@ -15,6 +15,11 @@ Order of work, and what stops it (every stop writes nothing):
 5. Only then are the sidecar ``<out>.aar.json`` (status ``unverified``) and the file moved into
    place, the sidecar first, so a written file never lacks its label.
 
+A run stopped hard between those two moves leaves a label without its file; the next run for
+the same ``--out`` refuses with ``orphan-sidecar`` and lists what to remove. Temporary files a
+stopped run left behind are listed in ``leftovers``. Nothing is ever deleted that this run did
+not create.
+
 Nothing here talks to Resolve. Outputs stay ``unverified`` until the sandbox round trip (D3).
 """
 
@@ -24,6 +29,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,7 +44,14 @@ from aar.drp.modify.plan import DrpEditPlan
 from aar.drp.modify.verify import verify_write
 from aar.drp.reader import read_drp
 
-__all__ = ["DEFAULT_MAX_INPUT_BYTES", "LABEL", "SIDECAR_SUFFIX", "EditOutcome", "edit_file"]
+__all__ = [
+    "DEFAULT_MAX_INPUT_BYTES",
+    "LABEL",
+    "SIDECAR_SUFFIX",
+    "EditOutcome",
+    "edit_file",
+    "leftovers",
+]
 
 LABEL = "unverified"
 SIDECAR_SUFFIX = ".aar.json"
@@ -48,6 +61,7 @@ UNVERIFIED_WHY = (
 )
 # The largest corpus file is 11.6 MB; the writer holds the input and the output in memory.
 DEFAULT_MAX_INPUT_BYTES = 1024 * 1024 * 1024
+_MAX_SIDECAR_BYTES = 512 * 1024 * 1024
 
 
 @dataclass(slots=True)
@@ -63,6 +77,7 @@ class EditOutcome:
     report: list[dict[str, Any]] = field(default_factory=list)
     refusals: list[Refusal] = field(default_factory=list)
     gate: dict[str, Any] | None = None
+    leftovers: list[str] = field(default_factory=list)
 
     @property
     def refused(self) -> bool:
@@ -82,6 +97,7 @@ class EditOutcome:
             "expected": self.expected,
             "report": self.report,
             "refusals": [r.to_dict() for r in self.refusals],
+            "leftovers": self.leftovers,
         }
 
 
@@ -154,6 +170,18 @@ def _precheck(
     sidecar = Path(str(out) + SIDECAR_SUFFIX)
     if _same_file(path, out) or _same_file(path, sidecar):
         refusals.append(Refusal("out-is-input", "the output must be a new file, not the input"))
+    elif not force and _orphan_sidecar(out, sidecar):
+        remove = [str(sidecar), *(str(p) for p in leftovers(out))]
+        refusals.append(
+            Refusal(
+                "orphan-sidecar",
+                f"an earlier aar drp edit was stopped after it wrote the label {sidecar} and "
+                f"before it moved {out.name} into place, so the label describes a file that does "
+                "not exist; remove the files listed in details.remove (or pass --force) and run "
+                "again",
+                details={"remove": remove},
+            )
+        )
     elif not force and (out.exists() or sidecar.exists()):
         existing = [str(p) for p in (out, sidecar) if p.exists()]
         refusals.append(
@@ -168,6 +196,44 @@ def _precheck(
             Refusal("no-output-dir", f"the output directory {out.parent} does not exist")
         )
     return refusals
+
+
+def _temp_pattern(name: str, suffix: str) -> re.Pattern[str]:
+    # _temp names files "." + final name + 8 random mkstemp characters + ".tmp" + suffix.
+    return re.compile(rf"\.{re.escape(name)}\.[a-z0-9_]{{8}}\.tmp{re.escape(suffix)}")
+
+
+def leftovers(out: Path) -> list[Path]:
+    """Temporary files an interrupted run for ``out`` left in its directory (ours by name)."""
+    sidecar = out.name + SIDECAR_SUFFIX
+    patterns = (_temp_pattern(out.name, out.suffix), _temp_pattern(sidecar, ".json"))
+    try:
+        with os.scandir(out.parent) as entries:
+            names = [e.name for e in entries if e.name.startswith("." + out.name)]
+    except OSError:
+        return []
+    return sorted(out.parent / n for n in names if any(p.fullmatch(n) for p in patterns))
+
+
+def _orphan_sidecar(out: Path, sidecar: Path) -> bool:
+    """``sidecar`` is a label this tool wrote for ``out``, and ``out`` itself does not exist."""
+    if out.exists() or out.is_symlink() or not sidecar.is_file():
+        return False
+    try:
+        if sidecar.stat().st_size > _MAX_SIDECAR_BYTES:
+            return False
+        record = json.loads(sidecar.read_bytes())
+    except (OSError, ValueError, RecursionError):
+        return False
+    output = record.get("output") if isinstance(record, dict) else None
+    return (
+        isinstance(output, dict)
+        and str(record.get("tool", "")).startswith("aar ")
+        and record.get("label") == LABEL
+        and record.get("status") == LABEL
+        and Path(str(output.get("path"))).name == out.name
+        and Path(str(output.get("sidecar"))).name == sidecar.name
+    )
 
 
 def _read_input(path: Path, max_bytes: int) -> bytes:
@@ -236,6 +302,8 @@ def edit_file(
     plan_dict = plan.model_dump(mode="json", exclude_none=True)  # parse_plan reads it back
     drp = read_drp(path)
     outcome = EditOutcome("refused", _input_info(path, drp), plan_dict)
+    if out_path is not None:
+        outcome.leftovers = [str(p) for p in leftovers(out_path)]
     outcome.refusals = _precheck(drp, path, plan, out_path, force, dry_run)
     if outcome.refusals:
         return outcome
