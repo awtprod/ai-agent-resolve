@@ -14,6 +14,7 @@ reused explicit id is rejected rather than silently overwriting.
 
 from __future__ import annotations
 
+import json
 import secrets
 from dataclasses import dataclass, field
 from typing import Any
@@ -272,6 +273,7 @@ class Registry:
                 "sources": source_dicts,
                 "aliases": alias_list,
             }
+            self._refuse_unless_foldable(EVENT_PROJECT_CREATED, actor, payload)
             event = txn.append(
                 EVENT_PROJECT_CREATED,
                 actor,
@@ -387,6 +389,7 @@ class Registry:
                         actor=actor,
                     )
                     return self._projects[project_id]
+            self._refuse_unless_foldable(event_type, actor, payload)
             event = txn.append(
                 event_type,
                 actor,
@@ -396,6 +399,18 @@ class Registry:
             )
         self._apply(event)
         return self._projects[project_id]
+
+    def _refuse_unless_foldable(
+        self, event_type: str, actor: Actor, payload: dict[str, Any]
+    ) -> None:
+        """Refuse, before writing, an event the fold would skip (a silent no-op or a
+        KeyError after the commit otherwise). Checked as stored, after a JSON round trip.
+        """
+        stored = json.loads(json.dumps(payload, allow_nan=False))
+        probe = Event(0, "", stored.get("project_id"), event_type, actor, "", stored)
+        problem = _problem(self._projects, probe)
+        if problem is not None:
+            raise ValueError(f"refused before writing {event_type}: {problem}")
 
     def _catch_up(self, txn: Transaction) -> None:
         for event in txn.read(self._last_seq, types=_REGISTRY_TYPES):

@@ -14,6 +14,7 @@ insert are therefore atomic.
 
 from __future__ import annotations
 
+import json
 import secrets
 from dataclasses import dataclass, field
 from typing import Any
@@ -380,6 +381,7 @@ class WorkGraph:
                 "title": title,
                 "data": data or {},
             }
+            self._refuse_unless_foldable(EVENT_NODE_ADDED, actor, payload)
             event = txn.append(
                 EVENT_NODE_ADDED,
                 actor,
@@ -426,10 +428,12 @@ class WorkGraph:
                 raise IllegalTransition(
                     f"cannot move node {node_id} from {node.status!r} to {new_status!r}"
                 )
+            payload = {"node_id": node_id, "to": new_status}
+            self._refuse_unless_foldable(EVENT_NODE_STATUS_CHANGED, actor, payload)
             event = txn.append(
                 EVENT_NODE_STATUS_CHANGED,
                 actor,
-                {"node_id": node_id, "to": new_status},
+                payload,
                 project_id=self._project_id,
                 idempotency_key=idempotency_key,
             )
@@ -502,6 +506,7 @@ class WorkGraph:
                 "dst": dst,
                 "data": data or {},
             }
+            self._refuse_unless_foldable(EVENT_EDGE_ADDED, actor, payload)
             event = txn.append(
                 EVENT_EDGE_ADDED,
                 actor,
@@ -556,10 +561,12 @@ class WorkGraph:
                 f"{actor.kind}:{actor.id} may not move review {node_id} to {new_status!r}: "
                 "only a human decides, and only the requester may withdraw"
             )
+        payload = {"node_id": node_id, "to": new_status}
+        self._refuse_unless_foldable(EVENT_NODE_STATUS_CHANGED, actor, payload)
         event = txn.append(
             EVENT_NODE_STATUS_CHANGED,
             actor,
-            {"node_id": node_id, "to": new_status},
+            payload,
             project_id=self._project_id,
         )
         self._apply(event)
@@ -570,6 +577,20 @@ class WorkGraph:
         return tuple(self._state.skipped)
 
     # -- internals ----------------------------------------------------------
+
+    def _refuse_unless_foldable(
+        self, event_type: str, actor: Actor, payload: dict[str, Any]
+    ) -> None:
+        """Refuse, before writing, an event this projection's own fold would skip.
+
+        Otherwise the event commits and the writer then fails to find what it wrote.
+        The payload is checked as it will be stored (after a JSON round trip).
+        """
+        stored = json.loads(json.dumps(payload, allow_nan=False))
+        probe = Event(0, "", self._project_id, event_type, actor, "", stored)
+        problem = _problem(self._state, probe)
+        if problem is not None:
+            raise ValueError(f"refused before writing {event_type}: {problem}")
 
     @staticmethod
     def _retried(found: dict[str, Any], existing: Event, field: str) -> Any:
