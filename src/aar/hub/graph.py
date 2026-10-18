@@ -19,7 +19,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from aar.hub.common import SkippedEvent
-from aar.hub.events import Actor, Event, EventLog, Transaction, match_or_conflict
+from aar.hub.events import (
+    Actor,
+    Event,
+    EventLog,
+    IdempotencyConflict,
+    Transaction,
+    match_or_conflict,
+)
 
 NODE_KINDS = frozenset({"brief", "plan", "op", "artifact", "review"})
 EDGE_TYPES = frozenset({"derives_from", "produces", "reviews", "blocks"})
@@ -362,7 +369,7 @@ class WorkGraph:
                         project_id=self._project_id,
                         actor=actor,
                     )
-                    return self._state.nodes[existing.payload["node_id"]]
+                    return self._retried(self._state.nodes, existing, "node_id")
             nid = node_id or new_node_id()
             if nid in self._state.nodes:
                 raise DuplicateNodeId(f"node id already exists: {nid!r}")
@@ -466,7 +473,7 @@ class WorkGraph:
                         project_id=self._project_id,
                         actor=actor,
                     )
-                    return self._state.edges[existing.payload["edge_id"]]
+                    return self._retried(self._state.edges, existing, "edge_id")
             src_node = self._state.nodes.get(src)
             dst_node = self._state.nodes.get(dst)
             if src_node is None:
@@ -563,6 +570,21 @@ class WorkGraph:
         return tuple(self._state.skipped)
 
     # -- internals ----------------------------------------------------------
+
+    @staticmethod
+    def _retried(found: dict[str, Any], existing: Event, field: str) -> Any:
+        """The entity an idempotent retry refers to, or a conflict if there is none.
+
+        The stored event matched the request, but if it was forged or malformed the
+        projection never folded it; that is a conflict, not a KeyError.
+        """
+        entity = found.get(existing.payload.get(field))
+        if entity is None:
+            raise IdempotencyConflict(
+                f"idempotency key {existing.idempotency_key!r} names an event the graph "
+                "could not use"
+            )
+        return entity
 
     def _catch_up(self, txn: Transaction) -> None:
         for event in txn.read(self._last_seq, project_id=self._project_id, types=_GRAPH_TYPES):

@@ -162,7 +162,9 @@ def match_or_conflict(
     deliberately not compared. The ``event_type`` check keeps the return path (indexing
     by the stored ``node_id``/``edge_id``/``project_id``) type-correct.
     """
-    same = existing.type == event_type
+    # A stored payload that is not an object cannot be the same request (and must not
+    # raise AttributeError on the retry path): refuse it as a conflict.
+    same = existing.type == event_type and isinstance(existing.payload, dict)
     if same and project_id is not None:
         same = existing.project_id == project_id
     if same and actor is not None:

@@ -98,6 +98,9 @@ def actor_dict(actor: Actor) -> dict[str, str]:
     return {"kind": actor.kind, "id": actor.id}
 
 
+MAX_SKIP_REASON = 200
+
+
 @dataclass(frozen=True, slots=True)
 class SkippedEvent:
     """An event a projection could not use (malformed, forged, or out of order).
@@ -110,6 +113,13 @@ class SkippedEvent:
     seq: int
     type: str
     reason: str
+
+    def __post_init__(self) -> None:
+        # Reasons quote agent-written values (an illegal status, an actor id), so they
+        # are capped like everything else shown to people and agents.
+        if len(self.reason) > MAX_SKIP_REASON:
+            capped = self.reason[: MAX_SKIP_REASON - 1] + "\u2026"
+            object.__setattr__(self, "reason", capped)
 
     @classmethod
     def of(cls, event: Event, reason: str) -> SkippedEvent:

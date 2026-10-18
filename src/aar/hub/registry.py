@@ -19,7 +19,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from aar.hub.common import SkippedEvent
-from aar.hub.events import Actor, Event, EventLog, Transaction, match_or_conflict
+from aar.hub.events import (
+    Actor,
+    Event,
+    EventLog,
+    IdempotencyConflict,
+    Transaction,
+    match_or_conflict,
+)
 
 SOURCE_KINDS = frozenset({"cloud_library", "local_db", "drp_file", "drt_file"})
 
@@ -249,7 +256,13 @@ class Registry:
                         project_id=project_id,
                         actor=actor,
                     )
-                    return self._projects[existing.payload["project_id"]]
+                    project = self._projects.get(existing.payload.get("project_id"))
+                    if project is None:
+                        raise IdempotencyConflict(
+                            f"idempotency key {idempotency_key!r} names an event the "
+                            "registry could not use"
+                        )
+                    return project
             pid = project_id or new_project_id()
             if pid in self._projects:
                 raise DuplicateProjectId(f"project id already exists: {pid!r}")

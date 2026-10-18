@@ -307,7 +307,8 @@ def resume(
                 for e in events
                 if e.type == EVENT_STOPPED
                 and e.seq < existing.seq
-                and e.payload.get("scope") == str(scope)
+                and _problem(e) is None
+                and e.payload["scope"] == str(scope)
             ]
             if not lifted:  # pragma: no cover - a resume is only written over a stop
                 raise NotStopped(f"{scope} was not stopped")
