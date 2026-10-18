@@ -27,6 +27,7 @@ from aar.hub.common import (
     InvalidInput,
     SkippedEvent,
     clean_text,
+    is_member,
     is_text,
     is_ts,
     iso,
@@ -244,7 +245,7 @@ def _expired(expires_at: str | None, now: datetime) -> bool:
 def _holder_ok(value: Any) -> bool:
     return (
         isinstance(value, dict)
-        and value.get("kind") in _HOLDER_KINDS
+        and is_member(value.get("kind"), _HOLDER_KINDS)
         and is_text(value.get("id"), MAX_NODE_ID)
     )
 
@@ -258,7 +259,7 @@ def _lease_problem(payload: Any) -> str | None:
     if not is_text(payload.get("lease_id"), MAX_LEASE_ID):
         return "lease_id is not an id"
     scope = payload.get("scope")
-    if scope not in _KEY_ARITY:
+    if not is_member(scope, _KEY_ARITY):
         return "scope is not instance, project or timeline"
     key = payload.get("key")
     if (

@@ -35,6 +35,7 @@ from aar.hub.common import (
     SkippedEvent,
     actor_dict,
     clean_text,
+    is_member,
     is_text,
     is_ts,
     iso,
@@ -168,7 +169,7 @@ def _grant_problem(actor: Actor, payload: Any) -> str | None:
         return "payload is not an object"
     if not is_text(payload.get("token_id"), MAX_TOKEN_ID):
         return "token_id is not an id"
-    if payload.get("scope") not in _SCOPE_VALUES:
+    if not is_member(payload.get("scope"), _SCOPE_VALUES):
         return "scope is not an approval scope"
     if not is_text(payload.get("target"), MAX_TARGET):
         return f"target is not 1-{MAX_TARGET} characters"

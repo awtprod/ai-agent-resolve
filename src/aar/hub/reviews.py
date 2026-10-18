@@ -72,7 +72,16 @@ MAX_RENDERS = 16
 MAX_FRAME = 10**9
 MAX_FPS = 1000.0
 
-_TIMECODE_RE = re.compile(r"^\d{2}:[0-5]\d:[0-5]\d[:;]\d{2}$")
+TIMECODE_RE = re.compile(r"^\d{2}:[0-5]\d:[0-5]\d[:;]\d{2}$")
+"""A display timecode, ``HH:MM:SS:FF`` (``;`` before the frames for drop-frame)."""
+_TIMECODE_RE = TIMECODE_RE  # kept: S11 imports the private name
+
+
+def is_timecode(value: Any) -> bool:
+    """Whether ``value`` is a display timecode string (``HH:MM:SS:FF``)."""
+    return isinstance(value, str) and TIMECODE_RE.fullmatch(value) is not None
+
+
 _ARTIFACT_RE = re.compile(r"^[0-9a-f]{64}$")
 
 

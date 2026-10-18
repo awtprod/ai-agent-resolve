@@ -8,7 +8,7 @@ validated text for anything an agent or a form can supply.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -150,6 +150,15 @@ def skipped_summary(skipped: Iterable[SkippedEvent]) -> dict[str, Any]:
 def is_int(value: Any, low: int, high: int) -> bool:
     """Whether ``value`` is a real int (not a bool) within ``[low, high]``."""
     return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
+def is_member(value: Any, allowed: Collection[str]) -> bool:
+    """Whether ``value`` is one of the ``allowed`` strings.
+
+    Checks the type first: a list or dict from a forged payload is unhashable, and a
+    bare ``in`` on a set would raise TypeError and break the whole projection.
+    """
+    return isinstance(value, str) and value in allowed
 
 
 def is_text(value: Any, max_len: int, *, allow_empty: bool = False) -> bool:

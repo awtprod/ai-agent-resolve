@@ -19,7 +19,7 @@ import secrets
 from dataclasses import dataclass, field
 from typing import Any
 
-from aar.hub.common import SkippedEvent
+from aar.hub.common import SkippedEvent, is_member
 from aar.hub.events import (
     Actor,
     Event,
@@ -59,6 +59,10 @@ EVENT_NODE_STATUS_CHANGED = "graph.node_status_changed"
 EVENT_EDGE_ADDED = "graph.edge_added"
 
 _GRAPH_TYPES = (EVENT_NODE_ADDED, EVENT_NODE_STATUS_CHANGED, EVENT_EDGE_ADDED)
+
+# Writers refuse longer titles (they are shown in every listing). The fold still
+# accepts what is already in the log, so old data never disappears from projections.
+MAX_TITLE_CHARS = 1000
 
 
 class IllegalTransition(ValueError):
@@ -204,9 +208,9 @@ def _problem(state: GraphState, event: Event) -> str | None:
             return "node_id is not a valid id"
         if node_id in state.nodes:
             return f"node {node_id} already exists"
-        if payload.get("kind") not in NODE_KINDS:
+        if not is_member(payload.get("kind"), NODE_KINDS):
             return "kind is not a node kind"
-        if payload.get("status") not in STATUSES:
+        if not is_member(payload.get("status"), STATUSES):
             return "status is not a status"
         title = payload.get("title")
         if title is not None and not isinstance(title, str):
@@ -217,7 +221,7 @@ def _problem(state: GraphState, event: Event) -> str | None:
         if node is None:
             return "status change for an unknown node"
         to = payload.get("to")
-        if to not in STATUSES or to not in allowed_transitions(node.status):
+        if not is_member(to, STATUSES) or to not in allowed_transitions(node.status):
             return f"illegal transition from {node.status!r} to {to!r}"
         if node.kind == "review" and not review_status_change_allowed(
             event.actor, state.creators.get(node.id), node.status, to
@@ -229,7 +233,7 @@ def _problem(state: GraphState, event: Event) -> str | None:
         if not _is_id(edge_id) or edge_id in state.edges:
             return "edge_id is missing or already used"
         edge_type = payload.get("type")
-        if edge_type not in EDGE_TYPES:
+        if not is_member(edge_type, EDGE_TYPES):
             return "type is not an edge type"
         src = state.nodes.get(payload.get("src")) if _is_id(payload.get("src")) else None
         dst = state.nodes.get(payload.get("dst")) if _is_id(payload.get("dst")) else None
@@ -349,9 +353,9 @@ class WorkGraph:
         An explicit ``node_id`` that already exists is rejected with
         :class:`DuplicateNodeId`, unless the same ``idempotency_key`` created it.
         """
-        if kind not in NODE_KINDS:
+        if not is_member(kind, NODE_KINDS):
             raise ValueError(f"node kind must be one of {sorted(NODE_KINDS)}, got {kind!r}")
-        if status not in STATUSES:
+        if not is_member(status, STATUSES):
             raise ValueError(f"status must be one of {sorted(STATUSES)}, got {status!r}")
         with self._log.transaction() as txn:
             self._catch_up(txn)
@@ -406,7 +410,7 @@ class WorkGraph:
         A retry with the same ``idempotency_key`` returns the existing node without
         re-checking the transition, so an idempotent retry never raises.
         """
-        if new_status not in STATUSES:
+        if not is_member(new_status, STATUSES):
             raise ValueError(f"status must be one of {sorted(STATUSES)}, got {new_status!r}")
         with self._log.transaction() as txn:
             self._catch_up(txn)
@@ -458,7 +462,7 @@ class WorkGraph:
         idempotency_key: str | None = None,
     ) -> Edge:
         """Connect two existing nodes with a typed edge."""
-        if edge_type not in EDGE_TYPES:
+        if not is_member(edge_type, EDGE_TYPES):
             raise ValueError(f"edge type must be one of {sorted(EDGE_TYPES)}, got {edge_type!r}")
         with self._log.transaction() as txn:
             self._catch_up(txn)
@@ -550,7 +554,7 @@ class WorkGraph:
         """
         if txn._log is not self._log:
             raise ValueError("transaction belongs to a different event log")
-        if new_status not in STATUSES:
+        if not is_member(new_status, STATUSES):
             raise ValueError(f"status must be one of {sorted(STATUSES)}, got {new_status!r}")
         self._catch_up(txn)
         node = self._state.nodes.get(node_id)
@@ -596,6 +600,11 @@ class WorkGraph:
         Otherwise the event commits and the writer then fails to find what it wrote.
         The payload is checked as it will be stored (after a JSON round trip).
         """
+        title = payload.get("title")
+        if isinstance(title, str) and len(title) > MAX_TITLE_CHARS:
+            raise ValueError(
+                f"refused before writing {event_type}: title is over {MAX_TITLE_CHARS}"
+            )
         stored = json.loads(json.dumps(payload, allow_nan=False))
         probe = Event(0, "", self._project_id, event_type, actor, "", stored)
         problem = _problem(self._state, probe)

@@ -19,7 +19,7 @@ import secrets
 from dataclasses import dataclass, field
 from typing import Any
 
-from aar.hub.common import SkippedEvent
+from aar.hub.common import SkippedEvent, is_member
 from aar.hub.events import (
     Actor,
     Event,
@@ -30,6 +30,10 @@ from aar.hub.events import (
 )
 
 SOURCE_KINDS = frozenset({"cloud_library", "local_db", "drp_file", "drt_file"})
+
+# Writers refuse longer names and aliases; the fold still accepts what is already
+# in the log, so old data never disappears from projections.
+MAX_NAME_CHARS = 500
 
 EVENT_PROJECT_CREATED = "project.created"
 EVENT_PROJECT_RENAMED = "project.renamed"
@@ -62,7 +66,7 @@ class ProjectSource:
     host: str | None = None
 
     def __post_init__(self) -> None:
-        if self.kind not in SOURCE_KINDS:
+        if not is_member(self.kind, SOURCE_KINDS):
             raise ValueError(
                 f"source kind must be one of {sorted(SOURCE_KINDS)}, got {self.kind!r}"
             )
@@ -125,7 +129,7 @@ def _reduce(
 def _source_ok(value: Any) -> bool:
     return (
         isinstance(value, dict)
-        and value.get("kind") in SOURCE_KINDS
+        and is_member(value.get("kind"), SOURCE_KINDS)
         and isinstance(value.get("locator"), dict)
         and (value.get("host") is None or isinstance(value.get("host"), str))
     )
@@ -406,6 +410,12 @@ class Registry:
         """Refuse, before writing, an event the fold would skip (a silent no-op or a
         KeyError after the commit otherwise). Checked as stored, after a JSON round trip.
         """
+        for name_field in ("name", "alias"):
+            value = payload.get(name_field)
+            if isinstance(value, str) and len(value) > MAX_NAME_CHARS:
+                raise ValueError(
+                    f"refused before writing {event_type}: {name_field} is over {MAX_NAME_CHARS}"
+                )
         stored = json.loads(json.dumps(payload, allow_nan=False))
         probe = Event(0, "", stored.get("project_id"), event_type, actor, "", stored)
         problem = _problem(self._projects, probe)
