@@ -224,7 +224,7 @@ def edit_file(
     """
     path = Path(input_path)
     out_path = Path(out) if out is not None else None
-    plan_dict = plan.model_dump(mode="json")
+    plan_dict = plan.model_dump(mode="json", exclude_none=True)  # parse_plan reads it back
     drp = read_drp(path)
     outcome = EditOutcome("refused", _input_info(path, drp), plan_dict)
     outcome.refusals = _precheck(drp, path, plan, out_path, force, dry_run)

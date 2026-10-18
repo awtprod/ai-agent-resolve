@@ -219,14 +219,18 @@ def parse_plan(text: str | bytes) -> DrpEditPlan:
         raise PlanProblem("plan-too-large", f"the plan is {size} bytes, over {MAX_PLAN_BYTES}")
     try:
         raw = json.loads(text)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
+        # ValueError covers JSONDecodeError and integers past Python's digit limit.
         raise PlanProblem("plan-not-json", f"the plan is not JSON: {exc}") from exc
     edits = raw.get("edits") if isinstance(raw, dict) else None
     if isinstance(edits, list):
         deferred, foreign = [], []
         for i, edit in enumerate(edits):
             op = edit.get("op") if isinstance(edit, dict) else None
-            if op in DEFERRED_OPS:
+            if not isinstance(op, str):
+                scalar = isinstance(op, int | float | bool)
+                foreign.append({"edit": i, "op": op if scalar else None})
+            elif op in DEFERRED_OPS:
                 deferred.append({"edit": i, "op": op, "reason": DEFERRED_OPS[op]})
             elif op not in WHITELISTED_OPS:
                 foreign.append({"edit": i, "op": op})

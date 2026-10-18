@@ -311,6 +311,8 @@ def test_marker_add_update_delete_on_a_timeline(tmp_path: Path) -> None:
     ]
     outcome, out = run(src, tmp_path, *edits)
     assert outcome.status == "written", outcome.to_dict()["refusals"]
+    label = json.loads(Path(str(out) + SIDECAR_SUFFIX).read_text())
+    assert parse_plan(json.dumps(label["plan"])).model_dump() == plan(*edits).model_dump()
     old50 = props(50, "Green", "Laugh", "big one")
     assert changes(src, out) == sorted(
         [
@@ -670,6 +672,7 @@ def test_sidecar_labels_the_output_unverified(tmp_path: Path) -> None:
     assert label["plan"]["edits"][0]["new_name"] == "x"
     assert [c["field"] for c in label["changes"]] == ["name"]
     assert label["gate"] == {"passed": True, "reasons": []}
+    assert parse_plan(json.dumps(label["plan"])).edits[0].new_name == "x"
     assert no_temp_files(tmp_path)
 
 

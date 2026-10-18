@@ -6,12 +6,13 @@ components, and the longest matching prefix wins:
 
 * Windows side: separators ``\\`` and ``/`` are both accepted, and every component is compared
   case-insensitively (drive letters included), because Windows file names are. The rest of the
-  path keeps its own spelling.
+  path keeps its own spelling; drive letters are written upper-case.
 * Mac side: compared exactly (case-sensitively), because Mac volumes can be case-sensitive.
 
 UNC paths are mapped only by an entry whose Windows side is a UNC prefix; a UNC path no entry
 covers is reported as ``unc-not-mapped``. A path that cannot be written on the other system
-(a Mac name with ``\\`` or ``:``, a Windows-reserved character, an empty component) is reported,
+(a Mac name with ``\\`` or ``:``, a Windows-reserved character or device name such as ``CON``,
+a trailing space or dot, an empty component) is reported,
 never changed. Nothing here touches files; it only rewrites strings.
 """
 
@@ -29,6 +30,7 @@ _DRIVE = re.compile(r"^([A-Za-z]):(?:[\\/](.*))?$", re.S)
 _UNC = re.compile(r"^(?:\\\\|//)([^\\/]+)[\\/]([^\\/]+)(?:[\\/](.*))?$", re.S)
 _WIN_SEP = re.compile(r"[\\/]")
 _WIN_BAD = re.compile(r'[<>:"|?*\\/\x00-\x1f]')
+_WIN_RESERVED = re.compile(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$", re.I)
 _MAX_TABLE = 256
 _MAX_PREFIX = 4096
 
@@ -69,13 +71,17 @@ def _parse_win(path: str) -> _Win | None:
     if m is not None:
         rest = m.group(3)
         root = f"\\\\{m.group(1)}\\{m.group(2)}"
-        return _Win(root, True, _split(rest, _WIN_SEP), bool(rest) and rest[-1] in "\\/")
+        return _Win(root, True, _split(rest, _WIN_SEP), _trailing(rest))
     m = _DRIVE.match(path)
     if m is not None:
         rest = m.group(2)
-        trailing = rest is not None and (rest == "" or rest[-1] in "\\/")
-        return _Win(m.group(1).upper() + ":", False, _split(rest, _WIN_SEP), trailing)
+        return _Win(m.group(1).upper() + ":", False, _split(rest, _WIN_SEP), _trailing(rest))
     return None
+
+
+def _trailing(rest: str | None) -> bool:
+    """Whether the path after its root ends with a separator (``E:\\`` counts, ``E:`` not)."""
+    return rest is not None and (rest == "" or rest[-1] in "\\/")
 
 
 def _split(rest: str | None, sep: re.Pattern[str]) -> tuple[str, ...]:
@@ -176,7 +182,9 @@ class PathMapper:
         if best is None:
             return MapResult(None, "no-mapping")
         rest = m.parts[len(best.mac.parts) :]
-        if any(_WIN_BAD.search(p) or p.endswith((" ", ".")) for p in rest):
+        if any(
+            _WIN_BAD.search(p) or _WIN_RESERVED.match(p) or p.endswith((" ", ".")) for p in rest
+        ):
             return MapResult(None, "unrepresentable")
         parts = (*best.win.parts, *rest)
         text = best.win.root + "\\" + "\\".join(parts) if parts else best.win.root + "\\"
