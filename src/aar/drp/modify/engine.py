@@ -375,7 +375,7 @@ class _Planner:
             self._expect(i, "media", "renamed", "media", c.id, "name", old, e.new_name)
         elif e.target == "timeline":
             tl = _one(drp.timelines, _sel(e, lambda x: x.id, lambda x: x.name), "timeline", sel, i)
-            self._rename_timeline(i, e, tl)
+            old = self._rename_timeline(i, e, tl)
         else:
             pairs = list(_items(drp))
             _, item = _one(
@@ -398,7 +398,7 @@ class _Planner:
                 "expect-mismatch", f"the current name is {old!r}, not {e.expect_name!r}", i
             )
 
-    def _rename_timeline(self, i: int, e: Rename, tl: Timeline) -> None:
+    def _rename_timeline(self, i: int, e: Rename, tl: Timeline) -> str | None:
         key = _timeline_key(tl)
         old = tl.name
         self._check_old(i, e, old)
@@ -413,6 +413,7 @@ class _Planner:
         if pool is not None and pool_span is not None and (own is None or pool.name == old):
             self._name_splice(i, pool_span, e.new_name, f"timeline {old!r} pool entry")
         self._expect(i, "timelines", "renamed", "timeline", key, "name", old, e.new_name)
+        return old
 
     # ------------------------------------------------------------------ paths
 
