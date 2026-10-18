@@ -98,6 +98,7 @@ def test_genuine_decisions_and_withdrawals_are_still_credited(hub: Hub, tmp_path
     decision = reviews.decide(hub.log, hub.pid, hub.review, "approve", "ship it", HUMAN)
     review = reviews.get_review(hub.log, hub.pid, hub.review)
     assert review is not None and review.decision == decision
+    (tmp_path / "second").mkdir()
     other = Hub(tmp_path / "second")
     reviews.withdraw(other.log, other.pid, other.review, "superseded", AGENT)
     withdrawn = reviews.get_review(other.log, other.pid, other.review)
