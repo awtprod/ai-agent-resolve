@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import os
 import sys
@@ -123,9 +122,13 @@ def _err(text: str) -> None:
     stream = sys.stderr
     if stream is None:
         return
-    with contextlib.suppress(OSError, ValueError):
+    try:
         stream.write(_safe(text, stream) + "\n")
         stream.flush()
+    except (OSError, ValueError):
+        # stderr is closed or failing (2>&- or 2>/dev/full): point it at /dev/null so the
+        # interpreter's own flush at exit cannot fail again and turn the exit code into 120.
+        _silence(stream)
 
 
 def _emit(text: str) -> int:
@@ -143,21 +146,21 @@ def _emit(text: str) -> int:
         stream.write(_safe(text, stream))
         stream.flush()
     except BrokenPipeError:
-        _silence_stdout()
+        _silence(sys.stdout)
         return EXIT_PIPE_CLOSED
     except (OSError, ValueError) as exc:  # ValueError: write to a closed file object
-        _silence_stdout()
+        _silence(sys.stdout)
         _err(f"aar drp diff: cannot write output: {exc}")
         return EXIT_OUTPUT_ERROR
     return EXIT_SAME
 
 
-def _silence_stdout() -> None:
-    """Point stdout at /dev/null so the interpreter's final flush cannot fail again."""
+def _silence(stream: TextIO | None) -> None:
+    """Point a std stream at /dev/null so the interpreter's final flush cannot fail again."""
     try:
-        fd = sys.stdout.fileno()
+        fd = stream.fileno()  # type: ignore[union-attr]
     except (AttributeError, OSError, ValueError):
-        return  # not backed by a file descriptor, so nothing is left to flush into the pipe
+        return  # not backed by a file descriptor, so nothing is left to flush into it
     devnull = os.open(os.devnull, os.O_WRONLY)
     try:
         os.dup2(devnull, fd)

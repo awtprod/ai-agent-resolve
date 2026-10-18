@@ -71,7 +71,8 @@ _INDEXED = re.compile(r"^(\w+)\[(\d+)\]$")
 _FRAME_FIELDS = frozenset({"record_start", "duration", "source_in"})
 _FRAME_RATE_HINT = re.compile(r"\d+(\.\d+)?")
 _PATH_SEP = re.compile(r"[\\/]")
-_STAMP_VALUES = re.compile(rb'(\b(?:DbAppVer|DbPrjVer)\s*=\s*")[^"]*(")()')
+_APP_VALUE = re.compile(rb'(\bDbAppVer\s*=\s*")[^"]*(")')
+_PRJ_VALUE = re.compile(rb'(\bDbPrjVer\s*=\s*")[^"]*(")')
 
 
 def member_root(member: str) -> Provenance:
@@ -558,26 +559,44 @@ class OpaqueEngine:
             self._lone(rb, name, "b", unit, (rb.tag,))
 
     def _prolog(self, name: str, da: Document, db: Document) -> None:
-        """The prolog and header comment, as raw bytes; only the stamp values are left out.
+        """The prolog and header comment, as raw bytes; only reported stamp values are left out.
 
-        The ``DbAppVer``/``DbPrjVer`` values are compared as version stamps below (and by the
-        header section); every other byte before the root, whitespace included, must match.
+        Every byte before the root (whitespace included) must match, except the part of the
+        ``DbAppVer``/``DbPrjVer`` stamp the header section already reports. That section
+        compares DbAppVer as raw text but DbPrjVer as a parsed int, so a spelling-only DbPrjVer
+        change it cannot see (``17`` vs ``017``, or non-ASCII digits that both fail to parse)
+        is kept here: it then shows as an opaque prolog change and fails the gate.
         """
-        stamps = []
         heads = []
-        masked = []
+        stamps: list[tuple[str | None, int | None] | None] = []
+        versions = []
         for doc in (da, db):
             end = doc.root.start if doc.root is not None else len(doc.data)
             head = doc.data[:end]
             heads.append(head)
             v = parse_version_header(head, name)
-            if v is not None:
-                comment = _STAMP_VALUES.sub(rb"\1\2\3", head[v.offset : v.end])
-                masked.append(head[: v.offset] + comment + head[v.end :])
-                stamps.append((v.app_version, v.project_version))
-            else:
+            versions.append(v)
+            stamps.append((v.app_version, v.project_version) if v is not None else None)
+        va, vb = versions
+        # DbAppVer is always owned by the header (it compares the raw text), so its value is
+        # always masked. DbPrjVer is masked only for a genuine int change, which the header
+        # reports too; otherwise its raw bytes stay in for the comparison below.
+        mask_prj = (
+            va is not None
+            and vb is not None
+            and va.project_version is not None
+            and vb.project_version is not None
+            and va.project_version != vb.project_version
+        )
+        masked = []
+        for head, v in zip(heads, versions, strict=True):
+            if v is None:
                 masked.append(head)
-                stamps.append(None)
+                continue
+            comment = _APP_VALUE.sub(rb"\1\2", head[v.offset : v.end])
+            if mask_prj:
+                comment = _PRJ_VALUE.sub(rb"\1\2", comment)
+            masked.append(head[: v.offset] + comment + head[v.end :])
         if masked[0] != masked[1]:
             count, _ = _diff_size(heads[0], heads[1])
             self._member_change(

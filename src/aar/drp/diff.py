@@ -63,6 +63,7 @@ from aar.drp.diff_model import (
     ProjectDiff,
     same_value,
     short_id,
+    short_id_pair,
 )
 from aar.drp.diff_opaque import OpaqueEngine, Source, Unit, member_root
 from aar.drp.model import (
@@ -514,8 +515,9 @@ class _Differ:
         self._mark(key, diffs)
         for f, (old, new) in diffs.items():
             if f == "id":
+                old_id, new_id = short_id_pair(old, new)
                 detail = (
-                    f"project DbId {short_id(old)} → {short_id(new)} "
+                    f"project DbId {old_id} → {new_id} "
                     "(a different DbId usually means a different project)"
                 )
                 self.out.append(

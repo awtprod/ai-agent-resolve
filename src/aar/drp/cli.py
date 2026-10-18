@@ -94,10 +94,10 @@ def _emit(text: str) -> int:
         stream.write(_safe(text, stream))
         stream.flush()
     except BrokenPipeError:
-        _silence_stdout()
+        _silence(sys.stdout)
         return EXIT_PIPE_CLOSED
     except (OSError, ValueError) as exc:  # ValueError: write to a closed file object
-        _silence_stdout()
+        _silence(sys.stdout)
         _warn(f"aar drp: cannot write output: {exc}")
         return EXIT_OUTPUT_ERROR
     return EXIT_OK
@@ -112,15 +112,17 @@ def _warn(message: str) -> None:
         stream.write(_safe(printable(message), stream) + "\n")
         stream.flush()
     except (OSError, ValueError):
-        pass  # nowhere left to report to
+        # stderr is closed or failing (2>&- or 2>/dev/full): point it at /dev/null so the
+        # interpreter's own flush at exit cannot fail again and turn the exit code into 120.
+        _silence(stream)
 
 
-def _silence_stdout() -> None:
-    """Point stdout at /dev/null so the interpreter's final flush cannot fail again."""
+def _silence(stream: TextIO | None) -> None:
+    """Point a std stream at /dev/null so the interpreter's final flush cannot fail again."""
     try:
-        fd = sys.stdout.fileno()
+        fd = stream.fileno()  # type: ignore[union-attr]
     except (AttributeError, OSError, ValueError):
-        return  # not backed by a file descriptor, so nothing is left to flush into the pipe
+        return  # not backed by a file descriptor, so nothing is left to flush into it
     devnull = os.open(os.devnull, os.O_WRONLY)
     try:
         os.dup2(devnull, fd)

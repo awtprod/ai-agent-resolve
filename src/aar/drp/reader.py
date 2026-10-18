@@ -48,9 +48,13 @@ __all__ = [
 ]
 
 # Per-file budgets. The private corpus maxima are 311,727 elements and 30.95 MB of XML in one
-# file (and 20.8 MB of decompressed blobs, see blobs.DEFAULT_MAX_TOTAL_OUTPUT); each budget is
-# about 20 times that. A scanned element costs roughly 450 bytes of memory.
-DEFAULT_MAX_ELEMENTS = 6_000_000
+# file (and 20.8 MB of decompressed blobs, see blobs.DEFAULT_MAX_TOTAL_OUTPUT). A scanned
+# element costs about 300 bytes of resident memory (measured with tracemalloc and RSS on a
+# "<a/>" bomb: 3M elements peak at ~0.9 GB, 6M at ~1.8 GB), so it is the element budget, not
+# the byte budgets, that bounds a zip bomb's memory. 3M keeps the worst case under ~1 GB and is
+# still about 9.6x the corpus maximum, so real projects are read whole. The XML budget stays
+# about 20x its corpus maximum. All of these are overridable per call in :func:`read_drp`.
+DEFAULT_MAX_ELEMENTS = 3_000_000
 DEFAULT_MAX_TOTAL_XML_BYTES = 600 * 1024 * 1024
 DEFAULT_MAX_ISSUES_PER_CODE = 100
 
@@ -117,6 +121,7 @@ def read_drp(
     with open_container(path, max_member_bytes=max_member_bytes) as container:
         reader = _Reader(container, check_blobs, max_blob_output)
         reader.budget = blobs.DecodeBudget(max_total_blob_output)
+        reader.max_elements = max_elements
         reader.elements_left = max_elements
         reader.xml_bytes_left = max_total_xml_bytes
         return reader.run()
@@ -222,9 +227,14 @@ class _Reader:
         self.later_stream_path = 0
         # Budgets (set by read_drp) and what they refused.
         self.budget = blobs.DecodeBudget()
+        self.max_elements = DEFAULT_MAX_ELEMENTS
         self.elements_left = DEFAULT_MAX_ELEMENTS
         self.xml_bytes_left = DEFAULT_MAX_TOTAL_XML_BYTES
         self.xml_refused = 0
+        # The element budget trips once per file: count the members it cut short and keep the
+        # first one's offset, then report it with a single issue at the end (not one per member).
+        self.scan_refused = 0
+        self.scan_first: Provenance | None = None
         self.member_sizes: dict[str, int] = {}
         # Issues kept per code; the rest are counted and summarised as issues-truncated.
         self.issue_counts: Counter[str] = Counter()
@@ -261,14 +271,11 @@ class _Reader:
         doc = scan(data, name, max_elements=max(self.elements_left, 0))
         self.elements_left -= doc.element_count
         if doc.stopped_at is not None:
-            where = Provenance(name, doc.stopped_at, doc.stopped_at, "offset")
-            self.issue(
-                "warning",
-                "scan-budget-exceeded",
-                f"{name}: the file's element budget is used up; the rest of this member "
-                "is not read",
-                where,
-            )
+            # One trip of the shared element budget can cut short every member scanned after
+            # it; count them and report once at the end rather than once per member.
+            self.scan_refused += 1
+            if self.scan_first is None:
+                self.scan_first = Provenance(name, doc.stopped_at, doc.stopped_at, "offset")
         return doc
 
     def text(self, member: str, el: Element, tag: str, spans: Spans, key: str) -> str | None:
@@ -427,6 +434,14 @@ class _Reader:
                 "xml-budget-exceeded",
                 f"{self.xml_refused} member(s) not read: the file's XML budget was used up",
             )
+        if self.scan_refused:
+            self.issue(
+                "warning",
+                "scan-budget-exceeded",
+                f"{self.scan_refused} member(s) not fully read: the file's element budget of "
+                f"{self.max_elements} was used up",
+                self.scan_first,
+            )
         if self.no_main_stream:
             self.issue(
                 "warning",
@@ -485,7 +500,7 @@ class _Reader:
         self.docs[name] = doc
         for si in doc.issues:
             if si.code == "budget-exceeded":
-                continue  # reported by scan_member
+                continue  # the element budget is reported once at the end of the run
             where = Provenance(name, si.offset, si.offset, "offset")
             self.issue("warning", f"scan-{si.code}", si.message, where)
         if doc.root is None:
@@ -1016,9 +1031,20 @@ class _Reader:
             except BlobError as exc:
                 self.issue("warning", "blob-decode", f"MediaExtents: {exc}", _text_prov(member, el))
         if tl.frame_rate and tl.start_seconds is not None:
-            tl.start_frame = round(tl.start_seconds * tl.frame_rate)
-            if tl.duration_seconds is not None:
-                tl.end_frame = round((tl.start_seconds + tl.duration_seconds) * tl.frame_rate)
+            # A finite but huge FrameRate x MediaExtents can overflow the float product to
+            # inf, and round(inf) raises OverflowError; keep it an issue, not a crash.
+            try:
+                tl.start_frame = round(tl.start_seconds * tl.frame_rate)
+                if tl.duration_seconds is not None:
+                    tl.end_frame = round((tl.start_seconds + tl.duration_seconds) * tl.frame_rate)
+            except (OverflowError, ValueError) as exc:
+                tl.start_frame = tl.end_frame = None
+                self.issue(
+                    "warning",
+                    "implausible-extents",
+                    f"frame rate x extents does not fit a frame count: {exc}",
+                    tl.spans.get("extents") or tl.spans.get("frame_rate"),
+                )
 
     def _tracks(self, member: str, root: Element, tl: Timeline) -> None:
         for vec in root.children:
