@@ -71,6 +71,10 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     desc.set_defaults(func=_describe)
 
     diff_cli.register(sub)
+    # Imported here: aar.drp.modify.cli reuses this module's output helpers.
+    from aar.drp.modify import cli as modify_cli
+
+    modify_cli.register(sub)
 
 
 def _safe(text: str, stream: TextIO) -> str:

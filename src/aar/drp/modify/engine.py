@@ -153,9 +153,12 @@ def change_key(c: Change) -> tuple[Any, ...]:
 
 @dataclass(slots=True)
 class Prepared:
+    """The splices to make, the changes they must produce, and the input bytes they apply to."""
+
     splices: list[Splice]
     expected: list[Expected]
     report: list[dict[str, Any]]
+    member_data: dict[str, bytes]
 
     def members(self) -> set[str]:
         return {s.member for s in self.splices}
@@ -314,7 +317,8 @@ class _Planner:
                 refusals.append(Refusal("cannot-encode", str(exc), None))
         if refusals:
             raise EditRefused(refusals)
-        return Prepared(self.splices, self.expected, self.report)
+        data = {s.member: self.src.data(s.member) for s in self.splices}
+        return Prepared(self.splices, self.expected, self.report, data)
 
     def _expect(self, edit: int, *args: Any) -> None:
         self.expected.append(Expected(*args, edit=edit))
