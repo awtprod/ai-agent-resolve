@@ -421,9 +421,14 @@ def test_mirror_leaves_human_and_other_review_markers_alone_when_pruning() -> No
     _, branch = _branch_with_content(show)
     branch.AddMarker(5, "Blue", "", "human", 1, "")
     branch.AddMarker(6, "Red", "", "other review", 1, "aar:note:rev2:n1")
-    _mirror(show, branch, [{"note_id": "n1", "frame": 10, "text": "a"}])
-    _mirror(show, branch, [])  # prune everything of rev1
+    added = _mirror(show, branch, [{"note_id": "n1", "frame": 10, "text": "a"}])
+    assert added.status is OpStatus.OK, added.error
+    assert [(m.note_id, m.frame, m.status) for m in added.value.markers] == [("n1", 10, "added")]
+    pruned = _mirror(show, branch, [])  # prune everything of rev1
+    assert pruned.status is OpStatus.OK, pruned.error
+    assert [(p.note_id, p.frame) for p in pruned.value.pruned] == [("n1", 10)]
     assert sorted(branch.markers) == [5, 6]
+    assert branch.markers[6]["customData"] == "aar:note:rev2:n1"  # the other review's, intact
 
 
 def test_mirror_converts_render_frames_to_timeline_frames() -> None:
