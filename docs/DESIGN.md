@@ -180,6 +180,24 @@ House rules ship as a rule profile, `ccn`:
 
 Other shows get their own profiles.
 
+#### R6 decisions for S13 (2026-10-19)
+
+These are defaults taken from Andrew's recorded feedback on real CCN cuts. Each one is a profile value or a recipe parameter, so it can change without code.
+
+- **End on the laugh means its onset.** The last frame lands between the laugh's onset and 400 ms after it: "end hard right after the punchline word or at the first hint of laugh, no dragging laugh, never fade to silence". A short's audio fade-out is a de-click (at most 1 frame), never a fade to silence. Long-forms end on the laugh, then the outro.
+- **Dissolves.** None between content segments. A transition in from black on the first segment and the transition into the outro are allowed (the real long-form build uses a 15-frame start dissolve).
+- **Cut density.** Warn when any 10 s window holds more than 2 cuts ("8 cuts in 13 s" was "extremely choppy"; 5 cuts in 50 s was accepted).
+- **Shortest shot.** Warn under 1.0 s; fold slivers into a neighbour.
+- **Pause trimming is a planner parameter, not a lint rule.** Trim pauses of at least 0.9 s down to a beat of about 0.45 s. The silence threshold is per venue: -42 dB by default, -36 dB where room laughs sit at -36 to -40 dB. QA reports the longest silence left in the output.
+- **Joins sit in source-audio quiet.** Transcript word gaps are not enough, because Whisper word times are off by 0.1–0.2 s at joins. The in-side of a join needs at least 60 ms below -40 dBFS in the source audio. After the render, 2–3 overlapping short-window transcriptions around each join must agree with each other and with the plan's words.
+- **Loudness.** Shorts get gain plus a limiter, not two-pass loudnorm, which flattened the laugh-to-voice range and padded the tail. Targets: -14.5 ± 0.5 LUFS for shorts, -22 ± 0.5 for long-forms. True peak at most -1.0 dBTP, no clipped samples, and the duration is unchanged.
+- **Captions.** Every kept word is captioned (words snapped equals words captioned).
+- **Where work runs.** Cold work (analysis, planning, QA, shorts compose) runs on the hub host. Resolve, its renders and the masters stay on the edit PC. Files move through one transport module that checks size and sha256.
+- **Builds start from the template with `timeline.branch`,** so the copy is a registered agent branch. A human merges it.
+- **Shorts compose with ffmpeg first** (a port of the proven runner). The Resolve template route comes later through the `plan.apply` compiler.
+- **Publishing.** aar's last step emits a publish packet (final file and its hash, metadata, thumbnail) and waits on a human approval. Command Center and ccn-web-app do the upload; aar holds no YouTube or Instagram credentials.
+- **Hub writes.** Agents create brief, plan and recipe nodes through hub write tools. Deciding a review stays human-only.
+
 ## 5. Safety rules (enforced in code, not just written here)
 
 - Before every hot op, the node checks that the expected project is the one open. It refuses to switch project or database while a human is active, unless a human forces it from the console.
