@@ -119,11 +119,22 @@ def test_fa_marker_edit_refuses_blob_data_in_two_zstd_frames(tmp_path: Path) -> 
         (zstd_raw_frame(b"abc") + b"\x00", "trailing"),
         (zstd_raw_frame(b"abc") + zstd_raw_frame(b"d"), "trailing"),
         (zstd_raw_frame(b"abc")[:-1], "truncated"),
-        (b"\x50\x2a\x4d\x18" + b"\x00" * 8, "not a zstd frame"),  # a skippable frame
+        (zstd_raw_frame(b"abc")[:8], "^truncated zstd block header"),  # 2 of 3 header bytes
+        (b"\x50\x2a\x4d\x18" + b"\x00" * 8, "^not a zstd frame"),  # a skippable frame
         (zstd_raw_frame(b"abc")[:4] + bytes([0x21]) + zstd_raw_frame(b"abc")[5:], "dictionary"),
-        (zstd_raw_frame(b"abc")[:6] + (7 << 1 | 1).to_bytes(3, "little"), "reserved"),
+        (zstd_raw_frame(b"abc")[:4] + bytes([0x28]) + zstd_raw_frame(b"abc")[5:], "reserved bit"),
+        (zstd_raw_frame(b"abc")[:6] + (7 << 1 | 1).to_bytes(3, "little"), "reserved block"),
     ],
-    ids=["byte-after", "second-frame", "truncated", "skippable", "dictionary", "reserved-block"],
+    ids=[
+        "byte-after",
+        "second-frame",
+        "truncated",
+        "short-block-header",
+        "skippable",
+        "dictionary",
+        "reserved-header-bit",
+        "reserved-block",
+    ],
 )
 def test_fa_check_single_frame_refuses(frame: bytes, why: str) -> None:
     with pytest.raises(EncodeError, match=why):
@@ -205,24 +216,38 @@ def _pad_field_8(kd_bytes: bytes, kd_: blobs.KeyedDict) -> bytes:
     return _new_save_date(kd_bytes, kd_, pad=8)
 
 
+def _pad_date_length(kd_bytes: bytes, kd_: blobs.KeyedDict) -> bytes:
+    """The new date, in a field 124 whose length prefix takes two bytes (20 = 0x94 0x00)."""
+    entry = kd_.entry("SetupBA")
+    assert entry is not None and isinstance(entry.value, bytes)
+    payload = blobs.unwrap_message(entry.value)
+    date = next(f for f in blobs.decode_protobuf(payload, nested_depth=0) if f.number == 124)
+    padded = encode.pb_key(124, 2) + b"\x94\x00" + b"Jan 19 2026 00:17:51"
+    assert len(b"Jan 19 2026 00:17:51") == 20
+    payload = payload[: date.offset] + padded + payload[date.end :]
+    return encode.replace_kd_bytes(kd_bytes, entry, encode.envelope(entry.value, payload))
+
+
 @needs_zstandard
 @pytest.mark.parametrize(
     "change",
-    [_header_word_2, _setup_null_flag, _pad_field_8],
-    ids=["kd-header-word", "setupba-null-flag", "setupba-padded-varint"],
+    [_header_word_2, _setup_null_flag, _pad_field_8, _pad_date_length],
+    ids=["kd-header-word", "setupba-null-flag", "setupba-padded-varint", "date-padded-length"],
 )
 def test_fg_settings_rule_covers_the_whole_blob(tmp_path: Path, change: Any) -> None:
     ok = edit_zip(H264, tmp_path / "ok.drp", {"project.xml": _settings_edit(_new_save_date)})
     assert compare_round_trip(H264, ok).ok
     bad = edit_zip(H264, tmp_path / "bad.drp", {"project.xml": _settings_edit(change)})
-    result = compare_round_trip(H264, bad)
-    assert [r.code for r in result.refusals] == ["unexplained-opaque"]
-    assert "settings-save-date" not in [rule for rule, _ in result.allowed]
+    for result in (compare_round_trip(H264, bad), compare_round_trip(bad, H264)):
+        assert [r.code for r in result.refusals] == ["unexplained-opaque"]
+        assert "settings-save-date" not in [rule for rule, _ in result.allowed]
 
 
 def test_fg_bin_rule_compares_field_bytes(tmp_path: Path) -> None:
-    def blob(stamp: int, field_5: bytes = encode.pb_varint(5, 1)) -> bytes:
-        payload = encode.pb_varint(4, stamp) + field_5
+    def blob(
+        stamp: int, field_5: bytes = encode.pb_varint(5, 1), stamp_field: bytes | None = None
+    ) -> bytes:
+        payload = (encode.pb_varint(4, stamp) if stamp_field is None else stamp_field) + field_5
         return (struct.pack(">II", 2, len(payload) + 1) + b"\x80" + payload).hex().encode()
 
     def with_blob(b: bytes) -> Callable[[bytes], bytes]:
@@ -237,6 +262,15 @@ def test_fg_bin_rule_compares_field_bytes(tmp_path: Path) -> None:
     c = edit_zip(H264, tmp_path / "c" / "c.drp", {POOL: with_blob(blob(301, padded_5))})
     assert blobs.decode_protobuf(padded_5, nested_depth=0)[0].value == 1
     assert [r.code for r in compare_round_trip(a, c).refusals] == ["unexplained-opaque"]
+    # The stamp itself written in three bytes (301 = 0xad 0x02, padded to 0xad 0x82 0x00).
+    padded_4 = encode.pb_key(4, 0) + b"\xad\x82\x00"
+    assert blobs.decode_protobuf(padded_4, nested_depth=0)[0].value == 301
+    (tmp_path / "d").mkdir()
+    d = edit_zip(H264, tmp_path / "d" / "d.drp", {POOL: with_blob(blob(301, stamp_field=padded_4))})
+    for old_side, new_side in ((a, d), (d, a)):
+        assert [r.code for r in compare_round_trip(old_side, new_side).refusals] == [
+            "unexplained-opaque"
+        ]
 
 
 # --------------------------------------------------------------------------- F-F
@@ -308,7 +342,11 @@ def test_fc_a_sidecar_we_did_not_write_is_plain_out_exists(tmp_path: Path) -> No
         sidecar.write_text(text)
         outcome = edit_file(H264, plan(RENAME), out)
         assert [r.code for r in outcome.refusals] == ["out-exists"], text
+        # Refused up front, not after a try to write: the pre-check names the label's path.
+        assert "pass --force" in outcome.refusals[0].message, text
+        assert outcome.refusals[0].details == {"paths": [str(sidecar)]}, text
         assert sidecar.read_text() == text
+        assert [p.name for p in tmp_path.iterdir()] == [sidecar.name]  # no temporary file
 
 
 def test_fc_leftover_temp_files_are_reported_not_deleted(tmp_path: Path) -> None:
@@ -316,7 +354,12 @@ def test_fc_leftover_temp_files_are_reported_not_deleted(tmp_path: Path) -> None
         tmp_path / ".out.drp.abcd1234.tmp.drp",
         tmp_path / ".out.drp.aar.json.zz_9yy1q.tmp.json",
     ]
-    unrelated = [tmp_path / ".out.drp.notours.txt", tmp_path / ".other.drp.abcd1234.tmp.drp"]
+    unrelated = [
+        tmp_path / ".out.drp.notours.txt",
+        tmp_path / ".other.drp.abcd1234.tmp.drp",
+        tmp_path / ".out.drp.abcd1234.tmp.drp.keep",  # starts like a temporary file, is not one
+        tmp_path / ".out.drp.aar.json.zz_9yy1q.tmp.json.bak",
+    ]
     for p in stale + unrelated:
         p.write_bytes(b"x")
     outcome, _ = run(H264, tmp_path, RENAME)
@@ -365,8 +408,8 @@ def test_fb_a_no_op_rename_beside_a_real_one(tmp_path: Path) -> None:
 UNDECODED = struct.pack("B", 7 << 3) + b"\x05"  # a varint field 7 the reader does not decode
 
 
-def _odd_marker_src(tmp_path: Path, **kw: Any) -> Path:
-    entries = [marker_entry(10, BLUE, "Intro", extra=UNDECODED, **kw), marker_entry(20, BLUE, "B")]
+def _odd_marker_src(tmp_path: Path, extra: bytes = UNDECODED, **kw: Any) -> Path:
+    entries = [marker_entry(10, BLUE, "Intro", extra=extra, **kw), marker_entry(20, BLUE, "B")]
     element = carrier(
         "0b0b0b0b-1111-2222-3333-444444444444", SEQUENCE, markers_fields_blob(*entries)
     )
@@ -397,6 +440,22 @@ def test_fh_an_update_that_would_rewrite_undecoded_bytes_is_refused(tmp_path: Pa
     )
     assert [r.code for r in outcome.refusals] == ["marker-undecoded"]
     assert not out.exists()
+
+
+def test_fh_a_non_canonical_spelling_alone_is_undecoded(tmp_path: Path) -> None:
+    # No undecoded field here: the duration "007" reads as 7 but is not how Resolve writes it, and
+    # the gate compares those bytes raw, so no edit may delete or rewrite this entry.
+    src = _odd_marker_src(tmp_path, extra=b"", duration=b"007")
+    assert read_drp(src).timelines[0].markers[0].duration == 7
+    for edit in (
+        {"op": "marker_delete", "frame": 10},
+        {"op": "marker_update", "frame": 10, "set": {"duration": 24}},
+    ):
+        outcome, out = run(src, tmp_path, _marker(edit))
+        assert [r.code for r in outcome.refusals] == ["marker-undecoded"], edit
+        assert not out.exists()
+    plain, _ = run(src, tmp_path, _marker({"op": "marker_delete", "frame": 20}))
+    assert plain.status == "written", plain.to_dict()["refusals"]
 
 
 def _fields_blob_of(archive: Path) -> str:
@@ -728,6 +787,164 @@ def test_gap_sidecar_records_the_output_size_and_hash(tmp_path: Path) -> None:
     data = out.read_bytes()
     assert label["output"]["size"] == len(data) == outcome.output["size"]
     assert label["output"]["sha256"] == hashlib.sha256(data).hexdigest()
+
+
+# --------------------------------------------------------------------------- refusal paths
+# Added after the S8b mutation pass: each test below fails when one specific check is removed.
+
+
+def _orphan_label(tmp_path: Path) -> tuple[Path, Path]:
+    out, sidecar, _stale = _interrupted_run(tmp_path)
+    return out, sidecar
+
+
+def test_fc_force_replaces_over_an_orphan_label(tmp_path: Path) -> None:
+    out, sidecar = _orphan_label(tmp_path)
+    outcome = edit_file(H264, plan(RENAME), out, force=True)
+    assert outcome.status == "written" and not outcome.refusals
+    label = json.loads(sidecar.read_text())
+    assert label["output"]["sha256"] == hashlib.sha256(out.read_bytes()).hexdigest()
+
+
+def _rewrite_label(sidecar: Path, change: Callable[[dict[str, Any]], None]) -> None:
+    record = json.loads(sidecar.read_text())
+    change(record)
+    sidecar.write_text(json.dumps(record))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda r: r.update(status="refused"),
+        lambda r: r.update(label="verified"),
+        lambda r: r.update(tool="other 1"),
+        lambda r: r["output"].update(path="/elsewhere/other.drp"),
+        lambda r: r["output"].update(sidecar="/elsewhere/other.drp.aar.json"),
+        lambda r: r.update(output=None),
+    ],
+    ids=["status", "label", "tool", "other-output", "other-sidecar", "no-output"],
+)
+def test_fc_a_label_that_is_not_ours_for_this_output_is_plain_out_exists(
+    tmp_path: Path, change: Callable[[dict[str, Any]], None]
+) -> None:
+    out, sidecar = _orphan_label(tmp_path)
+    _rewrite_label(sidecar, change)
+    before = sidecar.read_bytes()
+    outcome = edit_file(H264, plan(RENAME), out)
+    assert [r.code for r in outcome.refusals] == ["out-exists"]
+    assert sidecar.read_bytes() == before and not out.exists()
+
+
+def test_fc_the_label_size_cap_is_inclusive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aar.drp.modify import write
+
+    out, sidecar = _orphan_label(tmp_path)
+    size = sidecar.stat().st_size
+    monkeypatch.setattr(write, "_MAX_SIDECAR_BYTES", size)  # at the cap: still read and judged
+    assert [r.code for r in edit_file(H264, plan(RENAME), out).refusals] == ["orphan-sidecar"]
+    monkeypatch.setattr(write, "_MAX_SIDECAR_BYTES", size - 1)  # over it: never read
+    assert [r.code for r in edit_file(H264, plan(RENAME), out).refusals] == ["out-exists"]
+
+
+def test_fc_a_dangling_symlink_at_the_output_hides_an_orphan_label(tmp_path: Path) -> None:
+    out, sidecar = _orphan_label(tmp_path)
+    out.symlink_to(tmp_path / "nowhere.drp")  # out.exists() is False, yet a name is taken
+    outcome = edit_file(H264, plan(RENAME), out)
+    assert [r.code for r in outcome.refusals] == ["out-exists"]
+    assert out.is_symlink() and sidecar.exists()
+
+
+def test_fe_a_mode_keeps_no_execute_bits(tmp_path: Path) -> None:
+    src = tmp_path / "in.drp"
+    src.write_bytes(H264.read_bytes())
+    src.chmod(0o755)
+    (tmp_path / "o").mkdir()
+    out = tmp_path / "o" / "out.drp"
+    assert edit_file(src, plan(RENAME), out).status == "written"
+    sidecar = Path(str(out) + SIDECAR_SUFFIX)
+    assert (out.stat().st_mode & 0o777, sidecar.stat().st_mode & 0o777) == (0o644, 0o644)
+
+
+def test_fe_a_missing_output_directory_is_a_refusal_not_a_crash(tmp_path: Path) -> None:
+    out = tmp_path / "nowhere" / "out.drp"
+    assert stale_temp_files(out) == []  # the scan of a directory that does not exist
+    outcome = edit_file(H264, plan(RENAME), out)
+    assert [r.code for r in outcome.refusals] == ["no-output-dir"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_fe_force_with_a_directory_at_the_label_leaves_no_temporary_file(tmp_path: Path) -> None:
+    out = tmp_path / "out.drp"
+    sidecar = Path(str(out) + SIDECAR_SUFFIX)
+    sidecar.mkdir()
+    (sidecar / "keep.txt").write_text("keep")
+    with pytest.raises(IsADirectoryError):
+        edit_file(H264, plan(RENAME), out, force=True)
+    assert stale_temp_files(out) == []
+    assert [p.name for p in tmp_path.iterdir()] == [sidecar.name]
+    assert (sidecar / "keep.txt").read_text() == "keep"
+
+
+def test_gap_zip_zero_local_sizes_need_the_descriptor_flag() -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr("a.xml", b"a" * 64)
+    data = buf.getvalue()
+    assert not zipraw.parse_layout(data)[0].flags & 0x8  # a seekable write: no descriptor
+    zeroed = data[:14] + bytes(12) + data[26:]  # the local CRC, sizes zeroed; central intact
+    with pytest.raises(zipraw.ZipLayoutError, match="local CRC or sizes disagree"):
+        zipraw.parse_layout(zeroed)
+    # The same zeros are fine once the member says a descriptor follows (what streaming writes).
+    streamed = _descriptor_zip()
+    assert streamed[14:26] == bytes(12) and zipraw.parse_layout(streamed)[0].flags & 0x8
+
+
+def _cli_edit(tmp_path: Path, out: Path) -> list[str]:
+    plan_file = tmp_path / "plan.json"
+    plan_file.write_text(json.dumps({"edits": [RENAME]}))
+    return ["drp", "edit", str(H264), "--plan", str(plan_file), "--out", str(out)]
+
+
+def test_fe_cli_exits_74_when_the_label_cannot_be_written(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from aar.cli import main
+
+    (tmp_path / "o").mkdir()
+    limit = os.pathconf(tmp_path, "PC_NAME_MAX")
+    out = tmp_path / "o" / ("a" * (limit - 27 - len(".drp")) + ".drp")  # as in the test above
+    code = main(_cli_edit(tmp_path, out))
+    captured = capsys.readouterr()
+    assert code == 74
+    result = json.loads(captured.out)
+    assert result["status"] == "error"
+    assert [r["code"] for r in result["refusals"]] == ["output-error"]
+    assert "cannot write the output" in captured.err
+    assert list((tmp_path / "o").iterdir()) == []
+
+
+def test_fd_cli_internal_error_exits_2_and_is_never_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # An internal error cannot be produced on purpose, so the engine is made to fail with an
+    # exception no check expects; what is tested is how the command reports it.
+    from aar.cli import main
+
+    def explode(*args: Any, **kw: Any) -> Any:
+        raise RuntimeError("engine fell over")
+
+    monkeypatch.setattr("aar.drp.modify.cli.edit_file", explode)
+    code = main(_cli_edit(tmp_path, tmp_path / "out.drp"))
+    captured = capsys.readouterr()
+    assert code == 2  # 1 means "refused", which this is not
+    result = json.loads(captured.out)
+    assert result["status"] == "error"
+    assert [r["code"] for r in result["refusals"]] == ["internal-error"]
+    assert "RuntimeError: engine fell over" in result["refusals"][0]["message"]
+    assert "Traceback" in captured.err and "internal error" in captured.err
+    assert not (tmp_path / "out.drp").exists()
 
 
 # --------------------------------------------------------------------------- DESIGN.md claims
