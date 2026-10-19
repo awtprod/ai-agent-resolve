@@ -265,7 +265,15 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
     Scanning stops with a ``budget-exceeded`` issue before node number ``max_elements + 1`` is
     materialised (``max_elements`` counts every token, not only start elements; see
     ``Document.element_count``); what was scanned so far is kept and open elements are closed at
-    the end of the member. The scan is linear in ``len(data)``; ``Document.work`` measures it.
+    the end of the member. Attributes are charged too (one each), and an element keeps at most
+    4096 of them.
+
+    Time is linear in ``len(data)``: a start tag is read one attribute at a time and a tag with
+    no closing ``>`` is skipped past, never re-read. Measured on the worst shapes tried: 240 KB
+    of ``<`` inside quoted values in one unterminated tag takes 0.09 s (the previous
+    single-regex scanner needed 145 s), and 3M tokens take 1.5 to 11 s. ``Document.work``
+    counts bytes and match attempts, not the work inside one regex match, so it would not have
+    shown that quadratic cost; ``tests/drp/test_drp_s1h4_scanner.py`` guards it by timing.
     """
     issues = _IssueLog()
     work = 0
@@ -381,6 +389,11 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
             cursor = lt + 1
             continue
         attrs: dict[str, str] = {}
+        # Repeated attribute names are reported only if the tag turns out to be well formed (and
+        # after the text before it, as before). Keep at most the per-code cap of names: more
+        # would be dropped by the issue log anyway, and a tag may repeat one name millions of times.
+        repeated: list[str] = []
+        repeated_extra = 0
         p = mname.end()
         closed: bool | None = None
         over_budget = False
@@ -400,9 +413,10 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
                 name = ma.group("name").decode("utf-8", errors="replace")
                 raw = ma.group("dq") if ma.group("dq") is not None else ma.group("sq")
                 if name in attrs:
-                    issues.append(
-                        ScanIssue("duplicate-attribute", lt, f"attribute {name!r} repeated")
-                    )
+                    if len(repeated) < _MAX_ISSUES_PER_CODE:
+                        repeated.append(name)
+                    else:
+                        repeated_extra += 1
                 attrs[name] = unescape(raw.decode("utf-8", errors="replace"))
             element_count += 1
             p = ma.end()
@@ -414,12 +428,17 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
             pos = len(data)
             break
         if closed is None:
-            # Unterminated start tag. Report it and skip past what was scanned (never rewind to
-            # lt + 1, which would re-read the attribute run at every inner "<" -- quadratic).
+            # Unterminated start tag: the text stays in the gap, which reports it as unparsed
+            # markup. Skip past what was scanned (never rewind to lt + 1, which would re-read the
+            # attribute run at every inner "<" -- quadratic).
             element_count += 1
             cursor = max(p, lt + 1)
             continue
         gap(pos, lt)
+        for name in repeated:
+            issues.append(ScanIssue("duplicate-attribute", lt, f"attribute {name!r} repeated"))
+        for _ in range(repeated_extra):  # past the cap: counted, never listed
+            issues.append(ScanIssue("duplicate-attribute", lt, "attribute repeated"))
         pos = cursor = p
         element_count += 1
         tag = mname.group("start").decode("utf-8", errors="replace")
