@@ -37,11 +37,13 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    GetJsonSchemaHandler,
     ValidationError,
     field_validator,
     model_validator,
 )
-from pydantic_core import InitErrorDetails, PydanticCustomError
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import CoreSchema, InitErrorDetails, PydanticCustomError
 
 PLAN_VERSION = 2
 
@@ -91,15 +93,51 @@ def _not_blank(value: str) -> str:
 Name = Annotated[str, AfterValidator(_not_blank)]
 Finite = Annotated[float, Field(allow_inf_nan=False)]
 
+#: JSON Schema dialect the plan schema is written in (what pydantic emits).
+JSON_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
+
+#: JSON Schema pattern for the text form of a frame rate: 'N' or 'N/D', both above zero.
+FPS_TEXT_PATTERN = r"^\s*0*[1-9][0-9]*\s*(/\s*0*[1-9][0-9]*\s*)?$"
+
 
 class Fps(_Model):
     """A frame rate as a rational, e.g. ``{"num": 24000, "den": 1001}``.
 
-    A string such as ``"24000/1001"`` or ``"25"`` is also accepted on input.
+    A string such as ``"24000/1001"`` or ``"25"`` is also accepted on input, and so is a whole
+    number such as ``25``. The input JSON Schema lists all three forms.
     """
 
     num: int = Field(gt=0, description="Numerator, e.g. 24000.")
     den: int = Field(default=1, gt=0, description="Denominator, e.g. 1001.")
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls, core_schema: CoreSchema, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        """The input schema admits the 'N' / 'N/D' string and the whole-number shorthand too."""
+        schema = handler.resolve_ref_schema(handler(core_schema))
+        if handler.mode != "validation":
+            return schema
+        record = dict(schema)
+        schema.clear()
+        schema.update(
+            title=record.pop("title"),
+            description=record.pop("description"),
+            anyOf=[
+                record,
+                {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "description": "Shorthand for a whole rate, e.g. 25.",
+                },
+                {
+                    "type": "string",
+                    "pattern": FPS_TEXT_PATTERN,
+                    "description": "Shorthand 'N' or 'N/D' (both positive), e.g. '24000/1001'.",
+                },
+            ],
+        )
+        return schema
 
     @model_validator(mode="before")
     @classmethod
@@ -438,6 +476,8 @@ class Marker(_Model):
 
 class EditPlan(_Model):
     """Everything needed to build one timeline, checked against a rule profile first."""
+
+    model_config = ConfigDict(extra="forbid", json_schema_extra={"$schema": JSON_SCHEMA_DIALECT})
 
     version: PlanVersion = Field(
         default=PLAN_VERSION,
