@@ -442,19 +442,25 @@ def test_fh_an_update_that_would_rewrite_undecoded_bytes_is_refused(tmp_path: Pa
     assert not out.exists()
 
 
-def test_fh_a_non_canonical_spelling_alone_is_undecoded(tmp_path: Path) -> None:
-    # No undecoded field here: the duration "007" reads as 7 but is not how Resolve writes it, and
-    # the gate compares those bytes raw, so no edit may delete or rewrite this entry.
-    src = _odd_marker_src(tmp_path, extra=b"", duration=b"007")
-    assert read_drp(src).timelines[0].markers[0].duration == 7
-    for edit in (
-        {"op": "marker_delete", "frame": 10},
-        {"op": "marker_update", "frame": 10, "set": {"duration": 24}},
-    ):
-        outcome, out = run(src, tmp_path, _marker(edit))
-        assert [r.code for r in outcome.refusals] == ["marker-undecoded"], edit
-        assert not out.exists()
-    plain, _ = run(src, tmp_path, _marker({"op": "marker_delete", "frame": 20}))
+def test_fh_a_non_canonical_encoding_alone_is_undecoded(tmp_path: Path) -> None:
+    # No undecoded field here: the frame's varint is written in two bytes (10 = 0x8a 0x00). It
+    # reads as 10 but is not how Resolve writes it, and the gate compares those bytes raw, so no
+    # edit may delete this entry or rewrite the bytes of its frame.
+    src = _odd_marker_src(tmp_path, extra=b"", frame_raw=b"\x8a\x00")
+    assert read_drp(src).timelines[0].markers[0].frame == 10
+    outcome, out = run(src, tmp_path, _marker({"op": "marker_delete", "frame": 10}))
+    assert [r.code for r in outcome.refusals] == ["marker-undecoded"]
+    assert not out.exists()
+    moved, out = run(
+        src, tmp_path, _marker({"op": "marker_update", "frame": 10, "set": {"frame": 12}})
+    )
+    assert moved.status == "refused" and moved.refusals and not out.exists()
+    # The padded bytes stay as they are under an edit that does not touch them.
+    renamed, _ = run(
+        src, tmp_path, _marker({"op": "marker_update", "frame": 10, "set": {"name": "Intro 2"}})
+    )
+    assert renamed.status == "written", renamed.to_dict()["refusals"]
+    plain, _ = run(src, tmp_path, _marker({"op": "marker_delete", "frame": 20}), force=True)
     assert plain.status == "written", plain.to_dict()["refusals"]
 
 
