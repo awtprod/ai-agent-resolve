@@ -446,6 +446,11 @@ class EventLog:
                 f"event log at {self._path!r} is missing append-only triggers: {sorted(missing)}"
             )
 
+    @property
+    def read_only(self) -> bool:
+        """Whether this handle was opened read-only (appends and transactions refuse)."""
+        return self._read_only
+
     def close(self) -> None:
         """Close the underlying database connection."""
         with self._lock:

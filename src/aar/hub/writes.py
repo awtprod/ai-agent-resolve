@@ -237,23 +237,24 @@ def _text(max_len: int, *, multiline: bool = False) -> AfterValidator:
 _STRIP_SLACK = 256  # whitespace a value may carry around its text before it is stripped
 
 
-def _line(max_len: int, *, multiline: bool = False) -> Any:
+def bounded_text(max_len: int, *, multiline: bool = False) -> Any:
+    """A stripped string type of at most ``max_len`` characters, no control characters."""
     # The raw max_length keeps a huge value cheap to refuse; the exact bound is after strip.
     return Annotated[
         str, Field(max_length=max_len + _STRIP_SLACK), _text(max_len, multiline=multiline)
     ]
 
 
-ShowText = _line(MAX_SHOW)
-TitleText = _line(MAX_TITLE)
-HookText = _line(MAX_HOOK)
-HandleText = _line(MAX_HANDLE)
-LabelText = _line(MAX_LABEL)
-LibraryText = _line(MAX_LIBRARY)
-TimelineNameText = _line(MAX_TIMELINE_NAME)
-PathText = _line(MAX_PATH)
-HostText = _line(MAX_HOST)
-NotesText = _line(MAX_NOTES, multiline=True)
+ShowText = bounded_text(MAX_SHOW)
+TitleText = bounded_text(MAX_TITLE)
+HookText = bounded_text(MAX_HOOK)
+HandleText = bounded_text(MAX_HANDLE)
+LabelText = bounded_text(MAX_LABEL)
+LibraryText = bounded_text(MAX_LIBRARY)
+TimelineNameText = bounded_text(MAX_TIMELINE_NAME)
+PathText = bounded_text(MAX_PATH)
+HostText = bounded_text(MAX_HOST)
+NotesText = bounded_text(MAX_NOTES, multiline=True)
 Name = Annotated[str, Field(pattern=NAME_RE)]
 Segment = Annotated[str, Field(pattern=SEGMENT_RE)]
 ResolveId = Annotated[str, Field(pattern=RESOLVE_ID_RE)]
@@ -261,7 +262,7 @@ Sha256 = Annotated[str, Field(pattern=SHA256_RE)]
 NodeId = Annotated[str, Field(min_length=1, max_length=MAX_ID)]
 
 
-class _Strict(BaseModel):
+class StrictModel(BaseModel):
     """Strict models: no coercion, no unknown keys, no NaN or infinity."""
 
     model_config = ConfigDict(
@@ -273,7 +274,7 @@ class _Strict(BaseModel):
         return self.model_dump(mode="json", by_alias=True)
 
 
-class CloudProjectRef(_Strict):
+class CloudProjectRef(StrictModel):
     """A Blackmagic Cloud project, by library and project name."""
 
     kind: Literal["cloud_project"]
@@ -282,7 +283,7 @@ class CloudProjectRef(_Strict):
     label: LabelText | None = None
 
 
-class TimelineSourceRef(_Strict):
+class TimelineSourceRef(StrictModel):
     """A timeline, by its Resolve unique id (``Timeline.GetUniqueId()``). ``name`` is a
     display cross-check only; the id is what identifies it."""
 
@@ -292,7 +293,7 @@ class TimelineSourceRef(_Strict):
     label: LabelText | None = None
 
 
-class MediaRef(_Strict):
+class MediaRef(StrictModel):
     """A media file: its path, optionally the host it is on and its sha256."""
 
     kind: Literal["media"]
@@ -307,7 +308,7 @@ SourceRef = Annotated[CloudProjectRef | TimelineSourceRef | MediaRef, Field(disc
 DeliverableKind = Literal["master", "review", "short", "thumbnail", "captions"]
 
 
-class Deliverable(_Strict):
+class Deliverable(StrictModel):
     """One output the brief asks for. ``name`` is unique in the brief and may be used in
     facts keys (``render.hash.<name>``, ``qa.<metric>.<name>``)."""
 
@@ -315,7 +316,7 @@ class Deliverable(_Strict):
     kind: DeliverableKind
 
 
-class Brief(_Strict):
+class Brief(StrictModel):
     """``aar.brief/1``: what to make, for which show, from which sources.
 
     Bounds: show, title 200 characters; hook 300; handle 100; notes 8000 (newlines
@@ -347,7 +348,7 @@ class Brief(_Strict):
         return self
 
 
-class RecipeData(_Strict):
+class RecipeData(StrictModel):
     """``aar.recipe/1``: one recipe run derived from a brief.
 
     ``params`` is a JSON object of at most 64 KiB (canonical), nested at most 8 deep, with
@@ -377,7 +378,7 @@ class RecipeData(_Strict):
         return self
 
 
-class FindingSummary(_Strict):
+class FindingSummary(StrictModel):
     """One lint finding as kept on a plan node (text capped at 500, at most 4 refs)."""
 
     rule: Annotated[str, Field(max_length=MAX_NAME * 2)]
@@ -387,7 +388,7 @@ class FindingSummary(_Strict):
     refs: list[dict[str, Any]] = Field(default_factory=list, max_length=MAX_FINDING_REFS)
 
 
-class LintSummary(_Strict):
+class LintSummary(StrictModel):
     """A plan's lint result: counts, the rules that could not run, the first findings."""
 
     ok: bool
@@ -401,7 +402,7 @@ class LintSummary(_Strict):
     omitted: int = Field(ge=0, description="Findings not listed (the list keeps errors first).")
 
 
-class PlanNodeData(_Strict):
+class PlanNodeData(StrictModel):
     """``aar.plan-node/1``: an EditPlan submitted to the hub.
 
     ``plan_sha256`` is the artifact holding the plan's canonical JSON. ``brief_id`` is the
@@ -582,7 +583,8 @@ def _unknown_project(project_id: str) -> WriteError:
     )
 
 
-def _require_project(log: EventLog, project_id: str) -> None:
+def require_project(log: EventLog, project_id: str) -> None:
+    """Refuse with ``unknown_project`` unless the registry knows ``project_id``."""
     if Registry(log).get(project_id) is None:
         raise _unknown_project(project_id)
 
@@ -833,7 +835,7 @@ def create_brief(
         )
         if record is not None:
             return WriteResult(OP_BRIEF_CREATE, True, project_id, _graph_body(txn, key, False))
-        _require_project(log, project_id)
+        require_project(log, project_id)
         graph = WorkGraph(log, project_id)
         node_event = graph.add_node_in(
             txn, "brief", actor, title=title, data=data, idempotency_key=f"{key}#node"
@@ -890,7 +892,7 @@ def create_recipe(
     )
     if record is not None:
         return WriteResult(OP_RECIPE_CREATE, True, project_id, _graph_body(log, key, True))
-    _require_project(log, project_id)
+    require_project(log, project_id)
     brief = _recipe_brief(WorkGraph(log, project_id), model)
     problems = list(params_validator(model.recipe, model.params, brief))
     if problems:
@@ -1147,7 +1149,7 @@ def submit_plan(
         return WriteResult(OP_PLAN_SUBMIT, True, project_id, _plan_body(log, key, plan_sha))
     # Refuse what can be refused before storing anything; nodes and projects are never
     # removed, so these checks still hold when the transaction re-runs them.
-    _require_project(log, project_id)
+    require_project(log, project_id)
     _check_plan_parent(WorkGraph(log, project_id), derives_from, parsed.profile)
     stored = store.put(
         content,
@@ -1248,7 +1250,7 @@ def set_own_status(
         )
         if record is not None:
             return WriteResult(OP_SET_STATUS, True, project_id, _status_body(record.payload))
-        _require_project(log, project_id)
+        require_project(log, project_id)
         graph = WorkGraph(log, project_id)
         node = graph.node(node_id)
         if node is None:
@@ -1294,7 +1296,7 @@ def set_own_status(
                 f"From {node.status!r} the allowed moves are "
                 f"{', '.join(sorted(allowed)) or 'none (it is final)'}.",
                 node_id=node_id,
-                status=node.status,
+                **{"from": node.status},
                 to=status,
                 allowed=sorted(allowed),
             )

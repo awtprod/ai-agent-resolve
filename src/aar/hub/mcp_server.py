@@ -1,4 +1,4 @@
-"""Read-only MCP surface over the hub, for AI agents.
+"""MCP surface over the hub, for AI agents: read-only unless agent writes are enabled.
 
 Built with the official MCP Python SDK. In mcp 2.x the ergonomic server class that
 was ``FastMCP`` in v1 is ``MCPServer`` (``mcp.server.mcpserver``); the old
@@ -10,6 +10,10 @@ carries ``readOnlyHint`` so agents know it never mutates.
 The hub is tailnet-only for v1 (DESIGN D2): there is no auth here, so the server
 must be bound to a trusted interface by the caller and the database is opened
 read-only.
+
+``build_server(..., agent_writes=True)`` (``aar hub serve --agent-writes``) also registers
+the agent write tools of :mod:`aar.hub.mcp_writes` (briefs, recipes, plans, own status,
+facts) over a writable log. Without it the tool list is exactly the read-only tools above.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from aar.hub.events import Event, EventLog
 from aar.hub.graph import WorkGraph
 from aar.hub.leaseboard import lease_board as project_lease_board
 from aar.hub.registry import Registry
+from aar.hub.writes import ParamsValidator, accept_any_params
 
 SERVER_INSTRUCTIONS = (
     "Shared memory for humans and AI agents working on DaVinci Resolve projects. "
@@ -40,6 +45,20 @@ SERVER_INSTRUCTIONS = (
     "produced (artifacts). Call control_status before hot work: if it reports a stop, "
     "do not touch Resolve. Results carry skipped: {count, events}, the malformed log "
     "events that were ignored. This surface is read-only."
+)
+
+WRITE_INSTRUCTIONS = (
+    "Shared memory for humans and AI agents working on DaVinci Resolve projects. "
+    "Use it to discover which projects exist and where, what has happened (the event "
+    "log), what work is planned or in flight (the work graph), and what has been "
+    "produced (artifacts). Call control_status before hot work: if it reports a stop, "
+    "do not touch Resolve. Results carry skipped: {count, events}, the malformed log "
+    "events that were ignored. Agent writes are enabled: create briefs (brief_create), "
+    "recipe runs (recipe_create) and plans (plan_submit), move your own nodes' status "
+    "(node_set_status) and record project facts (facts_record, facts_retract). Every "
+    "write needs your agent_id (self-declared, for attribution only) and an "
+    "idempotency_key; retrying with the same key is safe. Deciding reviews, approvals "
+    "and resuming after a stop stay with humans."
 )
 
 # Every tool here only reads; advertise that to clients (SEP tool annotations).
@@ -116,12 +135,17 @@ def build_server(
     *,
     name: str = "aar-hub",
     clock: Clock = utcnow,
+    agent_writes: bool = False,
+    params_validator: ParamsValidator = accept_any_params,
 ) -> MCPServer:
-    """Build the read-only hub MCP server over the given hub components.
+    """Build the hub MCP server over the given hub components.
 
-    ``clock`` decides what has expired (leases, presence, approval tokens).
+    ``clock`` decides what has expired (leases, presence, approval tokens). With
+    ``agent_writes`` the agent write tools are registered too (the log must be
+    writable); ``params_validator`` checks recipe params for ``recipe_create``.
     """
-    server: MCPServer = MCPServer(name=name, instructions=SERVER_INSTRUCTIONS)
+    instructions = WRITE_INSTRUCTIONS if agent_writes else SERVER_INSTRUCTIONS
+    server: MCPServer = MCPServer(name=name, instructions=instructions)
 
     @server.tool(
         name="projects_list",
@@ -387,4 +411,8 @@ def build_server(
         ]
         return {"approvals": listed, "skipped": skipped_summary(view.skipped)}
 
+    if agent_writes:
+        from aar.hub.mcp_writes import register_write_tools
+
+        register_write_tools(server, log, registry, artifacts, params_validator=params_validator)
     return server

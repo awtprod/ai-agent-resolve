@@ -25,7 +25,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     hub = subparsers.add_parser("hub", help="Run and inspect the project/event/work-graph hub.")
     hub_sub = hub.add_subparsers(dest="hub_command", required=True)
 
-    serve = hub_sub.add_parser("serve", help="Serve the read-only hub over MCP (streamable HTTP).")
+    serve = hub_sub.add_parser(
+        "serve",
+        help="Serve the hub over MCP (streamable HTTP); read-only unless --agent-writes.",
+    )
     serve.add_argument("--db", required=True, help="Path to the SQLite event-log database.")
     serve.add_argument("--artifacts", required=True, help="Path to the artifact store directory.")
     serve.add_argument(
@@ -38,6 +41,15 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "--allow-remote",
         action="store_true",
         help="Permit binding to a non-loopback interface (required for any non-loopback --host).",
+    )
+    serve.add_argument(
+        "--agent-writes",
+        action="store_true",
+        help="Also serve the agent write tools (brief_create, recipe_create, plan_submit, "
+        "node_set_status, facts_record, facts_retract) and their reads (facts_get, "
+        "brief_get, plan_get), over a writable database. Agent ids are self-declared "
+        "(attribution, not authentication): keep the hub tailnet-only. Human-only actions "
+        "(review decisions, approvals, resume) are never tools.",
     )
     serve.set_defaults(func=_serve)
 
@@ -143,6 +155,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     show.add_argument("review_id", help="Review id.")
     show.set_defaults(func=_review_show)
 
+    from aar.hub import write_cli
+
+    write_cli.register(hub_sub)
+
 
 def _add_db(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--db", required=True, help="Path to the SQLite event-log database.")
@@ -174,10 +190,11 @@ def _serve(args: argparse.Namespace) -> int:
     # The read surface never writes, so open the log read-only and the artifact store
     # without creating anything (both must already exist; writers create them). A bad
     # --db or --artifacts is reported and exits 2 rather than raising a traceback or
-    # leaving a stray empty file/directory behind.
+    # leaving a stray empty file/directory behind. --agent-writes opens the existing log
+    # writable (create=False still checks the hub schema and never creates a database).
     try:
-        log = EventLog(args.db, read_only=True)
-    except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+        log = _open_existing(args.db) if args.agent_writes else EventLog(args.db, read_only=True)
+    except (OSError, ValueError, RuntimeError, sqlite3.Error, _DatabaseUnavailable) as exc:
         # The exception message already names the path and the reason; don't re-prefix.
         cli_io.warn(f"aar hub serve: {exc}")
         return 2
@@ -188,7 +205,12 @@ def _serve(args: argparse.Namespace) -> int:
         cli_io.warn(f"aar hub serve: {exc}")
         return 2
     registry = Registry(log)
-    server = build_server(log, registry, artifacts)
+    server = build_server(log, registry, artifacts, agent_writes=args.agent_writes)
+    if args.agent_writes:
+        cli_io.warn(
+            "aar hub serve: agent write tools are ON; agent ids are self-declared "
+            "(attribution, not authentication). Keep this server tailnet-only."
+        )
     server.run(transport="streamable-http", host=args.host, port=args.port)
     return 0
 
