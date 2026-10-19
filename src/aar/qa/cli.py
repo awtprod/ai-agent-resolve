@@ -38,7 +38,14 @@ def register(subparsers: Any) -> None:
             "2 unreadable input, invalid profile or ffmpeg/ffprobe missing."
         ),
     )
-    run.add_argument("file", type=Path, help="The rendered media file.")
+    run.add_argument(
+        "file",
+        type=Path,
+        help=(
+            "The rendered media file. A relative name that starts with '-' needs '--' before "
+            "it or './' in front of it."
+        ),
+    )
     run.add_argument(
         "--kind",
         required=True,
@@ -135,9 +142,7 @@ _LABEL = {"pass": "PASS", "warn": "WARN", "fail": "FAIL", "skipped": "SKIP"}
 def _detail_line(detail: dict[str, Any]) -> str:
     if "join" in detail:
         head = f"join {detail['join']} at {detail.get('record_tc', '')}"
-        reason = detail.get("reason")
-        if reason is None and "longest_quiet_ms" in detail:
-            reason = f"longest quiet run {detail['longest_quiet_ms']} ms"
+        reason = detail.get("hint") or detail.get("reason")
         return f"{head}: {detail['status']}" + (f" ({reason})" if reason else "")
     if "word" in detail:
         return f"{detail['word']!r} at {detail['record_start_s']} s"
@@ -162,6 +167,8 @@ def format_report(report: QAReport) -> str:
         f"{counts['fail']} fail, {counts['skipped']} skipped"
     )
     lines = [head]
+    if report.unchecked:
+        lines.append(f"not checked or not fully checked: {', '.join(report.unchecked)}")
     for entry in report.checks:
         lines.extend(_format_check(entry))
     return "\n".join(lines)

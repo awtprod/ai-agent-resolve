@@ -9,6 +9,7 @@ bounded tail; stdout is either collected up to a limit or streamed to a sink.
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import shutil
 import signal
@@ -30,7 +31,7 @@ STDOUT_LIMIT = 16 * 1024 * 1024
 STDERR_LIMIT = 64 * 1024
 ERROR_TAIL_CHARS = 2000
 _CHUNK = 64 * 1024
-_REAP_S = 5.0
+_REAP_S = 5.0  # how long to wait for the pipes to drain once the process group is gone
 
 
 class MediaError(RuntimeError):
@@ -181,16 +182,41 @@ class _Pump(threading.Thread):
             pass  # the pipe closed under us after a kill
 
 
+def _wait_exit(proc: subprocess.Popen[bytes], timeout_s: float) -> bool:
+    """Wait until the process exits, without reaping it where the OS allows.
+
+    An unreaped (zombie) leader keeps its process id, and so its group id, from being reused,
+    so the group can then be killed without any risk of hitting an unrelated process.
+    """
+    if not hasattr(os, "waitid"):  # pragma: no cover - macOS and Windows reap in wait()
+        try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+    deadline = time.monotonic() + timeout_s
+    delay = 0.0005
+    while True:
+        try:
+            if os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                return True
+        except ChildProcessError:  # pragma: no cover - already reaped
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(delay, remaining))
+        delay = min(delay * 2, 0.05)
+
+
 def _kill(proc: subprocess.Popen[bytes]) -> None:
-    if proc.poll() is not None:
-        return
-    try:
-        if os.name == "posix":
-            os.killpg(proc.pid, signal.SIGKILL)
-        else:  # pragma: no cover - the hub is POSIX
+    """Kill the process and everything in its process group (its own session)."""
+    if os.name != "posix":  # pragma: no cover - the hub is POSIX
+        if proc.poll() is None:
             proc.kill()
-    except (ProcessLookupError, PermissionError):
-        pass
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
 
 
 def run_tool(
@@ -214,8 +240,8 @@ def run_tool(
     """
     if isinstance(args, (str, bytes)) or not all(isinstance(a, str) for a in args):
         raise TypeError("args must be a sequence of str (no shell strings)")
-    if not timeout_s or timeout_s <= 0:
-        raise ValueError("timeout_s must be positive")
+    if not (isinstance(timeout_s, (int, float)) and math.isfinite(timeout_s) and timeout_s > 0):
+        raise ValueError("timeout_s must be a finite number of seconds above 0")
     exe = resolve_tool(tool)
     argv = (exe, *args)
     kwargs: dict[str, object] = {}
@@ -249,18 +275,21 @@ def run_tool(
     err_pump.start()
     timed_out = False
     try:
-        proc.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _kill(proc)
+        timed_out = not _wait_exit(proc, timeout_s)
     finally:
+        # On a timeout this stops the tool; on a normal exit it removes anything the tool
+        # left behind in its group (a child holding the pipes would keep them open).
+        _kill(proc)
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=_REAP_S)
-        out_pump.join(_REAP_S)
-        err_pump.join(_REAP_S)
-        for stream in (proc.stdout, proc.stderr):
-            with contextlib.suppress(OSError):
-                stream.close()
+        deadline = time.monotonic() + _REAP_S
+        for pump in (out_pump, err_pump):
+            pump.join(max(0.0, deadline - time.monotonic()))
+        drained = not (out_pump.is_alive() or err_pump.is_alive())
+        if drained:
+            for stream in (proc.stdout, proc.stderr):
+                with contextlib.suppress(OSError):
+                    stream.close()
     elapsed = time.monotonic() - started
     stderr_text = err.text()
     rc = proc.returncode if proc.returncode is not None else -1
@@ -269,6 +298,16 @@ def run_tool(
             f"{tool} timed out after {timeout_s:g} s",
             timeout_s=timeout_s,
             tool=tool,
+            stderr_tail=stderr_text,
+        )
+    if not drained:
+        # Something outside the group (it started its own session) still holds a pipe, so
+        # the output may be cut short. The daemon pump threads end when it lets go.
+        raise MediaError(
+            f"{tool} exited with status {rc} but its output pipes were still open "
+            f"{_REAP_S:g} s later; the output may be incomplete",
+            tool=tool,
+            exit_code=rc,
             stderr_tail=stderr_text,
         )
     if out_pump.error is not None:

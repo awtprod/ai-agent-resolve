@@ -24,6 +24,7 @@ from aar.media import (
     MediaInfo,
     MediaInputError,
     MediaTimeout,
+    QuietRun,
     count_clipped,
     decode_check,
     measure_audio,
@@ -35,10 +36,19 @@ from aar.media import (
 )
 from aar.media.probe import PROBE_TIMEOUT_S
 from aar.plan.inputs import Transcript, Word
-from aar.plan.model import EditPlan, Source
+from aar.plan.model import EditPlan, Fps, Source
 from aar.plan.profile import Profile, QATargets
-from aar.qa.planmap import Cut, KeptWord, cuts, kept_words, straddled_words
-from aar.qa.report import CHECK_IDS, Kind, QACheck, QAReport, Status, build_report, skipped
+from aar.qa.planmap import Cut, KeptWord, applies, cuts, kept_words, straddled_words
+from aar.qa.report import (
+    CHECK_IDS,
+    Kind,
+    QACheck,
+    QAReport,
+    Status,
+    UncheckedReason,
+    build_report,
+    skipped,
+)
 from aar.qa.transcriber import Transcriber
 
 MB = 1_000_000  # review_mp4_max_mb counts decimal megabytes
@@ -478,8 +488,14 @@ def _silence(ctx: _Ctx, m: AudioMeasurements) -> QACheck:
     if m.log_truncated:
         status = "warn" if status == "pass" else status
         message += " The silence log was truncated, so an earlier silence may be missing."
+        measured["unchecked_reason"] = "log-truncated"
     return QACheck(
-        id="longest-silence", status=status, message=message, measured=measured, target=target
+        id="longest-silence",
+        status=status,
+        message=message,
+        measured=measured,
+        target=target,
+        incomplete=m.log_truncated,
     )
 
 
@@ -563,12 +579,57 @@ def _cut_ref(plan: EditPlan, cut: Cut) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class JoinQuiet:
+    """How a cut sits against the quiet runs found around its src_in."""
+
+    status: Status
+    at_cut: QuietRun | None  # the longest run containing src_in (within the slack), any length
+    nearest: QuietRun | None  # when the cut fails: the nearest run long enough to cut in
+
+
+def judge_join_quiet(
+    runs: Sequence[QuietRun], src_in_s: float, *, min_ms: float, slack_ms: float
+) -> JoinQuiet:
+    """A cut passes when a run of at least ``min_ms`` contains ``src_in_s``, allowing
+    ``slack_ms`` at either end of the run. Otherwise the nearest run of at least ``min_ms``
+    (ties: the longer one) is the place to move the cut to."""
+    slack = slack_ms / 1000
+    containing = [r for r in runs if r.start_s - slack - _EPS <= src_in_s <= r.end_s + slack + _EPS]
+    at_cut = max(containing, key=lambda r: r.duration_s, default=None)
+    if at_cut is not None and evaluate_quiet_run(at_cut.duration_s * 1000, min_ms) == "pass":
+        return JoinQuiet("pass", at_cut, None)
+    long_enough = [r for r in runs if evaluate_quiet_run(r.duration_s * 1000, min_ms) == "pass"]
+
+    def distance(r: QuietRun) -> tuple[float, float]:
+        return (max(r.start_s - src_in_s, src_in_s - r.end_s, 0.0), -r.duration_s)
+
+    return JoinQuiet("fail", at_cut, min(long_enough, key=distance, default=None))
+
+
+def suggest_src_in(run: QuietRun, fps: Fps) -> int:
+    """The source frame (at the plan fps) nearest the middle of ``run``."""
+    return fps.frames((run.start_s + run.end_s) / 2)
+
+
+def _run_dict(run: QuietRun | None) -> dict[str, Any] | None:
+    if run is None:
+        return None
+    return {
+        "start_s": round(run.start_s, 4),
+        "end_s": round(run.end_s, 4),
+        "ms": round(run.duration_s * 1000, 2),
+        "level_dbfs": _round(run.level_dbfs, 1),
+    }
+
+
 def _join_quiet(ctx: _Ctx) -> QACheck:
     plan = ctx.plan
     qa = ctx.qa
     target = {
         "quiet_db": qa.join_quiet_db,
         "min_ms": qa.join_quiet_min_ms,
+        "slack_ms": qa.join_quiet_slack_ms,
         "search_s": qa.join_quiet_search_s,
         "window_ms": qa.join_quiet_window_ms,
     }
@@ -587,9 +648,10 @@ def _join_quiet(ctx: _Ctx) -> QACheck:
     details: list[dict[str, Any]] = []
     for cut in cut_list:
         entry = _cut_ref(plan, cut)
+        entry["src_in"] = cut.src_in_frame
         path, src_info, why = ctx.source(sources[cut.source_id])
         if src_info is None or path is None or src_info.audio is None:
-            entry.update(status="skipped", reason=why)
+            entry.update(status="unchecked", reason=why)
             details.append(entry)
             continue
         lo = max(0.0, cut.src_in_s - qa.join_quiet_search_s)
@@ -599,7 +661,8 @@ def _join_quiet(ctx: _Ctx) -> QACheck:
             hi = min(hi, end)
         entry["window_s"] = [round(lo, 4), round(hi, 4)]
         if hi <= lo:
-            entry.update(status="fail", reason="src_in is at or past the end of the source audio")
+            reason = "src_in is at or past the end of the source audio"
+            entry.update(status="fail", reason=reason, hint=f"join {cut.number}: {reason}")
             details.append(entry)
             continue
         try:
@@ -611,37 +674,69 @@ def _join_quiet(ctx: _Ctx) -> QACheck:
                 timeout_s=ctx.timeout(1.0, duration_s=0.0),
             )
         except MediaError as exc:
-            entry.update(status="fail", reason=f"could not read the source audio: {exc.summary()}")
+            reason = f"could not read the source audio: {exc.summary()}"
+            entry.update(status="fail", reason=reason, hint=f"join {cut.number}: {reason}")
             details.append(entry)
             continue
         scan = quiet_runs(
             pcm, threshold_dbfs=qa.join_quiet_db, window_s=qa.join_quiet_window_ms / 1000
         )
-        best = scan.longest
-        run_ms = best.duration_s * 1000 if best is not None else 0.0
+        judged = judge_join_quiet(
+            scan.runs,
+            cut.src_in_s,
+            min_ms=qa.join_quiet_min_ms,
+            slack_ms=qa.join_quiet_slack_ms,
+        )
+        at_cut = judged.at_cut
+        longest = scan.longest
         entry.update(
-            status=evaluate_quiet_run(run_ms, qa.join_quiet_min_ms),
-            longest_quiet_ms=round(run_ms, 2),
-            run_start_s=_round(best.start_s, 4) if best else None,
-            run_end_s=_round(best.end_s, 4) if best else None,
-            run_level_dbfs=_round(best.level_dbfs, 1) if best else None,
-            contains_cut=bool(best and best.start_s <= cut.src_in_s <= best.end_s),
+            status=judged.status,
+            quiet_ms_at_cut=round(at_cut.duration_s * 1000, 2) if at_cut else 0.0,
+            run_at_cut=_run_dict(at_cut),
+            nearest_pause=_run_dict(judged.nearest),
+            longest_quiet_ms=round(longest.duration_s * 1000, 2) if longest else 0.0,
             quietest_dbfs=_round(scan.quietest_dbfs, 1),
             scanned_s=round(scan.scanned_s, 4),
         )
+        if judged.status == "fail":
+            entry["hint"] = _quiet_hint(ctx, plan, cut, judged)
+            if judged.nearest is not None:
+                frame = suggest_src_in(judged.nearest, plan.fps)
+                entry.update(
+                    suggested_src_in=frame,
+                    suggested_src_in_s=round(plan.fps.seconds(frame), 4),
+                )
         details.append(entry)
+    rule = (
+        f"a pause of {qa.join_quiet_min_ms:g} ms below {qa.join_quiet_db:g} dBFS that contains "
+        f"src_in (± {qa.join_quiet_slack_ms:g} ms)"
+    )
     return _summarise_joins(
         "join-quiet",
         details,
         target,
-        fail_text=(
-            f"lack a {qa.join_quiet_min_ms:g} ms run below {qa.join_quiet_db:g} dBFS within "
-            f"±{qa.join_quiet_search_s:g} s of src_in: move them into a pause"
-        ),
-        pass_text=(
-            f"have a {qa.join_quiet_min_ms:g} ms run below {qa.join_quiet_db:g} dBFS within "
-            f"±{qa.join_quiet_search_s:g} s of src_in"
-        ),
+        fail_text=f"do not start in {rule}",
+        pass_text=f"start in {rule}",
+        unchecked_reason="source-unreadable",
+        unchecked_fix="make the plan's source media readable",
+    )
+
+
+def _quiet_hint(ctx: _Ctx, plan: EditPlan, cut: Cut, judged: JoinQuiet) -> str:
+    qa = ctx.qa
+    where = f"record {plan.fps.timecode(cut.record_frame)}, src_in frame {cut.src_in_frame}"
+    short = ""
+    if judged.at_cut is not None:
+        short = f"the pause at src_in is only {judged.at_cut.duration_s * 1000:.0f} ms; "
+    if judged.nearest is None:
+        return (
+            f"join {cut.number} ({where}): {short}no {qa.join_quiet_min_ms:g} ms pause within "
+            f"±{qa.join_quiet_search_s:g} s of src_in, so re-cut it by ear"
+        )
+    frame = suggest_src_in(judged.nearest, plan.fps)
+    return (
+        f"{short}move src_in of join {cut.number} to frame {frame} ({where}), inside a "
+        f"{judged.nearest.duration_s * 1000:.0f} ms pause"
     )
 
 
@@ -652,25 +747,34 @@ def _summarise_joins(
     *,
     fail_text: str,
     pass_text: str,
+    unchecked_reason: UncheckedReason,
+    unchecked_fix: str,
 ) -> QACheck:
+    """One status for a per-join check.
+
+    fail if any join failed; warn if none failed but some (or all) could not be checked;
+    pass only when every join was checked and passed. A join that could not be checked
+    never makes the check look better than one that could.
+    """
     total = len(details)
     failed = [d for d in details if d["status"] == "fail"]
-    unread = [d for d in details if d["status"] == "skipped"]
-    measured = {"cuts": total, "failed": len(failed), "unchecked": len(unread)}
-    if unread and len(unread) == total:
-        return QACheck(
-            id=check_id,
-            status="skipped",
-            skip_reason="source-unreadable",
-            message=f"Skipped: no source could be read ({unread[0]['reason']}).",
-            measured=measured,
-            target=target,
-            details=details,
-        )
+    unread = [d for d in details if d["status"] == "unchecked"]
+    measured: dict[str, Any] = {"cuts": total, "failed": len(failed), "unchecked": len(unread)}
+    if unread:
+        measured["unchecked_reason"] = unchecked_reason
+    status: Status
     if failed:
-        where = [f"join {d['join']} at {clock(d['record_s'])}" for d in failed]
-        message = f"{len(failed)} of {total} cuts {fail_text} ({_examples(where)})."
-        status: Status = "fail"
+        hints = [d.get("hint") or f"join {d['join']} at {clock(d['record_s'])}" for d in failed]
+        message = f"{len(failed)} of {total} cuts {fail_text}: {_examples(hints)}."
+        if unread:
+            message += f" {len(unread)} more could not be checked ({unread[0]['reason']})."
+        status = "fail"
+    elif unread and len(unread) == total:
+        message = (
+            f"None of the {total} cuts could be checked ({unread[0]['reason']}): "
+            f"{unchecked_fix} and run QA again."
+        )
+        status = "warn"
     elif unread:
         message = (
             f"{len(unread)} of {total} cuts could not be checked ({unread[0]['reason']}); "
@@ -687,6 +791,7 @@ def _summarise_joins(
         measured=measured,
         target=target,
         details=details,
+        incomplete=bool(unread),
     )
 
 
@@ -741,6 +846,8 @@ def _join_retranscribe(ctx: _Ctx) -> QACheck:
             "a word is clipped or doubled"
         ),
         pass_text="re-transcribe in agreement with each other and the plan",
+        unchecked_reason="transcript-does-not-cover",
+        unchecked_fix="give a transcript of the recordings on both sides of every cut",
     )
 
 
@@ -762,6 +869,24 @@ def _retranscribe_one(
     lo = max(0.0, centre - half + max(offsets) + edge)
     hi = min(render_end, centre + half + min(offsets) - edge)
     entry = _cut_ref(plan, cut)
+    sources = plan.source_map()
+    missing = [
+        sid
+        for sid in dict.fromkeys((cut.out_source_id, cut.source_id))
+        if not applies(transcript, sources[sid])
+    ]
+    if missing:
+        # Words from an uncovered side would be missing from the expected text, so the
+        # comparison would fail for the transcript's sake, not the cut's.
+        recording = transcript.recording
+        entry.update(
+            status="unchecked",
+            reason=(
+                f"the transcript (recording {recording!r}) does not cover source "
+                f"{_examples([repr(m) for m in missing])}"
+            ),
+        )
+        return entry
     entry["region_s"] = [round(lo, 3), round(hi, 3)]
     want = tokens(
         [w.text for w in expected if _in_region(w.record_start_s, w.record_end_s, lo, hi)]
@@ -821,10 +946,35 @@ def _caption_coverage(ctx: _Ctx) -> QACheck:
             "caption-coverage", "no-captions", f"the {ctx.kind} plan has no captions to check"
         )
     fps = plan.fps
+    sources = plan.source_map()
+    usable = [i for i, seg in enumerate(plan.segments) if seg.source in sources and seg.length > 0]
+    not_covered = [i for i in usable if not applies(transcript, sources[plan.segments[i].source])]
     spans = sorted((fps.seconds(c.record_in), fps.seconds(c.record_out)) for c in plan.captions)
     kept = kept_words(plan, transcript)
     uncovered = [w for w in kept if not any(a <= w.record_mid_s < b for a, b in spans)]
-    measured = {"kept_words": len(kept), "captions": len(spans), "uncovered": len(uncovered)}
+    measured: dict[str, Any] = {
+        "kept_words": len(kept),
+        "captions": len(spans),
+        "uncovered": len(uncovered),
+        "segments": len(usable),
+        "segments_unchecked": len(not_covered),
+    }
+    target = {"uncovered": 0, "rule": "word midpoint inside a caption's record range"}
+    if not_covered:
+        measured["unchecked_reason"] = "transcript-does-not-cover"
+    if usable and len(not_covered) == len(usable):
+        return QACheck(
+            id="caption-coverage",
+            status="warn",
+            message=(
+                f"The transcript (recording {transcript.recording!r}) covers none of the "
+                f"plan's {len(usable)} segments, so no word was checked: give the transcript "
+                "of the recording the plan uses."
+            ),
+            measured=measured,
+            target=target,
+            incomplete=True,
+        )
     details = [
         {
             "word": w.text,
@@ -844,13 +994,20 @@ def _caption_coverage(ctx: _Ctx) -> QACheck:
     else:
         message = f"All {len(kept)} kept words are covered by a caption."
         status = "pass"
+    if not_covered:
+        message += (
+            f" {len(not_covered)} of {len(usable)} segments come from a recording the "
+            "transcript does not cover and were not checked."
+        )
+        status = "fail" if status == "fail" else "warn"
     return QACheck(
         id="caption-coverage",
         status=status,
         message=message,
         measured=measured,
-        target={"uncovered": 0, "rule": "word midpoint inside a caption's record range"},
+        target=target,
         details=details,
+        incomplete=bool(not_covered),
     )
 
 
@@ -883,8 +1040,8 @@ def check(
     """
     if kind not in _KINDS:
         raise ValueError(f"kind must be one of {', '.join(_KINDS)}")
-    if timeout_s is not None and not timeout_s > 0:
-        raise ValueError("timeout_s must be positive")
+    if timeout_s is not None and not (math.isfinite(timeout_s) and timeout_s > 0):
+        raise ValueError("timeout_s must be a finite number of seconds above 0")
     qa = profile.qa
     level = qa.silence_db if silence_db is None else float(silence_db)
     if not (math.isfinite(level) and level < 0):

@@ -12,17 +12,21 @@ Status = Literal["pass", "warn", "fail", "skipped"]
 Kind = Literal["short", "longform", "review"]
 
 # Why a check did not run. Skipped never means passed: the message says what is missing.
+# The first four are inputs the caller chose not to give. render-unreadable and no-audio
+# always come with a failed decode or loudness check; not-applicable is the size cap on a
+# render that is not a review.
 SkipReason = Literal[
     "no-plan",
     "no-transcript",
     "no-transcriber",
     "no-captions",
-    "no-joins",
-    "source-unreadable",
     "render-unreadable",
     "no-audio",
     "not-applicable",
 ]
+
+# Why a check that ran could not check everything (``measured["unchecked_reason"]``).
+UncheckedReason = Literal["source-unreadable", "transcript-does-not-cover", "log-truncated"]
 
 CHECK_IDS = (
     "decode",
@@ -66,6 +70,14 @@ class QACheck(_Model):
     details: list[dict[str, Any]] = Field(
         default_factory=list, description="Per-join or per-word entries, when the check has any."
     )
+    incomplete: bool = Field(
+        default=False,
+        description=(
+            "True when the check ran but could not check everything (unreadable sources, "
+            "a transcript that does not cover every source, a truncated log); "
+            "measured and details say what was left out."
+        ),
+    )
 
     @field_validator("measured", "target", "details", mode="after")
     @classmethod
@@ -86,6 +98,13 @@ class QAReport(_Model):
     status: Literal["pass", "warn", "fail"]
     ok: bool = Field(description="False when any check failed.")
     counts: dict[str, int]
+    unchecked: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Ids of checks that were skipped or could not check everything: a pass with an "
+            "empty list is an all-clear, anything listed here was not (fully) checked."
+        ),
+    )
     media: dict[str, Any] | None = Field(default=None, description="ffprobe summary, if readable.")
     checks: list[QACheck]
 
@@ -104,6 +123,7 @@ def build_report(
     worst = max((_RANK[c.status] for c in checks), default=0)
     status: Literal["pass", "warn", "fail"] = ("pass", "warn", "fail")[worst]  # type: ignore[assignment]
     counts = {name: sum(1 for c in checks if c.status == name) for name in _RANK}
+    unchecked = [c.id for c in checks if c.status == "skipped" or c.incomplete]
     return QAReport(
         file=file,
         kind=kind,
@@ -111,6 +131,7 @@ def build_report(
         status=status,
         ok=status != "fail",
         counts=counts,
+        unchecked=unchecked,
         media=media,
         checks=checks,
     )

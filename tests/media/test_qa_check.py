@@ -304,53 +304,151 @@ def test_audio_only_render_duration_comes_from_the_audio(tmp_path):
 # ---------------------------------------------------------------- join source-audio quiet
 
 
-def _join_plan(tmp_path: Path, incoming: Path, src_in: int, *, src_out: int = 75) -> EditPlan:
-    """Two sources of different recordings, so the join between them is a cut (fps 50)."""
+def _join_plan(
+    tmp_path: Path, incoming: Path, src_in: int, *, src_out: int | None = None, fps: str = "50"
+) -> EditPlan:
+    """Two sources of different recordings, so the join between them is a cut."""
     other = sine(tmp_path / "other.wav", -14.5, seconds=1.0)
     return plan_of(
         plan_dict(
             [{"id": "o", "media": str(other)}, {"id": "a", "media": incoming.name}],
             [
-                {"track": 1, "source": "o", "src_in": 0, "src_out": 25},
-                {"track": 1, "source": "a", "src_in": src_in, "src_out": src_out},
+                {"track": 1, "source": "o", "src_in": 0, "src_out": 10},
+                {
+                    "track": 1,
+                    "source": "a",
+                    "src_in": src_in,
+                    "src_out": src_out if src_out is not None else src_in + 20,
+                },
             ],
+            fps=fps,
         )
     )
+
+
+def quiet_join(tmp_path: Path, plan: EditPlan, **kw: Any) -> dict[str, Any]:
+    """Run QA with ``plan`` and return the join-quiet check plus its single join's detail."""
+    entry = run(sine(tmp_path / "r.wav", -14.5), plan=plan, media_root=tmp_path, **kw).check(
+        "join-quiet"
+    )
+    assert len(entry.details) == 1
+    return {"check": entry, **entry.details[0]}
 
 
 @pytest.mark.parametrize(("gap_s", "status"), [(0.060, "pass"), (0.059, "fail")])
 def test_join_quiet_60_versus_59_ms(tmp_path, gap_s, status):
     source = gapped(tmp_path / "a.wav", before_s=0.5, gap_s=gap_s, after_s=0.5)
-    plan = _join_plan(tmp_path, source, src_in=26)  # 0.52 s, inside the gap
-    report = run(sine(tmp_path / "r.wav", -14.5), plan=plan, media_root=tmp_path)
-    entry = report.check("join-quiet")
-    assert entry.status == status
-    (join,) = entry.details
-    assert join["longest_quiet_ms"] == pytest.approx(gap_s * 1000, abs=0.25)
+    join = quiet_join(tmp_path, _join_plan(tmp_path, source, src_in=26))  # 0.52 s, in the gap
+    assert join["status"] == join["check"].status == status
+    assert join["quiet_ms_at_cut"] == pytest.approx(gap_s * 1000, abs=0.25)
+    assert join["run_at_cut"]["start_s"] == pytest.approx(0.5, abs=0.0005)
     assert join["window_s"] == [pytest.approx(0.42), pytest.approx(0.62)]
-    assert join["run_start_s"] == pytest.approx(0.5, abs=0.0005)
-    assert join["contains_cut"] is True
     assert join["quietest_dbfs"] is None  # digital silence: -inf
-    assert join["record_s"] == 0.5 and join["src_in_s"] == 0.52
-    assert entry.target == {"quiet_db": -40.0, "min_ms": 60.0, "search_s": 0.1, "window_ms": 10.0}
+    assert join["record_s"] == 0.2 and join["src_in_s"] == 0.52 and join["src_in"] == 26
+    assert join["check"].target == {
+        "quiet_db": -40.0,
+        "min_ms": 60.0,
+        "slack_ms": 10.0,
+        "search_s": 0.1,
+        "window_ms": 10.0,
+    }
+    if status == "fail":
+        assert join["nearest_pause"] is None
+        assert "the pause at src_in is only 59 ms; no 60 ms pause" in join["hint"]
 
 
-def test_join_quiet_outside_the_search_window_fails(tmp_path):
-    # A pause 0.18 s after src_in is outside [src_in - 0.1, src_in + 0.1].
-    source = gapped(tmp_path / "a.wav", before_s=0.7, gap_s=0.2, after_s=0.5)
-    plan = _join_plan(tmp_path, source, src_in=26)
-    entry = run(sine(tmp_path / "r.wav", -14.5), plan=plan, media_root=tmp_path).check("join-quiet")
-    assert entry.status == "fail"
-    assert entry.details[0]["longest_quiet_ms"] == 0.0
-    assert entry.details[0]["quietest_dbfs"] == pytest.approx(-9.0, abs=0.5)
-    assert "move them into a pause" in entry.message
-    wide = profile_with(join_quiet_search_s=0.25)
-    assert (
-        run(sine(tmp_path / "r.wav", -14.5), plan=plan, media_root=tmp_path, profile=wide)
-        .check("join-quiet")
-        .status
-        == "pass"
+def test_a_pause_that_ends_before_src_in_fails_with_a_suggestion(tmp_path):
+    # Pause 0.45-0.57 s, src_in 0.60 s (frame 30 at 50 fps): 70 ms of the pause lies in the
+    # ±0.1 s window, so the old "a run anywhere in the window" rule passed this cut, yet the
+    # incoming clip starts 30 ms after the pause, in the sound.
+    source = gapped(tmp_path / "a.wav", before_s=0.45, gap_s=0.12, after_s=0.5)
+    join = quiet_join(tmp_path, _join_plan(tmp_path, source, src_in=30))
+    assert join["status"] == "fail"
+    assert join["quiet_ms_at_cut"] == 0.0 and join["run_at_cut"] is None
+    assert join["longest_quiet_ms"] == pytest.approx(70, abs=0.25)  # cut short by the window
+    assert join["nearest_pause"]["end_s"] == pytest.approx(0.57, abs=0.0005)
+    assert join["suggested_src_in"] == 27  # midpoint of the in-window part, 0.535 s
+    assert join["suggested_src_in_s"] == 0.54
+    assert "move src_in of join 1 to frame 27" in join["check"].message
+    assert "1 of 1 cuts do not start in a pause of 60 ms below -40 dBFS" in join["check"].message
+
+
+def test_a_pause_80_ms_before_src_in(tmp_path):
+    # Pause 0.40-0.52 s, src_in 0.60 s: only 20 ms of it is within ±0.1 s, so the default
+    # search finds nothing to suggest; a ±0.25 s search suggests its middle.
+    source = gapped(tmp_path / "a.wav", before_s=0.40, gap_s=0.12, after_s=0.5)
+    plan = _join_plan(tmp_path, source, src_in=30)
+    default = quiet_join(tmp_path, plan)
+    assert default["status"] == "fail" and default["nearest_pause"] is None
+    assert "no 60 ms pause within ±0.1 s of src_in" in default["hint"]
+    assert "suggested_src_in" not in default
+    wide = quiet_join(tmp_path, plan, profile=profile_with(join_quiet_search_s=0.25))
+    assert wide["status"] == "fail"
+    assert wide["nearest_pause"]["ms"] == pytest.approx(120, abs=0.25)
+    assert wide["suggested_src_in"] == 23  # 0.46 s
+    assert "move src_in of join 1 to frame 23" in wide["hint"]
+
+
+def test_a_pause_containing_src_in_passes(tmp_path):
+    source = gapped(tmp_path / "a.wav", before_s=0.5, gap_s=0.1, after_s=0.5)
+    join = quiet_join(tmp_path, _join_plan(tmp_path, source, src_in=27))  # 0.54 s
+    assert join["status"] == "pass"
+    assert join["quiet_ms_at_cut"] == pytest.approx(100, abs=0.25)
+    assert join["nearest_pause"] is None and "hint" not in join
+    assert "All 1 cuts start in a pause" in join["check"].message
+
+
+@pytest.mark.parametrize(
+    ("pause_start_s", "status"),
+    [
+        (0.491, "pass"),  # pause ends 9 ms before src_in 0.60 s
+        (0.489, "fail"),  # ... 11 ms before
+        (0.609, "pass"),  # pause starts 9 ms after src_in
+        (0.611, "fail"),  # ... 11 ms after
+    ],
+)
+def test_join_quiet_slack_either_side_of_the_run(tmp_path, pause_start_s, status):
+    source = gapped(tmp_path / "a.wav", before_s=pause_start_s, gap_s=0.1, after_s=0.5)
+    join = quiet_join(tmp_path, _join_plan(tmp_path, source, src_in=30))
+    assert join["status"] == status
+    if status == "pass":
+        # The 100 ms pause is clipped by the window [0.5, 0.7] to 91 ms.
+        assert join["run_at_cut"]["ms"] == pytest.approx(91, abs=0.25)
+    else:
+        assert join["run_at_cut"] is None
+        mid = pause_start_s + 0.05
+        assert join["suggested_src_in"] == round(mid * 50)
+    slack0 = quiet_join(
+        tmp_path,
+        _join_plan(tmp_path, source, src_in=30),
+        profile=profile_with(join_quiet_slack_ms=0),
     )
+    assert slack0["status"] == "fail"
+
+
+@pytest.mark.parametrize(
+    ("fps", "src_in", "frame"),
+    [("24", 28, 25), ("25", 30, 26), ("30000/1001", 35, 31)],
+)
+def test_suggested_src_in_is_the_frame_nearest_the_pause_middle(tmp_path, fps, src_in, frame):
+    # Pause 1.00-1.10 s (middle 1.05 s); src_in sits 67-100 ms after it.
+    source = gapped(tmp_path / "a.wav", before_s=1.0, gap_s=0.1, after_s=0.5)
+    plan = _join_plan(tmp_path, source, src_in=src_in, fps=fps)
+    join = quiet_join(tmp_path, plan, profile=profile_with(join_quiet_search_s=0.25))
+    assert join["status"] == "fail"
+    assert join["suggested_src_in"] == frame == plan.fps.frames(1.05)
+    assert 1.0 < join["suggested_src_in_s"] < 1.1  # the suggestion lands inside the pause
+    assert join["suggested_src_in_s"] == round(plan.fps.seconds(frame), 4)
+    assert f"move src_in of join 1 to frame {frame}" in join["check"].message
+
+
+def test_join_quiet_without_a_pause_says_so(tmp_path):
+    source = sine(tmp_path / "a.wav", -6.0, seconds=1.0)
+    join = quiet_join(tmp_path, _join_plan(tmp_path, source, src_in=25))
+    assert join["status"] == "fail"
+    assert join["longest_quiet_ms"] == 0.0
+    assert join["quietest_dbfs"] == pytest.approx(-9.0, abs=0.5)
+    assert "no 60 ms pause within ±0.1 s of src_in, so re-cut it by ear" in join["hint"]
 
 
 @pytest.mark.parametrize(("lead_silence", "status"), [(True, "pass"), (False, "fail")])
@@ -359,16 +457,14 @@ def test_join_at_the_very_start_of_a_source(tmp_path, lead_silence, status):
         source = gapped(tmp_path / "a.wav", before_s=0.0, gap_s=0.07, after_s=1.0)
     else:
         source = sine(tmp_path / "a.wav", -6.0, seconds=1.0)
-    plan = _join_plan(tmp_path, source, src_in=0, src_out=50)
-    entry = run(sine(tmp_path / "r.wav", -14.5), plan=plan, media_root=tmp_path).check("join-quiet")
-    assert entry.status == status
-    join = entry.details[0]
+    join = quiet_join(tmp_path, _join_plan(tmp_path, source, src_in=0, src_out=50))
+    assert join["status"] == status
     assert join["window_s"] == [0.0, pytest.approx(0.1)]
     if lead_silence:
-        assert join["longest_quiet_ms"] == pytest.approx(70, abs=0.25)
-        assert join["run_start_s"] == 0.0
+        assert join["quiet_ms_at_cut"] == pytest.approx(70, abs=0.25)
+        assert join["run_at_cut"]["start_s"] == 0.0
     else:
-        assert join["longest_quiet_ms"] < 1
+        assert join["quiet_ms_at_cut"] < 1
 
 
 def test_join_quiet_reads_room_tone_as_quiet(tmp_path):
@@ -376,17 +472,15 @@ def test_join_quiet_reads_room_tone_as_quiet(tmp_path):
     quiet = gapped(
         tmp_path / "a.wav", before_s=0.5, gap_s=0.1, after_s=0.5, peak_dbfs=-6, gap_dbfs=-46
     )
-    plan = _join_plan(tmp_path, quiet, src_in=27)
-    entry = run(sine(tmp_path / "r.wav", -14.5), plan=plan, media_root=tmp_path).check("join-quiet")
-    assert entry.status == "pass"
-    assert entry.details[0]["run_level_dbfs"] == pytest.approx(-49.0, abs=0.5)
+    join = quiet_join(tmp_path, _join_plan(tmp_path, quiet, src_in=27))
+    assert join["status"] == "pass"
+    assert join["run_at_cut"]["level_dbfs"] == pytest.approx(-49.0, abs=0.5)
     loud = gapped(
         tmp_path / "b.wav", before_s=0.5, gap_s=0.1, after_s=0.5, peak_dbfs=-6, gap_dbfs=-30
     )
-    plan = _join_plan(tmp_path, loud, src_in=27)
-    entry = run(sine(tmp_path / "r.wav", -14.5), plan=plan, media_root=tmp_path).check("join-quiet")
-    assert entry.status == "fail"
-    assert entry.details[0]["quietest_dbfs"] == pytest.approx(-33.0, abs=0.5)
+    join = quiet_join(tmp_path, _join_plan(tmp_path, loud, src_in=27))
+    assert join["status"] == "fail"
+    assert join["quietest_dbfs"] == pytest.approx(-33.0, abs=0.5)
 
 
 def test_join_quiet_continuous_joins_are_not_cuts(tmp_path):
@@ -402,9 +496,10 @@ def test_join_quiet_continuous_joins_are_not_cuts(tmp_path):
     )
     entry = run(sine(tmp_path / "r.wav", -14.5), plan=plan).check("join-quiet")
     assert entry.status == "pass" and entry.measured == {"cuts": 0}
+    assert not entry.incomplete
 
 
-def test_join_quiet_unreadable_sources_are_skipped_not_passed(tmp_path):
+def test_join_quiet_with_no_readable_source_warns_and_is_listed_unchecked(tmp_path):
     plan = plan_of(
         plan_dict(
             [
@@ -419,11 +514,31 @@ def test_join_quiet_unreadable_sources_are_skipped_not_passed(tmp_path):
             ],
         )
     )
-    entry = run(sine(tmp_path / "r.wav", -14.5), plan=plan, media_root=tmp_path).check("join-quiet")
-    assert entry.status == "skipped" and entry.skip_reason == "source-unreadable"
+    # The render matches the plan's 1.5 s, so join-quiet is the only check that is not a pass.
+    report = run(sine(tmp_path / "r.wav", -14.5, seconds=1.5), plan=plan, media_root=tmp_path)
+    entry = report.check("join-quiet")
+    assert entry.status == "warn" and entry.skip_reason is None
+    assert entry.incomplete
+    assert entry.measured == {
+        "cuts": 2,
+        "failed": 0,
+        "unchecked": 2,
+        "unchecked_reason": "source-unreadable",
+    }
+    assert entry.message.startswith("None of the 2 cuts could be checked (")
+    assert "make the plan's source media readable" in entry.message
     reasons = [d["reason"] for d in entry.details]
     assert "file not found" in reasons[0]
     assert "not a local path" in reasons[1]
+    assert [d["status"] for d in entry.details] == ["unchecked", "unchecked"]
+    assert report.status == "warn" and report.ok
+    assert report.check("duration").status == "pass"
+    assert report.unchecked == [
+        "size-cap",
+        "join-quiet",
+        "join-retranscribe",
+        "caption-coverage",
+    ]
 
 
 def test_join_quiet_some_sources_unreadable_warns(tmp_path):
@@ -443,11 +558,35 @@ def test_join_quiet_some_sources_unreadable_warns(tmp_path):
             ],
         )
     )
-    entry = run(sine(tmp_path / "r.wav", -14.5), plan=plan, media_root=tmp_path).check("join-quiet")
-    assert entry.status == "warn"
-    assert [d["status"] for d in entry.details] == ["pass", "skipped"]
+    report = run(sine(tmp_path / "r.wav", -14.5), plan=plan, media_root=tmp_path)
+    entry = report.check("join-quiet")
+    assert entry.status == "warn" and entry.incomplete
+    assert [d["status"] for d in entry.details] == ["pass", "unchecked"]
     assert "no audio stream" in entry.details[1]["reason"]
-    assert entry.measured == {"cuts": 2, "failed": 0, "unchecked": 1}
+    assert entry.measured == {
+        "cuts": 2,
+        "failed": 0,
+        "unchecked": 1,
+        "unchecked_reason": "source-unreadable",
+    }
+    assert "join-quiet" in report.unchecked
+
+
+def test_join_quiet_failures_outrank_unreadable_sources(tmp_path):
+    loud = sine(tmp_path / "a.wav", -6.0, seconds=1.0)
+    plan = plan_of(
+        plan_dict(
+            [{"id": "o", "media": "missing.wav"}, {"id": "a", "media": loud.name}],
+            [
+                {"track": 1, "source": "o", "src_in": 0, "src_out": 25},
+                {"track": 1, "source": "a", "src_in": 25, "src_out": 40},
+                {"track": 1, "source": "o", "src_in": 30, "src_out": 40},
+            ],
+        )
+    )
+    entry = run(sine(tmp_path / "r.wav", -14.5), plan=plan, media_root=tmp_path).check("join-quiet")
+    assert entry.status == "fail" and entry.incomplete
+    assert "1 more could not be checked" in entry.message
 
 
 # ---------------------------------------------------------------- join re-transcription
@@ -630,7 +769,14 @@ def test_every_kept_word_captioned_passes(tmp_path):
     )
     entry = run(rendered, plan=plan, transcript=transcript).check("caption-coverage")
     assert entry.status == "pass"
-    assert entry.measured == {"kept_words": 16, "captions": 1, "uncovered": 0}
+    assert entry.measured == {
+        "kept_words": 16,
+        "captions": 1,
+        "uncovered": 0,
+        "segments": 2,
+        "segments_unchecked": 0,
+    }
+    assert not entry.incomplete
 
 
 def test_uncovered_words_are_listed(tmp_path):
@@ -644,7 +790,13 @@ def test_uncovered_words_are_listed(tmp_path):
     )
     entry = run(rendered, plan=plan, transcript=transcript).check("caption-coverage")
     assert entry.status == "fail"
-    assert entry.measured == {"kept_words": 16, "captions": 2, "uncovered": 4}
+    assert entry.measured == {
+        "kept_words": 16,
+        "captions": 2,
+        "uncovered": 4,
+        "segments": 2,
+        "segments_unchecked": 0,
+    }
     assert [d["word"] for d in entry.details] == ["eight1", "nine1", "ten1", "eleven1"]
     assert entry.details[0]["record_start_s"] == pytest.approx(3.0)
     assert "4 of 16 kept words have no caption" in entry.message
@@ -786,3 +938,75 @@ def test_messages_stay_on_one_line_for_hostile_names(tmp_path):
     missing = run(tmp_path / "gone\nfile.wav")
     message = missing.check("decode").message
     assert "\n" not in message and "gone file.wav" in message
+
+
+# ---------------------------------------------------------------- not checked is not all clear
+
+
+def test_a_transcript_of_another_recording_checks_no_join_and_warns(tmp_path):
+    plan, transcript, truth, rendered = _speech(tmp_path)
+    other = transcript.model_copy(update={"recording": "another-night"})
+    fake = FakeTranscriber(truth)
+    report = run(rendered, plan=plan, transcript=other, transcriber=fake)
+    entry = report.check("join-retranscribe")
+    assert entry.status == "warn" and entry.skip_reason is None and entry.incomplete
+    assert entry.measured == {
+        "cuts": 1,
+        "failed": 0,
+        "unchecked": 1,
+        "unchecked_reason": "transcript-does-not-cover",
+    }
+    assert "does not cover source 'a'" in entry.details[0]["reason"]
+    assert entry.message.startswith("None of the 1 cuts could be checked")
+    assert fake.calls == []  # nothing to compare against, so the transcriber is not run
+    captions = report.check("caption-coverage")
+    assert captions.status == "warn" and captions.incomplete
+    assert captions.measured["segments_unchecked"] == 2
+    assert "covers none of the plan's 2 segments" in captions.message
+    assert {"join-retranscribe", "caption-coverage"} <= set(report.unchecked)
+    assert "join-quiet" not in report.unchecked  # it ran in full (and fails: a plain tone)
+
+
+def test_a_transcript_covering_some_segments_marks_captions_incomplete(tmp_path):
+    plan, transcript, _, rendered = _speech(tmp_path)
+    data = plan.model_dump(mode="json")
+    data["sources"].append({"id": "x", "media": "x.wav", "recording_id": "other"})
+    data["segments"][1]["source"] = "x"
+    data["captions"] = [{"lines": ["ALL"], "record_in": 0, "record_out": 200}]
+    entry = run(rendered, plan=plan_of(data), transcript=transcript).check("caption-coverage")
+    assert entry.status == "warn" and entry.incomplete
+    assert entry.measured["segments_unchecked"] == 1 and entry.measured["kept_words"] == 8
+    assert "1 of 2 segments come from a recording the transcript does not cover" in entry.message
+
+
+def test_report_unchecked_lists_skips_and_incomplete_checks(tmp_path):
+    plan, transcript, truth, rendered = _speech(tmp_path)
+    data = plan.model_dump(mode="json")
+    data["captions"] = [{"lines": ["ALL"], "record_in": 0, "record_out": 200}]
+    full = run(
+        rendered,
+        plan=plan_of(data),
+        transcript=transcript,
+        transcriber=FakeTranscriber(truth),
+    )
+    # Only the size cap (not a review render) is left out; everything else ran in full.
+    assert full.unchecked == ["size-cap"]
+    assert full.check("join-quiet").status == "fail"  # the fixture's source is a plain tone
+    bare = run(rendered)
+    assert bare.status == "pass"
+    assert bare.unchecked == [
+        "size-cap",
+        "duration",
+        "join-quiet",
+        "join-retranscribe",
+        "caption-coverage",
+    ]
+    review = run(render(tmp_path / "v.mp4", frames=30, audio="none"), kind="review")
+    assert review.unchecked == [
+        "clipping",
+        "longest-silence",
+        "duration",
+        "join-quiet",
+        "join-retranscribe",
+        "caption-coverage",
+    ]

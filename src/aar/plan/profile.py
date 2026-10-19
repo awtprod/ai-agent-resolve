@@ -45,7 +45,11 @@ class QATargets(_Model):
 
     The first four keys are required. Every later key has a default, so a profile written
     before it existed still loads. See docs/DESIGN.md "Media QA" for what each check measures.
+    TOML allows ``nan`` and ``inf``; they are refused here, because ``lufs_tolerance = inf``
+    would pass every loudness and ``short_lufs = nan`` would fail every one.
     """
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     longform_lufs: float
     short_lufs: float
@@ -61,6 +65,7 @@ class QATargets(_Model):
     join_quiet_db: float = Field(default=-40.0, lt=0)
     join_quiet_min_ms: float = Field(default=60.0, gt=0)
     join_quiet_search_s: float = Field(default=0.10, gt=0)
+    join_quiet_slack_ms: float = Field(default=10.0, ge=0)
     join_quiet_window_ms: float = Field(default=10.0, gt=0)
     join_windows: int = Field(default=3, ge=2, le=3)
     join_window_s: float = Field(default=4.0, gt=0)
@@ -79,8 +84,11 @@ class QATargets(_Model):
             )
         if self.join_quiet_window_ms > self.join_quiet_min_ms:
             raise ValueError("join_quiet_window_ms must not exceed join_quiet_min_ms")
-        if self.join_quiet_min_ms / 1000 > 2 * self.join_quiet_search_s:
-            raise ValueError("join_quiet_min_ms cannot fit in the search window")
+        if self.join_quiet_min_ms + self.join_quiet_slack_ms > self.join_quiet_search_s * 1000:
+            raise ValueError(
+                "join_quiet_search_s must cover join_quiet_min_ms + join_quiet_slack_ms, or a "
+                "pause that contains src_in could be cut short by the search window"
+            )
         return self
 
 
