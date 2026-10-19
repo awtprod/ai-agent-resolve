@@ -92,11 +92,22 @@ def ntfs_upper(name: str) -> str:
     whose full uppercase expands) or, failing that, to ``c`` unchanged. Dotless i (U+0131) still
     folds to ``I``.
 
-    This is Unicode simple case mapping, not a copy of any one volume's table. Windows freezes
-    ``$UpCase`` when a volume is formatted, so a real volume can differ from this (newer) data for
-    code points added after it was made. ``path_map`` only rewrites path strings into a new output
-    file, which the post-write gate and the sandbox round trip still check, so a fold a particular
-    volume does not share cannot corrupt a file.
+    This is Unicode *simple* case mapping; it is close to, but not identical to, any one NTFS
+    ``$UpCase`` table (those are frozen when a volume is formatted, and differ between XP, Vista
+    and Win7-10; Win11 and exFAT tables are not established). It never *under*-folds a pair those
+    tables fold, but it OVER-folds pairs NTFS keeps distinct -- aar treats them as one name, NTFS
+    does not: U+0131 (dotless i) vs I, U+017F (long s) vs S, U+00B5 (micro) vs Greek mu, U+0345
+    and U+1FBE vs iota, the titlecase digraphs U+01C5/01C8/01CB/01F2, U+1E9B, every astral cased
+    letter (Deseret, Osage, Adlam, Warang Citi, ...), and -- on the Win7-10 table -- final sigma
+    vs sigma. These are Unicode 1.1 characters NTFS never folded, so "code points added after the
+    volume was formatted" does not excuse them.
+
+    ``ntfs_upper`` is used only to match ``path_map`` table prefixes (:class:`PathMapper`); it
+    does not decide output placement (the OS's own case rules do) and aar never writes to a media
+    file. An over-fold is therefore not a media overwrite, but it is NOT harmless: a table prefix
+    can match a path under a *different* directory that NTFS considers distinct, mapping it to the
+    wrong Mac location -- a wrong relink candidate in the new output file, which the human, the
+    post-write gate and the sandbox round trip must still catch.
     """
     out = []
     for ch in name:
