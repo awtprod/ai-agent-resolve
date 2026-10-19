@@ -24,7 +24,9 @@ from aar.node.jobs import (
     register_kind,
 )
 from aar.node.jobs.model import Done, Step, StepAction, StepContext, Submit
+from aar.node.jobs.render import snapshot_preset_name  # noqa: F401
 
+from .fake_resolve import DeliverState
 from .jobs_support import JobWorld
 
 HUMAN = Actor("human", "andrew")
@@ -780,3 +782,297 @@ def test_non_finite_render_timeout_is_refused_at_submit(tmp_path: Path) -> None:
                 "render", _render_params(world, timeout_seconds=bad), world.locator()
             )
     assert world.runner.list() == []
+
+
+def test_snapshot_preset_deleted_mid_build_is_reported_as_missing(tmp_path: Path) -> None:
+    """Kills B04/P-B04 (a missing snapshot preset tolerated): someone deletes the job's
+    snapshot preset while the build runs; the restore says exactly that, and alerts."""
+    world = JobWorld(tmp_path)
+    proj = world.project
+    real_set = proj.SetRenderSettings
+
+    def human_deletes_our_preset(settings):
+        for name in [p for p in world.fake.presets if p.startswith("aar-job-")]:
+            del world.fake.presets[name]
+        return real_set(settings)
+
+    proj.SetRenderSettings = human_deletes_our_preset  # type: ignore[method-assign]
+    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.run_until_settled()
+    view = world.runner.get(job_id)
+    assert view.state == "succeeded"  # the render itself is fine and tracked
+    assert view.measured["deliver_restore_error"]["code"] == "snapshot_preset_missing"
+    assert [a["code"] for a in view.alerts] == ["deliver_not_restored"]
+
+
+# -- fifth batch -----------------------------------------------------------------------------------
+
+
+def _crash_once(world: JobWorld, name: str, *, after: bool = False) -> None:
+    """``project.<name>`` dies (process death) on its next call; ``after``: once it ran."""
+    import types
+
+    proj = world.project
+    real = getattr(proj, name)
+    state = {"armed": True}
+
+    def dying(self, *a, **k):
+        if state["armed"]:
+            state["armed"] = False
+            if after:
+                real(*a, **k)
+            raise _Crash(f"died in {name}")
+        return real(*a, **k)
+
+    setattr(proj, name, types.MethodType(dying, proj))
+
+
+class _Crash(BaseException):
+    pass
+
+
+def _crash_drain(world: JobWorld) -> None:
+    import pytest
+
+    with pytest.raises(_Crash):
+        world.broker.run_until_idle()
+
+
+def test_next_step_gets_its_own_timeout(tmp_path: Path) -> None:
+    """Kills P-R21b (the next step keeps the previous step's remaining deadline)."""
+    world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1e6)), drain_budget=0.5)
+    steps = [
+        {"op": "timeline.list", "params": {}, "timeout": 1000.0},
+        {"op": "markers.add", "params": {"markers": [{"frame": 1}]}, "timeout": 10.0},
+    ]
+    job_id = world.runner.submit("ops.sequence", {"steps": steps}, world.locator())
+    world.runner.pump()
+    world.runner.pump()  # step 0 done
+    entered, release = _hung_marker(world)
+    try:
+        world.runner.pump()  # step 1 submitted
+        world.runner.pump()  # its op hangs
+        assert entered.wait(WAIT)
+        world.clock.advance(20.0)
+        world.runner.pump()
+        view = world.runner.get(job_id)
+        assert view.state == "stalled" and view.stall["code"] == "watchdog_step_timeout"
+    finally:
+        release.set()
+    assert world.runner.wait_drain(WAIT)
+
+
+def test_cleanup_never_deletes_a_job_that_is_rendering(tmp_path: Path) -> None:
+    """Kills F16: if the build fails after its render started, the rendering job is reported
+    as orphaned (alert with its JobId), never deleted."""
+    world = JobWorld(tmp_path)
+    world.project.render_complete_after = 50
+    runner = world.runner
+    real = runner._journal
+
+    def journal_fails_on_started(job_id, op_id, event, data):
+        if event == "started":
+            raise RuntimeError("the job store is gone")
+        return real(job_id, op_id, event, data)
+
+    runner._journal = journal_fails_on_started  # type: ignore[method-assign]
+    job_id = runner.submit("render", _render_params(world), world.locator())
+    runner.run_until_settled()
+    view = runner.get(job_id)
+    rid = world.project.render_jobs[0].job_id
+    assert world.project.render_jobs[0].status == "Rendering"  # left alone
+    assert view.state == "failed" and view.error["detail"]["cleanup"]["orphaned"] is True
+    assert ("render_orphaned", rid) in [(a["code"], a.get("render_job_id")) for a in view.alerts]
+
+
+def test_adopted_render_that_failed_meanwhile_is_reported_not_restarted(tmp_path: Path) -> None:
+    """Kills F48: an adopted render that FAILED while the node was down is polled (and the job
+    fails with the render's own error), never started again."""
+    world = JobWorld(tmp_path)
+    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.pump()
+    world.broker.run_until_idle()  # the build ran; the node dies before the checkpoint
+    rj = world.project.render_jobs[0]
+    rj.status, rj.error = "Failed", "disk full"
+    world.project.rendering = False
+    runner = world.restart()
+    runner.run_until_settled()
+    view = runner.get(job_id)
+    assert view.state == "failed" and view.error["code"] == "render_failed"
+    assert [c for c in world.fake.calls if c[0] in ("StartRendering", "DeleteRenderJob")] == []
+
+
+def test_resumed_build_never_loads_a_human_preset_named_like_its_deleted_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Kills F11/F59: once the build deleted its snapshot, a later attempt does not treat a
+    preset of that name (a human's, created meanwhile) as its own."""
+    world = JobWorld(tmp_path)
+    original = world.project.deliver.copy()
+    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.pump()
+    _crash_once(world, "StartRendering")  # dies after the Deliver restore deleted the snapshot
+    _crash_drain(world)
+    name = snapshot_name = world.store.get(job_id).cursor["journal"]["snapshot"]
+    human = DeliverState("mxf", "DNxHR", 0, {"TargetDir": "H:/Humans"})
+    world.fake.presets[snapshot_name] = human
+    runner = world.restart()
+    runner.run_until_settled()
+    assert runner.get(job_id).state == "succeeded"
+    assert world.fake.presets.get(name) is human
+    assert ("LoadRenderPreset", name) not in world.fake.calls
+    assert ("DeleteRenderPreset", name) not in world.fake.calls
+    assert world.project.deliver.settings == original.settings
+
+
+def test_snapshot_of_a_crashed_adopt_attempt_is_recovered_and_removed(tmp_path: Path) -> None:
+    """Kills F58: a second build attempt saves a new snapshot after the first one's was
+    deleted; when that attempt dies too, the third recovers and deletes it (no leak)."""
+    world = JobWorld(tmp_path)
+    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.pump()
+    _crash_once(world, "StartRendering")  # attempt 1 dies after its restore
+    _crash_drain(world)
+    world.restart()
+    world.runner.pump()  # attempt 2 (adopt) queued
+    _crash_once(world, "GetRenderJobList")  # dies after saving its own snapshot
+    _crash_drain(world)
+    assert [p for p in world.fake.presets if p.startswith("aar-job-")]  # its snapshot leaked
+    runner = world.restart()
+    runner.run_until_settled()
+    assert runner.get(job_id).state == "succeeded"
+    assert [p for p in world.fake.presets if p.startswith("aar-job-")] == []
+
+
+def test_stop_during_build_submits_the_build_once(tmp_path: Path) -> None:
+    """Kills F31: the result of a build that a stop overlapped is kept in memory and used on
+    resume -- the build op is not submitted again (not even as an adopt)."""
+    world = JobWorld(tmp_path)
+    orig = world.project.AddRenderJob
+
+    def add_and_stop():
+        rid = orig()
+        control.stop(world.log, control.StopScope.all(), "STOP mid-build", HUMAN)
+        return rid
+
+    world.project.AddRenderJob = add_and_stop  # type: ignore[method-assign]
+    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.pump()
+    world.runner.pump()
+    world.project.AddRenderJob = orig  # type: ignore[method-assign]
+    control.resume(world.log, control.StopScope.all(), "ok", HUMAN)
+    world.runner.run_until_settled()
+    view = world.runner.get(job_id)
+    assert view.state == "succeeded"
+    builds = [
+        e for e in view.events if e["kind"] == "op_submitted" and e["data"]["op"] == "render.build"
+    ]
+    assert len(builds) == 1
+
+
+def test_stop_keeps_the_used_part_of_a_running_step_deadline(tmp_path: Path) -> None:
+    """Kills P-N10 (a wait does not pause, so the used time is forgotten on resume)."""
+    world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1e6)))
+    world.project.render_complete_after = 10_000
+    job_id = world.runner.submit(
+        "render", _render_params(world, timeout_seconds=600.0), world.locator()
+    )
+    for _ in range(4):
+        world.runner.pump()
+    world.clock.advance(400.0)  # 400 s of the 600 s used
+    world.runner.pump()
+    control.stop(world.log, control.StopScope.all(), "stop", HUMAN)
+    world.runner.pump()
+    world.clock.advance(1000.0)  # a long stop does not count
+    control.resume(world.log, control.StopScope.all(), "go", HUMAN)
+    world.runner.pump()
+    assert world.runner.get(job_id).state == "running"
+    world.clock.advance(300.0)  # 400 + 300 > 600
+    world.runner.pump()
+    world.runner.pump()
+    assert world.runner.get(job_id).state == "stalled"
+
+
+def test_stall_cancels_the_jobs_queued_op_itself(tmp_path: Path) -> None:
+    """Kills P-N25 (a stall leaves the queued op queued; only the broker precheck caught it)."""
+    from aar.node.leases import Holder, Scope, timeline_key
+
+    world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=5.0)))
+    world.leases.acquire(
+        Holder.human("andrew"),
+        Scope.TIMELINE,
+        timeline_key(world.pid(), world.main.GetUniqueId()),
+        None,
+    )
+    steps = [
+        {"op": "markers.add", "params": {"timeline": world.ref("Main"), "markers": [{"frame": 1}]}}
+    ]
+    job_id = world.runner.submit("ops.sequence", {"steps": steps}, world.locator())
+    world.runner.pump()  # op queued, lease-blocked
+    op_id = next(
+        e["data"]["op_id"] for e in world.runner.get(job_id).events if e["kind"] == "op_submitted"
+    )
+    world.clock.advance(10.0)
+    world.runner.pump()
+    assert world.runner.get(job_id).state == "stalled"
+    assert world.broker.result(op_id).error.code == "cancelled"
+
+
+def test_a_stalled_project_runs_no_other_jobs_queued_op(tmp_path: Path) -> None:
+    """Kills F05: job A stalls on a hung op; job B's op, queued behind it in the same project,
+    must not run when the hang ends (the project is stalled until a human resumes)."""
+    world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1.0)), drain_budget=0.5)
+    other = world.project.timeline("Main [agent]")
+    a = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    world.runner.pump()
+    entered, release = _hung_marker(world)
+    try:
+        world.runner.pump()
+        assert entered.wait(WAIT)
+        steps = [
+            {
+                "op": "markers.add",
+                "params": {"timeline": world.ref("Main [agent]"), "markers": [{"frame": 2}]},
+            }
+        ]
+        b = world.runner.submit("ops.sequence", {"steps": steps}, world.locator())
+        world.runner.pump()  # B's op queued behind A's hung op
+        world.clock.advance(5.0)
+        world.runner.pump()
+        assert world.runner.get(a).state == "stalled"
+    finally:
+        release.set()
+    assert world.runner.wait_drain(WAIT)
+    world.runner.pump()
+    assert other.markers == {}  # B never wrote while the project was stalled
+    world.runner.resume(a)
+    world.runner.run_until_settled()
+    assert world.runner.get(b).state == "succeeded" and sorted(other.markers) == [2]
+
+
+def test_empty_add_render_job_id_is_refused_as_such(tmp_path: Path) -> None:
+    """Kills P-O08 (an empty AddRenderJob id accepted)."""
+    world = JobWorld(tmp_path)
+    world.project.render_add_fails = True
+    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.run_until_settled()
+    assert world.runner.get(job_id).error["code"] == "add_render_job_failed"
+
+
+def test_broker_refused_op_for_another_project_causes_no_switch(tmp_path: Path) -> None:
+    """Kills F02/F54: an op refused by its precheck is finished at the tick sweep, so the
+    broker never switches to its project only to refuse it."""
+    from dataclasses import replace
+
+    from aar.node.broker import OpError, OpStatus
+    from aar.node.leases import Holder
+    from aar.node.ops import make_hot_op
+
+    world = JobWorld(tmp_path)
+    hot = make_hot_op(
+        "timeline.list", {}, target=world.locator("Other"), holder=Holder.agent("pin")
+    )
+    op_id = world.broker.submit(replace(hot, precheck=lambda: OpError("stop", "stopped")))
+    world.broker.run_until_idle()
+    assert world.broker.result(op_id).status is OpStatus.CANCELLED
+    assert world.fake.current.GetName() == "Show"  # never loaded "Other"

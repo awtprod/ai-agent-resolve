@@ -985,7 +985,9 @@ def test_p15d_stalled_job_keeps_its_hung_op_and_resumes_with_its_result(tmp_path
     world.runner.resume(job_id)
     world.runner.run_until_settled()
     assert world.runner.get(job_id).state == "succeeded"
-    assert len(world.project.render_jobs) == 0 or len(_calls(world, "StartRendering")) == 1
+    # The hung build's own result was used: one render job ever added, one start.
+    assert len(_calls(world, "AddRenderJob")) == 1
+    assert len(_calls(world, "StartRendering")) == 1
 
 
 # == P16: restart mid-render + the broker's own restore ==========================================
