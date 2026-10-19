@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +26,7 @@ from aar.hub.collab import (
 )
 from aar.hub.common import InvalidInput, iso
 from aar.hub.events import Actor, EventLog
-from aar.hub.leaseboard import record_lease_event
+from aar.hub.leaseboard import record_lease_event, record_presence
 from aar.hub.mcp_server import build_server
 from aar.hub.registry import Registry
 from aar.node.leases import Holder, LeaseManager, Scope
@@ -329,5 +329,35 @@ def test_agent_branches_pages_stay_small(tmp_path: Path) -> None:
                 cursor = page["next_cursor"]
                 pages += 1
             assert seen == [f"tl-{i:03d}" for i in range(120)] and pages >= 2
+
+    asyncio.run(body())
+
+
+def test_branches_stay_in_first_recorded_order_after_an_update(tmp_path: Path) -> None:
+    log, project = _hub(tmp_path)
+    record_branch(log, project, NODE, **_base(branch_timeline_id="tl-a"))
+    record_branch(log, project, NODE, **_base(branch_timeline_id="tl-b"))
+    record_branch(log, project, NODE, **_base(branch_timeline_id="tl-a", handoff="updated"))
+    found = branches(log, project)
+    assert [(b.branch_timeline_id, b.handoff) for b in found] == [
+        ("tl-a", "updated"),
+        ("tl-b", "v3"),
+    ]
+
+
+def test_project_board_caps_presence_and_says_so(tmp_path: Path) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    at = datetime.fromtimestamp(1000.0 + W, UTC)
+    for i in range(501):
+        record_presence(log, f"node-{i}", active=True, at=at, human_id="op", ttl=timedelta(hours=1))
+    server = _server(tmp_path, log, Registry(log))
+
+    from mcp import Client
+
+    async def body() -> None:
+        async with Client(server) as client:
+            board = _payload(await client.call_tool("project_board", {"project_id": "p"}))
+            assert len(board["presence"]) == 500 and board["truncated"] is True
+            assert board["next_cursor"] is None  # no lease page left; presence is capped
 
     asyncio.run(body())

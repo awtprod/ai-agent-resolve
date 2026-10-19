@@ -87,6 +87,8 @@ def parse_branch(name: str) -> BranchName | None:
     source = name[: match.start()]
     if not source:  # a branch needs a non-empty source timeline name
         return None
+    if not valid_agent_id(match.group(1)):  # only what branch_name could have made
+        return None
     return BranchName(source=source, agent_id=match.group(1), version=int(match.group(2)))
 
 
