@@ -728,3 +728,55 @@ def test_gap_sidecar_records_the_output_size_and_hash(tmp_path: Path) -> None:
     data = out.read_bytes()
     assert label["output"]["size"] == len(data) == outcome.output["size"]
     assert label["output"]["sha256"] == hashlib.sha256(data).hexdigest()
+
+
+# --------------------------------------------------------------------------- DESIGN.md claims
+
+DESIGN = (Path(__file__).resolve().parents[2] / "docs" / "DESIGN.md").read_text(encoding="utf-8")
+
+
+def _design_modify_section() -> str:
+    start = DESIGN.index("- **Modify (S8).**")
+    return DESIGN[start : DESIGN.index("- **Create (S9).**")]
+
+
+def test_design_names_the_deferred_edits_the_plan_refuses() -> None:
+    from aar.drp.modify.plan import DEFERRED_OPS
+
+    section = _design_modify_section().lower()
+    assert set(DEFERRED_OPS) == {"metadata", "fader_keyframes"}
+    assert "cannot be verified" in section and "no keyframe writer exists" in section
+    # Neither deferred edit is listed as built, and keyframes are not "ported from drp_tools".
+    assert "ported from `drp_tools`" not in DESIGN
+    assert "  - metadata\n" not in section and "  - fader keyframes" not in section
+    assert "fader keyframes do not come from it" in DESIGN
+
+
+def test_design_states_the_round_trip_allow_list_as_the_code_has_it() -> None:
+    from aar.drp.modify.roundtrip import ROUND_TRIP_ALLOW_LIST
+
+    ids = [rule.id for rule in ROUND_TRIP_ALLOW_LIST]
+    assert sorted(ids) == sorted(
+        [
+            "bin-save-stamp",
+            "db-saved-time",
+            "last-modified",
+            "playhead",
+            "project-age",
+            "ptzr-preset-dbid",
+            "settings-save-date",
+        ]
+    )
+    section = _design_modify_section()
+    assert "exactly **11 opaque lines**" in section
+    assert "root bin's fields blob" in section and "3 playhead values" in section
+    assert "`LastModTimeInSecs`" in section
+    # The counts come from corpus pair 002 -> 003; test_drp_modify_corpus pins them.
+
+
+def test_design_states_the_input_has_warnings_exclusion_and_the_licence_status() -> None:
+    assert "16 files, all `blob-partial`" in _design_modify_section()
+    assert "the other 48 can be edited" in _design_modify_section()
+    prior = DESIGN[DESIGN.index("- **Prior art.**") :].split("\n- ")[0]
+    assert "`samuelgursky/drp-format` returns 404" in prior and "unconfirmed" in prior
+    assert "(MIT, JavaScript)" not in prior and "keyframe writer, zstd" not in prior

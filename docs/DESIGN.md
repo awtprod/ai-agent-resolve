@@ -73,17 +73,24 @@ Work is either hot or cold:
 - **Modify (S8).** Only a whitelist of round-trip-verified edits is allowed:
   - rename
   - relink and path mapping (Windows drive letters to Mac `/Volumes` and back)
-  - markers
-  - metadata
-  - fader keyframes, ported from `drp_tools`
+  - markers (add, update, delete)
 
-  Each edit is a text-span splice plus a blob re-encode. Anything outside the whitelist is refused.
+  Each edit is a text-span splice plus a blob re-encode. Anything outside the whitelist is refused. Two edits that were planned are **deferred, not built**:
+  - **Metadata.** It cannot be verified. The reader decodes no user-editable clip metadata (comments, keywords, scene, shot, take and camera fields live in `BtMetadataLockableBlob`, which it does not decode), so the post-write gate could not vouch for an edit. A clip's name is a rename.
+  - **Fader keyframes.** No keyframe writer exists. `drp_tools` has codecs and format notes only, and its notes leave the tick encoding, the track mapping and the `AdrDatabase` checksum open. The reader does not decode `FLStudioModelBA` either.
+
+  Every write must pass the S2 gate, and its full change list must equal the plan's intended edits. Three rules bound what is edited and what is accepted:
+  - **Inputs that read with warnings are refused** (`input-has-warnings`), because the gate can never pass for them. In the 64-file private corpus that is 16 files, all `blob-partial`; the other 48 can be edited.
+  - **The round-trip allow-list** (`aar.drp.modify.roundtrip`) is used only to compare a file with Resolve's own re-export of it, never for the writer's output. It accepts exactly **11 opaque lines** that Resolve rewrites on every export: 3 playhead values, 3 pan/tilt preset DbIds, 2 `DbSavedTime` values, 1 project age, 1 save date inside the settings blob, and **1 save stamp in the root bin's fields blob**. The project's `LastModTimeInSecs` is accepted as a decoded header change on top of those. Each rule checks the bytes, not just the name.
+  - **Files are labelled `unverified`** (`<out>.aar.json`) until the sandbox round trip exists.
+
 - **Create (S9).** There are two routes:
   1. Preferred: build the project with the scripting API in a sandbox, then call `ExportProject`. Resolve writes the file, so it is valid by construction.
   2. Offline: fill in a version-matched template that was exported from the target Resolve version.
 - **Validation gates every write.** Each written file is imported into the sandbox library, read back through the API and compared with the intended model. If it is visual, a frame is rendered as well. A file that has not been validated is labelled `unverified` and never offered to humans.
 - **Version gate.** A file is never stamped newer than the target host. Writing for an older DbPrjVer is refused unless a template for that version exists.
-- **Prior art.** We port the codecs from samuelgursky's `drp-format` (MIT, JavaScript) and Andrew's `drp_tools` (codecs, keyframe writer, zstd body). We do not reuse DRP-Toolkit, which is GPL.
+- **Prior art.** We port the codecs from the `drp-format` JavaScript library and from Andrew's `drp_tools`. `drp_tools` supplies codecs and format notes only; it has no keyframe writer, so fader keyframes do not come from it. We do not reuse DRP-Toolkit, which is GPL.
+  - **`drp-format` licence: unconfirmed.** The standalone repository `samuelgursky/drp-format` returns 404 (checked 2026-10-19). The library is vendored at `resolve-advanced/vendor/drp-format/` in `samuelgursky/davinci-resolve-mcp`. The repository's root `LICENSE` and the vendored `package.json` both say MIT, but the vendored directory has no licence file of its own and the copyright line names the repository's contributors, not the library's author. We therefore treat the licence as MIT per the host repository and unconfirmed for the directory; `tests/fixtures/drp/README.md` records the commit the four template files come from.
 - **Blocked on approval.** S8 and S9 need permission to use the edit PC's empty Local Database as the sandbox. Switching databases closes the open project.
 
 ### R2. Blackmagic Cloud
