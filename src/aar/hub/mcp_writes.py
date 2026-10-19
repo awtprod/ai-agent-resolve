@@ -190,7 +190,13 @@ def register_write_tools(
             "has lint errors is still stored, with status 'blocked'; with no errors it is "
             "'pending'. The hub lints without a transcript or laugh map, so the rules that "
             "need one are listed in node.payload.lint.skipped_rules: they did not run. "
-            "title is optional. Returns {ok: true, op: 'plan.submit', replayed, project_id, "
+            "title is optional. Example: project_id 'prj_1a2b', derives_from "
+            '\'nd_0123456789abcdef\' (the recipe node), plan {"project": "Acme S01", '
+            '"timeline": "Short 03", "kind": "short", "fps": "24000/1001", "resolution": '
+            '{"width": 1080, "height": 1920}, "profile": "ccn", "sources": [{"id": "cam-a", '
+            '"media": "media/camA.mov", "shot_size": "close", "recording_id": "take-1"}], '
+            '"segments": [{"source": "cam-a", "src_in": 1000, "src_out": 1240}]}. '
+            "Returns {ok: true, op: 'plan.submit', replayed, project_id, "
             "node: {id, kind: 'plan', status, payload: {schema: 'aar.plan-node/1', "
             "plan_sha256, plan_version, rule_profile, derives_from, brief_id, lint: {ok, "
             "errors, warnings, infos, skipped_rules, findings (errors first, at most 20), "
