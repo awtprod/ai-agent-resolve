@@ -592,7 +592,11 @@ def make_hot_op(
     timeline, timeline_id, also_leased = _lease_timeline(spec, checked)
     if require_branch:
         refusal = _branch_refusal(
-            spec, checked, holder=holder, branch_registry=branch_registry, project_id=target.project_id
+            spec,
+            checked,
+            holder=holder,
+            branch_registry=branch_registry,
+            project_id=target.project_id,
         )
         if refusal is not None:
             raise refusal

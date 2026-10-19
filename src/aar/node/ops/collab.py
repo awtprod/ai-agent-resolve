@@ -6,16 +6,19 @@ Three hot ops sit on top of the write-op library (DESIGN R3):
   ``<timeline> [agent:<id> v<n>]``, built on ``timeline.duplicate``. The owner is the lease
   holder that submitted it, never a value the caller passes, and the branch is recorded in
   the node's owner registry keyed by ``(project, timeline unique id)``. It is idempotent: a
-  re-run reuses only a branch the registry confirms this agent owns; a mere name match (a
-  human timeline, or a copy with a fresh id) is never reused. Merging a branch back is a
-  human step, so the result carries a handoff note.
+  re-run reuses a branch only when the registry confirms this agent owns it, branched from
+  this very source (by id) and at the resolution asked for; a mere name match (a human
+  timeline, or a copy with a fresh id) is never reused, it just takes a version number.
+  Merging a branch back is a human step, so the result carries a handoff note.
 - ``markers.mirror_review`` mirrors a hub review's timecoded notes to markers on the agent's
   branch. Each marker's ``customData`` carries the note id, so a re-run updates in place and
   prunes markers whose note is gone, never duplicating. It pre-flights the whole plan (every
   add, delete and conflict, including human and other-review markers and duplicate custom
-  data) before any mutation; it adds to free frames first and only then deletes vacated
-  frames and adds the rest, so a move never loses a marker; and it reports exactly what it
-  applied if a step fails.
+  data, and with ``prune`` off this review's markers that stay) before any mutation. A
+  moved marker is added before the old one is deleted (by frame, after checking it is
+  ours); where frames collide (a swap, an in-place change, a note onto a pruned note's
+  frame) the delete goes first. If a step fails, the error reports exactly the marker
+  writes that were applied.
 - ``markers.read_review`` maps the branch's markers back to notes: the ones it mirrored, and
   the ones a human added, so the latter flow back into the hub review as new notes.
 
@@ -33,6 +36,7 @@ from pydantic import Field, model_validator
 
 from aar.hub.common import clean_text
 from aar.hub.reviews import MAX_FPS, MAX_FRAME, MAX_NOTE, is_timecode
+from aar.node.branch_registry import OwnershipConflict
 from aar.node.branches import (
     branch_name,
     branch_version_for,
@@ -71,8 +75,9 @@ class BranchParams(OpModel):
     source: TimelineRef = Field(description="The human timeline to branch from (needs unique_id).")
     if_exists: Literal["reuse", "new"] = Field(
         default="reuse",
-        description="'reuse' returns the agent's latest branch of the source that this node "
-        "knows it owns (idempotent); 'new' always cuts the next version.",
+        description="'reuse' returns the latest branch of this source that the node's "
+        "registry says this agent owns, at the resolution asked for (idempotent), else cuts "
+        "the next version; 'new' always cuts the next version.",
     )
     resolution: Resolution | None = Field(
         default=None, description="Give the branch its own resolution (e.g. a vertical cut)."
@@ -126,7 +131,7 @@ def timeline_branch(env: OpEnv, params: BranchParams) -> BranchResult:
             "wire the broker with a BranchRegistry (the node runtime provides one)",
         )
     project_id = env.target.project_id
-    if project_id is None:
+    if project_id is None:  # make_hot_op refuses this at submit; never key ownership on None
         raise OpError(
             "project_id_required",
             "the target has no project_id, so branch ownership cannot be keyed",
@@ -137,63 +142,73 @@ def timeline_branch(env: OpEnv, params: BranchParams) -> BranchResult:
     source = env.timeline(params.source)
     source_name = str(source.GetName())
     source_id = str(source.GetUniqueId())
-    # Candidate branches by name give the version numbering; ownership comes from the
-    # registry, so a human timeline (or a copy) that happens to carry a branch name is never
-    # treated as this agent's.
-    by_name: dict[int, Any] = {}
-    owned: dict[int, Any] = {}
+    wanted = (
+        None if params.resolution is None else (params.resolution.width, params.resolution.height)
+    )
+    # Names only number the versions. What may be reused is decided by the registry, by
+    # unique id: a branch this agent owns, of this very source (by id), at the resolution
+    # asked for. A human timeline or a copy that carries a branch name is never reused.
+    taken: set[int] = set()
+    reusable: dict[int, Any] = {}
     for timeline in env.timelines():
         version = branch_version_for(str(timeline.GetName()), source_name, agent_id)
-        if version is None:
+        if version is not None:
+            taken.add(version)
+        owner = registry.owner(project_id, str(timeline.GetUniqueId()))
+        if owner is None or owner.agent_id != agent_id or owner.source_timeline_id != source_id:
             continue
-        by_name[version] = timeline
-        if registry.owned_by(project_id, str(timeline.GetUniqueId()), agent_id):
-            owned[version] = timeline
+        taken.add(owner.version)
+        if wanted is None or _resolution_of(timeline) == wanted:
+            reusable[owner.version] = timeline
 
-    if owned and params.if_exists == "reuse":
-        version = max(owned)
-        branch = owned[version]
-        if params.resolution is not None:
-            width, height = _resolution_of(branch)
-            if (width, height) != (params.resolution.width, params.resolution.height):
-                raise OpError(
-                    "reuse_resolution_mismatch",
-                    f"branch v{version} is {width}x{height}, not the "
-                    f"{params.resolution.width}x{params.resolution.height} asked for",
-                    "drop the resolution to reuse it, or cut a new version with if_exists='new'",
-                )
-        source_identity = env.identity(source)
-        branch_identity = env.identity(branch)
-        notes = [Note(code="reused", message=f"branch v{version} already existed; unchanged"), _HANDOFF]
-        created = False
-        count = int(env.project().GetTimelineCount() or 0)
-    else:
-        version = (max(by_name) if by_name else 0) + 1
-        name = branch_name(source_name, agent_id, version)
-        duplicated = timeline_duplicate(
-            env, DuplicateParams(source=params.source, name=name, resolution=params.resolution)
+    if reusable and params.if_exists == "reuse":
+        version = max(reusable)
+        branch = reusable[version]
+        return BranchResult(
+            source=env.identity(source),
+            timeline=env.identity(branch),
+            agent_id=agent_id,
+            version=version,
+            created=False,
+            timeline_count=int(env.project().GetTimelineCount() or 0),
+            notes=[
+                Note(code="reused", message=f"branch v{version} already existed; unchanged"),
+                _HANDOFF,
+            ],
         )
-        source_identity = duplicated.source
-        branch_identity = duplicated.timeline
-        notes = [*duplicated.notes, _HANDOFF]
-        created = duplicated.created
-        count = duplicated.timeline_count
 
-    registry.register(
-        project_id,
-        branch_identity.unique_id,
-        source_timeline_id=source_id,
-        agent_id=agent_id,
-        version=version,
+    version = max(taken, default=0) + 1
+    duplicated = timeline_duplicate(
+        env,
+        DuplicateParams(
+            source=params.source,
+            name=branch_name(source_name, agent_id, version),
+            resolution=params.resolution,
+            if_exists="error",  # never pick up a same-named timeline as the new branch
+        ),
     )
+    try:
+        registry.register(
+            project_id,
+            duplicated.timeline.unique_id,
+            source_timeline_id=source_id,
+            agent_id=agent_id,
+            version=version,
+        )
+    except OwnershipConflict as exc:
+        raise OpError(
+            "branch_owner_conflict",
+            f"the new timeline {duplicated.timeline.unique_id!r} is already registered: {exc}",
+            "list timelines with timeline.list and branch again",
+        ) from exc
     return BranchResult(
-        source=source_identity,
-        timeline=branch_identity,
+        source=duplicated.source,
+        timeline=duplicated.timeline,
         agent_id=agent_id,
         version=version,
-        created=created,
-        timeline_count=count,
-        notes=notes,
+        created=duplicated.created,
+        timeline_count=duplicated.timeline_count,
+        notes=[*duplicated.notes, _HANDOFF],
     )
 
 
@@ -289,7 +304,7 @@ def _timeline_fps(timeline: Any) -> float:
 
 @dataclass
 class _Plan:
-    """One note's place in the apply plan: what to add, and the frame to vacate first."""
+    """One note to (re)write: its target marker, and the marker it replaces, if any."""
 
     note_id: str
     frame: int
@@ -297,22 +312,22 @@ class _Plan:
     timecode: str
     text: str
     custom_data: str
-    status: Literal["added", "updated"]
-    old_frame: int | None  # the current frame to vacate (in-place, or a move), else None
+    old_frame: int | None  # where this note's marker is now (a move, or in place), else None
+
+    @property
+    def status(self) -> Literal["added", "updated"]:
+        return "added" if self.old_frame is None else "updated"
 
 
 @dataclass
 class _Applied:
-    """Exactly what a mirror run changed, for the result and for an error report."""
+    """Exactly the marker writes a mirror run made, in order, as measured from Resolve."""
 
-    markers: list[MirroredMarker] = field(default_factory=list)
-    pruned: list[PrunedMarker] = field(default_factory=list)
+    added: list[dict[str, Any]] = field(default_factory=list)
+    deleted: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "markers": [m.model_dump() for m in self.markers],
-            "pruned": [p.model_dump() for p in self.pruned],
-        }
+        return {"added": list(self.added), "deleted": list(self.deleted)}
 
 
 @op("markers.mirror_review", params=MirrorParams, result=MirrorResult, mutates=True)
@@ -360,9 +375,16 @@ def markers_mirror_review(env: OpEnv, params: MirrorParams) -> MirrorResult:
             )
         desired[note.note_id] = (frame, params.color, note.timecode, note.text)
 
-    # Pre-flight: the final markers must be one per frame, so a note may never land on a
-    # human or other-review marker, nor two notes on one frame. Checked before any mutation.
-    final: dict[int, str] = dict.fromkeys(other_frames, "a non-review marker")
+    # Pre-flight the final state, before any mutation: one marker per frame. A note may not
+    # land on a human or other-review marker, on another note, nor (with prune off) on a
+    # marker of this review that stays. The review's own markers that move or are pruned
+    # free their frames, so they never conflict; the apply order below handles them.
+    kept = {
+        marker["frame"]: f"this review's kept marker for note {note_id!r}"
+        for note_id, marker in ours.items()
+        if note_id not in desired and not params.prune
+    }
+    final: dict[int, str] = {**dict.fromkeys(other_frames, "a non-review marker"), **kept}
     for note_id, (frame, *_rest) in desired.items():
         if frame in final:
             raise OpError(
@@ -374,155 +396,137 @@ def markers_mirror_review(env: OpEnv, params: MirrorParams) -> MirrorResult:
             )
         final[frame] = f"note {note_id!r}"
 
+    markers: list[MirroredMarker] = []
+    plans: list[_Plan] = []
+    for note_id, (frame, color, timecode, text) in desired.items():
+        have = ours.get(note_id)
+        fields = (frame, color, timecode, text)
+        if (
+            have is not None
+            and (have["frame"], have["color"], have["name"], have["note"]) == fields
+        ):
+            markers.append(MirroredMarker(note_id=note_id, frame=frame, status="present"))
+            continue
+        custom_data = note_marker_custom_data(rid, note_id)
+        old_frame = None if have is None else int(have["frame"])
+        plans.append(_Plan(note_id, frame, color, timecode, text, custom_data, old_frame))
+    prunes = [
+        PrunedMarker(note_id=note_id, frame=marker["frame"])
+        for note_id, marker in ours.items()
+        if note_id not in desired and params.prune
+    ]
+
     applied = _Applied()
-    plans, present, prune = _mirror_plan(rid, desired, ours, prune=params.prune)
-    applied.markers.extend(present)
     try:
-        _mirror_apply(timeline, other_frames, ours, plans, prune, applied)
+        _mirror_apply(timeline, rid, plans, prunes, applied)
     except OpError as exc:
         raise _with_applied(exc, applied) from exc
-
-    applied.markers.sort(key=lambda m: m.frame)
-    applied.pruned.sort(key=lambda p: p.frame)
+    markers.extend(MirroredMarker(note_id=p.note_id, frame=p.frame, status=p.status) for p in plans)
     return MirrorResult(
-        timeline=env.identity(timeline), review_id=rid, markers=applied.markers, pruned=applied.pruned
+        timeline=env.identity(timeline),
+        review_id=rid,
+        markers=sorted(markers, key=lambda m: m.frame),
+        pruned=sorted(prunes, key=lambda p: p.frame),
     )
 
 
-def _mirror_plan(
-    rid: str,
-    desired: dict[str, tuple[int, str, str, str]],
-    ours: dict[str, dict[str, Any]],
-    *,
-    prune: bool,
-) -> tuple[list[_Plan], list[MirroredMarker], tuple[list[tuple[str, int]], list[tuple[str, int]]]]:
-    """Classify each note into add/update/present, and collect the prunes.
-
-    Returns ``(plans, present markers, (prune by (custom_data, frame), pruned (note_id, frame)))``.
-    """
-    plans: list[_Plan] = []
-    present: list[MirroredMarker] = []
-    for note_id, (frame, color, timecode, text) in desired.items():
-        have = ours.get(note_id)
-        custom_data = note_marker_custom_data(rid, note_id)
-        if have is not None and (have["frame"], have["color"], have["name"], have["note"]) == (
-            frame,
-            color,
-            timecode,
-            text,
-        ):
-            present.append(MirroredMarker(note_id=note_id, frame=frame, status="present"))
-            continue
-        plans.append(
-            _Plan(
-                note_id=note_id,
-                frame=frame,
-                color=color,
-                timecode=timecode,
-                text=text,
-                custom_data=custom_data,
-                status="updated" if have else "added",
-                old_frame=have["frame"] if have else None,
-            )
-        )
-    prune_notes = [note_id for note_id in ours if note_id not in desired and prune]
-    prune_list = [(note_marker_custom_data(rid, note_id), ours[note_id]["frame"]) for note_id in prune_notes]
-    pruned_markers = [(note_id, ours[note_id]["frame"]) for note_id in prune_notes]
-    return plans, present, (prune_list, pruned_markers)
-
-
 def _mirror_apply(
-    timeline: Any,
-    other_frames: dict[int, str],
-    ours: dict[str, dict[str, Any]],
-    plans: list[_Plan],
-    prune: Any,
-    applied: _Applied,
+    timeline: Any, rid: str, plans: list[_Plan], prunes: list[PrunedMarker], applied: _Applied
 ) -> None:
-    """Apply the plan without data loss: add to free frames, then vacate, then add the rest.
+    """Apply a pre-flighted plan, never losing a marker that can be kept.
 
-    Adding before deleting means a move never loses its marker; a swap (both targets held by
-    the other's old marker) and an in-place change fall to the delete-then-add third phase.
+    A moved note's new marker is added *before* its old one is deleted. Where frames
+    collide, deletes go first: a pruned marker sitting on a note's target frame is deleted
+    before that note is added, and when every remaining note waits on a frame held by
+    another remaining note's old marker (an in-place change, or a cycle such as a swap),
+    one old marker is deleted to break the wait. Other prunes run last.
     """
-    prune_list, pruned_markers = prune
-    occupied = set(other_frames) | {marker["frame"] for marker in ours.values()}
-
-    # Phase 1: adds whose target frame is already free.
-    remaining: list[_Plan] = []
-    for plan in plans:
-        if plan.frame not in occupied:
-            _add(timeline, plan)
-            occupied.add(plan.frame)
-            applied.markers.append(MirroredMarker(note_id=plan.note_id, frame=plan.frame, status=plan.status))
-        else:
-            remaining.append(plan)
-
-    # Phase 2: vacate the old frames of the remaining updates, and the pruned frames.
-    for plan in remaining:
-        if plan.old_frame is not None:
-            _delete(timeline, plan.custom_data, plan.old_frame)
-            occupied.discard(plan.old_frame)
-    for custom_data, frame in prune_list:
-        _delete(timeline, custom_data, frame)
-        occupied.discard(frame)
-
-    # Phase 3: add the rest (their target frames are free now).
-    for plan in remaining:
-        if plan.frame in occupied:
-            raise OpError(
-                "marker_conflict",
-                f"frame {plan.frame} is still occupied for note {plan.note_id!r}",
-                "remove the conflicting marker by hand, then re-run",
-                note_id=plan.note_id,
-                frame=plan.frame,
-            )
-        _add(timeline, plan)
-        occupied.add(plan.frame)
-        applied.markers.append(MirroredMarker(note_id=plan.note_id, frame=plan.frame, status=plan.status))
-
-    for note_id, frame in pruned_markers:
-        applied.pruned.append(PrunedMarker(note_id=note_id, frame=frame))
+    by_note = {plan.note_id: plan for plan in plans}
+    # The frames this run will vacate, and whose marker (by note id) sits on each now.
+    held: dict[int, str] = {p.old_frame: p.note_id for p in plans if p.old_frame is not None}
+    targets = {plan.frame for plan in plans}
+    for prune in prunes:
+        if prune.frame in targets:
+            _delete(timeline, rid, prune.note_id, prune.frame, applied)
+    pending = list(plans)
+    while pending:
+        ready = [plan for plan in pending if plan.frame not in held]
+        if not ready:
+            # Every remaining target is held by a remaining note's old marker: delete one.
+            blocker = by_note[held[pending[0].frame]]
+            assert blocker.old_frame is not None
+            _delete(timeline, rid, blocker.note_id, blocker.old_frame, applied)
+            del held[blocker.old_frame]
+            continue
+        for plan in ready:
+            _add(timeline, plan, applied)
+            if plan.old_frame is not None and held.get(plan.old_frame) == plan.note_id:
+                _delete(timeline, rid, plan.note_id, plan.old_frame, applied)
+                del held[plan.old_frame]
+            pending.remove(plan)
+    for prune in prunes:
+        if prune.frame not in targets:
+            _delete(timeline, rid, prune.note_id, prune.frame, applied)
 
 
-def _add(timeline: Any, plan: _Plan) -> None:
-    if not timeline.AddMarker(plan.frame, plan.color, plan.timecode, plan.text, 1, plan.custom_data):
+def _add(timeline: Any, plan: _Plan, applied: _Applied) -> None:
+    """Add the note's marker; record it once Resolve shows it, then verify its fields."""
+    ok = timeline.AddMarker(plan.frame, plan.color, plan.timecode, plan.text, 1, plan.custom_data)
+    read = {m["frame"]: m for m in raw.read_markers(timeline)}.get(plan.frame)
+    if read is None or read["custom_data"] != plan.custom_data:
         raise OpError(
             "add_marker_failed",
-            f"AddMarker at frame {plan.frame} for note {plan.note_id!r} returned False",
-            "the frame must lie inside the timeline and be free",
+            f"AddMarker at frame {plan.frame} for note {plan.note_id!r} returned {ok} and the "
+            f"frame holds {read}",
+            "the frame must lie inside the timeline and be free; re-run to reconcile",
             note_id=plan.note_id,
             frame=plan.frame,
         )
-    read = {m["frame"]: m for m in raw.read_markers(timeline)}.get(plan.frame)
-    if read is None or read["custom_data"] != plan.custom_data or read["note"] != plan.text:
+    applied.added.append({"note_id": plan.note_id, "frame": plan.frame})
+    if not ok or (read["color"], read["name"], read["note"]) != (
+        plan.color,
+        plan.timecode,
+        plan.text,
+    ):
         raise OpError(
             "marker_unverified",
             f"the marker for note {plan.note_id!r} reads back as {read}",
-            "inspect markers with timeline.describe",
+            "inspect markers with timeline.describe; re-run to reconcile",
             note_id=plan.note_id,
+            frame=plan.frame,
         )
 
 
-def _delete(timeline: Any, custom_data: str, frame: int) -> None:
-    """Delete our marker at ``frame`` by frame (not by custom data, which deletes the first
-    match and would remove a just-added copy at an earlier frame on a move)."""
+def _delete(timeline: Any, rid: str, note_id: str, frame: int, applied: _Applied) -> None:
+    """Delete this note's marker at ``frame``, by frame: never by custom data, which deletes
+    the *first* match and so would remove a just-added copy at an earlier frame. The frame is
+    checked to hold our marker first, so another writer's marker is never removed."""
+    custom_data = note_marker_custom_data(rid, note_id)
     if timeline.GetMarkerCustomData(frame) != custom_data:
         raise OpError(
             "marker_delete_failed",
             f"frame {frame} no longer holds marker {custom_data!r}",
             "another writer changed the marker; re-run to reconcile",
+            note_id=note_id,
+            frame=frame,
         )
-    if not timeline.DeleteMarkerAtFrame(frame):
+    ok = timeline.DeleteMarkerAtFrame(frame)
+    if timeline.GetMarkerCustomData(frame) == custom_data:
         raise OpError(
             "marker_delete_failed",
-            f"DeleteMarkerAtFrame({frame}) returned False for {custom_data!r}",
+            f"DeleteMarkerAtFrame({frame}) returned {ok}; marker {custom_data!r} is still there",
             "remove the marker by hand, then re-run",
+            note_id=note_id,
+            frame=frame,
         )
-    if frame in timeline.GetMarkers():
+    applied.deleted.append({"note_id": note_id, "frame": frame})
+    if frame in (timeline.GetMarkers() or {}):
         raise OpError(
             "marker_delete_failed",
-            f"a marker is still at frame {frame} after deletion",
+            f"a marker is still at frame {frame} after deleting {custom_data!r}",
             "remove the marker by hand, then re-run",
+            note_id=note_id,
+            frame=frame,
         )
 
 
@@ -530,7 +534,9 @@ def _with_applied(exc: OpError, applied: _Applied) -> OpError:
     if "applied" in exc.detail:
         return exc
     extra = {k: v for k, v in exc.detail.items() if k not in ("fix_hint", "trap_id")}
-    return OpError(exc.code, exc.message, exc.fix_hint, exc.trap_id, **extra, applied=applied.to_dict())
+    return OpError(
+        exc.code, exc.message, exc.fix_hint, exc.trap_id, **extra, applied=applied.to_dict()
+    )
 
 
 # -- markers.read_review ---------------------------------------------------------------------
