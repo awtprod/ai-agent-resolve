@@ -713,28 +713,56 @@ def test_l2_no_hardlink_place_never_overwrites_a_racing_create(
     from aar.drp.modify import write
 
     monkeypatch.setattr(os, "link", _no_hardlinks)  # force the no-hardlink path
-    real_rename = os.rename
+    real_rename, real_replace = os.rename, os.replace
     created: list[str] = []
 
-    def racing_rename(src: str, dst: str) -> None:
-        # A second writer tries to claim dst in the window between our check and our rename.
+    def racer(dst: str) -> None:
+        # A second writer tries to claim dst between our check/claim and our rename/replace.
         try:
             fd = os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
-            pass  # we already own the name under the new code; the racer cannot create it
-        else:
-            os.write(fd, b"a human's file")
-            os.close(fd)
-            created.append(dst)
+            return  # we already own the name under the new code; the racer cannot create it
+        os.write(fd, b"a human's file")
+        os.close(fd)
+        created.append(dst)
+
+    def racing_rename(src: str, dst: str) -> None:  # the move used at 064fa55
+        racer(dst)
         real_rename(src, dst)
 
+    def racing_replace(src: str, dst: str) -> None:  # the move used after S8c
+        racer(dst)
+        real_replace(src, dst)
+
     monkeypatch.setattr(os, "rename", racing_rename)
+    monkeypatch.setattr(os, "replace", racing_replace)
     tmp = write._temp(tmp_path, "out.drp", b"our output")
     dest = tmp_path / "out.drp"
     write._place(tmp, dest, force=False)
     # Old check-then-rename: the racer won the window and was overwritten (dest != its bytes).
     # New O_EXCL claim: the racer can never create the file, so nothing of theirs is lost.
     assert not created or dest.read_bytes() == b"a human's file"
+
+
+def test_l2_no_hardlink_place_uses_replace_not_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aar.drp.modify import write
+
+    monkeypatch.setattr(os, "link", _no_hardlinks)  # force the no-hardlink path
+
+    def windows_rename(src: str, dst: str) -> None:
+        # Windows os.rename fails when the destination exists -- here the placeholder always does.
+        if os.path.exists(dst):
+            raise FileExistsError(dst)
+        os.replace(src, dst)
+
+    monkeypatch.setattr(os, "rename", windows_rename)
+    tmp = write._temp(tmp_path, "out.drp", b"ours")
+    dest = tmp_path / "out.drp"
+    write._place(tmp, dest, force=False)  # must use os.replace, so os.rename is never called
+    assert dest.read_bytes() == b"ours"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["out.drp"]  # no placeholder left
 
 
 def test_l2_no_hardlink_cleans_up_its_placeholder_on_failure(
@@ -747,7 +775,7 @@ def test_l2_no_hardlink_cleans_up_its_placeholder_on_failure(
     def boom(src: str, dst: str) -> None:
         raise OSError(errno.ENOSPC, "No space left on device")
 
-    monkeypatch.setattr(os, "rename", boom)
+    monkeypatch.setattr(os, "replace", boom)
     tmp = write._temp(tmp_path, "out.drp", b"ours")
     dest = tmp_path / "out.drp"
     with pytest.raises(OSError, match="No space"):

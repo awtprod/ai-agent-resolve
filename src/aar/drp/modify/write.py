@@ -333,22 +333,30 @@ def _place(tmp: Path, dest: Path, force: bool) -> None:
 
 
 def _place_no_hardlink(tmp: Path, dest: Path) -> None:
-    """Place ``tmp`` at ``dest`` on a filesystem without hard links, never replacing a file
-    another writer put there.
+    """Place ``tmp`` at ``dest`` on a filesystem without hard links (FAT/exFAT), without
+    replacing a file another writer put there.
 
-    ``os.link`` is not available, so claim the name with ``O_CREAT|O_EXCL`` (which fails with
-    ``FileExistsError`` if ``dest`` already exists, leaving no check-then-rename window a
-    concurrent create could slip through), then rename our verified temporary onto our own
-    placeholder. A crash between the claim and the rename can leave our own partial labelled copy
-    (the empty placeholder, or the finished output), never a file that was already there.
+    ``os.link`` is unavailable, so claim the name with ``O_CREAT|O_EXCL`` -- which fails with
+    ``FileExistsError`` if the name is already taken, leaving no check-then-act window a plain
+    concurrent create could slip through -- then ``os.replace`` our verified temporary onto the
+    placeholder we just made. ``os.replace`` (not ``os.rename``) is required because on Windows
+    ``os.rename`` fails when the destination exists, which here it always does.
+
+    One narrow window remains, and it is adversarial: between our exclusive create and the
+    ``os.replace``, another writer could delete our placeholder and create its own file at the
+    name; that file would then be replaced (or, if the replace itself fails, removed by the
+    cleanup below). It requires deleting a file this tool exclusively created, and is far smaller
+    than the pre-S8c check-then-rename window. A crash in this window leaves our own partial
+    labelled copy (the empty placeholder, or the finished output), never a file that was already
+    there.
     """
     fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)  # FileExistsError if taken
     try:
         os.close(fd)
-        os.rename(tmp, dest)  # atomically replaces the placeholder we just created, nothing else
+        os.replace(tmp, dest)  # cross-platform atomic replace of the placeholder we just created
     except BaseException:
         with contextlib.suppress(OSError):
-            os.unlink(dest)  # remove only the placeholder we created; never a pre-existing file
+            os.unlink(dest)  # removes our placeholder (see the adversarial window above)
         raise
 
 
