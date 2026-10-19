@@ -40,12 +40,46 @@ def test_each_attribute_is_one_token() -> None:
 
 
 def test_an_element_keeps_at_most_4096_attributes_but_every_one_is_charged() -> None:
-    # Fails on 20f89a0 (5000 stored, 1 token) and models the 10M-attribute bomb in miniature.
+    # Models the 10M-attribute bomb in miniature (fails on 20f89a0: 5000 stored, 1 token). The
+    # 410a6b3 version of this test passed while the dropped attributes were *silent*; see
+    # test_an_element_past_the_attribute_cap_says_so and test_drp_s1h4_cap_gate.py.
     doc = scan(_attr_tag(5000))
     assert doc.root is not None
     assert len(doc.root.attrs) == 4096
     assert "k0" in doc.root.attrs and "k4095" in doc.root.attrs and "k4096" not in doc.root.attrs
     assert doc.element_count == 5001
+
+
+def test_an_element_past_the_attribute_cap_says_so() -> None:
+    # Fails on 410a6b3: attributes past 4096 were dropped with no issue, so the reader raised no
+    # warning and `aar drp diff --gate` compared only the first 4096 (validator C1).
+    doc = scan(b"<r>" + _attr_tag(5000, b"Big") + b"</r>", "m.xml")
+    capped = [i for i in doc.issues if i.code == "attributes-truncated"]
+    assert len(capped) == 1
+    assert capped[0].offset == 3  # the element's "<"
+    assert "5000 attributes" in capped[0].message and "first 4096" in capped[0].message
+    # exactly 4096 is still whole; one more is not
+    assert not [i for i in scan(_attr_tag(4096)).issues if i.code == "attributes-truncated"]
+    one_over = [i for i in scan(_attr_tag(4097)).issues if i.code == "attributes-truncated"]
+    assert len(one_over) == 1 and "4097 attributes" in one_over[0].message
+
+
+def test_each_capped_element_gets_its_own_issue_and_the_log_stays_bounded() -> None:
+    body = b"".join(_attr_tag(4100, b"E") for _ in range(150))
+    doc = scan(b"<r>" + body + b"</r>", "m.xml")
+    codes = [i.code for i in doc.issues]
+    assert codes.count("attributes-truncated") == 100  # the per-code cap
+    assert codes.count("issues-truncated") == 1
+    more = next(i for i in doc.issues if i.code == "issues-truncated")
+    assert "50 more attributes-truncated" in more.message
+
+
+def test_a_capped_tag_that_never_closes_reports_unparsed_markup_not_truncation() -> None:
+    # The cap issue belongs to an element that exists; an unterminated tag has none.
+    doc = scan(b"<r>" + _attr_tag(5000, b"Big", end=b" <") + b"</r>", "m.xml")
+    codes = {i.code for i in doc.issues}
+    assert "attributes-truncated" not in codes
+    assert "unparsed-markup" in codes
 
 
 def test_reader_budget_counts_attributes(tmp_path: Path) -> None:

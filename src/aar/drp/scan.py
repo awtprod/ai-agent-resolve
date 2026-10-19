@@ -38,7 +38,8 @@ _MAX_INT_DIGITS = 20
 _MAX_ISSUES_PER_CODE = 100
 # Attributes past this many on a single element are charged against the budget but not stored,
 # so one element with millions of attributes cannot grow an unbounded dict. Far above any real
-# element (corpus maximum is a handful), so decoded models are unaffected.
+# element (corpus maximum is a handful), so decoded models are unaffected. An element that goes
+# past it is never silent: it carries an ``attributes-truncated`` issue (see ``scan``).
 _MAX_ATTRS_PER_ELEMENT = 4096
 _ENTITY = re.compile(r"&(lt|gt|amp|quot|apos|#[0-9]+|#x[0-9a-fA-F]+);")
 _NAMED = {"lt": "<", "gt": ">", "amp": "&", "quot": '"', "apos": "'"}
@@ -266,7 +267,9 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
     materialised (``max_elements`` counts every token, not only start elements; see
     ``Document.element_count``); what was scanned so far is kept and open elements are closed at
     the end of the member. Attributes are charged too (one each), and an element keeps at most
-    4096 of them.
+    4096 of them; an element with more gets one ``attributes-truncated`` issue (with the exact
+    count), so a reader can warn and a diff gate can refuse rather than compare a prefix.
+    Attribute names and values are decoded only after the tag's closing ``>`` has matched.
 
     Time is linear in ``len(data)``: a start tag is read one attribute at a time and a tag with
     no closing ``>`` is skipped past, never re-read. Measured on the worst shapes tried: 240 KB
@@ -388,12 +391,15 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
             element_count += 1
             cursor = lt + 1
             continue
-        attrs: dict[str, str] = {}
-        # Repeated attribute names are reported only if the tag turns out to be well formed (and
-        # after the text before it, as before). Keep at most the per-code cap of names: more
-        # would be dropped by the issue log anyway, and a tag may repeat one name millions of times.
-        repeated: list[str] = []
-        repeated_extra = 0
+        # Attribute matches are only *recorded* while the tag is read: a Match holds spans into
+        # ``data``, not copies, so a tag that never closes (``<a b="`` followed by hundreds of MB)
+        # costs nothing beyond the gap it leaves. Names and values are decoded once the closing
+        # ">" has matched. At most ``_MAX_ATTRS_PER_ELEMENT`` are kept; the rest are charged
+        # against the budget and counted, and the element then carries an
+        # ``attributes-truncated`` issue (the reader turns any scan issue into a warning, so a
+        # diff gate refuses the file instead of comparing only the attributes that were kept).
+        found_attrs: list[re.Match[bytes]] = []
+        attrs_over = 0
         p = mname.end()
         closed: bool | None = None
         over_budget = False
@@ -409,15 +415,10 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
             ma = _ATTR_AT.match(data, p)
             if ma is None:  # neither the closing ">" nor another attribute: unterminated tag
                 break
-            if len(attrs) < _MAX_ATTRS_PER_ELEMENT:
-                name = ma.group("name").decode("utf-8", errors="replace")
-                raw = ma.group("dq") if ma.group("dq") is not None else ma.group("sq")
-                if name in attrs:
-                    if len(repeated) < _MAX_ISSUES_PER_CODE:
-                        repeated.append(name)
-                    else:
-                        repeated_extra += 1
-                attrs[name] = unescape(raw.decode("utf-8", errors="replace"))
+            if len(found_attrs) < _MAX_ATTRS_PER_ELEMENT:
+                found_attrs.append(ma)
+            else:
+                attrs_over += 1
             element_count += 1
             p = ma.end()
         work += p - lt
@@ -430,15 +431,40 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
         if closed is None:
             # Unterminated start tag: the text stays in the gap, which reports it as unparsed
             # markup. Skip past what was scanned (never rewind to lt + 1, which would re-read the
-            # attribute run at every inner "<" -- quadratic).
+            # attribute run at every inner "<" -- quadratic). Nothing was decoded, and the
+            # recorded matches are dropped before the gap is ever copied.
+            found_attrs = []
             element_count += 1
             cursor = max(p, lt + 1)
             continue
         gap(pos, lt)
+        attrs: dict[str, str] = {}
+        # Repeated attribute names are reported (after the text before the tag, as before). Keep
+        # at most the per-code cap of names: more would be dropped by the issue log anyway, and a
+        # tag may repeat one name thousands of times.
+        repeated: list[str] = []
+        repeated_extra = 0
+        for ma in found_attrs:
+            name = ma.group("name").decode("utf-8", errors="replace")
+            raw = ma.group("dq") if ma.group("dq") is not None else ma.group("sq")
+            if name in attrs:
+                if len(repeated) < _MAX_ISSUES_PER_CODE:
+                    repeated.append(name)
+                else:
+                    repeated_extra += 1
+            attrs[name] = unescape(raw.decode("utf-8", errors="replace"))
+        found_attrs = []
         for name in repeated:
             issues.append(ScanIssue("duplicate-attribute", lt, f"attribute {name!r} repeated"))
         for _ in range(repeated_extra):  # past the cap: counted, never listed
             issues.append(ScanIssue("duplicate-attribute", lt, "attribute repeated"))
+        if attrs_over:
+            total = _MAX_ATTRS_PER_ELEMENT + attrs_over
+            msg = (
+                f"element has {total} attributes; only the first {_MAX_ATTRS_PER_ELEMENT} "
+                "were read, so attribute changes past that point cannot be seen"
+            )
+            issues.append(ScanIssue("attributes-truncated", lt, msg))
         pos = cursor = p
         element_count += 1
         tag = mname.group("start").decode("utf-8", errors="replace")
