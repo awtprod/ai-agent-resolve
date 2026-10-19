@@ -1,15 +1,16 @@
 """Collaboration reads and records on the hub side.
 
-- :func:`project_board` narrows the lease board (:mod:`aar.hub.leaseboard`) to one project:
-  the project and timeline leases on it, which humans are active, and whether any node has
-  an unreconciled feed gap (so the view may be stale). It also reconciles a node's leases
-  against that node's latest ``lease.snapshot``, so a lease whose release was dropped on an
-  overflowing feed does not linger as a phantom.
+- :func:`project_board` narrows the lease board to one project: the project and timeline
+  leases on it, which humans are active, and whether any node's view may be stale. It is a
+  narrowing of :func:`aar.hub.leaseboard.lease_board`, the one reconciled board every view
+  reads (the console's leases page and the MCP ``lease_board`` tool too), so the views
+  cannot disagree: a node's leases are checked against its latest ``lease.snapshot`` there,
+  so a lease whose release was dropped does not linger as a phantom.
 - :func:`record_branch` records an agent branch timeline, linked to its source timeline and
   the owning agent; :func:`branches` projects them. Only a node may record one; the first
   node to record a ``(project, branch)`` owns that record, and only it may supersede it,
-  never with a lower version.
-- ``feed.gap`` is the event a node's feed emits when its outbox overflowed; a later
+  never with a lower version and never for another agent.
+- ``feed.gap`` is the event a node's feed emits when it dropped events; a later
   ``lease.snapshot`` from the same node clears it. :func:`feed_gaps` returns the gaps that
   are still unreconciled.
 
@@ -17,17 +18,46 @@ The project id the board uses is the Resolve project's unique id (the lease key)
 hub registry's ``prj_...`` id; the branch record carries both (the Resolve timeline ids and
 the hub project id on its row).
 
-No node runtime assembles the broker, feed and these recorders yet. Wiring it is the job of
-whichever of S7 (the job runner) and S11 lands second: build the ``NodeFeed`` with the lease
-table's ``active`` and clock (so it reconciles), call ``NodeFeed.flush`` from the pump,
-record each ``timeline.branch`` result here with :func:`record_branch`, and pass the node's
-``BranchRegistry`` to ``submit_op`` (``require_branch`` stays on unless a ``project.write``
-approval was consumed). Until then these are the hub-side primitives the tests drive.
+No node runtime assembles the broker, feed and these recorders yet. S7 (the job runner)
+lands after S11 and wires them; it must do all of this:
+
+1. ``aar.node.ops``: import every op module, ``cloud, collab, read, render, write``, so all
+   ops register; ``test_ops_framework.py``'s ``EXPECTED`` keeps both slices' ops.
+2. One shared ``BranchRegistry`` per node, passed to every ``submit_op`` /
+   ``make_hot_op`` (the job runner's included), and ``require_branch`` decided per op, never
+   left to a default by accident. Each job's ops run with the job's own agent as holder
+   (``Holder.agent(<agent id>)``): ``job-runner:<node>`` is not a valid agent id (the
+   ``:``), so it could never own or create a branch, and ``timeline.branch`` refuses it at
+   submit.
+3. What the branch guard refuses (shared project state, a human's timeline) and when an
+   approval lifts it is the coordinator's policy in the S7/S11 integration note; S7
+   implements it. ``require_branch=False`` only ever follows a consumed ``project.write``
+   approval for that op.
+4. ``LeaseManager`` and ``NodeFeed`` each need the other at construction, so they are bound
+   late: the feed's ``lease_source`` is the lease table's ``active``, and both use the same
+   (monotonic) clock. ``lease_source`` and ``clock`` are required, so a feed that never
+   reconciles cannot be built; :func:`aar.node.feed.wire_feed` builds the pair.
+5. The node's pump calls both ``NodeFeed.flush()`` and ``PresenceReporter.sync()``. The
+   feed backs off by itself while the hub is unreachable (``FlushReport.retry_at``), so
+   calling ``flush`` on every pump tick is cheap.
+6. Each ``timeline.branch`` result goes to :func:`record_branch` with the hub's ``prj_...``
+   id (look it up in the hub :class:`~aar.hub.registry.Registry`; the node knows only the
+   Resolve project id) and ``Actor("node", <the feed's node id>)``.
+7. Exactly one live ``NodeFeed`` per node id. The hub admits a new process of a node id
+   and refuses the one it replaced (:class:`~aar.hub.leaseboard.FeedConflict`, and the
+   node shows ``stale``); the refused feed stops, and its process must be stopped.
+8. The remote transport (F-S11-1) runs :func:`~aar.hub.leaseboard.deliver_feed_event` on
+   the hub and reports back to the node: "unreachable" as an ``OSError`` (the feed keeps
+   the spec and backs off), "refused" as a ``ValueError`` (quarantined), and a
+   ``FeedConflict`` as itself (the feed stops). It must keep a spec's idempotency key on
+   every resend; the feed reuses keys, orders its events itself (``feed.seq``) and drains
+   under lost acks (S11f), so a late or duplicate delivery is harmless.
+
+Until then these are the hub-side primitives the tests drive.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,159 +69,57 @@ from aar.hub.common import (
     clean_text,
     is_int,
     is_text,
-    is_ts,
     utcnow,
 )
 from aar.hub.events import Actor, Event, EventLog
 from aar.hub.leaseboard import (
-    LEASE_EVENT_TYPES,
-    MAX_LEASE_ID,
-    MAX_NODE_ID,
+    EVENT_FEED_GAP,
+    EVENT_LEASE_SNAPSHOT,
+    MAX_SNAPSHOT_LEASES,
     BoardLease,
+    FeedGap,
     Presence,
+    SupersededFeed,
     lease_board,
 )
 from aar.hub.registry import Registry
 
+__all__ = [
+    "EVENT_BRANCH_RECORDED",
+    "EVENT_FEED_GAP",
+    "EVENT_LEASE_SNAPSHOT",
+    "MAX_SNAPSHOT_LEASES",
+    "Branch",
+    "BranchScan",
+    "FeedGap",
+    "ProjectBoard",
+    "branches",
+    "feed_gaps",
+    "project_board",
+    "record_branch",
+    "scan_branches",
+]
+
 EVENT_BRANCH_RECORDED = "collab.branch_recorded"
-EVENT_FEED_GAP = "feed.gap"
-EVENT_LEASE_SNAPSHOT = "lease.snapshot"
 
 MAX_ID = 128
 MAX_NAME = 256
 MAX_HANDOFF = 2000
 MAX_VERSION = 10**6
-MAX_SNAPSHOT_LEASES = 10_000
-"""Lease ids one ``lease.snapshot`` may carry; a node with more does not reconcile."""
 _PROJECT_SCOPES = frozenset({"project", "timeline"})
 
 
-# -- feed gaps and lease snapshots -----------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class FeedGap:
-    """A node's report that its feed dropped events, so its board history may be stale."""
-
-    node_id: str
-    dropped: int
-    at: str
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"node_id": self.node_id, "dropped": self.dropped, "at": self.at}
-
-
-@dataclass(frozen=True, slots=True)
-class _Snapshot:
-    """A node's latest ``lease.snapshot``: the ids of every lease it held, at log ``seq``."""
-
-    seq: int
-    held: frozenset[str]
-
-
-def _gap_problem(payload: Any) -> str | None:
-    if not isinstance(payload, dict):
-        return "payload is not an object"
-    if not is_text(payload.get("node_id"), MAX_NODE_ID):
-        return "node_id is not an id"
-    if not is_int(payload.get("dropped"), 1, 10**18):
-        return "dropped is not a positive count"
-    if not is_ts(payload.get("at")):
-        return "at is not a timestamp"
-    return None
-
-
-def _snapshot_problem(payload: Any) -> str | None:
-    if not isinstance(payload, dict):
-        return "payload is not an object"
-    if not is_text(payload.get("node_id"), MAX_NODE_ID):
-        return "node_id is not an id"
-    if not is_ts(payload.get("at")):
-        return "at is not a timestamp"
-    ids = payload.get("lease_ids")
-    if not isinstance(ids, list) or len(ids) > MAX_SNAPSHOT_LEASES:
-        return f"lease_ids is not a list of at most {MAX_SNAPSHOT_LEASES} ids"
-    if not all(is_text(lease_id, MAX_LEASE_ID) for lease_id in ids):
-        return "lease_ids holds something that is not a lease id"
-    return None
-
-
-def _authored(event: Event) -> bool:
-    """Whether ``event`` was written by the node its payload names."""
-    return event.actor == Actor("node", event.payload["node_id"])
-
-
-def _node_events(
-    log: EventLog, event_type: str, problem: Callable[[Any], str | None]
-) -> tuple[list[Event], list[SkippedEvent]]:
-    """Well-formed ``event_type`` events written by the node they name; the rest, skipped."""
-    good: list[Event] = []
-    skipped: list[SkippedEvent] = []
-    for event in log.iter_events(types=[event_type]):
-        why = problem(event.payload)
-        if why is None and not _authored(event):
-            why = f"written by {event.actor.kind}:{event.actor.id}, not by the node it names"
-        if why is None:
-            good.append(event)
-        else:
-            skipped.append(SkippedEvent.of(event, why))
-    return good, skipped
-
-
-def _latest_snapshots(log: EventLog) -> tuple[dict[str, _Snapshot], list[SkippedEvent]]:
-    """Each node's latest well-formed ``lease.snapshot``, by node id."""
-    events, skipped = _node_events(log, EVENT_LEASE_SNAPSHOT, _snapshot_problem)
-    latest = {
-        event.payload["node_id"]: _Snapshot(event.seq, frozenset(event.payload["lease_ids"]))
-        for event in events
-    }
-    return latest, skipped
-
-
-def _gaps(
-    log: EventLog, snapshots: dict[str, _Snapshot]
-) -> tuple[list[FeedGap], list[SkippedEvent]]:
-    gaps: dict[str, tuple[FeedGap, int]] = {}
-    events, skipped = _node_events(log, EVENT_FEED_GAP, _gap_problem)
-    for event in events:
-        payload = event.payload
-        gap = FeedGap(payload["node_id"], payload["dropped"], payload["at"])
-        gaps[payload["node_id"]] = (gap, event.seq)
-    active = [
-        gap
-        for node_id, (gap, seq) in gaps.items()
-        if node_id not in snapshots or snapshots[node_id].seq < seq
-    ]
-    return sorted(active, key=lambda gap: gap.node_id), skipped
+# -- feed gaps and the per-project lease + presence board -------------------------------------
 
 
 def feed_gaps(log: EventLog) -> list[FeedGap]:
     """Unreconciled feed gaps: each node's latest gap that no later snapshot has cleared.
 
     A node sends a ``lease.snapshot`` after a gap; once it lands, the board has that node's
-    leases again (see :func:`project_board`), so the gap no longer makes the view stale.
+    leases again (see :func:`aar.hub.leaseboard.lease_board`), so the gap no longer makes
+    the view stale.
     """
-    snapshots, _ = _latest_snapshots(log)
-    return _gaps(log, snapshots)[0]
-
-
-def _last_held(log: EventLog) -> dict[tuple[str, str], int]:
-    """The log seq of the latest grant or renewal of each ``(node id, lease id)``."""
-    last: dict[tuple[str, str], int] = {}
-    held_types = [LEASE_EVENT_TYPES["granted"], LEASE_EVENT_TYPES["renewed"]]
-    for event in log.iter_events(types=held_types):
-        payload = event.payload
-        if (
-            isinstance(payload, dict)
-            and is_text(payload.get("node_id"), MAX_NODE_ID)
-            and is_text(payload.get("lease_id"), MAX_LEASE_ID)
-            and _authored(event)
-        ):
-            last[(payload["node_id"], payload["lease_id"])] = event.seq
-    return last
-
-
-# -- per-project lease + presence board ------------------------------------------------------
+    return list(lease_board(log).gaps)
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,15 +132,17 @@ class ProjectBoard:
     gaps: tuple[FeedGap, ...]
     as_of: str
     skipped: tuple[SkippedEvent, ...] = ()
+    superseded: tuple[SupersededFeed, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "project_id": self.project_id,
             "as_of": self.as_of,
-            "stale": bool(self.gaps),
+            "stale": bool(self.gaps or self.superseded),
             "leases": [lease.to_dict() for lease in self.leases],
             "presence": [entry.to_dict() for entry in self.presence],
             "gaps": [gap.to_dict() for gap in self.gaps],
+            "superseded": [entry.to_dict() for entry in self.superseded],
         }
 
 
@@ -223,40 +153,25 @@ def project_board(log: EventLog, project_id: str, *, clock: Clock = utcnow) -> P
     timeline lease key. Instance leases belong to no project and are left out. Presence is
     node-level, so every active human is listed.
 
-    A node's leases are reconciled against its latest ``lease.snapshot``: a lease last
-    granted or renewed before the snapshot, and not in it, is no longer held (its release
-    was dropped on an overflowing feed, or an earlier process of the node held it), so it
-    is left out. ``gaps`` lists nodes whose feed dropped events and has not reconciled
-    since, so the view may be stale.
+    It narrows :func:`aar.hub.leaseboard.lease_board`, the reconciled board every view
+    reads, so it shows exactly what the console and the ``lease_board`` tool show: a node's
+    leases checked against its latest ``lease.snapshot``, and ``gaps`` / ``superseded``
+    naming the nodes whose view may be stale.
     """
     board = lease_board(log, clock=clock)
-    snapshots, snapshot_skips = _latest_snapshots(log)
-    gaps, gap_skips = _gaps(log, snapshots)
-    last_held = _last_held(log) if snapshots else {}
-
-    def released(lease: BoardLease) -> bool:
-        snapshot = snapshots.get(lease.node_id)
-        return (
-            snapshot is not None
-            and lease.lease_id not in snapshot.held
-            and last_held.get((lease.node_id, lease.lease_id), -1) < snapshot.seq
-        )
-
     leases = tuple(
         lease
         for lease in board.leases
-        if lease.scope in _PROJECT_SCOPES
-        and lease.key
-        and lease.key[0] == project_id
-        and not released(lease)
+        if lease.scope in _PROJECT_SCOPES and lease.key and lease.key[0] == project_id
     )
     return ProjectBoard(
         project_id,
         leases,
         board.presence,
-        tuple(gaps),
+        board.gaps,
         board.as_of,
-        (*board.skipped, *snapshot_skips, *gap_skips),
+        board.skipped,
+        board.superseded,
     )
 
 
