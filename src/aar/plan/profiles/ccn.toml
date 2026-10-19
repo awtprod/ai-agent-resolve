@@ -84,4 +84,8 @@ active_hue_min = 45       # degrees; yellow
 active_hue_max = 70
 active_min_saturation = 0.6
 
+# House safety rule: never set an input colour space on BRAW media (it decodes through its own
+# RAW settings). A plan-text check only; the compiler checks the real clip.
+[rules.no-braw-input-color-space]
+
 [rules.ranges-valid]
