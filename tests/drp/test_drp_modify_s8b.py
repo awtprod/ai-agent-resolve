@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 from diff_testing import CLIP, H264, POOL, SEQUENCE, TIMELINE
 from drp_edit import add_carrier, carrier, edit_zip, marker_entry, markers_fields_blob
-from drp_helpers import UnseekableSink, kd, needs_zstandard, pb_len, zstd_raw_frame
+from drp_helpers import UnseekableSink, envelope, kd, needs_zstandard, pb_len, zstd_raw_frame
 
 from aar.drp import blobs
 from aar.drp.modify import compare_round_trip, encode, parse_plan, zipraw
@@ -1123,13 +1123,17 @@ def test_fe_a_missing_output_directory_is_a_refusal_not_a_crash(tmp_path: Path) 
     assert list(tmp_path.iterdir()) == []
 
 
-def test_fe_force_with_a_directory_at_the_label_leaves_no_temporary_file(tmp_path: Path) -> None:
+def test_fe_force_with_a_directory_at_the_label_is_refused_foreign(tmp_path: Path) -> None:
+    # L1-b (S8c round 3): a non-regular entry (here a directory) at the label name is not a
+    # sidecar aar wrote, so --force refuses it (foreign-sidecar) instead of crashing with
+    # IsADirectoryError as it did when the guard used is_file(). Nothing is touched.
     out = tmp_path / "out.drp"
     sidecar = Path(str(out) + SIDECAR_SUFFIX)
     sidecar.mkdir()
     (sidecar / "keep.txt").write_text("keep")
-    with pytest.raises(IsADirectoryError):
-        edit_file(H264, plan(RENAME), out, force=True)
+    outcome = edit_file(H264, plan(RENAME), out, force=True)
+    assert [r.code for r in outcome.refusals] == ["foreign-sidecar"]
+    assert outcome.status == "refused" and outcome.output is None
     assert stale_temp_files(out) == []
     assert [p.name for p in tmp_path.iterdir()] == [sidecar.name]
     assert (sidecar / "keep.txt").read_text() == "keep"
@@ -1245,3 +1249,224 @@ def test_design_states_the_input_has_warnings_exclusion_and_the_licence_status()
     prior = DESIGN[DESIGN.index("- **Prior art.**") :].split("\n- ")[0]
     assert "`samuelgursky/drp-format` returns 404" in prior and "unconfirmed" in prior
     assert "(MIT, JavaScript)" not in prior and "keyframe writer, zstd" not in prior
+
+
+# =========================================================================== S8c round 3
+# MED-1 (L4): a plan that changes nothing is written when a touched marker list is stored as a
+# *compressed* zstd frame, because _finish_markers re-splices it as a raw-block frame -> the bytes
+# differ while `expected` is empty. The guard is now on `not prepared.expected` alone.
+
+
+def _zstd_marker_src(tmp_path: Path, name: str) -> Path:
+    import zstandard
+
+    payload = pb_len(2, marker_entry(10, BLUE, name) + marker_entry(20, BLUE, name))
+    frame = zstandard.ZstdCompressor(level=3).compress(payload)
+    assert encode.zstd_raw_frame(payload) != frame  # a real compressed frame, not aar's raw-block
+    blob_data = envelope(10001, 0x81, frame)
+    fields = kd([("BlobData", 0x0C, struct.pack(">I", len(blob_data)) + blob_data)]).hex()
+    element = carrier("0b0b0b0b-1111-2222-3333-444444444444", SEQUENCE, fields)
+    return edit_zip(H264, tmp_path / "zstd-markers.drp", {"project.xml": add_carrier(element)})
+
+
+def _tl_marker(**edit: Any) -> dict[str, Any]:
+    return {"owner": "timeline", "owner_id": TIMELINE, **edit}
+
+
+@needs_zstandard
+@pytest.mark.parametrize(
+    "edits",
+    [
+        [_tl_marker(op="marker_update", frame=10, set={"name": "A" * 200})],
+        [_tl_marker(op="marker_add", frame=30), _tl_marker(op="marker_delete", frame=30)],
+        [
+            _tl_marker(op="marker_update", frame=10, set={"frame": 15}),
+            _tl_marker(op="marker_update", frame=15, set={"frame": 10}),
+        ],
+    ],
+    ids=["noop-update", "add-then-delete", "move-there-and-back"],
+)
+def test_l4_zstd_compressed_marker_no_op_is_refused(
+    tmp_path: Path, edits: list[dict[str, Any]]
+) -> None:
+    name = "A" * 200
+    src = _zstd_marker_src(tmp_path, name)
+    assert [m.name for m in read_drp(src).timelines[0].markers] == [name, name]
+    outcome, out = run(src, tmp_path, *edits)
+    assert [r.code for r in outcome.refusals] == ["no-op"]
+    assert outcome.expected == [] and not out.exists()
+
+
+def test_l4_dry_run_no_op_is_refused(tmp_path: Path) -> None:
+    # Coverage (kills V-L4-exempt-dry-run): a dry-run of a no-op plan is still refused no-op.
+    outcome = edit_file(H264, plan(), None, dry_run=True)
+    assert [r.code for r in outcome.refusals] == ["no-op"]
+
+
+# L1-a: --force re-checks the stamp just before the backup, so a foreign label that appears after
+# the pre-check (while the edit runs) is not replaced.
+
+
+def test_l1_force_rechecks_the_stamp_before_the_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aar.drp.modify import write
+
+    first = edit_file(H264, plan(RENAME), tmp_path / "out.drp")
+    assert first.status == "written"
+    out = tmp_path / "out.drp"
+    sidecar = Path(str(out) + SIDECAR_SUFFIX)
+    real_verify = write.verify_write
+
+    def verify_then_human_writes(*a: Any, **k: Any) -> Any:
+        res = real_verify(*a, **k)
+        sidecar.unlink()
+        sidecar.write_text('{"human": "my notes, written during the edit"}')
+        return res
+
+    monkeypatch.setattr(write, "verify_write", verify_then_human_writes)
+    outcome = edit_file(H264, plan({**RENAME, "new_name": "y"}), out, force=True)
+    assert [r.code for r in outcome.refusals] == ["foreign-sidecar"]
+    assert outcome.status == "refused" and outcome.output is None
+    assert "my notes" in sidecar.read_text()  # the human label aar did not write survives
+
+
+# L1-b: with --force a non-regular entry at the label name (dangling symlink, FIFO, symlink to a
+# directory) is refused, not replaced. The guard uses lexists, not is_file.
+
+
+@pytest.mark.parametrize("kind", ["dangling-symlink", "fifo", "symlink-to-dir"])
+def test_l1_force_refuses_a_non_regular_label(tmp_path: Path, kind: str) -> None:
+    out = tmp_path / "o" / "out.drp"
+    out.parent.mkdir()
+    sidecar = Path(str(out) + SIDECAR_SUFFIX)
+    if kind == "dangling-symlink":
+        sidecar.symlink_to(tmp_path / "nowhere.json")
+    elif kind == "fifo":
+        os.mkfifo(sidecar)
+    else:
+        (tmp_path / "adir").mkdir()
+        sidecar.symlink_to(tmp_path / "adir")
+    outcome = edit_file(H264, plan(RENAME), out, force=True)
+    assert [r.code for r in outcome.refusals] == ["foreign-sidecar"]
+    assert not out.exists()  # nothing was written
+    assert os.path.lexists(sidecar) and not sidecar.is_file()  # the entry is untouched
+
+
+def test_l1_sidecar_size_cap_is_proportionate() -> None:
+    from aar.drp.modify import write
+    from aar.drp.modify.plan import MAX_PLAN_BYTES
+
+    # Read on every --force; must be far below a read bomb and above the largest label we write.
+    assert write._MAX_SIDECAR_BYTES <= 16 * 1024 * 1024
+    assert write._MAX_SIDECAR_BYTES >= MAX_PLAN_BYTES
+
+
+def _our_stamp(out: Path, **over: Any) -> bytes:
+    rec = {
+        "status": "unverified",
+        "label": "unverified",
+        "tool": "aar 0.0.0",
+        "output": {"path": str(out), "sidecar": str(out) + SIDECAR_SUFFIX},
+    }
+    rec.update(over)
+    return json.dumps(rec).encode()
+
+
+@pytest.mark.parametrize("kind", ["tool-no-space", "json-null", "json-string", "recursion-bomb"])
+def test_l1_force_foreign_sidecar_shapes(tmp_path: Path, kind: str) -> None:
+    # Coverage for the mutants the validator's probes killed: tool prefix without the space
+    # ("aardvark 1" is an otherwise-complete stamp, so only the tool check rejects it), non-dict
+    # JSON, a recursion bomb -- and in every case the output does not exist, so this also pins
+    # that a foreign label is refused with no output present (V-L1-guard-only-when-out-exists).
+    out = tmp_path / "out.drp"
+    sidecar = Path(str(out) + SIDECAR_SUFFIX)
+    raw = {
+        "tool-no-space": _our_stamp(out, tool="aardvark 1"),
+        "json-null": b"null",
+        "json-string": b'"just a string"',
+        "recursion-bomb": b"[" * 100000 + b"]" * 100000,  # RecursionError, caught
+    }[kind]
+    sidecar.write_bytes(raw)
+    outcome = edit_file(H264, plan(RENAME), out, force=True)
+    assert [r.code for r in outcome.refusals] == ["foreign-sidecar"]
+    assert sidecar.read_bytes() == raw and not out.exists()
+
+
+# L2-a: on a failed replace, the cleanup removes the name only if it is still our placeholder or
+# our temp; a different file an adversary created there (after deleting our placeholder) survives.
+
+
+def test_l2_failed_replace_keeps_an_adversarys_new_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aar.drp.modify import write
+
+    monkeypatch.setattr(os, "link", _no_hardlinks)
+    dest = tmp_path / "out.drp"
+
+    def adversary_new_inode_then_fail(src: str, dst: str) -> None:
+        if Path(dst) == dest:
+            os.unlink(dst)  # delete our placeholder
+            fd = os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)  # their own new inode
+            os.write(fd, b"theirs")
+            os.close(fd)
+            raise OSError(errno.EIO, "I/O error")
+        os.replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", adversary_new_inode_then_fail)
+    tmp = write._temp(tmp_path, "out.drp", b"ours")
+    with pytest.raises(OSError, match="I/O error"):
+        write._place(tmp, dest, force=False)
+    assert dest.read_bytes() == b"theirs"  # a different inode is not deleted by our cleanup
+
+
+def test_l2_interrupt_after_replace_on_no_hardlink_leaves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Coverage (kills V-L2-cleanup-on-Exception-only): a BaseException after a good replace still
+    # cleans up (our temp's inode is recognised as ours).
+    real_replace = os.replace
+    out = tmp_path / "out.drp"
+
+    def replace_then_interrupt(src: str, dst: str) -> None:
+        real_replace(src, dst)
+        if Path(dst) == out:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(os, "link", _no_hardlinks)
+    monkeypatch.setattr(os, "replace", replace_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        edit_file(H264, plan(RENAME), out)
+    assert [p.name for p in tmp_path.iterdir()] == []
+
+
+def _squash(text: str | None) -> str:
+    return " ".join((text or "").split())  # collapse docstring line wraps for substring checks
+
+
+def test_l2_design_and_docstring_state_the_plain_writer_window() -> None:
+    from aar.drp.modify import write
+
+    section = _squash(_design_modify_section())
+    assert "does **not** beat a plain non-exclusive writer" in section
+    assert "same device and inode" in section
+    doc = _squash(write._place_no_hardlink.__doc__)
+    assert "does not create" in doc and "silently replaced" in doc
+
+
+def test_module_docstring_uses_replace_not_renames() -> None:
+    from aar.drp.modify import write
+
+    doc = _squash(write.__doc__)
+    assert "renames onto its own placeholder" not in doc
+    assert "os.replace``s onto its own placeholder" in doc
+
+
+def test_l3_docstring_states_the_over_folds_and_path_map_impact() -> None:
+    from aar.drp.modify.paths import ntfs_upper
+
+    doc = _squash(ntfs_upper.__doc__)
+    assert "OVER-fold" in doc  # honest about over-folding, not "harmless"
+    assert "long s" in doc and "dotless i" in doc and "astral" in doc
+    assert "wrong relink candidate" in doc and "never writes to a media file" in doc
