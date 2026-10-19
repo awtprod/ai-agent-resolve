@@ -14,7 +14,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from aar.host.errors import ConfigError
+from aar.host.errors import ConfigError, PathRefused
 from aar.host.winpath import PathForm, _Win, normalize_root
 
 __all__ = ["EditHostConfig", "env_config"]
@@ -78,7 +78,10 @@ class EditHostConfig:
             raise ConfigError("at least one remote root is required")
         if not self.local_roots:
             raise ConfigError("at least one local root is required")
-        parsed = tuple(normalize_root(root) for root in self.remote_roots)
+        try:
+            parsed = tuple(normalize_root(root) for root in self.remote_roots)
+        except PathRefused as exc:
+            raise ConfigError(f"invalid remote root {exc.path!r}: {exc.reason}") from exc
         object.__setattr__(self, "_remote_roots_parsed", parsed)
         local = tuple(self._normalize_local(root) for root in self.local_roots)
         object.__setattr__(self, "local_roots", local)
