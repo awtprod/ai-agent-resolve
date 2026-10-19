@@ -738,6 +738,50 @@ class FakeTimeline:
         }
         return True
 
+    def GetMarkerByCustomData(self, customData: str) -> dict[str, Any]:
+        for frame in sorted(self.markers):
+            info = self.markers[frame]
+            if info.get("customData") == customData:
+                return dict(info)
+        return {}
+
+    def GetMarkerCustomData(self, frameId: int) -> str:
+        info = self.markers.get(frameId)
+        return str(info.get("customData") or "") if info is not None else ""
+
+    def UpdateMarkerCustomData(self, frameId: int, customData: str) -> bool:
+        self._app.calls.append(("UpdateMarkerCustomData", frameId, customData))
+        info = self.markers.get(frameId)
+        if info is None:
+            return False
+        info["customData"] = customData
+        return True
+
+    def DeleteMarkerAtFrame(self, frameNum: int) -> bool:
+        self._app.calls.append(("DeleteMarkerAtFrame", frameNum))
+        return self.markers.pop(frameNum, None) is not None
+
+    def DeleteMarkerByCustomData(self, customData: str) -> bool:
+        self._app.calls.append(("DeleteMarkerByCustomData", customData))
+        if not customData:
+            return False  # live refuses an empty customData
+        for frame in sorted(self.markers):
+            if self.markers[frame].get("customData") == customData:
+                del self.markers[frame]
+                return True
+        return False
+
+    def DeleteMarkersByColor(self, color: str) -> bool:
+        self._app.calls.append(("DeleteMarkersByColor", color))
+        victims = [
+            frame
+            for frame, info in self.markers.items()
+            if color == "All" or info.get("color") == color
+        ]
+        for frame in victims:
+            del self.markers[frame]
+        return bool(victims)
+
     def DeleteClips(
         self, timelineItems: list[FakeTimelineItem], rippleDelete: bool = False
     ) -> bool:

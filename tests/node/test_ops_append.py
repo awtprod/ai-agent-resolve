@@ -237,6 +237,7 @@ def test_append_leases_and_selects_the_named_timeline() -> None:
         {"timeline": show.ref("Main [agent]"), "ranges": [rng(show.cam_a, 0, 30)]},
         target=show.locator(),
         holder=AGENT,
+        require_branch=False,
     )
     assert hot.timeline == "Main [agent]" and hot.label == "timeline.append_ranges"
 

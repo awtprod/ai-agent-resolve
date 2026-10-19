@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from aar.node.branch_registry import BranchRegistry
 from aar.node.broker import Broker, BrokerConfig, BrokerEvent, OpError, OpResult, OpStatus
 from aar.node.gateway import ScriptApiGateway
 from aar.node.leases import Holder, LeaseManager
@@ -41,6 +42,7 @@ class OpsWorld:
         self.clock = FakeClock()
         self.leases = LeaseManager(self.clock)
         self.presence = PresenceGuard(idle_window=IDLE)
+        self.branch_registry = BranchRegistry()
         self.events: list[BrokerEvent] = []
 
         def sink(event: BrokerEvent) -> None:
@@ -65,9 +67,25 @@ class OpsWorld:
         return ProjectLocator(project.folder, name, project.GetUniqueId())
 
     def run(
-        self, name: str, params: dict[str, Any], *, target: ProjectLocator | None = None
+        self,
+        name: str,
+        params: dict[str, Any],
+        *,
+        target: ProjectLocator | None = None,
+        holder: Holder = AGENT,
+        require_branch: bool = False,
     ) -> OpResult:
-        op_id = submit_op(self.broker, name, params, target=target or self.locator(), holder=AGENT)
+        # The op-mechanics tests exercise ops on any timeline, so the harness opts out of the
+        # branch guard by default; the collaboration tests pass require_branch=True.
+        op_id = submit_op(
+            self.broker,
+            name,
+            params,
+            target=target or self.locator(),
+            holder=holder,
+            require_branch=require_branch,
+            branch_registry=self.branch_registry,
+        )
         self.broker.run_until_idle()
         result = self.broker.result(op_id)
         assert result is not None, f"op {name} never finished"
@@ -123,6 +141,20 @@ class Show(OpsWorld):
         """A timeline ref by unique id, with its name as a cross-check (what writes need)."""
         return {"name": timeline, "unique_id": self.project.timeline(timeline).GetUniqueId()}
 
+    def make_branch(
+        self, *, source: str = "Main", holder: Holder = AGENT, if_exists: str = "reuse"
+    ) -> Any:
+        """Create (and register) a genuine agent branch via timeline.branch, owned by ``holder``.
+
+        Returns the BranchResult; the branch timeline is then owned by ``holder`` in this
+        world's registry, so an editing op with require_branch=True may touch it.
+        """
+        return self.ok(
+            "timeline.branch",
+            {"source": self.ref(source), "if_exists": if_exists},
+            holder=holder,
+        )
+
 
 def media(clip: FakeMediaPoolItem) -> dict[str, Any]:
     return {"unique_id": clip.GetUniqueId()}
@@ -135,6 +167,10 @@ CONTENT_WRITES = frozenset(
         "DeleteClips",
         "DuplicateTimeline",
         "AddMarker",
+        "DeleteMarkerAtFrame",
+        "DeleteMarkerByCustomData",
+        "DeleteMarkersByColor",
+        "UpdateMarkerCustomData",
         "AddTrack",
         "SetProperties",
         "SetProperty",

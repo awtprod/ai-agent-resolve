@@ -33,6 +33,23 @@ Clock = Callable[[], float]
 
 _ENDED_MEMORY = 1024
 
+_LIMITS: tuple[int, int, float] | None = None
+
+
+def _hub_limits() -> tuple[int, int, float]:
+    """The hub lease-board mapper's bounds (holder/node id, key part, ttl), loaded lazily.
+
+    Lazy because :mod:`aar.hub.leaseboard` imports this module; importing it at top level
+    would be a cycle. These are the same bounds the mapper enforces, so a lease that
+    passes :meth:`LeaseManager.acquire` can always be recorded on the hub.
+    """
+    global _LIMITS
+    if _LIMITS is None:
+        from aar.hub.leaseboard import MAX_KEY_PART, MAX_NODE_ID, MAX_TTL_SECONDS
+
+        _LIMITS = (MAX_NODE_ID, MAX_KEY_PART, MAX_TTL_SECONDS)
+    return _LIMITS
+
 
 class Scope(StrEnum):
     INSTANCE = "instance"
@@ -181,8 +198,15 @@ class LeaseManager:
             if not holder.is_human:
                 raise ValueError("agent leases need a positive ttl")
             return None
-        if ttl <= 0:
-            raise ValueError("ttl must be positive")
+        # A ttl the hub cannot record (not positive, over its cap, infinite, or NaN, which
+        # fails every comparison) is a caller bug: refuse it before granting, so a lease is
+        # never held and then unrecordable on the board.
+        max_ttl = _hub_limits()[2]
+        if not 0 < ttl <= max_ttl:
+            raise ValueError(
+                f"ttl must be a positive number of seconds, at most {max_ttl:g} (the hub's "
+                f"cap), got {ttl!r}"
+            )
         return now + ttl
 
     def _held(self, lease_id: str, holder: Holder, now: float) -> Lease:
@@ -227,9 +251,16 @@ class LeaseManager:
     ) -> Lease:
         """Grant a lease, renewing it if ``holder`` already has this exact one.
 
-        Raises ``LeaseConflict`` when a conflicting lease cannot be displaced.
+        Raises ``LeaseConflict`` when a conflicting lease cannot be displaced, and
+        ``ValueError`` when the holder id, key or ttl exceed what the hub can record (so a
+        lease is never granted and then fails to reach the board).
         """
         self._validate(scope, key)
+        max_id, max_key, _ = _hub_limits()
+        if len(holder.id) > max_id:
+            raise ValueError(f"holder id must be at most {max_id} characters, got {len(holder.id)}")
+        if any(len(part) > max_key for part in key):
+            raise ValueError(f"lease key parts must be at most {max_key} characters")
         if force and not holder.is_human:
             raise ValueError("only a human can force a lease")
         now = self._clock()

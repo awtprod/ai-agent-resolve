@@ -34,6 +34,9 @@ EXPECTED = {
     "grades.copy": (True, True),
     "clip.set_input_color_space": (True, True),
     "markers.add": (True, True),
+    "timeline.branch": (True, True),
+    "markers.mirror_review": (True, True),
+    "markers.read_review": (True, False),
 }
 
 
@@ -113,6 +116,7 @@ def test_op_code_cannot_run_outside_the_broker() -> None:
         {"timeline": show.ref("Main"), "markers": [{"frame": 5, "name": "direct"}]},
         target=show.locator(),
         holder=AGENT,
+        require_branch=False,
     )
     with pytest.raises(OpError) as err:
         hot.fn(show.gw)  # the HotOp body, called by hand
@@ -137,12 +141,14 @@ def test_op_code_cannot_run_outside_the_broker() -> None:
 
 
 def _marker(show: Show, ref: dict[str, Any], frame: int = 30) -> str:
+    # These tests exercise broker leasing, not the branch guard, so they opt out of it.
     return submit_op(
         show.broker,
         "markers.add",
         {"timeline": ref, "markers": [{"frame": frame, "name": "m"}]},
         target=show.locator(),
         holder=AGENT,
+        require_branch=False,
     )
 
 
@@ -240,6 +246,7 @@ def test_holders_of_two_timelines_of_one_project_both_get_to_work() -> None:
             {"timeline": show.ref(name), "markers": [{"frame": 50, "name": who}]},
             target=show.locator(),
             holder=holder,
+            require_branch=False,
         )
         for name, who, holder in (("Main", "a", a), ("Main [agent]", "b", b))
     ]
@@ -307,7 +314,11 @@ def _two_timeline_grades(show: Show) -> dict[str, Any]:
 def test_an_op_naming_two_timelines_leases_each_of_them() -> None:
     show = Show()
     hot = make_hot_op(
-        "grades.copy", _two_timeline_grades(show), target=show.locator(), holder=AGENT
+        "grades.copy",
+        _two_timeline_grades(show),
+        target=show.locator(),
+        holder=AGENT,
+        require_branch=False,
     )
     assert (hot.timeline_id, hot.extra_timeline_ids) == (
         show.branch.GetUniqueId(),
@@ -325,6 +336,7 @@ def test_an_op_naming_two_timelines_leases_each_of_them() -> None:
             _two_timeline_grades(world),
             target=world.locator(),
             holder=AGENT,
+            require_branch=False,
         )
         world.broker.run_until_idle()
         assert world.broker.result(op_id) is None, leased.GetName()
@@ -338,6 +350,7 @@ def test_an_op_naming_two_timelines_leases_each_of_them() -> None:
         _two_timeline_grades(world),
         target=world.locator(),
         holder=AGENT,
+        require_branch=False,
     )
     world.broker.run_until_idle()
     result = world.broker.result(op_id)
@@ -347,7 +360,11 @@ def test_an_op_naming_two_timelines_leases_each_of_them() -> None:
 def test_an_op_on_the_current_timeline_leases_the_whole_project() -> None:
     show = Show()
     hot = make_hot_op(
-        "markers.add", {"markers": [{"frame": 1}]}, target=show.locator(), holder=AGENT
+        "markers.add",
+        {"markers": [{"frame": 1}]},
+        target=show.locator(),
+        holder=AGENT,
+        require_branch=False,
     )
     assert (hot.timeline, hot.timeline_id, hot.extra_timeline_ids) == (None, None, ())
     single = make_hot_op(
@@ -355,6 +372,7 @@ def test_an_op_on_the_current_timeline_leases_the_whole_project() -> None:
         {"timeline": {"unique_id": show.branch.GetUniqueId()}, "markers": [{"frame": 1}]},
         target=show.locator(),
         holder=AGENT,
+        require_branch=False,
     )
     assert single.timeline_id == show.branch.GetUniqueId()
 
@@ -374,6 +392,7 @@ def test_a_project_lease_holds_after_the_project_is_renamed() -> None:
         {"timeline": show.ref("Main"), "markers": [{"frame": 5}]},
         target=renamed,
         holder=AGENT,
+        require_branch=False,
     )
     show.broker.run_until_idle()
     assert show.broker.result(op_id) is None
@@ -446,7 +465,14 @@ def test_no_lease_and_ref_combination_under_blocks() -> None:
                     with pytest.raises(OpError, match="timeline_id_required"):
                         submit_op(show.broker, "markers.add", params, target=target, holder=AGENT)
                     continue
-                op_id = submit_op(show.broker, "markers.add", params, target=target, holder=AGENT)
+                op_id = submit_op(
+                    show.broker,
+                    "markers.add",
+                    params,
+                    target=target,
+                    holder=AGENT,
+                    require_branch=False,
+                )
                 show.broker.run_until_idle()
                 wrote = bool(show.main.GetMarkers())
                 if lease_scope in ("project", "main"):
@@ -487,6 +513,7 @@ def test_an_op_body_cannot_run_another_ops_body_inside_the_broker() -> None:
         {"timeline": show.ref("Main"), "markers": [{"frame": 9, "name": "smuggled"}]},
         target=show.locator(),
         holder=AGENT,
+        require_branch=False,
     )
     errors: list[str] = []
 
@@ -533,6 +560,7 @@ def test_an_unknown_timeline_id_says_the_name_was_not_used() -> None:
         {"timeline": {"name": "Main", "unique_id": "tl-gone"}, "markers": [{"frame": 1}]},
         target=show.locator(),
         holder=AGENT,
+        require_branch=False,
     )
     show.broker.run_until_idle()
     result = show.broker.result(op_id)
@@ -553,7 +581,9 @@ def test_a_write_on_the_current_timeline_waits_for_any_timeline_lease_in_the_pro
     show.leases.acquire(
         OTHER, Scope.TIMELINE, timeline_key(show.pid, show.branch.GetUniqueId()), ttl=600
     )
-    hot = make_hot_op("grades.copy", params, target=show.locator(), holder=AGENT)
+    hot = make_hot_op(
+        "grades.copy", params, target=show.locator(), holder=AGENT, require_branch=False
+    )
     assert (hot.timeline_id, hot.extra_timeline_ids) == (None, ())
     op_id = show.broker.submit(hot)
     show.broker.run_until_idle()

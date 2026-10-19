@@ -216,6 +216,7 @@ def _set_resolution(
     params=DuplicateParams,
     result=DuplicateResult,
     mutates=True,
+    creates_timeline=True,
     traps=("custom-res-resets-colour-science",),
 )
 def timeline_duplicate(env: OpEnv, params: DuplicateParams) -> DuplicateResult:
