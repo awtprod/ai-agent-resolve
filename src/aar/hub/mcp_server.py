@@ -278,10 +278,13 @@ def build_server(
         name="lease_board",
         description=(
             "Who holds what on each Resolve node, and where a human is working. Returns "
-            '{"as_of": ts, "leases": [...], "presence": [...]}. A lease has node_id, scope '
-            "(instance, project, timeline), key, holder {kind: human|agent, id}, since and "
-            "expires_at; expired leases are already left out. Presence entries mean a "
-            "human is active on that node since the given time."
+            '{"as_of": ts, "stale": bool, "leases": [...], "presence": [...], "gaps": [...], '
+            '"superseded": [...]}. A lease has node_id, scope (instance, project, timeline), '
+            "key, holder {kind: human|agent, id}, since and expires_at; expired leases, and "
+            "leases a node no longer holds by its latest snapshot, are already left out. "
+            "Presence entries mean a human is active on that node since the given time. "
+            "stale means a node's feed dropped events (gaps) or a second feed process for "
+            "one node id was refused (superseded), and the node has not reconciled since."
         ),
         annotations=_READ_ONLY,
     )

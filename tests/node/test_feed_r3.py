@@ -11,6 +11,7 @@ from aar.hub.collab import EVENT_LEASE_SNAPSHOT, feed_gaps, project_board
 from aar.hub.events import Actor, EventLog
 from aar.hub.leaseboard import HubEventSpec, lease_board
 from aar.node.feed import (
+    BACKOFF_MAX,
     MAX_SPEC_ATTEMPTS,
     EventLogTransport,
     NodeFeed,
@@ -43,9 +44,11 @@ class Switch:
         self.delivered.append(spec)
 
 
-def _wired(log: EventLog, transport, *, outbox_max: int = 4096) -> tuple[NodeFeed, LeaseManager]:
+def _wired(
+    log: EventLog, transport, *, outbox_max: int = 4096, clock: FakeClock | None = None
+) -> tuple[NodeFeed, LeaseManager]:
     """A feed wired to a lease table the way a node runtime would (so it can reconcile)."""
-    clock = FakeClock()
+    clock = clock or FakeClock()
     holder: list[LeaseManager] = []
     feed = NodeFeed(
         NODE,
@@ -138,13 +141,15 @@ def test_a_snapshot_from_another_writer_is_ignored(tmp_path: Path) -> None:
     log.append(EVENT_LEASE_SNAPSHOT, Actor("agent", NODE), forged)  # not written by the node
     board = project_board(log, "pF")
     assert len(board.leases) == 1
-    assert any("not by the node" in item.reason for item in board.skipped)
+    assert any("written by agent:node-1" in item.reason for item in board.skipped)
 
 
 def test_reconcile_needs_the_lease_source_and_its_clock_together(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
-    with pytest.raises(ValueError, match="together"):
-        NodeFeed(NODE, EventLogTransport(log), lease_source=list)
+    with pytest.raises(TypeError, match="clock"):  # S11f LOW 12: both are required
+        NodeFeed(NODE, EventLogTransport(log), lease_source=list)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="lease_source"):
+        NodeFeed(NODE, EventLogTransport(log), clock=FakeClock())  # type: ignore[call-arg]
 
 
 # -- d02 #4: after a restart the gap key collided and every flush failed ---------------------
@@ -154,12 +159,12 @@ def test_gap_keys_never_collide_across_node_restarts(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
     feeds = []
     for process in range(3):
-        feed = NodeFeed(NODE, EventLogTransport(log), wall_offset=lambda: WALL, outbox_max=1)
-        leases = LeaseManager(FakeClock(), sink=feed.lease_sink)
+        feed, leases = _wired(log, EventLogTransport(log), outbox_max=1)
         leases.acquire(AGENT, Scope.PROJECT, (f"a{process}",), ttl=60)
         leases.acquire(AGENT, Scope.PROJECT, (f"b{process}",), ttl=60)  # drops a{process}
         report = feed.flush()
-        assert report.error is None and report.sent == 1 and report.delivered_gap, process
+        # The gap, the reconcile (a re-announced, the snapshot), then b's grant.
+        assert report.error is None and report.sent == 4 and report.delivered_gap, process
         feeds.append(feed)
     assert len(log.read(types=["feed.gap"])) == 3  # one per process, none refused
 
@@ -167,8 +172,8 @@ def test_gap_keys_never_collide_across_node_restarts(tmp_path: Path) -> None:
 def test_a_resent_gap_replays_the_same_key(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
     switch = Switch(log)
-    feed = NodeFeed(NODE, switch, wall_offset=lambda: WALL, outbox_max=1)
-    leases = LeaseManager(FakeClock(), sink=feed.lease_sink)
+    clock = FakeClock()
+    feed, leases = _wired(log, switch, outbox_max=1, clock=clock)
     leases.acquire(AGENT, Scope.PROJECT, ("p0",), ttl=60)
     leases.acquire(AGENT, Scope.PROJECT, ("p1",), ttl=60)
     keys = []
@@ -180,6 +185,7 @@ def test_a_resent_gap_replays_the_same_key(tmp_path: Path) -> None:
 
     feed._transport = Recording()
     feed.flush()
+    clock.advance(BACKOFF_MAX)  # past the backoff
     feed.flush()
     assert len(keys) == 2 and keys[0] == keys[1]  # the same pending gap, the same key
 
@@ -197,14 +203,14 @@ def test_a_poison_spec_is_quarantined_and_the_rest_are_delivered(tmp_path: Path)
                 raise ValueError("hub rejects this spec")
             real.deliver(spec, node_id=node_id)
 
-    feed = NodeFeed(NODE, Picky(), wall_offset=lambda: WALL)
-    leases = LeaseManager(FakeClock(), sink=feed.lease_sink)
+    feed, leases = _wired(log, Picky())
     leases.acquire(Holder.agent("poison"), Scope.PROJECT, ("p0",), ttl=60)
     for i in range(5):
         leases.acquire(Holder.agent(f"ok{i}"), Scope.PROJECT, (f"p{i + 1}",), ttl=60)
 
     report = feed.flush()
-    assert report.sent == 5 and feed.pending == 0 and "quarantined" in (report.error or "")
+    # The start-up snapshot and the five good grants; the poison one is quarantined.
+    assert report.sent == 6 and feed.pending == 0 and "quarantined" in (report.error or "")
     assert [q.type for q in feed.quarantined] == ["lease.granted"]
     assert feed.dropped == 1  # counted, and flagged as a gap on the next flush
     assert feed.flush().delivered_gap
@@ -223,13 +229,14 @@ def test_an_unknown_failure_is_retried_then_quarantined(tmp_path: Path) -> None:
                 raise RuntimeError("database is locked")
             real.deliver(spec, node_id=node_id)
 
-    feed = NodeFeed(NODE, Locked(), wall_offset=lambda: WALL)
-    leases = LeaseManager(FakeClock(), sink=feed.lease_sink)
+    clock = FakeClock()
+    feed, leases = _wired(log, Locked(), clock=clock)
     leases.acquire(Holder.agent("stuck"), Scope.PROJECT, ("p0",), ttl=60)
     leases.acquire(AGENT, Scope.PROJECT, ("p1",), ttl=60)
     for _ in range(MAX_SPEC_ATTEMPTS - 1):
         report = feed.flush()
-        assert report.sent == 0 and feed.pending == 2  # transient: kept, in order
+        assert feed.pending == 2 and report.retry_at is not None  # transient: kept, in order
+        clock.advance(BACKOFF_MAX)
     report = feed.flush()
     assert report.sent == 1 and feed.pending == 0 and len(attempts) == MAX_SPEC_ATTEMPTS
 
@@ -238,14 +245,15 @@ def test_an_unreachable_hub_never_quarantines(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
     switch = Switch(log)
     switch.up = False
-    feed = NodeFeed(NODE, switch, wall_offset=lambda: WALL)
-    leases = LeaseManager(FakeClock(), sink=feed.lease_sink)
+    clock = FakeClock()
+    feed, leases = _wired(log, switch, clock=clock)
     leases.acquire(AGENT, Scope.PROJECT, ("p1",), ttl=60)
     for _ in range(MAX_SPEC_ATTEMPTS * 3):
         assert feed.flush().sent == 0
+        clock.advance(BACKOFF_MAX)
     assert feed.pending == 1 and feed.quarantined == () and feed.dropped == 0
     switch.up = True
-    assert feed.flush().sent == 1
+    assert feed.flush().sent == 2  # the start-up snapshot, then the grant
 
 
 # -- d02 #1/#3: overflow order and coalescing completeness (no defect; pinned) ---------------
@@ -255,9 +263,8 @@ def test_overflow_recovery_sends_the_gap_first_then_the_survivors_in_order(tmp_p
     log = EventLog(tmp_path / "hub.db")
     switch = Switch(log)
     switch.up = False
-    feed = NodeFeed(NODE, switch, wall_offset=lambda: WALL, outbox_max=5)
     clock = FakeClock()
-    leases = LeaseManager(clock, sink=feed.lease_sink)
+    feed, leases = _wired(log, switch, outbox_max=5, clock=clock)
     held = []
     for i in range(4):
         held.append(leases.acquire(Holder.agent(f"a{i}"), Scope.PROJECT, (f"p{i}",), ttl=600))
@@ -268,10 +275,12 @@ def test_overflow_recovery_sends_the_gap_first_then_the_survivors_in_order(tmp_p
     assert (feed.pending, feed.dropped) == (5, 3)
     switch.up = True
     report = feed.flush()
-    assert (report.sent, report.delivered_gap, report.error) == (5, True, None)
-    assert [spec.type for spec in switch.delivered] == ["feed.gap", "lease.granted"] + [
-        "lease.released"
-    ] * 4
+    assert (report.sent, report.delivered_gap, report.error) == (7, True, None)
+    assert [spec.type for spec in switch.delivered] == [
+        "feed.gap",
+        "lease.snapshot",  # the reconcile: nothing is live, nothing to re-announce
+        "lease.granted",
+    ] + ["lease.released"] * 4
     assert lease_board(log).leases == ()
 
 
@@ -280,11 +289,18 @@ def test_overflow_recovery_sends_the_gap_first_then_the_survivors_in_order(tmp_p
 
 def test_a_retried_lease_event_is_not_double_counted(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
-    feed = NodeFeed(NODE, EventLogTransport(log), wall_offset=lambda: WALL)
-    seen = []
-    manager = LeaseManager(
-        FakeClock(), sink=lambda event: (seen.append(event), feed.lease_sink(event))
+    clock = FakeClock()
+    table: list[LeaseManager] = []
+    feed = NodeFeed(
+        NODE,
+        EventLogTransport(log),
+        wall_offset=lambda: WALL,
+        lease_source=lambda: table[0].active(),
+        clock=clock,
     )
+    seen = []
+    manager = LeaseManager(clock, sink=lambda event: (seen.append(event), feed.lease_sink(event)))
+    table.append(manager)
     manager.acquire(AGENT, Scope.PROJECT, ("proj-9",), ttl=60.0)
     feed.lease_sink(seen[0])  # the node retries the same grant
     assert feed.pending == 2
@@ -293,9 +309,16 @@ def test_a_retried_lease_event_is_not_double_counted(tmp_path: Path) -> None:
     assert len(rows) == 1 and rows[0].actor == Actor("node", NODE)
 
 
+def _presence_feed(log: EventLog) -> NodeFeed:
+    """A feed with no leases, for presence tests."""
+    return NodeFeed(
+        NODE, EventLogTransport(log), wall_offset=lambda: WALL, lease_source=list, clock=FakeClock()
+    )
+
+
 def test_a_retried_presence_report_is_not_double_counted(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
-    feed = NodeFeed(NODE, EventLogTransport(log), wall_offset=lambda: WALL)
+    feed = _presence_feed(log)
     ttl = timedelta(minutes=5)
     feed.report_presence(active=True, at=T0, human_id="operator", ttl=ttl)
     feed.report_presence(active=True, at=T0, human_id="operator", ttl=ttl)
@@ -309,7 +332,7 @@ def test_a_retried_presence_report_is_not_double_counted(tmp_path: Path) -> None
 
 def test_active_and_inactive_at_the_same_instant_are_two_events(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
-    feed = NodeFeed(NODE, EventLogTransport(log), wall_offset=lambda: WALL)
+    feed = _presence_feed(log)
     feed.report_presence(active=True, at=T0, human_id="op", ttl=timedelta(minutes=5))
     feed.report_presence(active=False, at=T0, human_id="op")
     assert feed.flush().error is None
@@ -329,7 +352,7 @@ _QUIET = Decision(True, "idle", "no human activity")
 
 
 def _reporter(log: EventLog, guard: _Guard, **kw) -> tuple[PresenceReporter, NodeFeed]:
-    feed = NodeFeed(NODE, EventLogTransport(log), wall_offset=lambda: WALL)
+    feed = _presence_feed(log)
     kw.setdefault("ttl", timedelta(minutes=5))
     return PresenceReporter(guard, feed, human_id="operator", **kw), feed
 
@@ -393,7 +416,7 @@ def test_reporter_refuses_a_refresh_that_cannot_keep_presence_alive(
 
 def test_an_unmappable_presence_change_is_gap_flagged_not_raised(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
-    feed = NodeFeed(NODE, EventLogTransport(log), wall_offset=lambda: WALL)
+    feed = _presence_feed(log)
     feed.report_presence(active=True, at=T0, human_id="h" * 500, ttl=timedelta(minutes=5))
     assert feed.pending == 0 and feed.dropped == 1
 
@@ -418,8 +441,10 @@ def test_a_reconcile_the_hub_keeps_refusing_is_given_up_and_never_blocks_the_out
         report = feed.flush()
         assert feed.pending == 0, attempt  # the outbox is delivered every time regardless
     assert len(snapshots) == MAX_SPEC_ATTEMPTS  # then given up, not retried forever
+    assert len(set(snapshots)) == MAX_SPEC_ATTEMPTS  # each a new reconcile, not a resend
     assert feed.reconciled and [q.type for q in feed.quarantined] == [EVENT_LEASE_SNAPSHOT]
-    assert len(log.read(types=["lease.renewed"])) == MAX_SPEC_ATTEMPTS  # bounded re-sends
+    # Bounded re-sends: the first reconcile had the grant still queued, the next two re-announced.
+    assert len(log.read(types=["lease.renewed"])) == MAX_SPEC_ATTEMPTS - 1
     assert report.error is None
 
 
@@ -428,8 +453,7 @@ def test_a_reconcile_the_hub_keeps_refusing_is_given_up_and_never_blocks_the_out
 
 def test_a_delivered_gap_is_not_sent_again(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
-    feed = NodeFeed(NODE, EventLogTransport(log), wall_offset=lambda: WALL, outbox_max=1)
-    leases = LeaseManager(FakeClock(), sink=feed.lease_sink)
+    feed, leases = _wired(log, EventLogTransport(log), outbox_max=1)
     leases.acquire(AGENT, Scope.PROJECT, ("p0",), ttl=60)
     leases.acquire(AGENT, Scope.PROJECT, ("p1",), ttl=60)
     assert feed.flush().delivered_gap is True
@@ -440,8 +464,7 @@ def test_a_delivered_gap_is_not_sent_again(tmp_path: Path) -> None:
 
 def test_two_gaps_in_one_process_both_reach_the_hub(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
-    feed = NodeFeed(NODE, EventLogTransport(log), wall_offset=lambda: WALL, outbox_max=1)
-    leases = LeaseManager(FakeClock(), sink=feed.lease_sink)
+    feed, leases = _wired(log, EventLogTransport(log), outbox_max=1)
     for batch in range(2):
         leases.acquire(AGENT, Scope.PROJECT, (f"a{batch}",), ttl=60)
         leases.acquire(AGENT, Scope.PROJECT, (f"b{batch}",), ttl=60)  # one more drop
@@ -453,9 +476,8 @@ def test_two_gaps_in_one_process_both_reach_the_hub(tmp_path: Path) -> None:
 
 def test_coalescing_keeps_the_latest_renewal_of_each_lease(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
-    feed = NodeFeed(NODE, EventLogTransport(log), wall_offset=lambda: WALL)
     clock = FakeClock()
-    leases = LeaseManager(clock, sink=feed.lease_sink)
+    feed, leases = _wired(log, EventLogTransport(log), clock=clock)
     a = leases.acquire(AGENT, Scope.PROJECT, ("pa",), ttl=60)
     b = leases.acquire(Holder.agent("other"), Scope.PROJECT, ("pb",), ttl=60)
     clock.advance(1)
@@ -482,7 +504,9 @@ def test_a_gap_delivered_after_a_reconcile_is_reconciled_again(tmp_path: Path) -
     leases.acquire(AGENT, Scope.PROJECT, ("p0",), ttl=60)
     leases.acquire(AGENT, Scope.PROJECT, ("p1",), ttl=60)  # drops p0's grant
     first = feed.flush()
-    assert "gap" in (first.error or "") and first.sent == 1  # R3F08: the outbox still went
+    # R3F08: the gap was refused, yet the reconcile (p0 re-announced, the snapshot) and the
+    # outbox (p1's grant) still went.
+    assert "gap" in (first.error or "") and first.sent == 3
     assert feed.flush().delivered_gap is True
     # The gap landed after the first reconcile, so it was reconciled again after it.
     assert feed_gaps(log) == [] and feed.reconciled  # R3F05

@@ -12,7 +12,7 @@ from aar.hub.collab import EVENT_FEED_GAP, feed_gaps
 from aar.hub.events import Actor, EventLog
 from aar.hub.leaseboard import lease_board
 from aar.node.broker import Broker
-from aar.node.feed import EventLogTransport, NodeFeed, PresenceReporter
+from aar.node.feed import BACKOFF_FIRST, EventLogTransport, NodeFeed, PresenceReporter, wire_feed
 from aar.node.gateway import ScriptApiGateway
 from aar.node.leases import Holder, Lease, LeaseEvent, LeaseManager, Scope
 from aar.node.locator import ProjectLocator
@@ -28,7 +28,26 @@ AGENT = Holder.agent("thread-1")
 
 
 def _feed(log: EventLog, **kw) -> NodeFeed:
-    return NodeFeed(NODE, EventLogTransport(log), wall_offset=lambda: WALL, **kw)
+    """A feed with no leases of its own (for presence and construction tests)."""
+    return NodeFeed(
+        NODE,
+        EventLogTransport(log),
+        wall_offset=lambda: WALL,
+        lease_source=list,
+        clock=FakeClock(),
+        **kw,
+    )
+
+
+def _wired(log: EventLog, transport=None, clock=None, **kw) -> tuple[NodeFeed, LeaseManager]:
+    """A feed and its lease table, bound to each other the way a node runtime wires them."""
+    return wire_feed(
+        NODE,
+        transport or EventLogTransport(log),
+        clock=clock or FakeClock(),
+        wall_offset=kw.pop("wall_offset", lambda: WALL),
+        **kw,
+    )
 
 
 def _board_clock(mono: float):
@@ -56,11 +75,10 @@ class Flaky:
 
 def test_a_failing_transport_does_not_raise_through_acquire_or_the_broker(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
-    feed = NodeFeed(NODE, Flaky(log, fail=1000), wall_offset=lambda: WALL)
     fake = FakeResolve({"Show": ["Main"]}, current="Show", folder=("Shows",))
     gw = ScriptApiGateway(fake)
     clock = FakeClock()
-    leases = LeaseManager(clock, sink=feed.lease_sink)
+    feed, leases = _wired(log, Flaky(log, fail=1000), clock)
     presence = PresenceGuard(idle_window=IDLE)
     broker = Broker(gw, leases=leases, presence=presence, clock=clock, config=CONFIG)
     presence.observe(gw.get_context(), clock())
@@ -90,8 +108,9 @@ def test_an_unmappable_lease_event_is_dropped_and_gap_flagged_not_raised(tmp_pat
     lease = Lease("l-1", Scope.PROJECT, ("p1",), AGENT, 0.0, math.inf, math.inf)
     feed.lease_sink(LeaseEvent("granted", 0.0, lease))  # does not raise
     assert feed.pending == 0 and feed.dropped == 1
-    feed.flush()
-    assert [gap.dropped for gap in feed_gaps(log)] == [1]
+    report = feed.flush()
+    assert report.delivered_gap and feed.reconciled  # the gap reached the hub, then a snapshot
+    assert [gap.payload["dropped"] for gap in log.read(types=[EVENT_FEED_GAP])] == [1]
 
 
 @pytest.mark.parametrize("ttl", [math.inf, -math.inf, math.nan, 0.0, -1.0])
@@ -121,7 +140,7 @@ def test_acquire_refuses_a_too_long_holder_id_and_too_large_ttl_before_granting(
 def test_node_id_with_surrounding_whitespace_is_refused_at_construction(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
     with pytest.raises(ValueError, match="node_id"):
-        NodeFeed("node-1 ", EventLogTransport(log))
+        NodeFeed("node-1 ", EventLogTransport(log), lease_source=list, clock=FakeClock())
 
 
 # -- idempotency: one stored spec, replayed on retry (P02a / #11) ----------------------------
@@ -130,16 +149,17 @@ def test_node_id_with_surrounding_whitespace_is_refused_at_construction(tmp_path
 def test_a_failed_send_is_retried_with_the_same_spec_despite_offset_drift(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
     offset = [WALL]
-    feed = NodeFeed(NODE, Flaky(log, fail=1), wall_offset=lambda: offset[0])
-    leases = LeaseManager(lambda: 1000.0, sink=feed.lease_sink)
+    now = [1000.0]
+    feed, leases = _wired(log, Flaky(log, fail=1), lambda: now[0], wall_offset=lambda: offset[0])
     leases.acquire(AGENT, Scope.PROJECT, ("p1",), ttl=60)  # mapped once, at this offset
 
     first = feed.flush()
     assert first.sent == 0 and first.error is not None and feed.pending == 1
     offset[0] += 0.001  # the wall offset drifts before the retry
+    now[0] += BACKOFF_FIRST  # past the backoff
 
     second = feed.flush()  # replays the SAME stored spec, not a re-mapping
-    assert second.sent == 1 and feed.pending == 0
+    assert second.sent == 2 and feed.pending == 0  # the start-up snapshot, then the grant
     rows = log.read(types=["lease.granted"])
     assert len(rows) == 1
     # The stored wall times are the ones from the first mapping, not the drifted offset.
@@ -151,9 +171,8 @@ def test_a_failed_send_is_retried_with_the_same_spec_despite_offset_drift(tmp_pa
 
 def test_pending_renewals_are_coalesced_to_the_latest(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
-    feed = _feed(log)
     clock = FakeClock()
-    leases = LeaseManager(clock, sink=feed.lease_sink)
+    feed, leases = _wired(log, clock=clock)
     lease = leases.acquire(AGENT, Scope.PROJECT, ("p1",), ttl=60)
     for _ in range(5):
         clock.advance(1)
@@ -173,19 +192,20 @@ def test_pending_renewals_are_coalesced_to_the_latest(tmp_path: Path) -> None:
 
 def test_the_outbox_cap_drops_the_oldest_counts_it_and_reports_a_gap(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
-    feed = _feed(log, outbox_max=2)
-    leases = LeaseManager(FakeClock(), sink=feed.lease_sink)
+    feed, leases = _wired(log, outbox_max=2)
     for i in range(3):
         leases.acquire(AGENT, Scope.PROJECT, (f"p{i}",), ttl=60)
 
     assert feed.dropped == 1 and feed.pending == 2
+    granted = [spec.payload["key"][0] for spec in feed._outbox]
+    assert granted == ["p1", "p2"]  # the two newest grants survived; the oldest (p0) was dropped
     report = feed.flush()
-    assert report.delivered_gap and report.sent == 2
-    gaps = feed_gaps(log)
-    assert [(gap.node_id, gap.dropped) for gap in gaps] == [(NODE, 1)]
-    # The two newest leases survived; the oldest (p0) was dropped.
+    # The gap, the reconcile (p0 re-announced, then the snapshot), then the two grants.
+    assert report.delivered_gap and report.sent == 5
+    assert [(gap.node_id, gap.dropped) for gap in feed_gaps(log)] == []  # reconciled at once
+    assert [gap.payload["dropped"] for gap in log.read(types=[EVENT_FEED_GAP])] == [1]
     kept = {lease.key[0] for lease in lease_board(log, clock=_board_clock(1030.0)).leases}
-    assert kept == {"p1", "p2"}
+    assert kept == {"p0", "p1", "p2"}  # the lost grant was re-announced by the reconcile
 
 
 # -- lease board reflects broker activity end to end -----------------------------------------
@@ -193,11 +213,10 @@ def test_the_outbox_cap_drops_the_oldest_counts_it_and_reports_a_gap(tmp_path: P
 
 def test_the_board_reflects_broker_lease_activity_end_to_end(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
-    feed = _feed(log)
     fake = FakeResolve({"Show": ["Main"]}, current="Show", folder=("Shows",))
     gw = ScriptApiGateway(fake)
     clock = FakeClock()
-    leases = LeaseManager(clock, sink=feed.lease_sink)
+    feed, leases = _wired(log, clock=clock)
     presence = PresenceGuard(idle_window=IDLE)
     broker = Broker(gw, leases=leases, presence=presence, clock=clock, config=CONFIG)
     presence.observe(gw.get_context(), clock())
@@ -276,8 +295,7 @@ def test_reporter_rejects_a_naive_wall_time(tmp_path: Path) -> None:
 
 def test_feed_gap_events_name_their_own_node(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "hub.db")
-    feed = _feed(log, outbox_max=1)
-    leases = LeaseManager(FakeClock(), sink=feed.lease_sink)
+    feed, leases = _wired(log, outbox_max=1)
     leases.acquire(AGENT, Scope.PROJECT, ("p0",), ttl=60)
     leases.acquire(AGENT, Scope.PROJECT, ("p1",), ttl=60)  # drops p0
     feed.flush()

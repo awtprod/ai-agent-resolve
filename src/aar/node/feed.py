@@ -35,7 +35,8 @@ Delivery and retries, for every way a send can fail (see :meth:`NodeFeed.flush`)
   committed; its resend carries the same key and the hub answers with the stored event.
 - **Refused** (``ValueError`` or ``TypeError``): the spec can never succeed. A queued spec is
   quarantined at once (counted as dropped and gap-flagged), so it never blocks the specs
-  behind it. A refused gap is given up (the reconcile it asked for still runs). A refused
+  behind it. A refused gap does not hold up the reconcile it asked for; it is tried again on
+  later flushes, ``MAX_SPEC_ATTEMPTS`` times in all, then given up. A refused
   reconcile spec abandons that reconcile; a new one (new keys: it is a new reconcile, not a
   resend) is tried on the next flush, at most ``MAX_SPEC_ATTEMPTS`` times in all, then it is
   given up and the node stays honestly stale on the board until its next gap.
@@ -243,6 +244,7 @@ class NodeFeed:
         self._gap_pending = False
         self._gap_at: datetime | None = None
         self._gap: HubEventSpec | None = None  # the pending gap's spec, resent unchanged
+        self._gap_failures = 0
         # A new process knows nothing of what an earlier one left on the board: reconcile.
         self._reconcile_pending = True
         self._reconcile_failures = 0
@@ -383,15 +385,21 @@ class NodeFeed:
             return False
         spec = self._gap_spec()
         refused = self._send(spec)
-        self._gap_pending, self._gap, self._gap_at = False, None, None
-        if refused is not None:  # given up; the reconcile _note_gap asked for still runs
+        if refused is not None:
+            # The reconcile _note_gap asked for still runs, now. The same gap is tried again
+            # on later flushes, MAX_SPEC_ATTEMPTS times in all, then given up.
+            self._gap_failures += 1
+            if self._gap_failures < MAX_SPEC_ATTEMPTS:
+                problems.append(f"gap refused, will retry: {refused!r}")
+                return False
             self._quarantined.append(Quarantined(spec.type, spec.idempotency_key, repr(refused)))
             problems.append(f"gap given up: {refused!r}")
-            return False
-        counts["sent"] += 1
-        # The stale flag this gap raises is cleared only by a later snapshot.
-        self._reconcile_pending = True
-        return True
+        else:
+            counts["sent"] += 1
+            # The stale flag this gap raises is cleared only by a later snapshot.
+            self._reconcile_pending = True
+        self._gap_pending, self._gap, self._gap_at, self._gap_failures = False, None, None, 0
+        return refused is None
 
     def _flush_reconcile(self, counts: dict[str, int], problems: list[str]) -> None:
         if self._reconcile_pending:
@@ -509,8 +517,9 @@ class NodeFeed:
 
         A live lease is re-announced (as a ``lease.renewed`` event the board already folds)
         unless a grant or renewal of it is still queued, which will announce it anyway. The
-        latest presence report is re-announced too. All are stamped before the snapshot, so
-        the hub orders them before it; a lease granted after this is stamped after it.
+        latest presence report is re-announced too, unless it is still queued. All are
+        stamped before the snapshot, so the hub orders them before it; a lease granted
+        after this is stamped after it.
         """
         live = list(self._lease_source())
         if len(live) > MAX_SNAPSHOT_LEASES:
@@ -530,9 +539,12 @@ class NodeFeed:
             batch.append(
                 self._stamp(replace(spec, idempotency_key=self._mint_key("lease.reannounced")))
             )
-        if self._last_presence is not None:
+        presence = self._last_presence
+        if presence is not None and not any(
+            spec.idempotency_key == presence.idempotency_key for spec in self._outbox
+        ):
             key = self._mint_key("presence.reannounced")
-            batch.append(self._stamp(replace(self._last_presence, idempotency_key=key)))
+            batch.append(self._stamp(replace(presence, idempotency_key=key)))
         snapshot = HubEventSpec(
             EVENT_LEASE_SNAPSHOT,
             {
