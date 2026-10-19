@@ -466,18 +466,6 @@ def test_c_the_label_read_itself_stops_at_cap_plus_one(
     assert sum(counting.returned) == (0 if honest_size else cap + 1)
 
 
-def test_c_a_non_regular_label_is_never_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    out = tmp_path / "out.drp"
-    sidecar = Path(str(out) + SIDECAR_SUFFIX)
-    os.mkfifo(sidecar)
-    counting = _CountingOpen()
-    monkeypatch.setattr(write, "open", counting, raising=False)
-    assert write._is_our_sidecar(sidecar, out) is False
-    assert counting.returned == []
-
-
 def test_c_a_label_at_the_cap_with_the_honest_size_is_still_ours(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -492,12 +480,17 @@ def test_c_a_label_at_the_cap_with_the_honest_size_is_still_ours(
     assert write._is_our_sidecar(sidecar, out) is False
 
 
-def test_c_a_fifo_label_is_refused_without_blocking(tmp_path: Path) -> None:
+def test_c_a_fifo_label_is_refused_without_blocking_or_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # The label is opened once with O_NONBLOCK: a FIFO at the name (even one that appeared after
-    # an is_file() check) must not hang the run waiting for a writer.
+    # an is_file() check) must not hang the run waiting for a writer, and a non-regular file is
+    # never read. Run in a thread so a regression fails the test instead of hanging the suite.
     out = tmp_path / "out.drp"
     sidecar = Path(str(out) + SIDECAR_SUFFIX)
     os.mkfifo(sidecar)
+    counting = _CountingOpen()
+    monkeypatch.setattr(write, "open", counting, raising=False)
     result: list[bool] = []
     worker = threading.Thread(target=lambda: result.append(write._is_our_sidecar(sidecar, out)))
     worker.daemon = True
@@ -509,6 +502,7 @@ def test_c_a_fifo_label_is_refused_without_blocking(tmp_path: Path) -> None:
         worker.join(5)
         pytest.fail("reading a FIFO label blocked")
     assert result == [False]
+    assert counting.returned == []
 
 
 # --------------------------------------------------------------------------- D: test gaps
