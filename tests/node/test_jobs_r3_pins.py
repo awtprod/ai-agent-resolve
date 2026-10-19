@@ -312,7 +312,7 @@ def test_a_long_render_poll_loop_is_not_an_op_timeout(tmp_path: Path) -> None:
     world.project.render_complete_after = 10_000
     job_id = world.runner.submit("render", _render_params(world), world.locator())
     for _ in range(40):
-        world.clock.advance(10.0)  # 400 s of polling, each poll returns at once
+        world.clock.advance(100.0)  # pumps further apart than op_timeout; each poll is quick
         world.runner.pump()
     assert world.runner.get(job_id).state == "running"
 
