@@ -4,12 +4,19 @@ A rule is a function registered with :func:`rule`. It receives a :class:`LintCon
 returns findings. Which rules run, and with what thresholds, comes from the profile.
 Rules that need an optional input (transcript, laugh map) that was not supplied produce one
 ``info`` finding saying so; they never pass silently.
+
+A rule's thresholds are either required (``params``: every profile that lists the rule must set
+them) or optional (``defaults``: a profile may set them; the code default applies otherwise).
+Optional thresholds let a rule grow without breaking profiles written before it grew. A rule
+may also have a ``prepare`` hook that checks the thresholds' values and combinations; a bad
+value is a :class:`ProfileError` before anything is linted.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass
+import math
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -61,14 +68,32 @@ class LintReport(_Model):
     findings: list[Finding]
 
 
+Prepare = Callable[[Mapping[str, Any], dict[str, Any]], dict[str, Any]]
+
+
 @dataclass(frozen=True)
 class Rule:
     id: str
     severity: Severity  # the highest severity the rule can emit
     summary: str
-    params: tuple[str, ...]
+    params: tuple[str, ...]  # required thresholds
     check: Callable[[LintContext], list[Finding]]
     needs: tuple[Need, ...] = ()
+    defaults: Mapping[str, Any] = field(default_factory=dict)  # optional thresholds
+    prepare: Prepare | None = None
+
+    def allowed(self) -> set[str]:
+        """Every threshold name a profile may set for this rule."""
+        return set(self.params) | set(self.defaults)
+
+    def resolve(self, given: Mapping[str, Any]) -> dict[str, Any]:
+        """The thresholds the rule runs with: the profile's, then the code defaults.
+
+        ``prepare`` (if any) sees what the profile set and the merged values, and may check,
+        translate or reject them. A rejection is a ``ValueError``.
+        """
+        merged = {**self.defaults, **given}
+        return merged if self.prepare is None else self.prepare(given, merged)
 
 
 _REGISTRY: dict[str, Rule] = {}
@@ -81,18 +106,64 @@ def rule(
     summary: str,
     params: tuple[str, ...] = (),
     needs: tuple[Need, ...] = (),
+    defaults: Mapping[str, Any] | None = None,
+    prepare: Prepare | None = None,
 ) -> Callable[[Callable[[LintContext], list[Finding]]], Callable[[LintContext], list[Finding]]]:
-    """Register a rule. ``params`` are the threshold names the profile must supply."""
+    """Register a rule.
+
+    ``params`` are the threshold names the profile must supply; ``defaults`` maps optional
+    threshold names to the value used when the profile does not set them (``None`` means the
+    rule's ``prepare`` decides). ``prepare`` checks and translates the merged thresholds.
+    """
 
     def decorate(
         func: Callable[[LintContext], list[Finding]],
     ) -> Callable[[LintContext], list[Finding]]:
         if rule_id in _REGISTRY:
             raise ValueError(f"rule {rule_id!r} is registered twice")
-        _REGISTRY[rule_id] = Rule(rule_id, severity, summary, params, func, needs)
+        if clash := set(params) & set(defaults or {}):
+            raise ValueError(f"rule {rule_id!r} lists {sorted(clash)} as required and optional")
+        _REGISTRY[rule_id] = Rule(
+            rule_id, severity, summary, params, func, needs, dict(defaults or {}), prepare
+        )
         return func
 
     return decorate
+
+
+def number(
+    params: Mapping[str, Any],
+    name: str,
+    *,
+    integer: bool = False,
+    minimum: float | None = None,
+    above: float | None = None,
+) -> float:
+    """Read one numeric threshold for a ``prepare`` hook, or raise a clear ``ValueError``.
+
+    ``minimum`` is inclusive and ``above`` exclusive. Booleans are not numbers here.
+    """
+    value = params[name]
+    kind = "a whole number" if integer else "a number"
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{name} must be {kind}, not {value!r}")
+    if integer and not (isinstance(value, int) or float(value).is_integer()):
+        raise ValueError(f"{name} must be {kind}, not {value!r}")
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite, not {value!r}")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be at least {minimum:g}, not {value!r}")
+    if above is not None and value <= above:
+        raise ValueError(f"{name} must be more than {above:g}, not {value!r}")
+    return value
+
+
+def flag(params: Mapping[str, Any], name: str) -> bool:
+    """Read one true/false threshold for a ``prepare`` hook, or raise a clear ``ValueError``."""
+    value = params[name]
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be true or false, not {value!r}")
+    return value
 
 
 def all_rules() -> dict[str, Rule]:
@@ -214,16 +285,25 @@ def validate_profile(profile: Profile) -> None:
                 f"profile {profile.name!r} lists unknown rule {rule_id!r}; "
                 f"known rules: {', '.join(sorted(known))}"
             )
-        expected = set(known[rule_id].params)
+        rule_ = known[rule_id]
         given = set(config.params)
-        if missing := expected - given:
+        if missing := set(rule_.params) - given:
             raise ProfileError(
                 f"profile {profile.name!r} rule {rule_id!r} is missing {sorted(missing)}"
             )
-        if extra := given - expected:
+        if extra := given - rule_.allowed():
             raise ProfileError(
                 f"profile {profile.name!r} rule {rule_id!r} has unknown thresholds {sorted(extra)}"
             )
+        _resolved(profile, rule_, config)
+
+
+def _resolved(profile: Profile, rule_: Rule, config: RuleConfig) -> dict[str, Any]:
+    """The thresholds a rule runs with; a value its ``prepare`` rejects is a ``ProfileError``."""
+    try:
+        return rule_.resolve(config.params)
+    except ValueError as exc:
+        raise ProfileError(f"profile {profile.name!r} rule {rule_.id!r}: {exc}") from exc
 
 
 def _skipped(rule_: Rule, missing: list[Need]) -> Finding:
@@ -264,7 +344,7 @@ def lint(
         if missing := [need for need in rule_.needs if available[need] is None]:
             findings.append(_skipped(rule_, missing))
             continue
-        ctx = LintContext(plan, rule_id, config.params, transcript, laughs)
+        ctx = LintContext(plan, rule_id, _resolved(profile, rule_, config), transcript, laughs)
         findings.extend(_run_rule(rule_, config, ctx))
     counts = {level: sum(1 for f in findings if f.severity == level) for level in _LEVELS}
     total = plan.total_frames()
