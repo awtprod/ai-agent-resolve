@@ -9,6 +9,7 @@ commit in its comment fails on that commit (20f89a0 is S1h3, 8d562a6 the first S
 from __future__ import annotations
 
 import time
+import tracemalloc
 from pathlib import Path
 
 from test_drp_hardening import small_drp
@@ -104,6 +105,22 @@ def test_unterminated_tag_with_quoted_markup_is_scanned_in_linear_time() -> None
     assert elapsed < 5.0, f"scan took {elapsed:.1f}s: unterminated tags are quadratic again"
     assert doc.roots == []
     assert "unparsed-markup" in {i.code for i in doc.issues}
+
+
+def test_an_unterminated_tag_costs_no_decode_of_its_attribute_values() -> None:
+    # M1: a value closed by a far-off quote and then no ">" was decoded and stored before the
+    # tag was known to be unterminated, on top of the copy the gap makes: twice the member in
+    # memory at 410a6b3 (measured 2.0x here; 1.0x now), 2060 MB against 1048 MB at 530 MB.
+    data = b'<a b="' + b"<x " * 2_000_000 + b'"c'
+    tracemalloc.start()
+    try:
+        doc = scan(data, "m.xml")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert doc.roots == []
+    assert "unparsed-markup" in {i.code for i in doc.issues}
+    assert peak < 1.5 * len(data), f"peak {peak / len(data):.2f}x the member"
 
 
 def test_unterminated_tag_does_not_swallow_the_next_well_formed_tag() -> None:
