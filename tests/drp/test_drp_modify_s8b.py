@@ -5,11 +5,15 @@ Each test names the finding it pins. They run on the bundled templates only.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
+import os
 import re
 import struct
+import subprocess
+import sys
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -18,11 +22,12 @@ from typing import Any
 import pytest
 from diff_testing import CLIP, H264, POOL, SEQUENCE, TIMELINE
 from drp_edit import add_carrier, carrier, edit_zip, marker_entry, markers_fields_blob
-from drp_helpers import kd, needs_zstandard, pb_len, zstd_raw_frame
+from drp_helpers import UnseekableSink, kd, needs_zstandard, pb_len, zstd_raw_frame
 
 from aar.drp import blobs
 from aar.drp.modify import compare_round_trip, encode, parse_plan, zipraw
 from aar.drp.modify.encode import EncodeError
+from aar.drp.modify.markers import COLOR_BITS
 from aar.drp.modify.write import SIDECAR_SUFFIX, edit_file
 from aar.drp.modify.write import leftovers as stale_temp_files
 from aar.drp.reader import read_drp
@@ -394,6 +399,16 @@ def test_fh_an_update_that_would_rewrite_undecoded_bytes_is_refused(tmp_path: Pa
     assert not out.exists()
 
 
+def _fields_blob_of(archive: Path) -> str:
+    with zipfile.ZipFile(archive) as zf:
+        found = re.findall(
+            rb'<Sm2SequenceLockableBlob DbId="0b0b0b0b[^>]*>\s*<FieldsBlob>([0-9a-f]+)</Fields',
+            zf.read("project.xml"),
+        )
+    assert len(found) == 1
+    return found[0].decode()
+
+
 def test_fh_multi_field_update_keeps_undecoded_fields(tmp_path: Path) -> None:
     src = _odd_marker_src(tmp_path)
     change = {"name": "Big", "note": "n", "color": "Red", "custom_data": "agent:7", "frame": 12}
@@ -401,8 +416,19 @@ def test_fh_multi_field_update_keeps_undecoded_fields(tmp_path: Path) -> None:
     assert outcome.status == "written", outcome.to_dict()["refusals"]
     [m, _] = read_drp(out).timelines[0].markers
     assert (m.frame, m.name, m.note, m.color, m.custom_data) == (12, "Big", "n", "Red", "agent:7")
-    with zipfile.ZipFile(out) as zf:
-        assert UNDECODED.hex().encode() in zf.read("project.xml")
+    # The whole list, byte for byte: the colour, note and name re-encoded in place, the frame
+    # moved, the custom data appended, and field 7 (undecoded) still sitting between them.
+    expected = markers_fields_blob(
+        marker_entry(
+            12,
+            COLOR_BITS["Red"],
+            "Big",
+            note="n",
+            extra=UNDECODED + pb_len(6, b"agent:7"),
+        ),
+        marker_entry(20, BLUE, "B"),
+    )
+    assert _fields_blob_of(out) == expected
 
 
 # --------------------------------------------------------------------------- F-E
@@ -457,6 +483,61 @@ def test_fe_a_failed_placement_removes_the_new_sidecar(
     assert list(tmp_path.iterdir()) == []
 
 
+# Placement failures that really happen (no patched internals): the output name is taken by a
+# directory or a dangling symlink, or a name is too long for the filesystem.
+
+
+def _directory_in_the_way(tmp_path: Path) -> Path:
+    out = tmp_path / "out.drp"
+    out.mkdir()
+    (out / "keep.txt").write_text("keep")
+    return out
+
+
+def test_fe_force_over_a_directory_restores_the_old_label(tmp_path: Path) -> None:
+    first, out = run(H264, tmp_path, RENAME)
+    assert first.status == "written"
+    sidecar = Path(str(out) + SIDECAR_SUFFIX)
+    old_label = sidecar.read_bytes()
+    out.unlink()
+    _directory_in_the_way(tmp_path)
+    with pytest.raises(IsADirectoryError):
+        edit_file(H264, plan({**RENAME, "new_name": "y"}), out, force=True)
+    assert sidecar.read_bytes() == old_label  # the label being replaced is back
+    assert (out / "keep.txt").read_text() == "keep"
+    assert stale_temp_files(out) == []
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["out.drp", "out.drp.aar.json"]
+
+
+def test_fe_force_over_a_directory_leaves_no_label_when_there_was_none(tmp_path: Path) -> None:
+    out = _directory_in_the_way(tmp_path)
+    with pytest.raises(IsADirectoryError):
+        edit_file(H264, plan(RENAME), out, force=True)
+    assert [p.name for p in tmp_path.iterdir()] == ["out.drp"]
+    assert (out / "keep.txt").read_text() == "keep"
+
+
+def test_fe_a_dangling_symlink_at_the_output_is_not_replaced(tmp_path: Path) -> None:
+    out = tmp_path / "out.drp"
+    out.symlink_to(tmp_path / "nowhere.drp")  # exists() is False; link() still refuses it
+    outcome = edit_file(H264, plan(RENAME), out)
+    assert [r.code for r in outcome.refusals] == ["out-exists"]
+    assert "appeared while writing" in outcome.refusals[0].message
+    assert outcome.status == "refused" and outcome.output is None
+    assert out.is_symlink() and os.readlink(out) == str(tmp_path / "nowhere.drp")
+    assert [p.name for p in tmp_path.iterdir()] == ["out.drp"]  # no label, no temporary file
+
+
+def test_fe_a_name_too_long_for_the_label_temp_file_leaves_nothing(tmp_path: Path) -> None:
+    limit = os.pathconf(tmp_path, "PC_NAME_MAX")
+    # The output's own temp name still fits, the label's (".<name>.aar.json.<8>.tmp.json") does not.
+    out = tmp_path / ("a" * (limit - 27 - len(".drp")) + ".drp")
+    with pytest.raises(OSError) as raised:
+        edit_file(H264, plan(RENAME), out)
+    assert raised.value.errno == errno.ENAMETOOLONG
+    assert list(tmp_path.iterdir()) == []  # the output's temporary file was removed again
+
+
 # --------------------------------------------------------------------------- F-D, F-J
 
 
@@ -476,6 +557,58 @@ def test_fd_stdout_closed_after_a_write_exits_74_with_the_file_in_place(
     assert label["status"] == "unverified" and read_drp(out).project.name == "x"
 
 
+CLI = "import sys; from aar.cli import main; sys.exit(main(sys.argv[1:]))"
+
+
+def _edit_in_a_child(
+    tmp_path: Path, **streams: Any
+) -> tuple[subprocess.CompletedProcess[bytes], Path]:
+    plan_file = tmp_path / "plan.json"
+    plan_file.write_text(json.dumps({"edits": [RENAME]}))
+    out = tmp_path / "out.drp"
+    args = [sys.executable, "-c", CLI, "drp", "edit", str(H264), "--plan", str(plan_file)]
+    proc = subprocess.run(
+        [*args, "--out", str(out)], stderr=subprocess.PIPE, check=False, **streams
+    )
+    return proc, out
+
+
+def _assert_edit_completed(out: Path) -> None:
+    label = json.loads(Path(str(out) + SIDECAR_SUFFIX).read_text())
+    assert label["status"] == "unverified" and label["output"]["size"] == out.stat().st_size
+    assert read_drp(out).project.name == "x"
+    assert stale_temp_files(out) == []
+
+
+def test_fd_a_really_closed_stdout_exits_74_with_the_file_in_place(tmp_path: Path) -> None:
+    proc, out = _edit_in_a_child(
+        tmp_path, stdout=subprocess.DEVNULL, preexec_fn=lambda: os.close(1)
+    )
+    assert proc.returncode == 74, proc.stderr
+    assert b"stdout is closed" in proc.stderr and b"Traceback" not in proc.stderr
+    _assert_edit_completed(out)
+
+
+@pytest.mark.skipif(not Path("/dev/full").exists(), reason="needs /dev/full (Linux)")
+def test_fd_a_full_stdout_exits_74_with_the_file_in_place(tmp_path: Path) -> None:
+    with open("/dev/full", "wb") as full:
+        proc, out = _edit_in_a_child(tmp_path, stdout=full)
+    assert proc.returncode == 74, proc.stderr
+    assert b"cannot write output" in proc.stderr and b"Traceback" not in proc.stderr
+    _assert_edit_completed(out)
+
+
+def test_fd_a_closed_pipe_exits_141_quietly_with_the_file_in_place(tmp_path: Path) -> None:
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    try:
+        proc, out = _edit_in_a_child(tmp_path, stdout=write_end)
+    finally:
+        os.close(write_end)
+    assert proc.returncode == 141 and proc.stderr == b""
+    _assert_edit_completed(out)
+
+
 def test_fj_path_map_report_states_its_scope(tmp_path: Path) -> None:
     table = [{"windows": "E:", "mac": MAC_DIR}]
     outcome = edit_file(
@@ -488,22 +621,8 @@ def test_fj_path_map_report_states_its_scope(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- test gaps
 
 
-class _Unseekable(io.RawIOBase):
-    """A write-only stream: zipfile then writes data descriptors after each member."""
-
-    def __init__(self) -> None:
-        self.buf = bytearray()
-
-    def writable(self) -> bool:
-        return True
-
-    def write(self, b: Any) -> int:
-        self.buf += bytes(b)
-        return len(bytes(b))
-
-
 def _descriptor_zip() -> bytes:
-    stream = _Unseekable()
+    stream = UnseekableSink()
     with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("a.xml", b"a" * 64)
         zf.writestr("b.xml", b"b" * 64)
@@ -545,8 +664,51 @@ def test_gap_zip_data_descriptor_without_its_signature_is_kept_that_way() -> Non
 
 def test_gap_zip_local_flags_that_disagree_are_refused() -> None:
     data = _descriptor_zip()
-    with pytest.raises(zipraw.ZipLayoutError, match="disagree"):
+    with pytest.raises(zipraw.ZipLayoutError, match="local and central headers disagree"):
         zipraw.parse_layout(_patched(data, 6, "<H", 0))  # local header: no descriptor flag
+
+
+def _central_at(data: bytes, index: int) -> int:
+    return zipraw.parse_layout(data)[index].central_start
+
+
+def test_gap_zip_encrypted_members_are_refused() -> None:
+    data = _descriptor_zip()
+    flags = zipraw.parse_layout(data)[0].flags | 0x1
+    both = _patched(_patched(data, 6, "<H", flags), _central_at(data, 0) + 8, "<H", flags)
+    with pytest.raises(zipraw.ZipLayoutError, match="encrypted members"):
+        zipraw.parse_layout(both)
+
+
+def test_gap_zip_member_names_that_do_not_decode_are_refused() -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("\u00e9.xml", b"x" * 64)  # a non-ASCII name sets the UTF-8 flag (0x800)
+    data = bytearray(buf.getvalue())
+    assert zipraw.parse_layout(bytes(data))[0].name == "\u00e9.xml"
+    first = data.index(b"\xc3\xa9")
+    data[first] = 0xFF  # the local header's name
+    data[data.rindex(b"\xc3\xa9")] = 0xFF  # and the central record's: still consistent
+    with pytest.raises(zipraw.ZipLayoutError, match="cannot be decoded"):
+        zipraw.parse_layout(bytes(data))
+
+
+@pytest.mark.parametrize(("field", "at"), [("crc", 0), ("size", 4), ("length", 8)])
+def test_gap_zip_each_data_descriptor_field_is_checked(field: str, at: int) -> None:
+    data = _descriptor_zip()
+    first = zipraw.parse_layout(data)[0]
+    value = struct.unpack_from("<I", data, first.data_end + 4 + at)[0]
+    bad = _patched(data, first.data_end + 4 + at, "<I", value ^ 1)
+    with pytest.raises(zipraw.ZipLayoutError, match="data descriptor disagrees"):
+        zipraw.parse_layout(bad)
+
+
+def test_gap_zip_a_data_descriptor_past_the_end_is_refused() -> None:
+    data = _descriptor_zip()
+    # The local header of a streamed member holds zeros, so only the central record claims a size.
+    huge = _patched(data, _central_at(data, 1) + 20, "<I", len(data) + 1000)
+    with pytest.raises(zipraw.ZipLayoutError, match="truncated data descriptor"):
+        zipraw.parse_layout(huge)
 
 
 @pytest.mark.parametrize(

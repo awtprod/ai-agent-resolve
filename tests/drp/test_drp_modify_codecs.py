@@ -13,7 +13,15 @@ import zlib
 from pathlib import Path
 
 import pytest
-from drp_helpers import kd, needs_zstandard, pb_len, pb_var, qstr, zstd_raw_frame
+from drp_helpers import (
+    UnseekableSink,
+    kd,
+    needs_zstandard,
+    pb_len,
+    pb_var,
+    qstr,
+    zstd_raw_frame,
+)
 
 from aar.drp import blobs
 from aar.drp.modify import encode, zipraw
@@ -247,23 +255,8 @@ def test_rewrite_stored_members_and_comments() -> None:
         assert zf.getinfo("a.xml").compress_type == zipfile.ZIP_STORED
 
 
-class _Unseekable(io.RawIOBase):
-    """A write-only stream that cannot seek, so zipfile writes data descriptors (as Resolve)."""
-
-    def __init__(self) -> None:
-        self.buf = bytearray()
-
-    def writable(self) -> bool:
-        return True
-
-    def write(self, b: object) -> int:
-        data = bytes(b)  # type: ignore[call-overload]
-        self.buf += data
-        return len(data)
-
-
 def test_rewrite_keeps_the_data_descriptor_form() -> None:
-    stream = _Unseekable()
+    stream = UnseekableSink()
     with zipfile.ZipFile(stream, "w") as zf:
         zf.writestr("a.xml", b"streamed content" * 20)
         zf.writestr("b.xml", b"other")
