@@ -16,14 +16,24 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any
 
 import pytest
 
-from aar.hub.events import EventLog
+from aar.hub.artifacts import ArtifactStore
+from aar.hub.events import Actor, EventLog
+from aar.hub.graph import WorkGraph
+from aar.hub.registry import Registry
+from aar.hub.reviews import request_review
 
 CLI = "import sys; from aar.cli import main; sys.exit(main(sys.argv[1:]))"
+# `aar hub console` would bind a port: the child replaces uvicorn.run with a no-op first.
+CLI_NO_SERVE = "import sys, uvicorn; uvicorn.run = lambda *a, **k: None; " + CLI
+HUMAN = Actor("human", "operator-1")
+AGENT = Actor("agent", "agent-1")
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "drp" / "empty-project.drp"
 
 pytestmark = pytest.mark.skipif(not Path("/dev/full").exists(), reason="needs /dev/full (Linux)")
@@ -46,7 +56,9 @@ USAGE_ARGV = [
 ]
 
 
-def run(argv: list[str], stdout: str = "ok", stderr: str = "capture") -> tuple[int, bytes]:
+def run(
+    argv: list[str], stdout: str = "ok", stderr: str = "capture", *, program: str = CLI
+) -> tuple[int, bytes]:
     """Run ``aar argv`` with stdout in one state and stderr in another; return (code, stderr)."""
     opened: list[IO[bytes]] = []
     kw: dict[str, Any] = {}
@@ -73,7 +85,7 @@ def run(argv: list[str], stdout: str = "ok", stderr: str = "capture") -> tuple[i
 
     env = {k: v for k, v in os.environ.items() if k != "AAR_LIVE"}
     proc = subprocess.Popen(
-        [sys.executable, "-c", CLI, *argv],
+        [sys.executable, "-c", program, *argv],
         preexec_fn=close_fds if "closed" in (stdout, stderr) else None,
         env=env,
         **kw,
@@ -185,3 +197,112 @@ def test_hub_missing_database_exits_2_in_every_stream_state(
     )
     assert code == 2, (code, err[:300])
     assert_clean(code, err)
+
+
+# ---------------------------------------------------------------- the other hub subcommands
+# Round 2 L4: H02, H03, H04 and H06 (a review command that ignores the result of printing),
+# H08 and H09 (`hub serve` printing its refusals bare) and H10 (the console's read-only
+# notice printed bare) survived the round-1 suite, which only drove `review list`.
+
+
+@dataclass
+class SeededHub:
+    db: str
+    artifacts: str
+    project_id: str
+    subject_id: str
+    render_id: str
+    review_id: str
+
+
+@pytest.fixture
+def seeded(tmp_path: Path) -> Iterator[SeededHub]:
+    """A hub on disk with one project, one node under review and one open review."""
+    db = tmp_path / "hub.db"
+    log = EventLog(db)
+    project = Registry(log).create_project("demo-show", HUMAN)
+    subject = WorkGraph(log, project.id).add_node("op", AGENT, title="assemble first cut")
+    store = ArtifactStore(tmp_path / "artifacts", log)
+    render_id = store.put(b"render-bytes", actor=AGENT, mime="video/mp4", project_id=project.id)
+    review = request_review(
+        log, store, project.id, subject.id, [render_id], AGENT, title="first cut", fps=24.0
+    )
+    yield SeededHub(
+        str(db), str(tmp_path / "artifacts"), project.id, subject.id, render_id, review.id
+    )
+    log.close()
+
+
+def _review_argv(hub: SeededHub, command: str) -> list[str]:
+    base = ["hub", "review", command, "--db", hub.db, "--project", hub.project_id]
+    if command == "request":
+        return [
+            *base,
+            *("--artifacts", hub.artifacts, "--subject", hub.subject_id),
+            *("--render", hub.render_id, "--title", "second cut", "--actor", "agent:agent-1"),
+        ]
+    if command == "note":
+        return [
+            *base,
+            *("--review", hub.review_id, "--frame", "48", "--text", "trim"),
+            *("--actor", "agent:agent-1"),
+        ]
+    if command == "withdraw":
+        return [
+            *base,
+            *("--review", hub.review_id, "--reason", "superseded", "--actor", "agent:agent-1"),
+        ]
+    assert command == "show"
+    return [*base, hub.review_id]
+
+
+@pytest.mark.parametrize("stdout", HELP_EXIT)
+@pytest.mark.parametrize("command", ["request", "note", "withdraw", "show"])
+def test_each_review_command_reports_the_state_of_stdout(
+    seeded: SeededHub, command: str, stdout: str
+) -> None:
+    # H02 (request), H03 (note), H04 (withdraw), H06 (show): each returned 0 whatever happened
+    # to its output, so a full or closed stdout looked like success.
+    code, err = run(_review_argv(seeded, command), stdout=stdout)
+    assert code == HELP_EXIT[stdout], (code, err[:300])
+    assert_clean(code, err)
+
+
+@pytest.mark.parametrize("stderr", ["capture", "full", "closed"])
+def test_a_refused_remote_bind_is_a_clean_exit_2_in_every_stderr_state(
+    seeded: SeededHub, stderr: str
+) -> None:
+    # H08: the refusal was a bare print to stderr, which on a full stderr ended in exit 120.
+    argv = ["hub", "serve", "--db", seeded.db, "--artifacts", seeded.artifacts]
+    code, err = run([*argv, "--host", "0.0.0.0"], stderr=stderr)
+    assert code == 2, (code, err[:300])
+    assert_clean(code, err)
+    if stderr == "capture":
+        assert err.decode().startswith("refusing to bind to '0.0.0.0'"), err
+
+
+@pytest.mark.parametrize("stderr", ["capture", "full", "closed"])
+def test_serve_with_a_missing_database_is_a_clean_exit_2_in_every_stderr_state(
+    seeded: SeededHub, tmp_path: Path, stderr: str
+) -> None:
+    # H09: the bad-database message was a bare print to stderr.
+    argv = ["hub", "serve", "--db", str(tmp_path / "nope.db"), "--artifacts", seeded.artifacts]
+    code, err = run(argv, stderr=stderr)
+    assert code == 2, (code, err[:300])
+    assert_clean(code, err)
+    if stderr == "capture":
+        assert err.decode().startswith("aar hub serve: "), err
+
+
+@pytest.mark.parametrize("stderr", ["capture", "full", "closed"])
+def test_the_read_only_console_notice_never_changes_the_exit_code(
+    seeded: SeededHub, stderr: str
+) -> None:
+    # H10: the notice was a bare print to stderr. The console is started with a stubbed
+    # uvicorn.run, so this reaches the line after the notice and returns.
+    argv = ["hub", "console", "--db", seeded.db, "--artifacts", seeded.artifacts]
+    code, err = run(argv, stderr=stderr, program=CLI_NO_SERVE)
+    assert code == 0, (code, err[:300])
+    assert_clean(code, err)
+    if stderr == "capture":
+        assert err.decode() == "console is read-only: no --operator and no trusted headers\n"
