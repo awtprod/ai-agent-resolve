@@ -67,9 +67,9 @@ class _CursorStep(Step):
 
     def advance(self, ctx: StepContext) -> StepAction:
         if ctx.outcome is None:
-            ctx.cursor.setdefault("seen_at_start", dict(ctx.cursor))
+            ctx.cursor["keys_at_start"] = sorted(ctx.cursor)  # what a fresh step inherits
             return Submit("timeline.list", {}, key=self.name)
-        return Done({"step": self.index, "seen_at_start": ctx.cursor["seen_at_start"]})
+        return Done({"step": self.index, "seen_at_start": ctx.cursor["keys_at_start"]})
 
 
 def _build_cursor(params: BaseModel, target: Any) -> list[Step]:
@@ -87,7 +87,7 @@ def test_each_step_starts_with_an_empty_cursor(tmp_path: Path) -> None:
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
     assert view.state == "succeeded"
-    assert [r["seen_at_start"] for r in view.results] == [{}, {}]
+    assert [r["seen_at_start"] for r in view.results] == [[], []]
 
 
 def test_measured_is_the_last_steps_result(tmp_path: Path) -> None:
@@ -97,6 +97,8 @@ def test_measured_is_the_last_steps_result(tmp_path: Path) -> None:
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
     assert view.measured["step"] == 2 == view.results[-1]["step"]
+    succeeded = [e for e in view.events if e["kind"] == "succeeded"]
+    assert succeeded[0]["data"]["measured"] == view.results[-1]  # the event says the same
 
 
 # -- approval -------------------------------------------------------------------------------------
@@ -579,8 +581,23 @@ def test_store_loads_a_nodes_jobs_oldest_first(tmp_path: Path) -> None:
 
 
 def test_render_mode_and_format_are_put_back_after_a_good_build(tmp_path: Path) -> None:
-    """Kills B06/B07 (restore skips the format/codec or the render mode reset)."""
+    """Kills B06/B07 (restore skips the format/codec or the render mode reset). The fake's
+    presets carry format, codec and mode; here loading the job's snapshot preset brings back
+    only the render SETTINGS (as a Resolve whose presets do not hold them would), so the
+    build's explicit format/codec and mode restore is what puts them back."""
     world = JobWorld(tmp_path)
+    proj = world.project
+    real_load = proj.LoadRenderPreset
+
+    def settings_only(name: str) -> bool:
+        if not name.startswith("aar-job-"):
+            return real_load(name)
+        fmt, codec, mode = proj.deliver.format, proj.deliver.codec, proj.deliver.mode
+        ok = real_load(name)
+        proj.deliver.format, proj.deliver.codec, proj.deliver.mode = fmt, codec, mode
+        return ok
+
+    proj.LoadRenderPreset = settings_only  # type: ignore[method-assign]
     world.project.deliver.mode = 0
     world.presence.observe(world.gw.get_context(), world.clock())
     world.clock.advance(60.0)
@@ -777,7 +794,8 @@ def test_non_finite_render_timeout_is_refused_at_submit(tmp_path: Path) -> None:
 
     world = JobWorld(tmp_path)
     for bad in (float("inf"), float("nan")):
-        with pytest.raises(ValueError):
+        # Refused by the params validation itself, not only by the store's JSON check.
+        with pytest.raises(ValueError, match=r"finite|greater than 0"):
             world.runner.submit(
                 "render", _render_params(world, timeout_seconds=bad), world.locator()
             )
