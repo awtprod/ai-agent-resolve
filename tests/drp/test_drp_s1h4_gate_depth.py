@@ -1,9 +1,9 @@
 """S1h4 round 2, gate depth: the opaque walk is linear in how deep the XML is nested.
 
 ``diff_opaque`` used to build each element's path as ``(*parent_path, segment)``, a copy of every
-segment above it, so a chain nested ``d`` deep cost O(d**2): 12 s at 100,000 levels and about
-20 minutes at 1,000,000. The path is now a parent-linked chain and its ``/``-joined text is built
-only for a reported change.
+segment above it, so a chain nested ``d`` deep cost O(d**2): 12.1 s at 100,000 levels (2.5 s now)
+and no finish within 900 s at 1,000,000 (23.5 s now). The path is now a parent-linked chain and
+its ``/``-joined text is built only for a reported change.
 
 The scaling test measures CPU time of the diff stage alone at two depths four times apart and
 asserts the ratio, so it needs no absolute time limit: linear work gives about 4, the old copy
