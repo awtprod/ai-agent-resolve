@@ -1010,3 +1010,25 @@ def test_report_unchecked_lists_skips_and_incomplete_checks(tmp_path):
         "join-retranscribe",
         "caption-coverage",
     ]
+
+
+@pytest.mark.parametrize(("render_s", "status", "diff"), [(1.5, "pass", 0), (1.0, "fail", -25)])
+def test_a_v2_outro_counts_towards_the_duration_but_is_not_a_cut(tmp_path, render_s, status, diff):
+    source = gapped(tmp_path / "a.wav", before_s=0.5, gap_s=0.1, after_s=0.5)
+    data = plan_dict(
+        [
+            {"id": "a", "media": source.name},
+            {"id": "out", "media": "outro.mov", "duration": 25},
+        ],
+        [{"track": 1, "source": "a", "src_in": 0, "src_out": 50}],
+    )
+    data.update(version=2, outro={"source": "out"})
+    plan = plan_of(data)
+    assert plan.total_frames() == 75
+    report = run(sine(tmp_path / "r.wav", -14.5, seconds=render_s), plan=plan, media_root=tmp_path)
+    duration = report.check("duration")
+    assert duration.status == status
+    assert duration.target["plan_frames"] == 75
+    assert duration.measured["diff_frames"] == pytest.approx(diff, abs=0.01)
+    # The content -> outro step is the outro's transition, not a content cut.
+    assert report.check("join-quiet").measured == {"cuts": 0}
