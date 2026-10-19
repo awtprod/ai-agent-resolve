@@ -10,7 +10,8 @@ from plan_support import FIXTURES, PlanData
 from pydantic import ValidationError
 
 from aar.cli import main
-from aar.plan.model import JSON_SCHEMA_DIALECT, EditPlan, Fps
+from aar.plan import model
+from aar.plan.model import EditPlan, Fps
 
 DIALECT = "https://json-schema.org/draft/2020-12/schema"
 
@@ -42,7 +43,7 @@ def schema_accepts(data: PlanData) -> bool:
 
 
 def test_the_dialect_constant_is_draft_2020_12() -> None:
-    assert JSON_SCHEMA_DIALECT == DIALECT
+    assert model.JSON_SCHEMA_DIALECT == DIALECT
 
 
 @pytest.mark.parametrize("mode", ["validation", "serialization"])
