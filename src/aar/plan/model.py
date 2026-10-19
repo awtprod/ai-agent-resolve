@@ -323,7 +323,12 @@ def _check_video_length(video: VideoTransitionType, frames: int) -> None:
 
 
 class Head(_Model):
-    """Version 2. How the first segment comes in from black."""
+    """Version 2. How the first segment comes in from black.
+
+    ``audio_fade_frames`` is deliberately uncapped: neither this model nor any lint rule limits
+    the fade-in (the ``short-end-fade`` rule limits only a short's end fade), so a long fade-in
+    is the author's call and is not an error or a finding.
+    """
 
     video: VideoTransitionType = Field(
         default="cut", description="Video transition in from black; 'cut' starts hard."

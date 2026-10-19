@@ -12,7 +12,7 @@ from plan_support import FIXTURES, PlanData, only
 from pydantic import ValidationError
 
 from aar.plan.lint import LintReport
-from aar.plan.model import EditPlan
+from aar.plan.model import EditPlan, Head
 from aar.plan.profile import Profile
 
 RunLint = Callable[..., LintReport]
@@ -354,3 +354,31 @@ def test_the_cut_into_the_outro_is_not_a_cut(clean_data: PlanData, run_lint: Run
     clean_data["outro"] = {"source": "outro", "src_out": 10}
     assert EditPlan.model_validate(clean_data).outro_range() == (450, 460)
     assert join_findings(run_lint(clean_data)) == before
+
+
+# --- F6: the head's audio fade-in is uncapped, on purpose -------------------------------------
+
+
+def test_a_long_head_audio_fade_in_is_valid_and_is_not_a_finding(
+    clean_data: PlanData, run_lint: RunLint
+) -> None:
+    baseline = [(f.rule, f.severity, f.message) for f in run_lint(clean_data).findings]
+    clean_data["version"] = 2
+    clean_data["head"] = {"audio_fade_frames": 100_000}
+    plan = EditPlan.model_validate(clean_data)
+    assert plan.head is not None
+    assert plan.head.audio_fade_frames == 100_000
+    assert [(f.rule, f.severity, f.message) for f in run_lint(clean_data).findings] == baseline
+
+
+def test_the_head_docstring_says_the_audio_fade_in_is_uncapped() -> None:
+    doc = Head.__doc__ or ""
+    assert "audio_fade_frames" in doc
+    assert "uncapped" in doc
+
+
+def test_a_negative_head_audio_fade_is_still_an_error(clean_data: PlanData) -> None:
+    clean_data["version"] = 2
+    clean_data["head"] = {"audio_fade_frames": -1}
+    [error] = version_errors(clean_data)
+    assert error["loc"] == ("head", "audio_fade_frames")
