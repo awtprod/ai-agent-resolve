@@ -18,34 +18,37 @@ The project id the board uses is the Resolve project's unique id (the lease key)
 hub registry's ``prj_...`` id; the branch record carries both (the Resolve timeline ids and
 the hub project id on its row).
 
-No node runtime assembles the broker, feed and these recorders yet. S7 (the job runner)
-lands after S11 and wires them; it must do all of this:
+The node runtime, :class:`aar.node.runtime.NodeRuntime` (S7), assembles the broker, the feed
+and these recorders. The wiring it does (tested in ``tests/node/test_s7_s11_integration.py``):
 
 1. ``aar.node.ops``: import every op module, ``cloud, collab, read, render, write``, so all
    ops register; ``test_ops_framework.py``'s ``EXPECTED`` keeps both slices' ops.
-2. One shared ``BranchRegistry`` per node, passed to every ``submit_op`` /
-   ``make_hot_op`` (the job runner's included), and ``require_branch`` decided per op, never
-   left to a default by accident. Each job's ops run with the job's own agent as holder
-   (``Holder.agent(<agent id>)``): ``job-runner:<node>`` is not a valid agent id (the
-   ``:``), so it could never own or create a branch, and ``timeline.branch`` refuses it at
-   submit.
-3. What the branch guard refuses (shared project state, a human's timeline) and when an
-   approval lifts it is the coordinator's policy in the S7/S11 integration note; S7
-   implements it. ``require_branch=False`` only ever follows a consumed ``project.write``
-   approval for that op.
-4. ``LeaseManager`` and ``NodeFeed`` each need the other at construction, so they are bound
-   late: the feed's ``lease_source`` is the lease table's ``active``, and both use the same
-   (monotonic) clock. ``lease_source`` and ``clock`` are required, so a feed that never
-   reconciles cannot be built; :func:`aar.node.feed.wire_feed` builds the pair.
-5. The node's pump calls both ``NodeFeed.flush()`` and ``PresenceReporter.sync()``. The
-   feed backs off by itself while the hub is unreachable (``FlushReport.retry_at``), so
-   calling ``flush`` on every pump tick is cheap.
-6. Each ``timeline.branch`` result goes to :func:`record_branch` with the hub's ``prj_...``
-   id (look it up in the hub :class:`~aar.hub.registry.Registry`; the node knows only the
-   Resolve project id) and ``Actor("node", <the feed's node id>)``.
-7. Exactly one live ``NodeFeed`` per node id. The hub admits a new process of a node id
-   and refuses the one it replaced (:class:`~aar.hub.leaseboard.FeedConflict`, and the
-   node shows ``stale``); the refused feed stops, and its process must be stopped.
+2. One shared ``BranchRegistry`` per node, passed to every ``make_hot_op`` the job runner
+   builds. Each job's ops run with the job's own agent as holder (``Holder.agent(<agent
+   id>)``); a job without a valid agent id is refused at submit. ``job-runner:<node>`` is
+   never an op holder.
+3. The branch guard is on for every op, in every project, production or not. An op it
+   refuses (shared project state, a human's timeline) waits for a ``project.write``
+   approval on target ``<Resolve project id>#op:<op name>``
+   (:func:`aar.node.jobs.runner.op_approval_target`); the job consumes it (audited as
+   ``agent:<agent id>#<job id>``), then builds that one op with ``require_branch=False``,
+   the only production path to it. The render ops carry a named ``guard_exemption``: they
+   read the timeline and touch only the render jobs their own job created.
+4. ``LeaseManager`` and ``NodeFeed`` are built by :func:`aar.node.feed.wire_feed`, bound
+   late: the feed's ``lease_source`` is the lease table's ``active``, and both use the
+   runtime's (monotonic) clock.
+5. The job runner's pump calls ``PresenceReporter.sync()`` and then ``NodeFeed.flush()``
+   on every tick. The feed backs off by itself while the hub is unreachable
+   (``FlushReport.retry_at``), so that is cheap.
+6. Each ``timeline.branch`` result a job gets goes to :func:`record_branch` (through
+   ``aar.node.hublink.LocalHubLink.record_branch``) with the hub's ``prj_...`` id (the one
+   registry project whose source carries the Resolve uid, else the one with its name; none
+   or several is an alert on the job) and ``Actor("node", <the feed's node id>)``. A record
+   the hub could not take is sent again on later pumps, and after a restart.
+7. Exactly one live ``NodeFeed`` per node id: a process refuses a second runtime for an
+   open node id (``NodeIdInUse``). The hub admits a new process of a node id and refuses
+   the one it replaced (:class:`~aar.hub.leaseboard.FeedConflict`, and the node shows
+   ``stale``); the refused feed stops, and its process must be stopped.
 8. The remote transport (F-S11-1) runs :func:`~aar.hub.leaseboard.deliver_feed_event` on
    the hub and reports back to the node: "unreachable" as an ``OSError`` (the feed keeps
    the spec and backs off), "refused" as a ``ValueError`` (quarantined), and a
@@ -53,7 +56,9 @@ lands after S11 and wires them; it must do all of this:
    every resend; the feed reuses keys, orders its events itself (``feed.seq``) and drains
    under lost acks (S11f), so a late or duplicate delivery is harmless.
 
-Until then these are the hub-side primitives the tests drive.
+The node's ``HubLink`` (approvals, stops, branch records) follows the same error contract
+as the feed transport: ``OSError`` unreachable (the job waits, fail-closed), ``ValueError``
+refused.
 """
 
 from __future__ import annotations
