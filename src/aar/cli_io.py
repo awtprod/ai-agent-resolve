@@ -90,7 +90,11 @@ def _flush(stream: TextIO | None) -> int:
 def finalize(code: int) -> int:
     """Flush stdout and stderr after a path that wrote with bare ``print`` (argparse help,
     usage and version). A failed stdout flush overrides the exit code with 74/141; a failed
-    stderr flush is silenced but leaves the code. Either way no exit-120 flush failure."""
-    out = _flush(sys.stdout)
+    stderr flush is silenced but leaves the code. Either way no exit-120 flush failure.
+
+    A closed stdout (``sys.stdout is None``) overrides only a success: help and version are
+    meant for stdout, so they report 74, but a usage error (exit 2) goes to stderr and keeps
+    its code, as every other command's input error does with a closed stdout."""
+    out = _flush(sys.stdout) if sys.stdout is not None or code == 0 else 0
     _flush(sys.stderr)
     return out or code
