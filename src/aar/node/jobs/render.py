@@ -187,7 +187,11 @@ class RenderStep(Step):
                     )
                 )
             # Ready / Rendering / background states: poll again next pump, do not block the broker.
-            return Pause("rendering", f"render job {cur['render_job_id']} is {status!r}")
+            return Pause(
+                "rendering",
+                f"render job {cur['render_job_id']} is {status!r}",
+                progress=[status, v.get("completion")],
+            )
 
         if phase == "cleanup":
             if out is None:
@@ -197,9 +201,15 @@ class RenderStep(Step):
             measured = dict(cur["measured"])
             if not out.ok:
                 assert out.error is not None
+                measured["cleanup"] = "failed"
                 measured["cleanup_note"] = (
                     f"the completed render job could not be removed from the queue: "
                     f"{out.error.message}"
+                )
+            else:
+                # deleted=False: it was already gone from the queue (a human removed it).
+                measured["cleanup"] = (
+                    "deleted" if out.value_dict().get("deleted") else "already_gone"
                 )
             return Done(measured)
 

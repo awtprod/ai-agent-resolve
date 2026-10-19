@@ -77,6 +77,9 @@ def test_a_foreign_same_named_timeline_made_during_the_op_is_never_deleted(
     assert _deletes(show) == []
     assert "removed" not in error.detail and "left_behind" not in error.detail
     assert "created_timeline_id" not in error.detail
+    # S7 x S11 (S11f r2 LOW): a same-named timeline that appeared during the call is named, as
+    # a possible copy, report only: never deleted (above), never claimed as ours.
+    assert error.detail["possible_copies"] == [{"name": BRANCH_V1, "unique_id": "tl-FOREIGN"}]
 
 
 # -- (ii) with two same-named new timelines, only the carried id is touched -------------------

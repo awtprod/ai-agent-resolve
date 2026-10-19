@@ -890,14 +890,16 @@ class JobRunner:
             self._enter_wait_blocked(job, stop, now)
 
     def _advance(self, job: JobRecord, now: float) -> None:
-        if job.state in TERMINAL_STATES or job.state is JobState.STALLED or job.readonly:
+        if job.readonly:
+            return
+        rt = self._runtime[job.job_id]
+        if rt.branch_records:  # a finished job's branch records are sent too
+            self._retry_branch_records(job, rt, now)
+        if job.state in TERMINAL_STATES or job.state is JobState.STALLED:
             return
         pid = job.target.project_id
         if pid in self._stalled_projects:
             return  # a stalled project stops scheduling for every job in it
-        rt = self._runtime[job.job_id]
-        if rt.branch_records:
-            self._retry_branch_records(job, rt, now)
         if rt.verify_pending:
             try:
                 self._verify_approval(job, now)
@@ -969,9 +971,23 @@ class JobRunner:
         elif isinstance(action, Fail):
             self._fail(job, action.error, now)
         elif isinstance(action, Pause):
-            return  # the step is polling; nothing to persist
+            self._note_progress(job, action, now)
         else:  # pragma: no cover - the action union is closed
             raise TypeError(f"step {step.name} returned {type(action).__name__}")
+
+    def _note_progress(self, job: JobRecord, action: Pause, now: float) -> None:
+        """A polling step: persist its progress mark when it changes, and forget the node
+        restarts counted against the step once it demonstrably moved on (LOW-4). No event per
+        poll; one ``progress_after_restart`` event when a count is forgotten."""
+        if action.progress is None or job.cursor.get("_progress") == action.progress:
+            return  # no observable progress: nothing to persist (polls are not checkpointed)
+        job.cursor["_progress"] = action.progress
+        events: list[tuple[str, dict[str, Any], float]] = []
+        if job.restarts:
+            events.append(("progress_after_restart", {"restarts": job.restarts}, now))
+            job.restarts = 0
+        job.updated_at = now
+        self._checkpoint(job, events, now)
 
     def _handle_submit(
         self, job: JobRecord, rt: _Runtime, step: Step, action: Submit, now: float

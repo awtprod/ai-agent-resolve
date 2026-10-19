@@ -186,6 +186,10 @@ class Pause:
 
     code: str
     message: str
+    progress: Any = None
+    """An observable progress mark (JSON-serialisable), e.g. a render's status and percent.
+    When it changes, the step demonstrably moved on, so the runner forgets the node restarts
+    it counted against this step (a healthy long render is never a crash loop)."""
 
 
 StepAction = Submit | Done | Fail | Pause
