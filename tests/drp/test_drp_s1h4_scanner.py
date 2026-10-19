@@ -141,3 +141,76 @@ def test_duplicate_attribute_issues_are_capped_per_code() -> None:
     assert len(listed) == 100  # the per-code cap
     [more] = [i for i in doc.issues if i.code == "issues-truncated"]
     assert more.message.startswith("899 more duplicate-attribute")  # 999 repeats, 100 listed
+
+
+# ------------------------------------------------------------ pins for the validator's survivors
+# Round 2 L4: each test below fails on one mutant that survived the round-1 suite (the id is the
+# validator's, in aar-evidence/s1h4-val/mut/). They pin behaviour, not wording.
+
+
+def test_an_empty_double_quoted_value_is_an_empty_string_not_a_missing_one() -> None:
+    # S17: `dq or sq` read "" as absent and then decoded None.
+    doc = scan(b"<a x=\"\" y=''/>")
+    assert doc.root is not None and doc.root.attrs == {"x": "", "y": ""}
+    assert doc.issues == []
+
+
+def test_whitespace_may_precede_the_closing_angle_bracket() -> None:
+    # S18: `<a b="1" >` and `<a />` are well-formed; without the leading \s* they became
+    # unterminated tags and the whole element vanished into the gap.
+    for data, tag, attrs in (
+        (b'<a b="1" ></a>', "a", {"b": "1"}),
+        (b"<a />", "a", {}),
+        (b"<a\n\t>t</a>", "a", {}),
+    ):
+        doc = scan(data)
+        assert doc.issues == [], data
+        assert doc.root is not None and (doc.root.tag, doc.root.attrs) == (tag, attrs), data
+
+
+def test_an_attribute_needs_whitespace_before_it() -> None:
+    # S19: `<a b="1"c="2">` is not well-formed XML; reading it as two attributes would let a
+    # malformed tag pass the gate as valid. It stays an unparsed tag.
+    doc = scan(b'<a b="1"c="2"></a>')
+    assert doc.roots == []
+    assert "unparsed-markup" in {i.code for i in doc.issues}
+
+
+def test_the_bytes_of_a_start_tag_are_work() -> None:
+    # S21: `work` is what the reader's total byte budget adds up, so a member that is mostly
+    # start tags must not be free. Every byte of a completely scanned member is examined at
+    # least once, and the attributes of a tag are the tag's bytes.
+    for data in (b'<a b="1">x</a>', b"<a/>", _attr_tag(40), b"<r><a k='v'/><b/></r>"):
+        assert scan(data).work >= len(data), data
+    one = scan(_attr_tag(1)).work
+    many = scan(_attr_tag(101)).work
+    assert many - one >= 100 * len(b' k0="v"'), (one, many)
+
+
+def test_a_run_of_unterminated_tags_trips_the_element_budget() -> None:
+    # S10: an unterminated start tag is skipped, but it is still a token that was materialised.
+    doc = scan(b"<a " * 10, "m.xml", max_elements=5)
+    assert doc.element_count == 5
+    assert doc.stopped_at == 15  # the sixth "<a"
+    assert [i.code for i in doc.issues] == ["budget-exceeded"]
+
+
+def test_a_run_of_unmatched_end_tags_trips_the_element_budget() -> None:
+    # S25: "</" that is not a close tag is skipped, but it is a token too.
+    doc = scan(b"</" * 10, "m.xml", max_elements=5)
+    assert doc.element_count == 5
+    assert doc.stopped_at == 10
+    assert [i.code for i in doc.issues] == ["budget-exceeded"]
+    assert scan(b"</>" * 3).element_count == 3
+
+
+def test_a_budget_stop_inside_a_tag_leaves_no_pending_gap() -> None:
+    # S07: the budget can run out between two attributes of one tag. The rest of the member is
+    # then not read, so no text before it may be reported as unparsed markup or stray text.
+    for data, limit in (
+        (b'<a b="1" c="2">tail<x/>', 2),
+        (b'<r><a b="1" c="2" d="3"/>tail<x/></r>', 4),
+    ):
+        doc = scan(data, "m.xml", max_elements=limit)
+        assert doc.stopped_at is not None, data
+        assert [i.code for i in doc.issues] == ["budget-exceeded"], (data, doc.issues)
