@@ -11,7 +11,7 @@ import pytest
 from plan_support import FIXTURES, PlanData, only
 from pydantic import ValidationError
 
-from aar.plan.lint import LintReport
+from aar.plan.lint import LintReport, all_rules
 from aar.plan.model import EditPlan, Head
 from aar.plan.profile import Profile
 
@@ -112,6 +112,14 @@ def test_a_profile_can_regrade_the_rule(
     assert finding.severity == "warn"
 
 
+def test_the_rule_is_registered_as_an_error_rule_without_thresholds() -> None:
+    registered = all_rules()[RULE]
+    assert registered.severity == "error"
+    assert registered.params == ()
+    assert registered.needs == ()
+    assert "BRAW" in registered.summary
+
+
 def test_the_ccn_profile_runs_the_rule_as_an_error(ccn: Profile) -> None:
     config = ccn.rules[RULE]
     assert config.enabled is True
@@ -142,6 +150,16 @@ def test_a_version_that_is_not_the_whole_number_1_or_2_is_one_error_at_version(
     assert error["loc"] == ("version",)
     assert error["type"] == "literal_error"
     assert str(error["msg"]).startswith("Input should be 1 or 2")
+
+
+@pytest.mark.parametrize("version", ["2", "1", 0, 3, None, [2]])
+def test_any_other_bad_version_keeps_the_plain_message(
+    clean_data: PlanData, version: object
+) -> None:
+    """The "not a boolean or a decimal" note is only for a boolean or a decimal."""
+    clean_data["version"] = version
+    [error] = version_errors(clean_data)
+    assert error["msg"] == "Input should be 1 or 2"
 
 
 @pytest.mark.parametrize("version", [True, 1.0, 2.0])
