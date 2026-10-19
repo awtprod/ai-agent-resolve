@@ -9,6 +9,7 @@ import pytest
 from aar.node.leases import Holder
 from aar.node.ops import OpError, submit_op
 
+from .fake_resolve import FakeResolve
 from .ops_support import AGENT, Show
 
 VERTICAL = {"width": 1080, "height": 1920}
@@ -159,4 +160,24 @@ def test_a_branch_refused_before_any_copy_deletes_nothing() -> None:
     show.fake.faults.add("DuplicateTimeline:detached")  # returns a timeline not in the project
     error = show.fails("timeline.branch", {"source": show.ref("Main")})
     assert error.code == "duplicate_unverified" and "removed" not in error.detail
+    assert not [call for call in show.fake.calls if call[0] == "DeleteTimelines"]
+
+
+def test_the_clean_up_never_deletes_a_same_named_timeline_that_was_there_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A human makes a timeline with the very name the branch is about to take (a race the
+    # version scan cannot see: here the scan is blinded). The duplicate is refused, and the
+    # clean-up must not take the human's timeline for its own half-made copy.
+    fake = FakeResolve(
+        {"Show": ["Main", "Main [agent]", f"Main [agent:{AGENT.id} v1]"]},
+        current="Show",
+        folder=("Shows",),
+    )
+    show = Show(fake)
+    monkeypatch.setattr("aar.node.ops.collab.branch_version_for", lambda *args: None)
+    before = {t.GetUniqueId() for t in show.project.timelines}
+    error = show.fails("timeline.branch", {"source": show.ref("Main")})
+    assert error.code == "timeline_exists" and "removed" not in error.detail
+    assert {t.GetUniqueId() for t in show.project.timelines} == before
     assert not [call for call in show.fake.calls if call[0] == "DeleteTimelines"]

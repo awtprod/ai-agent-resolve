@@ -673,3 +673,21 @@ def test_feed_fault_fuzz_every_view_matches_the_node_after_a_clean_drain(
         if problems:
             failures[seed] = problems
     assert failures == {}
+
+
+def test_a_gap_that_grows_while_pending_reports_its_latest_count(tmp_path: Path) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    clock = FakeClock()
+    transport = Faulty(log)
+    feed, leases = _wired(log, transport, clock, outbox_max=1)
+    feed.flush()
+    transport.down = True
+    for i in range(2):
+        leases.acquire(Holder.agent(f"a{i}"), Scope.PROJECT, (f"p{i}",), ttl=600)  # 1 drop
+    feed.flush()  # the gap (1 dropped) cannot be sent
+    clock.advance(BACKOFF_MAX)
+    leases.acquire(Holder.agent("a2"), Scope.PROJECT, ("p2",), ttl=600)  # a 2nd drop
+    transport.down = False
+    _drain(feed, clock)
+    gaps = [e.payload["dropped"] for e in log.read(types=["feed.gap"])]
+    assert gaps == [2]  # the pending gap was re-made with the new count (and a new key)
