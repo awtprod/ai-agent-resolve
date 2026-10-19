@@ -395,6 +395,18 @@ def edit_file(
         return outcome
     outcome.expected = [e.to_dict() for e in prepared.expected]
     outcome.report = prepared.report
+    if not prepared.expected and new_bytes == original:
+        # The plan changes nothing (every rename is to the current name, a path_map matched no
+        # path, ...). Writing a byte-identical "unverified" copy would be misleading, so refuse
+        # and write nothing; the report says what each edit matched.
+        outcome.refusals = [
+            Refusal(
+                "no-op",
+                "the plan changes nothing: every edit leaves the file exactly as it is, so no "
+                "output was written (see the report for what each edit matched)",
+            )
+        ]
+        return outcome
     with contextlib.ExitStack() as stack:
         if dry_run or out_path is None:
             directory = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="aar-edit-")))

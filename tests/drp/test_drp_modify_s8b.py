@@ -433,12 +433,15 @@ def test_fc_leftover_temp_files_are_reported_not_deleted(tmp_path: Path) -> None
 def test_fb_renaming_to_the_current_name_is_a_reported_no_op(
     tmp_path: Path, edit: dict[str, Any]
 ) -> None:
+    # L4: a plan whose only op is a same-name rename changes nothing, so it is refused and no
+    # labelled copy is written (it used to be written as a byte-identical "unverified" file).
     outcome, out = run(H264, tmp_path, edit)
-    assert outcome.status == "written", outcome.to_dict()["refusals"]
+    assert [r.code for r in outcome.refusals] == ["no-op"]
+    assert outcome.status == "refused"
     assert outcome.changes == [] and outcome.expected == []
     [report] = outcome.report
     assert report["unchanged"] is True and report["old"] == report["new"] == edit["new_name"]
-    assert out.read_bytes() == H264.read_bytes()
+    assert not out.exists()
 
 
 def test_fb_a_no_op_rename_beside_a_real_one(tmp_path: Path) -> None:
@@ -451,6 +454,47 @@ def test_fb_a_no_op_rename_beside_a_real_one(tmp_path: Path) -> None:
     assert outcome.status == "written", outcome.to_dict()["refusals"]
     assert [(c["object_kind"], c["new"]) for c in outcome.changes] == [("media", "Interview")]
     assert [r.get("unchanged", False) for r in outcome.report] == [True, False]
+
+
+# L4: every "this plan changes nothing" variant is refused the same way (no-op) and writes no
+# file; a plan with at least one real change still writes (above), and a case-only rename is a
+# real change, not a no-op.
+
+
+def test_l4_multiple_same_name_renames_write_nothing(tmp_path: Path) -> None:
+    drp = read_drp(H264)
+    pname, cname = drp.project.name, drp.media_by_id()[CLIP].name
+    outcome, out = run(
+        H264,
+        tmp_path,
+        {"op": "rename", "target": "project", "new_name": pname},
+        {"op": "rename", "target": "clip", "id": CLIP, "new_name": cname},
+    )
+    assert [r.code for r in outcome.refusals] == ["no-op"]
+    assert [r.get("unchanged") for r in outcome.report] == [True, True]
+    assert outcome.expected == [] and not out.exists()
+
+
+def test_l4_path_map_that_matches_no_path_writes_nothing(tmp_path: Path) -> None:
+    table = [{"windows": "Z:", "mac": "/Volumes/DoesNotExist"}]
+    outcome, out = run(
+        H264, tmp_path, {"op": "path_map", "direction": "mac_to_windows", "table": table}
+    )
+    assert [r.code for r in outcome.refusals] == ["no-op"]
+    assert not out.exists()
+    [report] = outcome.report
+    assert report["op"] == "path_map" and report["touched"] == []
+
+
+def test_l4_case_only_rename_is_a_real_change_and_is_written(tmp_path: Path) -> None:
+    pname = read_drp(H264).project.name
+    assert pname != pname.upper()  # the corpus project name has letters
+    outcome, out = run(
+        H264, tmp_path, {"op": "rename", "target": "project", "new_name": pname.upper()}
+    )
+    assert outcome.status == "written", outcome.to_dict()["refusals"]
+    assert [(c["object_kind"], c["new"]) for c in outcome.changes] == [("project", pname.upper())]
+    assert read_drp(out).project.name == pname.upper()
 
 
 # --------------------------------------------------------------------------- F-H
