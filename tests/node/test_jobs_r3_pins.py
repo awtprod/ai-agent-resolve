@@ -1130,3 +1130,42 @@ def test_refused_consume_clears_the_pending_intent(tmp_path: Path) -> None:
     rec = world.store.get(job_id)
     assert rec.state is JobState.WAITING and rec.waiting.detail["refused_code"]
     assert rec.approval_pending is None
+
+
+def test_cancel_while_the_last_poll_is_in_flight_alerts_only_a_live_render(
+    tmp_path: Path,
+) -> None:
+    """Kills F49 (orphan check ignores an ended poll): the job is cancelled while a poll op is
+    running; its late result decides the alert -- none if the render had already finished."""
+    world = JobWorld(tmp_path, drain_budget=0.5)
+    world.project.render_complete_after = 10_000
+    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    for _ in range(5):
+        world.runner.pump()
+    assert world.store.get(job_id).cursor.get("phase") == "poll"
+    proj = world.project
+    entered, release = threading.Event(), threading.Event()
+    real_status = proj.GetRenderJobStatus
+
+    def hung_status(job):
+        entered.set()
+        assert release.wait(WAIT)
+        return real_status(job)
+
+    proj.GetRenderJobStatus = hung_status  # type: ignore[method-assign]
+    for _ in range(20):  # each pump submits a poll or waits on the drain that runs one
+        world.runner.pump()
+        if entered.is_set():
+            break
+    assert entered.wait(WAIT)
+    assert world.runner.cancel(job_id)
+    rj = proj.render_jobs[0]
+    rj.status, rj.completion = "Complete", 100  # it finished meanwhile
+    proj.rendering = False
+    release.set()
+    assert world.runner.wait_drain(WAIT)
+    world.runner.pump()
+    view = world.runner.get(job_id)
+    late = [e for e in view.events if e["kind"] == "late_result"]
+    assert len(late) == 1 and late[0]["data"]["status"] == "ok"
+    assert view.alerts == []  # the render is over: nothing orphaned
