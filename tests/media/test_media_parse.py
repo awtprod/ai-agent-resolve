@@ -78,7 +78,9 @@ def test_ebur128_without_a_complete_summary_raises(text):
 
 def test_astats_without_overall_raises():
     with pytest.raises(ParseError):
-        parse_astats("[Parsed_astats_0 @ 0x1] Channel: 1\n[Parsed_astats_0 @ 0x1] Peak level dB: -3\n")
+        parse_astats(
+            "[Parsed_astats_0 @ 0x1] Channel: 1\n[Parsed_astats_0 @ 0x1] Peak level dB: -3\n"
+        )
 
 
 def test_silencedetect_open_silence_at_end_and_negative_start():
@@ -122,7 +124,12 @@ def test_parse_probe_json_tolerates_missing_and_junk_fields():
         {
             "format": {"format_name": "mov", "duration": "N/A", "bit_rate": "x"},
             "streams": [
-                {"index": 0, "codec_type": "video", "avg_frame_rate": "0/0", "r_frame_rate": "25/1"},
+                {
+                    "index": 0,
+                    "codec_type": "video",
+                    "avg_frame_rate": "0/0",
+                    "r_frame_rate": "25/1",
+                },
                 {"index": 1, "codec_type": "video", "disposition": {"attached_pic": 1}},
                 {"index": 2, "codec_type": "audio", "sample_rate": "48000", "channels": 2},
                 "junk",

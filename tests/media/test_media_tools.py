@@ -85,7 +85,10 @@ def test_non_zero_exit_carries_code_and_stderr_tail(monkeypatch, tmp_path):
 
 @posix_only
 def test_stderr_is_bounded_and_keeps_the_tail(monkeypatch, tmp_path):
-    body = "i=0\nwhile [ $i -lt 4000 ]; do echo \"line $i padding padding padding\" >&2; i=$((i+1)); done"
+    body = (
+        'i=0\nwhile [ $i -lt 4000 ]; do echo "line $i padding padding padding" >&2; '
+        "i=$((i+1)); done"
+    )
     tool = fake_tool(tmp_path, "chatty", body)
     monkeypatch.setenv("AAR_FFMPEG", str(tool))
     result = run_tool("ffmpeg", [], timeout_s=20, stderr_limit=4096)
@@ -97,7 +100,7 @@ def test_stderr_is_bounded_and_keeps_the_tail(monkeypatch, tmp_path):
 
 @posix_only
 def test_stdout_limit_kills_and_raises(monkeypatch, tmp_path):
-    tool = fake_tool(tmp_path, "flood", "while true; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done")
+    tool = fake_tool(tmp_path, "flood", "while true; do echo xxxxxxxxxxxxxxxxxxxxxxxx; done")
     monkeypatch.setenv("AAR_FFMPEG", str(tool))
     started = time.monotonic()
     with pytest.raises(OutputTooLarge):
@@ -127,7 +130,9 @@ def test_unstartable_binary_is_tool_missing(monkeypatch, tmp_path):
         run_tool("ffmpeg", [], timeout_s=5)
 
 
-@pytest.mark.parametrize("name", ["-leading-dash.wav", "has spaces.wav", "ünïcødé ✓.wav", "a:b.wav"])
+@pytest.mark.parametrize(
+    "name", ["-leading-dash.wav", "has spaces.wav", "ünïcødé ✓.wav", "a:b.wav"]
+)
 def test_input_url_is_absolute_and_never_an_option(tmp_path, monkeypatch, name):
     monkeypatch.chdir(tmp_path)
     url = input_url(name)

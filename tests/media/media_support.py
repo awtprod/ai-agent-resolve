@@ -64,7 +64,9 @@ def aeval(
     return path
 
 
-def sine(path: Path, peak_dbfs: float, *, seconds: float = 2.0, freq: int = 1000, **kw: Any) -> Path:
+def sine(
+    path: Path, peak_dbfs: float, *, seconds: float = 2.0, freq: int = 1000, **kw: Any
+) -> Path:
     return aeval(path, f"{amp(peak_dbfs)}*sin(2*PI*{freq}*t)", seconds=seconds, **kw)
 
 
@@ -93,7 +95,8 @@ def gapped(
 
 def square(path: Path, *, seconds: float = 1.0, **kw: Any) -> Path:
     """A full-scale 100 Hz square wave: every sample is clipped."""
-    return aeval(path, "if(lt(mod(t*100\\,1)\\,0.5)\\,1\\,-1)", seconds=seconds, codec="pcm_s16le", **kw)
+    expr = "if(lt(mod(t*100\\,1)\\,0.5)\\,1\\,-1)"
+    return aeval(path, expr, seconds=seconds, codec="pcm_s16le", **kw)
 
 
 def render(

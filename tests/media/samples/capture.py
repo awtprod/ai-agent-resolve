@@ -43,7 +43,7 @@ def main() -> None:
         expr = "if(between(t\\,0.7\\,1.7)\\,0\\,0.1*sin(2*PI*440*t))"
         run("-y", "-f", "lavfi", "-i", f"aevalsrc={expr}|{expr}:s=48000:d=2.5", str(gap))
         (HERE / "chain_gap.txt").write_text(
-            keep(run("-v", "info", "-i", str(gap), "-map", "0:a:0", "-af", CHAIN, "-f", "null", "-"))
+            keep(run("-v", "info", "-i", str(gap), "-af", CHAIN, "-f", "null", "-"))
         )
         quiet = scratch / "quiet.wav"
         run("-y", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=1", str(quiet))
@@ -51,13 +51,20 @@ def main() -> None:
             keep(run("-v", "info", "-i", str(quiet), "-af", CHAIN, "-f", "null", "-"))
         )
         nan = scratch / "nan.wav"
-        run("-y", "-f", "lavfi", "-i", "aevalsrc=0/0|0:s=48000:d=0.5", "-c:a", "pcm_f32le", str(nan))
+        src = "aevalsrc=0/0|0:s=48000:d=0.5"
+        run("-y", "-f", "lavfi", "-i", src, "-c:a", "pcm_f32le", str(nan))
         (HERE / "astats_nan_perchannel.txt").write_text(
             keep(
                 run(
-                    "-v", "info", "-i", str(nan), "-af",
+                    "-v",
+                    "info",
+                    "-i",
+                    str(nan),
+                    "-af",
                     "astats=measure_overall=Peak_level+Number_of_NaNs+Number_of_Infs",
-                    "-f", "null", "-",
+                    "-f",
+                    "null",
+                    "-",
                 )
             )
         )

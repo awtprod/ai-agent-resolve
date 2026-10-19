@@ -118,9 +118,11 @@ def test_live_stderr_feeds_the_pure_parsers(tmp_path):
     path = sine(tmp_path / "s.wav", -20.0, seconds=1.0)
     result = run_tool(
         "ffmpeg",
-        ["-hide_banner", "-nostdin", "-nostats", "-i", input_url(path), "-af"]
-        + ["astats=measure_perchannel=none,silencedetect=n=-42dB:d=0.2,ebur128=peak=true"]
-        + ["-f", "null", "-"],
+        [
+            *("-hide_banner", "-nostdin", "-nostats", "-i", input_url(path), "-af"),
+            "astats=measure_perchannel=none,silencedetect=n=-42dB:d=0.2,ebur128=peak=true",
+            *("-f", "null", "-"),
+        ],
         timeout_s=60,
     )
     assert parse_ebur128(result.stderr).integrated_lufs == pytest.approx(-20.0, abs=0.1)
@@ -171,13 +173,19 @@ def test_read_pcm_clamps_a_negative_start_and_stops_at_the_end(tmp_path):
 
 def test_count_clipped_square_and_sine(tmp_path):
     clipped = count_clipped(
-        square(tmp_path / "sq.wav", channels=1), level=LEVEL, channels=1, sample_rate=48000,
+        square(tmp_path / "sq.wav", channels=1),
+        level=LEVEL,
+        channels=1,
+        sample_rate=48000,
         timeout_s=60,
     )
     assert clipped.clipped == 48000 == clipped.scanned
     assert clipped.first_s == 0.0
     clean = count_clipped(
-        sine(tmp_path / "s.wav", -6.0, channels=2), level=LEVEL, channels=2, sample_rate=48000,
+        sine(tmp_path / "s.wav", -6.0, channels=2),
+        level=LEVEL,
+        channels=2,
+        sample_rate=48000,
         timeout_s=60,
     )
     assert clean.clipped == 0 and clean.first_s is None
