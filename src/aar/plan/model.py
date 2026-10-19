@@ -34,6 +34,7 @@ from typing import Annotated, Literal
 from pydantic import (
     AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     ValidationError,
@@ -43,7 +44,25 @@ from pydantic import (
 from pydantic_core import InitErrorDetails, PydanticCustomError
 
 PLAN_VERSION = 2
-PlanVersion = Literal[1, 2]
+
+
+def _whole_number_version(value: object) -> object:
+    """Refuse ``true`` and ``1.0``: pydantic would coerce them to 1, but the version is a label.
+
+    ``Literal`` cannot be made strict, so the check is a before-validator. It raises the same
+    ``literal_error`` that 0, 3 and ``"2"`` get, so every bad version reads alike, once, at the
+    ``version`` loc.
+    """
+    if isinstance(value, (bool, float)):
+        raise PydanticCustomError(
+            "literal_error",
+            "Input should be 1 or 2 (a whole number, not a boolean or a decimal)",
+            {"expected": "1 or 2"},
+        )
+    return value
+
+
+PlanVersion = Annotated[Literal[1, 2], BeforeValidator(_whole_number_version)]
 
 #: Fields only a version 2 plan may use, per model.
 V2_PLAN_FIELDS = ("template", "head", "outro", "audio_tracks", "end_fade_frames")

@@ -1,13 +1,16 @@
-"""S13a-f: the BRAW input-colour-space safety rule (validator finding F2)."""
+"""S13a-f validator follow-ups: the BRAW input-colour-space rule (F2) and the plan version (F1)."""
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 
 import pytest
 from plan_support import PlanData, only
+from pydantic import ValidationError
 
 from aar.plan.lint import LintReport
+from aar.plan.model import EditPlan
 from aar.plan.profile import Profile
 
 RunLint = Callable[..., LintReport]
@@ -112,3 +115,75 @@ def test_the_ccn_profile_runs_the_rule_as_an_error(ccn: Profile) -> None:
     assert config.enabled is True
     assert config.severity is None  # the rule's own severity, which is "error"
     assert config.params == {}
+
+
+# --- F1: the plan version is a whole number ---------------------------------------------------
+
+
+def version_errors(data: PlanData, *, as_json: bool = False) -> list[dict[str, object]]:
+    """The errors validating ``data`` gives, through Python input or through JSON text."""
+    with pytest.raises(ValidationError) as caught:
+        if as_json:
+            EditPlan.model_validate_json(json.dumps(data))
+        else:
+            EditPlan.model_validate(data)
+    return [dict(error) for error in caught.value.errors()]
+
+
+@pytest.mark.parametrize("version", [True, False, 1.0, 2.0, 0.0, 1.5, "2", "1", 0, 3, None, [2]])
+@pytest.mark.parametrize("as_json", [False, True], ids=["python", "json"])
+def test_a_version_that_is_not_the_whole_number_1_or_2_is_one_error_at_version(
+    clean_data: PlanData, version: object, as_json: bool
+) -> None:
+    clean_data["version"] = version
+    [error] = version_errors(clean_data, as_json=as_json)
+    assert error["loc"] == ("version",)
+    assert error["type"] == "literal_error"
+    assert str(error["msg"]).startswith("Input should be 1 or 2")
+
+
+@pytest.mark.parametrize("version", [True, 1.0, 2.0])
+def test_the_error_for_a_boolean_or_decimal_version_says_what_is_wrong(
+    clean_data: PlanData, version: object
+) -> None:
+    clean_data["version"] = version
+    [error] = version_errors(clean_data)
+    assert "whole number" in str(error["msg"])
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["python", "json"])
+@pytest.mark.parametrize("version", [1, 2])
+def test_the_whole_numbers_1_and_2_still_work(
+    clean_data: PlanData, version: int, as_json: bool
+) -> None:
+    clean_data["version"] = version
+    if as_json:
+        plan = EditPlan.model_validate_json(json.dumps(clean_data))
+    else:
+        plan = EditPlan.model_validate(clean_data)
+    assert plan.version == version
+    assert type(plan.version) is int
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["python", "json"])
+def test_an_omitted_version_is_still_2(clean_data: PlanData, as_json: bool) -> None:
+    del clean_data["version"]
+    if as_json:
+        plan = EditPlan.model_validate_json(json.dumps(clean_data))
+    else:
+        plan = EditPlan.model_validate(clean_data)
+    assert plan.version == 2
+
+
+def test_a_bad_version_does_not_pile_a_second_error_on_a_v1_plan(clean_data: PlanData) -> None:
+    """The version is wrong, so the v1/v2 check never runs: still one error."""
+    clean_data["version"] = True
+    clean_data["template"] = "Example Template"  # a v2 field; would be a plan_version error
+    assert len(version_errors(clean_data)) == 1
+
+
+def test_the_version_schema_is_still_the_integer_1_or_2() -> None:
+    schema = EditPlan.model_json_schema()["properties"]["version"]
+    assert schema["type"] == "integer"
+    assert schema["enum"] == [1, 2]
+    assert schema["default"] == 2
