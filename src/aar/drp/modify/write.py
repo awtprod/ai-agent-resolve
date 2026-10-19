@@ -193,6 +193,15 @@ def _precheck(
                 details={"paths": existing},
             )
         )
+    elif force and sidecar.is_file() and not _is_our_sidecar(sidecar, out):
+        refusals.append(
+            Refusal(
+                "foreign-sidecar",
+                f"a label {sidecar} that aar drp edit did not write is already here, so --force "
+                "leaves it and the output untouched; move or delete it, or choose another --out",
+                details={"sidecar": str(sidecar)},
+            )
+        )
     if not out.parent.is_dir():
         refusals.append(
             Refusal("no-output-dir", f"the output directory {out.parent} does not exist")
@@ -217,17 +226,24 @@ def leftovers(out: Path) -> list[Path]:
     return sorted(out.parent / n for n in names if any(p.fullmatch(n) for p in patterns))
 
 
-def _orphan_sidecar(out: Path, sidecar: Path) -> bool:
-    """``sidecar`` is a label this tool wrote for ``out``, and ``out`` itself does not exist."""
-    if out.exists() or out.is_symlink() or not sidecar.is_file():
-        return False
+def _is_our_sidecar(sidecar: Path, out: Path) -> bool:
+    """``sidecar`` is a label this tool wrote for this exact ``out`` (see DESIGN "Modify").
+
+    Recognised by the stamp every ``aar drp edit`` sidecar carries: a ``tool`` field of
+    ``aar <version>``, a ``label`` and ``status`` of ``unverified`` (the only states a sidecar on
+    disk is ever written in), and an ``output`` object whose ``path`` and ``sidecar`` name this
+    output file and this label. ``--force`` replaces only a sidecar that bears this stamp; any
+    other file at the path is left untouched.
+    """
     try:
-        if sidecar.stat().st_size > _MAX_SIDECAR_BYTES:
+        if not sidecar.is_file() or sidecar.stat().st_size > _MAX_SIDECAR_BYTES:
             return False
         record = json.loads(sidecar.read_bytes())
     except (OSError, ValueError, RecursionError):
         return False
-    output = record.get("output") if isinstance(record, dict) else None
+    if not isinstance(record, dict):
+        return False
+    output = record.get("output")
     return (
         isinstance(output, dict)
         and str(record.get("tool", "")).startswith("aar ")
@@ -236,6 +252,13 @@ def _orphan_sidecar(out: Path, sidecar: Path) -> bool:
         and Path(str(output.get("path"))).name == out.name
         and Path(str(output.get("sidecar"))).name == sidecar.name
     )
+
+
+def _orphan_sidecar(out: Path, sidecar: Path) -> bool:
+    """``sidecar`` is a label this tool wrote for ``out``, and ``out`` itself does not exist."""
+    if out.exists() or out.is_symlink():
+        return False
+    return _is_our_sidecar(sidecar, out)
 
 
 def _read_input(path: Path, max_bytes: int) -> bytes:

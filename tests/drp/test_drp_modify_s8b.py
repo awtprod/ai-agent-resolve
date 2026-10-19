@@ -598,6 +598,39 @@ def test_fe_a_failed_placement_removes_the_new_sidecar(
     assert list(tmp_path.iterdir()) == []
 
 
+# L1: --force must not overwrite a <out>.aar.json a human owns; it replaces only aar's own label.
+
+
+def test_l1_force_refuses_a_foreign_sidecar_and_touches_nothing(tmp_path: Path) -> None:
+    out = tmp_path / "out.drp"
+    sidecar = Path(str(out) + SIDECAR_SUFFIX)
+    out.write_bytes(b"a human's own output")
+    sidecar.write_text('{"owner": "a human", "keep": true}')
+    before = (out.read_bytes(), sidecar.read_bytes())
+    outcome = edit_file(H264, plan(RENAME), out, force=True)
+    assert [r.code for r in outcome.refusals] == ["foreign-sidecar"]
+    assert outcome.status == "refused" and outcome.output is None
+    assert outcome.refusals[0].details == {"sidecar": str(sidecar)}
+    assert (out.read_bytes(), sidecar.read_bytes()) == before  # neither file changed
+    assert sorted(p.name for p in tmp_path.iterdir()) == [out.name, sidecar.name]  # no temp file
+
+
+def test_l1_force_still_replaces_our_own_sidecar(tmp_path: Path) -> None:
+    first, out = run(H264, tmp_path, RENAME)
+    assert first.status == "written"
+    sidecar = Path(str(out) + SIDECAR_SUFFIX)
+    old_label = sidecar.read_bytes()
+    second = edit_file(H264, plan({**RENAME, "new_name": "y"}), out, force=True)
+    assert second.status == "written" and not second.refusals
+    assert sidecar.read_bytes() != old_label and read_drp(out).project.name == "y"
+
+
+def test_l1_design_states_the_force_sidecar_rule() -> None:
+    section = _design_modify_section()
+    assert "aar did not write is refused (`foreign-sidecar`)" in section
+    assert "`--force` replaces only the output and a label bearing that stamp" in section
+
+
 # Placement failures that really happen (no patched internals): the output name is taken by a
 # directory or a dangling symlink, or a name is too long for the filesystem.
 

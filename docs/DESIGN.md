@@ -82,7 +82,7 @@ Work is either hot or cold:
   Every write must pass the S2 gate, and its full change list must equal the plan's intended edits. Three rules bound what is edited and what is accepted:
   - **Inputs that read with warnings are refused** (`input-has-warnings`), because the gate can never pass for them. In the 64-file private corpus that is 16 files, all `blob-partial`; the other 48 can be edited.
   - **The round-trip allow-list** (`aar.drp.modify.roundtrip`) is used only to compare a file with Resolve's own re-export of it, never for the writer's output. It accepts exactly **11 opaque lines** that Resolve rewrites on every export: 3 playhead values, 3 pan/tilt preset DbIds, 2 `DbSavedTime` values, 1 project age, 1 save date inside the settings blob, and **1 save stamp in the root bin's fields blob**. The project's `LastModTimeInSecs` is accepted as a decoded header change on top of those. Each rule checks the bytes, not just the name.
-  - **Files are labelled `unverified`** (`<out>.aar.json`) until the sandbox round trip exists.
+  - **Files are labelled `unverified`** (`<out>.aar.json`) until the sandbox round trip exists. The label is a JSON file aar recognises as its own by the stamp it writes: a `tool` of `aar <version>`, a `label` and `status` of `unverified`, and an `output` block naming this file and this label. `--force` replaces only the output and a label bearing that stamp; a `<out>.aar.json` that aar did not write is refused (`foreign-sidecar`) and both files are left untouched.
 
 - **Create (S9).** There are two routes:
   1. Preferred: build the project with the scripting API in a sandbox, then call `ExportProject`. Resolve writes the file, so it is valid by construction.
