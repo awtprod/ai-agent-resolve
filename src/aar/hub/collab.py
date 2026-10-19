@@ -17,10 +17,12 @@ The project id the board uses is the Resolve project's unique id (the lease key)
 hub registry's ``prj_...`` id; the branch record carries both (the Resolve timeline ids and
 the hub project id on its row).
 
-No node runtime assembles the broker, feed and these recorders yet. Wiring the node's pump
-to call ``NodeFeed.flush`` and to record each ``timeline.branch`` result here is the job of
-whichever of S7 (the job runner) and S11 lands second; until then these are the hub-side
-primitives the tests drive directly.
+No node runtime assembles the broker, feed and these recorders yet. Wiring it is the job of
+whichever of S7 (the job runner) and S11 lands second: build the ``NodeFeed`` with the lease
+table's ``active`` and clock (so it reconciles), call ``NodeFeed.flush`` from the pump,
+record each ``timeline.branch`` result here with :func:`record_branch`, and pass the node's
+``BranchRegistry`` to ``submit_op`` (``require_branch`` stays on unless a ``project.write``
+approval was consumed). Until then these are the hub-side primitives the tests drive.
 """
 
 from __future__ import annotations
