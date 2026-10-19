@@ -31,7 +31,16 @@ CHECK_IDS = [
     "join-retranscribe",
     "caption-coverage",
 ]
-CHECK_KEYS = {"id", "status", "message", "skip_reason", "measured", "target", "details"}
+CHECK_KEYS = {
+    "id",
+    "status",
+    "message",
+    "skip_reason",
+    "measured",
+    "target",
+    "details",
+    "incomplete",
+}
 LINE = re.compile(r"^(PASS|WARN|FAIL|SKIP)\s+([a-z-]+): ", re.MULTILINE)
 
 
@@ -124,8 +133,12 @@ def test_a_short_at_target_passes_and_every_check_has_a_line(
     assert lines[0] == (
         f"qa {short_wav} (short, profile ccn): PASS: 4 pass, 0 warn, 0 fail, 5 skipped"
     )
-    # No fail or warn, so no detail lines: the head plus one line per check.
-    assert len(lines) == 10
+    assert lines[1] == (
+        "not checked or not fully checked: size-cap, duration, join-quiet, join-retranscribe, "
+        "caption-coverage"
+    )
+    # No fail or warn, so no detail lines: the head, the unchecked line, one line per check.
+    assert len(lines) == 11
     assert LINE.findall(out) == [
         ("PASS", "decode"),
         ("PASS", "loudness"),
@@ -179,7 +192,18 @@ def test_json_report_has_the_nine_checks_in_order(
     capsys: pytest.CaptureFixture[str], short_wav: Path, kind: str
 ):
     _, report = report_json(capsys, short_wav, "--kind", kind)
-    assert set(report) == {"file", "kind", "profile", "status", "ok", "counts", "media", "checks"}
+    assert set(report) == {
+        "file",
+        "kind",
+        "profile",
+        "status",
+        "ok",
+        "counts",
+        "unchecked",
+        "media",
+        "checks",
+    }
+    assert report["unchecked"] == CHECK_IDS[4:]
     assert report["kind"] == kind
     assert report["media"]["size_bytes"] == short_wav.stat().st_size
     assert [c["id"] for c in report["checks"]] == CHECK_IDS
@@ -441,7 +465,8 @@ def test_join_quiet_reads_plan_sources_next_to_the_plan_not_the_cwd(
     assert join["record_tc"] == "00:00:01:00"
     assert join["src_in_s"] == pytest.approx(1.24)
     assert join["longest_quiet_ms"] >= 150
-    assert join["contains_cut"] is True
+    assert join["quiet_ms_at_cut"] >= 150
+    assert join["run_at_cut"]["start_s"] <= 1.24 <= join["run_at_cut"]["end_s"]
 
 
 @needs_ffmpeg
@@ -458,8 +483,12 @@ def test_a_cut_in_the_middle_of_speech_fails_join_quiet(
     code, out, err = run(capsys, short_wav, "--kind", "short", "--plan", plan)
     assert (code, err) == (1, "")
     (line,) = [ln for ln in out.splitlines() if ln.startswith("FAIL  join-quiet:")]
-    assert "1 of 1 cuts lack a 60 ms run below -40 dBFS" in line
-    assert "      join 1 at 00:00:01:00: fail (longest quiet run 0.0 ms)" in out.splitlines()
+    assert "1 of 1 cuts do not start in a pause of 60 ms below -40 dBFS" in line
+    assert "no 60 ms pause within ±0.1 s of src_in, so re-cut it by ear" in line
+    assert (
+        "      join 1 at 00:00:01:00: fail (join 1 (record 00:00:01:00, src_in frame 62): no "
+        "60 ms pause within ±0.1 s of src_in, so re-cut it by ear)"
+    ) in out.splitlines()
 
     _, report = report_json(capsys, short_wav, "--kind", "short", "--plan", plan)
     join_quiet = checks_by_id(report)["join-quiet"]
@@ -469,7 +498,7 @@ def test_a_cut_in_the_middle_of_speech_fails_join_quiet(
 
 
 @needs_ffmpeg
-def test_plan_sources_that_cannot_be_read_skip_join_quiet(
+def test_plan_sources_that_cannot_be_read_warn_and_are_listed_unchecked(
     capsys: pytest.CaptureFixture[str], tmp_path: Path, short_wav: Path
 ):
     segments = [
@@ -478,11 +507,23 @@ def test_plan_sources_that_cannot_be_read_skip_join_quiet(
     ]
     plan = make_plan(tmp_path, segments=segments)  # src.wav is not next to the plan
     code, report = report_json(capsys, short_wav, "--kind", "short", "--plan", plan)
-    assert code == 0  # skipped is not failed
+    assert code == 0  # not checked is a warning, not a failure
+    assert report["status"] == "warn"
     join_quiet = checks_by_id(report)["join-quiet"]
-    assert join_quiet["status"] == "skipped"
-    assert join_quiet["skip_reason"] == "source-unreadable"
-    assert join_quiet["measured"] == {"cuts": 1, "failed": 0, "unchecked": 1}
+    assert join_quiet["status"] == "warn"
+    assert join_quiet["skip_reason"] is None
+    assert join_quiet["incomplete"] is True
+    assert join_quiet["measured"] == {
+        "cuts": 1,
+        "failed": 0,
+        "unchecked": 1,
+        "unchecked_reason": "source-unreadable",
+    }
+    assert "join-quiet" in report["unchecked"]
+    code, out, _ = run(capsys, short_wav, "--kind", "short", "--plan", plan)
+    assert code == 0
+    assert out.splitlines()[0].endswith("WARN: 5 pass, 1 warn, 0 fail, 3 skipped")
+    assert "join-quiet" in out.splitlines()[1]
 
 
 @needs_ffmpeg
@@ -516,7 +557,13 @@ def test_a_transcript_enables_caption_coverage(
     by_id = checks_by_id(report)
     coverage = by_id["caption-coverage"]
     assert coverage["status"] == ("pass" if code == 0 else "fail")
-    assert coverage["measured"] == {"kept_words": 2, "captions": 1, "uncovered": uncovered}
+    assert coverage["measured"] == {
+        "kept_words": 2,
+        "captions": 1,
+        "uncovered": uncovered,
+        "segments": 1,
+        "segments_unchecked": 0,
+    }
     assert [d["word"] for d in coverage["details"]] == ["world"] * uncovered
     # The CLI passes no transcriber, so the re-transcription check says so instead of passing.
     assert by_id["join-retranscribe"]["status"] == "skipped"
@@ -781,3 +828,11 @@ def test_json_report_for_a_file_name_that_is_not_utf8(
     assert report["file"] == str(path)
     code, out, _ = run(capsys, path, "--kind", "short")
     assert code == 0 and "bad\\udcff.wav" in out.splitlines()[0]
+
+
+def test_help_says_how_to_pass_a_dash_name(capsys: pytest.CaptureFixture[str]):
+    assert main(["qa", "check", "--help"]) == 0
+    text = " ".join(capsys.readouterr().out.split())
+    assert (
+        "A relative name that starts with '-' needs '--' before it or './' in front of it." in text
+    )

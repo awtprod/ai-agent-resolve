@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
+import shutil
+import signal
 import time
 from pathlib import Path
 
@@ -20,6 +23,7 @@ from aar.media import (
     resolve_tool,
     run_tool,
     timeout_for,
+    tools,
 )
 from aar.media.tools import require_regular_file
 
@@ -177,3 +181,80 @@ def test_timeout_for_grows_with_duration():
     assert timeout_for(float("nan")) == 60.0
     assert timeout_for(-1) == 60.0
     assert timeout_for(100.0, per_media_s=2.0) == 260.0
+
+
+# ---------------------------------------------------------------- round 2: normal-exit cleanup
+
+
+def _alive(pid: int) -> bool:
+    """True while ``pid`` runs (a zombie waiting for its reaper counts as gone)."""
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return False
+    return state != "Z"
+
+
+def _gone_soon(pid: int, within_s: float = 2.0) -> bool:
+    deadline = time.monotonic() + within_s
+    while time.monotonic() < deadline:
+        if not _alive(pid):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+@posix_only
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="needs /proc to see the leftover")
+def test_leftover_child_holding_the_pipes_is_killed_on_a_normal_exit(monkeypatch, tmp_path):
+    pidfile = tmp_path / "child.pid"
+    tool = fake_tool(
+        tmp_path,
+        "leaves-child",
+        f"echo out\necho err >&2\nsleep 30 &\necho $! > '{pidfile}'\nexit 0",
+    )
+    monkeypatch.setenv("AAR_FFMPEG", str(tool))
+    started = time.monotonic()
+    result = run_tool("ffmpeg", [], timeout_s=20)
+    elapsed = time.monotonic() - started
+    child = int(pidfile.read_text())
+    try:
+        assert elapsed < 2.0  # not the 5 s pipe-drain wait
+        assert result.returncode == 0
+        assert result.stdout == b"out\n"
+        assert result.stderr == "err\n"
+        assert _gone_soon(child)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(child, signal.SIGKILL)
+
+
+@posix_only
+@pytest.mark.skipif(shutil.which("setsid") is None, reason="needs setsid(1)")
+def test_a_pipe_held_outside_the_group_raises_instead_of_cutting_output(monkeypatch, tmp_path):
+    pidfile = tmp_path / "escaped.pid"
+    tool = fake_tool(
+        tmp_path,
+        "escapes",
+        # The child starts its own session, so killing the tool's group cannot reach it;
+        # the wrapper waits until it has, or the kill would win the race.
+        f"echo out\nsetsid sh -c 'echo $$ > \"{pidfile}\"; exec sleep 30' &\n"
+        f"while [ ! -s '{pidfile}' ]; do sleep 0.01; done\nsleep 0.1\nexit 0",
+    )
+    monkeypatch.setenv("AAR_FFMPEG", str(tool))
+    monkeypatch.setattr(tools, "_REAP_S", 0.5)
+    try:
+        started = time.monotonic()
+        with pytest.raises(MediaError, match="output pipes were still open") as caught:
+            run_tool("ffmpeg", [], timeout_s=20)
+        assert time.monotonic() - started < 3.0
+        assert caught.value.exit_code == 0
+    finally:
+        with contextlib.suppress(ProcessLookupError, ValueError, FileNotFoundError):
+            os.kill(int(pidfile.read_text()), signal.SIGKILL)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf"), -1.0, 0])
+def test_timeout_must_be_finite_and_positive(bad):
+    with pytest.raises(ValueError, match="finite"):
+        run_tool("ffmpeg", ["-version"], timeout_s=bad)

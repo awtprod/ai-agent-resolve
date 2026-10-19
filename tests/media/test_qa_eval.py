@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import pytest
 
+from aar.media import QuietRun
 from aar.plan.inputs import Transcript, Word
-from aar.plan.model import EditPlan
-from aar.plan.profile import QATargets, load_profile, parse_profile
+from aar.plan.model import EditPlan, Fps
+from aar.plan.profile import ProfileError, QATargets, load_profile, parse_profile
 from aar.qa import (
     agreement,
     cuts,
@@ -15,9 +16,11 @@ from aar.qa import (
     evaluate_quiet_run,
     evaluate_silence,
     evaluate_size,
+    judge_join_quiet,
     kept_words,
     resolve_media,
     straddled_words,
+    suggest_src_in,
     tokens,
 )
 from aar.qa.report import QACheck, build_report
@@ -263,6 +266,8 @@ def test_ccn_qa_block_matches_the_defaults():
         {"join_window_edge_s": 1.6},  # the edges eat the whole overlap
         {"join_quiet_window_ms": 80},
         {"join_quiet_min_ms": 250},  # cannot fit in +-0.1 s
+        {"join_quiet_slack_ms": 50},  # 60 + 50 ms does not fit in 0.1 s
+        {"join_quiet_slack_ms": -1},
         {"silence_db": 0},
         {"longest_silence_warn_s": 0},
         {"join_agreement_min": 1.5},
@@ -304,3 +309,116 @@ def test_kept_words_match_a_brute_force_mapping(seed):
     got = kept_words(plan, transcript)
     assert [k.index for k in got] == [index for _, index in expected]
     assert [k.record_start_s for k in got] == pytest.approx([t for t, _ in expected])
+
+
+# ---------------------------------------------------------------- round 2
+
+
+def _run(start: float, end: float) -> QuietRun:
+    return QuietRun(start_s=start, end_s=end, level_dbfs=-60.0)
+
+
+@pytest.mark.parametrize(
+    ("runs", "status", "at_cut", "nearest"),
+    [
+        ([(0.95, 1.05)], "pass", 0, None),  # contains src_in 1.0
+        ([(0.93, 0.99)], "pass", 0, None),  # ends 10 ms before: inside the slack
+        ([(0.92, 0.9899)], "fail", None, 0),  # ends 10.1 ms before
+        ([(1.01, 1.07)], "pass", 0, None),  # starts 10 ms after
+        ([(1.0101, 1.08)], "fail", None, 0),
+        ([(0.98, 1.039)], "fail", 0, None),  # contains src_in but is 59 ms
+        ([(0.98, 1.04)], "pass", 0, None),  # exactly 60 ms
+        ([(0.80, 0.92), (1.06, 1.13)], "fail", None, 1),  # the nearer one (60 ms away)
+        ([], "fail", None, None),
+    ],
+)
+def test_judge_join_quiet(runs, status, at_cut, nearest):
+    quiet = [_run(*r) for r in runs]
+    judged = judge_join_quiet(quiet, 1.0, min_ms=60, slack_ms=10)
+    assert judged.status == status
+    assert judged.at_cut is (None if at_cut is None else quiet[at_cut])
+    assert judged.nearest is (None if nearest is None else quiet[nearest])
+
+
+def test_judge_join_quiet_prefers_the_longer_of_two_equally_near_pauses():
+    a, b = _run(0.85, 0.95), _run(1.05, 1.20)
+    assert judge_join_quiet([a, b], 1.0, min_ms=60, slack_ms=10).nearest is b
+    assert judge_join_quiet([b, a], 1.0, min_ms=60, slack_ms=10).nearest is b
+
+
+@pytest.mark.parametrize(
+    ("fps", "frame"), [("24", 25), ("25", 26), ("30000/1001", 31), ("48", 50), ("60", 63)]
+)
+def test_suggest_src_in_is_the_frame_nearest_the_middle(fps, frame):
+    plan_fps = Fps.model_validate(fps)
+    assert suggest_src_in(_run(1.0, 1.1), plan_fps) == frame
+    assert abs(plan_fps.seconds(frame) - 1.05) < plan_fps.seconds(1) / 2
+
+
+@pytest.mark.parametrize(
+    "toml",
+    [
+        "lufs_tolerance = inf",
+        "short_lufs = nan",
+        "longform_lufs = -inf",
+        "review_mp4_max_mb = inf",
+        "true_peak_max_dbtp = nan",
+        "join_agreement_min = nan",
+        "longest_silence_warn_s = inf",
+    ],
+)
+def test_non_finite_qa_values_are_refused(tmp_path, toml):
+    key = toml.split()[0]
+    base = {
+        "longform_lufs": "-22.0",
+        "short_lufs": "-14.5",
+        "lufs_tolerance": "0.5",
+        "review_mp4_max_mb": "20",
+    }
+    base.pop(key, None)
+    lines = ['name = "x"', "[qa]", *(f"{k} = {v}" for k, v in base.items()), toml]
+    path = tmp_path / "x.toml"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with pytest.raises(ProfileError, match=key):
+        load_profile(path)
+
+
+def test_non_finite_qa_values_are_refused_in_code():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        QATargets(
+            longform_lufs=-22, short_lufs=float("nan"), lufs_tolerance=0.5, review_mp4_max_mb=20
+        )
+
+
+def test_slack_and_minimum_must_fit_the_search_window():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="join_quiet_search_s must cover"):
+        QATargets(
+            longform_lufs=-22,
+            short_lufs=-14.5,
+            lufs_tolerance=0.5,
+            review_mp4_max_mb=20,
+            join_quiet_search_s=0.065,
+        )
+    QATargets(
+        longform_lufs=-22,
+        short_lufs=-14.5,
+        lufs_tolerance=0.5,
+        review_mp4_max_mb=20,
+        join_quiet_search_s=0.07,
+    )
+
+
+def test_unchecked_lists_skipped_and_incomplete_checks():
+    checks = [
+        QACheck(id="a", status="pass", message="m"),
+        QACheck(id="b", status="skipped", message="m", skip_reason="no-plan"),
+        QACheck(id="c", status="warn", message="m", incomplete=True),
+        QACheck(id="d", status="fail", message="m", incomplete=True),
+        QACheck(id="e", status="warn", message="m"),
+    ]
+    report = build_report(file="f", kind="short", profile="p", media=None, checks=checks)
+    assert report.unchecked == ["b", "c", "d"]

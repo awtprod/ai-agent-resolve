@@ -4,6 +4,7 @@ See ``aar.qa.check`` for the checks and docs/DESIGN.md "Media QA" for their defi
 """
 
 from aar.qa.check import (
+    JoinQuiet,
     agreement,
     check,
     evaluate_duration,
@@ -11,7 +12,9 @@ from aar.qa.check import (
     evaluate_quiet_run,
     evaluate_silence,
     evaluate_size,
+    judge_join_quiet,
     resolve_media,
+    suggest_src_in,
     tokens,
 )
 from aar.qa.planmap import Cut, KeptWord, StraddledWord, cuts, kept_words, straddled_words
@@ -21,6 +24,7 @@ from aar.qa.transcriber import Transcriber
 __all__ = [
     "CHECK_IDS",
     "Cut",
+    "JoinQuiet",
     "KeptWord",
     "Kind",
     "QACheck",
@@ -37,8 +41,10 @@ __all__ = [
     "evaluate_quiet_run",
     "evaluate_silence",
     "evaluate_size",
+    "judge_join_quiet",
     "kept_words",
     "resolve_media",
     "straddled_words",
+    "suggest_src_in",
     "tokens",
 ]
