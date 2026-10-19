@@ -521,3 +521,159 @@ def test_render_poll_reports_is_rendering(tmp_path: Path) -> None:
     world.broker.run_until_idle()
     value = world.broker.result(op_id).value
     assert value.status == "Rendering" and value.is_rendering is True
+
+
+# -- third batch ----------------------------------------------------------------------------------
+
+
+def test_unknown_op_is_refused_at_submit(tmp_path: Path) -> None:
+    """Kills K02 (unknown op not checked at submit): no job is created for it."""
+    import pytest
+
+    world = JobWorld(tmp_path)
+    with pytest.raises(ValueError, match=r"no\.such\.op"):
+        world.runner.submit(
+            "ops.sequence", {"steps": [{"op": "no.such.op", "params": {}}]}, world.locator()
+        )
+    assert world.runner.list() == [] and world.store.load_all() == []
+
+
+def test_structured_error_lifts_fix_hint_out_of_the_detail(tmp_path: Path) -> None:
+    """Kills M01 (from_broker leaves fix_hint/trap_id in the detail)."""
+    world = JobWorld(tmp_path)
+    job_id = world.runner.submit(
+        "ops.sequence",
+        {
+            "steps": [
+                {
+                    "op": "markers.add",
+                    "params": {"timeline": {"name": "Main"}, "markers": [{"frame": 1}]},
+                }
+            ]
+        },
+        world.locator(),
+    )
+    world.runner.run_until_settled()
+    error = world.runner.get(job_id).error
+    assert error["fix_hint"] and "fix_hint" not in error["detail"]
+    assert "trap_id" not in error["detail"]
+
+
+def test_store_loads_a_nodes_jobs_oldest_first(tmp_path: Path) -> None:
+    """Kills S06/S06' (node load order reversed): the documented order of load_all."""
+    from aar.node.jobs import JobRecord, JobStore
+    from aar.node.locator import ProjectLocator
+
+    store = JobStore(tmp_path / "jobs.db")
+    try:
+        target = ProjectLocator((), "Show", "uid-1")
+        for job_id, created in (("job_b", 2.0), ("job_c", 3.0), ("job_a", 1.0)):
+            store.save(JobRecord(job_id, "ops.sequence", "n1", target, {}, created_at=created))
+        store.save(JobRecord("job_other", "ops.sequence", "n2", target, {}, created_at=0.5))
+        assert [r.job_id for r in store.load_all("n1")] == ["job_a", "job_b", "job_c"]
+        assert [r.job_id for r in store.load_all()] == ["job_other", "job_a", "job_b", "job_c"]
+    finally:
+        store.close()
+
+
+def test_render_mode_and_format_are_put_back_after_a_good_build(tmp_path: Path) -> None:
+    """Kills B06/B07 (restore skips the format/codec or the render mode reset)."""
+    world = JobWorld(tmp_path)
+    world.project.deliver.mode = 0
+    world.presence.observe(world.gw.get_context(), world.clock())
+    world.clock.advance(60.0)
+    original = world.project.deliver.copy()
+    job_id = world.runner.submit(
+        "render",
+        _render_params(world, render_format="mov", render_codec="ProRes", render_mode=1),
+        world.locator(),
+    )
+    world.runner.run_until_settled()
+    assert world.runner.get(job_id).state == "succeeded"
+    rendered = world.fake.calls
+    assert ("SetCurrentRenderMode", 1) in rendered or world.project.render_jobs == []
+    deliver = world.project.deliver
+    assert (deliver.format, deliver.codec, deliver.mode) == (
+        original.format,
+        original.codec,
+        original.mode,
+    )
+
+
+def test_stopped_job_with_a_hung_op_is_not_stalled_by_the_stop_time(tmp_path: Path) -> None:
+    """Kills R20' (watchdog also checks waiting jobs): a stop pauses the clocks, even when an
+    op it could not cancel is still out."""
+    world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1.0)), drain_budget=0.5)
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    world.runner.pump()
+    entered, release = _hung_marker(world)
+    try:
+        world.runner.pump()
+        assert entered.wait(WAIT)
+        control.stop(world.log, control.StopScope.all(), "STOP", HUMAN)
+        world.runner.pump()
+        world.clock.advance(500.0)
+        world.runner.pump()
+        assert world.runner.get(job_id).state == "waiting"
+    finally:
+        release.set()
+    assert world.runner.wait_drain(WAIT)
+    control.resume(world.log, control.StopScope.all(), "go", HUMAN)
+    world.runner.run_until_settled()
+    assert world.runner.get(job_id).state == "succeeded"
+
+
+def test_render_that_completes_instantly_after_start_succeeds(tmp_path: Path) -> None:
+    """Kills O19 (Complete not counted as already running): a render that is Complete by the
+    time the build checks it started is not 'not started'."""
+    world = JobWorld(tmp_path)
+    proj = world.project
+    real_start = proj.StartRendering
+
+    def instant(ids, interactive=False):
+        ok = real_start(ids, interactive)
+        for job in proj.render_jobs:
+            if job.job_id in ids:
+                job.status, job.completion = "Complete", 100
+        proj.rendering = False
+        return ok
+
+    proj.StartRendering = instant  # type: ignore[method-assign]
+    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.run_until_settled()
+    assert world.runner.get(job_id).state == "succeeded"
+
+
+def test_adopted_job_a_human_deleted_meanwhile_fails_visibly(tmp_path: Path) -> None:
+    """Kills O07 (the queue listing is not verified): the journaled JobId is gone after the
+    restart, so the resumed build fails with render_job_missing instead of guessing."""
+    world = JobWorld(tmp_path)
+    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.pump()
+    world.broker.run_until_idle()  # the build ran; the node dies before the checkpoint
+    world.project.render_jobs.clear()  # a human removed it while the node was down
+    world.project.rendering = False
+    runner = world.restart()
+    runner.run_until_settled()
+    view = runner.get(job_id)
+    assert view.state == "failed" and view.error["code"] == "render_job_missing"
+    assert [c for c in world.fake.calls if c[0] in ("AddRenderJob", "StartRendering")] == []
+
+
+def test_added_job_missing_from_the_queue_is_not_trusted(tmp_path: Path) -> None:
+    """Kills O07 on the fresh path: AddRenderJob's id must be listed exactly once."""
+    world = JobWorld(tmp_path)
+    proj = world.project
+    real_add = proj.AddRenderJob
+
+    def add_but_unlisted():
+        rid = real_add()
+        proj.render_jobs.clear()
+        return rid
+
+    proj.AddRenderJob = add_but_unlisted  # type: ignore[method-assign]
+    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.run_until_settled()
+    view = world.runner.get(job_id)
+    assert view.state == "failed" and view.error["code"] == "add_render_job_unverified"
+    assert [c for c in world.fake.calls if c[0] == "StartRendering"] == []
