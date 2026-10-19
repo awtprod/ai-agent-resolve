@@ -1,11 +1,14 @@
-"""Structural rules: valid ranges, chronological order, short duration."""
+"""Structural rules: valid ranges, chronological order, shortest shot, a short's duration and
+its final fade."""
 
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from fractions import Fraction
+from typing import Any
 
-from aar.plan.lint import Finding, LintContext, rule
+from aar.plan.lint import Finding, LintContext, check_number, rule
 
 
 @rule(
@@ -168,6 +171,81 @@ def short_max_duration(ctx: LintContext) -> list[Finding]:
             f"The short runs {fps.seconds(total):.3f} s ({total} frames); it must be under "
             f"{float(limit):g} s.",
             f"Cut at least {total - allowed} frames so the total is at most {allowed} frames.",
+            [ctx.record_ref(total, "end")],
+        )
+    ]
+
+
+def _min_shot_params(given: Mapping[str, Any], merged: dict[str, Any]) -> dict[str, Any]:
+    check_number(merged, "min_seconds", minimum=0)
+    return merged
+
+
+@rule(
+    "min-shot",
+    severity="warn",
+    summary="No slivers: every content segment runs at least the minimum record time.",
+    params=("min_seconds",),
+    prepare=_min_shot_params,
+)
+def min_shot(ctx: LintContext) -> list[Finding]:
+    plan = ctx.plan
+    fps = plan.fps
+    limit = Fraction(str(ctx.params["min_seconds"]))
+    need = math.ceil(limit * fps.num / fps.den)
+    before = {incoming: outgoing for outgoing, incoming in plan.joins()}
+    after = {outgoing: incoming for outgoing, incoming in plan.joins()}
+    out: list[Finding] = []
+    for index, seg in enumerate(plan.segments):
+        if not ctx.usable(index) or Fraction(seg.length * fps.den, fps.num) >= limit:
+            continue
+        neighbours = [n for n in (before.get(index), after.get(index)) if n is not None]
+        grow = f"lengthen it to at least {need} frames"
+        if neighbours:
+            names = " or ".join(f"segment {n}" for n in neighbours)
+            hint = (
+                f"Fold it into a neighbour: extend {names} over its {seg.length} frames, or {grow}."
+            )
+        else:
+            hint = f"It has no neighbour on its track to fold into: {grow}."
+        out.append(
+            ctx.finding(
+                "warn",
+                f"Segment {index} runs {fps.seconds(seg.length):.3f} s ({seg.length} frames); "
+                f"shots under {float(limit):g} s read as slivers.",
+                hint[0].upper() + hint[1:],
+                [ctx.ref(index, "in"), ctx.ref(index, "out")],
+            )
+        )
+    return out
+
+
+def _short_end_fade_params(given: Mapping[str, Any], merged: dict[str, Any]) -> dict[str, Any]:
+    check_number(merged, "max_frames", integer=True, minimum=0)
+    return merged
+
+
+@rule(
+    "short-end-fade",
+    severity="warn",
+    summary="A short's final audio fade is a de-click only, never a fade to silence.",
+    params=("max_frames",),
+    prepare=_short_end_fade_params,
+)
+def short_end_fade(ctx: LintContext) -> list[Finding]:
+    plan = ctx.plan
+    frames = plan.end_fade_frames
+    limit = int(ctx.params["max_frames"])
+    if plan.kind != "short" or frames is None or frames <= limit:
+        return []
+    total = plan.total_frames()
+    return [
+        ctx.finding(
+            "warn",
+            f"The short's final audio fade is {frames} frames "
+            f"({plan.fps.seconds(frames):.2f} s); a short ends hard on the laugh, so the fade "
+            f"is only a de-click of at most {limit} frame(s), never a fade to silence.",
+            f"Set end_fade_frames to {limit} or less.",
             [ctx.record_ref(total, "end")],
         )
     ]

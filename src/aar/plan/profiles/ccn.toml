@@ -32,7 +32,13 @@ continuity_tolerance_frames = 1
 min_size_step = 1         # ranks: close 0, medium 1, wide 2; incoming must be this many wider
 continuity_tolerance_frames = 1
 
+# Hard cuts between content segments. Only the way in from black and the way into the outro
+# may be a transition (the long-form build uses a 15-frame start dissolve).
 [rules.no-dissolve]
+allow_head = true         # the first segment may come in from black with a transition
+max_head_frames = 30      # ...at most this long
+allow_outro = true        # the outro may come in with a transition
+max_outro_frames = 30     # ...at most this long
 
 [rules.audio-crossfade]
 audio_type = "Cross Fade 0 dB"
@@ -41,11 +47,27 @@ handle_fraction = 0.5     # share of the crossfade that must exist as media on e
 require_on_cuts = true    # a non-continuous join with no audio crossfade is an error
 continuity_tolerance_frames = 1
 
+# Rhythm: no burst of cuts ("8 cuts in 13 s" was extremely choppy) and no sliver shots.
+[rules.cut-density]
+window_s = 10             # length of the sliding window of record time, in seconds
+max_cuts = 2              # warn when any window holds more cuts than this
+continuity_tolerance_frames = 1
+
+[rules.min-shot]
+min_seconds = 1.0         # warn when a segment is shorter; fold slivers into a neighbour
+
 [rules.short-max-duration]
 max_seconds = 37          # a short must be strictly shorter than this
 
+# A short ends hard on the laugh: its last audio fade is a de-click, never a fade to silence.
+[rules.short-end-fade]
+max_frames = 1            # the longest final fade on a short, in frames
+
+# End hard right after the punchline, at the first hint of the laugh; no dragging laugh.
 [rules.end-on-laugh]
-max_after_laugh_ms = 500  # the last frame may land this long after the laugh ends
+anchor = "onset"          # measure from the laugh's onset ("onset") or its end ("end")
+min_after_ms = 0          # the out point lands at least this long after the anchor
+max_after_ms = 400        # ...and at most this long after it
 min_strength = 0.0        # ignore laughs weaker than this
 
 # Reframe keyframes: dead-zone steady camera, never a whip-pan.

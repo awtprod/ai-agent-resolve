@@ -130,10 +130,12 @@ def test_dialogue_splice_uses_recording_time_for_sources_with_an_origin(
 
 
 def test_end_on_laugh_passes_when_the_edit_ends_just_after_a_laugh(
-    clean_data: PlanData, run_lint: RunLint, laughs: LaughMap
+    clean_data: PlanData, run_lint: RunLint, laughs: LaughMap, ccn_v1
 ):
-    # The final out point is recording frame 2028 = 84.58 s; the laugh ends at 84.50 s.
+    # The final out point is recording frame 2028 = 84.58 s; the laugh runs 84.25-84.50 s, so
+    # the out point is 335 ms after its onset (ccn) and 85 ms after its end (the v1 profile).
     assert only(run_lint(clean_data, laughs=laughs), "end-on-laugh") == []
+    assert only(run_lint(clean_data, laughs=laughs, profile=ccn_v1), "end-on-laugh") == []
 
 
 def test_end_on_laugh_reports_a_skip_without_a_laugh_map(clean_data: PlanData, run_lint: RunLint):
@@ -142,10 +144,15 @@ def test_end_on_laugh_reports_a_skip_without_a_laugh_map(clean_data: PlanData, r
     assert finding.message == "Skipped: this rule needs a laugh map, but none was supplied."
 
 
+# The next two pin the end-anchored rule through the pre-S13a profile, which sets none of the
+# new keys: such a profile behaves exactly as before (ccn itself now anchors on the onset).
+
+
 def test_end_on_laugh_warns_when_the_edit_runs_on_after_the_laugh(
-    clean_data: PlanData, run_lint: RunLint
+    clean_data: PlanData, run_lint: RunLint, ccn_v1
 ):
-    (finding,) = only(run_lint(clean_data, laughs=laugh_map((82.0, 83.0845, 0.9))), "end-on-laugh")
+    laughs = laugh_map((82.0, 83.0845, 0.9))
+    (finding,) = only(run_lint(clean_data, laughs=laughs, profile=ccn_v1), "end-on-laugh")
     assert finding.severity == "warn"
     assert "ends 1500 ms after the nearest laugh ended (83.08 s)" in finding.message
     assert "within 500 ms after a laugh" in finding.message
@@ -154,9 +161,10 @@ def test_end_on_laugh_warns_when_the_edit_runs_on_after_the_laugh(
 
 
 def test_end_on_laugh_warns_when_the_edit_cuts_the_laugh_off(
-    clean_data: PlanData, run_lint: RunLint
+    clean_data: PlanData, run_lint: RunLint, ccn_v1
 ):
-    (finding,) = only(run_lint(clean_data, laughs=laugh_map((83.9, 85.1845, 0.9))), "end-on-laugh")
+    laughs = laugh_map((83.9, 85.1845, 0.9))
+    (finding,) = only(run_lint(clean_data, laughs=laughs, profile=ccn_v1), "end-on-laugh")
     assert finding.severity == "warn"
     assert "ends 600 ms before the nearest laugh ends (85.18 s)" in finding.message
 

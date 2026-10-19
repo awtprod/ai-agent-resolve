@@ -145,6 +145,44 @@ Agents are the primary users. Humans get a thin supervision console.
 - **Everything resumes.** Jobs have ids and checkpoints, and the event log lets an agent replay its state after losing context.
 - **Humans get four things:** a review queue (render plus timecoded notes), approve or reject, a board of who holds what, and an emergency stop.
 
+#### The EditPlan (version 2)
+
+`aar plan schema` prints the JSON Schema; `src/aar/plan/model.py` is the reference. Positions and lengths are integer frames at the plan's `fps`, and every range is half-open, `[in, out)`.
+
+- **Version 1 fields** (S5): `project`, `timeline`, `kind` (`longform` or `short`), `fps`, `resolution`, `profile`; `sources` (id, media, camera, shot size, recording id and origin, duration); `segments` (track, source, `src_in`/`src_out`, `record_in`, keyframed `reframe`, `gain_db`); `transitions` between neighbouring segments (video type and length, audio transition); `titles` (lower thirds are `kind: "lower-third"` with a template name, lines and a record in/out); `captions` and `caption_style`; `markers`.
+- **Version 2 adds** what the S13 producers and the `plan.apply` compiler need:
+  - `template`: the timeline the build starts from. The compiler branches it with `timeline.branch`, never `timeline.duplicate`, so the copy is a registered agent branch.
+  - `head`: how the first segment comes in from black (video type and frames, audio fade-in frames).
+  - `outro`: the clip appended where the content ends (source id, optional source range, video track, the name of the audio track that carries it, the transition into it, and optional `sting` text over its start). The outro is not a content segment. Content rules (chronological, dialogue splice, end on the laugh, cut density) see the last content segment as the end. The outro does count towards the timeline length, so `short-max-duration` includes it.
+  - `audio_tracks`: per-track name, `gain_db`, `mute` and optional `bus`, in track order (A1 first), so the CCN topology can be stated: A1–A4 muted, A5 the bus, A6 the bounce. Names are unique.
+  - `Source.color`: input colour space, an optional CDL (slope, offset and power as three numbers each, plus saturation) and an optional LUT name. The safety rule still holds: never set the input colour space on BRAW.
+  - `Segment.transform`: a static zoom, pan, tilt, rotation and flips, separate from the keyframed `reframe`. The effective zoom is the transform's zoom times the reframe zoom; `no-same-camera-jump` uses it.
+  - `end_fade_frames`: the audio fade-out at the very end of the timeline.
+- **Versioning rule.** `version` is 1 or 2, and a plan that leaves it out is version 2. Version 2 only adds fields, so every valid version 1 plan is valid, and lints the same, as version 2. A plan that says version 1 and gives a version 2 field a value is a validation error (`plan_version`) naming the field, for example `segments[1].transform`. Null, or an empty `audio_tracks`, is not a use, so a full dump of a version 1 plan reads back as version 1. `tests/plan/fixtures/v1_compat` pins the pre-v2 profile and the reports the pre-v2 code wrote for the plan fixtures; linting them today must give the same bytes.
+- **Where problems are reported.** Version 2 cross-references are validation errors (exit 2), each with the field's location: an outro source that is not a plan source, an outro that plays to the end of a source with no duration, an outro range outside its source, a sting longer than the outro, an outro audio track not in `audio_tracks`, duplicate track names, a blank template or name, a CDL triple that is not three finite numbers in range, and a head or outro transition whose type and length disagree (a cut has no length; anything else needs one). The version 1 checks stay lint findings in `ranges-valid` (exit 1), so version 1 plans lint exactly as before.
+
+**Rules.** The `ccn` profile runs these; the thresholds are in `profiles/ccn.toml`, not in code.
+
+| Rule | Severity | What it checks (ccn values) |
+| ---- | -------- | --------------------------- |
+| `ranges-valid` | error | Ranges positive and inside the media, no overlap on a track, unique source ids, transitions that follow a join |
+| `chronological` | error | Each recording plays forward only |
+| `no-dialogue-splice` | error, warn | No cut inside a word (error); a cut sits in a pause of at least 250 ms (warn). Needs a transcript |
+| `no-same-camera-jump` | error | Same camera across a time jump needs a zoom change of at least 0.2 (static transform included) |
+| `timejump-close-to-wide` | warn | A time jump cuts to a wider shot |
+| `no-dissolve` | error | Cuts between content segments. **New:** the head and the outro transitions are allowed when the profile says so (`allow_head`, `allow_outro`), up to `max_head_frames` / `max_outro_frames` (30, which admits the 15-frame start dissolve). Without those keys only cuts pass |
+| `audio-crossfade` | error | Non-continuous joins get a "Cross Fade 0 dB" of at most 30 frames with enough handle |
+| `cut-density` | warn | **New.** No more than `max_cuts` (2) cuts in any `window_s` (10 s) of record time. A cut is a join that is not unbroken playback, placed at the incoming segment's first frame; windows are half-open, so cuts exactly 10 s apart never share one. Overlapping offending windows merge into one finding with the burst's span and cut count |
+| `min-shot` | warn | **New.** A content segment runs at least `min_seconds` (1.0 s) of record time; the hint says to fold it into a neighbour |
+| `short-max-duration` | error | A short runs under 37 s, outro included |
+| `short-end-fade` | warn | **New.** On a short, `end_fade_frames` is a de-click of at most `max_frames` (1); long-forms are not limited |
+| `end-on-laugh` | warn | **Changed.** The final content out point lands `min_after_ms` to `max_after_ms` after a laugh's `anchor`, with half a frame of slack each side. ccn: onset, 0–400 ms. The code default is the old rule (end, 0–500 ms), and the old key `max_after_laugh_ms` still means the end-anchored maximum, so a profile without the new keys behaves as before. The hint names the source frame at the anchor plus `min_after_ms`. Needs a laugh map |
+| `no-whip-pan` | error | Reframe keyframes move under 0.3 frame widths/s and zoom under 0.25/s |
+| `caption-length` | error | Caption lines at most 16 characters |
+| `caption-style` | info | Montserrat, active word yellow |
+
+A rule's thresholds are either required (every profile listing the rule sets them) or optional with a code default. A rule can also check its threshold values, and a bad value is a profile error (exit 2) before anything is linted.
+
 ### R6. CCN work end to end
 
 Recipes turn the existing, proven pipeline (the CCN shorts and long-form workflow, thumbpipe, the supoclip runner) into a work graph. The steps are:

@@ -23,6 +23,9 @@ CCN_RULES = [
     "audio-crossfade",
     "short-max-duration",
     "end-on-laugh",
+    "cut-density",
+    "min-shot",
+    "short-end-fade",
     "no-whip-pan",
     "caption-length",
     "caption-style",
@@ -53,7 +56,25 @@ def test_ccn_profile_holds_the_thresholds(ccn: Profile):
     assert params["audio-crossfade"]["audio_type"] == "Cross Fade 0 dB"
     assert params["audio-crossfade"]["max_frames"] == 30
     assert params["short-max-duration"]["max_seconds"] == 37
-    assert params["end-on-laugh"]["max_after_laugh_ms"] == 500
+    assert params["end-on-laugh"] == {
+        "anchor": "onset",
+        "min_after_ms": 0,
+        "max_after_ms": 400,
+        "min_strength": 0.0,
+    }
+    assert params["no-dissolve"] == {
+        "allow_head": True,
+        "max_head_frames": 30,
+        "allow_outro": True,
+        "max_outro_frames": 30,
+    }
+    assert params["cut-density"] == {
+        "window_s": 10,
+        "max_cuts": 2,
+        "continuity_tolerance_frames": 1,
+    }
+    assert params["min-shot"] == {"min_seconds": 1.0}
+    assert params["short-end-fade"] == {"max_frames": 1}
     assert params["no-whip-pan"] == {"max_pan_speed": 0.3, "max_zoom_speed": 0.25}
     assert params["caption-length"]["max_chars"] == 16
     assert params["caption-style"]["font"] == "Montserrat"

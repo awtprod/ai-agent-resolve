@@ -44,6 +44,12 @@ def ccn() -> Profile:
 
 
 @pytest.fixture
+def ccn_v1() -> Profile:
+    """The ccn profile as it was before S13a (end-anchored end-on-laugh, no new rules)."""
+    return load_profile(FIXTURES / "v1_compat" / "ccn_v1.toml")
+
+
+@pytest.fixture
 def run_lint(ccn: Profile) -> Callable[..., LintReport]:
     """Lint plan data (a dict) with the ccn profile unless another profile is given."""
 
