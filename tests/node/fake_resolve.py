@@ -47,6 +47,7 @@ FAULTS = frozenset(
         "CopyGrades:drops-label",  # the copy loses the first node's label
         "CopyGrades:drops-lut",  # the copy loses the LUT of the first node that has one
         "DuplicateTimeline:returns-source",  # the copy is made, but the source is returned
+        "DeleteTimelines:fail",  # MediaPool.DeleteTimelines returns False, deletes nothing
     }
 )
 _TIMECODE = re.compile(r"^\d{2}:\d{2}:\d{2}[:;]\d{2}$")
@@ -319,6 +320,23 @@ class FakeMediaPool:
         if not any(f is folder for f in self._root.walk()):
             return False
         self.current = folder
+        return True
+
+    def DeleteTimelines(self, timelines: list[Any]) -> bool:
+        self._app.calls.append(("DeleteTimelines", [t.GetUniqueId() for t in timelines]))
+        if "DeleteTimelines:fail" in self._app.faults:
+            return False
+        doomed = {id(t) for t in timelines}
+        if not all(any(t is mine for mine in self._project.timelines) for t in timelines):
+            return False
+        self._project.timelines = [t for t in self._project.timelines if id(t) not in doomed]
+        if (
+            self._project.current_timeline is not None
+            and id(self._project.current_timeline) in doomed
+        ):
+            self._project.current_timeline = (
+                self._project.timelines[0] if self._project.timelines else None
+            )
         return True
 
     def AppendToTimeline(self, clipInfos: list[dict[str, Any]]) -> list[FakeTimelineItem]:

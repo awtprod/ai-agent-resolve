@@ -176,14 +176,15 @@ def test_branch_ownership_is_the_submitting_holder_not_a_caller_value() -> None:
 
 def test_branch_refuses_a_holder_id_that_is_not_a_usable_owner() -> None:
     show = Show()
-    result = _result(
-        show,
-        "timeline.branch",
-        {"source": show.ref("Main")},
-        holder=Holder.agent("a\nb\x00" + "x" * 300),
-        require_branch=False,
-    )
-    assert result.status is OpStatus.FAILED and result.error.code == "invalid_agent_id"
+    with pytest.raises(OpError) as err:  # refused at submit (S11f LOW 8): never queued
+        _result(
+            show,
+            "timeline.branch",
+            {"source": show.ref("Main")},
+            holder=Holder.agent("a\nb\x00" + "x" * 300),
+            require_branch=False,
+        )
+    assert err.value.code == "invalid_agent_id"
 
 
 def test_branch_source_must_carry_its_unique_id() -> None:

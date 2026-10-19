@@ -326,8 +326,9 @@ def test_a_human_with_the_agents_id_does_not_inherit_its_branch() -> None:
 
 def test_a_human_holder_cannot_branch() -> None:
     show = Show()
-    result = show.run("timeline.branch", {"source": show.ref("Main")}, holder=HUMAN)
-    assert result.status is OpStatus.FAILED and result.error.code == "no_agent_holder"  # GN14
+    with pytest.raises(OpError) as err:  # refused at submit (S11f LOW 8)
+        show.run("timeline.branch", {"source": show.ref("Main")}, holder=HUMAN)
+    assert err.value.code == "no_agent_holder"  # GN14
     assert len(show.project.timelines) == 2
 
 

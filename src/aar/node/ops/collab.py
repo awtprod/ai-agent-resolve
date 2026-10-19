@@ -7,9 +7,14 @@ Three hot ops sit on top of the write-op library (DESIGN R3):
   holder that submitted it, never a value the caller passes, and the branch is recorded in
   the node's owner registry keyed by ``(project, timeline unique id)``. It is idempotent: a
   re-run reuses a branch only when the registry confirms this agent owns it, branched from
-  this very source (by id) and at the resolution asked for; a mere name match (a human
-  timeline, or a copy with a fresh id) is never reused, it just takes a version number.
-  Merging a branch back is a human step, so the result carries a handoff note.
+  this very source (by id) and at the resolution asked for (no resolution means the
+  source's, as for ``timeline.duplicate``); a mere name match (a human timeline, or a copy
+  with a fresh id) is never reused, it just takes a version number. Refusals that need no
+  Resolve call (no agent holder, an unusable agent id, no registry) are made at submit. If
+  the copy is made but a later step fails (its resolution will not set), the copy is
+  deleted again, so the op leaves no unowned half-made branch behind and a retry cuts the
+  same version. Merging a branch back is a human step, so the result carries a handoff
+  note.
 - ``markers.mirror_review`` mirrors a hub review's timecoded notes to markers on the agent's
   branch. Each marker's ``customData`` carries the note id, so a re-run updates in place and
   prunes markers whose note is gone, never duplicating. It pre-flights the whole plan (every
@@ -36,7 +41,7 @@ from pydantic import Field, model_validator
 
 from aar.hub.common import clean_text
 from aar.hub.reviews import MAX_FPS, MAX_FRAME, MAX_NOTE, is_timecode
-from aar.node.branch_registry import OwnershipConflict
+from aar.node.branch_registry import BranchRegistry, OwnershipConflict
 from aar.node.branches import (
     branch_name,
     branch_version_for,
@@ -45,6 +50,7 @@ from aar.node.branches import (
     valid_agent_id,
     valid_note_id,
 )
+from aar.node.leases import Holder
 from aar.node.ops import raw
 from aar.node.ops.framework import (
     Note,
@@ -104,32 +110,51 @@ def _resolution_of(timeline: Any) -> tuple[int | None, int | None]:
     )
 
 
-@op(
-    "timeline.branch", params=BranchParams, result=BranchResult, mutates=True, creates_timeline=True
-)
-def timeline_branch(env: OpEnv, params: BranchParams) -> BranchResult:
-    """Branch a human timeline to an agent copy owned by the submitting agent."""
-    holder = env.holder
+def _branch_refusal(
+    params: BranchParams, holder: Holder | None, registry: BranchRegistry | None
+) -> OpError | None:
+    """Why ``timeline.branch`` cannot run for ``holder``, decided with no Resolve call.
+
+    ``make_hot_op`` runs this at submit (the op's ``submit_check``), so a refused branch is
+    never queued and never makes the broker load or save a project; the body runs it again.
+    """
     if holder is None or holder.is_human:
-        raise OpError(
+        return OpError(
             "no_agent_holder",
             "timeline.branch must run for an agent holder; the branch is owned by it",
             "submit the op as the agent that will own the branch",
         )
-    agent_id = holder.id
-    if not valid_agent_id(agent_id):
-        raise OpError(
+    if not valid_agent_id(holder.id):
+        return OpError(
             "invalid_agent_id",
-            f"the holder id {agent_id!r} is not a usable agent branch owner",
+            f"the holder id {holder.id!r} is not a usable agent branch owner",
             "use an agent id of letters, digits, '.', '_' or '-', at most 128 characters",
         )
-    registry = env.branch_registry
     if registry is None:
-        raise OpError(
+        return OpError(
             "no_branch_registry",
             "timeline.branch needs the node's owner registry to record ownership",
             "wire the broker with a BranchRegistry (the node runtime provides one)",
         )
+    return None
+
+
+@op(
+    "timeline.branch",
+    params=BranchParams,
+    result=BranchResult,
+    mutates=True,
+    creates_timeline=True,
+    submit_check=_branch_refusal,
+)
+def timeline_branch(env: OpEnv, params: BranchParams) -> BranchResult:
+    """Branch a human timeline to an agent copy owned by the submitting agent."""
+    refusal = _branch_refusal(params, env.holder, env.branch_registry)
+    if refusal is not None:
+        raise refusal
+    assert env.holder is not None and env.branch_registry is not None
+    agent_id = env.holder.id
+    registry = env.branch_registry
     project_id = env.target.project_id
     if project_id is None:  # make_hot_op refuses this at submit; never key ownership on None
         raise OpError(
@@ -142,23 +167,30 @@ def timeline_branch(env: OpEnv, params: BranchParams) -> BranchResult:
     source = env.timeline(params.source)
     source_name = str(source.GetName())
     source_id = str(source.GetUniqueId())
+    # No resolution asked for means the source's, the rule timeline.duplicate(reuse) uses:
+    # a vertical copy is never handed back for a plain branch.
     wanted = (
-        None if params.resolution is None else (params.resolution.width, params.resolution.height)
+        _resolution_of(source)
+        if params.resolution is None
+        else (params.resolution.width, params.resolution.height)
     )
     # Names only number the versions. What may be reused is decided by the registry, by
     # unique id: a branch this agent owns, of this very source (by id), at the resolution
     # asked for. A human timeline or a copy that carries a branch name is never reused.
     taken: set[int] = set()
     reusable: dict[int, Any] = {}
+    existing: set[str] = set()
     for timeline in env.timelines():
+        uid = str(timeline.GetUniqueId())
+        existing.add(uid)
         version = branch_version_for(str(timeline.GetName()), source_name, agent_id)
         if version is not None:
             taken.add(version)
-        owner = registry.owner(project_id, str(timeline.GetUniqueId()))
+        owner = registry.owner(project_id, uid)
         if owner is None or owner.agent_id != agent_id or owner.source_timeline_id != source_id:
             continue
-        taken.add(owner.version)
-        if wanted is None or _resolution_of(timeline) == wanted:
+        taken.add(owner.version)  # a renamed branch still holds its version
+        if _resolution_of(timeline) == wanted:
             reusable[owner.version] = timeline
 
     if reusable and params.if_exists == "reuse":
@@ -178,15 +210,19 @@ def timeline_branch(env: OpEnv, params: BranchParams) -> BranchResult:
         )
 
     version = max(taken, default=0) + 1
-    duplicated = timeline_duplicate(
-        env,
-        DuplicateParams(
-            source=params.source,
-            name=branch_name(source_name, agent_id, version),
-            resolution=params.resolution,
-            if_exists="error",  # never pick up a same-named timeline as the new branch
-        ),
-    )
+    name = branch_name(source_name, agent_id, version)
+    try:
+        duplicated = timeline_duplicate(
+            env,
+            DuplicateParams(
+                source=params.source,
+                name=name,
+                resolution=params.resolution,
+                if_exists="error",  # never pick up a same-named timeline as the new branch
+            ),
+        )
+    except OpError as exc:
+        raise _undo_half_made_branch(env, existing, name, exc) from exc
     try:
         registry.register(
             project_id,
@@ -210,6 +246,41 @@ def timeline_branch(env: OpEnv, params: BranchParams) -> BranchResult:
         timeline_count=duplicated.timeline_count,
         notes=[*duplicated.notes, _HANDOFF],
     )
+
+
+def _undo_half_made_branch(env: OpEnv, existing: set[str], name: str, exc: OpError) -> OpError:
+    """Delete the copy a failed ``timeline.branch`` made, and say so on its error.
+
+    The duplicate can be made and a later step still fail (its resolution will not set, or
+    does not read back). That copy belongs to no one: it is not registered, so the guard
+    lets no agent edit it, and a retry would cut the next version beside it, every time.
+    Registering it instead would not help: it is not at the resolution asked for, so a
+    retry could not reuse it either. So the op undoes its own half-made work and leaves the
+    project as it found it; a retry then cuts the same version again.
+
+    Only a timeline this very run made is touched: one whose unique id was not in the
+    project before the duplicate and that carries the exact branch name asked for. If the
+    delete fails, the copy is reported (``left_behind``) for a human to remove.
+    """
+    made = [
+        timeline
+        for timeline in env.timelines()
+        if str(timeline.GetUniqueId()) not in existing and str(timeline.GetName()) == name
+    ]
+    if len(made) != 1:
+        return exc  # nothing was made (or not unambiguously by us): nothing to undo
+    copy = {"name": name, "unique_id": str(made[0].GetUniqueId())}
+    try:
+        env.media_pool().DeleteTimelines(made)
+        gone = all(str(t.GetUniqueId()) != copy["unique_id"] for t in env.timelines())
+    except Exception:  # a failed clean-up must never hide the original error
+        gone = False
+    extra = {k: v for k, v in exc.detail.items() if k not in ("fix_hint", "trap_id")}
+    if gone:
+        extra["removed"] = copy
+    else:
+        extra["left_behind"] = copy
+    return OpError(exc.code, exc.message, exc.fix_hint, exc.trap_id, **extra)
 
 
 # -- markers.mirror_review -------------------------------------------------------------------

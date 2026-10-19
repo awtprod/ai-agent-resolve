@@ -166,6 +166,7 @@ CONTENT_WRITES = frozenset(
         "AppendToTimeline",
         "DeleteClips",
         "DuplicateTimeline",
+        "DeleteTimelines",
         "AddMarker",
         "DeleteMarkerAtFrame",
         "DeleteMarkerByCustomData",

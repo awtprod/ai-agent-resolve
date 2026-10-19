@@ -166,17 +166,16 @@ def test_concurrent_branch_requests_resolve_to_distinct_versions() -> None:
 
 def test_branch_refuses_to_run_without_an_owner_registry() -> None:
     show = Show()
-    op_id = submit_op(
-        show.broker,
-        "timeline.branch",
-        {"source": show.ref("Main")},
-        target=show.locator("Show"),
-        holder=AGENT,
-        branch_registry=None,
-    )
-    show.broker.run_until_idle()
-    result = show.broker.result(op_id)
-    assert result.status is OpStatus.FAILED and result.error.code == "no_branch_registry"
+    with pytest.raises(OpError) as err:  # refused at submit (S11f LOW 8): never queued
+        submit_op(
+            show.broker,
+            "timeline.branch",
+            {"source": show.ref("Main")},
+            target=show.locator("Show"),
+            holder=AGENT,
+            branch_registry=None,
+        )
+    assert err.value.code == "no_branch_registry"
     assert [t.GetName() for t in show.project.timelines] == ["Main", "Main [agent]"]
 
 
@@ -196,9 +195,10 @@ def test_branch_reuse_honours_the_requested_resolution() -> None:
     )
     again = show.ok("timeline.branch", vertical)  # idempotent for the same request
     assert not again.created and again.timeline.unique_id == first.timeline.unique_id
-    plain = show.ok("timeline.branch", {"source": show.ref("Main")})  # any resolution: latest
-    assert not plain.created and plain.version == 2
-    assert landscape.version == 1
+    # No resolution means the source's (S11f LOW 6): the landscape v1, never the vertical v2.
+    plain = show.ok("timeline.branch", {"source": show.ref("Main")})
+    assert not plain.created and plain.version == 1
+    assert plain.timeline.unique_id == landscape.timeline.unique_id
 
 
 # -- d03: mirror atomicity --------------------------------------------------------------------
