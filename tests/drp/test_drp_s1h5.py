@@ -9,14 +9,18 @@ kills: with that mutant applied to ``diff_opaque.py`` the test fails, and it pas
 
 from __future__ import annotations
 
+import functools
 import zipfile
 from pathlib import Path
 
 import pytest
 from diff_testing import diff
 from drp_helpers import xml
+from test_drp_hardening import issues, small_drp
 
 from aar.cli import main
+from aar.drp.diff import DiffError, diff_projects
+from aar.drp.reader import read_drp
 
 _CAP = 4096
 # 4095 filler attributes: with the leading ``k0`` and a trailing ``t`` the element has 4097, so
@@ -274,3 +278,97 @@ def test_the_same_respellings_in_the_kept_attributes_are_not_changes(tmp_path: P
     a = _drp(tmp_path / "a.drp", f'{_NAME}<J k0="a"{kept} u="y" t="x"/>')
     b = _drp(tmp_path / "b.drp", f"{_NAME}<J t='x' u='y'{kept_sq} k0='a'/>")
     assert not diff(a, b).changes
+
+
+# ---- element budget exhausted: the unread member is named for the budget, not "empty" ----------
+#
+# Before S1h5 a member that came after the shared element budget ran out was reported twice: as
+# ``empty-member`` ("<name> has no root element", as if the file were wrong) and in the one
+# ``scan-budget-exceeded`` summary. Only the first was an error, so the refusal hung on a wrong
+# name. Now the member is named for the budget it never got, and that issue is the error.
+
+_TINY = 5  # small_drp's project.xml and bin member do not fit: both come back without a root
+
+
+def _budget_drp(tmp_path: Path) -> Path:
+    return small_drp(tmp_path / "budget.drp")
+
+
+def test_budget_exhaustion_is_named_scan_budget_exceeded_not_empty_member(tmp_path: Path) -> None:
+    drp = read_drp(_budget_drp(tmp_path), max_elements=_TINY)
+    assert not issues(drp, "empty-member"), [(i.code, i.message) for i in drp.issues]
+    [stop] = issues(drp, "scan-budget-exceeded")
+    assert stop.message.endswith(f"the file's element budget of {_TINY} was used up")
+    # a member that got no root at all is a read failure, not a note: it stays an error
+    assert stop.severity == "error"
+
+
+def test_a_genuinely_empty_member_is_still_empty_member(tmp_path: Path) -> None:
+    path = _budget_drp(tmp_path)
+    with zipfile.ZipFile(path, "a", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("MediaPool/Master/Empty/MpFolder.xml", xml(""))
+    drp = read_drp(path)
+    [empty] = issues(drp, "empty-member")
+    assert empty.severity == "error" and "Empty/MpFolder.xml" in empty.message
+    assert not issues(drp, "scan-budget-exceeded")
+
+
+def test_a_member_cut_short_after_its_root_stays_a_warning(tmp_path: Path) -> None:
+    # The budget runs out in the middle of a member that did get a root: nothing was left
+    # unread entirely, so the summary stays the warning it was (the gate still refuses it).
+    path = _budget_drp(tmp_path)
+    with zipfile.ZipFile(path, "a", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("Gallery2.xml", xml("<G>" + "<a/>" * 5_000 + "</G>"))
+    drp = read_drp(path, check_blobs=True, max_elements=100)
+    [stop] = issues(drp, "scan-budget-exceeded")
+    assert stop.severity == "warning"
+    assert not issues(drp, "empty-member")
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+def test_diff_still_refuses_a_file_whose_member_the_budget_left_unread(
+    tmp_path: Path, side: str
+) -> None:
+    ok = read_drp(small_drp(tmp_path / "ok.drp"))
+    starved = read_drp(_budget_drp(tmp_path), max_elements=_TINY)
+    pair = (starved, ok) if side == "a" else (ok, starved)
+    with pytest.raises(DiffError) as err:
+        diff_projects(*pair)
+    message = str(err.value)
+    assert f"{side.upper()} (" in message and "cannot be compared" in message
+    assert "scan-budget-exceeded" in message and "empty-member" not in message
+
+
+@pytest.mark.parametrize("flags", [[], ["--gate"], ["--json"]], ids=["plain", "gate", "json"])
+def test_the_cli_still_exits_2_and_prints_nothing_for_a_starved_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    flags: list[str],
+) -> None:
+    # The CLI has no budget option, so the starved read is arranged by giving diff_cli's
+    # read_drp a small budget. Exit codes are those of tests/test_cli_exit_codes_s1h4.py: 2 is
+    # "could not compare", the same as every other unreadable input; stdout stays empty.
+    from aar.drp import diff_cli
+
+    monkeypatch.setattr(diff_cli, "read_drp", functools.partial(read_drp, max_elements=_TINY))
+    path = _budget_drp(tmp_path)
+    code = main(["drp", "diff", *flags, str(path), str(path)])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert "scan-budget-exceeded" in captured.err and "empty-member" not in captured.err
+
+
+def test_inspect_lists_the_budget_issue_and_keeps_its_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from aar.drp import cli
+
+    monkeypatch.setattr(cli, "read_drp", functools.partial(read_drp, max_elements=_TINY))
+    code = main(["drp", "inspect", str(_budget_drp(tmp_path))])
+    out = capsys.readouterr().out
+    # inspect is a report, not a gate: the project member was read, so the exit stays 0 (it was
+    # 0 before too); the unread member shows up as the budget issue, not as an empty file.
+    assert code == 0
+    assert "[error] scan-budget-exceeded:" in out and "empty-member" not in out
