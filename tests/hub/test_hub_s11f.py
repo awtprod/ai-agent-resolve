@@ -15,12 +15,13 @@ from aar.hub.artifacts import ArtifactStore
 from aar.hub.collab import (
     EVENT_BRANCH_RECORDED,
     branches,
+    project_board,
     record_branch,
     scan_branches,
 )
 from aar.hub.common import InvalidInput
 from aar.hub.events import Actor, EventLog
-from aar.hub.leaseboard import record_lease_event
+from aar.hub.leaseboard import HubEventSpec, deliver_feed_event, lease_board, record_lease_event
 from aar.hub.mcp_server import build_server
 from aar.hub.registry import Registry
 from aar.node.leases import Holder, Lease, LeaseManager, Scope
@@ -185,3 +186,52 @@ def test_the_board_page_size_is_capped_at_500(tmp_path: Path) -> None:
     board = _Board(tmp_path, 501)
     pages = board.pages(10_000)
     assert [len(page) for page in pages] == [500, 1]
+
+
+# -- V44 and the board's own order --------------------------------------------------------------
+
+
+def _stamped(spec_type: str, payload: dict[str, Any], seq: int, key: str) -> HubEventSpec:
+    return HubEventSpec(spec_type, {**payload, "feed": {"nonce": "n" * 16, "seq": seq}}, key)
+
+
+def test_an_unauthored_renewal_after_the_snapshot_never_keeps_a_lease_on_the_board(
+    tmp_path: Path,
+) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    manager = LeaseManager(
+        lambda: 1000.0, sink=lambda e: record_lease_event(log, e, "node-1", wall_offset=W)
+    )
+    lease = manager.acquire(Holder.human("op"), Scope.PROJECT, ("pV",), ttl=None)
+    snapshot = {"node_id": "node-1", "at": "2027-01-15T14:00:00+00:00", "lease_ids": []}
+    log.append("lease.snapshot", Actor("node", "node-1"), snapshot)  # the lease is gone
+    renewed = log.read(types=["lease.granted"])[0].payload
+    log.append("lease.renewed", Actor("agent", "someone"), renewed)  # forged, after it
+    board = project_board(log, "pV", clock=lambda: datetime.fromtimestamp(W + 2000, UTC))
+    assert board.leases == ()
+    assert any("written by agent:someone" in s.reason for s in board.skipped)
+    assert lease.id not in {b.lease_id for b in lease_board(log).leases}
+
+
+def test_a_late_older_state_of_a_lease_never_overwrites_a_newer_one(tmp_path: Path) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    base = {
+        "node_id": "node-1",
+        "lease_id": "L1",
+        "scope": "project",
+        "key": ["pO"],
+        "holder": {"kind": "agent", "id": "a"},
+        "acquired_at": "2027-01-15T14:00:00+00:00",
+        "ttl": 60.0,
+        "at": "2027-01-15T14:00:00+00:00",
+        "by": None,
+    }
+    grant = {**base, "expires_at": "2027-01-15T14:01:00+00:00"}
+    renewal = {**base, "expires_at": "2027-01-15T15:00:00+00:00", "ttl": 3600.0}
+    deliver_feed_event(log, _stamped("lease.renewed", renewal, 2, "renew"), "node-1")
+    deliver_feed_event(log, _stamped("lease.granted", grant, 1, "grant"), "node-1")  # late
+    at = datetime(2027, 1, 15, 14, 30, tzinfo=UTC)
+    board = lease_board(log, clock=lambda: at)
+    assert [(b.lease_id, b.expires_at) for b in board.leases] == [
+        ("L1", "2027-01-15T15:00:00+00:00")
+    ]

@@ -32,7 +32,7 @@ reads:
   ``lease.snapshot`` of their ids. A lease last held before the snapshot and not in it is
   no longer held (its release was lost, or a previous process held it); a gap before the
   snapshot is cleared. A ``feed.superseded`` record (a refused process) also marks the
-  node stale until its current process next reconciles.
+  node stale, for ``SUPERSEDED_STALE`` or until its current process next reconciles.
 """
 
 from __future__ import annotations
@@ -86,6 +86,11 @@ MAX_SNAPSHOT_LEASES = 10_000
 """Lease ids one ``lease.snapshot`` may carry; a node with more does not reconcile."""
 MAX_FEED_NONCE = 64
 MAX_FEED_SEQ = 10**18
+SUPERSEDED_STALE = timedelta(minutes=10)
+"""How long a refused second feed process marks its node stale, unless the node's current
+process reconciles sooner. The refusal is loud at the refused process (it stops), and the
+board says so for this long: a live duplicate is an operator's problem to fix, and a
+restart's dead process whose last delivery commits late is harmless after the window."""
 MAX_NODE_ID = 128
 MAX_LEASE_ID = 128
 MAX_KEY_PART = 256
@@ -664,7 +669,11 @@ def lease_board(log: EventLog, *, clock: Clock = utcnow) -> LeaseBoard:
         key=lambda gap: gap.node_id,
     )
     refused = sorted(
-        (rec for node, (rec, pos) in fold.superseded.items() if not fold.cleared(node, pos)),
+        (
+            rec
+            for node, (rec, pos) in fold.superseded.items()
+            if now < parse_ts(rec.at) + SUPERSEDED_STALE and not fold.cleared(node, pos)
+        ),
         key=lambda rec: rec.node_id,
     )
     return LeaseBoard(

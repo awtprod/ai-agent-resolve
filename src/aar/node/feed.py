@@ -66,7 +66,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
-from aar.hub.common import InvalidInput, clean_text, iso
+from aar.hub.common import InvalidInput, clean_text, iso, utcnow
 from aar.hub.events import EventLog
 from aar.hub.leaseboard import (
     EVENT_FEED_GAP,
@@ -123,13 +123,16 @@ class FeedTransport(Protocol):
 
 
 class EventLogTransport:
-    """A :class:`FeedTransport` into a local hub event log, through the hub's acceptor."""
+    """A :class:`FeedTransport` into a local hub event log, through the hub's acceptor.
 
-    def __init__(self, log: EventLog) -> None:
+    ``clock`` is the hub's wall clock (it dates the hub's own records of the feed)."""
+
+    def __init__(self, log: EventLog, *, clock: Callable[[], datetime] = utcnow) -> None:
         self._log = log
+        self._clock = clock
 
     def deliver(self, spec: HubEventSpec, *, node_id: str) -> None:
-        deliver_feed_event(self._log, spec, node_id)
+        deliver_feed_event(self._log, spec, node_id, clock=self._clock)
 
 
 @dataclass(frozen=True, slots=True)
