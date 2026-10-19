@@ -237,6 +237,18 @@ These are defaults taken from Andrew's recorded feedback on real CCN cuts. Each 
 - **Publishing.** aar's last step emits a publish packet (final file and its hash, metadata, thumbnail) and waits on a human approval. Command Center and ccn-web-app do the upload; aar holds no YouTube or Instagram credentials.
 - **Hub writes.** Agents create brief, plan and recipe nodes through hub write tools. Deciding a review stays human-only.
 
+#### Edit-PC transport (S13f)
+
+Cold work runs on the hub; Resolve, its renders and the masters stay on the edit PC. One module (`aar.host`) moves files between them and runs PowerShell there. It is security-sensitive: it builds remote commands and moves files, so every path and string is treated as hostile.
+
+- **Config, not code, names the host.** The edit PC is an ssh alias plus an ssh config file (`ssh -F <config>`), given by `AAR_EDIT_*` environment variables or an explicit `EditHostConfig`. There is no default host anywhere in code, and the ssh config and key material are never read. The alias may not contain `:` or start with `-`.
+- **Roots bound every transfer.** The config lists allowed remote (Windows) roots and allowed local (hub) roots. A source or destination outside them is refused before any command runs. Local paths are resolved with `realpath`, so a symlink that escapes its root is refused.
+- **Runner seam.** All argv go through a `Runner` (argv list, optional stdin, timeout). The real one uses `subprocess` with an argument list and never a shell, and always passes `-F <config>`, `-o BatchMode=yes` and `-o ConnectTimeout=<n>`. Tests use a fake runner; nothing in the module or its tests contacts a real host.
+- **PowerShell.** Scripts run as `powershell -NoProfile -NonInteractive -EncodedCommand <base64 of UTF-16LE>`, refused if the built command line would exceed the Windows limit (32767). Output CRLF is normalised to LF and CLIXML progress is stripped from stderr (error text is kept). Values embedded in scripts use one quoting helper (single-quoted literals, `''` doubling).
+- **Transfers.** `pull`/`push` use scp in SFTP mode (the OpenSSH 9 default; `-O` is never passed). Remote size and SHA-256 come from `Get-Item`/`Get-FileHash`, local from `os`/`hashlib`. The file lands under a temporary name beside the destination and is moved into place only when both size and hash match; a mismatch or failure removes the partial and raises a typed error. An existing destination is never overwritten unless the caller asks.
+- **Path forms.** A Windows path becomes one of `alias:E:/...` (default) or `alias:/E:/...`, selected by config, because it is unsettled which Windows OpenSSH needs. The spec is rebuilt from validated components, so no raw separators or alternate spellings leak through.
+- **What is refused.** Relative and drive-relative paths (`E:Show`), `.`/`..`/empty components, verbatim and device namespaces (`\\?\`, `\\.\`), reserved device names (`CON`, `COM1`, …), illegal or control characters (including an alternate-data-stream `:`), trailing dots or spaces, UNC paths unless a UNC root is configured, and anything that does not resolve inside an allowed root under NTFS case rules. Path parsing, NTFS upcasing and the edit-PC↔hub map reuse `aar.drp.modify.paths`.
+
 ## 5. Safety rules (enforced in code, not just written here)
 
 - Before every hot op, the node checks that the expected project is the one open. It refuses to switch project or database while a human is active, unless a human forces it from the console.
