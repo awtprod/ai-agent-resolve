@@ -6,6 +6,10 @@
 size and the SHA-256 on both ends, writes to a temporary name beside the destination, and moves
 it into place only when both match. A partial transfer is removed and a typed error raised; an
 existing destination is never overwritten unless the caller asks.
+
+An upload's move fails closed if the remote destination is a directory or if its immediate parent
+is a reparse point (junction/symlink); a reparse point higher in the remote tree is a known
+lexical-validation limit (see :mod:`aar.host.winpath` and DESIGN "Edit-PC transport").
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from aar.host.errors import (
     DestinationExists,
     HashMismatch,
     HostError,
+    LocalIOError,
     PathRefused,
     RemoteCommandError,
     SizeMismatch,
@@ -32,7 +37,8 @@ from aar.host.runner import Runner, RunResult
 from aar.host.winpath import (
     _Win,
     remote_spec,
-    scp_target,
+    scp_remote_dest,
+    scp_remote_source,
     validate_windows_path,
     windows_literal,
     with_suffix,
@@ -65,21 +71,40 @@ def stat_script(literal: str) -> str:
 
 
 def exists_script(literal: str) -> str:
-    """PowerShell that prints ``AAREXISTS yes`` or ``AAREXISTS no`` for ``literal``."""
+    """PowerShell that prints ``AAREXISTS container|file|none`` for ``literal``.
+
+    A container (directory) is reported distinctly so a transfer is never aimed at a directory.
+    """
     quoted = ps_quote(literal)
     return (
         "$ErrorActionPreference = 'Stop'\n"
-        f"if (Test-Path -LiteralPath {quoted}) {{ Write-Output '{_EXISTS_TAG} yes' }} "
-        f"else {{ Write-Output '{_EXISTS_TAG} no' }}\n"
+        f"$p = {quoted}\n"
+        "$k = if (Test-Path -LiteralPath $p -PathType Container) { 'container' }"
+        " elseif (Test-Path -LiteralPath $p) { 'file' } else { 'none' }\n"
+        f"Write-Output ('{_EXISTS_TAG} ' + $k)\n"
     )
 
 
 def move_script(source: str, destination: str, overwrite: bool) -> str:
-    """PowerShell that moves ``source`` onto ``destination`` (``-Force`` only if ``overwrite``)."""
+    """PowerShell that moves ``source`` onto ``destination`` (``-Force`` only if ``overwrite``).
+
+    Fails closed before the move if the destination is a directory (so ``-Force`` cannot drop the
+    file *into* a container), or if the destination's immediate parent is a reparse point
+    (junction/symlink), which could redirect the write outside the allowed root. A reparse point
+    higher in the tree is a known residual limit (DESIGN "Edit-PC transport").
+    """
     force = " -Force" if overwrite else ""
+    dst = ps_quote(destination)
     return (
         "$ErrorActionPreference = 'Stop'\n"
-        f"Move-Item -LiteralPath {ps_quote(source)} -Destination {ps_quote(destination)}{force}\n"
+        f"$dst = {dst}\n"
+        "if (Test-Path -LiteralPath $dst -PathType Container) "
+        "{ throw 'aar: destination is a directory' }\n"
+        "$parent = Split-Path -LiteralPath $dst -Parent\n"
+        "$pitem = Get-Item -LiteralPath $parent -Force\n"
+        "if ($pitem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) "
+        "{ throw 'aar: destination parent is a reparse point' }\n"
+        f"Move-Item -LiteralPath {ps_quote(source)} -Destination $dst{force}\n"
     )
 
 
@@ -198,8 +223,12 @@ class EditHost:
         ]
 
     def powershell_argv(self, script: str) -> list[str]:
-        """The full ssh+powershell argv for ``script`` (also used to pin argv in tests)."""
-        return self._ssh_base() + powershell_argv(script)
+        """The full ssh+powershell argv for ``script`` (also used to pin argv in tests).
+
+        The command-line cap is the host's ``cmdline_max`` (default sized for a cmd.exe
+        DefaultShell), so an over-long script is refused here rather than truncated on the host.
+        """
+        return self._ssh_base() + powershell_argv(script, cmdline_max=self.config.cmdline_max)
 
     # -- PowerShell ---------------------------------------------------------------------------
 
@@ -234,10 +263,15 @@ class EditHost:
         return int(fields[0]), fields[1].upper()
 
     def remote_exists(self, win: _Win) -> bool:
+        """Whether a remote path exists at all (a file or a directory)."""
+        return self.remote_kind(win) in ("file", "container")
+
+    def remote_kind(self, win: _Win) -> str:
+        """``'file'``, ``'container'`` (directory) or ``'none'`` for a remote path."""
         fields = _parse_tagged(
             self.run_powershell(exists_script(windows_literal(win))), _EXISTS_TAG
         )
-        return fields == ["yes"]
+        return fields[0] if fields else "none"
 
     def _remote_remove_quiet(self, win: _Win) -> None:
         with contextlib.suppress(HostError):
@@ -253,7 +287,7 @@ class EditHost:
             raise DestinationExists(dest)
         remote_size, remote_hash = self.remote_stat(win)
         tmp = f"{dest}.aarpart-{self._token()}"
-        spec = scp_target(self.config.alias, win, self.config.path_form)
+        spec = scp_remote_source(self.config.alias, win, self.config.path_form)
         argv = [*self._scp_base(), spec, tmp]
         result = self.runner.run(argv, timeout=self._timeout(None))
         try:
@@ -265,10 +299,23 @@ class EditHost:
             if digest != remote_hash:
                 raise HashMismatch(remote_hash, digest)
             self._place(tmp, dest, overwrite)
+        except HostError:
+            _unlink_quiet(tmp)
+            raise
+        except OSError as exc:  # a local filesystem failure while verifying or placing
+            _unlink_quiet(tmp)
+            raise LocalIOError(f"local I/O error completing the download: {exc}") from exc
         except BaseException:
             _unlink_quiet(tmp)
             raise
-        return TransferResult("pull", size, digest, remote=spec, local=dest, argv=argv)
+        return TransferResult(
+            "pull",
+            size,
+            digest,
+            remote=remote_spec(win, self.config.path_form),
+            local=dest,
+            argv=argv,
+        )
 
     def push(self, local: str, remote: str, *, overwrite: bool = False) -> TransferResult:
         """Upload ``local`` (a hub path) to ``remote`` (an edit-PC path), verified."""
@@ -279,7 +326,7 @@ class EditHost:
         if not overwrite and self.remote_exists(win):
             raise DestinationExists(remote)
         tmp_win = with_suffix(win, f".aarpart-{self._token()}")
-        spec = scp_target(self.config.alias, tmp_win, self.config.path_form)
+        spec = scp_remote_dest(self.config.alias, tmp_win, self.config.path_form)
         argv = [*self._scp_base(), src, spec]
         result = self.runner.run(argv, timeout=self._timeout(None))
         try:
@@ -325,7 +372,33 @@ class EditHost:
             os.replace(tmp, dest)
             return
         try:
-            os.link(tmp, dest)  # fails if dest appeared since the earlier check (no clobber)
+            os.link(tmp, dest)  # atomic no-clobber: fails if dest exists
         except FileExistsError:
             raise DestinationExists(dest) from None
+        except OSError:
+            # No hard links on this filesystem (FAT/exFAT, many SMB/CIFS and some FUSE mounts, or a
+            # cross-device dir): EPERM/EOPNOTSUPP/EXDEV. Fall back to an O_EXCL claim then replace.
+            _place_no_hardlink(tmp, dest)
+            return
         os.unlink(tmp)
+
+
+def _place_no_hardlink(tmp: str, dest: str) -> None:
+    """No-clobber placement without hard links: claim ``dest`` with ``O_EXCL``, then replace it.
+
+    ``O_EXCL`` guarantees we never overwrite a pre-existing destination. The residual window is
+    small: between the empty claim and the replace, ``dest`` exists as a zero-byte file, so a
+    crash there can leave an empty file (the verified data is still in ``tmp``, which the caller
+    removes). ``aar.drp.modify.write._place`` solves the same problem with a check-then-rename;
+    the ``O_EXCL`` claim here is tighter against a concurrent creator.
+    """
+    try:
+        fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        raise DestinationExists(dest) from None
+    os.close(fd)
+    try:
+        os.replace(tmp, dest)
+    except OSError:
+        _unlink_quiet(dest)  # drop the empty claim so a failed placement leaves nothing behind
+        raise

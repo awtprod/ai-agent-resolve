@@ -54,6 +54,7 @@ class FakeRunner:
     # Remote file facts (what the stat script reports): (size, sha256-upper).
     stat_result: tuple[int, str] = (0, "")
     exists: bool = False
+    exists_container: bool = False
     # What a pull's scp writes locally.
     scp_payload: bytes = b""
     # Failure switches.
@@ -84,6 +85,8 @@ class FakeRunner:
         raise AssertionError(f"unexpected argv: {argv!r}")
 
     def _ssh(self, script: str) -> RunResult:
+        # Order matters: the move script also contains Test-Path/Get-Item, so classify the
+        # mutating cmdlets (Move-Item/Remove-Item) before the Test-Path existence check.
         if "Get-FileHash" in script:
             if self.stat_timeout:
                 return RunResult(-1, b"", b"", timed_out=True)
@@ -92,14 +95,14 @@ class FakeRunner:
             size, digest = self.stat_result
             out = f"AARSTAT {size} {digest}\r\n".encode()
             return RunResult(0, out, self.stat_stderr)
-        if "Test-Path" in script:
-            answer = "yes" if self.exists else "no"
-            return RunResult(0, f"AAREXISTS {answer}\r\n".encode(), b"")
         if "Move-Item" in script:
             return RunResult(self.move_returncode, b"", self.move_stderr)
         if "Remove-Item" in script:
             self.removed.append(script)
             return RunResult(0, b"", b"")
+        if "Test-Path" in script:
+            kind = "container" if self.exists_container else "file" if self.exists else "none"
+            return RunResult(0, f"AAREXISTS {kind}\r\n".encode(), b"")
         if self.ps_timeout:
             return RunResult(-1, b"", b"", timed_out=True)
         return RunResult(self.ps_returncode, self.ps_stdout, self.ps_stderr)

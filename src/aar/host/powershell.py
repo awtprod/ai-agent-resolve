@@ -15,7 +15,9 @@ import re
 from aar.host.errors import ScriptTooLong
 
 __all__ = [
-    "WINDOWS_CMDLINE_MAX",
+    "CMD_EXE_CMDLINE_MAX",
+    "DEFAULT_REMOTE_CMDLINE_MAX",
+    "POWERSHELL_CMDLINE_MAX",
     "encode_command",
     "normalize_newlines",
     "powershell_argv",
@@ -23,9 +25,15 @@ __all__ = [
     "strip_clixml",
 ]
 
-# CreateProcess caps lpCommandLine at 32767 UTF-16 units including the terminating NUL, so the
-# usable text is one shorter. The whole remote command line (prefix + encoded command) must fit.
-WINDOWS_CMDLINE_MAX = 32767
+# Win32-OpenSSH runs a remote command through the sshd DefaultShell. The default DefaultShell is
+# cmd.exe, whose command line caps near 8191 characters; a PowerShell DefaultShell uses the
+# CreateProcess cap of 32767. sshd wraps the command roughly as `cmd.exe /c <command>`, so the
+# usable budget is the shell cap minus that wrapper. The cap is a host-config value
+# (AAR_EDIT_CMDLINE_MAX); the default below is conservative (cmd.exe).
+CMD_EXE_CMDLINE_MAX = 8191
+POWERSHELL_CMDLINE_MAX = 32767
+_CMD_C_OVERHEAD = len("cmd.exe /c ")  # the sshd command wrapper for a cmd.exe DefaultShell
+DEFAULT_REMOTE_CMDLINE_MAX = CMD_EXE_CMDLINE_MAX - _CMD_C_OVERHEAD
 
 # Fixed tokens of the remote command. Order and spelling are pinned by tests.
 _PS_PREFIX: tuple[str, ...] = ("powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand")
@@ -48,16 +56,17 @@ def encode_command(script: str) -> str:
     return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
 
 
-def powershell_argv(script: str) -> list[str]:
+def powershell_argv(script: str, *, cmdline_max: int = DEFAULT_REMOTE_CMDLINE_MAX) -> list[str]:
     """Build the remote ``powershell ... -EncodedCommand <b64>`` argument list.
 
-    Refuses (with :class:`ScriptTooLong`) when the whole command line would not fit the Windows
-    command-line limit, so the failure happens here, not as a truncated command on the host.
+    Refuses (with :class:`ScriptTooLong`) when the whole command line would not fit ``cmdline_max``
+    (the usable budget for the remote DefaultShell), so the failure happens here, not as a
+    truncated command on the host.
     """
     encoded = encode_command(script)
     command_line = " ".join((*_PS_PREFIX, encoded))
-    if len(command_line) > WINDOWS_CMDLINE_MAX - 1:  # leave room for the NUL terminator
-        raise ScriptTooLong(len(command_line), WINDOWS_CMDLINE_MAX)
+    if len(command_line) > cmdline_max:
+        raise ScriptTooLong(len(command_line), cmdline_max)
     return [*_PS_PREFIX, encoded]
 
 

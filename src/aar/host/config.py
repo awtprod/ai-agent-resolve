@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from aar.host.errors import ConfigError, PathRefused
+from aar.host.powershell import DEFAULT_REMOTE_CMDLINE_MAX
 from aar.host.winpath import PathForm, _Win, normalize_root
 
 __all__ = ["EditHostConfig", "env_config"]
@@ -26,6 +27,7 @@ _ENV_LOCAL_ROOTS = "AAR_EDIT_LOCAL_ROOTS"
 _ENV_PATH_FORM = "AAR_EDIT_PATH_FORM"
 _ENV_CONNECT_TIMEOUT = "AAR_EDIT_CONNECT_TIMEOUT"
 _ENV_COMMAND_TIMEOUT = "AAR_EDIT_COMMAND_TIMEOUT"
+_ENV_CMDLINE_MAX = "AAR_EDIT_CMDLINE_MAX"
 
 _PATH_FORMS = ("drive", "slash")
 
@@ -60,6 +62,7 @@ class EditHostConfig:
     path_form: PathForm = "drive"
     connect_timeout: int = 10
     command_timeout: float = 300.0
+    cmdline_max: int = DEFAULT_REMOTE_CMDLINE_MAX
     path_map: tuple[tuple[str, str], ...] = ()
     _remote_roots_parsed: tuple[_Win, ...] = field(default=(), repr=False, compare=False)
 
@@ -74,6 +77,8 @@ class EditHostConfig:
             raise ConfigError("connect timeout must be a positive integer (seconds)")
         if not (isinstance(self.command_timeout, (int, float)) and self.command_timeout > 0):
             raise ConfigError("command timeout must be a positive number (seconds)")
+        if not isinstance(self.cmdline_max, int) or self.cmdline_max <= 0:
+            raise ConfigError("cmdline max must be a positive integer (characters)")
         if not self.remote_roots:
             raise ConfigError("at least one remote root is required")
         if not self.local_roots:
@@ -142,6 +147,11 @@ def env_config(env: Mapping[str, str] | None = None) -> EditHostConfig:
         command_timeout = float(command) if command else 300.0
     except ValueError as exc:
         raise ConfigError(f"{_ENV_COMMAND_TIMEOUT} must be a number: {command!r}") from exc
+    cmdline = env.get(_ENV_CMDLINE_MAX)
+    try:
+        cmdline_max = int(cmdline) if cmdline else DEFAULT_REMOTE_CMDLINE_MAX
+    except ValueError as exc:
+        raise ConfigError(f"{_ENV_CMDLINE_MAX} must be an integer: {cmdline!r}") from exc
     form = env.get(_ENV_PATH_FORM) or "drive"
     return EditHostConfig(
         alias=env[_ENV_ALIAS],
@@ -151,4 +161,5 @@ def env_config(env: Mapping[str, str] | None = None) -> EditHostConfig:
         path_form=form,  # type: ignore[arg-type]  # validated in __post_init__
         connect_timeout=connect_timeout,
         command_timeout=command_timeout,
+        cmdline_max=cmdline_max,
     )

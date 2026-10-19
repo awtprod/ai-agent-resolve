@@ -6,6 +6,14 @@ empty components, no reserved device name, no illegal or control character, no t
 space, and resolves inside an allowed root under NTFS case rules. The parse, the NTFS upcasing
 and the path map all reuse :mod:`aar.drp.modify.paths` (owned by S8c; not edited here) so there
 is a single source of truth for Windows path rules.
+
+Validation is lexical: it reasons about the path string, never about the remote filesystem.
+A junction or symlink (a reparse point) under an allowed root can therefore still redirect a
+transfer outside that root on the edit PC. The push path adds a remote reparse-point check on the
+destination's immediate parent as a partial mitigation; a reparse point higher in the tree is a
+known residual limit (see DESIGN "Edit-PC transport"). This is acceptable for a trusted,
+single-tenant edit PC on a tailnet, and a fully safe fix would need an atomic remote
+resolve-and-move the SFTP protocol does not offer (any check-then-move still races).
 """
 
 from __future__ import annotations
@@ -28,15 +36,23 @@ from aar.host.errors import PathRefused
 __all__ = [
     "PathForm",
     "PathMapper",
+    "glob_escape",
     "normalize_root",
     "remote_spec",
-    "scp_target",
+    "scp_remote_dest",
+    "scp_remote_source",
     "validate_windows_path",
     "windows_literal",
     "with_suffix",
 ]
 
 PathForm = Literal["drive", "slash"]
+
+# scp in SFTP mode (OpenSSH 9 default) globs a remote *source* path client-side with escaping
+# enabled: sftp_glob(conn, abs_src, GLOB_NOCHECK|GLOB_MARK) (scp.c:1571), QUOTE='\\' (glob.c:96),
+# metacharacters * ? [ ]. A remote *destination* is NOT globbed (prepare_remote_path only,
+# scp.c:1350-1354 "No need to glob here"), so a destination must stay literal.
+_GLOB_META = frozenset("\\*?[]")
 
 # Windows verbatim / device namespaces. A path in one of these bypasses normal path rules on
 # Windows, so it is refused outright before parsing.
@@ -156,8 +172,26 @@ def remote_spec(win: _Win, form: PathForm) -> str:
     return base
 
 
-def scp_target(alias: str, win: _Win, form: PathForm) -> str:
-    """Build the full ``alias:spec`` scp argument for a validated path."""
+def glob_escape(text: str) -> str:
+    """Backslash-escape scp/SFTP glob metacharacters (``\\ * ? [ ]``) in ``text``."""
+    return "".join("\\" + ch if ch in _GLOB_META else ch for ch in text)
+
+
+def scp_remote_source(alias: str, win: _Win, form: PathForm) -> str:
+    """The scp argument for a remote *source* (download): path portion is glob-escaped.
+
+    scp globs a remote source client-side, so a literal ``[``/``]`` in a name must be escaped or
+    it would fail to match or match a sibling. ``*``/``?`` cannot occur in a validated path.
+    """
+    return f"{alias}:{glob_escape(remote_spec(win, form))}"
+
+
+def scp_remote_dest(alias: str, win: _Win, form: PathForm) -> str:
+    """The scp argument for a remote *destination* (upload): path portion stays literal.
+
+    scp does not glob an upload destination, so backslash escaping would reach the server as
+    literal filename characters; the path must be sent as-is.
+    """
     return f"{alias}:{remote_spec(win, form)}"
 
 

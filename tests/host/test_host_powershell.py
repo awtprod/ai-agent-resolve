@@ -8,7 +8,8 @@ import pytest
 
 from aar.host.errors import ScriptTooLong
 from aar.host.powershell import (
-    WINDOWS_CMDLINE_MAX,
+    DEFAULT_REMOTE_CMDLINE_MAX,
+    POWERSHELL_CMDLINE_MAX,
     encode_command,
     normalize_newlines,
     powershell_argv,
@@ -69,19 +70,33 @@ def test_powershell_argv_pins_flags_and_payload() -> None:
     ]
 
 
-def test_powershell_argv_accepts_a_script_under_the_limit() -> None:
-    # ~10k chars -> well under the limit; must not raise.
-    powershell_argv("a" * 10_000)
+def test_powershell_argv_accepts_a_script_under_the_default_cap() -> None:
+    # ~3k chars -> base64 ~4k, under the conservative cmd.exe default; must not raise.
+    powershell_argv("a" * 3_000)
 
 
-def test_powershell_argv_refuses_over_the_limit() -> None:
-    script = "a" * 20_000  # UTF-16LE then base64 blows past 32767
+def test_powershell_argv_refuses_over_the_default_cap() -> None:
+    script = "a" * 20_000  # UTF-16LE then base64 blows past the default (cmd.exe) cap
     with pytest.raises(ScriptTooLong) as info:
         powershell_argv(script)
     encoded = encode_command(script)
     assert info.value.length == len(_PREFIX + encoded)
-    assert info.value.limit == WINDOWS_CMDLINE_MAX
-    assert "32767" in str(info.value)
+    assert info.value.limit == DEFAULT_REMOTE_CMDLINE_MAX
+    assert "AAR_EDIT_CMDLINE_MAX" in str(info.value)
+
+
+def test_default_cap_is_cmd_exe_sized_not_createprocess() -> None:
+    # The cmd.exe DefaultShell budget is far below the 32767 CreateProcess/PowerShell cap.
+    assert DEFAULT_REMOTE_CMDLINE_MAX < POWERSHELL_CMDLINE_MAX
+    assert DEFAULT_REMOTE_CMDLINE_MAX < 8192
+
+
+def test_cmdline_cap_is_a_parameter() -> None:
+    # A larger cap (configured PowerShell DefaultShell) lets a bigger script through.
+    script = "a" * 5_000  # over the cmd.exe default, under 32767
+    with pytest.raises(ScriptTooLong):
+        powershell_argv(script)
+    powershell_argv(script, cmdline_max=POWERSHELL_CMDLINE_MAX)  # must not raise
 
 
 def test_normalize_newlines() -> None:

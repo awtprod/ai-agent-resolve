@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
+import errno
+
 import pytest
 from host_support import ALIAS, FakeRunner, make_config, sha256_upper
 
+from aar.host import transport
 from aar.host.errors import (
     DestinationExists,
     HashMismatch,
+    HostError,
     PathRefused,
     RemoteCommandError,
     SizeMismatch,
     TransportTimeout,
 )
 from aar.host.transport import EditHost, exists_script, move_script, stat_script
+
+
+def _raise_oserror(*_args, **_kwargs):
+    raise OSError(errno.EOPNOTSUPP, "operation not supported")
+
 
 REMOTE = "E:\\Show\\Review\\cut v2.mp4"
 LITERAL = "E:\\Show\\Review\\cut v2.mp4"
@@ -299,3 +308,133 @@ def test_run_powershell_nonzero_strips_clixml_from_error(tmp_path) -> None:
         host.run_powershell("throw 'Boom'")
     assert "Boom happened" in info.value.stderr
     assert "CLIXML" not in info.value.stderr
+
+
+# -- round 2 fixes ---------------------------------------------------------------------------
+
+
+def test_pull_escapes_glob_metacharacters_in_remote_source(tmp_path) -> None:
+    # item 1: scp globs a remote SOURCE, so a literal '[' / ']' must be escaped.
+    payload = b"bracketed media"
+    runner = FakeRunner(stat_result=(len(payload), sha256_upper(payload)), scp_payload=payload)
+    host = build(tmp_path, runner)
+    dest = tmp_path / "out.mp4"
+    host.pull("E:\\Show\\cut [v2].mp4", str(dest))
+    assert runner.calls[1][-2] == f"{ALIAS}:E:/Show/cut \\[v2\\].mp4"
+    assert dest.read_bytes() == payload
+
+
+def test_push_remote_dest_is_literal_not_glob_escaped(tmp_path) -> None:
+    # item 1: scp does NOT glob an upload DESTINATION, so it must stay literal (no backslashes).
+    src, content = _src(tmp_path)
+    runner = FakeRunner(stat_result=(len(content), sha256_upper(content)))
+    host = build(tmp_path, runner)
+    host.push(str(src), "E:\\Show\\out [1].mp4")
+    assert runner.calls[1][-1] == f"{ALIAS}:E:/Show/out [1].mp4.aarpart-TOKEN"
+
+
+def test_pull_falls_back_when_hardlinks_unsupported(tmp_path, monkeypatch) -> None:
+    # item 3: on FAT/exFAT/SMB/FUSE os.link raises OSError; the O_EXCL fallback still completes.
+    payload = b"content bytes"
+    runner = FakeRunner(stat_result=(len(payload), sha256_upper(payload)), scp_payload=payload)
+    host = build(tmp_path, runner)
+    dest = tmp_path / "out.mp4"
+    monkeypatch.setattr(transport.os, "link", _raise_oserror)
+    host.pull(REMOTE, str(dest))
+    assert dest.read_bytes() == payload
+    assert not (tmp_path / "out.mp4.aarpart-TOKEN").exists()
+
+
+def test_pull_fallback_no_clobber_without_overwrite(tmp_path, monkeypatch) -> None:
+    # item 3: even without hard links, an existing destination is never overwritten.
+    dest = tmp_path / "out.mp4"
+    dest.write_bytes(b"original")
+    payload = b"content bytes"
+    runner = FakeRunner(stat_result=(len(payload), sha256_upper(payload)), scp_payload=payload)
+    host = build(tmp_path, runner)
+    monkeypatch.setattr(transport.os, "link", _raise_oserror)
+    with pytest.raises(DestinationExists):
+        host.pull(REMOTE, str(dest))
+    assert dest.read_bytes() == b"original"
+    assert not (tmp_path / "out.mp4.aarpart-TOKEN").exists()
+
+
+def test_pull_placement_failure_is_typed_and_cleans_up(tmp_path, monkeypatch) -> None:
+    # item 3: a raw OSError during placement surfaces as a typed HostError, partial removed.
+    payload = b"content bytes"
+    runner = FakeRunner(stat_result=(len(payload), sha256_upper(payload)), scp_payload=payload)
+    host = build(tmp_path, runner)
+    dest = tmp_path / "out.mp4"
+    monkeypatch.setattr(transport.os, "link", _raise_oserror)
+    monkeypatch.setattr(transport.os, "replace", _raise_oserror)
+    with pytest.raises(HostError) as info:
+        host.pull(REMOTE, str(dest))
+    assert info.value.kind == "local-io-error"
+    assert not (tmp_path / "out.mp4.aarpart-TOKEN").exists()
+    assert not dest.exists()  # the empty O_EXCL claim is cleaned up
+
+
+def test_pull_refuses_directory_destination(tmp_path) -> None:
+    # item 4: confirm pull's local side already refuses a directory destination.
+    adir = tmp_path / "adir"
+    adir.mkdir()
+    runner = FakeRunner(stat_result=(1, sha256_upper(b"x")), scp_payload=b"x")
+    host = build(tmp_path, runner)
+    with pytest.raises(PathRefused) as info:
+        host.pull(REMOTE, str(adir))
+    assert info.value.reason == "destination-is-a-directory"
+    assert runner.calls == []
+
+
+def test_push_refuses_existing_remote_container(tmp_path) -> None:
+    # item 4: a remote directory counts as existing, so a non-overwrite push is refused.
+    src, _ = _src(tmp_path)
+    runner = FakeRunner(exists_container=True)
+    host = build(tmp_path, runner)
+    with pytest.raises(DestinationExists):
+        host.push(str(src), "E:\\Show\\out.mp4")
+    assert len(runner.calls) == 1  # existence check only, no upload
+
+
+def test_push_overwrite_onto_directory_fails_closed(tmp_path) -> None:
+    # item 4: --overwrite skips the check, but the move script refuses a directory destination.
+    src, content = _src(tmp_path)
+    runner = FakeRunner(
+        stat_result=(len(content), sha256_upper(content)),
+        move_returncode=1,
+        move_stderr=b"aar: destination is a directory",
+    )
+    host = build(tmp_path, runner)
+    with pytest.raises(RemoteCommandError):
+        host.push(str(src), "E:\\Show\\out.mp4", overwrite=True)
+    assert runner.removed  # the partial upload is cleaned up
+    move = next(s for s in runner.scripts if "Move-Item" in s)
+    assert "PathType Container" in move  # the guard is in the move script itself
+
+
+def test_push_move_script_guards_against_reparse_point_parent(tmp_path) -> None:
+    # item 5: the move script refuses when the destination's parent is a junction/symlink.
+    src, content = _src(tmp_path)
+    runner = FakeRunner(stat_result=(len(content), sha256_upper(content)))
+    host = build(tmp_path, runner)
+    host.push(str(src), "E:\\Show\\out.mp4", overwrite=True)
+    move = next(s for s in runner.scripts if "Move-Item" in s)
+    assert "ReparsePoint" in move
+    assert "Split-Path" in move
+
+
+def test_ps_uses_the_configured_cmdline_cap(tmp_path) -> None:
+    # item 2: the cmd.exe-sized default cap refuses a multi-KB script that fits CreateProcess.
+    runner = FakeRunner()
+    host = build(tmp_path, runner)
+    with pytest.raises(HostError) as info:
+        host.run_powershell("a" * 4000)
+    assert info.value.kind == "script-too-long"
+    assert runner.calls == []  # refused before any ssh call
+
+
+def test_ps_cmdline_cap_is_configurable(tmp_path) -> None:
+    # item 2: raising AAR_EDIT_CMDLINE_MAX (a PowerShell DefaultShell) lets the script through.
+    runner = FakeRunner(ps_stdout=b"ok\r\n")
+    host = build(tmp_path, runner, cmdline_max=32767)
+    assert host.run_powershell("a" * 4000) == "ok\n"

@@ -13,6 +13,7 @@ __all__ = [
     "DestinationExists",
     "HashMismatch",
     "HostError",
+    "LocalIOError",
     "PathRefused",
     "RemoteCommandError",
     "ScriptTooLong",
@@ -46,7 +47,12 @@ class PathRefused(HostError):
 
 
 class ScriptTooLong(HostError):
-    """The encoded PowerShell command line would exceed the Windows command-line limit."""
+    """The encoded PowerShell command line would exceed the remote command-line cap.
+
+    ``limit`` is the configured usable cap (``AAR_EDIT_CMDLINE_MAX``). The default assumes the
+    edit PC's sshd DefaultShell is ``cmd.exe`` (an ~8191-character line); a PowerShell DefaultShell
+    allows up to 32767.
+    """
 
     kind = "script-too-long"
 
@@ -54,8 +60,10 @@ class ScriptTooLong(HostError):
         self.length = length
         self.limit = limit
         super().__init__(
-            f"the encoded PowerShell command line is {length} characters, over the Windows "
-            f"command-line limit of {limit}"
+            f"the encoded PowerShell command line is {length} characters, over the "
+            f"{limit}-character remote command-line cap. The default assumes a cmd.exe "
+            "DefaultShell (~8191 chars); a PowerShell DefaultShell allows 32767. Shorten the "
+            "script or raise AAR_EDIT_CMDLINE_MAX."
         )
 
 
@@ -114,3 +122,9 @@ class DestinationExists(TransportError):
     def __init__(self, destination: str) -> None:
         self.destination = destination
         super().__init__(f"destination already exists: {destination}")
+
+
+class LocalIOError(TransportError):
+    """A local filesystem operation failed while completing a transfer (the partial is removed)."""
+
+    kind = "local-io-error"

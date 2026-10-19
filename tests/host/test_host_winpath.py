@@ -7,9 +7,11 @@ import pytest
 from aar.host.errors import PathRefused
 from aar.host.pathmap import HostPathMap
 from aar.host.winpath import (
+    glob_escape,
     normalize_root,
     remote_spec,
-    scp_target,
+    scp_remote_dest,
+    scp_remote_source,
     validate_windows_path,
     windows_literal,
 )
@@ -32,13 +34,29 @@ def test_accepts_a_path_inside_the_root() -> None:
 def test_drive_form_remote_spec() -> None:
     win = _validate("E:\\Show\\Review\\cut v2.mp4")
     assert remote_spec(win, "drive") == "E:/Show/Review/cut v2.mp4"
-    assert scp_target("edit-pc", win, "drive") == "edit-pc:E:/Show/Review/cut v2.mp4"
+    # a plain path (no glob metacharacters) is identical as source or destination
+    assert scp_remote_source("edit-pc", win, "drive") == "edit-pc:E:/Show/Review/cut v2.mp4"
+    assert scp_remote_dest("edit-pc", win, "drive") == "edit-pc:E:/Show/Review/cut v2.mp4"
 
 
 def test_slash_form_remote_spec() -> None:
     win = _validate("E:\\Show\\Review\\cut v2.mp4")
     assert remote_spec(win, "slash") == "/E:/Show/Review/cut v2.mp4"
-    assert scp_target("edit-pc", win, "slash") == "edit-pc:/E:/Show/Review/cut v2.mp4"
+    assert scp_remote_source("edit-pc", win, "slash") == "edit-pc:/E:/Show/Review/cut v2.mp4"
+
+
+def test_glob_escape_escapes_sftp_metacharacters() -> None:
+    assert glob_escape("E:/Show/cut [v2].mp4") == "E:/Show/cut \\[v2\\].mp4"
+    assert glob_escape("a*b?c\\d") == "a\\*b\\?c\\\\d"
+
+
+def test_scp_source_escapes_brackets_but_dest_stays_literal() -> None:
+    # Brackets are legal Windows filename chars; scp globs a remote SOURCE but not a DESTINATION.
+    win = _validate("E:\\Show\\cut [v2].mp4")
+    assert scp_remote_source("edit-pc", win, "drive") == "edit-pc:E:/Show/cut \\[v2\\].mp4"
+    assert scp_remote_dest("edit-pc", win, "drive") == "edit-pc:E:/Show/cut [v2].mp4"
+    # reporting uses the literal, human-readable path
+    assert remote_spec(win, "drive") == "E:/Show/cut [v2].mp4"
 
 
 def test_mixed_separators_are_accepted_and_normalised() -> None:
@@ -62,7 +80,7 @@ def test_lowercase_drive_and_case_insensitive_root_match() -> None:
 def test_leading_dash_component_stays_behind_the_alias() -> None:
     # A path whose component starts with '-' must never become a bare scp option.
     win = _validate("E:\\Show\\-rf")
-    target = scp_target("edit-pc", win, "drive")
+    target = scp_remote_source("edit-pc", win, "drive")
     assert target == "edit-pc:E:/Show/-rf"
     assert not target.startswith("-")
 
