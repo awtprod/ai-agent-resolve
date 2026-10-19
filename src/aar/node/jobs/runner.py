@@ -11,6 +11,8 @@ A pump has three phases, in this order, so a stop is honoured before anything ru
 2. **Run the broker** off the pump thread. Exactly one drain runs at a time (concurrent pumps
    share it), and it ticks the broker on every pump -- also when the queue is empty, which is
    how the broker restores the human's project, timeline and page once the agents are done.
+   Each drain ends by reporting presence and flushing the node's lease/presence feed to the
+   hub (S11, P5), on the same thread as the broker that feeds them.
    The pump waits for the drain up to ``drain_budget`` seconds (``None``: until it finishes),
    so a hung gateway call cannot block the pump and the watchdog can still stall the job. A
    broker crash on the drain thread is logged and recorded on the affected jobs.
@@ -276,7 +278,6 @@ class JobRunner:
         self._drain_thread: threading.Thread | None = None
         self._drain_done: threading.Event | None = None
         self._drain_errors: list[dict[str, Any]] = []
-        self._hub_sync_lock = threading.Lock()
         self.last_flush = None
         """The last ``FlushReport`` of the node's feed."""
         self._closed = False
@@ -642,31 +643,26 @@ class JobRunner:
             for record in self._order():
                 self._advance(record, now)
             self._run_watchdog(now)
-            outcome = self._outcome()
-        self._sync_hub(now)  # outside the job lock: the feed may talk to a remote hub
-        return outcome
+            return self._outcome()
 
-    def _sync_hub(self, now: float) -> None:
+    def _sync_hub(self) -> None:
         """Report presence and flush the lease/presence feed (S11 wiring, P5).
 
-        Both are called on every pump: ``PresenceReporter.sync`` turns the presence guard's
-        verdict (refreshed by the broker's tick) into hub presence events, then
-        ``NodeFeed.flush`` sends what is queued (it backs off by itself while the hub is
-        unreachable). A concurrent pump skips it rather than flush the same feed twice; a
-        feed error never escapes into the pump."""
-        if not self._hub_sync_lock.acquire(blocking=False):
-            return
+        Called at the end of every drain the pump runs, ON the drain thread: the lease table,
+        the presence guard and the feed are not thread-safe, and the broker (which grants
+        leases into the feed and observes presence) runs on that thread, so they are only
+        ever touched from it. ``PresenceReporter.sync`` turns the guard's verdict (refreshed
+        by the broker's tick) into hub presence events, then ``NodeFeed.flush`` sends what is
+        queued (it backs off by itself while the hub is unreachable). A feed error never
+        escapes into the drain."""
         try:
-            try:
-                self.presence_reporter.sync(now, self.wall_clock())
-            except Exception:  # a bad presence report must not stop the jobs
-                _log.exception("job runner %s: presence sync failed", self.node_id)
-            report = self.feed.flush()
-            if report.stopped:
-                _log.error("job runner %s: the hub replaced this node's feed", self.node_id)
-            self.last_flush = report
-        finally:
-            self._hub_sync_lock.release()
+            self.presence_reporter.sync(self.clock(), self.wall_clock())
+        except Exception:  # a bad presence report must not stop the jobs
+            _log.exception("job runner %s: presence sync failed", self.node_id)
+        report = self.feed.flush()
+        if report.stopped:
+            _log.error("job runner %s: the hub replaced this node's feed", self.node_id)
+        self.last_flush = report
 
     def run_until_settled(self, max_pumps: int = 10000) -> list[PumpOutcome]:
         """Pump until no job can make progress on its own. For tests and batch drains."""
@@ -719,7 +715,12 @@ class JobRunner:
             with self._drain_lock:
                 self._drain_errors.append(error)
         finally:
-            done.set()
+            try:
+                self._sync_hub()
+            except Exception:  # pragma: no cover - flush never raises; belt and braces
+                _log.exception("job runner %s: hub sync failed", self.node_id)
+            finally:
+                done.set()
 
     def _note_drain_errors(self, now: float) -> None:
         """Record a broker crash on every job whose op it left outstanding (once per error)."""

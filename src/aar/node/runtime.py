@@ -11,7 +11,9 @@ The wiring, in one place so nothing is left to a default by accident:
   ``lease_source`` is the table's ``active`` and both run on the runtime's monotonic clock;
 - one :class:`~aar.node.feed.PresenceReporter` over the broker's presence guard;
 - the pump (:meth:`aar.node.jobs.JobRunner.pump`) calls ``PresenceReporter.sync`` and then
-  ``NodeFeed.flush`` on every tick, and records each ``timeline.branch`` result on the hub
+  ``NodeFeed.flush`` on every tick -- at the end of the drain it runs, on the broker's thread,
+  because the lease table, presence guard and feed are not thread-safe -- and records each
+  ``timeline.branch`` result on the hub
   (:func:`aar.hub.collab.record_branch`) under the hub's ``prj_`` id, as
   ``Actor("node", <the feed's node id>)``;
 - exactly one live feed per node id in a process: a second :class:`NodeRuntime` for a node id

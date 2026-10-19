@@ -434,15 +434,30 @@ def test_p5_the_feed_and_the_lease_table_see_each_other_on_one_clock(tmp_path: P
 
 
 def test_p5_every_pump_syncs_presence_then_flushes_the_feed(tmp_path: Path) -> None:
+    """Every pump: sync then flush, on the drain thread (the broker's), never the pump's own:
+    the lease table, presence guard and feed are not thread-safe."""
     world = _human_world(tmp_path)
     rt = world.runtime
     calls: list[str] = []
+    threads: set[str] = set()
     real_sync, real_flush = rt.presence_reporter.sync, rt.feed.flush
-    rt.presence_reporter.sync = lambda now, wall: (calls.append("sync"), real_sync(now, wall))[1]  # type: ignore[method-assign]
-    rt.feed.flush = lambda: (calls.append("flush"), real_flush())[1]  # type: ignore[method-assign]
+
+    def sync(now, wall):
+        calls.append("sync")
+        threads.add(threading.current_thread().name)
+        return real_sync(now, wall)
+
+    def flush():
+        calls.append("flush")
+        threads.add(threading.current_thread().name)
+        return real_flush()
+
+    rt.presence_reporter.sync = sync  # type: ignore[method-assign]
+    rt.feed.flush = flush  # type: ignore[method-assign]
     for _ in range(3):
         world.runner.pump()
     assert calls == ["sync", "flush"] * 3
+    assert threads == {f"aar-drain-{world.node_id}"}
     # A human starts working: the next pump puts them on the board.
     world.project.current_timeline = world.project.timeline("Main [agent]")
     world.presence.observe(world.gw.get_context(), world.clock())

@@ -38,8 +38,9 @@ and these recorders. The wiring it does (tested in ``tests/node/test_s7_s11_inte
    late: the feed's ``lease_source`` is the lease table's ``active``, and both use the
    runtime's (monotonic) clock.
 5. The job runner's pump calls ``PresenceReporter.sync()`` and then ``NodeFeed.flush()``
-   on every tick. The feed backs off by itself while the hub is unreachable
-   (``FlushReport.retry_at``), so that is cheap.
+   on every tick, at the end of the drain it runs, on the broker's thread (the lease table,
+   the presence guard and the feed are not thread-safe). The feed backs off by itself while
+   the hub is unreachable (``FlushReport.retry_at``), so that is cheap.
 6. Each ``timeline.branch`` result a job gets goes to :func:`record_branch` (through
    ``aar.node.hublink.LocalHubLink.record_branch``) with the hub's ``prj_...`` id (the one
    registry project whose source carries the Resolve uid, else the one with its name; none
