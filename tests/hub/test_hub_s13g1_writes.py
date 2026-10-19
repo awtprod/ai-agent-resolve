@@ -992,6 +992,20 @@ def test_plan_title_must_be_one_line(hub: Hub) -> None:
     brief_id = _brief(hub)
     error = _refused("invalid_input", lambda: _plan(hub, brief_id, title="a\nb"))
     assert error.details["field"] == "title"
+    # A title derived from the plan's free-text timeline name is made one line.
+    plan = plan_fixture("short_clean")
+    plan["timeline"] = "Short 03\nsecond line\x07"
+    stored = writes.submit_plan(
+        hub.log,
+        hub.store,
+        hub.project_id,
+        plan,
+        AGENT,
+        derives_from=brief_id,
+        idempotency_key="derived",
+    )
+    version = EditPlan.model_validate(plan).version
+    assert stored.body["node"]["title"] == f"plan v{version}: Short 03 second line "
 
 
 def test_plan_replay_and_conflict(hub: Hub) -> None:

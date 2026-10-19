@@ -142,6 +142,7 @@ SEGMENT_RE = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
 RESOLVE_ID_RE = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 SHA256_RE = r"^[0-9a-f]{64}$"
 _KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 AGENT_OWNABLE_KINDS = frozenset({"brief", "recipe", "plan", "op"})
 PLAN_PARENT_KINDS = frozenset({"brief", "recipe", "plan", "review"})
@@ -1177,7 +1178,9 @@ def submit_plan(
             brief_id=brief_id,
             lint=lint_summary(report, profile),
         ).dump()
-        node_title = title or _clip(f"plan v{parsed.version}: {parsed.timeline}", MAX_TITLE)
+        # The plan's timeline name is free text: shown as a title, it is made one line.
+        derived = _CONTROL.sub(" ", f"plan v{parsed.version}: {parsed.timeline}")
+        node_title = title or _clip(derived, MAX_TITLE)
         node_event = graph.add_node_in(
             txn,
             "plan",
