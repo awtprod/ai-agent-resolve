@@ -26,6 +26,11 @@ from .model import Done, Fail, Step, StepAction, StepContext, Submit
 DEFAULT_STEP_TIMEOUT = 300.0
 """A step should finish well under the live MCP 60 s cap per op; a generous whole-step limit."""
 
+RENDER_KIND_ONLY_OPS = frozenset({"render.build", "render.delete_job"})
+"""Ops only the ``render`` job kind may run: as a bare op step, a re-run build would add a
+second render job (the step would not adopt the journaled one) and ``render.delete_job`` would
+delete any JobId it is given, a human's included."""
+
 
 @dataclass(frozen=True, slots=True)
 class JobKind:
@@ -108,6 +113,8 @@ def _build_op_sequence(params: BaseModel, target: ProjectLocator) -> list[Step]:
             get_op(spec.op)  # fail at submit, not mid-job, on an unknown op
         except KeyError as exc:
             raise ValueError(str(exc)) from exc
+        if spec.op in RENDER_KIND_ONLY_OPS:
+            raise ValueError(f"op {spec.op!r} runs only inside a 'render' job, not ops.sequence")
         steps.append(
             OpStep(
                 spec.op, spec.params, name=spec.name or f"{index}:{spec.op}", timeout=spec.timeout

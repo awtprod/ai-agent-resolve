@@ -80,6 +80,9 @@ _DRAIN_BUDGET = 0.5
 """Real seconds a pump waits for the broker to finish before leaving a hung op to the watchdog."""
 DEFAULT_MAX_RESTARTS = 5
 """Node restarts that may interrupt one running step before the job is stalled (P5b)."""
+DEADLINE_PERSIST_EVERY = 5.0
+"""Clock seconds between saves of a running step's remaining deadline when nothing else saves
+it, so a restart loses at most this much of the countdown (P5b)."""
 
 _drain_delay = 0.0
 """TEST-ONLY: seconds every drain sleeps before it ticks. Set above ``_DRAIN_BUDGET`` to prove
@@ -183,6 +186,8 @@ class _Runtime:
     quarantined: bool = False
     broker_error: dict[str, Any] | None = None
     """The last broker crash seen while this job's op was outstanding (the stall's cause)."""
+    persisted_at: float | None = None
+    """Clock time the remaining deadline was last saved while running."""
 
 
 class JobRunner:
@@ -1134,6 +1139,7 @@ class JobRunner:
         ):
             remaining = job.step_deadline - (now - rt.deadline_anchor)
             self.store.save(replace(job, step_deadline=remaining), events)
+            rt.persisted_at = now
             return
         self.store.save(job, events)
 
@@ -1177,6 +1183,8 @@ class JobRunner:
             )
             if overdue is not None:
                 self._stall(job, overdue, now)
+            elif rt.persisted_at is None or now - rt.persisted_at >= DEADLINE_PERSIST_EVERY:
+                self._checkpoint(job, [], now)  # keep the persisted countdown current
 
     # -- views -----------------------------------------------------------------------------
 
