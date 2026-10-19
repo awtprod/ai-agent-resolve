@@ -59,10 +59,6 @@ class HubLink(Protocol):
         :class:`~aar.hub.approvals.ApprovalError` subclass on refusal; refusals are logged."""
         ...
 
-    def approval_state(self, token_id: str) -> tuple[str, Actor | None] | None:
-        """Return ``(state, consumed_by)`` for a token, or ``None`` if it was never granted."""
-        ...
-
     def approval(self, token_id: str) -> Approval | None:
         """The token's record (scope, target, who consumed it), or ``None`` if never granted."""
         ...
@@ -105,12 +101,6 @@ class LocalHubLink:
         self, token_id: str, scope: ApprovalScope | str, target: str, actor: Actor
     ) -> Approval:
         return consume(self._log, token_id, scope, target, actor, clock=self._approval_clock)
-
-    def approval_state(self, token_id: str) -> tuple[str, Actor | None] | None:
-        approval = get_approval(self._log, token_id)
-        if approval is None:
-            return None
-        return approval.state(self._approval_clock()), approval.consumed_by
 
     def approval(self, token_id: str) -> Approval | None:
         return get_approval(self._log, token_id)

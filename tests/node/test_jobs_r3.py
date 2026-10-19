@@ -540,9 +540,9 @@ def test_p6_refused_token_not_retried(tmp_path: Path) -> None:
     world.runner.run_until_settled()
     token = grant(world.log, ApprovalScope.PROJECT_LOAD, world.pid(), 3600, "wrong", HUMAN)
     world.runner.approve(job_id, token.token_id, HUMAN)
-    for _ in range(200):
+    for _ in range(50):
         world.runner.pump()
-    assert len(world.log.read(types=["approval.consume_refused"])) <= 1
+    assert len(world.log.read(types=["approval.consume_refused"])) == 1
 
 
 # == P7: production broker restore around a blocked build =======================================
@@ -1171,11 +1171,11 @@ def test_p21_render_does_not_stall_other_project(tmp_path: Path) -> None:
 
 def test_p22_events_bounded(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
-    world.project.render_complete_after = 500
+    world.project.render_complete_after = 200
     job_id = world.runner.submit("render", _render_params(world), world.locator())
     world.runner.run_until_settled()
     n = len(world.store.events(job_id))
-    assert n < 50
+    assert n < 30  # 200 polls; a per-poll event (mutant N22) would be 200+
 
 
 # == N: render.build failure paths ===============================================================
@@ -1466,7 +1466,8 @@ def test_n5_concurrent_pumps_share_one_drain(tmp_path: Path) -> None:
             "params": {"timeline": world.ref(timeline), "markers": [{"frame": frame}]},
         }
         world.runner.submit("ops.sequence", {"steps": [step]}, world.locator())
-    world.runner.pump()  # both queued (drain 1 ticks an empty queue)
+    world.runner.pump()  # both queued
+    before = drains[0]
     ts = [threading.Thread(target=world.runner.pump) for _ in range(2)]
     for t in ts:
         t.start()
@@ -1474,7 +1475,9 @@ def test_n5_concurrent_pumps_share_one_drain(tmp_path: Path) -> None:
     for t in ts:
         t.join(WAIT)
         assert not t.is_alive()
-    assert drains[0] == 2  # the first pump's drain + ONE shared by the two concurrent pumps
+    # At most ONE drain served both concurrent pumps (none if the first pump's drain was
+    # still running -- e.g. under the test-only drain delay -- and they shared that one).
+    assert drains[0] - before <= 1
     release.set()
     assert world.runner.wait_drain(WAIT)
     world.runner.run_until_settled()
@@ -1569,3 +1572,27 @@ def test_events_json_is_readable(tmp_path: Path) -> None:
     world.runner.run_until_settled()
     for e in world.runner.get(job_id).events:
         json.dumps(e)
+
+
+def test_v1_store_is_migrated_to_v2_in_place(tmp_path: Path) -> None:
+    """Schema v2 adds the restart counter; a v1 store (no ``restarts`` column) is migrated."""
+    world = JobWorld(tmp_path)
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    world.runner.close()
+    world.store.close()
+    conn = sqlite3.connect(world.db_path)
+    conn.execute("ALTER TABLE jobs DROP COLUMN restarts")
+    conn.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
+    conn.commit()
+    conn.close()
+    world.store = JobStore(world.db_path)
+    runner = world.restart()
+    conn = sqlite3.connect(world.db_path)
+    try:
+        version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    finally:
+        conn.close()
+    assert version == ("2",) and "restarts" in columns
+    runner.run_until_settled()
+    assert runner.get(job_id).state == "succeeded"

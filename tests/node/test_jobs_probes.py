@@ -245,10 +245,12 @@ def test_p15_hung_gateway_call_does_not_block_the_pump(tmp_path: Path) -> None:
     job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
     world.runner.pump()  # the op is queued, not yet run
     release = threading.Event()
+    returned: list[int] = []
     orig = world.main.AddMarker
 
     def hung(*args, **kwargs):
-        release.wait(5.0)
+        assert release.wait(30.0)
+        returned.append(1)
         return orig(*args, **kwargs)
 
     world.main.AddMarker = hung  # type: ignore[method-assign]
@@ -256,17 +258,20 @@ def test_p15_hung_gateway_call_does_not_block_the_pump(tmp_path: Path) -> None:
     try:
         pump_thread = threading.Thread(target=world.runner.pump)
         pump_thread.start()
-        pump_thread.join(2.0)
-        assert not pump_thread.is_alive()  # the pump returned despite the hung op
+        pump_thread.join(30.0)
+        # The pump returned although the hung call (if it ran) has not: it only returns once
+        # released, so the pump did not wait for it. No wall-clock bound is assumed.
+        assert not pump_thread.is_alive() and returned == []
         # A read from another thread is not blocked while the op hangs on the worker.
         got: list = []
         reader = threading.Thread(target=lambda: got.append(world.runner.get(job_id)))
         reader.start()
-        reader.join(1.0)
+        reader.join(30.0)
         assert got and got[0] is not None
     finally:
         release.set()
         pump_thread.join()
+        assert world.runner.wait_drain(30.0)
     assert world.runner.get(job_id).state == JobState.STALLED.value
     assert world.runner.get(job_id).stall["code"] == "watchdog_op_timeout"
 

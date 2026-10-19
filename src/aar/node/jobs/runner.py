@@ -1183,7 +1183,11 @@ class JobRunner:
             )
             if overdue is not None:
                 self._stall(job, overdue, now)
-            elif rt.persisted_at is None or now - rt.persisted_at >= DEADLINE_PERSIST_EVERY:
+            elif (
+                rt.deadline_anchor is not None
+                and job.step_deadline is not None
+                and (rt.persisted_at is None or now - rt.persisted_at >= DEADLINE_PERSIST_EVERY)
+            ):
                 self._checkpoint(job, [], now)  # keep the persisted countdown current
 
     # -- views -----------------------------------------------------------------------------
