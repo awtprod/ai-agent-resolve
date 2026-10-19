@@ -107,6 +107,15 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def canonical_json(value: Any) -> str:
+    """The log's canonical JSON text of ``value``: sorted keys, no spaces, no NaN/Infinity.
+
+    The same form :meth:`EventLog.append` stores, so a hash of it (a content-addressed
+    plan, a write request's fingerprint) is stable across processes and retries.
+    """
+    return _canonical(value)
+
+
 def _canonical_lenient(value: Any) -> str:
     # Comparison-only canonical form for the STORED side: tolerates a legacy stored
     # NaN/inf (allow_nan=True) so matching never raises on old data. Still distinguishes

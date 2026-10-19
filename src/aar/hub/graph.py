@@ -1,7 +1,7 @@
 """Work graph: what is planned and in flight for one project.
 
-Nodes are the units of work (``brief``, ``plan``, ``op``, ``artifact``, ``review``)
-and carry a lifecycle status governed by a small state machine; illegal transitions
+Nodes are the units of work (``brief``, ``recipe``, ``plan``, ``op``, ``artifact``,
+``review``) and carry a lifecycle status governed by a small state machine; illegal transitions
 are rejected. Typed edges (``derives_from``, ``produces``, ``reviews``, ``blocks``)
 connect them. Every mutation is an event on the shared log, and the live state is a
 projection that is byte-for-byte rebuildable from that log.
@@ -30,7 +30,9 @@ from aar.hub.events import (
     match_or_conflict,
 )
 
-NODE_KINDS = frozenset({"brief", "plan", "op", "artifact", "review"})
+# ``recipe`` (S13g1) is a recipe run derived from a brief; see aar.hub.writes. Adding a
+# kind only widens what the fold accepts, so every log written before still folds the same.
+NODE_KINDS = frozenset({"brief", "recipe", "plan", "op", "artifact", "review"})
 EDGE_TYPES = frozenset({"derives_from", "produces", "reviews", "blocks"})
 
 # Lifecycle states and the transitions allowed between them. ``done`` and
@@ -60,6 +62,7 @@ EVENT_NODE_STATUS_CHANGED = "graph.node_status_changed"
 EVENT_EDGE_ADDED = "graph.edge_added"
 
 _GRAPH_TYPES = (EVENT_NODE_ADDED, EVENT_NODE_STATUS_CHANGED, EVENT_EDGE_ADDED)
+GRAPH_EVENT_TYPES = _GRAPH_TYPES
 
 # Writers refuse longer titles (they are shown in every listing). The fold still
 # accepts what is already in the log, so old data never disappears from projections.
@@ -403,17 +406,8 @@ class WorkGraph:
                         actor=actor,
                     )
                     return self._retried(self._state.nodes, existing, "node_id")
-            nid = node_id or new_node_id()
-            if nid in self._state.nodes:
-                raise DuplicateNodeId(f"node id already exists: {nid!r}")
-            payload = {
-                "node_id": nid,
-                "kind": kind,
-                "status": status,
-                "title": title,
-                "data": data or {},
-            }
-            self._refuse_unless_foldable(EVENT_NODE_ADDED, actor, payload)
+            payload = self._node_payload(kind, actor, title, status, data, node_id)
+            nid = payload["node_id"]
             event = txn.append(
                 EVENT_NODE_ADDED,
                 actor,
@@ -510,35 +504,8 @@ class WorkGraph:
                         actor=actor,
                     )
                     return self._retried(self._state.edges, existing, "edge_id")
-            src_node = self._state.nodes.get(src)
-            dst_node = self._state.nodes.get(dst)
-            if src_node is None:
-                raise KeyError(f"unknown src node: {src!r}")
-            if dst_node is None:
-                raise KeyError(f"unknown dst node: {dst!r}")
-            allowed_src = _EDGE_SRC_KINDS.get(edge_type)
-            if allowed_src is not None and src_node.kind not in allowed_src:
-                raise ValueError(
-                    f"{edge_type!r} edge must start at a node of kind {sorted(allowed_src)}, "
-                    f"not {src_node.kind!r}"
-                )
-            allowed_dst = _EDGE_DST_KINDS.get(edge_type)
-            if allowed_dst is not None and dst_node.kind not in allowed_dst:
-                raise ValueError(
-                    f"{edge_type!r} edge must end at a node of kind {sorted(allowed_dst)}, "
-                    f"not {dst_node.kind!r}"
-                )
-            eid = edge_id or new_edge_id()
-            if eid in self._state.edges:
-                raise DuplicateEdgeId(f"edge id already exists: {eid!r}")
-            payload = {
-                "edge_id": eid,
-                "type": edge_type,
-                "src": src,
-                "dst": dst,
-                "data": data or {},
-            }
-            self._refuse_unless_foldable(EVENT_EDGE_ADDED, actor, payload)
+            payload = self._edge_payload(edge_type, src, dst, actor, data, edge_id)
+            eid = payload["edge_id"]
             event = txn.append(
                 EVENT_EDGE_ADDED,
                 actor,
@@ -574,8 +541,7 @@ class WorkGraph:
         state as of ``txn``. Idempotency is the caller's job. Use a ``WorkGraph`` built
         for this one transaction: if the caller rolls back, its live state is stale.
         """
-        if txn._log is not self._log:
-            raise ValueError("transaction belongs to a different event log")
+        self._check_txn(txn)
         if not is_member(new_status, STATUSES):
             raise ValueError(f"status must be one of {sorted(STATUSES)}, got {new_status!r}")
         self._catch_up(txn)
@@ -604,6 +570,80 @@ class WorkGraph:
         self._apply(event)
         return event
 
+    def add_node_in(
+        self,
+        txn: Transaction,
+        kind: str,
+        actor: Actor,
+        *,
+        title: str | None = None,
+        status: str = "pending",
+        data: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+    ) -> Event:
+        """Append a validated new node inside a caller-owned transaction; return its event.
+
+        For writers that add a node atomically with other events of their own (a brief
+        node and its write record, a plan node, its edge and its record). The checks are
+        those of :meth:`add_node`, against the state as of ``txn``. Idempotency is the
+        caller's job: ``idempotency_key`` is stored on the event as a second guard (the
+        database refuses a second row with it) but no retry is resolved here. Use a
+        ``WorkGraph`` built for this one transaction: if the caller rolls back, its live
+        state is stale.
+        """
+        self._check_txn(txn)
+        if not is_member(kind, NODE_KINDS):
+            raise ValueError(f"node kind must be one of {sorted(NODE_KINDS)}, got {kind!r}")
+        if not is_member(status, STATUSES):
+            raise ValueError(f"status must be one of {sorted(STATUSES)}, got {status!r}")
+        self._catch_up(txn)
+        payload = self._node_payload(kind, actor, title, status, data, None)
+        event = txn.append(
+            EVENT_NODE_ADDED,
+            actor,
+            payload,
+            project_id=self._project_id,
+            idempotency_key=idempotency_key,
+        )
+        self._apply(event)
+        return event
+
+    def add_edge_in(
+        self,
+        txn: Transaction,
+        edge_type: str,
+        src: str,
+        dst: str,
+        actor: Actor,
+        *,
+        data: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+    ) -> Event:
+        """Append a validated edge inside a caller-owned transaction; return its event.
+
+        The checks are those of :meth:`add_edge` (both endpoints exist, typed endpoints
+        have the right kinds), against the state as of ``txn``. Idempotency is the
+        caller's job, as for :meth:`add_node_in`.
+        """
+        self._check_txn(txn)
+        if not is_member(edge_type, EDGE_TYPES):
+            raise ValueError(f"edge type must be one of {sorted(EDGE_TYPES)}, got {edge_type!r}")
+        self._catch_up(txn)
+        payload = self._edge_payload(edge_type, src, dst, actor, data, None)
+        event = txn.append(
+            EVENT_EDGE_ADDED,
+            actor,
+            payload,
+            project_id=self._project_id,
+            idempotency_key=idempotency_key,
+        )
+        self._apply(event)
+        return event
+
+    def creator(self, node_id: str) -> Actor | None:
+        """The actor on the event that created ``node_id``, or ``None`` for an unknown node."""
+        return self._state.creators.get(node_id)
+
     def skipped(self) -> tuple[SkippedEvent, ...]:
         """Events the live projection could not use (malformed or forged)."""
         return tuple(self._state.skipped)
@@ -613,6 +653,74 @@ class WorkGraph:
         return self._state.last_change.get(node_id)
 
     # -- internals ----------------------------------------------------------
+
+    def _check_txn(self, txn: Transaction) -> None:
+        if txn._log is not self._log:
+            raise ValueError("transaction belongs to a different event log")
+
+    def _node_payload(
+        self,
+        kind: str,
+        actor: Actor,
+        title: str | None,
+        status: str,
+        data: dict[str, Any] | None,
+        node_id: str | None,
+    ) -> dict[str, Any]:
+        """The payload of a new node, refused (before writing) if the fold would skip it."""
+        nid = node_id or new_node_id()
+        if nid in self._state.nodes:
+            raise DuplicateNodeId(f"node id already exists: {nid!r}")
+        payload = {
+            "node_id": nid,
+            "kind": kind,
+            "status": status,
+            "title": title,
+            "data": data or {},
+        }
+        self._refuse_unless_foldable(EVENT_NODE_ADDED, actor, payload)
+        return payload
+
+    def _edge_payload(
+        self,
+        edge_type: str,
+        src: str,
+        dst: str,
+        actor: Actor,
+        data: dict[str, Any] | None,
+        edge_id: str | None,
+    ) -> dict[str, Any]:
+        """The payload of a new edge between existing nodes of the kinds its type allows."""
+        src_node = self._state.nodes.get(src)
+        dst_node = self._state.nodes.get(dst)
+        if src_node is None:
+            raise KeyError(f"unknown src node: {src!r}")
+        if dst_node is None:
+            raise KeyError(f"unknown dst node: {dst!r}")
+        allowed_src = _EDGE_SRC_KINDS.get(edge_type)
+        if allowed_src is not None and src_node.kind not in allowed_src:
+            raise ValueError(
+                f"{edge_type!r} edge must start at a node of kind {sorted(allowed_src)}, "
+                f"not {src_node.kind!r}"
+            )
+        allowed_dst = _EDGE_DST_KINDS.get(edge_type)
+        if allowed_dst is not None and dst_node.kind not in allowed_dst:
+            raise ValueError(
+                f"{edge_type!r} edge must end at a node of kind {sorted(allowed_dst)}, "
+                f"not {dst_node.kind!r}"
+            )
+        eid = edge_id or new_edge_id()
+        if eid in self._state.edges:
+            raise DuplicateEdgeId(f"edge id already exists: {eid!r}")
+        payload = {
+            "edge_id": eid,
+            "type": edge_type,
+            "src": src,
+            "dst": dst,
+            "data": data or {},
+        }
+        self._refuse_unless_foldable(EVENT_EDGE_ADDED, actor, payload)
+        return payload
 
     def _refuse_unless_foldable(
         self, event_type: str, actor: Actor, payload: dict[str, Any]
