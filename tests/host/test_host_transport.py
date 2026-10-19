@@ -8,6 +8,7 @@ from host_support import ALIAS, FakeRunner, make_config, sha256_upper
 from aar.host.errors import (
     DestinationExists,
     HashMismatch,
+    PathRefused,
     RemoteCommandError,
     SizeMismatch,
     TransportTimeout,
@@ -254,7 +255,7 @@ def test_push_refuses_source_symlink_out_of_root(tmp_path) -> None:
     link.symlink_to(outside)
     runner = FakeRunner()
     host = build(tmp_path, runner)
-    with pytest.raises(Exception) as info:  # PathRefused
+    with pytest.raises(PathRefused) as info:
         host.push(str(link), "E:\\Show\\out.mp4")
     assert "outside-allowed-roots" in str(info.value)
     assert runner.calls == []
