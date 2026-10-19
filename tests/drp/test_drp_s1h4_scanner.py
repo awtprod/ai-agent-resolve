@@ -231,3 +231,12 @@ def test_a_budget_stop_inside_a_tag_leaves_no_pending_gap() -> None:
         doc = scan(data, "m.xml", max_elements=limit)
         assert doc.stopped_at is not None, data
         assert [i.code for i in doc.issues] == ["budget-exceeded"], (data, doc.issues)
+
+
+def test_an_attribute_name_with_invalid_utf8_keeps_a_replacement_character() -> None:
+    # Round 3 (validator R14): the name is decoded with errors="replace". Dropping the bad bytes
+    # ("ignore") would fold `k\xffx` into the valid name `kx` and silently lose one of the two.
+    doc = scan(b'<r kx="valid" k\xffx="bad" \xff="lone"/>', "m.xml")
+    assert doc.root is not None
+    assert doc.root.attrs == {"kx": "valid", "k�x": "bad", "�": "lone"}
+    assert [i.code for i in doc.issues] == ["invalid-utf8"]
