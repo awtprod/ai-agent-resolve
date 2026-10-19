@@ -46,6 +46,24 @@ def _result(
     return result
 
 
+def _refused(show: Show, name: str, params: dict, *, holder: Holder = AGENT) -> OpError:
+    """Submit under the guard and return the refusal. The guard refuses at submit, so the
+    op is never queued: the broker never switches project or timeline, and nothing runs."""
+    calls = len(show.fake.calls)
+    with pytest.raises(OpError) as err:
+        submit_op(
+            show.broker,
+            name,
+            params,
+            target=show.locator("Show"),
+            holder=holder,
+            branch_registry=show.branch_registry,
+        )
+    assert show.broker.pending() == []
+    assert show.fake.calls[calls:] == []
+    return err.value
+
+
 def _branch_with_content(show: Show, *, holder: Holder = AGENT):
     """A registered agent branch owned by ``holder``, with a 1000-frame item so markers fit."""
     branch = show.make_branch(holder=holder)
@@ -126,7 +144,7 @@ def test_branch_names_the_copy_after_the_holder_and_records_the_handoff() -> Non
     assert result.created and result.version == 1 and result.agent_id == "thread-1"
     assert result.timeline.name == "Main [agent:thread-1 v1]"
     assert any(note.code == "merge_is_human" for note in result.notes)
-    assert show.branch_registry.owned_by(result.timeline.unique_id, "thread-1")
+    assert show.branch_registry.owned_by(show.pid, result.timeline.unique_id, "thread-1")
 
 
 def test_branch_cuts_the_next_version_after_an_existing_v1_and_v2() -> None:
@@ -152,8 +170,8 @@ def test_branch_ownership_is_the_submitting_holder_not_a_caller_value() -> None:
     # thread-2 cannot create or claim thread-1's branch: the owner is always the holder.
     result = show.make_branch(holder=B)
     assert result.agent_id == "thread-2" and result.timeline.name == "Main [agent:thread-2 v1]"
-    assert show.branch_registry.owned_by(result.timeline.unique_id, "thread-2")
-    assert not show.branch_registry.owned_by(result.timeline.unique_id, "thread-1")
+    assert show.branch_registry.owned_by(show.pid, result.timeline.unique_id, "thread-2")
+    assert not show.branch_registry.owned_by(show.pid, result.timeline.unique_id, "thread-1")
 
 
 def test_branch_refuses_a_holder_id_that_is_not_a_usable_owner() -> None:
@@ -187,10 +205,10 @@ def test_branch_source_must_carry_its_unique_id() -> None:
 
 def test_an_editing_op_is_refused_on_a_human_timeline_by_default() -> None:
     show = Show()
-    result = _result(show, "markers.add", {"timeline": show.ref("Main"), "markers": [{"frame": 5}]})
-    assert result.status is OpStatus.FAILED and result.error.code == "not_an_agent_branch"
-    assert "require_branch=False" not in str(result.error.detail["fix_hint"])
-    assert "timeline.branch" in str(result.error.detail["fix_hint"])
+    error = _refused(show, "markers.add", {"timeline": show.ref("Main"), "markers": [{"frame": 5}]})
+    assert error.code == "not_an_agent_branch"
+    assert "require_branch" not in str(error.detail["fix_hint"])
+    assert "timeline.branch" in str(error.detail["fix_hint"])
     assert show.main.GetMarkers() == {}
 
 
@@ -202,22 +220,23 @@ def test_a_timeline_that_merely_looks_like_a_branch_is_still_refused() -> None:
     )
     show = Show(fake)
     look_alike = show.project.timeline("Interview [agent:review v2]")
-    result = _result(
+    error = _refused(
         show,
         "markers.add",
         {
             "timeline": {"name": look_alike.GetName(), "unique_id": look_alike.GetUniqueId()},
             "markers": [{"frame": 5}],
         },
+        holder=Holder.agent("review"),
     )
-    assert result.status is OpStatus.FAILED and result.error.code == "not_an_agent_branch"
+    assert error.code == "not_an_agent_branch"
     assert look_alike.GetMarkers() == {}
 
 
 def test_an_agent_cannot_edit_another_agents_branch() -> None:
     show = Show()
     branch = show.make_branch(holder=AGENT)  # owned by thread-ops
-    result = _result(
+    error = _refused(
         show,
         "markers.add",
         {
@@ -226,37 +245,40 @@ def test_an_agent_cannot_edit_another_agents_branch() -> None:
         },
         holder=B,  # a different agent
     )
-    assert result.status is OpStatus.FAILED and result.error.code == "not_an_agent_branch"
+    assert error.code == "not_an_agent_branch"
 
 
 def test_a_human_renaming_a_timeline_to_a_branch_name_does_not_grant_access() -> None:
     show = Show()
     show.main._name = "Main [agent:thread-ops v1]"  # a human renames in the Resolve UI
     human_settles(show)
-    result = _result(
+    error = _refused(
         show,
         "markers.add",
         {"timeline": {"unique_id": show.main.GetUniqueId()}, "markers": [{"frame": 9}]},
     )
-    assert result.status is OpStatus.FAILED and result.error.code == "not_an_agent_branch"
+    assert error.code == "not_an_agent_branch"
 
 
 def test_an_op_on_the_current_human_timeline_is_refused() -> None:
     show = Show()
     show.project.current_timeline = show.main
-    result = _result(show, "markers.add", {"markers": [{"frame": 11}]})
-    assert result.status is OpStatus.FAILED and result.error.code == "not_an_agent_branch"
+    error = _refused(show, "markers.add", {"markers": [{"frame": 11}]})
+    assert error.code == "not_an_agent_branch"
+    assert show.main.GetMarkers() == {}
 
 
 def test_a_shared_state_op_is_refused_and_writes_nothing(tmp_path: Path) -> None:
     show = Show()
-    result = _result(
+    before = show.cam_a.GetClipProperty("Input Color Space")
+    error = _refused(
         show,
         "clip.set_input_color_space",
         {"items": [media(show.cam_a)], "color_space": "Rec.709 (Scene)"},
     )
-    assert result.status is OpStatus.FAILED and result.error.code == "requires_approval"
+    assert error.code == "requires_approval"
     assert content_writes(show.fake) == []  # nothing was written to the shared media pool
+    assert show.cam_a.GetClipProperty("Input Color Space") == before
 
 
 def test_the_owner_may_edit_its_branch_under_the_guard() -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from aar.hub.leaseboard import lease_board
 from aar.node.broker import Broker
 from aar.node.feed import EventLogTransport, NodeFeed, PresenceReporter
 from aar.node.gateway import ScriptApiGateway
-from aar.node.leases import Holder, LeaseManager, Scope
+from aar.node.leases import Holder, Lease, LeaseEvent, LeaseManager, Scope
 from aar.node.locator import ProjectLocator
 from aar.node.ops import submit_op
 from aar.node.presence import Decision, PresenceGuard
@@ -82,15 +83,24 @@ def test_a_failing_transport_does_not_raise_through_acquire_or_the_broker(tmp_pa
 
 
 def test_an_unmappable_lease_event_is_dropped_and_gap_flagged_not_raised(tmp_path: Path) -> None:
-    # A non-finite ttl is allowed at acquire (the hub mapper's job) but cannot be mapped; the
-    # sink must drop it and flag a gap rather than raise into the LeaseManager.
+    # The LeaseManager refuses a non-finite ttl before granting, but the sink must still drop
+    # (and gap-flag) any event it cannot map rather than raise into whoever emitted it.
     log = EventLog(tmp_path / "hub.db")
     feed = _feed(log)
-    leases = LeaseManager(FakeClock(), sink=feed.lease_sink)
-    leases.acquire(AGENT, Scope.PROJECT, ("p1",), ttl=float("inf"))  # granted; unmappable
+    lease = Lease("l-1", Scope.PROJECT, ("p1",), AGENT, 0.0, math.inf, math.inf)
+    feed.lease_sink(LeaseEvent("granted", 0.0, lease))  # does not raise
     assert feed.pending == 0 and feed.dropped == 1
     feed.flush()
     assert [gap.dropped for gap in feed_gaps(log)] == [1]
+
+
+@pytest.mark.parametrize("ttl", [math.inf, -math.inf, math.nan, 0.0, -1.0])
+def test_acquire_refuses_a_non_finite_or_non_positive_ttl_before_granting(ttl: float) -> None:
+    events: list[LeaseEvent] = []
+    leases = LeaseManager(FakeClock(), sink=events.append)
+    with pytest.raises(ValueError, match="ttl"):
+        leases.acquire(AGENT, Scope.PROJECT, ("p1",), ttl=ttl)
+    assert leases.active() == [] and events == []  # never granted, so never announced
 
 
 # -- acquire refuses bad input before granting (P02b) ----------------------------------------

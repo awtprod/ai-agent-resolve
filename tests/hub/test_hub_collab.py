@@ -239,14 +239,23 @@ def test_mcp_project_board_and_agent_branches_are_capped_and_bounded(tmp_path: P
             assert board["project_id"] == "proj-A" and [
                 lease["scope"] for lease in board["leases"]
             ] == ["project"]
+            assert board["next_cursor"] is None and board["truncated"] is False
             first = _payload(await client.call_tool("agent_branches", {"project_id": project}))
-            assert len(first["branches"]) == 100 and first["next_cursor"] == 100
-            rest = _payload(
+            assert len(first["branches"]) == 50 and first["next_cursor"] == 50
+            more = _payload(
                 await client.call_tool(
-                    "agent_branches", {"project_id": project, "cursor": 100, "limit": 200}
+                    "agent_branches", {"project_id": project, "cursor": 50, "limit": 200}
                 )
             )
-            assert len(rest["branches"]) == 150 and rest["next_cursor"] is None
+            assert len(more["branches"]) == 100 and more["next_cursor"] == 150  # limit capped
+            rest = _payload(
+                await client.call_tool(
+                    "agent_branches", {"project_id": project, "cursor": 150, "limit": 100}
+                )
+            )
+            assert len(rest["branches"]) == 100 and rest["next_cursor"] is None
+            ids = [b["branch"]["id"] for page in (first, more, rest) for b in page["branches"]]
+            assert ids == [f"tl-{i:04d}" for i in range(250)]  # no gap, no overlap
             huge = await client.call_tool("project_board", {"project_id": "P" * 1_000_000})
             assert huge.is_error is True
 
