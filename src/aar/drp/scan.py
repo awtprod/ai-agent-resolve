@@ -40,7 +40,7 @@ _MAX_ISSUES_PER_CODE = 100
 # so one element with millions of attributes cannot grow an unbounded dict. Far above any real
 # element (corpus maximum is a handful), so decoded models are unaffected. An element that goes
 # past it is never silent: it carries an ``attributes-truncated`` issue (see ``scan``).
-_MAX_ATTRS_PER_ELEMENT = 4096
+MAX_ATTRS_PER_ELEMENT = 4096
 _ENTITY = re.compile(r"&(lt|gt|amp|quot|apos|#[0-9]+|#x[0-9a-fA-F]+);")
 _NAMED = {"lt": "<", "gt": ">", "amp": "&", "quot": '"', "apos": "'"}
 
@@ -228,6 +228,12 @@ class Document:
     """Bytes examined plus tag-match attempts: a deterministic measure of scanning effort."""
     stopped_at: int | None = None
     """Offset where scanning stopped because the element budget ran out, else ``None``."""
+    attrs_unread_from: dict[int, int] = field(default_factory=dict)
+    """For each element that kept only its first ``MAX_ATTRS_PER_ELEMENT`` attributes (the ones
+    that also carry an ``attributes-truncated`` issue): its ``start`` offset -> the offset in
+    ``data`` where its first unread attribute begins. A diff compares the bytes from there to the
+    end of the start tag, because the attributes in them are not in ``Element.attrs``. At most one
+    entry per ``MAX_ATTRS_PER_ELEMENT`` + 1 charged attributes, so it is tiny next to the tree."""
 
     @property
     def root(self) -> Element | None:
@@ -268,7 +274,9 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
     ``Document.element_count``); what was scanned so far is kept and open elements are closed at
     the end of the member. Attributes are charged too (one each), and an element keeps at most
     4096 of them; an element with more gets one ``attributes-truncated`` issue (with the exact
-    count), so a reader can warn and a diff gate can refuse rather than compare a prefix.
+    count), so a reader can warn and a diff gate can refuse rather than compare a prefix;
+    ``Document.attrs_unread_from`` says where its unread attributes begin, so a plain diff can
+    compare those bytes instead of reporting the two elements as the same.
     Attribute names and values are decoded only after the tag's closing ``>`` has matched.
 
     Time is linear in ``len(data)``: a start tag is read one attribute at a time and a tag with
@@ -282,6 +290,7 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
     work = 0
     element_count = 0
     stopped_at: int | None = None
+    attrs_unread_from: dict[int, int] = {}
     comments: list[tuple[int, int, str]] = []
     roots: list[Element] = []
     stack: list[Element] = []
@@ -394,7 +403,7 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
         # Attribute matches are only *recorded* while the tag is read: a Match holds spans into
         # ``data``, not copies, so a tag that never closes (``<a b="`` followed by hundreds of MB)
         # costs nothing beyond the gap it leaves. Names and values are decoded once the closing
-        # ">" has matched. At most ``_MAX_ATTRS_PER_ELEMENT`` are kept; the rest are charged
+        # ">" has matched. At most ``MAX_ATTRS_PER_ELEMENT`` are kept; the rest are charged
         # against the budget and counted, and the element then carries an
         # ``attributes-truncated`` issue (the reader turns any scan issue into a warning, so a
         # diff gate refuses the file instead of comparing only the attributes that were kept).
@@ -415,7 +424,7 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
             ma = _ATTR_AT.match(data, p)
             if ma is None:  # neither the closing ">" nor another attribute: unterminated tag
                 break
-            if len(found_attrs) < _MAX_ATTRS_PER_ELEMENT:
+            if len(found_attrs) < MAX_ATTRS_PER_ELEMENT:
                 found_attrs.append(ma)
             else:
                 attrs_over += 1
@@ -453,18 +462,20 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
                 else:
                     repeated_extra += 1
             attrs[name] = unescape(raw.decode("utf-8", errors="replace"))
+        kept_end = found_attrs[-1].end() if attrs_over else 0
         found_attrs = []
         for name in repeated:
             issues.append(ScanIssue("duplicate-attribute", lt, f"attribute {name!r} repeated"))
         for _ in range(repeated_extra):  # past the cap: counted, never listed
             issues.append(ScanIssue("duplicate-attribute", lt, "attribute repeated"))
         if attrs_over:
-            total = _MAX_ATTRS_PER_ELEMENT + attrs_over
+            total = MAX_ATTRS_PER_ELEMENT + attrs_over
             msg = (
-                f"element has {total} attributes; only the first {_MAX_ATTRS_PER_ELEMENT} "
+                f"element has {total} attributes; only the first {MAX_ATTRS_PER_ELEMENT} "
                 "were read, so attribute changes past that point cannot be seen"
             )
             issues.append(ScanIssue("attributes-truncated", lt, msg))
+            attrs_unread_from[lt] = kept_end
         pos = cursor = p
         element_count += 1
         tag = mname.group("start").decode("utf-8", errors="replace")
@@ -501,6 +512,7 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
         element_count=element_count,
         work=work,
         stopped_at=stopped_at,
+        attrs_unread_from=attrs_unread_from,
     )
 
 

@@ -77,6 +77,7 @@ from aar.drp.model import (
     Track,
 )
 from aar.drp.reader import DEFAULT_MAX_ELEMENTS, DEFAULT_MAX_TOTAL_XML_BYTES
+from aar.drp.scan import MAX_ATTRS_PER_ELEMENT
 
 __all__ = [
     "SECTIONS",
@@ -451,6 +452,11 @@ class _Differ:
                 notes.append(
                     f"{side}: {codes['marker-decode']} marker blob(s) did not decode; their "
                     "bytes are compared as opaque, and their markers are missing from the model"
+                )
+            if codes.get("scan-attributes-truncated"):
+                notes.append(
+                    f"{side}: an element has more than {MAX_ATTRS_PER_ELEMENT} attributes; the "
+                    "attributes past that point are compared as raw bytes, not by name"
                 )
         return notes
 

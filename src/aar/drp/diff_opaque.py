@@ -62,7 +62,7 @@ from aar.drp.reader import (
     MARKER_COLORS,
     join_clip_path,
 )
-from aar.drp.scan import Document, Element, scan
+from aar.drp.scan import MAX_ATTRS_PER_ELEMENT, Document, Element, scan
 
 __all__ = ["Cover", "OpaqueEngine", "Source", "Unit", "member_root"]
 
@@ -781,12 +781,17 @@ class OpaqueEngine:
             for attrs, expected in ((attrs_a, drop[0]), (attrs_b, drop[1])):
                 if expected is not None and attrs.get("DbId") == expected:
                     del attrs["DbId"]
+        unread_a = self.src["a"].doc(ma).attrs_unread_from.get(ea.start)
+        unread_b = self.src["b"].doc(mb).attrs_unread_from.get(eb.start)
+        if attrs_a == attrs_b and unread_a is None and unread_b is None:
+            return
+        data_a, data_b = self._data("a", ma), self._data("b", mb)
+        end_a, end_b = ea.inner_start or ea.end, eb.inner_start or eb.end
+        tag_a, tag_b = data_a[ea.start : end_a], data_b[eb.start : end_b]
         if attrs_a != attrs_b:
             names = sorted(
                 k for k in set(attrs_a) | set(attrs_b) if attrs_a.get(k) != attrs_b.get(k)
             )
-            tag_a = self._data("a", ma)[ea.start : ea.inner_start or ea.end]
-            tag_b = self._data("b", mb)[eb.start : eb.inner_start or eb.end]
             self._changed(
                 unit,
                 path,
@@ -795,6 +800,24 @@ class OpaqueEngine:
                 mb,
                 eb,
                 f"attribute(s) {', '.join(names)} changed",
+                part=(tag_a, tag_b),
+            )
+        elif (
+            unread_a is None or unread_b is None or data_a[unread_a:end_a] != data_b[unread_b:end_b]
+        ):
+            # The scanner keeps the first MAX_ATTRS_PER_ELEMENT attributes of an element and not the
+            # rest, so the dicts above can be equal while the elements are not. The attributes it
+            # did not keep are compared as raw bytes, from where the first unread one begins to
+            # the end of the start tag (an element that is cut on one side only always differs).
+            self._changed(
+                unit,
+                path,
+                ma,
+                ea,
+                mb,
+                eb,
+                f"attributes past the first {MAX_ATTRS_PER_ELEMENT} differ "
+                "(they are compared as raw bytes, not by name)",
                 part=(tag_a, tag_b),
             )
 
