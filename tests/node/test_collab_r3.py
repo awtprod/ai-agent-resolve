@@ -524,3 +524,16 @@ def test_a_refused_shared_state_op_on_another_project_never_loads_it() -> None:
     names = {call[0] for call in show.fake.calls[start:]}
     assert not names & {"LoadProject", "SaveProject", "SetCurrentTimeline"}
     assert show.fake.calls[start:] == []
+
+
+def test_the_next_version_follows_the_highest_even_with_a_hole() -> None:
+    show = Show()
+    show.make_branch()
+    v2 = show.make_branch(if_exists="new")
+    show.make_branch(if_exists="new")
+    show.project.timelines = [  # a human deleted v2
+        t for t in show.project.timelines if t.GetUniqueId() != v2.timeline.unique_id
+    ]
+    human_settles(show)
+    nxt = show.make_branch(if_exists="new")
+    assert nxt.created and nxt.version == 4  # O04: never reuse a number below the highest

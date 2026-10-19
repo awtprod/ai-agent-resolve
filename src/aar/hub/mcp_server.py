@@ -329,7 +329,7 @@ def build_server(
         size = 0
         for branch in found[cursor : cursor + limit]:
             row = branch.to_dict()
-            size += len(json.dumps(row))
+            size += len(json.dumps(row, ensure_ascii=False).encode())
             if page and size > _MAX_BRANCHES_BYTES:
                 break
             page.append(row)

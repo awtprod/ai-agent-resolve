@@ -21,7 +21,6 @@ other. A human only displaces another human with ``force=True`` (the console's o
 
 from __future__ import annotations
 
-import math
 import time
 import uuid
 from collections import OrderedDict
@@ -199,14 +198,15 @@ class LeaseManager:
             if not holder.is_human:
                 raise ValueError("agent leases need a positive ttl")
             return None
-        # ``not ttl > 0`` also refuses NaN, which compares false to everything. An infinite
-        # or over-cap ttl is a caller bug: refuse it before granting, so a lease is never
-        # held and then unrecordable on the hub (whose mapper refuses a non-finite ttl).
-        if not ttl > 0 or not math.isfinite(ttl):
-            raise ValueError(f"ttl must be a positive, finite number of seconds, got {ttl!r}")
+        # A ttl the hub cannot record (not positive, over its cap, infinite, or NaN, which
+        # fails every comparison) is a caller bug: refuse it before granting, so a lease is
+        # never held and then unrecordable on the board.
         max_ttl = _hub_limits()[2]
-        if ttl > max_ttl:
-            raise ValueError(f"ttl must be at most {max_ttl:g} seconds (the hub's cap)")
+        if not 0 < ttl <= max_ttl:
+            raise ValueError(
+                f"ttl must be a positive number of seconds, at most {max_ttl:g} (the hub's "
+                f"cap), got {ttl!r}"
+            )
         return now + ttl
 
     def _held(self, lease_id: str, holder: Holder, now: float) -> Lease:

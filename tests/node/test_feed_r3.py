@@ -421,3 +421,66 @@ def test_a_reconcile_the_hub_keeps_refusing_is_given_up_and_never_blocks_the_out
     assert feed.reconciled and [q.type for q in feed.quarantined] == [EVENT_LEASE_SNAPSHOT]
     assert len(log.read(types=["lease.renewed"])) == MAX_SPEC_ATTEMPTS  # bounded re-sends
     assert report.error is None
+
+
+# -- more survivor pins: N07 N08 N10 R3F05 R3F08 ----------------------------------------------
+
+
+def test_a_delivered_gap_is_not_sent_again(tmp_path: Path) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    feed = NodeFeed(NODE, EventLogTransport(log), wall_offset=lambda: WALL, outbox_max=1)
+    leases = LeaseManager(FakeClock(), sink=feed.lease_sink)
+    leases.acquire(AGENT, Scope.PROJECT, ("p0",), ttl=60)
+    leases.acquire(AGENT, Scope.PROJECT, ("p1",), ttl=60)
+    assert feed.flush().delivered_gap is True
+    assert feed.flush().delivered_gap is False  # N07: cleared once delivered
+
+
+def test_two_gaps_in_one_process_both_reach_the_hub(tmp_path: Path) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    feed = NodeFeed(NODE, EventLogTransport(log), wall_offset=lambda: WALL, outbox_max=1)
+    leases = LeaseManager(FakeClock(), sink=feed.lease_sink)
+    for batch in range(2):
+        leases.acquire(AGENT, Scope.PROJECT, (f"a{batch}",), ttl=60)
+        leases.acquire(AGENT, Scope.PROJECT, (f"b{batch}",), ttl=60)  # one more drop
+        report = feed.flush()
+        assert report.delivered_gap and report.error is None, batch
+    gaps = [event.payload["dropped"] for event in log.read(types=["feed.gap"])]
+    assert gaps == [1, 2]  # N08: each gap has its own key
+
+
+def test_coalescing_keeps_the_latest_renewal_of_each_lease(tmp_path: Path) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    feed = NodeFeed(NODE, EventLogTransport(log), wall_offset=lambda: WALL)
+    clock = FakeClock()
+    leases = LeaseManager(clock, sink=feed.lease_sink)
+    a = leases.acquire(AGENT, Scope.PROJECT, ("pa",), ttl=60)
+    b = leases.acquire(Holder.agent("other"), Scope.PROJECT, ("pb",), ttl=60)
+    clock.advance(1)
+    leases.renew(a.id, AGENT)
+    leases.renew(b.id, b.holder)
+    feed.flush()
+    renewed = {event.payload["lease_id"] for event in log.read(types=["lease.renewed"])}
+    assert renewed == {a.id, b.id}  # N10: one lease's renewal never drops another's
+
+
+def test_a_gap_delivered_after_a_reconcile_is_reconciled_again(tmp_path: Path) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    real = EventLogTransport(log)
+    refuse_gap = [True]
+
+    class GapOnce:
+        def deliver(self, spec: HubEventSpec, *, node_id: str) -> None:
+            if spec.type == "feed.gap" and refuse_gap[0]:
+                refuse_gap[0] = False
+                raise ValueError("hub refuses this gap once")
+            real.deliver(spec, node_id=node_id)
+
+    feed, leases = _wired(log, GapOnce(), outbox_max=1)
+    leases.acquire(AGENT, Scope.PROJECT, ("p0",), ttl=60)
+    leases.acquire(AGENT, Scope.PROJECT, ("p1",), ttl=60)  # drops p0's grant
+    first = feed.flush()
+    assert "gap" in (first.error or "") and first.sent == 1  # R3F08: the outbox still went
+    assert feed.flush().delivered_gap is True
+    # The gap landed after the first reconcile, so it was reconciled again after it.
+    assert feed_gaps(log) == [] and feed.reconciled  # R3F05

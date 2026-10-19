@@ -323,8 +323,10 @@ def test_agent_branches_pages_stay_small(tmp_path: Path) -> None:
                     "agent_branches", {"project_id": project, "cursor": cursor, "limit": 1000}
                 )
                 page = _payload(result)
-                assert len(result.content[0].text) < 400_000
-                assert 0 < len(page["branches"]) <= 100
+                rows = [json.dumps(row, ensure_ascii=False).encode() for row in page["branches"]]
+                # Each row is ~4 KB (2000 two-byte characters), so the 256 KiB page budget
+                # ends a page well before the 100-row limit (R3M01).
+                assert 0 < len(rows) < 100 and sum(map(len, rows)) <= 256 * 1024 + len(rows[-1])
                 seen += [b["branch"]["id"] for b in page["branches"]]
                 cursor = page["next_cursor"]
                 pages += 1
