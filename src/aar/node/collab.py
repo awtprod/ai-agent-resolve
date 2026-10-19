@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from aar.node.broker import BrokerConfig
 from aar.node.leases import (
     Holder,
     LeaseManager,
@@ -34,10 +35,11 @@ from aar.node.presence import PresenceGuard
 # the broker cannot act yet, as in warm-up or a stale observation).
 _HUMAN_PRESENT_CODES = frozenset({"human_context_change", "human_input"})
 
-# Defaults that mirror BrokerConfig, so contention consults the same instance lease the
-# broker's gate does.
-DEFAULT_INSTANCE_ID = "default"
-DEFAULT_BROKER_ID = "broker"
+# Contention consults the same instance lease the broker's gate does, so it reads the
+# instance and broker ids from BrokerConfig's own defaults rather than copying the values.
+_BROKER_DEFAULTS = BrokerConfig()
+DEFAULT_INSTANCE_ID = _BROKER_DEFAULTS.instance_id
+DEFAULT_BROKER_ID = _BROKER_DEFAULTS.broker_id
 
 
 @dataclass(frozen=True, slots=True)

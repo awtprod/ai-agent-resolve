@@ -2,13 +2,16 @@
 
 - :func:`project_board` narrows the lease board (:mod:`aar.hub.leaseboard`) to one project:
   the project and timeline leases on it, which humans are active, and whether any node has
-  flagged a feed gap (so the view may be stale).
+  an unreconciled feed gap (so the view may be stale). It also reconciles a node's leases
+  against that node's latest ``lease.snapshot``, so a lease whose release was dropped on an
+  overflowing feed does not linger as a phantom.
 - :func:`record_branch` records an agent branch timeline, linked to its source timeline and
-  the owning agent; :func:`branches` projects them. Only a node may record one; the writer,
-  names, handoff and ids are validated and bounded; the latest record for a given
-  ``(project, branch timeline id)`` wins.
-- ``feed.gap`` is the event a node's feed emits when its outbox overflowed and dropped
-  events; :func:`feed_gaps` projects the latest per node.
+  the owning agent; :func:`branches` projects them. Only a node may record one; the first
+  node to record a ``(project, branch)`` owns it, and only that node may supersede it, and
+  only with a version that does not go backwards.
+- ``feed.gap`` is the event a node's feed emits when its outbox overflowed; a later
+  ``lease.snapshot`` from the same node clears it. :func:`feed_gaps` returns the gaps that
+  are still unreconciled.
 
 The project id the board uses is the Resolve project's unique id (the lease key), not the
 hub registry's ``prj_...`` id; the branch record carries both (the Resolve timeline ids and
@@ -34,6 +37,7 @@ from aar.hub.common import (
     is_int,
     is_text,
     is_ts,
+    iso,
     utcnow,
 )
 from aar.hub.events import Actor, Event, EventLog
@@ -42,6 +46,7 @@ from aar.hub.registry import Registry
 
 EVENT_BRANCH_RECORDED = "collab.branch_recorded"
 EVENT_FEED_GAP = "feed.gap"
+EVENT_LEASE_SNAPSHOT = "lease.snapshot"
 
 MAX_ID = 128
 MAX_NAME = 256
@@ -50,7 +55,7 @@ MAX_VERSION = 10**6
 _PROJECT_SCOPES = frozenset({"project", "timeline"})
 
 
-# -- feed gaps ------------------------------------------------------------------------------
+# -- feed gaps and lease snapshots -----------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +70,13 @@ class FeedGap:
         return {"node_id": self.node_id, "dropped": self.dropped, "at": self.at}
 
 
+@dataclass(frozen=True, slots=True)
+class _Snapshot:
+    at: str
+    held: frozenset[str]
+    seq: int
+
+
 def _gap_problem(payload: Any) -> str | None:
     if not isinstance(payload, dict):
         return "payload is not an object"
@@ -77,15 +89,55 @@ def _gap_problem(payload: Any) -> str | None:
     return None
 
 
+def _snapshot_problem(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return "payload is not an object"
+    if not is_text(payload.get("node_id"), MAX_ID):
+        return "node_id is not an id"
+    if not is_ts(payload.get("at")):
+        return "at is not a timestamp"
+    if not isinstance(payload.get("leases"), list):
+        return "leases is not a list"
+    return None
+
+
+def _latest_snapshots(log: EventLog) -> dict[str, _Snapshot]:
+    """The latest ``lease.snapshot`` per node, by node id (node-authored only)."""
+    latest: dict[str, _Snapshot] = {}
+    for event in log.iter_events(types=[EVENT_LEASE_SNAPSHOT]):
+        payload = event.payload
+        if _snapshot_problem(payload) is not None:
+            continue
+        if event.actor != Actor("node", payload["node_id"]):
+            continue
+        held = frozenset(
+            lease.get("lease_id")
+            for lease in payload["leases"]
+            if isinstance(lease, dict) and is_text(lease.get("lease_id"), MAX_ID)
+        )
+        latest[payload["node_id"]] = _Snapshot(payload["at"], held, event.seq)
+    return latest
+
+
 def feed_gaps(log: EventLog) -> list[FeedGap]:
-    """The latest feed gap reported by each node, by node id."""
-    latest: dict[str, FeedGap] = {}
+    """Unreconciled feed gaps, by node id: the latest gap per node that no later snapshot
+    has cleared. A ``lease.snapshot`` the node emits after a gap reconciles it."""
+    gaps: dict[str, tuple[FeedGap, int]] = {}
     for event in log.iter_events(types=[EVENT_FEED_GAP]):
         payload = event.payload
         if _gap_problem(payload) is not None or event.actor != Actor("node", payload["node_id"]):
             continue
-        latest[payload["node_id"]] = FeedGap(payload["node_id"], payload["dropped"], payload["at"])
-    return sorted(latest.values(), key=lambda gap: gap.node_id)
+        gaps[payload["node_id"]] = (
+            FeedGap(payload["node_id"], payload["dropped"], payload["at"]),
+            event.seq,
+        )
+    snaps = _latest_snapshots(log)
+    active = [
+        gap
+        for node_id, (gap, seq) in gaps.items()
+        if node_id not in snaps or snaps[node_id].seq < seq
+    ]
+    return sorted(active, key=lambda gap: gap.node_id)
 
 
 # -- per-project lease + presence board ------------------------------------------------------
@@ -118,13 +170,20 @@ def project_board(log: EventLog, project_id: str, *, clock: Clock = utcnow) -> P
 
     ``project_id`` is the Resolve project's unique id, the first part of a project or
     timeline lease key. Instance leases belong to no project and are left out. Presence is
-    node-level, so every active human is listed. ``gaps`` flags nodes whose feed overflowed.
+    node-level, so every active human is listed. A node's leases are reconciled against that
+    node's latest ``lease.snapshot``: a lease that predates the snapshot and is not in it (a
+    phantom left by a dropped release) is dropped. ``gaps`` flags nodes whose feed overflowed
+    and has not yet reconciled.
     """
     board = lease_board(log, clock=clock)
+    snaps = _latest_snapshots(log)
     leases = tuple(
         lease
         for lease in board.leases
-        if lease.scope in _PROJECT_SCOPES and lease.key and lease.key[0] == project_id
+        if lease.scope in _PROJECT_SCOPES
+        and lease.key
+        and lease.key[0] == project_id
+        and not _superseded(lease, snaps.get(lease.node_id))
     )
     return ProjectBoard(
         project_id,
@@ -133,6 +192,15 @@ def project_board(log: EventLog, project_id: str, *, clock: Clock = utcnow) -> P
         tuple(feed_gaps(log)),
         board.as_of,
         board.skipped,
+    )
+
+
+def _superseded(lease: BoardLease, snapshot: _Snapshot | None) -> bool:
+    """Whether ``snapshot`` shows ``lease`` is no longer held (acquired before it, absent)."""
+    return (
+        snapshot is not None
+        and lease.since <= snapshot.at
+        and lease.lease_id not in snapshot.held
     )
 
 
@@ -180,12 +248,12 @@ def record_branch(
     version: int,
     handoff: str,
 ) -> Event:
-    """Record one agent branch, for a known project, written by a node. Latest record wins.
+    """Record one agent branch, for a known project, written by a node.
 
     The writer must be a node (only nodes report branches); the project must exist in the
     registry; names and the handoff are cleaned and bounded; ids and the version are
-    bounded. A later record for the same ``(project, branch timeline id)`` supersedes an
-    earlier one in :func:`branches`.
+    bounded. The first node to record a ``(project, branch)`` owns it; only that node may
+    supersede it (see :func:`scan_branches`), and only with a version that never goes back.
     """
     if not isinstance(actor, Actor) or actor.kind != "node":
         raise InvalidInput("actor", "only a node may record a branch")
@@ -246,6 +314,14 @@ def _branch_from_event(event: Event) -> Branch:
     )
 
 
+@dataclass
+class _Record:
+    owner_node: str
+    version: int
+    seq: int
+    branch: Branch
+
+
 @dataclass(frozen=True, slots=True)
 class BranchScan:
     branches: tuple[Branch, ...]
@@ -255,11 +331,12 @@ class BranchScan:
 def scan_branches(log: EventLog, project_id: str | None = None) -> BranchScan:
     """Every recorded branch (optionally for one project), oldest first, plus skipped events.
 
-    Keyed by ``(project id, branch timeline id)`` so projects never collide, and the latest
-    record for a key wins. An event from a non-node actor, or a malformed one, is skipped.
+    Keyed by ``(project id, branch timeline id)`` so projects never collide. The first node
+    to record a key owns it; a later record is applied only when it is from that same node
+    and carries a version that is not lower than the one already recorded. A non-node actor,
+    a cross-node overwrite, a version rollback, or a malformed event is skipped and listed.
     """
-    latest: dict[tuple[str | None, str], Branch] = {}
-    order: dict[tuple[str | None, str], int] = {}
+    state: dict[tuple[str | None, str], _Record] = {}
     skipped: list[SkippedEvent] = []
     for event in log.iter_events(project_id=project_id, types=[EVENT_BRANCH_RECORDED]):
         problem = _branch_problem(event.payload)
@@ -270,10 +347,24 @@ def scan_branches(log: EventLog, project_id: str | None = None) -> BranchScan:
             continue
         branch = _branch_from_event(event)
         key = (branch.project_id, branch.branch_timeline_id)
-        order.setdefault(key, event.seq)
-        latest[key] = branch
-    ordered = sorted(latest.items(), key=lambda item: (order[item[0]], item[0]))
-    return BranchScan(tuple(branch for _, branch in ordered), tuple(skipped))
+        current = state.get(key)
+        if current is None:
+            state[key] = _Record(event.actor.id, branch.version, event.seq, branch)
+            continue
+        if event.actor.id != current.owner_node:
+            skipped.append(
+                SkippedEvent.of(event, f"branch owned by node {current.owner_node!r}, not this one")
+            )
+            continue
+        if branch.version < current.version:
+            skipped.append(
+                SkippedEvent.of(event, f"version {branch.version} is behind {current.version}")
+            )
+            continue
+        current.version = branch.version
+        current.branch = branch
+    ordered = sorted(state.items(), key=lambda item: (item[1].seq, item[0]))
+    return BranchScan(tuple(record.branch for _, record in ordered), tuple(skipped))
 
 
 def branches(log: EventLog, project_id: str | None = None) -> list[Branch]:

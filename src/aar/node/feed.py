@@ -29,12 +29,13 @@ and approval tokens are S7's ``aar.node.hublink``.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import secrets
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
-from aar.hub.collab import EVENT_FEED_GAP
+from aar.hub.collab import EVENT_FEED_GAP, EVENT_LEASE_SNAPSHOT
 from aar.hub.common import InvalidInput, clean_text, iso
 from aar.hub.events import Actor, EventLog
 from aar.hub.leaseboard import (
@@ -45,7 +46,7 @@ from aar.hub.leaseboard import (
     lease_event_to_hub,
     presence_to_hub,
 )
-from aar.node.leases import LeaseEvent
+from aar.node.leases import Lease, LeaseEvent
 from aar.node.presence import PresenceGuard
 
 DEFAULT_PRESENCE_TTL = timedelta(minutes=10)
@@ -114,6 +115,11 @@ def _clean_node_id(node_id: str) -> str:
     return cleaned
 
 
+# A delivery failure that is transient (the hub is down) is retried; any other failure is
+# the hub rejecting this spec, so it is quarantined rather than left to block the queue.
+_TRANSIENT = (ConnectionError, TimeoutError, OSError)
+
+
 class NodeFeed:
     """Maps a node's lease and presence changes and sends them to the hub on ``flush``."""
 
@@ -124,6 +130,8 @@ class NodeFeed:
         *,
         wall_offset: Callable[[], float] = current_wall_offset,
         outbox_max: int = DEFAULT_OUTBOX_MAX,
+        lease_source: Callable[[], Iterable[Lease]] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         if outbox_max < 1:
             raise ValueError("outbox_max must be at least 1")
@@ -131,10 +139,18 @@ class NodeFeed:
         self._transport = transport
         self._wall_offset = wall_offset
         self._outbox_max = outbox_max
+        self._lease_source = lease_source
+        self._clock = clock
+        # A per-process nonce so a gap (or snapshot) key never collides with one minted by an
+        # earlier process for the same node (which would wedge every later flush on a
+        # conflict). Monotonic within the process via ``_event_seq``.
+        self._epoch = secrets.token_hex(8)
+        self._event_seq = 0
         self._outbox: list[HubEventSpec] = []
         self._dropped = 0
         self._gap_pending = False
         self._gap_at: datetime | None = None
+        self._reconcile_pending = False
 
     @property
     def node_id(self) -> str:
@@ -194,13 +210,15 @@ class NodeFeed:
     def _note_gap(self) -> None:
         self._dropped += 1
         self._gap_pending = True
+        self._reconcile_pending = True
         if self._gap_at is None:
             self._gap_at = datetime.now(UTC)
 
     # -- flush (called by the pump; never raises into it) ----------------------------------
 
     def flush(self) -> FlushReport:
-        """Send queued specs in order. On a send failure, keep the rest for next time."""
+        """Send queued specs in order. On a transient failure, keep the rest for next time;
+        on a rejection, quarantine the offending spec (gap-flagged) so it cannot block."""
         delivered_gap = False
         error: str | None = None
         sent = 0
@@ -212,24 +230,77 @@ class NodeFeed:
             self._gap_pending = False
             self._gap_at = None
             delivered_gap = True
+        # After a gap, send a snapshot of the node's live leases so the board can reconcile
+        # (drop a phantom left by a dropped release) and clear the stale flag.
+        if self._reconcile_pending:
+            snapshot = self._snapshot_spec()
+            if snapshot is None:
+                self._reconcile_pending = False  # no lease source wired: nothing to reconcile
+            else:
+                try:
+                    self._transport.deliver(snapshot, node_id=self._node_id)
+                    self._reconcile_pending = False
+                except Exception as exc:
+                    return FlushReport(sent, len(self._outbox), self._dropped, delivered_gap, repr(exc))
         while self._outbox:
             spec = self._outbox[0]
             try:
                 self._transport.deliver(spec, node_id=self._node_id)
             except Exception as exc:
-                error = repr(exc)
-                break
+                if isinstance(exc, _TRANSIENT):
+                    error = repr(exc)
+                    break
+                # The hub rejected this spec; quarantine it (gap-flagged) and keep going so a
+                # poison spec never blocks everything behind it.
+                self._outbox.pop(0)
+                self._note_gap()
+                error = f"quarantined: {exc!r}"
+                continue
             self._outbox.pop(0)
             sent += 1
         return FlushReport(sent, len(self._outbox), self._dropped, delivered_gap, error)
+
+    def _next_key(self, kind: str) -> str:
+        self._event_seq += 1
+        return f"{kind}:{self._node_id}:{self._epoch}:{self._event_seq}"
 
     def _gap_spec(self) -> HubEventSpec:
         at = self._gap_at or datetime.now(UTC)
         return HubEventSpec(
             EVENT_FEED_GAP,
             {"node_id": self._node_id, "dropped": self._dropped, "at": iso(at)},
-            f"{EVENT_FEED_GAP}:{self._node_id}:{self._dropped}",
+            self._next_key(EVENT_FEED_GAP),
         )
+
+    def _snapshot_spec(self) -> HubEventSpec | None:
+        if self._lease_source is None:
+            return None
+        offset = self._wall_offset()
+        now = (self._clock() + offset) if self._clock is not None else datetime.now(UTC).timestamp()
+        leases = [self._lease_dict(lease, offset) for lease in self._lease_source()]
+        return HubEventSpec(
+            EVENT_LEASE_SNAPSHOT,
+            {
+                "node_id": self._node_id,
+                "at": iso(datetime.fromtimestamp(now, UTC)),
+                "leases": leases,
+            },
+            self._next_key(EVENT_LEASE_SNAPSHOT),
+        )
+
+    def _lease_dict(self, lease: Lease, offset: float) -> dict:
+        return {
+            "lease_id": lease.id,
+            "scope": lease.scope.value,
+            "key": list(lease.key),
+            "holder": {"kind": lease.holder.kind.value, "id": lease.holder.id},
+            "acquired_at": iso(datetime.fromtimestamp(lease.acquired_at + offset, UTC)),
+            "expires_at": (
+                None
+                if lease.expires_at is None
+                else iso(datetime.fromtimestamp(lease.expires_at + offset, UTC))
+            ),
+        }
 
 
 class PresenceReporter:
