@@ -276,3 +276,31 @@ def test_bad_qa_values_are_rejected(bad):
         QATargets(
             longform_lufs=-22, short_lufs=-14.5, lufs_tolerance=0.5, review_mp4_max_mb=20, **bad
         )
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_kept_words_match_a_brute_force_mapping(seed):
+    import random
+
+    rng = random.Random(seed)
+    starts = sorted(rng.uniform(0, 30) for _ in range(300))
+    words = [
+        Word(text=f"w{i}", start_s=s, end_s=s + rng.uniform(0.0, 0.9)) for i, s in enumerate(starts)
+    ]
+    transcript = Transcript(words=words)
+    segments = []
+    for _ in range(12):
+        src_in = rng.randrange(0, 1400)
+        segments.append(seg("a", src_in, src_in + rng.randrange(1, 200)))
+    plan = _plan(segments)
+    ranges = plan.record_ranges()
+    expected = []
+    for i, s in enumerate(plan.segments):
+        r0, r1 = s.src_in / 50, s.src_out / 50
+        for index, w in enumerate(words):
+            if r0 <= (w.start_s + w.end_s) / 2 < r1:
+                expected.append((ranges[i][0] / 50 + w.start_s - r0, index))
+    expected.sort()
+    got = kept_words(plan, transcript)
+    assert [k.index for k in got] == [index for _, index in expected]
+    assert [k.record_start_s for k in got] == pytest.approx([t for t, _ in expected])

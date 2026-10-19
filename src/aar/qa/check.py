@@ -271,6 +271,7 @@ def _decode(ctx: _Ctx, error: MediaError | None) -> QACheck:
         "exit_code": result.exit_code,
         "error_lines": result.error_lines,
         "errors": result.errors,
+        "log_truncated": result.log_truncated,
     }
     if result.ok:
         return QACheck(

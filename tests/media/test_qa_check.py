@@ -189,7 +189,13 @@ def test_size_cap_applies_to_review_renders_only(tmp_path):
 def test_clean_render_decodes(tmp_path):
     entry = run(render(tmp_path / "r.mp4", frames=30)).check("decode")
     assert entry.status == "pass"
-    assert entry.measured == {"readable": True, "exit_code": 0, "error_lines": 0, "errors": []}
+    assert entry.measured == {
+        "readable": True,
+        "exit_code": 0,
+        "error_lines": 0,
+        "errors": [],
+        "log_truncated": False,
+    }
 
 
 def test_truncated_render_fails_decode(tmp_path):

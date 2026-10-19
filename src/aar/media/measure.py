@@ -111,7 +111,8 @@ class DecodeResult:
     ok: bool
     exit_code: int
     errors: list[str]
-    error_lines: int
+    error_lines: int  # in the kept stderr tail; see log_truncated
+    log_truncated: bool = False
 
 
 def decode_check(path: str | os.PathLike[str], *, timeout_s: float) -> DecodeResult:
@@ -144,6 +145,7 @@ def decode_check(path: str | os.PathLike[str], *, timeout_s: float) -> DecodeRes
         exit_code=result.returncode,
         errors=lines[:DECODE_ERROR_LINES],
         error_lines=len(lines),
+        log_truncated=result.stderr_truncated,
     )
 
 

@@ -7,6 +7,7 @@ Transcript times are recording seconds; a source's file frame ``f`` is recording
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass
 
 from aar.plan.inputs import Transcript, Word
@@ -109,6 +110,21 @@ def applies(transcript: Transcript, source: Source) -> bool:
     return transcript.recording in (source.recording_id, source.id)
 
 
+class _WordIndex:
+    """Words sorted by start (as a Transcript guarantees), searchable by time."""
+
+    def __init__(self, words: list[Word]) -> None:
+        self.words = words
+        self.starts = [w.start_s for w in words]
+        self.longest = max((w.end_s - w.start_s for w in words), default=0.0)
+
+    def overlapping(self, lo: float, hi: float) -> range:
+        """Indexes of words that may overlap ``[lo, hi]`` (a superset; callers filter)."""
+        first = bisect_left(self.starts, lo - self.longest)
+        last = bisect_left(self.starts, hi, lo=first)
+        return range(first, min(last + 1, len(self.words)))
+
+
 def kept_words(plan: EditPlan, transcript: Transcript) -> list[KeptWord]:
     """Transcript words whose midpoint lies inside a kept segment, in record order.
 
@@ -120,7 +136,7 @@ def kept_words(plan: EditPlan, transcript: Transcript) -> list[KeptWord]:
     ranges = plan.record_ranges()
     fps = plan.fps
     words = transcript.words
-    mids = [(w.start_s + w.end_s) / 2 for w in words]
+    index_of = _WordIndex(words)
     seen: set[tuple[int, int]] = set()
     kept: list[KeptWord] = []
     for i, seg in enumerate(plan.segments):
@@ -130,8 +146,9 @@ def kept_words(plan: EditPlan, transcript: Transcript) -> list[KeptWord]:
         r0 = fps.seconds(source.recording_origin + seg.src_in)
         r1 = fps.seconds(source.recording_origin + seg.src_out)
         rec0 = fps.seconds(ranges[i][0])
-        for index, (word, mid) in enumerate(zip(words, mids, strict=True)):
-            if not (r0 <= mid < r1):
+        for index in index_of.overlapping(r0, r1):
+            word = words[index]
+            if not (r0 <= (word.start_s + word.end_s) / 2 < r1):
                 continue
             start = rec0 + (word.start_s - r0)
             key = (index, ranges[i][0])
@@ -162,6 +179,7 @@ def straddled_words(
     by more than ``tolerance_s`` on both sides."""
     sources = plan.source_map()
     fps = plan.fps
+    index_of = _WordIndex(transcript.words)
     found: list[StraddledWord] = []
     sides = (
         ("out", sources[cut.out_source_id], cut.src_out_frame),
@@ -171,9 +189,8 @@ def straddled_words(
         if not applies(transcript, source):
             continue
         boundary = fps.seconds(source.recording_origin + frame)
-        for word in transcript.words:
-            if word.start_s > boundary:
-                break
+        for index in index_of.overlapping(boundary, boundary):
+            word = transcript.words[index]
             if _straddles(word, boundary, tolerance_s):
                 found.append(
                     StraddledWord(
