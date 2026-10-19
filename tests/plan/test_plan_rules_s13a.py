@@ -299,9 +299,15 @@ def test_no_dissolve_ignores_a_hard_start_with_an_audio_fade(
 # cut-density (ccn: more than 2 cuts in any 10 s window warns)
 
 
-def test_cut_density_allows_exactly_two_cuts_in_a_window(clean_data: PlanData, run_lint: RunLint):
-    report = run_lint(timeline(clean_data, [250, 100, 250]))  # cuts at 10 s and 14 s
-    assert only(report, "cut-density") == []
+def test_cut_density_allows_exactly_two_cuts_in_a_window(
+    clean_data: PlanData, run_lint: RunLint, ccn: Profile
+):
+    timeline(clean_data, [250, 100, 250])  # cuts at 10 s and 14 s
+    assert only(run_lint(clean_data), "cut-density") == []
+    # The same two cuts are one too many where the profile allows only one.
+    ccn.rules["cut-density"].params["max_cuts"] = 1
+    (finding,) = only(run_lint(clean_data, profile=ccn), "cut-density")
+    assert finding.message.startswith("2 cuts in 4.00 s of record time")
 
 
 def test_cut_density_warns_on_three_cuts_in_a_window(clean_data: PlanData, run_lint: RunLint):
@@ -320,16 +326,20 @@ def test_cut_density_warns_on_three_cuts_in_a_window(clean_data: PlanData, run_l
     ]
 
 
-@pytest.mark.parametrize(("third", "count"), [(125, 0), (124, 1)], ids=["10.00s", "9.96s"])
-def test_cut_density_window_is_half_open(
-    clean_data: PlanData, run_lint: RunLint, third: int, count: int
-):
-    # Cuts at frames 100, 225 and 225 + third: exactly 10 s from first to last is two windows.
-    report = run_lint(timeline(clean_data, [100, 125, third, 100]))
-    findings = only(report, "cut-density")
-    assert len(findings) == count
-    if count:
-        assert findings[0].message.startswith("3 cuts in 9.96 s of record time")
+def test_cut_density_window_is_half_open(clean_data: PlanData, run_lint: RunLint, ccn: Profile):
+    # Cuts at frames 100, 225 and 350: exactly 10 s from first to last is not one window...
+    timeline(clean_data, [100, 125, 125, 100])
+    assert only(run_lint(clean_data), "cut-density") == []
+    # ...but a window one frame longer holds all three.
+    ccn.rules["cut-density"].params["window_s"] = 10.04
+    (finding,) = only(run_lint(clean_data, profile=ccn), "cut-density")
+    assert finding.message.startswith("3 cuts in 10.00 s of record time")
+
+
+def test_cut_density_one_frame_inside_the_window_warns(clean_data: PlanData, run_lint: RunLint):
+    # Cuts at frames 100, 225 and 349: 9.96 s from first to last.
+    (finding,) = only(run_lint(timeline(clean_data, [100, 125, 124, 100])), "cut-density")
+    assert finding.message.startswith("3 cuts in 9.96 s of record time")
 
 
 def test_cut_density_merges_overlapping_windows_into_one_finding(
@@ -364,10 +374,28 @@ def test_cut_density_merges_bursts_that_share_a_window(clean_data: PlanData, run
     )
 
 
-def test_cut_density_does_not_count_unbroken_joins(clean_data: PlanData, run_lint: RunLint):
+def test_cut_density_merges_bursts_that_share_only_one_cut(clean_data: PlanData, run_lint: RunLint):
+    # Cuts at 1, 2, 10, 12 and 19 s: 1-10 s and 10-19 s are both bursts (9 s each) and the
+    # cuts at 2, 10 and 12 s are not (exactly 10 s), but the two bursts share the cut at 10 s.
+    report = run_lint(timeline(clean_data, [25, 25, 200, 50, 175, 100]))
+    (finding,) = only(report, "cut-density")
+    assert finding.message.startswith(
+        "5 cuts in 18.00 s of record time (00:00:01:00 to 00:00:19:00)"
+    )
+
+
+def test_cut_density_does_not_count_unbroken_joins(
+    clean_data: PlanData, run_lint: RunLint, ccn: Profile
+):
     # The join into segment 2 resumes the recording, so only two cuts remain.
-    report = run_lint(timeline(clean_data, [250, 100, 100, 250], continuous=[2]))
-    assert only(report, "cut-density") == []
+    timeline(clean_data, [250, 100, 100, 250], continuous=[2])
+    assert only(run_lint(clean_data), "cut-density") == []
+    ccn.rules["cut-density"].params["max_cuts"] = 1
+    (finding,) = only(run_lint(clean_data, profile=ccn), "cut-density")
+    assert [(r.segment, r.record_tc) for r in finding.refs] == [
+        (1, "00:00:10:00"),
+        (3, "00:00:18:00"),
+    ]
 
 
 def test_cut_density_threshold_comes_from_the_profile(
@@ -382,23 +410,23 @@ def test_cut_density_threshold_comes_from_the_profile(
 # min-shot (ccn: under 1.0 s warns)
 
 
-@pytest.mark.parametrize(("length", "count"), [(25, 0), (24, 1)], ids=["1.00s", "0.96s"])
-def test_min_shot_boundary_is_exactly_the_minimum(
-    clean_data: PlanData, run_lint: RunLint, length: int, count: int
-):
-    findings = only(run_lint(timeline(clean_data, [250, length, 250])), "min-shot")
-    assert len(findings) == count
-    if count:
-        (finding,) = findings
-        assert finding.severity == "warn"
-        assert finding.message == (
-            "Segment 1 runs 0.960 s (24 frames); shots under 1 s read as slivers."
-        )
-        assert finding.fix_hint == (
-            "Fold it into a neighbour: extend segment 0 or segment 2 over its 24 frames, or "
-            "lengthen it to at least 25 frames."
-        )
-        assert [(r.segment, r.point) for r in finding.refs] == [(1, "in"), (1, "out")]
+def test_min_shot_exactly_the_minimum_passes(clean_data: PlanData, run_lint: RunLint, ccn: Profile):
+    timeline(clean_data, [250, 25, 250])  # exactly 1.00 s
+    assert only(run_lint(clean_data), "min-shot") == []
+    ccn.rules["min-shot"].params["min_seconds"] = 1.04  # one frame more is too short
+    (finding,) = only(run_lint(clean_data, profile=ccn), "min-shot")
+    assert finding.message.startswith("Segment 1 runs 1.000 s (25 frames)")
+
+
+def test_min_shot_one_frame_under_the_minimum_warns(clean_data: PlanData, run_lint: RunLint):
+    (finding,) = only(run_lint(timeline(clean_data, [250, 24, 250])), "min-shot")
+    assert finding.severity == "warn"
+    assert finding.message == "Segment 1 runs 0.960 s (24 frames); shots under 1 s read as slivers."
+    assert finding.fix_hint == (
+        "Fold it into a neighbour: extend segment 0 or segment 2 over its 24 frames, or "
+        "lengthen it to at least 25 frames."
+    )
+    assert [(r.segment, r.point) for r in finding.refs] == [(1, "in"), (1, "out")]
 
 
 def test_min_shot_at_a_fractional_rate(clean_data: PlanData, run_lint: RunLint):
@@ -421,8 +449,10 @@ def test_min_shot_names_the_only_neighbour_or_none(clean_data: PlanData, run_lin
 
 
 def test_min_shot_skips_segments_that_ranges_valid_reports(clean_data: PlanData, run_lint: RunLint):
-    clean_data["segments"][1].update(source="nope", src_out=1510)
-    assert only(run_lint(clean_data), "min-shot") == []
+    clean_data["segments"][1].update(source="nope", src_out=1510)  # unknown source
+    clean_data["segments"][2].update(src_out=1774)  # a usable 10-frame sliver
+    (finding,) = only(run_lint(clean_data), "min-shot")
+    assert finding.refs[0].segment == 2
 
 
 # short-end-fade (ccn: a short's end fade is at most 1 frame)
