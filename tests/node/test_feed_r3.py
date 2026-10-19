@@ -433,7 +433,9 @@ def test_a_delivered_gap_is_not_sent_again(tmp_path: Path) -> None:
     leases.acquire(AGENT, Scope.PROJECT, ("p0",), ttl=60)
     leases.acquire(AGENT, Scope.PROJECT, ("p1",), ttl=60)
     assert feed.flush().delivered_gap is True
-    assert feed.flush().delivered_gap is False  # N07: cleared once delivered
+    again = feed.flush()
+    assert again.delivered_gap is False and again.error is None  # N07: cleared once delivered
+    assert len(log.read(types=["feed.gap"])) == 1
 
 
 def test_two_gaps_in_one_process_both_reach_the_hub(tmp_path: Path) -> None:
