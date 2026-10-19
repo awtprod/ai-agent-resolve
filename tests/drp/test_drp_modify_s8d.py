@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from diff_testing import A1_ITEM, CLIP, H264, TIMELINE
+from diff_testing import A1_ITEM, CLIP, H264, TIMELINE, V1_ITEM
 from drp_helpers import needs_zstandard
 
 from aar.drp.modify import engine, parse_plan, write
@@ -90,6 +90,32 @@ def test_a_a_foreign_label_written_before_the_snapshot_is_refused_and_kept(
     assert kind == "label-snapshot" and Path(path).read_text() == HUMAN
     assert outcome.to_dict()["left_behind"][0]["path"] == path
     assert files(tmp_path) == sorted([out.name, sidecar.name, Path(path).name])
+
+
+def test_a_the_stamp_is_read_from_the_snapshot_not_the_live_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The label was a human's when it was snapshotted, and is our stamp again (a new file) by the
+    # time it is checked. The check reads the snapshot, so the run is refused and the snapshot of
+    # the human label is kept (kills "check the live file instead").
+    out, sidecar = _first_run(tmp_path)
+    ours = sidecar.read_bytes()
+    real_backup = write._backup
+
+    def human_label_snapshotted_then_ours_back(directory: Path, side: Path) -> Any:
+        side.unlink()
+        side.write_text(HUMAN)
+        snapshot = real_backup(directory, side)
+        side.unlink()
+        side.write_bytes(ours)
+        return snapshot
+
+    monkeypatch.setattr(write, "_backup", human_label_snapshotted_then_ours_back)
+    outcome = edit_file(H264, plan({**RENAME, "new_name": "y"}), out, force=True)
+    assert [r.code for r in outcome.refusals] == ["foreign-sidecar"]
+    assert sidecar.read_bytes() == ours
+    [(path, kind)] = _left(outcome)
+    assert kind == "label-snapshot" and Path(path).read_text() == HUMAN
 
 
 def test_a_a_label_written_in_place_after_the_check_survives_in_the_snapshot(
@@ -389,6 +415,67 @@ def test_c_the_label_read_is_bounded_when_the_label_grew_after_the_size_check(
     monkeypatch.setattr(write.json, "loads", loads)
     assert write._is_our_sidecar(sidecar, out) is False
     assert all(n <= cap for n in parsed), parsed  # never parsed past the cap
+
+
+class _CountingOpen:
+    """Stands in for ``open`` inside the writer module and counts what label reads return."""
+
+    def __init__(self) -> None:
+        self.returned: list[int] = []
+
+    def __call__(self, *a: Any, **k: Any) -> Any:
+        fh = open(*a, **k)  # noqa: SIM115 - handed back to the code under test, which closes it
+        real_read = fh.read
+
+        def read(*ra: Any) -> Any:
+            data = real_read(*ra)
+            self.returned.append(len(data))
+            return data
+
+        fh.read = read
+        return fh
+
+
+@pytest.mark.parametrize("honest_size", [False, True], ids=["grew-after-fstat", "honest-size"])
+def test_c_the_label_read_itself_stops_at_cap_plus_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, honest_size: bool
+) -> None:
+    # Not just the verdict: the bytes read. A label that grew after the fstat is read only to
+    # cap + 1; one whose fstat already shows it over the cap is not read at all.
+    cap = 4096
+    monkeypatch.setattr(write, "_MAX_SIDECAR_BYTES", cap)
+    out = tmp_path / "out.drp"
+    sidecar = Path(str(out) + SIDECAR_SUFFIX)
+    body = json.dumps(_stamp(out)).encode()
+    sidecar.write_bytes(body + b" " * (8 * cap))
+    if not honest_size:
+        ino, real_fstat = os.stat(sidecar).st_ino, os.fstat
+
+        def fstat(fd: int) -> os.stat_result:
+            st = real_fstat(fd)
+            if st.st_ino != ino:
+                return st
+            fields = list(st)
+            fields[stat.ST_SIZE] = len(body)
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(os, "fstat", fstat)
+    counting = _CountingOpen()
+    monkeypatch.setattr(write, "open", counting, raising=False)
+    assert write._is_our_sidecar(sidecar, out) is False
+    assert sum(counting.returned) == (0 if honest_size else cap + 1)
+
+
+def test_c_a_non_regular_label_is_never_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out.drp"
+    sidecar = Path(str(out) + SIDECAR_SUFFIX)
+    os.mkfifo(sidecar)
+    counting = _CountingOpen()
+    monkeypatch.setattr(write, "open", counting, raising=False)
+    assert write._is_our_sidecar(sidecar, out) is False
+    assert counting.returned == []
 
 
 def test_c_a_label_at_the_cap_with_the_honest_size_is_still_ours(
@@ -738,6 +825,23 @@ def test_g_two_renames_of_one_bin_conflict(tmp_path: Path) -> None:
         tmp_path / "out.drp",
     )
     assert [(r.code, r.edit) for r in outcome.refusals] == [("conflicting-edits", 1)]
+
+
+def test_g_renames_of_two_different_objects_of_one_kind_combine(tmp_path: Path) -> None:
+    # The claim is per object, not per kind (kills keying it on the target kind).
+    out = tmp_path / "out.drp"
+    outcome = edit_file(
+        H264,
+        plan(
+            {"op": "rename", "target": "item", "id": A1_ITEM, "new_name": "first"},
+            {"op": "rename", "target": "item", "id": V1_ITEM, "new_name": "second"},
+        ),
+        out,
+    )
+    assert outcome.status == "written", outcome.to_dict()["refusals"]
+    assert sorted((c["object_id"], c["new"]) for c in outcome.changes) == sorted(
+        [(A1_ITEM, "first"), (V1_ITEM, "second")]
+    )
 
 
 def test_g_renames_of_different_objects_still_combine(tmp_path: Path) -> None:
