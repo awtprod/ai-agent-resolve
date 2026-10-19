@@ -691,3 +691,47 @@ def test_a_gap_that_grows_while_pending_reports_its_latest_count(tmp_path: Path)
     _drain(feed, clock)
     gaps = [e.payload["dropped"] for e in log.read(types=["feed.gap"])]
     assert gaps == [2]  # the pending gap was re-made with the new count (and a new key)
+
+
+def test_a_dead_processs_late_resend_after_a_restart_is_answered_not_refused(
+    tmp_path: Path,
+) -> None:
+    """A resend of a spec already in the log is answered with the stored event, even from a
+    process the hub has since replaced: it adds nothing and marks nothing stale."""
+    log = EventLog(tmp_path / "hub.db")
+    clock = FakeClock()
+    transport = Faulty(log, hub_clock=_at(clock))
+    first, leases = _wired(log, transport, clock)
+    first.flush()
+    transport.lose_first_ack = True
+    leases.acquire(Holder.agent("a"), Scope.PROJECT, ("P",), ttl=600)
+    first.flush()  # the grant commits; its ack is lost
+    transport.lose_first_ack = False
+    transport.hold = lambda spec: spec.type == "lease.granted"
+    clock.advance(BACKOFF_MAX)
+    first.flush()  # the resend is in flight when the process dies
+    transport.hold = lambda spec: False
+    second, _ = _wired(log, EventLogTransport(log, clock=_at(clock)), clock)
+    second.flush()  # the restarted process takes over
+    transport.land()  # the dead process's resend lands now
+    assert log.read(types=[EVENT_FEED_SUPERSEDED]) == []
+    assert len(log.read(types=["lease.granted"])) == 1
+    assert project_board(log, "P", clock=_at(clock)).to_dict()["stale"] is False
+
+
+def test_a_hand_written_re_claim_never_brings_back_a_replaced_process(tmp_path: Path) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    clock = FakeClock()
+    fa, _ = _wired(log, EventLogTransport(log), clock)
+    fa.flush()
+    fb, lb = _wired(log, EventLogTransport(log), clock)
+    lb.acquire(Holder.agent("B"), Scope.PROJECT, ("Q",), ttl=600)
+    fb.flush()
+    claim = {"node_id": NODE, "nonce": fa.nonce, "at": "2027-01-01T00:00:00+00:00"}
+    log.append(EVENT_FEED_CLAIMED, Actor("node", NODE), claim)  # by hand, around the acceptor
+    snapshot = {"node_id": NODE, "at": "2027-01-01T00:00:00+00:00", "lease_ids": []}
+    snapshot["feed"] = {"nonce": fa.nonce, "seq": 10**6}
+    log.append(EVENT_LEASE_SNAPSHOT, Actor("node", NODE), snapshot)
+    board = lease_board(log, clock=_at(clock))
+    assert [lease.holder_id for lease in board.leases] == ["B"]
+    assert any("already admitted" in item.reason for item in board.skipped)

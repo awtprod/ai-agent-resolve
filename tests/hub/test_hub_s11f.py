@@ -235,3 +235,33 @@ def test_a_late_older_state_of_a_lease_never_overwrites_a_newer_one(tmp_path: Pa
     assert [(b.lease_id, b.expires_at) for b in board.leases] == [
         ("L1", "2027-01-15T15:00:00+00:00")
     ]
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    ["garbage", {"seq": 1}, {"nonce": "n", "seq": 0}, {"nonce": "n" * 65, "seq": 1}, None],
+    ids=["not-a-dict", "no-nonce", "seq-0", "long-nonce", "absent"],
+)
+def test_a_malformed_feed_stamp_is_skipped_never_raised(tmp_path: Path, stamp: Any) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    payload = {
+        "node_id": "node-1",
+        "lease_id": "L1",
+        "scope": "project",
+        "key": ["pS"],
+        "holder": {"kind": "agent", "id": "a"},
+        "acquired_at": "2027-01-15T14:00:00+00:00",
+        "expires_at": None,
+        "ttl": None,
+        "at": "2027-01-15T14:00:00+00:00",
+        "by": None,
+    }
+    if stamp is not None:
+        payload["feed"] = stamp
+    log.append("lease.granted", Actor("node", "node-1"), payload)
+    board = lease_board(log)  # never raises
+    if stamp is None:  # an unstamped (hand-written or legacy) event is still folded
+        assert [b.lease_id for b in board.leases] == ["L1"]
+    else:
+        assert board.leases == ()
+        assert any("feed is not a stamp" in s.reason for s in board.skipped)
