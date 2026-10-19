@@ -5,12 +5,29 @@
 name = "ccn"
 description = "CCN comedy show: continuous takes, hard cuts, crossfaded audio, end on the laugh."
 
-# Post-render QA targets. Used by later slices, not by the plan linter.
+# Post-render QA targets for `aar qa check` (aar.qa); the plan linter does not use them.
+# Every key after review_mp4_max_mb is optional; the values below are the defaults.
 [qa]
 longform_lufs = -22.0
 short_lufs = -14.5
 lufs_tolerance = 0.5      # LU either side of the target
-review_mp4_max_mb = 20
+review_mp4_max_mb = 20    # review renders only; 1 MB = 1,000,000 bytes
+true_peak_max_dbtp = -1.0 # ebur128 true peak (4x oversampled) must be at or below this
+clip_level_dbfs = -0.01   # a decoded sample at or above this magnitude counts as clipped
+silence_db = -42.0        # longest-silence threshold; a venue may use -36 (--silence-db)
+silence_min_s = 0.2       # shorter silences are not reported
+# longest_silence_warn_s = 2.0  # warn when the longest silence is longer; off when absent
+duration_tolerance_frames = 1        # render duration versus the plan's record duration
+join_continuity_tolerance_frames = 1 # a join this close to unbroken playback is not a cut
+join_quiet_db = -40.0     # the incoming source audio near src_in must have a run below this
+join_quiet_min_ms = 60    # ... at least this long
+join_quiet_search_s = 0.10  # ... inside [src_in - this, src_in + this], clipped to the source
+join_quiet_window_ms = 10   # RMS window; a run is the union of windows below join_quiet_db
+join_windows = 3          # overlapping re-transcription windows per join (2 or 3)
+join_window_s = 4.0       # length of each window, centred on the join
+join_window_step_s = 0.5  # offset between windows; compared region = their overlap
+join_agreement_min = 0.8  # difflib ratio every window pair and window vs plan must reach
+word_straddle_s = 0.03    # a word may cross a cut or region edge by this much
 
 # Segments from one recording play in source-time order: no reordering, no imported cold opens.
 [rules.chronological]

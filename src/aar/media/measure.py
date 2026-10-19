@@ -243,44 +243,30 @@ def count_clipped(
     path: str | os.PathLike[str],
     *,
     level: float,
-    channels: int,
-    sample_rate: int,
     timeout_s: float,
+    channels: int | None = None,
+    sample_rate: int | None = None,
 ) -> ClipCount:
     """Count decoded samples (any channel) whose magnitude is at or above ``level``.
 
-    The first audio stream is decoded to 32-bit float at its own rate (no resampling, which
+    The first audio stream is decoded to 32-bit float in its own layout and rate (resampling
     would invent or hide overs) and streamed, so memory stays flat for long files.
+    ``channels`` and ``sample_rate`` (from ``probe``) only place the first clipped sample in time.
     """
     p = require_regular_file(path, tool="ffmpeg")
-    if channels <= 0:
-        raise ValueError("channels must be positive")
     counter = _ClipCounter(level)
     run_tool(
         "ffmpeg",
         [
             *_BASE,
-            "-v",
-            "error",
-            "-i",
-            input_url(p),
-            "-map",
-            "0:a:0",
-            "-ac",
-            str(channels),
-            "-c:a",
-            "pcm_f32le",
-            "-f",
-            "f32le",
-            "-",
+            *("-v", "error", "-i", input_url(p), "-map", "0:a:0"),
+            *("-c:a", "pcm_f32le", "-f", "f32le", "-"),
         ],
         timeout_s=timeout_s,
         stdout_sink=counter.feed,
     )
     first = counter.first_index
-    return ClipCount(
-        clipped=counter.clipped,
-        first_s=None if first is None or sample_rate <= 0 else (first // channels) / sample_rate,
-        level=level,
-        scanned=counter.scanned,
-    )
+    first_s = None
+    if first is not None and channels and sample_rate:
+        first_s = (first // channels) / sample_rate
+    return ClipCount(clipped=counter.clipped, first_s=first_s, level=level, scanned=counter.scanned)
