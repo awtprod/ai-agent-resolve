@@ -535,21 +535,20 @@ def test_a_quarantined_inactive_report_is_re_announced_by_the_reconcile(tmp_path
 def test_an_older_presence_report_landing_late_never_overrides_a_newer_one(
     tmp_path: Path,
 ) -> None:
+    """A reconcile's re-announced presence goes before the queued reports; by the node's
+    own order the newest report stands, whatever order the hub commits them in."""
     log = EventLog(tmp_path / "hub.db")
-    clock = FakeClock()
-    transport = Faulty(log)
-    feed, _ = _wired(log, transport, clock)
-    feed.flush()
-    at = _at(clock)
-    transport.hold = lambda spec: spec.type == "presence.changed" and spec.payload["active"]
-    feed.report_presence(active=True, at=at(), human_id="op", ttl=timedelta(minutes=10))
-    feed.flush()  # times out (the hub commits it later)
-    transport.hold = lambda spec: False
-    feed.report_presence(active=False, at=at() + timedelta(seconds=1), human_id="op")
-    clock.advance(BACKOFF_MAX)
-    _drain(feed, clock)
-    transport.land()  # the older "active" lands last
-    assert project_board(log, "P", clock=_at(clock)).presence == ()
+    at = datetime(2027, 1, 15, 14, 0, tzinfo=UTC)
+    stamp = {"nonce": "a" * 16}
+    active = {"node_id": NODE, "active": True, "human_id": "op", "at": at.isoformat()}
+    active["expires_at"] = (at + timedelta(minutes=10)).isoformat()
+    quiet = {"node_id": NODE, "active": False, "human_id": "op", "expires_at": None}
+    quiet["at"] = (at + timedelta(seconds=1)).isoformat()
+    newer = HubEventSpec("presence.changed", {**quiet, "feed": {**stamp, "seq": 2}}, "quiet")
+    older = HubEventSpec("presence.changed", {**active, "feed": {**stamp, "seq": 1}}, "active")
+    deliver_feed_event(log, newer, NODE)
+    deliver_feed_event(log, older, NODE)  # lands last
+    assert lease_board(log, clock=lambda: at + timedelta(seconds=5)).presence == ()
 
 
 # -- LOW 12: a feed cannot be built in a mode that never reconciles ---------------------------
