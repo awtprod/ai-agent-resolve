@@ -5,6 +5,8 @@ Each test names the finding it pins. They run on the bundled templates only.
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import re
 import struct
@@ -19,7 +21,7 @@ from drp_edit import add_carrier, carrier, edit_zip, marker_entry, markers_field
 from drp_helpers import kd, needs_zstandard, pb_len, zstd_raw_frame
 
 from aar.drp import blobs
-from aar.drp.modify import compare_round_trip, encode, parse_plan
+from aar.drp.modify import compare_round_trip, encode, parse_plan, zipraw
 from aar.drp.modify.encode import EncodeError
 from aar.drp.modify.write import SIDECAR_SUFFIX, edit_file
 from aar.drp.modify.write import leftovers as stale_temp_files
@@ -481,3 +483,86 @@ def test_fj_path_map_report_states_its_scope(tmp_path: Path) -> None:
     )
     [report] = outcome.report
     assert "project settings" in report["scope"] and "GalleryPath" in report["scope"]
+
+
+# --------------------------------------------------------------------------- test gaps
+
+
+class _Unseekable(io.RawIOBase):
+    """A write-only stream: zipfile then writes data descriptors after each member."""
+
+    def __init__(self) -> None:
+        self.buf = bytearray()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, b: Any) -> int:
+        self.buf += bytes(b)
+        return len(bytes(b))
+
+
+def _descriptor_zip() -> bytes:
+    stream = _Unseekable()
+    with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("a.xml", b"a" * 64)
+        zf.writestr("b.xml", b"b" * 64)
+    return bytes(stream.buf)
+
+
+def _patched(data: bytes, at: int, fmt: str, value: int) -> bytes:
+    out = bytearray(data)
+    struct.pack_into(fmt, out, at, value)
+    return bytes(out)
+
+
+def test_gap_zip_data_descriptor_that_disagrees_is_refused() -> None:
+    data = _descriptor_zip()
+    first = zipraw.parse_layout(data)[0]
+    assert first.flags & 0x8 and first.descriptor_sig
+    crc_at = first.data_end + 4  # after the PK\x07\x08 signature
+    bad = _patched(data, crc_at, "<I", 0x12345678)
+    with pytest.raises(zipraw.ZipLayoutError, match="data descriptor disagrees"):
+        zipraw.parse_layout(bad)
+
+
+def test_gap_zip_data_descriptor_without_its_signature_is_kept_that_way() -> None:
+    data = _descriptor_zip()
+    first, second = zipraw.parse_layout(data)
+    end = data.rfind(b"PK\x05\x06")
+    cd_off = struct.unpack_from("<I", data, end + 16)[0]
+    cut = data[: first.data_end] + data[first.data_end + 4 :]  # drop the optional signature
+    cut = _patched(cut, second.central_start - 4 + 42, "<I", second.local_start - 4)
+    cut = _patched(cut, end - 4 + 16, "<I", cd_off - 4)
+    entry = zipraw.parse_layout(cut)[0]
+    assert entry.flags & 0x8 and not entry.descriptor_sig
+    assert zipraw.rewrite(cut, {}) == cut
+    out = zipraw.rewrite(cut, {"a.xml": b"new"})
+    assert not zipraw.parse_layout(out)[0].descriptor_sig
+    with zipfile.ZipFile(io.BytesIO(out)) as zf:
+        assert (zf.read("a.xml"), zf.read("b.xml")) == (b"new", b"b" * 64)
+
+
+def test_gap_zip_local_flags_that_disagree_are_refused() -> None:
+    data = _descriptor_zip()
+    with pytest.raises(zipraw.ZipLayoutError, match="disagree"):
+        zipraw.parse_layout(_patched(data, 6, "<H", 0))  # local header: no descriptor flag
+
+
+@pytest.mark.parametrize(
+    ("method", "number"), [(zipfile.ZIP_BZIP2, 12), (zipfile.ZIP_LZMA, 14)], ids=["bzip2", "lzma"]
+)
+def test_gap_zip_other_compression_methods_are_refused(method: int, number: int) -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", method) as zf:
+        zf.writestr("a.xml", b"a" * 64)
+    with pytest.raises(zipraw.ZipLayoutError, match=f"compression method {number}"):
+        zipraw.parse_layout(buf.getvalue())
+
+
+def test_gap_sidecar_records_the_output_size_and_hash(tmp_path: Path) -> None:
+    outcome, out = run(H264, tmp_path, RENAME)
+    label = json.loads(Path(str(out) + SIDECAR_SUFFIX).read_text())
+    data = out.read_bytes()
+    assert label["output"]["size"] == len(data) == outcome.output["size"]
+    assert label["output"]["sha256"] == hashlib.sha256(data).hexdigest()
