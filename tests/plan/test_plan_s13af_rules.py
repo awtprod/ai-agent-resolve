@@ -1,5 +1,5 @@
-"""S13a-f validator follow-ups: the BRAW input-colour-space rule (F2), the plan version (F1) and
-blank text lines (F5)."""
+"""S13a-f validator follow-ups: the BRAW input-colour-space rule (F2), the plan version (F1),
+blank text lines (F5), what the cut rules count (F3) and the Head fade note (F6)."""
 
 from __future__ import annotations
 
@@ -278,3 +278,79 @@ def test_no_fixture_plan_has_a_blank_text_line() -> None:
             for line in item["lines"]
         ]
         assert all(line.strip() for line in texts), path.name
+
+
+# --- F3: the cut rules see same-track joins only ----------------------------------------------
+
+DESIGN = FIXTURES.parents[2] / "docs" / "DESIGN.md"
+
+#: The rules built on joins (neighbouring segments on one track), and the one that hints with them.
+JOIN_RULES = (
+    "cut-density",
+    "no-same-camera-jump",
+    "timejump-close-to-wide",
+    "audio-crossfade",
+    "min-shot",
+)
+
+
+def three_segments_two_cuts(data: PlanData) -> PlanData:
+    """Track 1 only: segments of 250, 100 and 100 frames at 25 fps, cuts at 10 s and 14 s."""
+    data["fps"] = 25
+    data["transitions"] = []
+    data["segments"] = [
+        {"source": "cam-a", "src_in": 1000, "src_out": 1250},
+        {"source": "cam-a", "src_in": 1350, "src_out": 1450},
+        {"source": "cam-a", "src_in": 1550, "src_out": 1650},
+    ]
+    return data
+
+
+def join_findings(report: LintReport) -> list[tuple[str, str, str]]:
+    return [(f.rule, f.severity, f.message) for f in report.findings if f.rule in JOIN_RULES]
+
+
+def test_the_design_doc_says_the_cut_rules_consider_same_track_joins_only() -> None:
+    text = DESIGN.read_text(encoding="utf-8")
+    [line] = [x for x in text.splitlines() if x.startswith("The join-based cut rules")]
+    for rule_id in JOIN_RULES:
+        assert f"`{rule_id}`" in line
+    assert "same-track joins only" in line
+    assert "overlay entry" in line
+    assert "cut into the outro" in line
+
+
+def test_an_overlay_entry_on_another_track_is_not_a_cut(
+    clean_data: PlanData, run_lint: RunLint
+) -> None:
+    base = three_segments_two_cuts(clean_data)
+    before = join_findings(run_lint(base))
+    # Two cuts in 10 s is the most the profile allows, so a third would warn.
+    assert not [f for f in before if f[0] == "cut-density"]
+    clean_data["segments"].append(
+        {"track": 2, "source": "cam-a", "src_in": 5000, "src_out": 5100, "record_in": 400}
+    )
+    plan = EditPlan.model_validate(clean_data)
+    assert plan.joins() == [(0, 1), (1, 2)]
+    assert join_findings(run_lint(clean_data)) == before
+
+
+def test_the_same_segment_on_the_main_track_is_a_cut(
+    clean_data: PlanData, run_lint: RunLint
+) -> None:
+    """The control for the overlay test: on track 1 it is a third cut, and it is counted."""
+    three_segments_two_cuts(clean_data)
+    clean_data["segments"].append({"source": "cam-a", "src_in": 5000, "src_out": 5100})
+    [finding] = only(run_lint(clean_data), "cut-density")
+    assert finding.message.startswith("3 cuts in ")
+
+
+def test_the_cut_into_the_outro_is_not_a_cut(clean_data: PlanData, run_lint: RunLint) -> None:
+    three_segments_two_cuts(clean_data)
+    before = join_findings(run_lint(clean_data))
+    clean_data["version"] = 2
+    clean_data["sources"].append({"id": "outro", "media": "media/outro.mov", "duration": 302})
+    # A 10-frame outro (0.4 s) is shorter than min-shot allows and follows the 2nd cut by 4 s.
+    clean_data["outro"] = {"source": "outro", "src_out": 10}
+    assert EditPlan.model_validate(clean_data).outro_range() == (450, 460)
+    assert join_findings(run_lint(clean_data)) == before
