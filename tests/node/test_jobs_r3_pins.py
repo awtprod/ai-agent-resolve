@@ -677,3 +677,106 @@ def test_added_job_missing_from_the_queue_is_not_trusted(tmp_path: Path) -> None
     view = world.runner.get(job_id)
     assert view.state == "failed" and view.error["code"] == "add_render_job_unverified"
     assert [c for c in world.fake.calls if c[0] == "StartRendering"] == []
+
+
+# -- fourth batch -------------------------------------------------------------------------------
+
+
+def test_a_single_hung_op_hits_the_step_deadline(tmp_path: Path) -> None:
+    """Kills N11 (running does not anchor the step deadline): the countdown starts when the
+    job starts running, so one hung op with a huge op timeout still stalls on the step."""
+    world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1e6)), drain_budget=0.5)
+    steps = [{"op": "markers.add", "params": {"markers": [{"frame": 1}]}, "timeout": 30.0}]
+    job_id = world.runner.submit("ops.sequence", {"steps": steps}, world.locator())
+    entered, release = _hung_marker(world)
+    try:
+        world.runner.pump()  # submits the op: running, countdown starts
+        world.runner.pump()  # the drain runs it; it hangs
+        assert entered.wait(WAIT)
+        world.clock.advance(35.0)
+        world.runner.pump()
+        view = world.runner.get(job_id)
+        assert view.state == "stalled" and view.stall["code"] == "watchdog_step_timeout"
+    finally:
+        release.set()
+    assert world.runner.wait_drain(WAIT)
+
+
+def test_next_step_gets_its_own_deadline(tmp_path: Path) -> None:
+    """Kills P-R21 (the next step keeps the previous step's anchor)."""
+    world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1e6)))
+    steps = [
+        {"op": "markers.add", "params": {"markers": [{"frame": f}]}, "timeout": 100.0}
+        for f in (1, 2)
+    ]
+    job_id = world.runner.submit("ops.sequence", {"steps": steps}, world.locator())
+    world.runner.pump()  # step 0's op submitted
+    world.clock.advance(80.0)  # step 0 takes 80 s of its 100
+    world.runner.pump()  # step 0 completes; step 1 starts its own 100 s
+    assert world.store.get(job_id).current_step == 1
+    world.clock.advance(30.0)
+    world.runner.pump()
+    assert world.runner.get(job_id).state in ("running", "succeeded")
+    world.runner.run_until_settled()
+    assert world.runner.get(job_id).state == "succeeded"
+
+
+def test_higher_priority_render_takes_the_render_slot_first(tmp_path: Path) -> None:
+    """Kills R29/R29' (job priority order inverted)."""
+    world = JobWorld(tmp_path)
+    low = world.runner.submit("render", _render_params(world, custom_name="low"), world.locator())
+    world.clock.advance(1.0)
+    high = world.runner.submit(
+        "render",
+        _render_params(world, timeline=world.ref("Main [agent]"), custom_name="high"),
+        world.locator(),
+        priority=5,
+    )
+    world.runner.pump()
+    assert world.runner.get(high).state == "running"
+    assert world.runner.get(low).state == "queued"
+
+
+def test_render_slot_survives_a_restart(tmp_path: Path) -> None:
+    """Kills N19 (render slot not restored on load): after a restart mid-render, a queued
+    render of the same project -- even one with a higher priority -- waits for the slot."""
+    world = JobWorld(tmp_path)
+    world.project.render_complete_after = 6
+    first = world.runner.submit("render", _render_params(world), world.locator())
+    for _ in range(4):
+        world.runner.pump()
+    assert world.store.get(first).cursor.get("phase") == "poll"
+    world.clock.advance(1.0)
+    second = world.runner.submit(
+        "render",
+        _render_params(world, timeline=world.ref("Main [agent]"), custom_name="b"),
+        world.locator(),
+        priority=5,
+    )
+    runner = world.restart()
+    runner.pump()
+    assert runner.get(second).state == "queued"  # not building while the first renders
+    runner.run_until_settled()
+    assert runner.get(first).state == runner.get(second).state == "succeeded"
+
+
+def test_render_is_started_non_interactively(tmp_path: Path) -> None:
+    """Kills B17b/P-O11 (StartRendering in interactive mode, which can raise modal dialogs)."""
+    world = JobWorld(tmp_path)
+    world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.run_until_settled()
+    starts = [c for c in world.fake.calls if c[0] == "StartRendering"]
+    assert len(starts) == 1 and starts[0][2] is False
+
+
+def test_non_finite_render_timeout_is_refused_at_submit(tmp_path: Path) -> None:
+    """Kills D17 (non-finite render timeout accepted)."""
+    import pytest
+
+    world = JobWorld(tmp_path)
+    for bad in (float("inf"), float("nan")):
+        with pytest.raises(ValueError):
+            world.runner.submit(
+                "render", _render_params(world, timeout_seconds=bad), world.locator()
+            )
+    assert world.runner.list() == []
