@@ -133,12 +133,14 @@ class ProjectBoard:
     as_of: str
     skipped: tuple[SkippedEvent, ...] = ()
     superseded: tuple[SupersededFeed, ...] = ()
+    stale: bool = False
+    """The lease board's own verdict (:attr:`aar.hub.leaseboard.LeaseBoard.stale`)."""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "project_id": self.project_id,
             "as_of": self.as_of,
-            "stale": bool(self.gaps or self.superseded),
+            "stale": self.stale,
             "leases": [lease.to_dict() for lease in self.leases],
             "presence": [entry.to_dict() for entry in self.presence],
             "gaps": [gap.to_dict() for gap in self.gaps],
@@ -172,6 +174,7 @@ def project_board(log: EventLog, project_id: str, *, clock: Clock = utcnow) -> P
         board.as_of,
         board.skipped,
         board.superseded,
+        board.stale,
     )
 
 

@@ -735,3 +735,32 @@ def test_a_hand_written_re_claim_never_brings_back_a_replaced_process(tmp_path: 
     board = lease_board(log, clock=_at(clock))
     assert [lease.holder_id for lease in board.leases] == ["B"]
     assert any("already admitted" in item.reason for item in board.skipped)
+
+
+def test_a_refused_second_process_shows_as_stale_on_every_view(tmp_path: Path) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    clock = FakeClock()
+    transport = EventLogTransport(log, clock=_at(clock, 5))
+    fa, _ = _wired(log, transport, clock)
+    fa.flush()
+    fb, _ = _wired(log, transport, clock)
+    fb.flush()
+    fa._reconcile_pending = True  # A has something to say again
+    assert fa.flush().stopped
+    assert lease_board(log, clock=_at(clock, 5)).stale is True
+    assert project_board(log, "P", clock=_at(clock, 5)).to_dict()["stale"] is True
+    page = _console_leases(log, tmp_path, clock)
+    assert "This view may be stale" in page and "a second feed process" in page
+    data = _mcp_lease_board(log, tmp_path, clock)
+    assert data["stale"] is True and [s["nonce"] for s in data["superseded"]] == [fa.nonce]
+
+
+def test_a_late_older_gap_never_replaces_the_newer_gaps_count(tmp_path: Path) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    stamp = {"nonce": "a" * 16}
+    gap = {"node_id": NODE, "at": "2027-01-15T14:00:00+00:00"}
+    newer = HubEventSpec("feed.gap", {**gap, "dropped": 3, "feed": {**stamp, "seq": 9}}, "g3")
+    older = HubEventSpec("feed.gap", {**gap, "dropped": 1, "feed": {**stamp, "seq": 4}}, "g1")
+    deliver_feed_event(log, newer, NODE)
+    deliver_feed_event(log, older, NODE)  # lands late
+    assert [g.dropped for g in lease_board(log).gaps] == [3]
