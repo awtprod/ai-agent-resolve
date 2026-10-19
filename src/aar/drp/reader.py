@@ -255,6 +255,8 @@ class _Reader:
         # first one's offset, then report it with a single issue at the end (not one per member).
         self.scan_refused = 0
         self.scan_first: Provenance | None = None
+        # How many of those got no root at all: the budget ran out before their first element.
+        self.scan_unread = 0
         self.member_sizes: dict[str, int] = {}
         # Issues kept per code; the rest are counted and summarised as issues-truncated.
         self.issue_counts: Counter[str] = Counter()
@@ -456,7 +458,7 @@ class _Reader:
             )
         if self.scan_refused:
             self.issue(
-                "warning",
+                "error" if self.scan_unread else "warning",
                 "scan-budget-exceeded",
                 f"{self.scan_refused} member(s) not fully read: the file's element budget of "
                 f"{self.max_elements} was used up",
@@ -524,7 +526,13 @@ class _Reader:
             where = Provenance(name, si.offset, si.offset, "offset")
             self.issue("warning", f"scan-{si.code}", si.message, where)
         if doc.root is None:
-            self.issue("error", "empty-member", f"{name} has no root element")
+            if doc.stopped_at is None:
+                self.issue("error", "empty-member", f"{name} has no root element")
+            else:
+                # Not an empty file: the shared element budget ran out before this member's
+                # first element. It is named for the budget (one summary issue, below), which
+                # is an error when a member was left with nothing, so the refusal is unchanged.
+                self.scan_unread += 1
 
     def _versions(self, members: list[MemberSummary]) -> VersionInfo | None:
         found = {}
