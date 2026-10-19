@@ -66,8 +66,8 @@ def _human_world(tmp_path: Path, **kwargs: object) -> JobWorld:
     return JobWorld(tmp_path, own_timelines=False, **kwargs)  # type: ignore[arg-type]
 
 
-def _op_grant(world: JobWorld, op: str, project: str = "Show") -> str:
-    target = op_approval_target(world.pid(project), op)
+def _op_grant(world: JobWorld, op: str, project: str = "Show", step: int = 0) -> str:
+    target = op_approval_target(world.pid(project), op, step)
     return grant(
         world.log, ApprovalScope.PROJECT_WRITE, target, 3600, f"let {op} run", HUMAN
     ).token_id
@@ -85,7 +85,7 @@ def test_p1_human_timeline_edit_waits_for_an_approval_in_a_sandbox_project(tmp_p
     view = world.runner.get(job_id)
     assert view.state == "waiting" and view.waiting["kind"] == "needs_approval"
     detail = view.waiting["detail"]
-    assert detail["target"] == f"{world.pid()}#op:markers.add"
+    assert detail["target"] == f"{world.pid()}#op:markers.add#step:0"
     assert detail["op"] == "markers.add" and detail["guard"]["code"] == "not_an_agent_branch"
     assert world.main.markers == {} and content_writes(world.fake) == []
     assert world.broker.pending() == []  # never queued
@@ -141,25 +141,28 @@ def test_p4_an_approval_naming_the_op_lets_it_run_once_and_is_audited(tmp_path: 
     consumed = world.log.read(types=["approval.consumed"])
     assert len(consumed) == 1  # the hub audit: one consume, by the job's agent, for this job
     assert consumed[0].actor == Actor("agent", f"{AGENT_ID}#{job_id}")
-    assert consumed[0].payload["target"] == f"{world.pid()}#op:markers.add"
+    assert consumed[0].payload["target"] == f"{world.pid()}#op:markers.add#step:0"
     overrides = [e for e in view.events if e["kind"] == "guard_override"]
     assert len(overrides) == 1 and overrides[0]["data"]["token_id"] == token
     assert view.approvals == {"op:0/0:markers.add/markers.add": token}
 
 
-@pytest.mark.parametrize("which", ["project", "other-op", "other-project"])
+@pytest.mark.parametrize("which", ["project", "other-op", "other-step", "other-project"])
 def test_p4_an_approval_for_anything_else_is_refused(tmp_path: Path, which: str) -> None:
-    """Only a token on exactly ``<project>#op:<op>`` lifts the guard: a plain project.write
-    (the F15 production target), one naming another op, or another project's, is refused."""
+    """Only a token on exactly ``<project>#op:<op>#step:<n>`` lifts the guard: a plain
+    project.write (the F15 production target), one naming another op, another step, or
+    another project, is refused."""
     world = _human_world(tmp_path)
     job_id = world.submit("ops.sequence", _marker_job(100), world.locator())
     world.runner.run_until_settled()
     if which == "project":
         target = world.pid()
     elif which == "other-op":
-        target = op_approval_target(world.pid(), "timeline.duplicate")
+        target = op_approval_target(world.pid(), "timeline.duplicate", 0)
+    elif which == "other-step":
+        target = op_approval_target(world.pid(), "markers.add", 1)
     else:
-        target = op_approval_target(world.pid("Other"), "markers.add")
+        target = op_approval_target(world.pid("Other"), "markers.add", 0)
     token = grant(world.log, ApprovalScope.PROJECT_WRITE, target, 3600, "wrong", HUMAN)
     world.runner.approve(job_id, token.token_id, HUMAN)
     world.runner.run_until_settled()
@@ -178,11 +181,16 @@ def test_p4_each_guarded_op_needs_its_own_approval(tmp_path: Path) -> None:
     view = world.runner.get(job_id)
     assert sorted(world.main.markers) == [100]
     assert view.state == "waiting" and view.current_step == 1
-    world.runner.approve(job_id, _op_grant(world, "markers.add"), HUMAN)
+    # The spent token is not offered again: step 1 asks afresh, for its own step.
+    assert "refused_code" not in view.waiting["detail"]
+    assert view.waiting["detail"]["target"] == f"{world.pid()}#op:markers.add#step:1"
+    assert view.approval_token is None
+    world.runner.approve(job_id, _op_grant(world, "markers.add", step=1), HUMAN)
     world.runner.run_until_settled()
     assert world.runner.get(job_id).state == "succeeded"
     assert sorted(world.main.markers) == [100, 200]
     assert len(world.log.read(types=["approval.consumed"])) == 2
+    assert world.log.read(types=["approval.consume_refused"]) == []
 
 
 def test_p4_a_consumed_override_survives_a_restart_and_is_not_consumed_again(
@@ -245,6 +253,48 @@ def _code_lines(path: Path) -> list[str]:
                 hi = c1 if r == r1 else len(row)
                 row[lo:hi] = [" "] * (hi - lo)
     return ["".join(row) for row in out]
+
+
+def test_p4_a_consumed_approval_moved_to_another_step_is_not_trusted(tmp_path: Path) -> None:
+    """A store row that re-files step 0's (genuinely consumed) token under step 1 does not
+    verify: the hub's consume names step 0's target, so step 1 still waits."""
+    world = _human_world(tmp_path)
+    job_id = world.submit("ops.sequence", _marker_job(100, 200), world.locator())
+    world.runner.run_until_settled()
+    token = _op_grant(world, "markers.add")
+    world.runner.approve(job_id, token, HUMAN)
+    world.runner.run_until_settled()
+    assert world.runner.get(job_id).current_step == 1
+    world.runtime.close()
+    world.store.close()
+    conn = sqlite3.connect(world.db_path)
+    keys = '{"op:0/0:markers.add/markers.add": "%s", "op:1/1:markers.add/markers.add": "%s"}'
+    conn.execute("UPDATE jobs SET approvals=? WHERE job_id=?", (keys % (token, token), job_id))
+    conn.commit()
+    conn.close()
+    world.store = JobStore(world.db_path)
+    runner = world.restart()
+    runner.run_until_settled()
+    view = runner.get(job_id)
+    assert view.state == "waiting" and sorted(world.main.markers) == [100]
+    assert list(view.approvals) == ["op:0/0:markers.add/markers.add"]
+
+
+def test_p3_a_guard_exemption_needs_a_mutating_op_and_a_stated_reason() -> None:
+    from pydantic import BaseModel
+
+    from aar.node.ops.framework import OpModel, op
+
+    class P(OpModel):
+        pass
+
+    class R(BaseModel):
+        pass
+
+    for mutates, reason in ((True, ""), (True, "   "), (False, "a reason")):
+        with pytest.raises(ValueError, match="exemption"):
+            op("test.never_registered", params=P, result=R, mutates=mutates, guard_exemption=reason)
+    assert "test.never_registered" not in {s.name for s in list_ops()}
 
 
 def _require_branch_keywords() -> list[tuple[str, str, str]]:

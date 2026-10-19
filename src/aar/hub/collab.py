@@ -29,7 +29,7 @@ and these recorders. The wiring it does (tested in ``tests/node/test_s7_s11_inte
    never an op holder.
 3. The branch guard is on for every op, in every project, production or not. An op it
    refuses (shared project state, a human's timeline) waits for a ``project.write``
-   approval on target ``<Resolve project id>#op:<op name>``
+   approval on target ``<Resolve project id>#op:<op name>#step:<n>``
    (:func:`aar.node.jobs.runner.op_approval_target`); the job consumes it (audited as
    ``agent:<agent id>#<job id>``), then builds that one op with ``require_branch=False``,
    the only production path to it. The render ops carry a named ``guard_exemption``: they

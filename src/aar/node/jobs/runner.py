@@ -380,11 +380,13 @@ class JobRunner:
     @staticmethod
     def _approval_target(record: JobRecord, key: str) -> str:
         """The exact ``project.write`` target an approval key needs: the project id for the
-        F15 approval, ``<project id>#op:<op>`` for an override that names one op (P4)."""
+        F15 approval, ``<project id>#op:<op>#step:<n>`` for an override that names one op of
+        one step (P4)."""
         project = record.target.project_id or ""
         if key == _PROJECT_APPROVAL:
             return project
-        return op_approval_target(project, key.rsplit("/", 1)[-1])
+        step, _, op = key.removeprefix("op:").partition("/")
+        return op_approval_target(project, op.rsplit("/", 1)[-1], int(step))
 
     def _consume_verified(self, record: JobRecord, token_id: str | None, key: str) -> bool:
         """Whether the hub shows ``token_id`` consumed by THIS job, for the key's target."""
@@ -1592,10 +1594,12 @@ class _Empty(BaseModel):
     """A placeholder params model for a quarantined job (it never runs)."""
 
 
-def op_approval_target(project_id: str, op: str) -> str:
-    """The ``project.write`` approval target that lets op ``op`` past the branch guard in
-    project ``project_id`` (P4): a human grants exactly this to approve exactly this op."""
-    return f"{project_id}#op:{op}"
+def op_approval_target(project_id: str, op: str, step: int) -> str:
+    """The ``project.write`` approval target that lets op ``op`` of step ``step`` past the
+    branch guard in project ``project_id`` (P4): a human grants exactly this to approve exactly
+    this op. The step is part of it so a consumed token can only ever back the op occurrence it
+    was granted for: a store row that moves it to another step no longer verifies."""
+    return f"{project_id}#op:{op}#step:{step}"
 
 
 def _override_key(job: JobRecord, action: Submit) -> str:
