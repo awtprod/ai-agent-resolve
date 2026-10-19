@@ -244,6 +244,22 @@ def test_partial_blob_files_refuse_while_their_clean_siblings_edit(tmp_path: Pat
     print(f"s8-partial refused={len(partial)} clean-sibling=written")
 
 
+@needs_corpus
+def test_input_has_warnings_excludes_16_of_the_64_corpus_files(tmp_path: Path) -> None:
+    """docs/DESIGN.md (Modify, S8) states these numbers."""
+    spec = parse_plan(
+        json.dumps({"edits": [{"op": "rename", "target": "project", "new_name": "x"}]})
+    )
+    refused, codes = 0, Counter()
+    for i, p in enumerate(FILES):
+        outcome = edit_file(p, spec, tmp_path / f"{i:03d}.drp", dry_run=True)
+        if "input-has-warnings" in {r.code for r in outcome.refusals}:
+            refused += 1
+            codes.update(outcome.refusals[0].details["codes"])
+    assert (len(FILES), refused, dict(codes)) == (64, 16, {"blob-partial": 16})
+    print(f"s8b-warnings files={len(FILES)} refused={refused} codes={dict(codes)}")
+
+
 def _pair_002_003() -> tuple[Path, Path]:
     a, b = FILES[2], FILES[3]
     va, vb = read_drp(a).versions, read_drp(b).versions

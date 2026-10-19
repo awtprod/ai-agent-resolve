@@ -5,7 +5,8 @@ tests (decode -> encode is the identity on every corpus blob of that kind):
 
 * protobuf: :func:`varint`, :func:`pb_key`, :func:`pb_len`, :func:`replace_field`
 * message envelope ``[u32 version][u32 length][codec][payload]``: :func:`envelope`
-* zstd frames made of raw blocks only: :func:`zstd_raw_frame`. Resolve itself writes raw-block
+* zstd frames made of raw blocks only: :func:`zstd_raw_frame`; an original payload must be
+  exactly one frame (:func:`check_single_frame`). Resolve itself writes raw-block
   frames for small payloads; any conforming zstd decoder reads them. Writing raw blocks keeps the
   writer stdlib-only and its output deterministic (no compressor version in the loop).
 * keyed dict byte-array values: :func:`replace_kd_bytes`
@@ -21,10 +22,12 @@ import re
 import struct
 
 from aar.drp import blobs
-from aar.drp.errors import DrpError
+from aar.drp.errors import BlobError, DrpError
 
 __all__ = [
     "EncodeError",
+    "check_envelope_payload",
+    "check_single_frame",
     "check_text",
     "envelope",
     "hex_like",
@@ -132,6 +135,60 @@ def zstd_raw_frame(payload: bytes) -> bytes:
             return bytes(out)
 
 
+def check_single_frame(frame: bytes) -> int:
+    """``len(frame)`` when ``frame`` is exactly one zstd frame; raises :class:`EncodeError` else.
+
+    The frame is walked by its block headers (no decompression): raw blocks carry their size,
+    RLE blocks one byte, compressed blocks their compressed size, then the optional checksum.
+    A second frame, a skippable frame, trailing bytes, a dictionary or a reserved bit or block
+    type are refused. Decoders differ on what follows a first frame (``zstandard`` reads on into
+    the next frame, the stdlib-only path stops after the first), so a re-encode of such a
+    payload would change or drop data that the gate cannot see.
+    """
+    if len(frame) < 6 or frame[:4] != ZSTD_MAGIC:
+        raise EncodeError("not a zstd frame (magic 28b52ffd missing)")
+    fhd = frame[4]
+    if fhd & 0x08:
+        raise EncodeError("the zstd frame header has its reserved bit set")
+    if fhd & 0x03:
+        raise EncodeError("the zstd frame uses a dictionary")
+    try:
+        off, _ = blobs._frame_header(frame)
+    except BlobError as exc:
+        raise EncodeError(f"truncated zstd frame header: {exc}") from exc
+    while True:
+        if off + 3 > len(frame):
+            raise EncodeError("truncated zstd block header")
+        header = int.from_bytes(frame[off : off + 3], "little")
+        off += 3
+        last, btype, bsize = header & 1, (header >> 1) & 3, header >> 3
+        if btype == 3:
+            raise EncodeError("a zstd block has the reserved block type")
+        off += 1 if btype == 1 else bsize
+        if off > len(frame):
+            raise EncodeError("truncated zstd block")
+        if last:
+            break
+    if fhd & 0x04:
+        off += 4
+        if off > len(frame):
+            raise EncodeError("truncated zstd checksum")
+    if off != len(frame):
+        raise EncodeError(f"{len(frame) - off} trailing byte(s) after the first zstd frame")
+    return off
+
+
+def check_envelope_payload(original: bytes) -> None:
+    """Refuse an envelope whose zstd payload is not exactly one zstd frame."""
+    env = blobs.parse_envelope(original)
+    if env is None or env.codec != "zstd":
+        return
+    try:
+        check_single_frame(env.payload)
+    except EncodeError as exc:
+        raise EncodeError(f"the blob's payload must be exactly one zstd frame: {exc}") from exc
+
+
 def envelope(original: bytes, payload: bytes) -> bytes:
     """Re-frame ``payload`` (protobuf bytes) with the framing of the ``original`` blob.
 
@@ -142,6 +199,7 @@ def envelope(original: bytes, payload: bytes) -> bytes:
     env = blobs.parse_envelope(original)
     if env is None:
         raise EncodeError("the original blob is not an envelope")
+    check_envelope_payload(original)
     if env.codec == "zstd":
         body = bytes([blobs.CODEC_ZSTD]) + zstd_raw_frame(payload)
     elif env.codec == "protobuf":

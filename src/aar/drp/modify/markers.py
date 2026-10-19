@@ -20,12 +20,20 @@ from dataclasses import dataclass
 from typing import Any
 
 from aar.drp import blobs
+from aar.drp.diff_opaque import _marker_entry_residue
 from aar.drp.modify import encode
 from aar.drp.modify.encode import EncodeError
 from aar.drp.reader import MARKER_COLORS
 from aar.drp.scan import parse_int
 
-__all__ = ["COLOR_BITS", "DEFAULT_BODY_VERSION", "MarkerEntry", "MarkerList", "props"]
+__all__ = [
+    "COLOR_BITS",
+    "DEFAULT_BODY_VERSION",
+    "MarkerEntry",
+    "MarkerList",
+    "props",
+    "undecoded_part",
+]
 
 COLOR_BITS = {name: bit for bit, name in MARKER_COLORS.items()}
 # Every marker body in the corpus (57 of 57, Resolve 19-21) has version 2.
@@ -57,6 +65,10 @@ class MarkerEntry:
     raw: bytes
     values: dict[str, Any]
     body_version: int
+    odd: tuple[Any, ...] | None = None
+    """What the S2 diff keeps of this entry beyond its decoded values (undecoded fields,
+    non-standard spellings), or ``None`` when it holds nothing else. The gate compares it raw,
+    so an edit must leave it as it is."""
 
     @classmethod
     def decode(cls, raw: bytes) -> MarkerEntry:
@@ -89,7 +101,7 @@ class MarkerEntry:
             if custom is not None and isinstance(custom.value, bytes)
             else "",
         )
-        return cls(raw, values, env.version)
+        return cls(raw, values, env.version, undecoded_part(raw))
 
     @classmethod
     def new(cls, values: dict[str, Any], body_version: int) -> MarkerEntry:
@@ -130,7 +142,19 @@ class MarkerEntry:
             raw = encode.replace_field(raw, frame, changes["frame"])
         values = dict(self.values)
         values.update(changes)
-        return MarkerEntry(raw, values, self.body_version)
+        return MarkerEntry(raw, values, self.body_version, undecoded_part(raw))
+
+
+def undecoded_part(raw: bytes) -> tuple[Any, ...] | None:
+    """The part of a marker entry the gate compares raw (see :attr:`MarkerEntry.odd`).
+
+    Uses the diff's own residue (``aar.drp.diff_opaque``), so the modify path refuses exactly
+    what the post-write gate would.
+    """
+    [entry] = blobs.decode_protobuf(encode.pb_len(1, raw), nested_depth=0)
+    residue = _marker_entry_residue(entry)
+    rest_entry, _strings, _version, _codec, rest_inner, rest_detail, noncanonical = residue
+    return residue if rest_entry or rest_inner or rest_detail or noncanonical else None
 
 
 def _update_detail(detail: bytes, changes: dict[str, Any]) -> bytes:
@@ -183,6 +207,7 @@ class MarkerList:
         blob_data = entry.value
         if blobs.parse_envelope(blob_data) is None:
             raise EncodeError("BlobData is not an envelope")
+        encode.check_envelope_payload(blob_data)
         payload = blobs.unwrap_message(blob_data, budget=budget)
         top = blobs.decode_protobuf(payload, nested_depth=0)
         if len(top) != 1 or top[0].number != 2 or not isinstance(top[0].value, bytes):

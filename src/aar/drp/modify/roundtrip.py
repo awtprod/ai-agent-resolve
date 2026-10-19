@@ -21,6 +21,7 @@ save date such as ``Jan 19 2026 00:17:51``) once both are decompressed; the rest
 from __future__ import annotations
 
 import re
+import struct
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -33,6 +34,8 @@ from aar.drp.diff import diff_projects
 from aar.drp.diff_model import Change, ProjectDiff
 from aar.drp.errors import BlobError, ContainerError, DrpError
 from aar.drp.model import Provenance
+from aar.drp.modify import encode
+from aar.drp.modify.encode import EncodeError
 from aar.drp.modify.engine import Expected, Refusal, change_key
 from aar.drp.reader import read_drp
 
@@ -77,13 +80,16 @@ ROUND_TRIP_ALLOW_LIST: tuple[AllowRule, ...] = (
     AllowRule(
         "settings-save-date",
         "SetupBA field 124 in project <CommonConfig>/<SM_Config>/<FieldsBlob>",
-        "keyed dicts equal except SetupBA; SetupBA envelopes have the same version and codec; "
-        "decompressed protobuf fields equal except field 124, a date string on both sides",
+        "keyed-dict header, count and every entry byte-equal except SetupBA's value (its key, "
+        "type and null flag equal too); SetupBA envelopes have the same version and codec; "
+        "decompressed protobuf fields byte-equal except field 124, a canonically written date "
+        "string on both sides",
     ),
     AllowRule(
         "bin-save-stamp",
         "field 4 of a bin's own <FieldsBlob>",
-        "both are protobuf envelopes of the same version; fields equal except varint field 4",
+        "both are protobuf envelopes of the same version; fields byte-equal except varint "
+        "field 4, written canonically on both sides",
     ),
 )
 
@@ -173,8 +179,19 @@ def _hex(c: Change, raw: _Raw) -> tuple[bytes, bytes] | None:
         return None
 
 
-def _fields(payload: bytes) -> list[tuple[int, int, Any]]:
-    return [(f.number, f.wire, f.value) for f in blobs.decode_protobuf(payload, nested_depth=0)]
+def _fields(payload: bytes) -> list[tuple[int, int, Any, bytes]]:
+    """(number, wire, value, encoded bytes) of each field: rules compare the encoded bytes, so a
+    re-spelled field (a padded varint, a longer length prefix) is not taken for an equal one."""
+    return [
+        (f.number, f.wire, f.value, payload[f.offset : f.end])
+        for f in blobs.decode_protobuf(payload, nested_depth=0)
+    ]
+
+
+def _entry_head(data: bytes, e: blobs.KdEntry) -> bytes:
+    """A keyed-dict entry's key, value type and null flag: everything before its value."""
+    (klen,) = struct.unpack_from(">I", data, e.offset)
+    return data[e.offset : e.offset + 4 + klen + 5]
 
 
 def _settings_date(c: Change, raw: _Raw) -> bool:
@@ -183,6 +200,9 @@ def _settings_date(c: Change, raw: _Raw) -> bool:
         return False
     try:
         kds = [blobs.decode_keyed_dict(x, strict=True) for x in pair]
+        # The header word and the entry count, then entry by entry.
+        if pair[0][:8] != pair[1][:8]:
+            return False
         if [e.key for e in kds[0].entries] != [e.key for e in kds[1].entries]:
             return False
         for ea, eb in zip(kds[0].entries, kds[1].entries, strict=True):
@@ -190,32 +210,30 @@ def _settings_date(c: Change, raw: _Raw) -> bool:
                 if pair[0][ea.offset : ea.end] != pair[1][eb.offset : eb.end]:
                     return False
                 continue
+            if _entry_head(pair[0], ea) != _entry_head(pair[1], eb):
+                return False  # the SetupBA key, its value type or its null flag changed
             if not isinstance(ea.value, bytes) or not isinstance(eb.value, bytes):
                 return False
             env_a, env_b = blobs.parse_envelope(ea.value), blobs.parse_envelope(eb.value)
-            if (
-                env_a is None
-                or env_b is None
-                or (env_a.version, env_a.codec)
-                != (
-                    env_b.version,
-                    env_b.codec,
-                )
-            ):
+            if env_a is None or env_b is None:
+                return False
+            if (env_a.version, env_a.codec) != (env_b.version, env_b.codec):
                 return False
             fa = _fields(blobs.unwrap_message(ea.value))
             fb = _fields(blobs.unwrap_message(eb.value))
             if len(fa) != len(fb):
                 return False
             for x, y in zip(fa, fb, strict=True):
-                if x == y:
+                if x[3] == y[3]:
                     continue
                 if x[:2] != (124, 2) or y[:2] != (124, 2):
                     return False
                 if not all(_SAVE_DATE.match(v.decode("ascii")) for v in (x[2], y[2])):
                     return False
+                if encode.pb_len(124, x[2]) != x[3] or encode.pb_len(124, y[2]) != y[3]:
+                    return False  # the date's own field must be written canonically
         return "SetupBA" in {e.key for e in kds[0].entries}
-    except (BlobError, UnicodeDecodeError):
+    except (BlobError, EncodeError, UnicodeDecodeError, struct.error):
         return False
 
 
@@ -235,7 +253,14 @@ def _bin_stamp(c: Change, raw: _Raw) -> bool:
         return False
     if len(fa) != len(fb):
         return False
-    return all(x == y or (x[:2] == y[:2] == (4, 0)) for x, y in zip(fa, fb, strict=True))
+    for x, y in zip(fa, fb, strict=True):
+        if x[3] == y[3]:
+            continue
+        if x[:2] != (4, 0) or y[:2] != (4, 0):
+            return False
+        if encode.pb_varint(4, x[2]) != x[3] or encode.pb_varint(4, y[2]) != y[3]:
+            return False
+    return True
 
 
 def _rule_for(c: Change, raw: _Raw) -> str | None:

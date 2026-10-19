@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import struct
+from typing import Any
 
 import pytest
 
@@ -61,3 +63,19 @@ def zstd_raw_frame(payload: bytes) -> bytes:
 def envelope(version: int, codec: int, payload: bytes) -> bytes:
     body = bytes([codec]) + payload
     return struct.pack(">II", version, len(body)) + body
+
+
+class UnseekableSink(io.RawIOBase):
+    """A write-only stream that cannot seek, so :mod:`zipfile` writes a data descriptor after
+    each member (as Resolve's exports have)."""
+
+    def __init__(self) -> None:
+        self.buf = bytearray()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, b: Any) -> int:
+        data = bytes(b)
+        self.buf += data
+        return len(data)

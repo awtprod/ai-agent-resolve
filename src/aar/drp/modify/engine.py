@@ -57,6 +57,12 @@ _INFO_TAGS = frozenset({"BtVideoInfo", "BtAudioInfo"})
 _INFO_SKIP = frozenset({"Sequence", "TimelineSharedHandle"})
 _CARRIERS = {"timeline": "Sm2SequenceLockableBlob", "item": "Sm2TiItemLockableBlob"}
 _TAG = re.compile(rb"^<([^\s/>]+)")
+PATH_MAP_SCOPE = (
+    "maps media pool Clip blob paths and timeline item <MediaFilePath> text only; paths "
+    "elsewhere stay as they are: project settings in project.xml (the SM_Config settings blob, "
+    "e.g. cache and capture locations), gallery stills (stills/*.xml <GalleryPath>), proxy and "
+    "render-cache locations, and anything inside blobs the reader does not decode"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +257,10 @@ def _one(objs: Sequence[T], match: Callable[[T], bool], what: str, sel: str, edi
     return found[0]
 
 
+class _Unchanged(Exception):
+    """A rename to the name the object already has: nothing to write (internal)."""
+
+
 class _Refuse(Exception):
     def __init__(self, code: str, message: str, edit: int, **details: Any) -> None:
         super().__init__(message)
@@ -346,6 +356,26 @@ class _Planner:
             encode.check_text(e.new_name, "new_name", max_chars=MAX_NAME)
         except EncodeError as exc:
             raise _Refuse("bad-value", str(exc), i) from exc
+        try:
+            old = self._rename_target(i, e)
+        except _Unchanged:
+            self.report.append(
+                {
+                    "edit": i,
+                    "op": "rename",
+                    "target": e.target,
+                    "old": e.new_name,
+                    "new": e.new_name,
+                    "unchanged": True,
+                }
+            )
+            return
+        self.report.append(
+            {"edit": i, "op": "rename", "target": e.target, "old": old, "new": e.new_name}
+        )
+
+    def _rename_target(self, i: int, e: Rename) -> str | None:
+        """Splice the new name and expect the change; returns the old name."""
         sel = f"with DbId {e.id}" if e.id is not None else f"named {e.name!r}"
         drp = self.drp
         old: str | None
@@ -387,16 +417,17 @@ class _Planner:
             self._check_old(i, e, old)
             self._name_splice(i, item.spans.get("name"), e.new_name, f"item {sel}")
             self._expect(i, "timelines", "renamed", "item", item.id, "name", old, e.new_name)
-        self.report.append(
-            {"edit": i, "op": "rename", "target": e.target, "old": old, "new": e.new_name}
-        )
+        return old
 
     @staticmethod
     def _check_old(i: int, e: Rename, old: str | None) -> None:
+        """Refuse a stale ``expect_name``; stop (as a no-op) when the name would not change."""
         if e.expect_name is not None and e.expect_name != (old or ""):
             raise _Refuse(
                 "expect-mismatch", f"the current name is {old!r}, not {e.expect_name!r}", i
             )
+        if old == e.new_name:
+            raise _Unchanged
 
     def _rename_timeline(self, i: int, e: Rename, tl: Timeline) -> str | None:
         key = _timeline_key(tl)
@@ -459,6 +490,7 @@ class _Planner:
                 "direction": e.direction,
                 "touched": touched,
                 "unmapped": unmapped,
+                "scope": PATH_MAP_SCOPE,
             }
         )
 
@@ -627,16 +659,31 @@ class _Planner:
             raise _Refuse("marker-not-found", f"no marker at frame {e.frame}", i)
         if len(at) > 1:
             raise _Refuse("marker-ambiguous", f"{len(at)} markers sit at frame {e.frame}", i)
+        current = ml.entries[at[0]]
         if isinstance(e, MarkerDelete):
+            if current.odd is not None:
+                raise _Refuse(
+                    "marker-undecoded",
+                    f"the marker at frame {e.frame} holds data the reader does not decode; "
+                    "deleting it would drop that data, which the post-write gate cannot vouch for",
+                    i,
+                )
             del ml.entries[at[0]]
             return
         changes = e.set.model_dump(exclude_unset=True)
-        current = ml.entries[at[0]]
         moved_to = changes.get("frame", e.frame)
         if moved_to != e.frame and any(m.values["frame"] == moved_to for m in ml.entries):
             raise _Refuse("marker-exists", f"a marker already sits at frame {moved_to}", i)
         _check_marker_text(i, {**current.values, **changes})
-        ml.entries[at[0]] = current.updated(changes)
+        updated = current.updated(changes)
+        if updated.odd != current.odd:
+            raise _Refuse(
+                "marker-undecoded",
+                f"updating the marker at frame {e.frame} would rewrite data the reader does not "
+                "decode (for example a duration not spelled the way Resolve writes it)",
+                i,
+            )
+        ml.entries[at[0]] = updated
 
     def _finish_markers(self) -> None:
         for key, (prov, ml, edits) in self.marker_lists.items():
