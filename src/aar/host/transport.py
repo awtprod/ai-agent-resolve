@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+import re
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -56,6 +57,8 @@ __all__ = [
 _READ_CHUNK = 1024 * 1024
 _STAT_TAG = "AARSTAT"
 _EXISTS_TAG = "AAREXISTS"
+_SIZE_RE = re.compile(r"[0-9]+")  # ASCII digits only (str.isdigit accepts superscripts etc.)
+_SHA256_RE = re.compile(r"[0-9A-Fa-f]{64}")
 
 
 def stat_script(literal: str) -> str:
@@ -100,7 +103,7 @@ def move_script(source: str, destination: str, overwrite: bool) -> str:
         f"$dst = {dst}\n"
         "if (Test-Path -LiteralPath $dst -PathType Container) "
         "{ throw 'aar: destination is a directory' }\n"
-        "$parent = Split-Path -LiteralPath $dst -Parent\n"
+        "$parent = [System.IO.Path]::GetDirectoryName($dst)\n"
         "$pitem = Get-Item -LiteralPath $parent -Force\n"
         "if ($pitem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) "
         "{ throw 'aar: destination parent is a reparse point' }\n"
@@ -212,8 +215,13 @@ class EditHost:
 
     def _scp_base(self) -> list[str]:
         cfg = self.config
+        # -s forces SFTP mode so the glob-escaping and no-remote-shell assumptions do not depend on
+        # the client's default (a client older than OpenSSH 8.7 would reject -s; the hub is 9.6p1).
+        # Configurable via AAR_EDIT_SCP_SFTP, default on.
+        sftp = ["-s"] if cfg.scp_use_sftp else []
         return [
             "scp",
+            *sftp,
             "-F",
             cfg.ssh_config,
             "-o",
@@ -256,9 +264,17 @@ class EditHost:
         return override if override is not None else self.config.command_timeout
 
     def remote_stat(self, win: _Win) -> tuple[int, str]:
-        """``(size, sha256)`` of a remote file, from ``Get-Item`` and ``Get-FileHash``."""
+        """``(size, sha256)`` of a remote file, from ``Get-Item`` and ``Get-FileHash``.
+
+        The size must be ASCII digits and the hash exactly 64 hex characters; anything else is a
+        :class:`RemoteCommandError` (``str.isdigit`` would accept e.g. superscript digits).
+        """
         fields = _parse_tagged(self.run_powershell(stat_script(windows_literal(win))), _STAT_TAG)
-        if len(fields) != 2 or not fields[0].isdigit():
+        if (
+            len(fields) != 2
+            or not _SIZE_RE.fullmatch(fields[0])
+            or not _SHA256_RE.fullmatch(fields[1])
+        ):
             raise RemoteCommandError(0, f"could not parse {_STAT_TAG} output: {fields!r}")
         return int(fields[0]), fields[1].upper()
 
@@ -267,11 +283,17 @@ class EditHost:
         return self.remote_kind(win) in ("file", "container")
 
     def remote_kind(self, win: _Win) -> str:
-        """``'file'``, ``'container'`` (directory) or ``'none'`` for a remote path."""
+        """``'file'``, ``'container'`` (directory) or ``'none'`` for a remote path.
+
+        Any other output (a bare tag, an unknown word, extra fields) is a
+        :class:`RemoteCommandError`, so the push pre-check fails closed rather than open.
+        """
         fields = _parse_tagged(
             self.run_powershell(exists_script(windows_literal(win))), _EXISTS_TAG
         )
-        return fields[0] if fields else "none"
+        if len(fields) != 1 or fields[0] not in ("file", "container", "none"):
+            raise RemoteCommandError(0, f"could not parse {_EXISTS_TAG} output: {fields!r}")
+        return fields[0]
 
     def _remote_remove_quiet(self, win: _Win) -> None:
         with contextlib.suppress(HostError):
@@ -289,8 +311,10 @@ class EditHost:
         tmp = f"{dest}.aarpart-{self._token()}"
         spec = scp_remote_source(self.config.alias, win, self.config.path_form)
         argv = [*self._scp_base(), spec, tmp]
-        result = self.runner.run(argv, timeout=self._timeout(None))
         try:
+            # inside the try: a KeyboardInterrupt or a runner OSError during scp must still remove
+            # the partial scp wrote in place (SFTP mode writes directly to the temp).
+            result = self.runner.run(argv, timeout=self._timeout(None))
             self._check_scp(result, "download")
             size = os.path.getsize(tmp)
             digest = sha256_file(tmp)
@@ -328,8 +352,10 @@ class EditHost:
         tmp_win = with_suffix(win, f".aarpart-{self._token()}")
         spec = scp_remote_dest(self.config.alias, tmp_win, self.config.path_form)
         argv = [*self._scp_base(), src, spec]
-        result = self.runner.run(argv, timeout=self._timeout(None))
         try:
+            # inside the try: an interrupt or runner error during scp must still attempt the
+            # remote Remove-Item for the partial upload.
+            result = self.runner.run(argv, timeout=self._timeout(None))
             self._check_scp(result, "upload")
             remote_size, remote_hash = self.remote_stat(tmp_win)
             if remote_size != size:
@@ -339,6 +365,12 @@ class EditHost:
             self.run_powershell(
                 move_script(windows_literal(tmp_win), windows_literal(win), overwrite)
             )
+        except HostError:
+            self._remote_remove_quiet(tmp_win)
+            raise
+        except OSError as exc:  # a runner / local failure during the upload path
+            self._remote_remove_quiet(tmp_win)
+            raise LocalIOError(f"I/O error during the upload: {exc}") from exc
         except BaseException:
             self._remote_remove_quiet(tmp_win)
             raise
@@ -386,19 +418,38 @@ class EditHost:
 def _place_no_hardlink(tmp: str, dest: str) -> None:
     """No-clobber placement without hard links: claim ``dest`` with ``O_EXCL``, then replace it.
 
-    ``O_EXCL`` guarantees we never overwrite a pre-existing destination. The residual window is
-    small: between the empty claim and the replace, ``dest`` exists as a zero-byte file, so a
-    crash there can leave an empty file (the verified data is still in ``tmp``, which the caller
-    removes). ``aar.drp.modify.write._place`` solves the same problem with a check-then-rename;
-    the ``O_EXCL`` claim here is tighter against a concurrent creator.
+    ``O_EXCL`` guarantees we never overwrite a pre-existing destination, and it does not follow a
+    symlink planted at the name. On any failure or interrupt before the replace lands, ``dest`` is
+    removed only if it is still our empty claim -- matched by device, inode *and* ``ctime_ns``
+    (``st_ino`` alone is recycled, per S8c's inode-reuse note) and size 0. A non-empty file or a
+    file another writer created at the name is left in place (and reported via the raised error),
+    never deleted. This mirrors S8c's ``_unlink_if_ours`` in ``aar.drp.modify.write``. The residual
+    window is the empty claim itself: a crash with no cleanup could leave a zero-byte ``dest`` (the
+    verified data stays in ``tmp``, which the caller removes), but a caught interrupt removes it.
     """
     try:
-        fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
         raise DestinationExists(dest) from None
-    os.close(fd)
+    try:
+        claim = os.fstat(fd)
+    finally:
+        os.close(fd)
     try:
         os.replace(tmp, dest)
-    except OSError:
-        _unlink_quiet(dest)  # drop the empty claim so a failed placement leaves nothing behind
+    except BaseException:
+        _unlink_if_claim(dest, claim)
         raise
+
+
+def _unlink_if_claim(dest: str, claim: os.stat_result) -> None:
+    """Remove ``dest`` only if it is still our zero-byte O_EXCL claim (dev, inode, ctime_ns)."""
+    with contextlib.suppress(OSError):
+        now = os.lstat(dest)  # lstat: never follow a symlink that replaced the claim
+        same = (now.st_dev, now.st_ino, now.st_ctime_ns) == (
+            claim.st_dev,
+            claim.st_ino,
+            claim.st_ctime_ns,
+        )
+        if same and now.st_size == 0:
+            os.unlink(dest)

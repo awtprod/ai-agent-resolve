@@ -139,6 +139,14 @@ def _cmd_ps(args: argparse.Namespace) -> int:
             script = _read_text(args.script)
         except OSError as exc:
             return _error(exc, EXIT_INPUT, args.json)
+        except UnicodeDecodeError as exc:
+            # a .ps1 saved as UTF-16 (Windows ISE default) or otherwise not UTF-8: a typed input
+            # error with exit 2, never a traceback.
+            return _error(
+                ValueError(f"{args.script}: not a UTF-8 PowerShell script ({exc})"),
+                EXIT_INPUT,
+                args.json,
+            )
         stdout = _host().run_powershell(script, timeout=args.timeout)
         if args.json:
             body = {"ok": True, "op": "ps", "stdout": stdout}

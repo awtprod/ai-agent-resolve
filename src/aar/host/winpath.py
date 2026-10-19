@@ -138,12 +138,22 @@ def validate_windows_path(path: str, roots: tuple[_Win, ...]) -> _Win:
         raise PathRefused(path, "dot-or-empty-component")
     if not win.parts:
         raise PathRefused(path, "no-file-component")
+    if win.trailing_sep:
+        # e.g. "E:\\Show\\x.mp4\\" -- a trailing separator names a directory, not a file.
+        raise PathRefused(path, "trailing-separator")
     reason = _check_components(win)
     if reason is not None:
         raise PathRefused(path, reason)
     if win.unc and not any(root.unc for root in roots):
         raise PathRefused(path, "unc-not-allowed")
-    if not any(_within(win, root) for root in roots):
+    within = False
+    for root in roots:
+        if _within(win, root):
+            within = True
+            if win.key() == root.key():
+                # the path IS an allowed root (a directory), not a file under it
+                raise PathRefused(path, "equals-allowed-root")
+    if not within:
         raise PathRefused(path, "outside-allowed-roots")
     return win
 

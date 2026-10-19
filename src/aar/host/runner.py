@@ -41,10 +41,14 @@ class SubprocessRunner:
     def run(
         self, argv: list[str], *, stdin: bytes | None = None, timeout: float | None = None
     ) -> RunResult:
+        # When the caller supplies no stdin, give the child /dev/null rather than the parent's
+        # stdin: ssh/scp must not consume our stdin, and leaving the remote PowerShell's stdin
+        # open-but-idle can hang Windows PowerShell.
         try:
             completed = subprocess.run(  # argv list, shell=False, never a user shell
                 argv,
-                input=stdin,
+                input=stdin if stdin is not None else None,
+                stdin=subprocess.DEVNULL if stdin is None else None,
                 capture_output=True,
                 timeout=timeout,
                 shell=False,

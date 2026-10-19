@@ -38,6 +38,13 @@ def test_ps_quote_keeps_metacharacters_literal(value: str) -> None:
     assert ps_quote(value) == "'" + value.replace("'", "''") + "'"
 
 
+@pytest.mark.parametrize("cp", [0x2018, 0x2019, 0x201A, 0x201B])
+def test_ps_quote_doubles_smart_single_quotes(cp: int) -> None:
+    # HIGH-1: PowerShell treats U+2018/U+2019/U+201A/U+201B as single quotes too.
+    q = chr(cp)
+    assert ps_quote(f"Don{q}t") == f"'Don{q}{q}t'"
+
+
 def test_ps_quote_preserves_non_bmp() -> None:
     treble = "\U0001d11e"  # U+1D11E MUSICAL SYMBOL G CLEF (a surrogate pair in UTF-16)
     quoted = ps_quote(f"name {treble}")

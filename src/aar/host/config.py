@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -28,8 +29,15 @@ _ENV_PATH_FORM = "AAR_EDIT_PATH_FORM"
 _ENV_CONNECT_TIMEOUT = "AAR_EDIT_CONNECT_TIMEOUT"
 _ENV_COMMAND_TIMEOUT = "AAR_EDIT_COMMAND_TIMEOUT"
 _ENV_CMDLINE_MAX = "AAR_EDIT_CMDLINE_MAX"
+_ENV_SCP_SFTP = "AAR_EDIT_SCP_SFTP"
 
 _PATH_FORMS = ("drive", "slash")
+# A strict ssh host/alias: an alphanumeric start, then alphanumerics, dot, underscore, @, hyphen.
+# This refuses the characters that change scp's host:path splitting -- '/', '[', ':', spaces -- and
+# a leading '-' (which would look like an option).
+_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]*$")
+_TRUE = ("1", "true", "yes", "on")
+_FALSE = ("0", "false", "no", "off")
 
 
 def _check_token(value: str, name: str) -> str:
@@ -43,6 +51,12 @@ def _check_token(value: str, name: str) -> str:
             f"{name} may not start with '-' (it would look like an option): {value!r}"
         )
     return value
+
+
+def _check_int(value: object, name: str) -> None:
+    """Require a positive ``int`` and reject ``bool`` (which is an ``int`` subclass)."""
+    if type(value) is bool or not isinstance(value, int) or value <= 0:
+        raise ConfigError(f"{name} must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -63,22 +77,25 @@ class EditHostConfig:
     connect_timeout: int = 10
     command_timeout: float = 300.0
     cmdline_max: int = DEFAULT_REMOTE_CMDLINE_MAX
+    scp_use_sftp: bool = True
     path_map: tuple[tuple[str, str], ...] = ()
     _remote_roots_parsed: tuple[_Win, ...] = field(default=(), repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        _check_token(self.alias, _ENV_ALIAS)
-        if ":" in self.alias:
-            raise ConfigError(f"the ssh alias may not contain ':': {self.alias!r}")
+        if not isinstance(self.alias, str) or not _ALIAS_RE.match(self.alias):
+            raise ConfigError(
+                f"{_ENV_ALIAS} must match {_ALIAS_RE.pattern} (a plain ssh host/alias): "
+                f"{self.alias!r}"
+            )
         _check_token(self.ssh_config, _ENV_CONFIG)
         if self.path_form not in _PATH_FORMS:
             raise ConfigError(f"path form must be one of {_PATH_FORMS}, not {self.path_form!r}")
-        if not isinstance(self.connect_timeout, int) or self.connect_timeout <= 0:
-            raise ConfigError("connect timeout must be a positive integer (seconds)")
-        if not (isinstance(self.command_timeout, (int, float)) and self.command_timeout > 0):
+        _check_int(self.connect_timeout, "connect timeout")
+        if type(self.command_timeout) is bool or not (
+            isinstance(self.command_timeout, (int, float)) and self.command_timeout > 0
+        ):
             raise ConfigError("command timeout must be a positive number (seconds)")
-        if not isinstance(self.cmdline_max, int) or self.cmdline_max <= 0:
-            raise ConfigError("cmdline max must be a positive integer (characters)")
+        _check_int(self.cmdline_max, "cmdline max")
         if not self.remote_roots:
             raise ConfigError("at least one remote root is required")
         if not self.local_roots:
@@ -152,6 +169,7 @@ def env_config(env: Mapping[str, str] | None = None) -> EditHostConfig:
         cmdline_max = int(cmdline) if cmdline else DEFAULT_REMOTE_CMDLINE_MAX
     except ValueError as exc:
         raise ConfigError(f"{_ENV_CMDLINE_MAX} must be an integer: {cmdline!r}") from exc
+    scp_use_sftp = _parse_bool(env.get(_ENV_SCP_SFTP), _ENV_SCP_SFTP, default=True)
     form = env.get(_ENV_PATH_FORM) or "drive"
     return EditHostConfig(
         alias=env[_ENV_ALIAS],
@@ -162,4 +180,16 @@ def env_config(env: Mapping[str, str] | None = None) -> EditHostConfig:
         connect_timeout=connect_timeout,
         command_timeout=command_timeout,
         cmdline_max=cmdline_max,
+        scp_use_sftp=scp_use_sftp,
     )
+
+
+def _parse_bool(raw: str | None, name: str, *, default: bool) -> bool:
+    if raw is None or raw.strip() == "":
+        return default
+    text = raw.strip().lower()
+    if text in _TRUE:
+        return True
+    if text in _FALSE:
+        return False
+    raise ConfigError(f"{name} must be a boolean (one of {_TRUE + _FALSE}): {raw!r}")

@@ -137,3 +137,33 @@ def test_ps_remote_failure_is_exit_one(env, monkeypatch, capsys) -> None:
     code = main(["host", "ps", str(script), "--json"])
     assert code == 1
     assert json.loads(capsys.readouterr().out)["error"]["type"] == "remote-command-error"
+
+
+def test_ps_utf16_script_is_exit_two_not_a_traceback(env, monkeypatch, capsys) -> None:
+    # N3: a .ps1 saved as UTF-16 (Windows ISE default) is not UTF-8; it must become a typed exit-2
+    # error, never an uncaught UnicodeDecodeError.
+    script = env / "probe.ps1"
+    script.write_text("Get-Date\n", encoding="utf-16")
+    _use(monkeypatch, FakeRunner(ps_stdout=b"x\r\n"))
+    code = main(["host", "ps", str(script), "--json"])
+    assert code == 2
+    assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+def test_ps_script_too_long_is_exit_two_with_json(env, monkeypatch, capsys) -> None:
+    script = env / "big.ps1"
+    script.write_text("a" * 4000, encoding="utf-8")
+    _use(monkeypatch, FakeRunner())
+    code = main(["host", "ps", str(script), "--json"])
+    body = json.loads(capsys.readouterr().out)
+    assert code == 2 and body["error"]["type"] == "script-too-long"
+    assert "AAR_EDIT_CMDLINE_MAX" in body["error"]["message"] and "8180" in body["error"]["message"]
+
+
+def test_ps_env_cmdline_max_raises_cap_through_cli(env, monkeypatch, capsys) -> None:
+    script = env / "big.ps1"
+    script.write_text("a" * 4000, encoding="utf-8")
+    _use(monkeypatch, FakeRunner(ps_stdout=b"ok\r\n"))
+    monkeypatch.setenv("AAR_EDIT_CMDLINE_MAX", "32767")
+    assert main(["host", "ps", str(script)]) == 0
+    assert capsys.readouterr().out == "ok\n"

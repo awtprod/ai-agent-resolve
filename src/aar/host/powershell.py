@@ -39,16 +39,26 @@ DEFAULT_REMOTE_CMDLINE_MAX = CMD_EXE_CMDLINE_MAX - _CMD_C_OVERHEAD
 _PS_PREFIX: tuple[str, ...] = ("powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand")
 
 
+# PowerShell's tokenizer (CharExtensions.IsSingleQuote) treats all of U+0027 and the four
+# "smart" single quotes U+2018, U+2019, U+201A, U+201B as string delimiters, and its own escaper
+# (CodeGeneration.EscapeSingleQuotedStringContent) doubles all of them. Doubling only U+0027 would
+# let a name such as a right-single-quote followed by "; Stop-Computer; " break out of the literal.
+# None of the four is illegal in a Windows filename, so validate_windows_path accepts them.
+_PS_SINGLE_QUOTES = frozenset(map(chr, (0x27, 0x2018, 0x2019, 0x201A, 0x201B)))
+
+
 def ps_quote(value: str) -> str:
     """Return ``value`` as a single-quoted PowerShell literal.
 
-    In a single-quoted PowerShell string every character is literal except ``'``, which is
-    written ``''``. So ``$()``, backticks, ``;`` and newlines need no other handling. A NUL is
-    refused: it cannot be carried safely and has no place in a path or argument.
+    Every PowerShell single-quote character (``'`` and the smart quotes U+2018, U+2019, U+201A,
+    U+201B) is doubled; everything else -- ``$()``, backticks, ``;``, newlines -- is literal inside
+    single quotes. A NUL is refused: it cannot be carried safely and has no place in a path or
+    argument. All embedded values in this package's scripts use single-quoted literals, so the
+    double-quoted smart quotes (U+201C/U+201D/U+201E) do not arise.
     """
     if "\x00" in value:
         raise ValueError("a PowerShell literal cannot contain NUL")
-    return "'" + value.replace("'", "''") + "'"
+    return "'" + "".join(ch * 2 if ch in _PS_SINGLE_QUOTES else ch for ch in value) + "'"
 
 
 def encode_command(script: str) -> str:

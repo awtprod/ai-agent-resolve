@@ -80,8 +80,9 @@ def test_ssh_base_flags(tmp_path) -> None:
         "ConnectTimeout=20",
         ALIAS,
     ]
-    assert host._scp_base()[:7] == [
+    assert host._scp_base() == [
         "scp",
+        "-s",  # force SFTP mode (AAR_EDIT_SCP_SFTP default on)
         "-F",
         str(tmp_path / "ssh.cfg"),
         "-o",
@@ -89,6 +90,9 @@ def test_ssh_base_flags(tmp_path) -> None:
         "-o",
         "ConnectTimeout=20",
     ]
+    # with sftp off, -s is dropped
+    off = build(tmp_path, FakeRunner(), connect_timeout=20, scp_use_sftp=False)
+    assert "-s" not in off._scp_base()
 
 
 def test_pull_size_mismatch_removes_temp(tmp_path) -> None:
@@ -203,9 +207,34 @@ def test_push_overwrite_skips_existence_check_and_forces_move(tmp_path) -> None:
 
     # first call is the upload, not a Test-Path
     assert runner.calls[0][0] == "scp"
-    assert runner.scripts[-1] == move_script(
-        "E:\\Show\\out.mp4.aarpart-TOKEN", "E:\\Show\\out.mp4", True
+    # line-level assertions (not move_script-against-itself): the actual move line, with -Force
+    lines = runner.scripts[-1].splitlines()
+    move = next(ln for ln in lines if ln.startswith("Move-Item"))
+    assert (
+        move == "Move-Item -LiteralPath 'E:\\Show\\out.mp4.aarpart-TOKEN' -Destination $dst -Force"
     )
+
+
+def test_move_script_guard_order_and_targets() -> None:
+    """Line-level pins for the move guards (replaces the keyword-only reparse test): the container
+    and reparse throws precede Move-Item, the reparse guard checks the parent, and -Force tracks
+    overwrite. Covers HIGH-2 (no Split-Path) and MED-2 (M31/M32/M33/M34/M35)."""
+    for overwrite in (False, True):
+        lines = move_script("E:\\Show\\a.aarpart-T", "E:\\Show\\a", overwrite).splitlines()
+        assert lines[0] == "$ErrorActionPreference = 'Stop'"
+        move = [i for i, ln in enumerate(lines) if ln.startswith("Move-Item")]
+        cont = [i for i, ln in enumerate(lines) if "-PathType Container" in ln and "throw" in ln]
+        rep = [i for i, ln in enumerate(lines) if "ReparsePoint" in ln and "throw" in ln]
+        assert len(move) == 1 and cont and rep and max(cont + rep) < move[0]
+        # the reparse guard targets the parent, computed lexically (not Split-Path, HIGH-2)
+        assert "$parent = [System.IO.Path]::GetDirectoryName($dst)" in lines
+        assert "$pitem = Get-Item -LiteralPath $parent -Force" in lines
+        assert "Split-Path" not in "\n".join(lines)
+        move_line = lines[move[0]]
+        assert move_line.startswith(
+            "Move-Item -LiteralPath 'E:\\Show\\a.aarpart-T' -Destination $dst"
+        )
+        assert move_line.endswith(" -Force") is overwrite
 
 
 def test_push_refuses_existing_remote_without_overwrite(tmp_path) -> None:
@@ -345,17 +374,22 @@ def test_pull_falls_back_when_hardlinks_unsupported(tmp_path, monkeypatch) -> No
     assert not (tmp_path / "out.mp4.aarpart-TOKEN").exists()
 
 
-def test_pull_fallback_no_clobber_without_overwrite(tmp_path, monkeypatch) -> None:
-    # item 3: even without hard links, an existing destination is never overwritten.
+def test_pull_fallback_no_clobber_against_a_concurrent_creator(tmp_path, monkeypatch) -> None:
+    # item 3 / MED-2 (M22): the up-front exists() check passes, then a creator wins the race
+    # AFTER it, so the O_EXCL claim in the fallback is what must refuse (not the pre-check).
     dest = tmp_path / "out.mp4"
-    dest.write_bytes(b"original")
     payload = b"content bytes"
+
+    def link_then_someone_creates_dest(*_a, **_k):
+        dest.write_bytes(b"theirs")  # concurrent creator, after the pre-check
+        raise OSError(errno.EOPNOTSUPP, "no hard links")
+
+    monkeypatch.setattr(transport.os, "link", link_then_someone_creates_dest)
     runner = FakeRunner(stat_result=(len(payload), sha256_upper(payload)), scp_payload=payload)
     host = build(tmp_path, runner)
-    monkeypatch.setattr(transport.os, "link", _raise_oserror)
     with pytest.raises(DestinationExists):
         host.pull(REMOTE, str(dest))
-    assert dest.read_bytes() == b"original"
+    assert dest.read_bytes() == b"theirs"  # not clobbered
     assert not (tmp_path / "out.mp4.aarpart-TOKEN").exists()
 
 
@@ -410,17 +444,6 @@ def test_push_overwrite_onto_directory_fails_closed(tmp_path) -> None:
     assert runner.removed  # the partial upload is cleaned up
     move = next(s for s in runner.scripts if "Move-Item" in s)
     assert "PathType Container" in move  # the guard is in the move script itself
-
-
-def test_push_move_script_guards_against_reparse_point_parent(tmp_path) -> None:
-    # item 5: the move script refuses when the destination's parent is a junction/symlink.
-    src, content = _src(tmp_path)
-    runner = FakeRunner(stat_result=(len(content), sha256_upper(content)))
-    host = build(tmp_path, runner)
-    host.push(str(src), "E:\\Show\\out.mp4", overwrite=True)
-    move = next(s for s in runner.scripts if "Move-Item" in s)
-    assert "ReparsePoint" in move
-    assert "Split-Path" in move
 
 
 def test_ps_uses_the_configured_cmdline_cap(tmp_path) -> None:
