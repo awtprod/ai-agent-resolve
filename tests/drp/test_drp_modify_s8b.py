@@ -306,6 +306,56 @@ def test_ff_rows_that_differ_only_under_full_folding_are_distinct() -> None:
     assert m.map("E:\\strasse\\x").new == "/Volumes/B/x"
 
 
+# L3: str.upper() EXPANDS the Greek iota-subscript letters (full case mapping), so the per-char
+# rule left them unfolded. Their Unicode simple uppercase is a single precomposed capital, a
+# collision NTFS $UpCase really has; ntfs_upper must fold onto it.
+
+
+@pytest.mark.parametrize(
+    ("small", "capital"),
+    [("\u1f80", "\u1f88"), ("\u1fb3", "\u1fbc"), ("\u1fc3", "\u1fcc"), ("\u1ff3", "\u1ffc")],
+    ids=["alpha-psili-ypo", "alpha-ypo", "eta-ypo", "omega-ypo"],
+)
+def test_ff_greek_iota_subscript_folds_onto_its_capital_like_ntfs(small: str, capital: str) -> None:
+    from aar.drp.modify.paths import PathMapper, ntfs_upper
+
+    assert len(small.upper()) > 1  # Python's full uppercase expands it (base + capital iota)
+    assert ntfs_upper(small) == ntfs_upper(capital)  # NTFS simple uppercase folds them together
+    mapped = PathMapper("windows_to_mac", [("E:\\" + small, "/Volumes/M")]).map(
+        "E:\\" + capital + "\\a.mov"
+    )
+    assert mapped.new == "/Volumes/M/a.mov"
+
+
+@pytest.mark.parametrize(
+    ("ch", "expansion"),
+    [("\u00df", "SS"), ("\ufb01", "FI"), ("\u0149", "\u02bcN")],
+    ids=["sharp-s", "fi-ligature", "apostrophe-n"],
+)
+def test_ff_full_expansions_keep_their_spelling(ch: str, expansion: str) -> None:
+    from aar.drp.modify.paths import ntfs_upper
+
+    assert ch.upper() == expansion  # Python's full uppercase does change the length
+    assert ntfs_upper(ch) == ch  # simple uppercase has no single code point, so it is kept
+    assert ntfs_upper(ch) != ntfs_upper(expansion)  # never equal to the expanded form
+
+
+def test_ff_simple_uppercase_table_is_the_unicode_set() -> None:
+    # The override table is exactly the code points whose full uppercase expands yet whose simple
+    # (single-code-point) uppercase exists. Re-derived from the running Unicode database so it can
+    # never silently drift from Python's data.
+    from aar.drp.modify.paths import _SIMPLE_UPPER_EXPANDING
+
+    derived = {}
+    for cp in range(0x110000):
+        c = chr(cp)
+        title = c.title()
+        if len(c.upper()) > 1 and len(title) == 1 and title != c:
+            derived[c] = title
+    assert derived == _SIMPLE_UPPER_EXPANDING
+    assert len(_SIMPLE_UPPER_EXPANDING) == 27  # the Greek ypogegrammeni set
+
+
 # --------------------------------------------------------------------------- F-C
 
 RENAME = {"op": "rename", "target": "project", "new_name": "x"}

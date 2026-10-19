@@ -67,18 +67,44 @@ class MapResult:
     reason: str | None = None
 
 
+# Characters whose Unicode *simple* uppercase is a single code point but whose *full* uppercase
+# (what ``str.upper`` gives) expands to several, so the per-character rule in ``ntfs_upper`` would
+# otherwise leave them unfolded. These are the Greek small letters with iota subscript
+# (ypogegrammeni); NTFS folds each onto its precomposed capital (prosgegrammeni) form, e.g.
+# U+1F80 -> U+1F88. Verified complete against the running Unicode database by
+# test_ff_simple_uppercase_table_is_the_unicode_set.
+_SIMPLE_UPPER_EXPANDING: dict[str, str] = {
+    chr(cp): chr(cp + 8) for base in (0x1F80, 0x1F90, 0x1FA0) for cp in range(base, base + 8)
+}
+_SIMPLE_UPPER_EXPANDING.update({"ᾳ": "ᾼ", "ῃ": "ῌ", "ῳ": "ῼ"})
+
+
 def ntfs_upper(name: str) -> str:
     """``name`` upper-cased one character at a time, the way NTFS compares names.
 
-    NTFS maps each UTF-16 unit through its upcase table (a simple, one-to-one mapping), so
-    ``Straße`` and ``STRASSE`` are different names, and so are ``k`` and the Kelvin sign.
-    Python's ``casefold`` and ``upper`` use full mappings (``ß`` -> ``ss``/``SS``), which would
-    call them equal. A character whose full uppercase is not one character keeps its spelling.
+    This follows Unicode *simple* (one-to-one) case mapping, which is what NTFS's ``$UpCase``
+    table does: a code point maps to a single upper-case code point or to itself, never to
+    several. So ``Straße`` and ``STRASSE`` are different names (``ß`` has no simple uppercase, it
+    folds to itself), ``ﬁ`` is not ``FI``, and ``k`` is not the Kelvin sign. Python's
+    ``str.upper``/``casefold`` use *full* case mapping, which expands those (``ß`` -> ``SS``),
+    so we take ``c.upper()`` only when it is a single code point and otherwise fall back to the
+    simple mapping (:data:`_SIMPLE_UPPER_EXPANDING`, which covers the Greek iota-subscript forms
+    whose full uppercase expands) or, failing that, to ``c`` unchanged. Dotless i (U+0131) still
+    folds to ``I``.
+
+    This is Unicode simple case mapping, not a copy of any one volume's table. Windows freezes
+    ``$UpCase`` when a volume is formatted, so a real volume can differ from this (newer) data for
+    code points added after it was made. ``path_map`` only rewrites path strings into a new output
+    file, which the post-write gate and the sandbox round trip still check, so a fold a particular
+    volume does not share cannot corrupt a file.
     """
     out = []
     for ch in name:
         up = ch.upper()
-        out.append(up if len(up) == 1 else ch)
+        if len(up) == 1:
+            out.append(up)
+        else:
+            out.append(_SIMPLE_UPPER_EXPANDING.get(ch, ch))
     return "".join(out)
 
 
