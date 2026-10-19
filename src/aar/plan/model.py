@@ -355,7 +355,7 @@ class OutroTransition(_Model):
 class Sting(_Model):
     """Version 2. Text shown over the start of the outro."""
 
-    lines: list[str] = Field(min_length=1, description="Text lines shown together.")
+    lines: list[Name] = Field(min_length=1, description="Text lines shown together.")
     start: int = Field(default=0, ge=0, description="Frames from the outro's first frame.")
     frames: int = Field(gt=0, description="How long the text shows, in frames.")
     template: Name | None = Field(default=None, description="Title template / preset name.")
@@ -399,7 +399,7 @@ class AudioTrack(_Model):
 
 class Title(_Model):
     kind: TitleKind = "title"
-    lines: list[str] = Field(min_length=1)
+    lines: list[Name] = Field(min_length=1)
     record_in: int = Field(ge=0)
     record_out: int = Field(ge=0, description="End frame (exclusive).")
     template: str | None = Field(default=None, description="Template / preset name.")
@@ -415,7 +415,7 @@ class CaptionStyle(_Model):
 
 
 class Caption(_Model):
-    lines: list[str] = Field(min_length=1, description="Text lines shown together.")
+    lines: list[Name] = Field(min_length=1, description="Text lines shown together.")
     record_in: int = Field(ge=0)
     record_out: int = Field(ge=0, description="End frame (exclusive).")
     style: CaptionStyle | None = Field(

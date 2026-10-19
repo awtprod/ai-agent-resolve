@@ -1,12 +1,14 @@
-"""S13a-f validator follow-ups: the BRAW input-colour-space rule (F2) and the plan version (F1)."""
+"""S13a-f validator follow-ups: the BRAW input-colour-space rule (F2), the plan version (F1) and
+blank text lines (F5)."""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from typing import Any
 
 import pytest
-from plan_support import PlanData, only
+from plan_support import FIXTURES, PlanData, only
 from pydantic import ValidationError
 
 from aar.plan.lint import LintReport
@@ -187,3 +189,92 @@ def test_the_version_schema_is_still_the_integer_1_or_2() -> None:
     assert schema["type"] == "integer"
     assert schema["enum"] == [1, 2]
     assert schema["default"] == 2
+
+
+# --- F5: no blank text lines ------------------------------------------------------------------
+
+BLANKS = ["", " ", "   ", "\t", "\n", " \u00a0 "]
+
+
+def with_sting(data: PlanData, lines: list[str]) -> PlanData:
+    """A version 2 plan with an outro whose sting has these lines."""
+    data["version"] = 2
+    data["sources"].append({"id": "outro", "media": "media/outro.mov", "duration": 302})
+    data["outro"] = {"source": "outro", "sting": {"lines": lines, "start": 2, "frames": 100}}
+    return data
+
+
+def errors_at(data: PlanData) -> list[tuple[tuple[str | int, ...], str]]:
+    """(loc, message) of every error validating ``data`` gives."""
+    return [(tuple(e["loc"]), str(e["msg"])) for e in version_errors(data)]
+
+
+@pytest.mark.parametrize("blank", BLANKS)
+def test_a_blank_sting_line_is_one_error_at_that_line(clean_data: PlanData, blank: str) -> None:
+    with_sting(clean_data, ["Pat Example", blank])
+    [(loc, msg)] = errors_at(clean_data)
+    assert loc == ("outro", "sting", "lines", 1)
+    assert "blank" in msg
+
+
+@pytest.mark.parametrize("blank", BLANKS)
+def test_a_blank_title_line_is_one_error_at_that_line(clean_data: PlanData, blank: str) -> None:
+    clean_data["titles"][0]["lines"] = [blank, "Stand-up comic"]
+    [(loc, msg)] = errors_at(clean_data)
+    assert loc == ("titles", 0, "lines", 0)
+    assert "blank" in msg
+
+
+@pytest.mark.parametrize("blank", BLANKS)
+def test_a_blank_caption_line_is_one_error_at_that_line(clean_data: PlanData, blank: str) -> None:
+    clean_data["captions"][1]["lines"] = ["WAIT FOR IT", blank]
+    [(loc, msg)] = errors_at(clean_data)
+    assert loc == ("captions", 1, "lines", 1)
+    assert "blank" in msg
+
+
+def test_every_blank_line_gets_its_own_error(clean_data: PlanData) -> None:
+    clean_data["captions"][0]["lines"] = ["", "ONE", " "]
+    assert [loc for loc, _ in errors_at(clean_data)] == [
+        ("captions", 0, "lines", 0),
+        ("captions", 0, "lines", 2),
+    ]
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["python", "json"])
+def test_a_blank_line_is_refused_through_json_too(clean_data: PlanData, as_json: bool) -> None:
+    clean_data["captions"][0]["lines"] = ["  "]
+    [error] = version_errors(clean_data, as_json=as_json)
+    assert error["loc"] == ("captions", 0, "lines", 0)
+
+
+def test_an_empty_list_of_lines_is_still_refused(clean_data: PlanData) -> None:
+    clean_data["captions"][0]["lines"] = []
+    [(loc, _)] = errors_at(clean_data)
+    assert loc == ("captions", 0, "lines")
+
+
+def test_ordinary_lines_still_validate_and_keep_their_text(clean_data: PlanData) -> None:
+    """Padding inside a line is the author's business; only an all-blank line is refused."""
+    with_sting(clean_data, ["Pat Example", " Stand-up comic "])
+    clean_data["titles"][0]["lines"] = ["A", "B"]
+    clean_data["captions"][0]["lines"] = ["I PARKED THERE", "FOR ONE MINUTE"]
+    plan = EditPlan.model_validate(clean_data)
+    assert plan.outro is not None and plan.outro.sting is not None
+    assert plan.outro.sting.lines == ["Pat Example", " Stand-up comic "]
+    assert plan.titles[0].lines == ["A", "B"]
+    assert plan.captions[0].lines == ["I PARKED THERE", "FOR ONE MINUTE"]
+
+
+def test_no_fixture_plan_has_a_blank_text_line() -> None:
+    """The plan fixtures and goldens must keep validating: none of them uses a blank line."""
+    plans = sorted(FIXTURES.rglob("*.plan.json"))
+    assert plans
+    for path in plans:
+        data: Any = json.loads(path.read_text(encoding="utf-8"))
+        texts = [
+            line
+            for item in [*data.get("titles", []), *data.get("captions", [])]
+            for line in item["lines"]
+        ]
+        assert all(line.strip() for line in texts), path.name
