@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -36,6 +37,7 @@ CHECK_IDS = (
 )
 
 _RANK = {"skipped": 0, "pass": 0, "warn": 1, "fail": 2}
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
 
 
 class _Model(BaseModel):
@@ -69,6 +71,12 @@ class QACheck(_Model):
     @classmethod
     def _finite(cls, value: Any) -> Any:
         return json_clean(value)
+
+    @field_validator("message", mode="after")
+    @classmethod
+    def _one_line(cls, value: str) -> str:
+        # File names and tool output can carry newlines; the message stays one line.
+        return _CONTROL.sub(" ", value)
 
 
 class QAReport(_Model):

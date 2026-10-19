@@ -769,3 +769,20 @@ def test_bad_arguments(tmp_path):
         check(path, kind="short", profile=CCN, silence_db=0)
     with pytest.raises(ValueError):
         check(path, kind="short", profile=CCN, timeout_s=0)
+
+
+def test_a_cut_past_the_end_of_its_source_fails(tmp_path):
+    source = sine(tmp_path / "a.wav", -6.0, seconds=1.0)
+    plan = _join_plan(tmp_path, source, src_in=60, src_out=80)  # 1.2 s into a 1.0 s file
+    entry = run(sine(tmp_path / "r.wav", -14.5), plan=plan, media_root=tmp_path).check("join-quiet")
+    assert entry.status == "fail"
+    assert entry.details[0]["reason"] == "src_in is at or past the end of the source audio"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file names may hold a newline")
+def test_messages_stay_on_one_line_for_hostile_names(tmp_path):
+    good = run(sine(tmp_path / "two\nlines.wav", -14.5))
+    assert good.status == "pass"
+    missing = run(tmp_path / "gone\nfile.wav")
+    message = missing.check("decode").message
+    assert "\n" not in message and "gone file.wav" in message
