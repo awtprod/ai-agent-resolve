@@ -1,0 +1,33 @@
+  Metadata:
+    encoder         : Lavf60.16.100
+Stream mapping:
+  Stream #0:0 -> #0:0 (pcm_s16le (native) -> pcm_s16le (native))
+[Parsed_ebur128_0 @ 0x62d4755f8840] t: 0.0999792  TARGET:-23 LUFS    M:-120.7 S:-120.7     I: -70.0 LUFS       LRA:   0.0 LU  FTPK: -18.1 dBFS  TPK: -18.1 dBFS
+Output #0, null, to 'pipe:':
+  Metadata:
+    encoder         : Lavf60.16.100
+    Metadata:
+      encoder         : Lavc60.31.102 pcm_s16le
+[Parsed_ebur128_0 @ 0x62d4755f8840] t: 0.199979   TARGET:-23 LUFS    M:-120.7 S:-120.7     I: -70.0 LUFS       LRA:   0.0 LU  FTPK: -18.1 dBFS  TPK: -18.1 dBFS
+[Parsed_ebur128_0 @ 0x62d4755f8840] t: 0.299979   TARGET:-23 LUFS    M:-120.7 S:-120.7     I: -70.0 LUFS       LRA:   0.0 LU  FTPK: -18.1 dBFS  TPK: -18.1 dBFS
+[Parsed_ebur128_0 @ 0x62d4755f8840] t: 0.399979   TARGET:-23 LUFS    M: -21.1 S:-120.7     I: -21.1 LUFS       LRA:   0.0 LU  FTPK: -18.1 dBFS  TPK: -18.1 dBFS
+[Parsed_ebur128_0 @ 0x62d4755f8840] t: 0.499979   TARGET:-23 LUFS    M: -21.1 S:-120.7     I: -21.1 LUFS       LRA:   0.0 LU  FTPK: -18.1 dBFS  TPK: -18.1 dBFS
+[Parsed_ebur128_0 @ 0x62d4755f8840] t: 0.599979   TARGET:-23 LUFS    M: -21.1 S:-120.7     I: -21.1 LUFS       LRA:   0.0 LU  FTPK: -18.1 dBFS  TPK: -18.1 dBFS
+[Parsed_ebur128_0 @ 0x62d4755f8840] t: 0.699979   TARGET:-23 LUFS    M: -21.1 S:-120.7     I: -21.1 LUFS       LRA:   0.0 LU  FTPK: -18.1 dBFS  TPK: -18.1 dBFS
+[Parsed_ebur128_0 @ 0x62d4755f8840] t: 0.799979   TARGET:-23 LUFS    M: -21.1 S:-120.7     I: -21.1 LUFS       LRA:   0.0 LU  FTPK: -18.1 dBFS  TPK: -18.1 dBFS
+[Parsed_ebur128_0 @ 0x62d4755f8840] t: 0.899979   TARGET:-23 LUFS    M: -21.1 S:-120.7     I: -21.1 LUFS       LRA:   0.0 LU  FTPK: -18.1 dBFS  TPK: -18.1 dBFS
+[Parsed_ebur128_0 @ 0x62d4755f8840] t: 0.999979   TARGET:-23 LUFS    M: -21.1 S:-120.7     I: -21.1 LUFS       LRA:   0.0 LU  FTPK: -18.1 dBFS  TPK: -18.1 dBFS
+[Parsed_ebur128_0 @ 0x62d4755f8840] Summary:
+
+  Integrated loudness:
+    I:         -21.1 LUFS
+    Threshold: -31.1 LUFS
+
+  Loudness range:
+    LRA:         0.0 LU
+    Threshold:   0.0 LUFS
+    LRA low:     0.0 LUFS
+    LRA high:    0.0 LUFS
+
+  True peak:
+    Peak:      -18.1 dBFS

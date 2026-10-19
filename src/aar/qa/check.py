@@ -365,13 +365,16 @@ def _clipping(ctx: _Ctx, m: AudioMeasurements) -> QACheck:
     target = {"clipped_samples": 0, "clip_level_dbfs": level_db}
     peak = m.stats.peak_level_dbfs
     non_finite = m.stats.non_finite
-    measured: dict[str, Any] = {"sample_peak_dbfs": _round(peak, 4), "non_finite_samples": 0}
+    measured: dict[str, Any] = {"sample_peak_dbfs": _round(peak, 4), "non_finite_per_channel": 0}
     if non_finite:
-        measured["non_finite_samples"] = non_finite
+        measured["non_finite_per_channel"] = non_finite
         return QACheck(
             id="clipping",
             status="fail",
-            message=f"{non_finite} NaN or infinite sample(s): re-render the audio.",
+            message=(
+                f"NaN or infinite samples ({non_finite} per channel on average): re-render the "
+                "audio."
+            ),
             measured=measured,
             target=target,
         )

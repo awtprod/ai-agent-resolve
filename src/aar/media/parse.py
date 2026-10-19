@@ -98,7 +98,8 @@ class AStats:
 
     @property
     def non_finite(self) -> int:
-        """NaN plus infinite samples (0 when astats was not asked to count them)."""
+        """NaN plus infinite samples, as astats prints them in Overall: the per-channel average
+        (0 when astats was not asked to count them or the format cannot hold them)."""
         nan = self.overall.get("Number of NaNs") or 0.0
         inf = self.overall.get("Number of Infs") or 0.0
         return int(nan + inf)

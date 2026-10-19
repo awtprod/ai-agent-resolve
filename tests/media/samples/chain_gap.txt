@@ -1,0 +1,33 @@
+  Metadata:
+    encoder         : Lavf60.16.100
+Stream mapping:
+  Stream #0:0 -> #0:0 (pcm_s16le (native) -> pcm_s16le (native))
+Output #0, null, to 'pipe:':
+  Metadata:
+    encoder         : Lavf60.16.100
+    Metadata:
+      encoder         : Lavc60.31.102 pcm_s16le
+[silencedetect @ 0x592ebc887540] silence_start: 0.699979
+[silencedetect @ 0x592ebc887540] silence_end: 1.70004 | silence_duration: 1.00006
+[Parsed_astats_0 @ 0x592ebc887140] Overall
+[Parsed_astats_0 @ 0x592ebc887140] Peak level dB: -19.999205
+[Parsed_astats_0 @ 0x592ebc887140] Flat factor: 0.000000
+[Parsed_astats_0 @ 0x592ebc887140] Peak count: 600.000000
+[Parsed_astats_0 @ 0x592ebc887140] Number of samples: 120000
+[Parsed_ebur128_2 @ 0x592ebc88bf80] Summary:
+
+  Integrated loudness:
+    I:         -21.7 LUFS
+    Threshold: -31.9 LUFS
+
+  Loudness range:
+    LRA:         0.0 LU
+    Threshold:   0.0 LUFS
+    LRA low:     0.0 LUFS
+    LRA high:    0.0 LUFS
+
+  Sample peak:
+    Peak:      -20.0 dBFS
+
+  True peak:
+    Peak:      -20.0 dBFS
