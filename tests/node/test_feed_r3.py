@@ -396,3 +396,28 @@ def test_an_unmappable_presence_change_is_gap_flagged_not_raised(tmp_path: Path)
     feed = NodeFeed(NODE, EventLogTransport(log), wall_offset=lambda: WALL)
     feed.report_presence(active=True, at=T0, human_id="h" * 500, ttl=timedelta(minutes=5))
     assert feed.pending == 0 and feed.dropped == 1
+
+
+def test_a_reconcile_the_hub_keeps_refusing_is_given_up_and_never_blocks_the_outbox(
+    tmp_path: Path,
+) -> None:
+    log = EventLog(tmp_path / "hub.db")
+    real = EventLogTransport(log)
+    snapshots = []
+
+    class NoSnapshots:
+        def deliver(self, spec: HubEventSpec, *, node_id: str) -> None:
+            if spec.type == EVENT_LEASE_SNAPSHOT:
+                snapshots.append(spec.idempotency_key)
+                raise ValueError("hub refuses snapshots")
+            real.deliver(spec, node_id=node_id)
+
+    feed, leases = _wired(log, NoSnapshots())
+    leases.acquire(AGENT, Scope.PROJECT, ("p1",), ttl=600)
+    for attempt in range(MAX_SPEC_ATTEMPTS + 2):
+        report = feed.flush()
+        assert feed.pending == 0, attempt  # the outbox is delivered every time regardless
+    assert len(snapshots) == MAX_SPEC_ATTEMPTS  # then given up, not retried forever
+    assert feed.reconciled and [q.type for q in feed.quarantined] == [EVENT_LEASE_SNAPSHOT]
+    assert len(log.read(types=["lease.renewed"])) == MAX_SPEC_ATTEMPTS  # bounded re-sends
+    assert report.error is None

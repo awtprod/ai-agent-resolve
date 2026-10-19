@@ -194,6 +194,7 @@ class NodeFeed:
         self._gap_at: datetime | None = None
         # A new process knows nothing of what an earlier one left on the board: reconcile.
         self._reconcile_pending = lease_source is not None
+        self._reconcile_failures = 0
         self._quarantined: deque[Quarantined] = deque(maxlen=QUARANTINE_MEMORY)
 
     @property
@@ -310,9 +311,18 @@ class NodeFeed:
             except _UNREACHABLE as exc:  # reconciled again, from scratch, on the next flush
                 return self._report(0, delivered_gap, f"reconcile: {exc!r}")
             except Exception as exc:
+                # Retried (from scratch) on the next flush, but not forever: each attempt
+                # re-sends every live lease, so after MAX_SPEC_ATTEMPTS it is given up and
+                # the node's gap stays on the board (honestly stale) until the next gap.
                 problems.append(f"reconcile: {exc!r}")
+                self._reconcile_failures += 1
+                if self._reconcile_failures >= MAX_SPEC_ATTEMPTS:
+                    self._quarantined.append(Quarantined(EVENT_LEASE_SNAPSHOT, None, repr(exc)))
+                    self._reconcile_pending = False
+                    self._reconcile_failures = 0
             else:
                 self._reconcile_pending = False
+                self._reconcile_failures = 0
         sent = 0
         while self._outbox:
             spec = self._outbox[0]
