@@ -49,16 +49,25 @@ __all__ = [
 
 # Per-file budgets. The element budget counts every scanner token (start and end tags,
 # comments, PIs, CDATA, declarations, lone "<") and every attribute, summed over the members of
-# one file. The private corpus maxima in one file are 566,892 such tokens (548,251 before
+# one file. The private corpus maxima in one file are 566,413 such tokens (547,801 before
 # attributes were counted), 30.95 MB of XML and 20.8 MB of decompressed blobs (see
 # blobs.DEFAULT_MAX_TOTAL_OUTPUT). 3M tokens is about 5.3x the token maximum, so real projects
-# are read whole; 600 MiB of XML is about 20x. Memory is bounded by the token budget, not the
-# byte budgets: a token costs about 300 to 400 bytes of resident memory, depending on the
-# shape of the input. Measured peak RSS of a scan that runs into the 3M budget:
-#   3M "<a/>" tokens        0.90 GB     3M nested open elements   1.17 GB (worst shape)
-#   1M elements, 2 attrs    0.56 GB     150K elements, 19 attrs   0.31 GB
-#   one tag, 10M attrs      0.30 GB     3.5M comments             0.46 GB
-# so the worst case is about 1.2 GB. All of these are overridable per call in :func:`read_drp`.
+# are read whole; 600 MiB of XML is about 20x.
+#
+# Memory is NOT bounded by the token budget alone. A token costs 300 to 400 bytes of resident
+# memory with short names and about 750 with 168-character ones, and the byte caps (512 MiB per
+# member, 600 MiB per file) let one member carry a few hundred MB of text, names or values on
+# top of that. Measured peak RSS of `aar drp inspect` on a hostile file at the tip (a 530 MB
+# member where bytes matter, the 3M token budget where tokens do), in MB:
+#   20M "<a/>" (stops at 3M)    985    3.2M nested open elements        1161
+#   530 MB unterminated tag    1048    530 MB text or attribute value   1554
+#   101 x 5M-char attr name    1958    530 MB of ProjectName text       2060
+#   3.1M nested, 168-char names 2314   530 MB text with one 4-byte char 3070
+# so the worst case is about 3.1 GB, not 1.2 GB. The largest is the UTF-8 validity check in the
+# scanner (`data.decode`), which builds a 4-bytes-per-character copy of a member whose text
+# holds a non-BMP character; it is the same at 20f89a0. The token and XML-byte budgets are
+# per-file totals, so they bound the sum over members, not each member separately. All of these
+# limits are overridable per call in :func:`read_drp`.
 DEFAULT_MAX_ELEMENTS = 3_000_000
 DEFAULT_MAX_TOTAL_XML_BYTES = 600 * 1024 * 1024
 DEFAULT_MAX_ISSUES_PER_CODE = 100
