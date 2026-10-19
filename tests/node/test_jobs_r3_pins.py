@@ -1076,3 +1076,39 @@ def test_broker_refused_op_for_another_project_causes_no_switch(tmp_path: Path) 
     world.broker.run_until_idle()
     assert world.broker.result(op_id).status is OpStatus.CANCELLED
     assert world.fake.current.GetName() == "Show"  # never loaded "Other"
+
+
+# -- sixth batch -----------------------------------------------------------------------------------
+
+
+def test_unknown_schema_version_is_refused_on_the_create_path_too(tmp_path: Path) -> None:
+    """Kills S10 (version mismatch accepted when opening with create=True, the default)."""
+    import sqlite3
+
+    import pytest
+
+    from aar.node.jobs import JobStore, JobStoreVersionError
+
+    path = tmp_path / "jobs.db"
+    JobStore(path).close()
+    conn = sqlite3.connect(path)
+    conn.execute("UPDATE meta SET value='999' WHERE key='schema_version'")
+    conn.commit()
+    conn.close()
+    with pytest.raises(JobStoreVersionError):
+        JobStore(path)
+    with pytest.raises(JobStoreVersionError):
+        JobStore(path)  # the failed open released the lock and left the version alone
+
+
+def test_refused_consume_clears_the_pending_intent(tmp_path: Path) -> None:
+    """Kills N20 (approval_pending not cleared on a refusal)."""
+    world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    world.runner.run_until_settled()
+    token = grant(world.log, ApprovalScope.PROJECT_LOAD, world.pid(), 3600, "wrong scope", HUMAN)
+    world.runner.approve(job_id, token.token_id, HUMAN)
+    world.runner.run_until_settled()
+    rec = world.store.get(job_id)
+    assert rec.state is JobState.WAITING and rec.waiting.detail["refused_code"]
+    assert rec.approval_pending is None
