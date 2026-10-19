@@ -13,7 +13,10 @@ Order of work, and what stops it (every stop writes nothing):
 4. The result is written to a temporary file in the output directory and verified
    (:func:`aar.drp.modify.verify.verify_write`): gate, exact change list, version stamps.
 5. Only then are the sidecar ``<out>.aar.json`` (status ``unverified``) and the file moved into
-   place, the sidecar first, so a written file never lacks its label.
+   place, the sidecar first, so a written file never lacks its label. Without ``--force`` each
+   move replaces nothing: it hard-links onto the name, or on a filesystem with no hard links
+   (FAT/exFAT) claims the name with ``O_CREAT|O_EXCL`` and renames onto its own placeholder, so a
+   file another writer put there is never overwritten (:func:`_place_no_hardlink`).
 
 A run stopped hard between those two moves leaves a label without its file; the next run for
 the same ``--out`` refuses with ``orphan-sidecar`` and lists what to remove. Temporary files a
@@ -324,13 +327,29 @@ def _place(tmp: Path, dest: Path, force: bool) -> None:
     except FileExistsError:
         raise
     except OSError:
-        # No hard links on this filesystem (FAT/exFAT). Check, then rename; the window between
-        # the two is the one place a concurrent writer could be replaced.
-        if dest.exists():
-            raise FileExistsError(str(dest)) from None
-        os.rename(tmp, dest)
+        _place_no_hardlink(tmp, dest)  # no hard links on this filesystem (FAT/exFAT)
         return
     tmp.unlink()
+
+
+def _place_no_hardlink(tmp: Path, dest: Path) -> None:
+    """Place ``tmp`` at ``dest`` on a filesystem without hard links, never replacing a file
+    another writer put there.
+
+    ``os.link`` is not available, so claim the name with ``O_CREAT|O_EXCL`` (which fails with
+    ``FileExistsError`` if ``dest`` already exists, leaving no check-then-rename window a
+    concurrent create could slip through), then rename our verified temporary onto our own
+    placeholder. A crash between the claim and the rename can leave our own partial labelled copy
+    (the empty placeholder, or the finished output), never a file that was already there.
+    """
+    fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)  # FileExistsError if taken
+    try:
+        os.close(fd)
+        os.rename(tmp, dest)  # atomically replaces the placeholder we just created, nothing else
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(dest)  # remove only the placeholder we created; never a pre-existing file
+        raise
 
 
 def edit_file(

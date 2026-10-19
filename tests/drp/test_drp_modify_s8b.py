@@ -631,6 +631,75 @@ def test_l1_design_states_the_force_sidecar_rule() -> None:
     assert "`--force` replaces only the output and a label bearing that stamp" in section
 
 
+# L2: on a filesystem without hard links (FAT/exFAT) placement used to check-then-rename, a
+# TOCTOU window; the O_CREAT|O_EXCL claim closes it.
+
+
+def _no_hardlinks(src: str, dst: str) -> None:
+    raise OSError(errno.EPERM, "Operation not permitted")  # FAT/exFAT has no hard links
+
+
+def test_l2_no_hardlink_placement_writes_when_the_name_is_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(os, "link", _no_hardlinks)
+    outcome, out = run(H264, tmp_path, RENAME)
+    assert outcome.status == "written" and read_drp(out).project.name == "x"
+    assert stale_temp_files(out) == []
+    assert sorted(p.name for p in tmp_path.iterdir()) == [out.name, out.name + SIDECAR_SUFFIX]
+
+
+def test_l2_no_hardlink_place_refuses_a_name_already_taken(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aar.drp.modify import write
+
+    monkeypatch.setattr(os, "link", _no_hardlinks)
+    dest = tmp_path / "out.drp"
+    dest.write_bytes(b"already here")
+    tmp = write._temp(tmp_path, "out.drp", b"ours")
+    with pytest.raises(FileExistsError):
+        write._place(tmp, dest, force=False)
+    assert dest.read_bytes() == b"already here"  # the claim fails; the file is left alone
+
+
+def test_l2_no_hardlink_place_never_overwrites_a_racing_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aar.drp.modify import write
+
+    monkeypatch.setattr(os, "link", _no_hardlinks)  # force the no-hardlink path
+    real_rename = os.rename
+    created: list[str] = []
+
+    def racing_rename(src: str, dst: str) -> None:
+        # A second writer tries to claim dst in the window between our check and our rename.
+        try:
+            fd = os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            pass  # we already own the name under the new code; the racer cannot create it
+        else:
+            os.write(fd, b"a human's file")
+            os.close(fd)
+            created.append(dst)
+        real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", racing_rename)
+    tmp = write._temp(tmp_path, "out.drp", b"our output")
+    dest = tmp_path / "out.drp"
+    write._place(tmp, dest, force=False)
+    # Old check-then-rename: the racer won the window and was overwritten (dest != its bytes).
+    # New O_EXCL claim: the racer can never create the file, so nothing of theirs is lost.
+    assert not created or dest.read_bytes() == b"a human's file"
+
+
+def test_l2_design_states_the_placement_crash_story() -> None:
+    section = _design_modify_section()
+    assert "claims the name with `O_CREAT|O_EXCL`" in section
+    assert "A crash mid-move may leave aar's own partial labelled copy" in section
+    assert "never a file that was already there" in section
+
+
 # Placement failures that really happen (no patched internals): the output name is taken by a
 # directory or a dangling symlink, or a name is too long for the filesystem.
 
