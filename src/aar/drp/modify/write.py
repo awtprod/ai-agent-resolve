@@ -22,7 +22,10 @@ Order of work, and what stops it (every stop writes nothing):
 A run stopped hard between those two moves leaves a label without its file; the next run for
 the same ``--out`` refuses with ``orphan-sidecar`` and lists what to remove. Temporary files a
 stopped run left behind are listed in ``leftovers``. Nothing is ever deleted that this run did
-not create.
+not create, nor anything it cannot prove it created: what this run leaves in place for that
+reason (an empty placeholder after a failed replace, a snapshot of a label that is not aar's) is
+named in ``left_behind`` (:class:`LeftBehind`), on the outcome or on the raised
+:class:`PlacementError`.
 
 Nothing here talks to Resolve. Outputs stay ``unverified`` until the sandbox round trip (D3).
 """
@@ -38,7 +41,7 @@ import shutil
 import stat
 import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from aar import __version__
@@ -55,6 +58,8 @@ __all__ = [
     "LABEL",
     "SIDECAR_SUFFIX",
     "EditOutcome",
+    "LeftBehind",
+    "PlacementError",
     "edit_file",
     "leftovers",
 ]
@@ -71,6 +76,48 @@ DEFAULT_MAX_INPUT_BYTES = 1024 * 1024 * 1024
 # and report, each bounded by the edit count. 16 MiB is ample headroom for a real label and, read
 # on every --force, refuses a multi-hundred-MB read bomb (a 512 MiB cap cost ~13 GiB of RSS).
 _MAX_SIDECAR_BYTES = 16 * 1024 * 1024
+# A path recorded on Windows starts with a drive and a separator (``E:\``, ``E:/``) or a
+# backslash (``\\server\share``, ``\dir``). A path recorded on POSIX starts with ``/`` or is
+# relative (see _recorded_name).
+_WINDOWS_ROOT = re.compile(r"^(?:[A-Za-z]:[\\/]|\\)")
+
+
+@dataclass(frozen=True, slots=True)
+class LeftBehind:
+    """A file this run left on disk on purpose, because deleting it might destroy someone else's.
+
+    ``kind`` is one of:
+
+    * ``placeholder``: an empty regular file at the output (or label) name after ``os.replace``
+      failed on a filesystem without hard links. It is usually aar's own claim on the name, but
+      another program may have truncated it or put its own empty file there, and aar cannot tell,
+      so it is not deleted. The output is not in place and the label was removed: delete the file
+      once nothing else is writing to it, then run again.
+    * ``label-snapshot``: a hard link (else a copy) of the label ``--force`` found at
+      ``<out>.aar.json``, kept because it does not bear aar's stamp. Check it against that label,
+      then delete it.
+    """
+
+    path: str
+    kind: str
+    message: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"path": self.path, "kind": self.kind, "message": self.message}
+
+
+class PlacementError(OSError):
+    """Placing a file failed, and the failed placement left ``left_behind`` on disk.
+
+    Raised instead of the original ``OSError`` (chained as ``__cause__``, same ``errno``,
+    ``strerror`` and ``filename``) only when something was left behind.
+    """
+
+    def __init__(self, cause: OSError, left_behind: list[LeftBehind]) -> None:
+        super().__init__(*cause.args)
+        self.filename = cause.filename
+        self.filename2 = cause.filename2
+        self.left_behind = left_behind
 
 
 @dataclass(slots=True)
@@ -87,6 +134,7 @@ class EditOutcome:
     refusals: list[Refusal] = field(default_factory=list)
     gate: dict[str, Any] | None = None
     leftovers: list[str] = field(default_factory=list)
+    left_behind: list[LeftBehind] = field(default_factory=list)
 
     @property
     def refused(self) -> bool:
@@ -107,6 +155,7 @@ class EditOutcome:
             "report": self.report,
             "refusals": [r.to_dict() for r in self.refusals],
             "leftovers": self.leftovers,
+            "left_behind": [x.to_dict() for x in self.left_behind],
         }
 
 
@@ -236,20 +285,67 @@ def leftovers(out: Path) -> list[Path]:
     return sorted(out.parent / n for n in names if any(p.fullmatch(n) for p in patterns))
 
 
-def _is_our_sidecar(sidecar: Path, out: Path) -> bool:
+def _read_label(path: Path) -> bytes | None:
+    """The bytes of the regular file at ``path``, or ``None`` if it is not one or is over the cap.
+
+    One open; the size check is on that open file (``fstat``) and the read itself stops at the
+    cap plus one byte, so a label that grows after the check, or a symlink retargeted in between,
+    is refused, never read whole. ``O_NONBLOCK`` keeps a FIFO from blocking the open.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_SIDECAR_BYTES:
+            return None
+        with open(fd, "rb", closefd=False) as fh:
+            data = fh.read(_MAX_SIDECAR_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return data if len(data) <= _MAX_SIDECAR_BYTES else None
+
+
+def _recorded_name(recorded: str) -> str:
+    """The file name in a path a label records, read with the rules of the OS that wrote it.
+
+    A label written on Windows records ``E:\\dir\\out.drp`` (or a UNC path); on POSIX
+    ``Path(...).name`` would take that whole string as the name. A path that starts with ``/``
+    was written on POSIX (Windows writes its separators as backslashes), so it is read with POSIX
+    rules even on Windows, and a POSIX name that contains a backslash keeps it. A relative path
+    is read with this host's rules: ``sub\\out.drp`` is a valid POSIX name, so a label recorded
+    with a relative Windows path is still refused on POSIX. (A relative POSIX name that itself
+    starts with a backslash or with ``X:\\`` is read the Windows way, so its own label is refused
+    too.) Both err on the safe side: a refused label is left alone, never replaced.
+    """
+    if recorded.startswith("/"):
+        return PurePosixPath(recorded).name
+    if _WINDOWS_ROOT.match(recorded):
+        return PureWindowsPath(recorded).name
+    return Path(recorded).name
+
+
+def _is_our_sidecar(sidecar: Path, out: Path, read: Path | None = None) -> bool:
     """``sidecar`` is a label this tool wrote for this exact ``out`` (see DESIGN "Modify").
 
     Recognised by the stamp every ``aar drp edit`` sidecar carries: a ``tool`` field of
     ``aar <version>``, a ``label`` and ``status`` of ``unverified`` (the only states a sidecar on
     disk is ever written in), and an ``output`` object whose ``path`` and ``sidecar`` name this
-    output file and this label. ``--force`` replaces only a sidecar that bears this stamp; any
-    other file at the path is left untouched.
+    output file and this label (:func:`_recorded_name`, so a label aar wrote on Windows matches
+    on POSIX). ``--force`` replaces only a sidecar that bears this stamp; any other file at the
+    path is left untouched. ``read`` is the file to read the stamp from, when that is a snapshot
+    of the label rather than the label itself.
     """
+    data = _read_label(read if read is not None else sidecar)
+    if data is None:
+        return False
     try:
-        if not sidecar.is_file() or sidecar.stat().st_size > _MAX_SIDECAR_BYTES:
-            return False
-        record = json.loads(sidecar.read_bytes())
-    except (OSError, ValueError, RecursionError):
+        record = json.loads(data)
+    except (ValueError, RecursionError):
         return False
     if not isinstance(record, dict):
         return False
@@ -259,8 +355,8 @@ def _is_our_sidecar(sidecar: Path, out: Path) -> bool:
         and str(record.get("tool", "")).startswith("aar ")
         and record.get("label") == LABEL
         and record.get("status") == LABEL
-        and Path(str(output.get("path"))).name == out.name
-        and Path(str(output.get("sidecar"))).name == sidecar.name
+        and _recorded_name(str(output.get("path"))) == out.name
+        and _recorded_name(str(output.get("sidecar"))) == sidecar.name
     )
 
 
@@ -352,29 +448,38 @@ def _place_no_hardlink(tmp: Path, dest: Path) -> None:
     * An exclusive creator (``O_CREAT|O_EXCL``) or a check-then-create writer loses: the name is
       already held, so its create fails. This is the common case (another ``aar`` run, or any
       tool that refuses to clobber) and is what the pre-S8c check-then-rename window let through.
-    * A plain writer that does not create -- ``open(dest, "wb")``, ``cp``, Windows
+    * A plain writer that does not create exclusively -- ``open(dest, "wb")``, ``cp``, Windows
       ``CREATE_ALWAYS`` -- opens and truncates our placeholder (it exists) and writes into it; our
-      ``os.replace`` then discards those bytes. Its data is silently replaced. This is the same
-      two-adjacent-syscalls shape as the old window, for this class of writer only.
+      ``os.replace`` then discards those bytes. Its data is silently replaced. For this class of
+      writer the window runs from the exclusive create through its close to the replace (the
+      temporary's identity is read before the claim, so nothing else sits in between).
 
-    On failure the cleanup removes ``dest`` only when it is our own finished output (the temp we
-    were placing, by device+inode) or an *empty* regular file (an untouched placeholder). It never
-    deletes a non-empty file an adversary created at the name after unlinking our placeholder --
-    even if that file reused the placeholder's inode number, because we match the temp's inode, not
-    the placeholder's. A placeholder a plain writer truncated and wrote into keeps someone else's
-    bytes, so it is left alone too. (We cannot hold the placeholder's fd open across the replace to
-    settle this exactly: on Windows that fails every exFAT placement.) A crash in the window leaves
-    our own partial labelled copy (the empty placeholder, or the finished output), never a file
-    that predated the claim.
+    On a failed replace the cleanup deletes ``dest`` only when it is our finished output: the
+    temporary we were placing, matched by device+inode on ``lstat`` (an interrupt that lands after
+    a good replace). It deletes nothing else, not even an *empty* regular file. That is usually
+    our untouched placeholder, but it may be a file another writer created after deleting the
+    placeholder, or the placeholder a plain writer has truncated and not yet written to, and no
+    identity aar can record tells these apart: the inode number is reused, and a truncating open
+    of an empty file can leave its size and timestamps unchanged (a coarse kernel clock, or
+    FAT/exFAT's 2 s/10 ms resolution). So the empty file is left in place and named in the
+    raised :class:`PlacementError`'s ``left_behind`` (kind ``placeholder``). Holding the
+    placeholder's fd open across the replace would settle it, but on Windows that fails every
+    exFAT placement. A crash in the window leaves our own empty placeholder or our finished
+    output, never a file that predated the claim.
     """
-    fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)  # FileExistsError if taken
-    os.close(fd)
     try:
         tmp_id = _dev_ino(os.stat(tmp))  # after a good replace, dest carries this inode
     except OSError:
         tmp_id = None
+    fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)  # FileExistsError if taken
+    os.close(fd)
     try:
         os.replace(tmp, dest)  # cross-platform atomic replace of the placeholder we just created
+    except OSError as exc:
+        left = _unlink_if_ours(dest, tmp_id)
+        if left:
+            raise PlacementError(exc, left) from exc
+        raise
     except BaseException:
         _unlink_if_ours(dest, tmp_id)
         raise
@@ -384,16 +489,59 @@ def _dev_ino(st: os.stat_result) -> tuple[int, int]:
     return (st.st_dev, st.st_ino)
 
 
-def _unlink_if_ours(dest: Path, tmp_id: tuple[int, int] | None) -> None:
-    """Remove ``dest`` only if it is our finished output (``tmp_id``) or an empty placeholder."""
+def _unlink_if_ours(dest: Path, tmp_id: tuple[int, int] | None) -> list[LeftBehind]:
+    """Remove ``dest`` only if it is our finished output (``tmp_id``); report an empty file.
+
+    ``lstat``, so a symlink an adversary put at ``dest`` (even one pointing at our temporary) is
+    never followed or deleted; only a regular file is ever ours.
+    """
     try:
         now = os.lstat(dest)
     except OSError:
-        return
-    ours = _dev_ino(now) == tmp_id or (stat.S_ISREG(now.st_mode) and now.st_size == 0)
-    if ours:
+        return []
+    if not stat.S_ISREG(now.st_mode):
+        return []
+    if _dev_ino(now) == tmp_id:
         with contextlib.suppress(OSError):
             os.unlink(dest)
+        return []
+    if now.st_size != 0:
+        return []  # someone else's bytes
+    return [
+        LeftBehind(
+            str(dest),
+            "placeholder",
+            f"os.replace failed after aar claimed {dest.name} with an empty placeholder; the "
+            "empty file there now is probably that placeholder, but another program may have "
+            "truncated it or created its own, so aar did not delete it. The file was not placed "
+            "and has no label: delete the empty file once nothing else writes to it, then run "
+            "again",
+        )
+    ]
+
+
+def _settle_backup(backup: Path, sidecar: Path, out: Path, left: list[LeftBehind]) -> None:
+    """Delete the ``--force`` snapshot of the label, unless it no longer bears our stamp.
+
+    Runs when the edit ends, on every path. A snapshot moved back over the label (a failed
+    placement) is gone and needs nothing. A hard-linked snapshot shares the old label's file, so a
+    label written in place after the check shows up here: such a snapshot, or one that was never
+    ours (a refused run), is kept and named in ``left``, never deleted.
+    """
+    if not os.path.lexists(backup):
+        return
+    if _is_our_sidecar(sidecar, out, read=backup):
+        backup.unlink(missing_ok=True)
+        return
+    left.append(
+        LeftBehind(
+            str(backup),
+            "label-snapshot",
+            f"a hard link (or copy) of the label that was at {sidecar.name} when --force checked "
+            "it; that label does not bear aar's stamp, so this snapshot of it is kept: compare it "
+            "with the label, then delete it",
+        )
+    )
 
 
 def edit_file(
@@ -489,24 +637,28 @@ def edit_file(
         label = json.dumps(record, indent=1, ensure_ascii=True, allow_nan=False) + "\n"
         side_tmp = _temp(directory, sidecar.name, label.encode("ascii"), mode)
         stack.callback(side_tmp.unlink, missing_ok=True)
-        if force and os.path.lexists(sidecar) and not _is_our_sidecar(sidecar, out_path):
-            # The label passed the pre-check but a foreign one appeared while the edit ran; re-check
-            # just before the backup so --force never replaces a label aar did not write.
-            outcome.status = "refused"
-            outcome.output = None
-            outcome.refusals = [
-                Refusal(
-                    "foreign-sidecar",
-                    f"the label {sidecar} changed to one aar did not write while the edit ran; "
-                    "nothing was placed",
-                    details={"sidecar": str(sidecar)},
-                )
-            ]
-            return outcome
-        # With --force, the label being replaced is kept until the new file is in place.
-        backup = _backup(directory, sidecar) if force else None
-        if backup is not None:
-            stack.callback(backup.unlink, missing_ok=True)
+        backup = None
+        if force and os.path.lexists(sidecar):
+            # The label passed the pre-check, but the edit took time. Snapshot it (a hard link,
+            # else a copy) and check the SNAPSHOT for our stamp: a label that is not ours by the
+            # time of the snapshot is refused, and the snapshot is kept (_settle_backup). This
+            # narrows the window, it does not close it: rename has no compare-and-swap, so a label
+            # written as a new file after this check and before the os.replace below is lost.
+            backup = _backup(directory, sidecar)
+            if backup is not None:
+                stack.callback(_settle_backup, backup, sidecar, out_path, outcome.left_behind)
+            if backup is None or not _is_our_sidecar(sidecar, out_path, read=backup):
+                outcome.status = "refused"
+                outcome.output = None
+                outcome.refusals = [
+                    Refusal(
+                        "foreign-sidecar",
+                        f"the label {sidecar} changed to one aar did not write while the edit "
+                        "ran; nothing was placed",
+                        details={"sidecar": str(sidecar)},
+                    )
+                ]
+                return outcome
         try:
             _place(side_tmp, sidecar, force)
             try:

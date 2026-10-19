@@ -672,7 +672,8 @@ def test_l1_force_still_replaces_our_own_sidecar(tmp_path: Path) -> None:
 def test_l1_design_states_the_force_sidecar_rule() -> None:
     section = _design_modify_section()
     assert "aar did not write is refused (`foreign-sidecar`)" in section
-    assert "`--force` replaces only the output and a label bearing that stamp" in section
+    # S8d: no absolute claim; the remaining window is stated (see test_drp_modify_s8d.py).
+    assert "`--force` replaces only the output and a label bearing that stamp;" not in section
 
 
 # L2: on a filesystem without hard links (FAT/exFAT) placement used to check-then-rename, a
@@ -765,7 +766,7 @@ def test_l2_no_hardlink_place_uses_replace_not_rename(
     assert sorted(p.name for p in tmp_path.iterdir()) == ["out.drp"]  # no placeholder left
 
 
-def test_l2_no_hardlink_cleans_up_its_placeholder_on_failure(
+def test_l2_no_hardlink_leaves_and_names_its_placeholder_on_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from aar.drp.modify import write
@@ -778,9 +779,13 @@ def test_l2_no_hardlink_cleans_up_its_placeholder_on_failure(
     monkeypatch.setattr(os, "replace", boom)
     tmp = write._temp(tmp_path, "out.drp", b"ours")
     dest = tmp_path / "out.drp"
-    with pytest.raises(OSError, match="No space"):
+    with pytest.raises(write.PlacementError, match="No space") as raised:
         write._place(tmp, dest, force=False)
-    assert not dest.exists()  # the O_CREAT|O_EXCL placeholder we created was cleaned up
+    # S8d (B): an empty file at the name cannot be proven to be our placeholder, so it is left
+    # in place and named, never deleted. The error keeps the cause's errno.
+    assert dest.read_bytes() == b""
+    assert raised.value.errno == errno.ENOSPC
+    assert [(x.path, x.kind) for x in raised.value.left_behind] == [(str(dest), "placeholder")]
 
 
 def test_l2_design_states_the_placement_crash_story() -> None:
