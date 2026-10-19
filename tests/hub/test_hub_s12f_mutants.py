@@ -22,7 +22,7 @@ from aar.hub.events import Actor, EventLog
 from aar.hub.graph import WorkGraph
 from aar.hub.leaseboard import lease_board, lease_event_to_hub
 from aar.hub.registry import Registry
-from aar.node.leases import Holder, LeaseEvent, LeaseManager, Scope
+from aar.node.leases import Holder, Lease, LeaseEvent, Scope
 
 HUMAN = Actor("human", "operator-1")
 AGENT = Actor("agent", "agent-1")
@@ -219,12 +219,15 @@ def test_L03_a_lease_ttl_past_the_upper_bound_is_skipped_and_refused(hub: Hub) -
     board = lease_board(hub.log)
     assert board.leases == ()
     assert forged in {item.event_id for item in board.skipped}
-    events: list[LeaseEvent] = []
-    LeaseManager(clock=lambda: 10.0, sink=events.append).acquire(
-        Holder.agent("agent-1"), Scope.PROJECT, ("demo-show",), ttl=2e9
+    # The node's lease table refuses this ttl before granting (S11), so the event the
+    # mapper must still refuse is built directly.
+    lease = Lease(
+        "lease-1", Scope.PROJECT, ("demo-show",), Holder.agent("agent-1"), 10.0, 2e9 + 10.0, 2e9
     )
     with pytest.raises(InvalidInput, match="ttl"):
-        lease_event_to_hub(events[0], "node-1", wall_offset=NOW.timestamp() - 10.0)
+        lease_event_to_hub(
+            LeaseEvent("granted", 10.0, lease), "node-1", wall_offset=NOW.timestamp() - 10.0
+        )
 
 
 # -- A04, A05, A06: duplicate grant, double consume, revoke after use -------------------

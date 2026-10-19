@@ -21,7 +21,7 @@ from aar.hub.leaseboard import (
     record_lease_event,
     record_presence,
 )
-from aar.node.leases import Holder, LeaseEvent, LeaseManager, Scope
+from aar.node.leases import Holder, Lease, LeaseEvent, LeaseManager, Scope
 
 WALL_OFFSET = 1_800_000_000.0  # Unix time minus the node's monotonic clock
 NODE = "node-1"
@@ -594,8 +594,10 @@ def test_non_finite_lease_times_are_invalid_input_and_never_logged(
     tmp_path: Path, ttl: float, offset: float
 ) -> None:
     log = _log(tmp_path)
-    manager, _clock, events = _node()
-    manager.acquire(AGENT, Scope.PROJECT, (PROJECT,), ttl=ttl)
+    # The mapper must refuse a non-finite time from any producer. The node's own lease
+    # table refuses a non-finite ttl before granting (S11), so the lease is built directly.
+    lease = Lease("lease-1", Scope.PROJECT, (PROJECT,), AGENT, 0.0, 0.0 + ttl, ttl)
+    events = [LeaseEvent("granted", 0.0, lease)]
 
     with pytest.raises(InvalidInput):
         lease_event_to_hub(events[0], "node-1", wall_offset=offset)
