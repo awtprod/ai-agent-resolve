@@ -62,7 +62,7 @@ from aar.drp.reader import (
     MARKER_COLORS,
     join_clip_path,
 )
-from aar.drp.scan import Document, Element, scan
+from aar.drp.scan import MAX_ATTRS_PER_ELEMENT, Document, Element, scan
 
 __all__ = ["Cover", "OpaqueEngine", "Source", "Unit", "member_root"]
 
@@ -114,6 +114,29 @@ class Cover:
     mode: str
     arg: Any = None
     value: Any = None
+
+
+class _Path:
+    """Where an element sits under its unit root, as a chain of parent links.
+
+    Extending a path is O(1). The walk used to copy a tuple of every segment at each level, so a
+    chain nested ``d`` deep cost O(d**2): 12 s at 100,000 levels. The ``/``-joined text is O(d)
+    and is built only when a change is reported (:meth:`text`), so the output is unchanged.
+    """
+
+    __slots__ = ("parent", "segment")
+
+    def __init__(self, parent: _Path | None, segment: str) -> None:
+        self.parent = parent
+        self.segment = segment
+
+    def text(self) -> str:
+        parts = []
+        node: _Path | None = self
+        while node is not None:
+            parts.append(node.segment)
+            node = node.parent
+        return "/".join(reversed(parts))
 
 
 @dataclass(slots=True)
@@ -602,9 +625,9 @@ class OpaqueEngine:
             self._walk(ra, name, rb, name, unit, root=False)
             return
         if not ua:
-            self._lone(ra, name, "a", unit, (ra.tag,))
+            self._lone(ra, name, "a", unit, _Path(None, ra.tag))
         if not ub:
-            self._lone(rb, name, "b", unit, (rb.tag,))
+            self._lone(rb, name, "b", unit, _Path(None, rb.tag))
 
     def _prolog(self, name: str, da: Document, db: Document) -> None:
         """The prolog and header comment, as raw bytes; only reported stamp values are left out.
@@ -693,7 +716,7 @@ class OpaqueEngine:
         self._walk(ea, unit.a.member, eb, unit.b.member, unit, root=True)
 
     def _walk(self, ea: Element, ma: str, eb: Element, mb: str, unit: Unit, *, root: bool) -> None:
-        stack: list[tuple[Element, Element, tuple[str, ...], bool]] = [(ea, eb, (), root)]
+        stack: list[tuple[Element, Element, _Path | None, bool]] = [(ea, eb, None, root)]
         while stack:
             ca, cb, path, is_root = stack.pop()
             pushed = self._compare(ca, ma, cb, mb, unit, path, is_root)
@@ -709,10 +732,10 @@ class OpaqueEngine:
         eb: Element,
         mb: str,
         unit: Unit,
-        path: tuple[str, ...],
+        path: _Path | None,
         root: bool,
-    ) -> list[tuple[Element, Element, tuple[str, ...], bool]]:
-        here = path or (ea.tag,)
+    ) -> list[tuple[Element, Element, _Path | None, bool]]:
+        here = path if path is not None else _Path(None, ea.tag)
         if ea.tag != eb.tag:
             self._changed(unit, here, ma, ea, mb, eb, f"element <{ea.tag}> became <{eb.tag}>")
             return []
@@ -730,7 +753,7 @@ class OpaqueEngine:
         parent = (id(ea), id(eb))
         for key, ca in ka.items():
             cb = kb.get(key)
-            seg = (*path, _segment(key, ca))
+            seg = _Path(path, _segment(key, ca))
             if cb is None:
                 self._lone_child(ca, ma, "a", unit, seg, parent)
             elif ca.unit is not None:
@@ -739,13 +762,13 @@ class OpaqueEngine:
                 pushed.append((ca.el, cb.el, seg, False))
         for key, cb in kb.items():
             if key not in ka:
-                self._lone_child(cb, mb, "b", unit, (*path, _segment(key, cb)), parent)
+                self._lone_child(cb, mb, "b", unit, _Path(path, _segment(key, cb)), parent)
         return pushed
 
     def _attrs(
         self,
         unit: Unit,
-        path: tuple[str, ...],
+        path: _Path,
         ma: str,
         ea: Element,
         mb: str,
@@ -758,12 +781,17 @@ class OpaqueEngine:
             for attrs, expected in ((attrs_a, drop[0]), (attrs_b, drop[1])):
                 if expected is not None and attrs.get("DbId") == expected:
                     del attrs["DbId"]
+        unread_a = self.src["a"].doc(ma).attrs_unread_from.get(ea.start)
+        unread_b = self.src["b"].doc(mb).attrs_unread_from.get(eb.start)
+        if attrs_a == attrs_b and unread_a is None and unread_b is None:
+            return
+        data_a, data_b = self._data("a", ma), self._data("b", mb)
+        end_a, end_b = ea.inner_start or ea.end, eb.inner_start or eb.end
+        tag_a, tag_b = data_a[ea.start : end_a], data_b[eb.start : end_b]
         if attrs_a != attrs_b:
             names = sorted(
                 k for k in set(attrs_a) | set(attrs_b) if attrs_a.get(k) != attrs_b.get(k)
             )
-            tag_a = self._data("a", ma)[ea.start : ea.inner_start or ea.end]
-            tag_b = self._data("b", mb)[eb.start : eb.inner_start or eb.end]
             self._changed(
                 unit,
                 path,
@@ -774,11 +802,29 @@ class OpaqueEngine:
                 f"attribute(s) {', '.join(names)} changed",
                 part=(tag_a, tag_b),
             )
+        elif (
+            unread_a is None or unread_b is None or data_a[unread_a:end_a] != data_b[unread_b:end_b]
+        ):
+            # The scanner keeps the first MAX_ATTRS_PER_ELEMENT attributes of an element and not the
+            # rest, so the dicts above can be equal while the elements are not. The attributes it
+            # did not keep are compared as raw bytes, from where the first unread one begins to
+            # the end of the start tag (an element that is cut on one side only always differs).
+            self._changed(
+                unit,
+                path,
+                ma,
+                ea,
+                mb,
+                eb,
+                f"attributes past the first {MAX_ATTRS_PER_ELEMENT} differ "
+                "(they are compared as raw bytes, not by name)",
+                part=(tag_a, tag_b),
+            )
 
     def _loose(
         self,
         unit: Unit,
-        path: tuple[str, ...],
+        path: _Path,
         ma: str,
         ea: Element,
         mb: str,
@@ -820,7 +866,7 @@ class OpaqueEngine:
         return out
 
     def _unit_child(
-        self, ca: _Child, ma: str, cb: _Child, mb: str, unit: Unit, path: tuple[str, ...]
+        self, ca: _Child, ma: str, cb: _Child, mb: str, unit: Unit, path: _Path
     ) -> None:
         """The same unit under both parents: compare its ``<Element>`` wrapper, not the unit."""
         if ca.wrapper != cb.wrapper:
@@ -837,7 +883,7 @@ class OpaqueEngine:
         member: str,
         side: str,
         unit: Unit,
-        path: tuple[str, ...],
+        path: _Path,
         parent: tuple[int, int],
     ) -> None:
         if child.unit is None:
@@ -879,9 +925,7 @@ class OpaqueEngine:
         found += self.covers[side].get((member, el.start, el.end), [])
         return found
 
-    def _leaf(
-        self, ea: Element, ma: str, eb: Element, mb: str, unit: Unit, path: tuple[str, ...]
-    ) -> None:
+    def _leaf(self, ea: Element, ma: str, eb: Element, mb: str, unit: Unit, path: _Path) -> None:
         ia, ib = ea.inner_raw, eb.inner_raw
         if ia == ib:
             return
@@ -912,7 +956,7 @@ class OpaqueEngine:
         ra, rb = _residue(mode, ia, ca), _residue(mode, ib, cb)
         return ra is not None and rb is not None and _same_residue(ra, rb)
 
-    def _lone(self, el: Element, member: str, side: str, unit: Unit, path: tuple[str, ...]) -> None:
+    def _lone(self, el: Element, member: str, side: str, unit: Unit, path: _Path) -> None:
         """A plain element on one side only (units inside it are compared on their own)."""
         if not el.children:
             covers = self._covers(side, member, el)
@@ -925,7 +969,7 @@ class OpaqueEngine:
     def _presence(
         self,
         unit: Unit,
-        path: tuple[str, ...],
+        path: _Path,
         member: str,
         el: Element,
         side: str,
@@ -938,12 +982,13 @@ class OpaqueEngine:
         prov = Provenance(member, el.start, el.end, "element")
         verb = "removed" if side == "a" else "added"
         reason = f"; {why}" if why else ""
+        where_path = path.text()
         self.out.append(
             unit.ctx.change(
                 "opaque",
                 f"opaque-{verb}",
-                f"opaque <{'/'.join(path)}> {verb} ({size} bytes, {member} @{el.start}){reason}",
-                field_name="/".join(path),
+                f"opaque <{where_path}> {verb} ({size} bytes, {member} @{el.start}){reason}",
+                field_name=where_path,
                 where_a=prov if side == "a" else None,
                 where_b=prov if side == "b" else None,
                 byte_count=size,
@@ -967,7 +1012,7 @@ class OpaqueEngine:
             return
         self._presence(
             unit,
-            (el.tag,),
+            _Path(None, el.tag),
             prov.member,
             el,
             side,
@@ -977,7 +1022,7 @@ class OpaqueEngine:
     def _changed(
         self,
         unit: Unit,
-        path: tuple[str, ...],
+        path: _Path,
         ma: str,
         ea: Element,
         mb: str,
@@ -1007,13 +1052,14 @@ class OpaqueEngine:
             wb = Provenance(mb, eb.start, eb.end, "element")
         count, first = _diff_size(xa, xb)
         where = f"{ma} @{wa.start}" if ma == mb else f"{ma} @{wa.start} / {mb} @{wb.start}"
+        where_path = path.text()
         self.out.append(
             unit.ctx.change(
                 "opaque",
                 "opaque-changed",
-                f"opaque <{'/'.join(path)}> changed: {count} of {max(len(xa), len(xb))} bytes "
+                f"opaque <{where_path}> changed: {count} of {max(len(xa), len(xb))} bytes "
                 f"differ from byte {first}; {why} ({where})",
-                field_name="/".join(path),
+                field_name=where_path,
                 where_a=wa,
                 where_b=wb,
                 byte_count=count,

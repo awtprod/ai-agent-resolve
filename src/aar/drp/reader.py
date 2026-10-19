@@ -47,13 +47,33 @@ __all__ = [
     "read_drp",
 ]
 
-# Per-file budgets. The private corpus maxima are 311,727 elements and 30.95 MB of XML in one
-# file (and 20.8 MB of decompressed blobs, see blobs.DEFAULT_MAX_TOTAL_OUTPUT). A scanned
-# element costs about 300 bytes of resident memory (measured with tracemalloc and RSS on a
-# "<a/>" bomb: 3M elements peak at ~0.9 GB, 6M at ~1.8 GB), so it is the element budget, not
-# the byte budgets, that bounds a zip bomb's memory. 3M keeps the worst case under ~1 GB and is
-# still about 9.6x the corpus maximum, so real projects are read whole. The XML budget stays
-# about 20x its corpus maximum. All of these are overridable per call in :func:`read_drp`.
+# Per-file budgets. The element budget counts every scanner token (start and end tags,
+# comments, PIs, CDATA, declarations, lone "<") and every attribute, summed over the members of
+# one file. The private corpus maxima in one file are 566,413 such tokens (547,801 before
+# attributes were counted), 30.95 MB of XML and 20.8 MB of decompressed blobs (see
+# blobs.DEFAULT_MAX_TOTAL_OUTPUT). 3M tokens is about 5.3x the token maximum, so real projects
+# are read whole; 600 MiB of XML is about 20x.
+#
+# Memory is NOT bounded by the token budget alone. A token costs 300 to 400 bytes of resident
+# memory with short names and about 750 with 168-character ones, and the byte caps (512 MiB per
+# member, 600 MiB per file) let one member carry a few hundred MB of text, names or values on
+# top of that. Measured peak RSS of `aar drp inspect` on a hostile file at the tip (a 530 MB
+# member where bytes matter, the 3M token budget where tokens do), in MB:
+#   20M "<a/>" (stops at 3M)    985    3.2M nested open elements        1161
+#   530 MB unterminated tag    1048    530 MB text or attribute value   1554
+#   101 x 5M-char attr name    1958    530 MB of ProjectName text       2060
+#   3.1M nested, 168-char names 2314   530 MB text with one 4-byte char 3070
+#   530 MB ProjectName, or one attribute value, with one 4-byte char    3578
+# so the worst case is about 3.6 GB (3578 MB), not 1.2 GB. One character outside the BMP is
+# enough: CPython then stores the whole str at 4 bytes per character, so every decode of the
+# 530 MB member or of a 530 MB name or value is a 2.1 GB copy. The first is the UTF-8 validity
+# check in the scanner (`data.decode`), which holds that copy next to the member bytes and the
+# zip read buffer (about 1.0 GB of its own); measured stage by stage, a read of such a file is
+# at 1.0 GB after the zip read, 3.0 GB after the check and 3.6 GB after the name or value is
+# decoded as well. fbfdcc5 peaks the same for a name (3578) and higher for an attribute value
+# (4083), so this is not new. The token and XML-byte budgets are per-file totals, so they bound
+# the sum over members, not each member separately. All of these limits are overridable per
+# call in :func:`read_drp`.
 DEFAULT_MAX_ELEMENTS = 3_000_000
 DEFAULT_MAX_TOTAL_XML_BYTES = 600 * 1024 * 1024
 DEFAULT_MAX_ISSUES_PER_CODE = 100

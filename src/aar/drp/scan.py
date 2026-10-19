@@ -18,17 +18,15 @@ from dataclasses import dataclass, field
 
 __all__ = ["Document", "Element", "ScanIssue", "parse_int", "scan", "unescape"]
 
-# Start and end tags are matched with anchored regexes; comments, CDATA, processing
-# instructions and declarations are found with bytes.find so a hostile member (for example
-# thousands of unterminated "<!--") is scanned in linear time.
-_START = re.compile(
-    rb"""
-    <(?P<start>[^\s<>/!?][^\s<>/]*)
-     (?P<attrs>(?:\s+[^\s<>=/]+\s*=\s*(?:"[^"]*"|'[^']*'))*)
-     \s*(?P<close>/?)>
-    """,
-    re.X,
-)
+# A start tag is read piece by piece -- the name, then one attribute at a time, then the
+# closing ">" -- never with one regex over the whole tag. The old single regex buffered the
+# entire attribute run (a 10M-attribute tag peaked at several GB) and, on a tag with no
+# terminator, restarted at every "<" inside a quoted value (quadratic). Each attribute is also
+# charged against the budget. End tags, comments, CDATA, PIs and declarations are found by
+# bytes.find; with this, every byte is examined a bounded number of times.
+_NAME_AT = re.compile(rb"<(?P<start>[^\s<>/!?][^\s<>/]*)")
+_ATTR_AT = re.compile(rb"""\s+(?P<name>[^\s<>=/]+)\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)')""")
+_TAGCLOSE_AT = re.compile(rb"\s*(?P<close>/?)>")
 _END = re.compile(rb"</(?P<end>[^\s<>]+)\s*>")
 _DELIMITED: tuple[tuple[bytes, bytes, str], ...] = (
     (b"<!--", b"-->", "comment"),
@@ -38,7 +36,11 @@ _DELIMITED: tuple[tuple[bytes, bytes, str], ...] = (
 )
 _MAX_INT_DIGITS = 20
 _MAX_ISSUES_PER_CODE = 100
-_ATTR = re.compile(rb"""([^\s<>=/]+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
+# Attributes past this many on a single element are charged against the budget but not stored,
+# so one element with millions of attributes cannot grow an unbounded dict. Far above any real
+# element (corpus maximum is a handful), so decoded models are unaffected. An element that goes
+# past it is never silent: it carries an ``attributes-truncated`` issue (see ``scan``).
+MAX_ATTRS_PER_ELEMENT = 4096
 _ENTITY = re.compile(r"&(lt|gt|amp|quot|apos|#[0-9]+|#x[0-9a-fA-F]+);")
 _NAMED = {"lt": "<", "gt": ">", "amp": "&", "quot": '"', "apos": "'"}
 
@@ -226,21 +228,16 @@ class Document:
     """Bytes examined plus tag-match attempts: a deterministic measure of scanning effort."""
     stopped_at: int | None = None
     """Offset where scanning stopped because the element budget ran out, else ``None``."""
+    attrs_unread_from: dict[int, int] = field(default_factory=dict)
+    """For each element that kept only its first ``MAX_ATTRS_PER_ELEMENT`` attributes (the ones
+    that also carry an ``attributes-truncated`` issue): its ``start`` offset -> the offset in
+    ``data`` where its first unread attribute begins. A diff compares the bytes from there to the
+    end of the start tag, because the attributes in them are not in ``Element.attrs``. At most one
+    entry per ``MAX_ATTRS_PER_ELEMENT`` + 1 charged attributes, so it is tiny next to the tree."""
 
     @property
     def root(self) -> Element | None:
         return self.roots[0] if self.roots else None
-
-
-def _decode_attrs(blob: bytes, offset: int, issues: list[ScanIssue]) -> dict[str, str]:
-    attrs: dict[str, str] = {}
-    for m in _ATTR.finditer(blob):
-        value = m.group(2) if m.group(2) is not None else m.group(3)
-        name = m.group(1).decode("utf-8", errors="replace")
-        if name in attrs:
-            issues.append(ScanIssue("duplicate-attribute", offset, f"attribute {name!r} repeated"))
-        attrs[name] = unescape(value.decode("utf-8", errors="replace"))
-    return attrs
 
 
 class _IssueLog(list[ScanIssue]):
@@ -275,12 +272,25 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
     Scanning stops with a ``budget-exceeded`` issue before node number ``max_elements + 1`` is
     materialised (``max_elements`` counts every token, not only start elements; see
     ``Document.element_count``); what was scanned so far is kept and open elements are closed at
-    the end of the member. The scan is linear in ``len(data)``; ``Document.work`` measures it.
+    the end of the member. Attributes are charged too (one each), and an element keeps at most
+    4096 of them; an element with more gets one ``attributes-truncated`` issue (with the exact
+    count), so a reader can warn and a diff gate can refuse rather than compare a prefix;
+    ``Document.attrs_unread_from`` says where its unread attributes begin, so a plain diff can
+    compare those bytes instead of reporting the two elements as the same.
+    Attribute names and values are decoded only after the tag's closing ``>`` has matched.
+
+    Time is linear in ``len(data)``: a start tag is read one attribute at a time and a tag with
+    no closing ``>`` is skipped past, never re-read. Measured on the worst shapes tried: 240 KB
+    of ``<`` inside quoted values in one unterminated tag takes 0.09 s (the previous
+    single-regex scanner needed 145 s), and 3M tokens take 1.5 to 11 s. ``Document.work``
+    counts bytes and match attempts, not the work inside one regex match, so it would not have
+    shown that quadratic cost; ``tests/drp/test_drp_s1h4_scanner.py`` guards it by timing.
     """
     issues = _IssueLog()
     work = 0
     element_count = 0
     stopped_at: int | None = None
+    attrs_unread_from: dict[int, int] = {}
     comments: list[tuple[int, int, str]] = []
     roots: list[Element] = []
     stack: list[Element] = []
@@ -356,20 +366,17 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
             if kind == "cdata" and stack:
                 text_seen[-1] = True
             continue
-        m = _END.match(data, lt) if nxt == b"/" else _START.match(data, lt)
-        work += 1 if m is None else m.end() - lt
-        if m is None:
-            # Not markup the scanner understands. Charge it, then leave it in the pending text
-            # so the next gap() reports a run of such "<" once rather than once per character.
+        if nxt == b"/":
+            m = _END.match(data, lt)
+            work += 1 if m is None else m.end() - lt
+            if m is None:
+                element_count += 1
+                cursor = lt + 1
+                continue
+            gap(pos, m.start())
+            pos = cursor = m.end()
             element_count += 1
-            cursor = lt + 1
-            continue
-        gap(pos, m.start())
-        pos = cursor = m.end()
-        element_count += 1
-        end_name = m.group("end") if m.re is _END else None
-        if end_name is not None:
-            tag = end_name.decode("utf-8", errors="replace")
+            tag = m.group("end").decode("utf-8", errors="replace")
             if stack and stack[-1].tag == tag:
                 el, had_text = pop()
                 _close(el, had_text, m.start(), m.end(), issues)
@@ -384,24 +391,108 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
                 msg = f"</{tag}> has no open element"
                 issues.append(ScanIssue("stray-end-tag", m.start(), msg))
             continue
-        # Start or self-closing tag.
-        tag = m.group("start").decode("utf-8", errors="replace")
-        attrs = _decode_attrs(m.group("attrs"), m.start(), issues) if m.group("attrs") else {}
-        closed = m.group("close") == b"/"
+        # Start or self-closing tag: match the name, then read attributes one at a time until
+        # the closing ">". Each attribute is charged, so a tag with millions of them trips the
+        # budget, and nothing re-scans the attribute run, so a tag with no terminator is linear.
+        mname = _NAME_AT.match(data, lt)
+        if mname is None:
+            work += 1
+            element_count += 1
+            cursor = lt + 1
+            continue
+        # Attribute matches are only *recorded* while the tag is read: a Match holds spans into
+        # ``data``, not copies, so a tag that never closes (``<a b="`` followed by hundreds of MB)
+        # costs nothing beyond the gap it leaves. Names and values are decoded once the closing
+        # ">" has matched. At most ``MAX_ATTRS_PER_ELEMENT`` are kept; the rest are charged
+        # against the budget and counted, and the element then carries an
+        # ``attributes-truncated`` issue (the reader turns any scan issue into a warning, so a
+        # diff gate refuses the file instead of comparing only the attributes that were kept).
+        found_attrs: list[re.Match[bytes]] = []
+        attrs_over = 0
+        p = mname.end()
+        closed: bool | None = None
+        over_budget = False
+        while True:
+            if max_elements is not None and element_count >= max_elements:
+                over_budget = True
+                break
+            mc = _TAGCLOSE_AT.match(data, p)
+            if mc is not None:
+                closed = mc.group("close") == b"/"
+                p = mc.end()
+                break
+            ma = _ATTR_AT.match(data, p)
+            if ma is None:  # neither the closing ">" nor another attribute: unterminated tag
+                break
+            if len(found_attrs) < MAX_ATTRS_PER_ELEMENT:
+                found_attrs.append(ma)
+            else:
+                attrs_over += 1
+            element_count += 1
+            p = ma.end()
+        work += p - lt
+        if over_budget:
+            stopped_at = lt
+            msg = f"node budget of {max_elements} reached; the rest of the member is not read"
+            issues.append(ScanIssue("budget-exceeded", lt, msg))
+            pos = len(data)
+            break
+        if closed is None:
+            # Unterminated start tag: the text stays in the gap, which reports it as unparsed
+            # markup. Skip past what was scanned (never rewind to lt + 1, which would re-read the
+            # attribute run at every inner "<" -- quadratic). Nothing was decoded, and the
+            # recorded matches are dropped before the gap is ever copied.
+            found_attrs = []
+            element_count += 1
+            cursor = max(p, lt + 1)
+            continue
+        gap(pos, lt)
+        attrs: dict[str, str] = {}
+        # Repeated attribute names are reported (after the text before the tag, as before). Keep
+        # at most the per-code cap of names: more would be dropped by the issue log anyway, and a
+        # tag may repeat one name thousands of times.
+        repeated: list[str] = []
+        repeated_extra = 0
+        for ma in found_attrs:
+            name = ma.group("name").decode("utf-8", errors="replace")
+            raw = ma.group("dq") if ma.group("dq") is not None else ma.group("sq")
+            if name in attrs:
+                if len(repeated) < _MAX_ISSUES_PER_CODE:
+                    repeated.append(name)
+                else:
+                    repeated_extra += 1
+            attrs[name] = unescape(raw.decode("utf-8", errors="replace"))
+        kept_end = found_attrs[-1].end() if attrs_over else 0
+        found_attrs = []
+        for name in repeated:
+            issues.append(ScanIssue("duplicate-attribute", lt, f"attribute {name!r} repeated"))
+        for _ in range(repeated_extra):  # past the cap: counted, never listed
+            issues.append(ScanIssue("duplicate-attribute", lt, "attribute repeated"))
+        if attrs_over:
+            total = MAX_ATTRS_PER_ELEMENT + attrs_over
+            msg = (
+                f"element has {total} attributes; only the first {MAX_ATTRS_PER_ELEMENT} "
+                "were read, so attribute changes past that point cannot be seen"
+            )
+            issues.append(ScanIssue("attributes-truncated", lt, msg))
+            attrs_unread_from[lt] = kept_end
+        pos = cursor = p
+        element_count += 1
+        tag = mname.group("start").decode("utf-8", errors="replace")
         el = Element(
             tag=tag,
             attrs=attrs,
-            start=m.start(),
-            end=m.end(),
-            inner_start=None if closed else m.end(),
-            inner_end=None if closed else m.end(),
+            start=lt,
+            end=p,
+            inner_start=None if closed else p,
+            inner_end=None if closed else p,
             _data=data,
         )
         if stack:
             stack[-1].children.append(el)
         else:
             if roots:
-                issues.append(ScanIssue("extra-root", m.start(), f"second root element <{tag}>"))
+                issues.append(ScanIssue("extra-root", lt, f"second root element <{tag}>"))
             roots.append(el)
         if not closed:
             push(el)
@@ -421,6 +512,7 @@ def scan(data: bytes, member: str = "", *, max_elements: int | None = None) -> D
         element_count=element_count,
         work=work,
         stopped_at=stopped_at,
+        attrs_unread_from=attrs_unread_from,
     )
 
 
