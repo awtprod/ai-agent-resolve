@@ -47,13 +47,18 @@ __all__ = [
     "read_drp",
 ]
 
-# Per-file budgets. The private corpus maxima are 311,727 elements and 30.95 MB of XML in one
-# file (and 20.8 MB of decompressed blobs, see blobs.DEFAULT_MAX_TOTAL_OUTPUT). A scanned
-# element costs about 300 bytes of resident memory (measured with tracemalloc and RSS on a
-# "<a/>" bomb: 3M elements peak at ~0.9 GB, 6M at ~1.8 GB), so it is the element budget, not
-# the byte budgets, that bounds a zip bomb's memory. 3M keeps the worst case under ~1 GB and is
-# still about 9.6x the corpus maximum, so real projects are read whole. The XML budget stays
-# about 20x its corpus maximum. All of these are overridable per call in :func:`read_drp`.
+# Per-file budgets. The element budget counts every scanner token (start and end tags,
+# comments, PIs, CDATA, declarations, lone "<") and every attribute, summed over the members of
+# one file. The private corpus maxima in one file are 566,892 such tokens (548,251 before
+# attributes were counted), 30.95 MB of XML and 20.8 MB of decompressed blobs (see
+# blobs.DEFAULT_MAX_TOTAL_OUTPUT). 3M tokens is about 5.3x the token maximum, so real projects
+# are read whole; 600 MiB of XML is about 20x. Memory is bounded by the token budget, not the
+# byte budgets: a token costs about 300 to 400 bytes of resident memory, depending on the
+# shape of the input. Measured peak RSS of a scan that runs into the 3M budget:
+#   3M "<a/>" tokens        0.90 GB     3M nested open elements   1.17 GB (worst shape)
+#   1M elements, 2 attrs    0.56 GB     150K elements, 19 attrs   0.31 GB
+#   one tag, 10M attrs      0.30 GB     3.5M comments             0.46 GB
+# so the worst case is about 1.2 GB. All of these are overridable per call in :func:`read_drp`.
 DEFAULT_MAX_ELEMENTS = 3_000_000
 DEFAULT_MAX_TOTAL_XML_BYTES = 600 * 1024 * 1024
 DEFAULT_MAX_ISSUES_PER_CODE = 100
