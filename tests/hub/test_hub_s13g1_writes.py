@@ -722,6 +722,31 @@ def test_clean_plan_is_stored_pending_with_its_artifact_and_summary(hub: Hub) ->
     assert result.body["node"]["title"] == f"plan v{parsed.version}: {parsed.timeline}"
 
 
+def test_a_plan_without_a_version_gets_the_current_one_explicitly(hub: Hub) -> None:
+    """Version-agnostic: whatever version aar.plan defaults to is what the node records."""
+    from aar.plan.model import PLAN_VERSION
+
+    plan = plan_fixture("short_clean")
+    del plan["version"]
+    result = writes.submit_plan(
+        hub.log,
+        hub.store,
+        hub.project_id,
+        plan,
+        AGENT,
+        derives_from=_brief(hub),
+        idempotency_key="nov",
+    )
+    data = result.body["node"]["payload"]
+    assert data["plan_version"] == PLAN_VERSION
+    stored = json.loads(hub.store.read_bytes(data["plan_sha256"]))
+    assert stored["version"] == PLAN_VERSION  # the canonical form spells it out
+    assert hub.store.get_meta(data["plan_sha256"]).meta == {
+        "schema": "aar.edit-plan",
+        "version": PLAN_VERSION,
+    }
+
+
 def test_plan_with_lint_errors_is_stored_blocked_errors_first(hub: Hub) -> None:
     _, report = _lint_of("short_broken")
     assert report.counts["error"] > 0
