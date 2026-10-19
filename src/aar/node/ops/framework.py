@@ -544,6 +544,22 @@ def _branch_refusal(
     return None
 
 
+def as_op_error(exc: Exception) -> OpError:
+    """``exc`` as an :class:`OpError`: itself, a ``GatewayError``'s code and message, or
+    ``resolve_call_failed`` for anything else a Resolve call raised. An op that must report
+    what it applied before a failure (``markers.mirror_review``) wraps every failure this
+    way, so a raise is never left without its ``applied``."""
+    if isinstance(exc, OpError):
+        return exc
+    if isinstance(exc, GatewayError):
+        return OpError(exc.code, exc.message, "see the gateway message")
+    return OpError(
+        "resolve_call_failed",
+        f"a Resolve call raised {type(exc).__name__}: {exc}",
+        "re-run once Resolve answers; the error's detail says what was applied",
+    )
+
+
 def _execute(
     spec: OpSpec,
     gateway: ResolveGateway,
@@ -559,7 +575,7 @@ def _execute(
     try:
         result = spec._body(env, params)
     except GatewayError as exc:
-        raise OpError(exc.code, exc.message, "see the gateway message") from exc
+        raise as_op_error(exc) from exc
     if not isinstance(result, spec.result):
         raise TypeError(f"op {spec.name} returned {type(result).__name__}, not {spec.result}")
     return result

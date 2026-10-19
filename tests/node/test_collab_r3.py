@@ -351,10 +351,14 @@ def test_a_move_whose_old_delete_fails_reports_the_add() -> None:
         "added": [{"note_id": "n1", "frame": 40}],
         "deleted": [],
     }
-    # Both markers are there, as reported; a re-run refuses rather than guess which is right.
+    # Both markers are there, as reported. A re-run of the same request recognises its own
+    # half-finished move (the marker at 40 already is the note as asked) and finishes it by
+    # deleting the stale one at 10 (S11f LOW 5).
     assert set(tl.markers) == {10, 40}
     again = _mirror(show, tl, [_note("n1", 40, "a")])
-    assert again.error.code == "duplicate_marker_custom_data"
+    assert again.status is OpStatus.OK, again.error
+    assert [(m.note_id, m.frame) for m in again.value.cleared] == [("n1", 10)]
+    assert _marks(tl) == {40: (_cd("n1"), "a")}
 
 
 def test_a_human_marker_landing_mid_run_is_reported_and_kept() -> None:
