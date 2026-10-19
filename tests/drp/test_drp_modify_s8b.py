@@ -737,6 +737,24 @@ def test_l2_no_hardlink_place_never_overwrites_a_racing_create(
     assert not created or dest.read_bytes() == b"a human's file"
 
 
+def test_l2_no_hardlink_cleans_up_its_placeholder_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aar.drp.modify import write
+
+    monkeypatch.setattr(os, "link", _no_hardlinks)  # force the no-hardlink path
+
+    def boom(src: str, dst: str) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "rename", boom)
+    tmp = write._temp(tmp_path, "out.drp", b"ours")
+    dest = tmp_path / "out.drp"
+    with pytest.raises(OSError, match="No space"):
+        write._place(tmp, dest, force=False)
+    assert not dest.exists()  # the O_CREAT|O_EXCL placeholder we created was cleaned up
+
+
 def test_l2_design_states_the_placement_crash_story() -> None:
     section = _design_modify_section()
     assert "claims the name with `O_CREAT|O_EXCL`" in section
