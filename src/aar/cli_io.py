@@ -71,30 +71,38 @@ def emit(prog: str, text: str) -> int:
     return 0
 
 
-def _flush(stream: TextIO | None) -> int:
+def _flush(stream: TextIO | None, prog: str | None = None) -> int:
     """Flush a std stream; return 0, 141 (broken pipe) or 74 (closed/full/failing). Silences
-    the stream on failure so the interpreter's own exit-time flush cannot fail (exit 120)."""
+    the stream on failure so the interpreter's own exit-time flush cannot fail (exit 120).
+    With ``prog``, a 74 also puts the standard one-line reason on stderr (141 stays quiet)."""
     if stream is None:
+        if prog is not None:
+            warn(f"{prog}: stdout is closed; nothing written")
         return EXIT_OUTPUT_ERROR
     try:
         stream.flush()
     except BrokenPipeError:
         _silence(stream)
         return EXIT_PIPE_CLOSED
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
         _silence(stream)
+        if prog is not None:
+            warn(f"{prog}: cannot write output: {exc}")
         return EXIT_OUTPUT_ERROR
     return 0
 
 
-def finalize(code: int) -> int:
+def finalize(code: int, prog: str = "aar") -> int:
     """Flush stdout and stderr after a path that wrote with bare ``print`` (argparse help,
-    usage and version). A failed stdout flush overrides the exit code with 74/141; a failed
-    stderr flush is silenced but leaves the code. Either way no exit-120 flush failure.
+    usage and version); return the exit code. Never an exit-120 flush failure.
 
-    A closed stdout (``sys.stdout is None``) overrides only a success: help and version are
-    meant for stdout, so they report 74, but a usage error (exit 2) goes to stderr and keeps
-    its code, as every other command's input error does with a closed stdout."""
-    out = _flush(sys.stdout) if sys.stdout is not None or code == 0 else 0
+    A non-zero ``code`` always wins: a usage error (2) stays 2 whatever state stdout and stderr
+    are in. That includes stdout closed or full, where a drp input error also stays 2, and
+    stderr closed, where argparse prints its usage text to stdout instead (``print_usage(None)``
+    falls back to ``sys.stdout``) and that flush fails. Only a success (``code`` 0) is overridden,
+    by 74 (stdout closed, full or failing, with the same ``prog: cannot write output: ...`` line
+    on stderr as every other command prints) or 141 (the reader went away, quiet). A failed
+    stderr flush is silenced and never changes the code."""
+    out = _flush(sys.stdout, prog if code == 0 else None)
     _flush(sys.stderr)
-    return out or code
+    return code or out
