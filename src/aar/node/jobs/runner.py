@@ -8,24 +8,38 @@ A pump has three phases, in this order, so a stop is honoured before anything ru
 
 1. **Stop check** (DESIGN R5, §5): a job whose project or node is stopped is paused at its
    checkpoint as ``waiting`` and its queued op is cancelled, BEFORE the broker runs anything.
-2. **Run the broker** off the pump thread, with a deadline, so a hung gateway call cannot
-   block the pump or a concurrent read, and the watchdog can still stall it.
-3. **Advance** each job: resolve its op's result and submit its next op; then the watchdog
+2. **Run the broker** off the pump thread. Exactly one drain runs at a time (concurrent pumps
+   share it), and it ticks the broker on every pump -- also when the queue is empty, which is
+   how the broker restores the human's project, timeline and page once the agents are done.
+   The pump waits for the drain up to ``drain_budget`` seconds (``None``: until it finishes),
+   so a hung gateway call cannot block the pump and the watchdog can still stall the job. A
+   broker crash on the drain thread is logged and recorded on the affected jobs.
+3. **Advance** each job: collect its op's result (a result that came back is never dropped, not
+   even when a stop landed while the op ran), then submit its next op; then the watchdog
    stalls any job whose op or step ran past its (pausable, persisted) deadline.
 
+Every op the runner submits carries a broker *precheck* (the emergency stop and "does the job
+still want this op"), asked right before the op runs, so a stop takes effect between ops even
+inside one broker batch; and a *journal* (:mod:`aar.node.ops.journal`) through which a render
+build records each side effect on the job's checkpoint as it happens, so a crash, a stop or a
+cancel can never duplicate or silently orphan a render.
+
 Gates around a step: the emergency stop (above), the F15 approval gate (the first mutating op
-against a production project consumes a human token at the moment of the write and is verified
-against the hub), and a per-project render lock (one agent render per Resolve project at a
-time).
+against a production project consumes a human token at the moment of the write; the consume is
+bound to the job and verified against the hub), and a per-project render lock (one agent
+render per Resolve project at a time).
 """
 
 from __future__ import annotations
 
-import contextlib
+import functools
+import logging
+import math
 import threading
 import time
+import traceback
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
@@ -33,11 +47,13 @@ from pydantic import BaseModel, ValidationError
 from aar.hub.approvals import ApprovalError, ApprovalScope
 from aar.hub.control import Stopped
 from aar.hub.events import Actor
-from aar.node.broker import Broker, HotOpFailure
+from aar.node.broker import Broker, HotOp, HotOpFailure, OpResult, OpStatus
+from aar.node.broker import OpError as BrokerOpError
 from aar.node.hublink import HubLink
 from aar.node.leases import Clock, Holder
 from aar.node.locator import ProjectLocator
-from aar.node.ops import get_op, submit_op
+from aar.node.ops import get_op, make_hot_op
+from aar.node.ops.journal import op_journal
 
 from .kinds import get_kind
 from .model import (
@@ -53,12 +69,36 @@ from .model import (
     Submit,
     WaitReason,
 )
+from .render import live_render_id
 from .store import JobRecord, JobStore
 from .watchdog import Watchdog, WatchdogConfig
 
+_log = logging.getLogger(__name__)
+
 _APPROVAL_SCOPE = ApprovalScope.PROJECT_WRITE
 _DRAIN_BUDGET = 0.5
-"""Real seconds a pump waits for the broker to finish an op before leaving it to the watchdog."""
+"""Real seconds a pump waits for the broker to finish before leaving a hung op to the watchdog."""
+DEFAULT_MAX_RESTARTS = 5
+"""Node restarts that may interrupt one running step before the job is stalled (P5b)."""
+
+_drain_delay = 0.0
+"""TEST-ONLY: seconds every drain sleeps before it ticks. Set above ``_DRAIN_BUDGET`` to prove
+no test depends on the drain finishing inside the wall-clock budget (``AAR_TEST_DRAIN_DELAY``,
+see ``tests/node/conftest.py``). Always 0 in production."""
+
+_NOT_RUN = frozenset({"emergency_stop", "job_inactive", "project_stalled"})
+"""Precheck refusals: the op never ran, so the step re-issues it later (not a failure)."""
+
+_JOURNALED_EVENTS = frozenset({"added", "started", "deleted", "orphaned", "restore_failed"})
+"""Journal entries that also become job events (a handful per build: bounded)."""
+
+_NOT_A_STATE = frozenset(
+    {"build_started", "snapshot_recovered", "snapshot_deleted", "restore_failed"}
+)
+"""Journal entries that record a fact without moving the build's ``state``."""
+
+_RENDER_ENDED = frozenset({"render_failed", "render_job_unknown"})
+"""Failure codes after which the job's render is known to be over (no orphan alert)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +162,8 @@ class JobView:
     created_at: float
     updated_at: float
     events: list[dict[str, Any]]
+    alerts: list[dict[str, Any]]
+    """Things a human must look at (an orphaned render, Deliver not restored ...)."""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -139,6 +181,8 @@ class _Runtime:
     """Clock time the current step's countdown last (re)started; ``None`` while paused."""
     op_outcome: OpOutcome | None = None
     quarantined: bool = False
+    broker_error: dict[str, Any] | None = None
+    """The last broker crash seen while this job's op was outstanding (the stall's cause)."""
 
 
 class JobRunner:
@@ -156,10 +200,15 @@ class JobRunner:
         actor: Actor | None = None,
         approval: ApprovalPolicy | None = None,
         watchdog: Watchdog | None = None,
-        drain_budget: float = _DRAIN_BUDGET,
+        drain_budget: float | None = _DRAIN_BUDGET,
+        max_restarts: int = DEFAULT_MAX_RESTARTS,
     ) -> None:
         if not node_id:
             raise ValueError("a job runner needs a non-empty node_id")
+        if drain_budget is not None and not (math.isfinite(drain_budget) and drain_budget > 0):
+            raise ValueError("drain_budget must be a positive number of seconds, or None")
+        if max_restarts < 0:
+            raise ValueError("max_restarts must not be negative")
         self.broker = broker
         self.store = store
         self.hublink = hublink
@@ -169,13 +218,20 @@ class JobRunner:
         self.actor = actor or Actor("node", node_id)
         self.policy = approval or ApprovalPolicy()
         self.watchdog = watchdog or Watchdog(WatchdogConfig())
+        self.max_restarts = max_restarts
         self._drain_budget = drain_budget
         self._lock = threading.RLock()
         self._jobs: dict[str, JobRecord] = {}
         self._runtime: dict[str, _Runtime] = {}
         self._stalled_projects: set[str] = set()
         self._render_inflight: dict[str, str] = {}  # project_id -> job_id holding the render slot
+        self._abandoned: set[str] = set()  # op ids a terminal job dropped while they ran
+        self._late: dict[str, str] = {}  # abandoned op id -> job id, until its result lands
+        self._drain_lock = threading.Lock()
         self._drain_thread: threading.Thread | None = None
+        self._drain_done: threading.Event | None = None
+        self._drain_errors: list[dict[str, Any]] = []
+        self._closed = False
         self._load()
 
     # -- startup ---------------------------------------------------------------------------
@@ -183,49 +239,109 @@ class JobRunner:
     def _load(self) -> None:
         now = self.clock()
         for record in self.store.load_all(self.node_id):
-            quarantined = False
-            try:
-                steps = self._build_steps(record)
-                params = self._parse_params(record)
-            except Exception as exc:  # a forged or future row must not brick the runner (M5)
-                steps, params, quarantined = [], _Empty(), True
-                record.state = JobState.FAILED
-                record.error = StructuredError(
-                    "quarantined_bad_record",
-                    f"job record could not be loaded: {type(exc).__name__}: {exc}",
-                    "the row is malformed or from a newer version; remove or migrate it",
-                )
-                self.store.save(record, [("quarantined", {"error": record.error.to_dict()}, now)])
             self._jobs[record.job_id] = record
-            rt = _Runtime(steps=steps, params=params, quarantined=quarantined)
-            if record.state in (JobState.RUNNING, JobState.QUEUED):
-                rt.deadline_anchor = now if record.state is JobState.RUNNING else None
+            if not record.readonly:
+                try:
+                    steps = self._build_steps(record)
+                    params = self._parse_params(record)
+                except Exception as exc:  # a forged or future row must not brick the runner
+                    record.readonly = True
+                    record.state = JobState.FAILED
+                    record.error = StructuredError(
+                        "quarantined_bad_record",
+                        f"job record could not be loaded: {type(exc).__name__}: {exc}",
+                        "the row is malformed or from a newer version; remove or migrate it",
+                    )
+            if record.readonly:
+                self._runtime[record.job_id] = _Runtime([], _Empty(), quarantined=True)
+                self._note_quarantine(record, now)
+                continue
+            rt = _Runtime(steps=steps, params=params)
             self._runtime[record.job_id] = rt
-            self._verify_consumed(record, now)
+            self._verify_approval(record, now)
+            if record.state is JobState.RUNNING:
+                rt.deadline_anchor = now  # the persisted remaining deadline runs on
+                self._count_restart(record, now)
             if record.state is JobState.STALLED and record.target.project_id is not None:
                 self._stalled_projects.add(record.target.project_id)
             if (
-                not quarantined
-                and record.state is JobState.RUNNING
+                record.state is JobState.RUNNING
                 and steps
                 and steps[record.current_step % max(len(steps), 1)].renders_project
-                and record.cursor.get("render_job_id")
+                and (record.cursor.get("render_job_id") or record.cursor.get("journal"))
                 and record.target.project_id is not None
             ):
                 self._render_inflight[record.target.project_id] = record.job_id
 
-    def _verify_consumed(self, record: JobRecord, now: float) -> None:
-        """Reset a forged ``approval_consumed`` unless the hub shows our own consume (L1)."""
-        if not record.approval_consumed:
+    def _note_quarantine(self, record: JobRecord, now: float) -> None:
+        """Record a quarantine once (the row itself is never rewritten)."""
+        events = self.store.events(record.job_id)
+        if events and events[-1].kind == "quarantined":
             return
-        state = (
-            self.hublink.approval_state(record.approval_token) if record.approval_token else None
+        assert record.error is not None
+        _log.warning("job %s quarantined: %s", record.job_id, record.error.message)
+        self.store.append_events(
+            record.job_id, [("quarantined", {"error": record.error.to_dict()}, now)]
         )
-        if state is None or state[0] != "consumed" or state[1] != self.actor:
+
+    def _count_restart(self, record: JobRecord, now: float) -> None:
+        """A RUNNING job on load was interrupted by a restart: count it, persistently (P5b)."""
+        record.restarts += 1
+        record.updated_at = now
+        if record.restarts > self.max_restarts:
+            self._stall(
+                record,
+                StructuredError(
+                    "crash_loop",
+                    f"the node restarted {record.restarts} times while this step ran (limit "
+                    f"{self.max_restarts}); the step is not making progress",
+                    "check the node log for what kills it during this step; resume(job_id) "
+                    "once it is fixed",
+                    detail={"restarts": record.restarts, "max_restarts": self.max_restarts},
+                ),
+                now,
+            )
+            return
+        self.store.save(record, [("restarted", {"restarts": record.restarts}, now)])
+
+    def _job_actor(self, job_id: str) -> Actor:
+        """The actor a job consumes its approval as: binds the hub's consume to this job."""
+        return Actor(self.actor.kind, f"{self.actor.id}#{job_id}")
+
+    def _consume_verified(self, record: JobRecord, token_id: str | None) -> bool:
+        """Whether the hub shows ``token_id`` consumed by THIS job, for its scope and target."""
+        if token_id is None:
+            return False
+        approval = self.hublink.approval(token_id)
+        return (
+            approval is not None
+            and approval.consumed_at is not None
+            and approval.consumed_by == self._job_actor(record.job_id)
+            and approval.scope is _APPROVAL_SCOPE
+            and approval.target == (record.target.project_id or "")
+        )
+
+    def _verify_approval(self, record: JobRecord, now: float) -> None:
+        """On load: trust ``approval_consumed`` only when the hub shows this job's own consume
+        (L1, P13b), and finish a consume a crash interrupted (L2): ``approval_pending`` is the
+        token a consume was started with; if the hub shows it consumed by this job, the
+        consume happened and is recovered, otherwise the intent is dropped."""
+        if record.approval_consumed and not self._consume_verified(record, record.approval_token):
             record.approval_consumed = False
             self.store.save(
                 record, [("approval_unverified", {"token_id": record.approval_token}, now)]
             )
+        pending = record.approval_pending
+        if pending is None:
+            return
+        record.approval_pending = None
+        if not record.approval_consumed and self._consume_verified(record, pending):
+            record.approval_consumed = True
+            record.approval_token = pending
+            event = ("approval_recovered", {"token_id": pending}, now)
+        else:
+            event = ("approval_pending_dropped", {"token_id": pending}, now)
+        self.store.save(record, [event])
 
     def _parse_params(self, record: JobRecord) -> BaseModel:
         return get_kind(record.kind).params_model.model_validate(record.params)
@@ -270,8 +386,6 @@ class JobRunner:
                 created_at=now,
                 updated_at=now,
             )
-            self._jobs[job_id] = record
-            self._runtime[job_id] = _Runtime(steps=steps, params=model)
             self.store.save(
                 record,
                 [
@@ -282,6 +396,8 @@ class JobRunner:
                     )
                 ],
             )
+            self._jobs[job_id] = record
+            self._runtime[job_id] = _Runtime(steps=steps, params=model)
         return job_id
 
     def get(self, job_id: str) -> JobView | None:
@@ -306,14 +422,27 @@ class JobRunner:
                 and (project_id is None or r.target.project_id == project_id)
             ]
 
+    def alerts(self) -> list[dict[str, Any]]:
+        """Every alert raised on any job, oldest first, each with its ``job_id``."""
+        with self._lock:
+            out = [
+                {"job_id": job_id, **event.to_dict()}
+                for job_id in sorted(self._jobs)
+                for event in self.store.events(job_id)
+                if event.kind == "alert"
+            ]
+        return sorted(out, key=lambda a: a["seq"])
+
     def cancel(self, job_id: str, reason: str = "cancelled by request") -> bool:
         with self._lock:
             record = self._jobs.get(job_id)
-            if record is None or record.state in TERMINAL_STATES:
+            if record is None or record.state in TERMINAL_STATES or record.readonly:
                 return False
-            self._drop_pending(record)
+            now = self.clock()
+            in_flight = self._drop_pending(record, abandon=True)
+            events = [] if in_flight else self._orphan_alerts(record, None, now)
             self._terminate(
-                record, JobState.CANCELLED, "cancelled", {"reason": reason}, self.clock()
+                record, JobState.CANCELLED, "cancelled", {"reason": reason}, now, events
             )
             return True
 
@@ -325,7 +454,7 @@ class JobRunner:
         """
         with self._lock:
             record = self._jobs.get(job_id)
-            if record is None or record.state in TERMINAL_STATES:
+            if record is None or record.state in TERMINAL_STATES or record.readonly:
                 return self._view(record) if record is not None else None
             record.approval_token = token_id
             record.updated_at = self.clock()
@@ -336,7 +465,7 @@ class JobRunner:
             ):
                 record.waiting = None
                 record.state = JobState.QUEUED
-            self.store.save(
+            self._checkpoint(
                 record,
                 [
                     (
@@ -345,6 +474,7 @@ class JobRunner:
                         record.updated_at,
                     )
                 ],
+                record.updated_at,
             )
             return self._view(record)
 
@@ -357,18 +487,38 @@ class JobRunner:
             if record.state is not JobState.STALLED:
                 return self._view(record)
             now = self.clock()
-            record.stall = None
-            record.state = JobState.QUEUED
-            record.updated_at = now
             rt = self._runtime[job_id]
-            rt.deadline_anchor = None
-            rt.op_submitted_at = None
-            rt.pending_op_id = None
-            self.store.save(
-                record, [("resumed", {"from": "stalled", "by": _actor_dict(actor)}, now)]
+            record.stall = None
+            record.restarts = 0
+            record.updated_at = now
+            rt.broker_error = None
+            if rt.pending_op_id is not None:
+                # The op that hung is still out; keep tracking it, with a fresh op window.
+                record.state = JobState.RUNNING
+                rt.deadline_anchor = now
+                rt.op_submitted_at = now
+            else:
+                record.state = JobState.QUEUED
+                rt.deadline_anchor = None
+                rt.op_submitted_at = None
+            self._checkpoint(
+                record, [("resumed", {"from": "stalled", "by": _actor_dict(actor)}, now)], now
             )
             self._clear_project_stall(record)
             return self._view(record)
+
+    def close(self, timeout: float = 5.0) -> bool:
+        """Stop the runner: no op it submitted runs any more. Returns whether the drain ended."""
+        with self._drain_lock:
+            self._closed = True
+            done = self._drain_done
+        return done.wait(timeout) if done is not None else True
+
+    def wait_drain(self, timeout: float | None = None) -> bool:
+        """Block until the current drain (if any) has finished. For tests and shutdown."""
+        with self._drain_lock:
+            done = self._drain_done
+        return done.wait(timeout) if done is not None else True
 
     # -- driving ---------------------------------------------------------------------------
 
@@ -380,6 +530,8 @@ class JobRunner:
                 self._pre_check_stop(record, now)
         self._run_broker()  # off the pump thread, bounded; the lock is released here
         with self._lock:
+            self._note_drain_errors(now)
+            self._reconcile_late(now)
             for record in self._order():
                 self._advance(record, now)
             self._run_watchdog(now)
@@ -399,66 +551,240 @@ class JobRunner:
         return sorted(self._jobs.values(), key=lambda r: (-r.priority, r.created_at, r.job_id))
 
     def _run_broker(self) -> None:
-        """Drain the broker queue on a worker thread, bounded by ``drain_budget``.
+        """Tick the broker on a worker thread -- one drain at a time -- and wait for it.
 
-        A hung gateway call keeps the worker busy; the pump returns after the budget and the
-        watchdog can stall the job. The worker is never killed (DESIGN §6): its late result is
-        ignored once the job is terminal or stalled.
+        It ticks even with nothing queued: that is how the broker restores the human's context
+        after the agents are done. A hung gateway call keeps the worker busy; the pump returns
+        after ``drain_budget`` and the watchdog can stall the job. The worker is never killed
+        (DESIGN §6); a concurrent or later pump waits on the same drain instead of starting a
+        second one, so Resolve never sees two calls at once.
         """
-        if self._drain_thread is not None and self._drain_thread.is_alive():
-            return  # a prior drain is stuck on a hung op; do not start a second tick loop
-        if not self.broker.pending():
-            return
-        thread = threading.Thread(target=self._drain, name=f"aar-drain-{self.node_id}", daemon=True)
-        self._drain_thread = thread
-        thread.start()
-        thread.join(self._drain_budget)
+        with self._drain_lock:
+            if self._closed:
+                return
+            done = self._drain_done
+            if done is None or done.is_set():
+                done = threading.Event()
+                thread = threading.Thread(
+                    target=self._drain, args=(done,), name=f"aar-drain-{self.node_id}", daemon=True
+                )
+                self._drain_thread, self._drain_done = thread, done
+                thread.start()
+        done.wait(self._drain_budget)
 
-    def _drain(self) -> None:
-        # Op failures live in their OpResults; a broker-level crash on the worker thread is
-        # swallowed here only because it cannot propagate, and the watchdog covers a hang.
-        with contextlib.suppress(Exception):
+    def _drain(self, done: threading.Event) -> None:
+        try:
+            if _drain_delay:
+                time.sleep(_drain_delay)
             self.broker.run_until_idle()
+        except Exception as exc:  # op failures live in their OpResults; this is the broker
+            _log.exception("job runner %s: the broker crashed during a drain", self.node_id)
+            error = {
+                "code": "broker_crashed",
+                "exception": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc()[-4000:],
+            }
+            with self._drain_lock:
+                self._drain_errors.append(error)
+        finally:
+            done.set()
+
+    def _note_drain_errors(self, now: float) -> None:
+        """Record a broker crash on every job whose op it left outstanding (once per error)."""
+        with self._drain_lock:
+            errors, self._drain_errors = self._drain_errors, []
+        if not errors:
+            return
+        error = errors[-1]
+        brief = {k: error[k] for k in ("code", "exception", "message")}
+        for job in self._jobs.values():
+            rt = self._runtime[job.job_id]
+            if job.state in TERMINAL_STATES or rt.pending_op_id is None:
+                continue
+            if (
+                rt.broker_error is not None
+                and {k: rt.broker_error[k] for k in ("code", "exception", "message")} == brief
+            ):
+                continue  # the same crash again: already recorded (bounded events)
+            rt.broker_error = error
+            self._checkpoint(job, [("broker_error", brief | {"count": len(errors)}, now)], now)
+
+    def _reconcile_late(self, now: float) -> None:
+        """Handle the late result of an op a cancelled/failed job dropped while it ran (P15)."""
+        for op_id, job_id in list(self._late.items()):
+            result = self.broker.result(op_id)
+            if result is None:
+                continue
+            del self._late[op_id]
+            self._abandoned.discard(op_id)
+            job = self._jobs.get(job_id)
+            if job is None:
+                continue
+            data = {
+                "op_id": op_id,
+                "status": result.status.value,
+                "code": result.error.code if result.error is not None else None,
+            }
+            events = [("late_result", data, now)]
+            value = result.value if result.status is OpStatus.OK else None
+            events += self._orphan_alerts(job, value, now)
+            self._checkpoint(job, events, now)
+
+    # -- broker hooks (called on the drain thread) -----------------------------------------
+
+    def _wrap(self, job_id: str, hot: HotOp) -> HotOp:
+        """Give an op this job's precheck and journal."""
+        inner = hot.fn
+        journal = functools.partial(self._journal, job_id, hot.id)
+
+        def run(gateway: Any) -> Any:
+            with op_journal(journal):
+                return inner(gateway)
+
+        return replace(hot, fn=run, precheck=functools.partial(self._precheck, job_id, hot.id))
+
+    def _op_wanted(self, job_id: str, op_id: str) -> bool:
+        record = self._jobs.get(job_id)
+        return (
+            not self._closed
+            and record is not None
+            and record.state not in TERMINAL_STATES
+            and op_id not in self._abandoned
+        )
+
+    def _precheck(self, job_id: str, op_id: str) -> BrokerOpError | None:
+        """Right before the op runs: refuse it if the job no longer wants it or is stopped."""
+        with self._lock:
+            record = self._jobs.get(job_id)
+            if record is None or not self._op_wanted(job_id, op_id):
+                return BrokerOpError("job_inactive", f"job {job_id} no longer wants op {op_id}")
+            target = record.target
+            if target.project_id in self._stalled_projects:
+                return BrokerOpError(
+                    "project_stalled", f"project {target.project_id} is stalled; nothing runs"
+                )
+        try:
+            self.hublink.assert_running(project=target, node_id=self.node_id)
+        except Stopped as stop:
+            return BrokerOpError("emergency_stop", str(stop), {"scope": str(stop.scope)})
+        return None
+
+    def _journal(self, job_id: str, op_id: str, event: str, data: dict[str, Any]) -> bool:
+        """Persist an op's side effect on its job's checkpoint; say whether the job wants it."""
+        with self._lock:
+            record = self._jobs.get(job_id)
+            if record is None or record.readonly:
+                return False
+            wanted = self._op_wanted(job_id, op_id)
+            now = self.clock()
+            journal = record.cursor.setdefault("journal", {})
+            if event == "snapshot_saving":
+                journal["snapshot_deleted"] = False
+            if event == "snapshot_deleted":
+                journal["snapshot_deleted"] = True
+            elif event == "deleted":
+                if journal.get("render_job_id") == data.get("render_job_id"):
+                    journal.pop("render_job_id", None)
+            else:
+                journal.update(data)
+            if event not in _NOT_A_STATE:
+                journal["state"] = event
+            events: list[tuple[str, dict[str, Any], float]] = []
+            if event in _JOURNALED_EVENTS:
+                events.append(("journal", {"event": event, "late": not wanted, **data}, now))
+            if event == "orphaned":
+                events.append(
+                    _alert(
+                        "render_orphaned",
+                        f"render job {data.get('render_job_id')} was added by this job but could "
+                        "not be removed; it is not tracked",
+                        "remove it from the render queue on the Deliver page (only that JobId)",
+                        {
+                            "render_job_id": data.get("render_job_id"),
+                            "cleanup": data.get("cleanup"),
+                        },
+                        now,
+                    )
+                )
+            if event == "restore_failed":
+                events.append(
+                    _alert(
+                        "deliver_not_restored",
+                        "the Deliver settings could not be put back after the render was set up",
+                        f"load the preset {data.get('snapshot')!r} on the Deliver page if it is "
+                        "still there (it holds the original settings), then delete it",
+                        {
+                            "restore_error": data.get("restore_error"),
+                            "snapshot": data.get("snapshot"),
+                        },
+                        now,
+                    )
+                )
+            self._checkpoint(record, events, now)
+            return wanted
 
     # -- the step machine ------------------------------------------------------------------
 
-    def _pre_check_stop(self, job: JobRecord, now: float) -> None:
-        """Pause a stopped job (cancelling its queued op) before the broker runs anything (H3)."""
-        if job.state in TERMINAL_STATES or job.state is JobState.STALLED:
-            return
-        if job.target.project_id in self._stalled_projects:
-            return
+    def _stop_of(self, job: JobRecord) -> Stopped | None:
         try:
             self.hublink.assert_running(project=job.target, node_id=self.node_id)
         except Stopped as stop:
+            return stop
+        return None
+
+    def _pre_check_stop(self, job: JobRecord, now: float) -> None:
+        """Pause a stopped job (cancelling its queued op) before the broker runs anything (H3)."""
+        if job.state in TERMINAL_STATES or job.state is JobState.STALLED or job.readonly:
+            return
+        if job.target.project_id in self._stalled_projects:
+            return
+        stop = self._stop_of(job)
+        if stop is not None:
             self._enter_wait_stop(job, stop, now)
 
     def _advance(self, job: JobRecord, now: float) -> None:
-        if job.state in TERMINAL_STATES or job.state is JobState.STALLED:
+        if job.state in TERMINAL_STATES or job.state is JobState.STALLED or job.readonly:
             return
         pid = job.target.project_id
         if pid in self._stalled_projects:
             return  # a stalled project stops scheduling for every job in it
         rt = self._runtime[job.job_id]
 
-        try:
-            self.hublink.assert_running(project=job.target, node_id=self.node_id)
-        except Stopped as stop:
-            self._enter_wait_stop(job, stop, now)
+        if rt.pending_op_id is not None:
+            result = self.broker.result(rt.pending_op_id)
+            if result is None:
+                stop = self._stop_of(job)
+                if stop is not None:
+                    self._enter_wait_stop(job, stop, now)  # a queued op is cancelled
+                elif job.state is JobState.WAITING:
+                    # The stop lifted while an op it could not cancel is still out: run again,
+                    # so the watchdog covers that op.
+                    events = self._begin_running(job, rt, now)
+                    rt.op_submitted_at = now
+                    job.updated_at = now
+                    self._checkpoint(job, events, now)
+                return  # still outstanding; the watchdog may stall it
+            # The op came back: its result is ALWAYS collected, even if a stop landed while it
+            # ran (P3c) -- dropping it would make the step run the op a second time.
+            rt.pending_op_id = None
+            rt.op_submitted_at = None
+            rt.broker_error = None
+            rt.op_outcome = None if _not_run(result) else OpOutcome.from_result(result)
+
+        stop = self._stop_of(job)
+        if stop is not None:
+            self._enter_wait_stop(job, stop, now)  # a collected outcome waits in rt.op_outcome
             return
 
         if job.state is JobState.WAITING:
             assert job.waiting is not None
-            if job.waiting.kind == "needs_approval" and not self._approval_retryable(job):
+            if (
+                job.waiting.kind == "needs_approval"
+                and rt.op_outcome is None
+                and not self._approval_retryable(job)
+            ):
                 return  # waiting for a human to offer a different token
-
-        if rt.pending_op_id is not None:
-            result = self.broker.result(rt.pending_op_id)
-            if result is None:
-                return  # still outstanding; the watchdog may stall it
-            rt.pending_op_id = None
-            rt.op_submitted_at = None
-            rt.op_outcome = OpOutcome.from_result(result)
 
         steps = rt.steps
         if job.current_step >= len(steps):
@@ -507,14 +833,14 @@ class JobRunner:
         ):
             return
         try:
-            op_id = submit_op(
-                self.broker,
+            hot = make_hot_op(
                 action.op,
                 action.params,
                 target=job.target,
                 holder=self.holder,
                 priority=job.priority,
             )
+            op_id = self.broker.submit(self._wrap(job.job_id, hot))
         except HotOpFailure as exc:
             self._fail(job, StructuredError.from_broker(exc), now)
             return
@@ -532,7 +858,7 @@ class JobRunner:
                 ("op_submitted", {"op": action.op, "key": action.key, "op_id": op_id}, now)
             )
         job.updated_at = now
-        self.store.save(job, events)
+        self._checkpoint(job, events, now)
 
     # -- approval --------------------------------------------------------------------------
 
@@ -552,13 +878,15 @@ class JobRunner:
         ):
             self._enter_wait_approval(job, target, now, None)
             return False
-        # L2: record the intent before consuming, so a crash in between is recoverable.
+        # L2: record the intent before consuming, so a crash in between is recovered on load.
         job.approval_pending = token
         job.updated_at = now
-        self.store.save(job, [("approval_consuming", {"token_id": token, "target": target}, now)])
+        self._checkpoint(
+            job, [("approval_consuming", {"token_id": token, "target": target}, now)], now
+        )
         try:
             approval = self.hublink.consume_approval(
-                token, _APPROVAL_SCOPE, target or "", self.actor
+                token, _APPROVAL_SCOPE, target or "", self._job_actor(job.job_id)
             )
         except ApprovalError as exc:
             job.approval_pending = None
@@ -567,7 +895,7 @@ class JobRunner:
         job.approval_consumed = True
         job.approval_pending = None
         job.updated_at = now
-        self.store.save(
+        self._checkpoint(
             job,
             [
                 (
@@ -581,6 +909,7 @@ class JobRunner:
                     now,
                 )
             ],
+            now,
         )
         return True
 
@@ -650,15 +979,15 @@ class JobRunner:
         ]
 
     def _enter_wait(self, job: JobRecord, reason: WaitReason, now: float) -> None:
+        rt = self._runtime[job.job_id]
+        self._drop_pending(job, abandon=False)  # a queued op is cancelled; a running one kept
         if job.state is JobState.WAITING and job.waiting == reason:
             return  # already paused for exactly this; no churn
-        rt = self._runtime[job.job_id]
         self._pause_deadline(job, rt, now)
-        self._drop_pending(job)
         job.state = JobState.WAITING
         job.waiting = reason
         job.updated_at = now
-        self.store.save(job, [("waiting", reason.to_dict(), now)])
+        self._checkpoint(job, [("waiting", reason.to_dict(), now)], now)
 
     def _complete_step(
         self, job: JobRecord, rt: _Runtime, step: Step, value: dict[str, Any], now: float
@@ -668,12 +997,13 @@ class JobRunner:
         job.results.append(value)
         job.current_step += 1
         job.cursor = {}
+        job.restarts = 0  # the step made progress
         if job.current_step < len(rt.steps):
             job.step_deadline = rt.steps[job.current_step].timeout
             rt.deadline_anchor = now  # the next step gets its own deadline
         job.updated_at = now
         events.append(("step_completed", {"index": index, "step": step.name, "value": value}, now))
-        self.store.save(job, events)
+        self._checkpoint(job, events, now)
         if job.current_step >= len(rt.steps):
             self._succeed(job, now)
 
@@ -682,35 +1012,95 @@ class JobRunner:
         self._terminate(job, JobState.SUCCEEDED, "succeeded", {"measured": measured}, now)
 
     def _fail(self, job: JobRecord, error: StructuredError, now: float) -> None:
-        self._drop_pending(job)
+        in_flight = self._drop_pending(job, abandon=True)
         job.error = error
-        self._terminate(job, JobState.FAILED, "failed", {"error": error.to_dict()}, now)
+        events: list[tuple[str, dict[str, Any], float]] = []
+        if error.code == "render_build_ambiguous":
+            events.append(
+                _alert(
+                    "render_build_ambiguous",
+                    error.message,
+                    error.fix_hint,
+                    {"candidates": error.detail.get("candidates")},
+                    now,
+                )
+            )
+        elif not in_flight and error.code not in _RENDER_ENDED:
+            events += self._orphan_alerts(job, None, now)
+        self._terminate(job, JobState.FAILED, "failed", {"error": error.to_dict()}, now, events)
 
     def _stall(self, job: JobRecord, error: StructuredError, now: float) -> None:
-        self._drop_pending(job)
+        rt = self._runtime[job.job_id]
+        if rt.broker_error is not None:  # say WHY the op never returned (finding 10)
+            error = replace(error, detail=error.detail | {"broker_error": rt.broker_error})
+        self._drop_pending(job, abandon=False)  # a running op is kept: it may still come back
         job.stall = error
         job.state = JobState.STALLED
         job.updated_at = now
         if job.target.project_id is not None:
             self._stalled_projects.add(job.target.project_id)
         self._release_render_slot(job)
-        self.store.save(job, [("stalled", {"reason": error.to_dict()}, now)])
+        self._checkpoint(job, [("stalled", {"reason": error.to_dict()}, now)], now)
 
     def _terminate(
-        self, job: JobRecord, state: JobState, event: str, data: dict[str, Any], now: float
+        self,
+        job: JobRecord,
+        state: JobState,
+        event: str,
+        data: dict[str, Any],
+        now: float,
+        extra: list[tuple[str, dict[str, Any], float]] | None = None,
     ) -> None:
         job.state = state
         job.updated_at = now
         self._release_render_slot(job)
-        self.store.save(job, [(event, data, now)])
+        self._checkpoint(job, [*(extra or []), (event, data, now)], now)
 
-    def _drop_pending(self, job: JobRecord) -> None:
+    def _drop_pending(self, job: JobRecord, *, abandon: bool) -> bool:
+        """Let go of the job's op. A queued op is cancelled. An op that already ran or is
+        running is never silently dropped: for a pause (``abandon=False``) it stays tracked
+        and its result is collected later; a cancelled/failed job (``abandon=True``) abandons
+        it (its precheck and journal now refuse it) and reconciles its late result. Returns
+        whether an op was abandoned (its late result is reconciled by the pump)."""
         rt = self._runtime[job.job_id]
-        if rt.pending_op_id is not None:
-            self.broker.cancel(rt.pending_op_id, reason="job paused")
+        op_id = rt.pending_op_id
+        if abandon:
+            rt.op_outcome = None
+        if op_id is None:
+            return False
+        if self.broker.cancel(op_id, reason="job paused"):
             rt.pending_op_id = None
             rt.op_submitted_at = None
-            rt.op_outcome = None
+            return False
+        if not abandon:
+            return False
+        rt.pending_op_id = None
+        rt.op_submitted_at = None
+        self._abandoned.add(op_id)
+        self._late[op_id] = job.job_id
+        return True
+
+    def _orphan_alerts(
+        self, job: JobRecord, value: object, now: float
+    ) -> list[tuple[str, dict[str, Any], float]]:
+        """An alert if this ended job leaves a render it started running untracked."""
+        rid = live_render_id(job.cursor, value)
+        if rid is None or any(
+            e.kind == "alert" and e.data.get("render_job_id") == rid
+            for e in self.store.events(job.job_id)
+        ):
+            return []
+        return [
+            _alert(
+                "render_orphaned",
+                f"the job ended ({job.state.value}) while its render job {rid} may still be "
+                "running in Resolve; nothing tracks it now",
+                "check the render queue on the Deliver page; stop or remove that JobId by hand "
+                "if it is not wanted",
+                {"render_job_id": rid},
+                now,
+            )
+        ]
 
     def _clear_project_stall(self, job: JobRecord) -> None:
         pid = job.target.project_id
@@ -721,13 +1111,31 @@ class JobRunner:
         ):
             self._stalled_projects.discard(pid)
 
-    # -- deadlines -------------------------------------------------------------------------
+    # -- deadlines and checkpoints ---------------------------------------------------------
 
     def _pause_deadline(self, job: JobRecord, rt: _Runtime, now: float) -> None:
         """Stop the step deadline counting down (it does not run while a job waits, H6)."""
         if rt.deadline_anchor is not None and job.step_deadline is not None:
             job.step_deadline = max(0.0, job.step_deadline - (now - rt.deadline_anchor))
             rt.deadline_anchor = None
+
+    def _checkpoint(
+        self, job: JobRecord, events: list[tuple[str, dict[str, Any], float]], now: float
+    ) -> None:
+        """Save the job. A running step's REMAINING deadline is what gets persisted, so a
+        restart resumes the countdown instead of granting a fresh deadline (P5b). The in-memory
+        countdown (anchor + deadline at the anchor) is left as it is."""
+        rt = self._runtime.get(job.job_id)
+        if (
+            rt is not None
+            and job.state is JobState.RUNNING
+            and rt.deadline_anchor is not None
+            and job.step_deadline is not None
+        ):
+            remaining = job.step_deadline - (now - rt.deadline_anchor)
+            self.store.save(replace(job, step_deadline=remaining), events)
+            return
+        self.store.save(job, events)
 
     # -- per-project render lock -----------------------------------------------------------
 
@@ -764,7 +1172,7 @@ class JobRunner:
             overdue = self.watchdog.overdue(
                 now=now,
                 step_started_at=rt.deadline_anchor,
-                step_timeout=job.step_deadline if job.step_deadline is not None else 0.0,
+                step_timeout=job.step_deadline,
                 op_submitted_at=op_submitted,
             )
             if overdue is not None:
@@ -796,6 +1204,7 @@ class JobRunner:
             if rt is not None and record.current_step < len(rt.steps)
             else None
         )
+        events = [event.to_dict() for event in self.store.events(record.job_id)]
         return JobView(
             job_id=record.job_id,
             kind=record.kind,
@@ -815,12 +1224,29 @@ class JobRunner:
             approval_consumed=record.approval_consumed,
             created_at=record.created_at,
             updated_at=record.updated_at,
-            events=[event.to_dict() for event in self.store.events(record.job_id)],
+            events=events,
+            alerts=[e["data"] for e in events if e["kind"] == "alert"],
         )
 
 
 class _Empty(BaseModel):
     """A placeholder params model for a quarantined job (it never runs)."""
+
+
+def _not_run(result: OpResult) -> bool:
+    """A precheck refused the op: it never ran, so it is re-issued, not reported as failed."""
+    return (
+        result.status is OpStatus.CANCELLED
+        and result.error is not None
+        and result.error.code in _NOT_RUN
+    )
+
+
+def _alert(
+    code: str, message: str, fix_hint: str, detail: dict[str, Any], now: float
+) -> tuple[str, dict[str, Any], float]:
+    _log.warning("job alert %s: %s", code, message)
+    return ("alert", {"code": code, "message": message, "fix_hint": fix_hint, **detail}, now)
 
 
 def _actor_dict(actor: Actor | None) -> dict[str, str] | None:

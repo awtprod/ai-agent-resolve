@@ -11,7 +11,10 @@ Safety properties:
   runners can never drive the same jobs and double-execute them. ``load_all`` is further
   scoped to one ``node_id``.
 - **Schema version** (L4): the version is stored and checked on open; an unknown version is
-  refused rather than silently mis-read.
+  refused rather than silently mis-read. Version 1 stores are migrated in place to 2.
+- **Poison rows** (M5/P12): a row that cannot be parsed (bad state, bad JSON, bad target) is
+  loaded as a read-only *quarantined* record -- failed, with the parse error -- and is never
+  written back, so one bad row cannot brick the runner and the original data is kept.
 - ``job_events`` is append-only, enforced by triggers.
 """
 
@@ -30,7 +33,7 @@ from aar.node.locator import ProjectLocator
 
 from .model import JobState, StructuredError, WaitReason
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -53,6 +56,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     approval_pending   TEXT,
     step_deadline      REAL,
     priority           INTEGER NOT NULL DEFAULT 0,
+    restarts           INTEGER NOT NULL DEFAULT 0,
     created_at         REAL NOT NULL,
     updated_at         REAL NOT NULL
 );
@@ -114,8 +118,12 @@ class JobRecord:
     step_deadline: float | None = None
     """Seconds the current step may still run; counts down only while the job is running."""
     priority: int = 0
+    restarts: int = 0
+    """How many node restarts interrupted the current step while it ran (crash-loop guard)."""
     created_at: float = 0.0
     updated_at: float = 0.0
+    readonly: bool = False
+    """A quarantined row loaded from a malformed record: never written back (not persisted)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,20 +163,56 @@ def _record_from_row(row: sqlite3.Row) -> JobRecord:
         approval_pending=row["approval_pending"],
         step_deadline=row["step_deadline"],
         priority=row["priority"],
+        restarts=row["restarts"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+def _raw(row: sqlite3.Row, column: str) -> Any:
+    try:
+        return row[column]
+    except (IndexError, KeyError):
+        return None
+
+
+def _quarantined_record(row: sqlite3.Row, exc: Exception) -> JobRecord:
+    """A read-only, failed stand-in for a row that cannot be parsed (the row is left as is)."""
+    created = _raw(row, "created_at")
+    return JobRecord(
+        job_id=str(_raw(row, "job_id")),
+        kind=str(_raw(row, "kind") or "?"),
+        node_id=str(_raw(row, "node_id") or ""),
+        target=ProjectLocator((), "<unreadable>"),
+        params={},
+        state=JobState.FAILED,
+        error=StructuredError(
+            "quarantined_bad_record",
+            f"job record could not be loaded: {type(exc).__name__}: {exc}",
+            "the row is malformed or from a newer version; inspect it, then remove or migrate it",
+            detail={"stored_state": str(_raw(row, "state"))},
+        ),
+        created_at=float(created) if isinstance(created, int | float) else 0.0,
+        readonly=True,
+    )
+
+
+def _parse_row(row: sqlite3.Row) -> JobRecord:
+    try:
+        return _record_from_row(row)
+    except Exception as exc:  # one poison row must not brick the runner (P12)
+        return _quarantined_record(row, exc)
 
 
 _UPSERT = """
 INSERT INTO jobs (
     job_id, kind, node_id, target, params, state, current_step, cursor, results,
     error, waiting, stall, approval_token, approval_consumed, approval_pending,
-    step_deadline, priority, created_at, updated_at
+    step_deadline, priority, restarts, created_at, updated_at
 ) VALUES (
     :job_id, :kind, :node_id, :target, :params, :state, :current_step, :cursor, :results,
     :error, :waiting, :stall, :approval_token, :approval_consumed, :approval_pending,
-    :step_deadline, :priority, :created_at, :updated_at
+    :step_deadline, :priority, :restarts, :created_at, :updated_at
 )
 ON CONFLICT(job_id) DO UPDATE SET
     state=excluded.state, current_step=excluded.current_step, cursor=excluded.cursor,
@@ -176,7 +220,7 @@ ON CONFLICT(job_id) DO UPDATE SET
     stall=excluded.stall, approval_token=excluded.approval_token,
     approval_consumed=excluded.approval_consumed, approval_pending=excluded.approval_pending,
     step_deadline=excluded.step_deadline, priority=excluded.priority,
-    updated_at=excluded.updated_at
+    restarts=excluded.restarts, updated_at=excluded.updated_at
 """
 
 
@@ -228,6 +272,8 @@ class JobStore:
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
+            elif int(row["value"]) == 1:
+                self._migrate_v1()
             elif int(row["value"]) != SCHEMA_VERSION:
                 raise JobStoreVersionError(
                     f"job store at {self._path!r} is schema version {row['value']}, "
@@ -238,6 +284,15 @@ class JobStore:
             raise
         else:
             self._conn.execute("COMMIT")
+
+    def _migrate_v1(self) -> None:
+        """v1 -> v2: add the ``restarts`` counter (inside the caller's transaction)."""
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(jobs)")}
+        if "restarts" not in columns:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN restarts INTEGER NOT NULL DEFAULT 0")
+        self._conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),)
+        )
 
     def _check_version(self) -> None:
         row = self._conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
@@ -278,6 +333,8 @@ class JobStore:
         self, record: JobRecord, events: Iterable[tuple[str, dict[str, Any], float]] = ()
     ) -> None:
         """Upsert ``record`` and append ``events`` (``kind``, ``data``, ``at``) in one txn."""
+        if record.readonly:
+            raise ValueError(f"job {record.job_id} is a quarantined read-only record")
         params = {
             "job_id": record.job_id,
             "kind": record.kind,
@@ -296,6 +353,7 @@ class JobStore:
             "approval_pending": record.approval_pending,
             "step_deadline": record.step_deadline,
             "priority": record.priority,
+            "restarts": record.restarts,
             "created_at": record.created_at,
             "updated_at": record.updated_at,
         }
@@ -308,6 +366,24 @@ class JobStore:
                     self._conn.execute(
                         "INSERT INTO job_events (job_id, at, kind, data) VALUES (?, ?, ?, ?)",
                         (job_id, at, kind, data),
+                    )
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            else:
+                self._conn.execute("COMMIT")
+
+    def append_events(
+        self, job_id: str, events: Iterable[tuple[str, dict[str, Any], float]]
+    ) -> None:
+        """Append ``events`` for ``job_id`` without touching its row (quarantined records)."""
+        rows = [(job_id, at, kind, _dumps(data)) for kind, data, at in events]
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                for row in rows:
+                    self._conn.execute(
+                        "INSERT INTO job_events (job_id, at, kind, data) VALUES (?, ?, ?, ?)", row
                     )
             except BaseException:
                 self._conn.execute("ROLLBACK")
@@ -329,12 +405,12 @@ class JobStore:
                     "SELECT * FROM jobs WHERE node_id = ? ORDER BY created_at ASC, job_id ASC",
                     (node_id,),
                 ).fetchall()
-        return [_record_from_row(row) for row in rows]
+        return [_parse_row(row) for row in rows]
 
     def get(self, job_id: str) -> JobRecord | None:
         with self._lock:
             row = self._conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
-        return _record_from_row(row) if row is not None else None
+        return _parse_row(row) if row is not None else None
 
     def events(self, job_id: str) -> list[JobEvent]:
         with self._lock:
@@ -342,6 +418,14 @@ class JobStore:
                 "SELECT * FROM job_events WHERE job_id = ? ORDER BY seq ASC", (job_id,)
             ).fetchall()
         return [
-            JobEvent(row["seq"], row["job_id"], row["at"], row["kind"], json.loads(row["data"]))
+            JobEvent(row["seq"], row["job_id"], row["at"], row["kind"], _event_data(row["data"]))
             for row in rows
         ]
+
+
+def _event_data(text: str) -> dict[str, Any]:
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {"unreadable": text[:200]}
+    return data if isinstance(data, dict) else {"value": data}

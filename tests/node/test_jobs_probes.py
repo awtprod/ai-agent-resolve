@@ -14,8 +14,7 @@ from pathlib import Path
 import pytest
 
 from aar.hub import control
-from aar.hub.approvals import ApprovalScope, get_approval, grant
-from aar.hub.common import utcnow
+from aar.hub.approvals import ApprovalScope, grant
 from aar.hub.events import Actor
 from aar.hub.registry import ProjectSource, Registry
 from aar.node.jobs import (
@@ -241,7 +240,8 @@ def test_p14_non_finite_timeout_is_rejected_at_submit(tmp_path: Path) -> None:
 
 
 def test_p15_hung_gateway_call_does_not_block_the_pump(tmp_path: Path) -> None:
-    world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1.0)))
+    # The production drain budget: the pump must return while the op hangs.
+    world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1.0)), drain_budget=0.5)
     job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
     world.runner.pump()  # the op is queued, not yet run
     release = threading.Event()
@@ -325,10 +325,13 @@ def test_p18_project_scope_stop_reaches_the_job(tmp_path: Path) -> None:
         control.stop(world.log, control.StopScope.project(world.pid()), "by uid", HUMAN)
 
 
-# -- P23: a crash between the hub consume and the local checkpoint strands safely ---------------
+# -- P23 / L2: a crash between the hub consume and the local checkpoint is recovered ----------
 
 
-def test_p23_crash_after_consume_leaves_job_waiting_not_written(tmp_path: Path) -> None:
+def test_p23_crash_after_consume_is_recovered_from_the_pending_intent(tmp_path: Path) -> None:
+    """L2 decision: ``approval_pending`` is USED on load. The intent was checkpointed before
+    the consume; the hub shows the token consumed by THIS job, so the consume is recovered and
+    the write runs once -- the human's token is not burned for nothing."""
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
     job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
     world.runner.run_until_settled()
@@ -348,10 +351,66 @@ def test_p23_crash_after_consume_leaves_job_waiting_not_written(tmp_path: Path) 
     world.store.save = save  # type: ignore[method-assign]
     with pytest.raises(Crash):
         world.runner.pump()
+    assert world.store.get(job_id).approval_pending == token.token_id  # the intent survived
     runner = world.restart(approval=ApprovalPolicy(live=True))
+    assert world.store.get(job_id).approval_pending is None
+    assert world.store.get(job_id).approval_consumed  # recovered on load
     runner.run_until_settled()
     view = runner.get(job_id)
-    assert view.state == JobState.WAITING.value
-    assert view.waiting["detail"]["refused_code"] == "already_consumed"
-    assert world.main.markers == {}  # the write never happened; the token is burned
-    assert get_approval(world.log, token.token_id).state(utcnow()) == "consumed"
+    assert view.state == JobState.SUCCEEDED.value
+    assert sorted(world.main.markers) == [100]  # written exactly once
+    assert len(world.log.read(types=["approval.consumed"])) == 1  # one consume, never twice
+    assert [e["kind"] for e in view.events].count("approval_recovered") == 1
+
+
+def test_p23b_pending_intent_for_a_token_never_consumed_is_dropped(tmp_path: Path) -> None:
+    """A crash BEFORE the hub consume: the pending intent is dropped on load and the job
+    consumes the (still active) token normally."""
+    world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    world.runner.run_until_settled()
+    token = grant(world.log, ApprovalScope.PROJECT_WRITE, world.pid(), 3600, "ok", HUMAN)
+    world.runner.approve(job_id, token.token_id, HUMAN)
+    world.store.close()
+    conn = sqlite3.connect(world.db_path)
+    conn.execute("UPDATE jobs SET approval_pending=? WHERE job_id=?", (token.token_id, job_id))
+    conn.commit()
+    conn.close()
+    world.store = JobStore(world.db_path)
+    runner = world.restart(approval=ApprovalPolicy(live=True))
+    rec = world.store.get(job_id)
+    assert rec.approval_pending is None and not rec.approval_consumed
+    runner.run_until_settled()
+    assert runner.get(job_id).state == JobState.SUCCEEDED.value
+    assert sorted(world.main.markers) == [100]
+    kinds = [e["kind"] for e in runner.get(job_id).events]
+    assert "approval_pending_dropped" in kinds and "approval_recovered" not in kinds
+
+
+def test_p23c_pending_intent_consumed_by_another_job_is_not_recovered(tmp_path: Path) -> None:
+    """The pending token was consumed by ANOTHER job (same project): not ours, so the intent
+    is dropped, the consume is refused and nothing is written (fail closed)."""
+    world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
+    a = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    world.runner.run_until_settled()
+    token = grant(world.log, ApprovalScope.PROJECT_WRITE, world.pid(), 3600, "A", HUMAN)
+    world.runner.approve(a, token.token_id, HUMAN)
+    world.runner.run_until_settled()
+    assert world.runner.get(a).state == JobState.SUCCEEDED.value
+    b = world.runner.submit("ops.sequence", _markers(200), world.locator())
+    world.runner.run_until_settled()
+    world.runner.close()
+    world.store.close()
+    conn = sqlite3.connect(world.db_path)
+    conn.execute(
+        "UPDATE jobs SET approval_pending=?, approval_token=? WHERE job_id=?",
+        (token.token_id, token.token_id, b),
+    )
+    conn.commit()
+    conn.close()
+    world.store = JobStore(world.db_path)
+    runner = world.restart(approval=ApprovalPolicy(live=True))
+    runner.run_until_settled()
+    assert not world.store.get(b).approval_consumed
+    assert runner.get(b).state == JobState.WAITING.value
+    assert sorted(world.main.markers) == [100]  # B never wrote

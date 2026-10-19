@@ -9,6 +9,11 @@ same store and hub log against the same (persistent) Resolve.
 The broker uses the production restore delay (15 s). With a frozen clock it therefore holds the
 borrowed context for the test (nothing to restore), and a test that advances the clock past the
 delay sees the real restore -- the behaviour production has while work is pending.
+
+Determinism: the runner's drain budget is ``None`` by default here, so a pump waits for its
+drain to FINISH and every test counts pumps on the injected clock alone, never on how fast the
+machine is. A test about a hung gateway call passes an explicit ``drain_budget`` and drives the
+hang with events (``threading.Event``), waiting on completion signals (``runner.wait_drain``).
 """
 
 from __future__ import annotations
@@ -48,6 +53,7 @@ class JobWorld:
         approval: ApprovalPolicy | None = None,
         watchdog: Watchdog | None = None,
         node_id: str = NODE_ID,
+        drain_budget: float | None = None,
     ) -> None:
         self.fake = FakeResolve(
             {"Show": ["Main", "Main [agent]"], "Other": ["Other main"]},
@@ -64,6 +70,7 @@ class JobWorld:
         self.hublink = LocalHubLink(self.log)
         self._approval = approval or ApprovalPolicy(live=False)
         self._watchdog = watchdog or Watchdog(WatchdogConfig())
+        self.drain_budget = drain_budget
         self._fresh_broker()
         self.store = JobStore(self.db_path)
         self.runner = self._new_runner()
@@ -87,12 +94,18 @@ class JobWorld:
             clock=self.clock,
             approval=self._approval,
             watchdog=self._watchdog,
+            drain_budget=self.drain_budget,
         )
 
     def restart(
         self, *, approval: ApprovalPolicy | None = None, watchdog: Watchdog | None = None
     ) -> JobRunner:
-        """Model a node restart: a fresh broker and runner reopen the same store and log."""
+        """Model a node restart: a fresh broker and runner reopen the same store and log.
+
+        The old runner is closed first, so a drain thread of the "dead" process can never run
+        another op against the shared fake Resolve after the restart.
+        """
+        self.runner.close()
         self.store.close()
         if approval is not None:
             self._approval = approval

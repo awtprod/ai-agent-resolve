@@ -38,10 +38,14 @@ class Watchdog:
         *,
         now: float,
         step_started_at: float | None,
-        step_timeout: float,
+        step_timeout: float | None,
         op_submitted_at: float | None,
     ) -> StructuredError | None:
-        """Return why the job is stalled, or ``None`` if it is still within its deadlines."""
+        """Return why the job is stalled, or ``None`` if it is still within its deadlines.
+
+        ``step_timeout`` is the step's remaining deadline as of ``step_started_at``; ``None``
+        means the step has none. Zero or less (a deadline already used up before a restart or
+        a pause) is overdue as soon as any time passes."""
         if op_submitted_at is not None:
             age = now - op_submitted_at
             if age > self.config.op_timeout:
@@ -54,7 +58,7 @@ class Watchdog:
                     "resume(job_id) once the node is healthy.",
                     detail={"op_age_seconds": age, "op_timeout": self.config.op_timeout},
                 )
-        if step_started_at is not None and step_timeout > 0:
+        if step_started_at is not None and step_timeout is not None:
             age = now - step_started_at
             if age > step_timeout:
                 return StructuredError(
