@@ -309,7 +309,8 @@ def record_branch(
     The writer must be a node (only nodes report branches); the project must exist in the
     registry; names and the handoff are cleaned and bounded; ids and the version are
     bounded. The first node to record a ``(project, branch)`` owns its record: another
-    node's record for it, or one with a lower version (a delayed retry), is refused.
+    node's record for it, one with a lower version (a delayed retry), or one naming another
+    agent (at any version) is refused.
     """
     if not isinstance(actor, Actor) or actor.kind != "node":
         raise InvalidInput("actor", "only a node may record a branch")
@@ -336,7 +337,7 @@ def record_branch(
         raise InvalidInput("version", f"must be an integer between 1 and {MAX_VERSION}")
     current = _current_record(log, project_id, payload["branch_timeline_id"])
     if current is not None:
-        problem = _supersede_problem(current, actor.id, version)
+        problem = _supersede_problem(current, actor.id, payload["agent_id"], version)
         if problem is not None:
             raise InvalidInput("branch_timeline_id", problem)
     return log.append(EVENT_BRANCH_RECORDED, actor, payload, project_id=project_id)
@@ -381,14 +382,19 @@ class BranchScan:
     skipped: tuple[SkippedEvent, ...]
 
 
-def _supersede_problem(current: Branch, node_id: str, version: int) -> str | None:
-    """Why ``node_id`` may not replace ``current`` with a record at ``version``, or ``None``.
+def _supersede_problem(current: Branch, node_id: str, agent_id: str, version: int) -> str | None:
+    """Why ``node_id`` may not replace ``current`` with ``agent_id``'s record at ``version``.
 
     The node that first recorded a branch owns its record; only it may supersede the
-    record, and never with a lower version (a delayed retry must not roll it back).
+    record, never with a lower version (a delayed retry must not roll it back), and never
+    for another agent: the owning agent is part of the branch's identity (a branch timeline
+    belongs to the agent that made it, as on the node's registry), so even its own node
+    cannot hand the record to another agent, at any version. ``None`` if it may.
     """
     if node_id != current.recorded_by.id:
         return f"the branch is recorded by node {current.recorded_by.id!r}, not {node_id!r}"
+    if agent_id != current.agent_id:
+        return f"the branch belongs to agent {current.agent_id!r}, not {agent_id!r}"
     if version < current.version:
         return f"version {version} is behind the recorded version {current.version}"
     return None
@@ -412,7 +418,7 @@ def _fold(log: EventLog, project_id: str | None) -> tuple[_BranchState, list[Ski
         key = (branch.project_id, branch.branch_timeline_id)
         first = state.get(key)
         if first is not None:
-            problem = _supersede_problem(first[1], event.actor.id, branch.version)
+            problem = _supersede_problem(first[1], event.actor.id, branch.agent_id, branch.version)
             if problem is not None:
                 skipped.append(SkippedEvent.of(event, problem))
                 continue
@@ -431,10 +437,10 @@ def scan_branches(log: EventLog, project_id: str | None = None) -> BranchScan:
 
     Keyed by ``(project id, branch timeline id)`` so projects never collide. The first node
     to record a key owns it: a later record replaces it only when it comes from that same
-    node with a version no lower than the recorded one (:func:`record_branch` refuses the
-    others up front; the fold re-checks, for events written concurrently or by hand). A
-    non-node writer, a cross-node overwrite, a rollback or a malformed event is skipped and
-    listed.
+    node, for the same agent, with a version no lower than the recorded one
+    (:func:`record_branch` refuses the others up front; the fold re-checks, for events
+    written concurrently or by hand). A non-node writer, a cross-node overwrite, an agent
+    swap, a rollback or a malformed event is skipped and listed.
     """
     state, skipped = _fold(log, project_id)
     ordered = sorted(state.items(), key=lambda item: (item[1][0], item[0]))

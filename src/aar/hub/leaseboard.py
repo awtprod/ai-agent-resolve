@@ -80,6 +80,12 @@ class BoardLease:
     since: str
     expires_at: str | None
 
+    @property
+    def sort_key(self) -> tuple[str, str, str]:
+        """The board's order: ``(since, node id, lease id)``. Unique (a lease id is unique on
+        its node) and fixed for the lease's lifetime, so a keyset cursor can page on it."""
+        return (self.since, self.node_id, self.lease_id)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "node_id": self.node_id,
@@ -383,7 +389,7 @@ def lease_board(log: EventLog, *, clock: Clock = utcnow) -> LeaseBoard:
             ended.add(lease_key)
     held = sorted(
         (lease for lease in leases.values() if not _expired(lease.expires_at, now)),
-        key=lambda lease: (lease.since, lease.node_id, lease.lease_id),
+        key=lambda lease: lease.sort_key,
     )
     present = sorted(
         (entry for entry in presence.values() if not _expired(entry.expires_at, now)),
