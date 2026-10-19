@@ -272,7 +272,25 @@ def test_h_a_sharing_violation_leaves_an_empty_unlabelled_output_and_names_it(
     assert raised.value.errno == errno.EACCES
     assert files(tmp_path) == [out.name] and out.read_bytes() == b""  # no label, empty file
     assert _left(raised.value) == [(str(out), "placeholder")]
-    assert "no label" in raised.value.left_behind[0].message
+    assert "Nothing was placed" in raised.value.left_behind[0].message
+
+
+def test_h_a_failed_label_placement_names_the_empty_label_it_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The label is placed first, the same way: if its replace fails, the empty file left at the
+    # label's name is named too, and the next run sees it as an existing label (out-exists).
+    out = tmp_path / "out.drp"
+    sidecar = Path(str(out) + SIDECAR_SUFFIX)
+    monkeypatch.setattr(os, "link", _no_hardlinks)
+    monkeypatch.setattr(os, "replace", _failing_replace_after(lambda d: None, sidecar))
+    with pytest.raises(OSError, match="simulated") as raised:
+        edit_file(H264, plan(RENAME), out)
+    assert _left(raised.value) == [(str(sidecar), "placeholder")]
+    assert files(tmp_path) == [sidecar.name] and sidecar.read_bytes() == b""
+    monkeypatch.undo()
+    again = edit_file(H264, plan(RENAME), out)
+    assert [r.code for r in again.refusals] == ["out-exists"]
 
 
 def test_h_the_cli_names_the_left_behind_file_and_exits_74(

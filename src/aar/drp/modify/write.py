@@ -91,8 +91,8 @@ class LeftBehind:
     * ``placeholder``: an empty regular file at the output (or label) name after ``os.replace``
       failed on a filesystem without hard links. It is usually aar's own claim on the name, but
       another program may have truncated it or put its own empty file there, and aar cannot tell,
-      so it is not deleted. The output is not in place and the label was removed: delete the file
-      once nothing else is writing to it, then run again.
+      so it is not deleted. Nothing was placed (an output whose placement failed has its new
+      label removed again): delete the file once nothing else is writing to it, then run again.
     * ``label-snapshot``: a hard link (else a copy) of the label ``--force`` found at
       ``<out>.aar.json``, kept because it does not bear aar's stamp. Check it against that label,
       then delete it.
@@ -513,9 +513,9 @@ def _unlink_if_ours(dest: Path, tmp_id: tuple[int, int] | None) -> list[LeftBehi
             "placeholder",
             f"os.replace failed after aar claimed {dest.name} with an empty placeholder; the "
             "empty file there now is probably that placeholder, but another program may have "
-            "truncated it or created its own, so aar did not delete it. The file was not placed "
-            "and has no label: delete the empty file once nothing else writes to it, then run "
-            "again",
+            "truncated it or created its own, so aar did not delete it. Nothing was placed (not "
+            "the output, not its label): delete the empty file once nothing else writes to it, "
+            "then run again",
         )
     ]
 
