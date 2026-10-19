@@ -625,9 +625,9 @@ class OpaqueEngine:
             self._walk(ra, name, rb, name, unit, root=False)
             return
         if not ua:
-            self._lone(ra, name, "a", unit, (ra.tag,))
+            self._lone(ra, name, "a", unit, _Path(None, ra.tag))
         if not ub:
-            self._lone(rb, name, "b", unit, (rb.tag,))
+            self._lone(rb, name, "b", unit, _Path(None, rb.tag))
 
     def _prolog(self, name: str, da: Document, db: Document) -> None:
         """The prolog and header comment, as raw bytes; only reported stamp values are left out.
