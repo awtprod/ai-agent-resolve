@@ -41,12 +41,18 @@ def write(tmp_path: Path, text: str) -> Path:
 
 def test_ccn_profile_carries_the_qa_targets(ccn: Profile):
     assert ccn.name == "ccn"
-    assert ccn.qa.model_dump() == {
+    qa = ccn.qa.model_dump()
+    assert {key: qa[key] for key in ("longform_lufs", "short_lufs")} == {
         "longform_lufs": -22.0,
         "short_lufs": -14.5,
-        "lufs_tolerance": 0.5,
-        "review_mp4_max_mb": 20,
     }
+    assert qa["lufs_tolerance"] == 0.5
+    assert qa["review_mp4_max_mb"] == 20
+    assert qa["true_peak_max_dbtp"] == -1.0
+    assert qa["silence_db"] == -42.0
+    assert qa["longest_silence_warn_s"] is None
+    assert qa["join_quiet_db"] == -40.0
+    assert qa["join_quiet_min_ms"] == 60
 
 
 def test_ccn_profile_holds_the_thresholds(ccn: Profile):
