@@ -188,6 +188,27 @@ def test_end_on_laugh_ignores_laughs_below_the_profile_strength(
     assert finding.message == "The laugh map has no laugh to end on."
 
 
+def test_end_on_laugh_keeps_a_laugh_exactly_at_the_profile_strength(
+    clean_data: PlanData, ccn, run_lint: RunLint
+):
+    """min_strength means "ignore laughs weaker than this": equal strength is not weaker."""
+    # The final out point is at 84.5 s, 200 ms after this laugh begins: well placed if it counts.
+    ccn.rules["end-on-laugh"].params["min_strength"] = 0.8
+    kept = run_lint(clean_data, laughs=laugh_map((84.3, 85.0, 0.8)), profile=ccn)
+    assert only(kept, "end-on-laugh") == []
+    just_below = run_lint(clean_data, laughs=laugh_map((84.3, 85.0, 0.79)), profile=ccn)
+    (finding,) = only(just_below, "end-on-laugh")
+    assert finding.message == "The laugh map has no laugh to end on."
+
+
+def test_end_on_laugh_keeps_a_zero_strength_laugh_at_the_default_threshold(
+    clean_data: PlanData, ccn, run_lint: RunLint
+):
+    assert ccn.rules["end-on-laugh"].params["min_strength"] == 0.0
+    report = run_lint(clean_data, laughs=laugh_map((84.3, 85.0, 0.0)), profile=ccn)
+    assert only(report, "end-on-laugh") == []
+
+
 def test_end_on_laugh_reports_a_laugh_map_for_another_recording(
     clean_data: PlanData, run_lint: RunLint
 ):
