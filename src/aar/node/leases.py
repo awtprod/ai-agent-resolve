@@ -199,12 +199,13 @@ class LeaseManager:
             if not holder.is_human:
                 raise ValueError("agent leases need a positive ttl")
             return None
-        if ttl <= 0:
-            raise ValueError("ttl must be positive")
-        # A finite ttl beyond the hub's cap is a caller bug; refuse it before granting so a
-        # lease is never held and then unrecordable. A non-finite ttl stays the mapper's job.
+        # ``not ttl > 0`` also refuses NaN, which compares false to everything. An infinite
+        # or over-cap ttl is a caller bug: refuse it before granting, so a lease is never
+        # held and then unrecordable on the hub (whose mapper refuses a non-finite ttl).
+        if not ttl > 0 or not math.isfinite(ttl):
+            raise ValueError(f"ttl must be a positive, finite number of seconds, got {ttl!r}")
         max_ttl = _hub_limits()[2]
-        if math.isfinite(ttl) and ttl > max_ttl:
+        if ttl > max_ttl:
             raise ValueError(f"ttl must be at most {max_ttl:g} seconds (the hub's cap)")
         return now + ttl
 

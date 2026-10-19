@@ -14,6 +14,7 @@ read-only.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -50,8 +51,9 @@ ELIDED = "<elided: nested deeper than 64 levels>"
 
 _MAX_PROJECT_ID = 256
 _MAX_BOARD_ROWS = 500
-_MAX_BRANCHES_PAGE = 100
-_MAX_BRANCHES_LIMIT = 500
+_MAX_BRANCHES_PAGE = 50
+_MAX_BRANCHES_LIMIT = 100
+_MAX_BRANCHES_BYTES = 256 * 1024
 
 
 def _bounded(value: Any, depth: int = 0) -> Any:
@@ -270,19 +272,35 @@ def build_server(
             "The lease board narrowed to one project: who holds the project and which of "
             "its timelines, and which humans are active. project_id is the Resolve project's "
             'unique id (the first part of a lease key). Returns {"project_id": id, "as_of": '
-            'ts, "leases": [...], "presence": [...]}. Instance leases are left out; presence '
-            "is node-level. Use this when a hot op is refused or delayed to see who holds what."
+            'ts, "stale": bool, "leases": [...], "presence": [...], "gaps": [...], '
+            '"next_cursor": N|null, "truncated": bool}; stale means a node\'s feed dropped '
+            "events and has not reconciled yet. Leases come a page at a time: pass "
+            "next_cursor back as cursor. Instance leases are left out; presence is "
+            "node-level. Use this when a hot op is refused or delayed to see who holds what."
         ),
         annotations=_READ_ONLY,
     )
-    def project_board(project_id: str) -> dict[str, Any]:
+    def project_board(
+        project_id: str, cursor: int = 0, limit: int = _MAX_BOARD_ROWS
+    ) -> dict[str, Any]:
         if not isinstance(project_id, str) or not 0 < len(project_id) <= _MAX_PROJECT_ID:
             raise ToolError(f"project_id must be 1 to {_MAX_PROJECT_ID} characters")
+        if cursor < 0:
+            raise ToolError("cursor must not be negative")
+        limit = max(1, min(_MAX_BOARD_ROWS, limit))
         board = collab_project_board(log, project_id, clock=clock)
         data = board.to_dict()
-        data["leases"] = data["leases"][:_MAX_BOARD_ROWS]
-        data["presence"] = data["presence"][:_MAX_BOARD_ROWS]
-        return {**data, "skipped": skipped_summary(board.skipped)}
+        leases = data["leases"]
+        data["leases"] = leases[cursor : cursor + limit]
+        next_cursor = cursor + limit if cursor + limit < len(leases) else None
+        presence = data["presence"]
+        data["presence"] = presence[:_MAX_BOARD_ROWS]
+        return {
+            **data,
+            "next_cursor": next_cursor,
+            "truncated": next_cursor is not None or len(presence) > _MAX_BOARD_ROWS,
+            "skipped": skipped_summary(board.skipped),
+        }
 
     @server.tool(
         name="agent_branches",
@@ -291,7 +309,8 @@ def build_server(
             "source timeline (id, name), the owning agent_id, the branch timeline (id, name), "
             "its version, and a handoff note (merging back is a human step: Compare "
             'Timelines). Returns {"branches": [...], "next_cursor": N|null}; pass next_cursor '
-            "back as cursor to page. Omit project_id for every project."
+            "back as cursor to page (a page also ends early to stay small). Omit project_id "
+            "for every project."
         ),
         annotations=_READ_ONLY,
     )
@@ -306,9 +325,16 @@ def build_server(
             raise ToolError("cursor must not be negative")
         limit = max(1, min(_MAX_BRANCHES_LIMIT, limit))
         found = collab_branches(log, project_id)
-        page = found[cursor : cursor + limit]
-        next_cursor = cursor + limit if cursor + limit < len(found) else None
-        return {"branches": [branch.to_dict() for branch in page], "next_cursor": next_cursor}
+        page: list[dict[str, Any]] = []
+        size = 0
+        for branch in found[cursor : cursor + limit]:
+            row = branch.to_dict()
+            size += len(json.dumps(row))
+            if page and size > _MAX_BRANCHES_BYTES:
+                break
+            page.append(row)
+        end = cursor + len(page)
+        return {"branches": page, "next_cursor": end if end < len(found) else None}
 
     @server.tool(
         name="approvals_list",

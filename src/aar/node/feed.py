@@ -14,7 +14,14 @@ idempotency key. A send that fails leaves its spec queued for the next flush. Th
 is bounded: on overflow the oldest spec is dropped, counted, and a ``feed.gap`` event is
 sent on the next successful flush so the board can show the node's history may be stale.
 Pending renewals for one lease are coalesced to the latest; expiries emitted while the
-lease table is read go through the same path.
+lease table is read go through the same path. A spec the hub keeps refusing is
+quarantined (counted as dropped and gap-flagged) rather than left to block the queue.
+
+After a gap, and on a new process's first flush, the feed reconciles: it re-announces its
+live leases and sends a ``lease.snapshot`` of their ids, so the hub's project board drops a
+lease whose release was lost (or that an earlier process held) and clears the stale flag.
+Every key the feed mints itself carries a per-process nonce, so a restarted node never
+collides with the keys of an earlier one.
 
 Bad input that the hub could not map is refused *before* a lease is granted
 (:meth:`aar.node.leases.LeaseManager.acquire`), so the feed never has to drop a lease
@@ -30,12 +37,13 @@ and approval tokens are S7's ``aar.node.hublink``.
 from __future__ import annotations
 
 import secrets
+from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
-from aar.hub.collab import EVENT_FEED_GAP, EVENT_LEASE_SNAPSHOT
+from aar.hub.collab import EVENT_FEED_GAP, EVENT_LEASE_SNAPSHOT, MAX_SNAPSHOT_LEASES
 from aar.hub.common import InvalidInput, clean_text, iso
 from aar.hub.events import Actor, EventLog
 from aar.hub.leaseboard import (
@@ -68,8 +76,11 @@ class FeedTransport(Protocol):
 
     In process this appends to an :class:`~aar.hub.events.EventLog`; a remote transport
     would POST to the hub. It must be idempotent on ``spec.idempotency_key``: delivering
-    the same spec twice must not add a second event. It may raise on a delivery failure;
-    the feed keeps the spec queued and retries it.
+    the same spec twice must not add a second event. On failure it raises: a
+    ``ConnectionError``, ``TimeoutError`` or other ``OSError`` when the hub cannot be
+    reached (the feed keeps the spec and retries it), a ``ValueError`` when the hub refuses
+    the spec (the feed quarantines it), anything else for a failure that may pass (retried
+    up to ``MAX_SPEC_ATTEMPTS`` times, then quarantined).
     """
 
     def deliver(self, spec: HubEventSpec, *, node_id: str) -> None: ...
@@ -115,13 +126,39 @@ def _clean_node_id(node_id: str) -> str:
     return cleaned
 
 
-# A delivery failure that is transient (the hub is down) is retried; any other failure is
-# the hub rejecting this spec, so it is quarantined rather than left to block the queue.
-_TRANSIENT = (ConnectionError, TimeoutError, OSError)
+# Delivery failures, by what the feed does about them (see :meth:`NodeFeed.flush`).
+# Unreachable: the hub is down or the link is; retried every flush until it comes back.
+_UNREACHABLE = (ConnectionError, TimeoutError, OSError)
+# Rejected: the hub refused this spec (a payload it will not take, or a reused idempotency
+# key). It can never succeed, so it is quarantined at once rather than block the queue.
+_REJECTED = (ValueError, TypeError)
+
+MAX_SPEC_ATTEMPTS = 3
+"""Tries before a spec that fails in any other way (neither unreachable nor rejected, e.g.
+a locked database) is quarantined, so no spec blocks the queue forever."""
+
+QUARANTINE_MEMORY = 64
+"""Quarantined specs remembered for inspection (oldest forgotten first); all are counted."""
+
+
+@dataclass(frozen=True, slots=True)
+class Quarantined:
+    """A spec the feed gave up on, and why. It counts as dropped and is gap-flagged."""
+
+    type: str
+    idempotency_key: str | None
+    error: str
 
 
 class NodeFeed:
-    """Maps a node's lease and presence changes and sends them to the hub on ``flush``."""
+    """Maps a node's lease and presence changes and sends them to the hub on ``flush``.
+
+    ``lease_source`` and ``clock`` (the lease table's ``active`` and its monotonic clock)
+    let the feed reconcile the board after it lost events: on its first flush, and after
+    any gap, it re-announces every live lease and then sends a ``lease.snapshot`` of their
+    ids, so the board picks up a grant it missed, drops a lease whose release it missed
+    (or that a previous process of this node held), and clears the node's stale flag.
+    """
 
     def __init__(
         self,
@@ -135,22 +172,29 @@ class NodeFeed:
     ) -> None:
         if outbox_max < 1:
             raise ValueError("outbox_max must be at least 1")
+        if (lease_source is None) != (clock is None):
+            raise ValueError("lease_source and clock go together (the lease table and its clock)")
         self._node_id = _clean_node_id(node_id)
         self._transport = transport
         self._wall_offset = wall_offset
         self._outbox_max = outbox_max
         self._lease_source = lease_source
         self._clock = clock
-        # A per-process nonce so a gap (or snapshot) key never collides with one minted by an
-        # earlier process for the same node (which would wedge every later flush on a
-        # conflict). Monotonic within the process via ``_event_seq``.
+        # A per-process nonce in every key the feed mints itself (gaps, snapshots, lease
+        # re-announcements), so a restarted node never reuses a key an earlier process of
+        # the same node already used for a different event (which the hub would refuse on
+        # every flush from then on).
         self._epoch = secrets.token_hex(8)
-        self._event_seq = 0
+        self._minted = 0
         self._outbox: list[HubEventSpec] = []
+        self._failing: HubEventSpec | None = None  # the head spec, while it keeps failing
+        self._failures = 0
         self._dropped = 0
         self._gap_pending = False
         self._gap_at: datetime | None = None
-        self._reconcile_pending = False
+        # A new process knows nothing of what an earlier one left on the board: reconcile.
+        self._reconcile_pending = lease_source is not None
+        self._quarantined: deque[Quarantined] = deque(maxlen=QUARANTINE_MEMORY)
 
     @property
     def node_id(self) -> str:
@@ -163,6 +207,16 @@ class NodeFeed:
     @property
     def dropped(self) -> int:
         return self._dropped
+
+    @property
+    def quarantined(self) -> tuple[Quarantined, ...]:
+        """The most recent specs the feed gave up on (up to ``QUARANTINE_MEMORY``)."""
+        return tuple(self._quarantined)
+
+    @property
+    def reconciled(self) -> bool:
+        """Whether the board has this node's current leases (no reconcile is pending)."""
+        return not self._reconcile_pending
 
     # -- enqueue (never raises into the LeaseManager or the broker) ------------------------
 
@@ -188,8 +242,18 @@ class NodeFeed:
         human_id: str | None = None,
         ttl: timedelta | None = None,
     ) -> None:
-        """Map and enqueue a presence change. ``at`` must be timezone-aware."""
-        spec = presence_to_hub(self._node_id, active=active, at=at, human_id=human_id, ttl=ttl)
+        """Map and enqueue a presence change. ``at`` must be timezone-aware.
+
+        A change the hub could not map is dropped and gap-flagged, never raised, like a
+        lease event.
+        """
+        if at.tzinfo is None:
+            raise ValueError("at must be timezone-aware")  # a caller bug, not a feed failure
+        try:
+            spec = presence_to_hub(self._node_id, active=active, at=at, human_id=human_id, ttl=ttl)
+        except InvalidInput:
+            self._note_gap()
+            return
         state = "active" if active else "inactive"
         key = f"presence:{self._node_id}:{state}:{at.astimezone(UTC).isoformat()}"
         self._enqueue(replace(spec, idempotency_key=key))
@@ -210,97 +274,118 @@ class NodeFeed:
     def _note_gap(self) -> None:
         self._dropped += 1
         self._gap_pending = True
-        self._reconcile_pending = True
+        self._reconcile_pending = self._lease_source is not None
         if self._gap_at is None:
             self._gap_at = datetime.now(UTC)
 
     # -- flush (called by the pump; never raises into it) ----------------------------------
 
     def flush(self) -> FlushReport:
-        """Send queued specs in order. On a transient failure, keep the rest for next time;
-        on a rejection, quarantine the offending spec (gap-flagged) so it cannot block."""
+        """Send the pending gap, then reconcile, then the queued specs, in order.
+
+        Never raises. Failing to reach the hub stops the flush and keeps everything for the
+        next one. Any other failure never blocks what follows: a gap or reconcile that fails
+        is retried on the next flush, and a queued spec the hub rejects is quarantined at
+        once (one that fails any other way, after ``MAX_SPEC_ATTEMPTS`` tries), counted as
+        dropped and gap-flagged, so a poison spec never blocks the specs behind it.
+        """
         delivered_gap = False
-        error: str | None = None
-        sent = 0
+        problems: list[str] = []
         if self._gap_pending:
             try:
                 self._transport.deliver(self._gap_spec(), node_id=self._node_id)
-            except Exception as exc:  # a failed gap send is retried next flush
-                return FlushReport(0, len(self._outbox), self._dropped, False, repr(exc))
-            self._gap_pending = False
-            self._gap_at = None
-            delivered_gap = True
-        # After a gap, send a snapshot of the node's live leases so the board can reconcile
-        # (drop a phantom left by a dropped release) and clear the stale flag.
-        if self._reconcile_pending:
-            snapshot = self._snapshot_spec()
-            if snapshot is None:
-                self._reconcile_pending = False  # no lease source wired: nothing to reconcile
+            except _UNREACHABLE as exc:  # re-sent (same key) on the next flush
+                return self._report(0, delivered_gap, repr(exc))
+            except Exception as exc:
+                problems.append(f"gap: {exc!r}")
             else:
-                try:
-                    self._transport.deliver(snapshot, node_id=self._node_id)
-                    self._reconcile_pending = False
-                except Exception as exc:
-                    return FlushReport(sent, len(self._outbox), self._dropped, delivered_gap, repr(exc))
+                self._gap_pending = False
+                self._gap_at = None
+                delivered_gap = True
+                # The stale flag this gap raises is cleared only by a later snapshot.
+                self._reconcile_pending = self._lease_source is not None
+        if self._reconcile_pending:
+            try:
+                self._reconcile()
+            except _UNREACHABLE as exc:  # reconciled again, from scratch, on the next flush
+                return self._report(0, delivered_gap, f"reconcile: {exc!r}")
+            except Exception as exc:
+                problems.append(f"reconcile: {exc!r}")
+            else:
+                self._reconcile_pending = False
+        sent = 0
         while self._outbox:
             spec = self._outbox[0]
+            if spec is not self._failing:
+                self._failing, self._failures = spec, 0
             try:
                 self._transport.deliver(spec, node_id=self._node_id)
+            except _UNREACHABLE as exc:
+                problems.append(repr(exc))
+                break
             except Exception as exc:
-                if isinstance(exc, _TRANSIENT):
-                    error = repr(exc)
+                self._failures += 1
+                if not isinstance(exc, _REJECTED) and self._failures < MAX_SPEC_ATTEMPTS:
+                    problems.append(repr(exc))
                     break
-                # The hub rejected this spec; quarantine it (gap-flagged) and keep going so a
-                # poison spec never blocks everything behind it.
                 self._outbox.pop(0)
+                self._quarantined.append(Quarantined(spec.type, spec.idempotency_key, repr(exc)))
                 self._note_gap()
-                error = f"quarantined: {exc!r}"
+                problems.append(f"quarantined {spec.type}: {exc!r}")
                 continue
             self._outbox.pop(0)
             sent += 1
+        return self._report(sent, delivered_gap, "; ".join(problems) or None)
+
+    def _report(self, sent: int, delivered_gap: bool, error: str | None) -> FlushReport:
         return FlushReport(sent, len(self._outbox), self._dropped, delivered_gap, error)
 
-    def _next_key(self, kind: str) -> str:
-        self._event_seq += 1
-        return f"{kind}:{self._node_id}:{self._epoch}:{self._event_seq}"
+    def _mint_key(self, kind: str) -> str:
+        self._minted += 1
+        return f"{kind}:{self._node_id}:{self._epoch}:{self._minted}"
 
     def _gap_spec(self) -> HubEventSpec:
+        # Keyed by this process's epoch and the running drop count: a resend of the same
+        # pending gap replays the same key and payload, and a later gap (more drops) or a
+        # later process never reuses it.
         at = self._gap_at or datetime.now(UTC)
         return HubEventSpec(
             EVENT_FEED_GAP,
             {"node_id": self._node_id, "dropped": self._dropped, "at": iso(at)},
-            self._next_key(EVENT_FEED_GAP),
+            f"{EVENT_FEED_GAP}:{self._node_id}:{self._epoch}:{self._dropped}",
         )
 
-    def _snapshot_spec(self) -> HubEventSpec | None:
-        if self._lease_source is None:
-            return None
+    def _reconcile(self) -> None:
+        """Re-announce every live lease, then send a snapshot of their ids. Raises on failure.
+
+        The re-announcements are ``lease.renewed`` events the lease board already folds, so
+        a lease whose grant was dropped reappears; the snapshot lets the hub drop a lease
+        this node no longer holds. Both are built fresh (fresh keys) on every attempt.
+        """
+        assert self._lease_source is not None and self._clock is not None
+        live = list(self._lease_source())
+        if len(live) > MAX_SNAPSHOT_LEASES:
+            raise ValueError(
+                f"{len(live)} live leases is over the snapshot cap of {MAX_SNAPSHOT_LEASES}"
+            )
+        now = self._clock()
         offset = self._wall_offset()
-        now = (self._clock() + offset) if self._clock is not None else datetime.now(UTC).timestamp()
-        leases = [self._lease_dict(lease, offset) for lease in self._lease_source()]
-        return HubEventSpec(
+        for lease in live:
+            spec = lease_event_to_hub(
+                LeaseEvent("renewed", now, lease), self._node_id, wall_offset=offset
+            )
+            spec = replace(spec, idempotency_key=self._mint_key("lease.reannounced"))
+            self._transport.deliver(spec, node_id=self._node_id)
+        snapshot = HubEventSpec(
             EVENT_LEASE_SNAPSHOT,
             {
                 "node_id": self._node_id,
-                "at": iso(datetime.fromtimestamp(now, UTC)),
-                "leases": leases,
+                "at": iso(datetime.fromtimestamp(now + offset, UTC)),
+                "lease_ids": [lease.id for lease in live],
             },
-            self._next_key(EVENT_LEASE_SNAPSHOT),
+            self._mint_key(EVENT_LEASE_SNAPSHOT),
         )
-
-    def _lease_dict(self, lease: Lease, offset: float) -> dict:
-        return {
-            "lease_id": lease.id,
-            "scope": lease.scope.value,
-            "key": list(lease.key),
-            "holder": {"kind": lease.holder.kind.value, "id": lease.holder.id},
-            "acquired_at": iso(datetime.fromtimestamp(lease.acquired_at + offset, UTC)),
-            "expires_at": (
-                None
-                if lease.expires_at is None
-                else iso(datetime.fromtimestamp(lease.expires_at + offset, UTC))
-            ),
-        }
+        self._transport.deliver(snapshot, node_id=self._node_id)
 
 
 class PresenceReporter:
