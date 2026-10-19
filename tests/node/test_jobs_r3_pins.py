@@ -372,3 +372,152 @@ def test_render_params_are_validated_at_submit(tmp_path: Path) -> None:
             "render", _render_params(world, mark_in=10, mark_out=10), world.locator()
         )
     assert world.runner.list() == [] and world.store.load_all() == []
+
+
+# -- the broker precheck (S3 hook used by the runner) ----------------------------------------------
+
+
+def _marker_op(world: JobWorld, frame: int, precheck):
+    from dataclasses import replace
+
+    from aar.node.leases import Holder
+    from aar.node.ops import make_hot_op
+
+    hot = make_hot_op(
+        "markers.add",
+        {"timeline": world.ref("Main"), "markers": [{"frame": frame}]},
+        target=world.locator(),
+        holder=Holder.agent("pin"),
+    )
+    return replace(hot, precheck=precheck)
+
+
+def test_broker_precheck_refuses_runs_and_fails_closed(tmp_path: Path) -> None:
+    """Kills F01/F02/F03/F54: a refusing precheck finishes the op cancelled with its error and
+    never runs it (at the tick sweep AND right before the op); a precheck that raises refuses;
+    no precheck or ``None`` runs the op."""
+    from aar.node.broker import OpError, OpStatus
+
+    world = JobWorld(tmp_path)
+    calls: list[str] = []
+
+    def refuse():
+        calls.append("refuse")
+        return OpError("nope", "refused by the test")
+
+    def boom():
+        raise RuntimeError("cannot check")
+
+    ok = world.broker.submit(_marker_op(world, 1, lambda: None))
+    refused = world.broker.submit(_marker_op(world, 2, refuse))
+    raised = world.broker.submit(_marker_op(world, 3, boom))
+    world.broker.run_until_idle()
+    assert world.broker.result(ok).status is OpStatus.OK
+    r = world.broker.result(refused)
+    assert r.status is OpStatus.CANCELLED and r.error.code == "nope" and r.started_at is None
+    r = world.broker.result(raised)
+    assert r.status is OpStatus.CANCELLED and r.error.code == "precheck_failed"
+    assert sorted(world.main.markers) == [1]
+    assert calls == ["refuse"]  # refused at the tick sweep: never reached the batch
+
+
+def test_broker_precheck_is_asked_again_right_before_the_op(tmp_path: Path) -> None:
+    """Kills F01: the gate is re-asked between ops of one batch, after the sweep passed."""
+    from aar.node.broker import OpError, OpStatus
+
+    world = JobWorld(tmp_path)
+    gate = {"open": True}
+
+    def first_op_closes_the_gate(*a, **k):
+        gate["open"] = False
+        return orig(*a, **k)
+
+    orig = world.main.AddMarker
+    world.main.AddMarker = first_op_closes_the_gate  # type: ignore[method-assign]
+    a = world.broker.submit(_marker_op(world, 1, lambda: None))
+    b = world.broker.submit(
+        _marker_op(world, 2, lambda: None if gate["open"] else OpError("closed", "gate closed"))
+    )
+    world.broker.run_until_idle()
+    assert world.broker.result(a).status is OpStatus.OK
+    assert world.broker.result(b).error.code == "closed"
+    assert sorted(world.main.markers) == [1]
+
+
+# -- render op details -----------------------------------------------------------------------------
+
+
+def test_cleanup_failure_is_noted_in_measured(tmp_path: Path) -> None:
+    """Kills D12 (cleanup failure note dropped) and O18 (delete_job unverified): a completed
+    render job that is still listed after DeleteRenderJob is reported, not claimed removed."""
+    world = JobWorld(tmp_path)
+    world.project.DeleteRenderJob = lambda job_id: True  # type: ignore[method-assign]
+    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.run_until_settled()
+    view = world.runner.get(job_id)
+    assert view.state == "succeeded"
+    assert "still listed" in view.measured["cleanup_note"]
+    assert len(world.project.render_jobs) == 1
+
+
+def test_start_that_does_not_start_fails_and_removes_our_job(tmp_path: Path) -> None:
+    """Kills O10 (start not verified): StartRendering says True but nothing renders."""
+    world = JobWorld(tmp_path)
+    world.project.StartRendering = lambda ids, interactive=False: True  # type: ignore[method-assign]
+    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.run_until_settled()
+    view = world.runner.get(job_id)
+    assert view.state == "failed" and view.error["code"] == "render_not_started"
+    assert view.error["detail"]["cleanup"]["deleted"] is True
+    assert world.project.render_jobs == []
+
+
+def test_failed_render_reports_resolves_error_text(tmp_path: Path) -> None:
+    """Kills O20 (poll drops the error text)."""
+    world = JobWorld(tmp_path)
+    world.project.render_outcome = "fail"
+    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.run_until_settled()
+    view = world.runner.get(job_id)
+    assert view.error["code"] == "render_failed"
+    assert "frames offline" in view.error["message"]
+    assert view.alerts == []  # the render is over: not an orphan
+
+
+def test_render_removed_by_a_human_mid_poll_fails_without_an_orphan_alert(tmp_path: Path) -> None:
+    """Kills O21 (an unknown job id is not refused by render.poll)."""
+    world = JobWorld(tmp_path)
+    world.project.render_complete_after = 50
+    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    for _ in range(6):
+        world.runner.pump()
+    assert world.store.get(job_id).cursor.get("phase") == "poll"
+    world.project.render_jobs.clear()  # a human deleted it from the queue
+    world.project.rendering = False
+    world.runner.run_until_settled()
+    view = world.runner.get(job_id)
+    assert view.state == "failed" and view.error["code"] == "render_job_unknown"
+    assert view.alerts == []
+
+
+def test_render_poll_reports_is_rendering(tmp_path: Path) -> None:
+    """Kills O13 (is_rendering always False)."""
+    from aar.node.leases import Holder
+    from aar.node.ops import submit_op
+
+    world = JobWorld(tmp_path)
+    world.project.render_complete_after = 50
+    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    for _ in range(6):
+        world.runner.pump()
+    rid = world.store.get(job_id).cursor["render_job_id"]
+    op_id = submit_op(
+        world.broker,
+        "render.poll",
+        {"render_job_id": rid},
+        target=world.locator(),
+        holder=Holder.agent("reader"),
+    )
+    world.broker.run_until_idle()
+    value = world.broker.result(op_id).value
+    assert value.status == "Rendering" and value.is_rendering is True
