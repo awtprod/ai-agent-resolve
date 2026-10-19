@@ -10,6 +10,7 @@ import math
 from array import array
 from dataclasses import dataclass, field
 from itertools import accumulate
+from statistics import median
 
 
 @dataclass(frozen=True)
@@ -45,7 +46,7 @@ class QuietRun:
 
     start_s: float
     end_s: float
-    level_dbfs: float  # the loudest window that makes up the run
+    level_dbfs: float  # median level of the quiet windows that make up the run
 
     @property
     def duration_s(self) -> float:
@@ -73,7 +74,8 @@ def quiet_runs(pcm: Pcm, *, threshold_dbfs: float, window_s: float = 0.010) -> Q
     below ``threshold_dbfs``. A quiet run is a maximal stretch covered by overlapping or
     touching quiet windows, so its length is exact to the sample: a 60 ms gap of digital
     silence between loud sounds measures 60 ms plus at most a few samples where the
-    neighbouring sound passes through zero.
+    neighbouring sound passes through zero. A run's level is the median of its windows, so
+    the few edge windows that reach into the neighbouring sound do not colour it.
     """
     width = max(1, round(window_s * pcm.rate))
     frames = pcm.frames
@@ -87,14 +89,14 @@ def quiet_runs(pcm: Pcm, *, threshold_dbfs: float, window_s: float = 0.010) -> Q
     quietest = math.inf
     run_start = -1
     run_end = -1
-    run_peak = 0.0
+    run_energies: list[float] = []
 
     def close() -> None:
         runs.append(
             QuietRun(
                 start_s=pcm.start_s + run_start / pcm.rate,
                 end_s=pcm.start_s + run_end / pcm.rate,
-                level_dbfs=db(run_peak / width),
+                level_dbfs=db(median(run_energies) / width),
             )
         )
 
@@ -105,11 +107,11 @@ def quiet_runs(pcm: Pcm, *, threshold_dbfs: float, window_s: float = 0.010) -> Q
         if energy < limit:
             if run_start >= 0 and i <= run_end:
                 run_end = i + width
-                run_peak = max(run_peak, energy)
+                run_energies.append(energy)
             else:
                 if run_start >= 0:
                     close()
-                run_start, run_end, run_peak = i, i + width, energy
+                run_start, run_end, run_energies = i, i + width, [energy]
     if run_start >= 0:
         close()
     return QuietScan(

@@ -53,7 +53,7 @@ def test_room_tone_below_threshold_is_quiet_and_above_is_not():
     quiet = quiet_runs(pcm_from(tone(2400) + noise(-46, 4800) + tone(2400)), threshold_dbfs=-40)
     assert quiet.longest is not None
     assert quiet.longest.duration_s == pytest.approx(0.1, abs=0.002)
-    assert -48 < quiet.longest.level_dbfs < -40
+    assert quiet.longest.level_dbfs == pytest.approx(-46, abs=0.5)  # median window level
     loud = quiet_runs(pcm_from(noise(-35, 9600)), threshold_dbfs=-40)
     assert loud.runs == []
     assert loud.quietest_dbfs == pytest.approx(-35, abs=1.5)

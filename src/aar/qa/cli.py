@@ -84,10 +84,13 @@ def _cmd_check(args: argparse.Namespace) -> int:
         return _input_error(
             "invalid-argument", "--silence-db must be a negative number of dB", [], as_json
         )
-    if not file.exists():
-        return _input_error("FileNotFoundError", f"file not found: {file}", [], as_json)
-    if not file.is_file():
-        return _input_error("NotAFile", f"not a regular file: {file}", [], as_json)
+    try:
+        if not file.exists():
+            return _input_error("FileNotFoundError", f"file not found: {file}", [], as_json)
+        if not file.is_file():
+            return _input_error("NotAFile", f"not a regular file: {file}", [], as_json)
+    except OSError as exc:
+        return _input_error(type(exc).__name__, f"cannot read {file}: {exc}", [], as_json)
     try:
         plan = (
             EditPlan.model_validate_json(args.plan.read_text(encoding="utf-8"))
@@ -113,7 +116,13 @@ def _cmd_check(args: argparse.Namespace) -> int:
         )
     except (OSError, json.JSONDecodeError, ProfileError, MediaError, ValueError) as exc:
         return _input_error(type(exc).__name__, str(exc), [], as_json)
-    out = report.model_dump_json(indent=2) if as_json else format_report(report)
+    # json.dumps, not model_dump_json: a file name that is not valid UTF-8 carries lone
+    # surrogates, which pydantic refuses to encode and cli_io.emit escapes instead.
+    out = (
+        json.dumps(report.model_dump(mode="json"), indent=2, ensure_ascii=False)
+        if as_json
+        else format_report(report)
+    )
     written = cli_io.emit(_PROG, out + "\n")
     if written != EXIT_OK:
         return written

@@ -701,6 +701,7 @@ def _join_retranscribe(ctx: _Ctx) -> QACheck:
         "windows": qa.join_windows,
         "window_s": qa.join_window_s,
         "step_s": qa.join_window_step_s,
+        "edge_s": qa.join_window_edge_s,
         "agreement_min": qa.join_agreement_min,
         "straddle_s": qa.word_straddle_s,
     }
@@ -756,8 +757,9 @@ def _retranscribe_one(
     half = qa.join_window_s / 2
     offsets = [(k - (n - 1) / 2) * qa.join_window_step_s for k in range(n)]
     centre = cut.record_s
-    lo = max(0.0, centre - half + max(offsets))
-    hi = min(render_end, centre + half + min(offsets))
+    edge = qa.join_window_edge_s
+    lo = max(0.0, centre - half + max(offsets) + edge)
+    hi = min(render_end, centre + half + min(offsets) - edge)
     entry = _cut_ref(plan, cut)
     entry["region_s"] = [round(lo, 3), round(hi, 3)]
     want = tokens(

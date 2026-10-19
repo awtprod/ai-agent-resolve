@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 Status = Literal["pass", "warn", "fail", "skipped"]
 Kind = Literal["short", "longform", "review"]
@@ -41,6 +42,18 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def json_clean(value: Any) -> Any:
+    """Replace non-finite floats (``-inf`` for digital silence, NaN) with None, recursively,
+    so a report always serialises to strict JSON."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: json_clean(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_clean(item) for item in value]
+    return value
+
+
 class QACheck(_Model):
     id: str = Field(description="Check id, e.g. 'loudness'.")
     status: Status
@@ -51,6 +64,11 @@ class QACheck(_Model):
     details: list[dict[str, Any]] = Field(
         default_factory=list, description="Per-join or per-word entries, when the check has any."
     )
+
+    @field_validator("measured", "target", "details", mode="after")
+    @classmethod
+    def _finite(cls, value: Any) -> Any:
+        return json_clean(value)
 
 
 class QAReport(_Model):

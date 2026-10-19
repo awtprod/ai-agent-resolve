@@ -25,7 +25,8 @@ join_quiet_search_s = 0.10  # ... inside [src_in - this, src_in + this], clipped
 join_quiet_window_ms = 10   # RMS window; a run is the union of windows below join_quiet_db
 join_windows = 3          # overlapping re-transcription windows per join (2 or 3)
 join_window_s = 4.0       # length of each window, centred on the join
-join_window_step_s = 0.5  # offset between windows; compared region = their overlap
+join_window_step_s = 0.5  # offset between windows
+join_window_edge_s = 0.25 # compared region = the windows' overlap less this at each end
 join_agreement_min = 0.8  # difflib ratio every window pair and window vs plan must reach
 word_straddle_s = 0.03    # a word may cross a cut or region edge by this much
 

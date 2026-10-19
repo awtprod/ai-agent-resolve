@@ -65,15 +65,17 @@ class QATargets(_Model):
     join_windows: int = Field(default=3, ge=2, le=3)
     join_window_s: float = Field(default=4.0, gt=0)
     join_window_step_s: float = Field(default=0.5, gt=0)
+    join_window_edge_s: float = Field(default=0.25, ge=0)
     join_agreement_min: float = Field(default=0.8, ge=0, le=1)
     word_straddle_s: float = Field(default=0.03, ge=0)
 
     @model_validator(mode="after")
     def _consistent(self) -> QATargets:
-        if self.join_window_step_s * (self.join_windows - 1) >= self.join_window_s:
+        spread = self.join_window_step_s * (self.join_windows - 1)
+        if spread + 2 * self.join_window_edge_s >= self.join_window_s:
             raise ValueError(
-                "join windows do not overlap: join_window_step_s * (join_windows - 1) "
-                "must be shorter than join_window_s"
+                "join windows leave no region to compare: join_window_s must be longer than "
+                "join_window_step_s * (join_windows - 1) + 2 * join_window_edge_s"
             )
         if self.join_quiet_window_ms > self.join_quiet_min_ms:
             raise ValueError("join_quiet_window_ms must not exceed join_quiet_min_ms")
