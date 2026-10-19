@@ -76,6 +76,10 @@ _INDEXED = re.compile(r"^(\w+)\[(\d+)\]$")
 _FRAME_FIELDS = frozenset({"record_start", "duration", "source_in"})
 _FRAME_RATE_HINT = re.compile(r"\d+(\.\d+)?")
 _PATH_SEP = re.compile(r"[\\/]")
+# The attribute that identifies an element. Searched for by name in the bytes the scanner did not
+# decode (see ``_unread_identity``); a false hit, such as the same text inside an attribute value,
+# only adds wording to a change that is reported anyway.
+_IDENTITY_IN_TAIL = re.compile(rb"\sDbId\s*=")
 _APP_VALUE = re.compile(rb'(\bDbAppVer\s*=\s*")[^"]*(")')
 _PRJ_VALUE = re.compile(rb'(\bDbPrjVer\s*=\s*")[^"]*(")')
 
@@ -799,7 +803,8 @@ class OpaqueEngine:
                 ea,
                 mb,
                 eb,
-                f"attribute(s) {', '.join(names)} changed",
+                f"attribute(s) {', '.join(names)} changed"
+                + self._unread_identity(data_a, unread_a, end_a, data_b, unread_b, end_b),
                 part=(tag_a, tag_b),
             )
         elif (
@@ -817,9 +822,41 @@ class OpaqueEngine:
                 mb,
                 eb,
                 f"attributes past the first {MAX_ATTRS_PER_ELEMENT} differ "
-                "(they are compared as raw bytes, not by name)",
+                "(they are compared as raw bytes, not by name)"
+                + self._unread_identity(data_a, unread_a, end_a, data_b, unread_b, end_b),
                 part=(tag_a, tag_b),
             )
+
+    @staticmethod
+    def _unread_identity(
+        data_a: bytes,
+        unread_a: int | None,
+        end_a: int,
+        data_b: bytes,
+        unread_b: int | None,
+        end_b: int,
+    ) -> str:
+        """Wording for a ``DbId`` among the attributes the scanner did not decode, or ``""``.
+
+        Inside the first ``MAX_ATTRS_PER_ELEMENT`` attributes a repeated name is last-wins; past
+        them nothing is decoded, so a ``DbId`` there is never read (the first one, if any, is the
+        one in use). The change is reported either way; this says that such a ``DbId`` is present.
+        """
+        sides = [
+            side
+            for side, data, start, end in (
+                ("A", data_a, unread_a, end_a),
+                ("B", data_b, unread_b, end_b),
+            )
+            if start is not None and _IDENTITY_IN_TAIL.search(data, start, end)
+        ]
+        if not sides:
+            return ""
+        return (
+            f"; DbId appears past the first {MAX_ATTRS_PER_ELEMENT} attributes in "
+            f"{' and '.join(sides)} and is not decoded "
+            "(a repeated DbId counts last below the cap, first past it)"
+        )
 
     def _loose(
         self,
