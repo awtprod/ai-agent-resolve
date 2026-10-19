@@ -673,6 +673,16 @@ def _join_quiet(ctx: _Ctx) -> QACheck:
                 channels=src_info.audio.channels or 1,
                 timeout_s=ctx.timeout(1.0, duration_s=0.0),
             )
+        except MediaTimeout as exc:
+            # A stalled read says nothing about the cut (a slow mount, a busy disk), so the
+            # join is not checked rather than failed. A decode error still fails it below.
+            reason = (
+                f"reading the source audio timed out after {exc.timeout_s:g} s "
+                "(a slow or stalled mount?)"
+            )
+            entry.update(status="unchecked", reason=reason)
+            details.append(entry)
+            continue
         except MediaError as exc:
             reason = f"could not read the source audio: {exc.summary()}"
             entry.update(status="fail", reason=reason, hint=f"join {cut.number}: {reason}")
