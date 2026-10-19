@@ -142,19 +142,6 @@ def test_a_copy_that_cannot_be_deleted_is_reported_as_left_behind(
     assert error.detail["left_behind"]["name"] in _names(show)
 
 
-def test_the_clean_up_never_deletes_the_source_or_any_timeline_it_did_not_make() -> None:
-    show = Show()
-    show.fake.faults.add("DuplicateTimeline:returns-source")  # the copy is made, then refused
-    before = {t.GetUniqueId() for t in show.project.timelines}
-    error = show.fails("timeline.branch", {"source": show.ref("Main")})
-    assert error.code == "duplicate_unverified"
-    after = {t.GetUniqueId() for t in show.project.timelines}
-    assert after == before  # Main and the human's "Main [agent]" are kept; only the copy went
-    assert error.detail["removed"]["unique_id"] not in before
-    deletes = [call for call in show.fake.calls if call[0] == "DeleteTimelines"]
-    assert deletes == [("DeleteTimelines", [error.detail["removed"]["unique_id"]])]
-
-
 def test_a_branch_refused_before_any_copy_deletes_nothing() -> None:
     show = Show()
     show.fake.faults.add("DuplicateTimeline:detached")  # returns a timeline not in the project

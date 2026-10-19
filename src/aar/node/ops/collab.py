@@ -12,9 +12,9 @@ Three hot ops sit on top of the write-op library (DESIGN R3):
   with a fresh id) is never reused, it just takes a version number. Refusals that need no
   Resolve call (no agent holder, an unusable agent id, no registry) are made at submit. If
   the copy is made but a later step fails (its resolution will not set), the copy is
-  deleted again, so the op leaves no unowned half-made branch behind and a retry cuts the
-  same version. Merging a branch back is a human step, so the result carries a handoff
-  note.
+  deleted again, by the unique id ``timeline.duplicate`` reports for it (never by name), so
+  the op leaves no unowned half-made branch behind and a retry cuts the same version.
+  Merging a branch back is a human step, so the result carries a handoff note.
 - ``markers.mirror_review`` mirrors a hub review's timecoded notes to markers on the agent's
   branch. Each marker's ``customData`` carries the note id, so a re-run updates in place and
   prunes markers whose note is gone, never duplicating. It pre-flights the whole plan (every
@@ -66,7 +66,13 @@ from aar.node.ops.framework import (
     op,
 )
 from aar.node.ops.timebase import converted_length
-from aar.node.ops.write import DuplicateParams, MarkerColor, Resolution, timeline_duplicate
+from aar.node.ops.write import (
+    CREATED_TIMELINE_ID,
+    DuplicateParams,
+    MarkerColor,
+    Resolution,
+    timeline_duplicate,
+)
 
 MAX_NOTES = 1000
 MAX_TOTAL_TEXT = 1_000_000  # total marker text bytes per mirror call
@@ -183,10 +189,8 @@ def timeline_branch(env: OpEnv, params: BranchParams) -> BranchResult:
     # asked for. A human timeline or a copy that carries a branch name is never reused.
     taken: set[int] = set()
     reusable: dict[int, Any] = {}
-    existing: set[str] = set()
     for timeline in env.timelines():
         uid = str(timeline.GetUniqueId())
-        existing.add(uid)
         version = branch_version_for(str(timeline.GetName()), source_name, agent_id)
         if version is not None:
             taken.add(version)
@@ -226,7 +230,7 @@ def timeline_branch(env: OpEnv, params: BranchParams) -> BranchResult:
             ),
         )
     except OpError as exc:
-        raise _undo_half_made_branch(env, existing, name, exc) from exc
+        raise _undo_half_made_branch(env, exc) from exc
     try:
         registry.register(
             project_id,
@@ -252,8 +256,8 @@ def timeline_branch(env: OpEnv, params: BranchParams) -> BranchResult:
     )
 
 
-def _undo_half_made_branch(env: OpEnv, existing: set[str], name: str, exc: OpError) -> OpError:
-    """Delete the copy a failed ``timeline.branch`` made, and say so on its error.
+def _undo_half_made_branch(env: OpEnv, exc: OpError) -> OpError:
+    """Delete, by unique id, the copy a failed ``timeline.branch`` made; say so on its error.
 
     The duplicate can be made and a later step still fail (its resolution will not set, or
     does not read back). That copy belongs to no one: it is not registered, so the guard
@@ -262,28 +266,28 @@ def _undo_half_made_branch(env: OpEnv, existing: set[str], name: str, exc: OpErr
     retry could not reuse it either. So the op undoes its own half-made work and leaves the
     project as it found it; a retry then cuts the same version again.
 
-    Only a timeline this very run made is touched: one whose unique id was not in the
-    project before the duplicate and that carries the exact branch name asked for. If the
-    delete fails, the copy is reported (``left_behind``) for a human to remove.
+    Only the timeline this very call made is touched, by id: the one ``timeline.duplicate``
+    names on its error (``created_timeline_id``, the id ``DuplicateTimeline`` returned for a
+    timeline that was not in the project before). Never a timeline found by name: under
+    concurrent nodes another one can carry the same deterministic branch name. With no
+    created id on the error, nothing is deleted. The id is re-read from the project right
+    before the delete (as ``_delete`` re-reads a marker), and again after it: ``removed`` if
+    it is gone, ``left_behind`` (for a human to remove) if not.
     """
-    made = [
-        timeline
-        for timeline in env.timelines()
-        if str(timeline.GetUniqueId()) not in existing and str(timeline.GetName()) == name
-    ]
-    if len(made) != 1:
-        return exc  # nothing was made (or not unambiguously by us): nothing to undo
-    copy = {"name": name, "unique_id": str(made[0].GetUniqueId())}
+    created = exc.detail.get(CREATED_TIMELINE_ID)
+    if not isinstance(created, str) or not created:
+        return exc  # no copy was made, or none provably by this call: nothing to undo
+    ours = [timeline for timeline in env.timelines() if str(timeline.GetUniqueId()) == created]
+    if not ours:
+        return exc  # already gone (someone else removed it): nothing to undo
+    copy = {"name": str(ours[0].GetName()), "unique_id": created}
     try:
-        env.media_pool().DeleteTimelines(made)
-        gone = all(str(t.GetUniqueId()) != copy["unique_id"] for t in env.timelines())
+        env.media_pool().DeleteTimelines(ours[:1])
+        gone = all(str(t.GetUniqueId()) != created for t in env.timelines())
     except Exception:  # a failed clean-up must never hide the original error
         gone = False
     extra = {k: v for k, v in exc.detail.items() if k not in ("fix_hint", "trap_id")}
-    if gone:
-        extra["removed"] = copy
-    else:
-        extra["left_behind"] = copy
+    extra["removed" if gone else "left_behind"] = copy
     return OpError(exc.code, exc.message, exc.fix_hint, exc.trap_id, **extra)
 
 
