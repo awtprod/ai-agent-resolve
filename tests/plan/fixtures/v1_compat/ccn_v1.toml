@@ -1,0 +1,65 @@
+# House rules for the CCN comedy show. Thresholds live here, not in code.
+# A rule that is not listed does not run. Per rule: enabled = false switches it off and
+# severity = "error" | "warn" | "info" re-grades its findings; every other key is a threshold.
+
+name = "ccn"
+description = "CCN comedy show: continuous takes, hard cuts, crossfaded audio, end on the laugh."
+
+# Post-render QA targets. Used by later slices, not by the plan linter.
+[qa]
+longform_lufs = -22.0
+short_lufs = -14.5
+lufs_tolerance = 0.5      # LU either side of the target
+review_mp4_max_mb = 20
+
+# Segments from one recording play in source-time order: no reordering, no imported cold opens.
+[rules.chronological]
+tolerance_frames = 0      # how far a segment may start before the previous one ended
+
+# A cut must not land inside a word, and should sit in a pause.
+[rules.no-dialogue-splice]
+min_pause_ms = 250        # the pause around a cut should be at least this long (warn)
+word_tolerance_ms = 10    # slack on word edges for transcript timing noise
+continuity_tolerance_frames = 1  # a join this close to unbroken playback is not a cut
+
+# Two adjacent shots from one camera with a time jump read as a jump cut.
+[rules.no-same-camera-jump]
+min_zoom_delta = 0.2      # allowed if the zoom factor differs at least this much across the cut
+continuity_tolerance_frames = 1
+
+# At a time jump, go from a tighter shot to a wider one.
+[rules.timejump-close-to-wide]
+min_size_step = 1         # ranks: close 0, medium 1, wide 2; incoming must be this many wider
+continuity_tolerance_frames = 1
+
+[rules.no-dissolve]
+
+[rules.audio-crossfade]
+audio_type = "Cross Fade 0 dB"
+max_frames = 30
+handle_fraction = 0.5     # share of the crossfade that must exist as media on each side of the cut
+require_on_cuts = true    # a non-continuous join with no audio crossfade is an error
+continuity_tolerance_frames = 1
+
+[rules.short-max-duration]
+max_seconds = 37          # a short must be strictly shorter than this
+
+[rules.end-on-laugh]
+max_after_laugh_ms = 500  # the last frame may land this long after the laugh ends
+min_strength = 0.0        # ignore laughs weaker than this
+
+# Reframe keyframes: dead-zone steady camera, never a whip-pan.
+[rules.no-whip-pan]
+max_pan_speed = 0.3       # frame widths per second (centre movement)
+max_zoom_speed = 0.25     # zoom factor change per second
+
+[rules.caption-length]
+max_chars = 16
+
+[rules.caption-style]
+font = "Montserrat"
+active_hue_min = 45       # degrees; yellow
+active_hue_max = 70
+active_min_saturation = 0.6
+
+[rules.ranges-valid]

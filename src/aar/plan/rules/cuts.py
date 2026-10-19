@@ -1,21 +1,31 @@
-"""Rules about joins between segments: jump cuts, shot sizes, transitions and reframing."""
+"""Rules about joins between segments: jump cuts, shot sizes, transitions, cut density and
+reframing."""
 
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
+from fractions import Fraction
+from typing import Any, Literal
 
-from aar.plan.lint import Finding, LintContext, Ref, rule
-from aar.plan.model import Segment, Transition
+from aar.plan.lint import Finding, LintContext, Ref, check_flag, check_number, rule
+from aar.plan.model import Segment, Transition, VideoTransitionType
 
 _SIZE_RANK = {"close": 0, "medium": 1, "wide": 2}
 
 
+def _static_zoom(seg: Segment) -> float:
+    return seg.transform.zoom if seg.transform is not None else 1.0
+
+
 def _zoom_out(seg: Segment) -> float:
-    return seg.reframe[-1].zoom if seg.reframe else 1.0
+    """Effective zoom at the segment's last frame: the static transform times the reframe."""
+    return (seg.reframe[-1].zoom if seg.reframe else 1.0) * _static_zoom(seg)
 
 
 def _zoom_in(seg: Segment) -> float:
-    return seg.reframe[0].zoom if seg.reframe else 1.0
+    """Effective zoom at the segment's first frame: the static transform times the reframe."""
+    return (seg.reframe[0].zoom if seg.reframe else 1.0) * _static_zoom(seg)
 
 
 def _join_refs(ctx: LintContext, outgoing: int, incoming: int) -> list[Ref]:
@@ -107,11 +117,75 @@ def timejump_close_to_wide(ctx: LintContext) -> list[Finding]:
     return out
 
 
-@rule("no-dissolve", severity="error", summary="Video transitions are cuts.")
+Edge = Literal["head", "outro"]
+_EDGE_LABEL: dict[Edge, tuple[str, str]] = {
+    "head": ("The head transition (in from black)", "head"),
+    "outro": ("The transition into the outro", "outro.transition"),
+}
+
+
+def _no_dissolve_params(given: Mapping[str, Any], merged: dict[str, Any]) -> dict[str, Any]:
+    """An allowed head or outro transition needs its maximum length from the profile."""
+    for edge in ("head", "outro"):
+        allowed = check_flag(merged, f"allow_{edge}")
+        key = f"max_{edge}_frames"
+        if merged[key] is not None:
+            merged[key] = int(check_number(merged, key, integer=True, minimum=0))
+        elif allowed:
+            raise ValueError(
+                f"allow_{edge} = true needs {key} (the longest {edge} transition, in frames)"
+            )
+    return merged
+
+
+def _edge_transition(
+    ctx: LintContext, edge: Edge, video: VideoTransitionType, frames: int, ref: Ref
+) -> list[Finding]:
+    """Findings for the head or outro transition, which a profile may allow up to a length."""
+    if video == "cut":
+        return []
+    label, field = _EDGE_LABEL[edge]
+    if not ctx.params[f"allow_{edge}"]:
+        return [
+            ctx.finding(
+                "error",
+                f"{label} is {video!r} ({frames} frames); this profile allows only hard cuts.",
+                f'Set {field}.video to "cut" with video_frames 0, or allow it in the profile '
+                f"(allow_{edge} = true).",
+                [ref],
+            )
+        ]
+    limit = ctx.params[f"max_{edge}_frames"]
+    if frames <= limit:
+        return []
+    return [
+        ctx.finding(
+            "error",
+            f"{label} is a {frames}-frame {video}; the maximum is {limit} frames.",
+            f"Shorten {field}.video_frames to {limit} or fewer.",
+            [ref],
+        )
+    ]
+
+
+@rule(
+    "no-dissolve",
+    severity="error",
+    summary="Video transitions between content segments are cuts; a profile may allow a short "
+    "transition in from black (head) and into the outro.",
+    defaults={
+        "allow_head": False,
+        "max_head_frames": None,
+        "allow_outro": False,
+        "max_outro_frames": None,
+    },
+    prepare=_no_dissolve_params,
+)
 def no_dissolve(ctx: LintContext) -> list[Finding]:
+    plan = ctx.plan
     out: list[Finding] = []
-    count = len(ctx.plan.segments)
-    for transition in ctx.plan.transitions:
+    count = len(plan.segments)
+    for transition in plan.transitions:
         if transition.video == "cut":
             continue
         refs = [ctx.ref(transition.after, "out")] if transition.after < count else []
@@ -122,6 +196,79 @@ def no_dissolve(ctx: LintContext) -> list[Finding]:
                 f"({transition.video_frames} frames); only hard cuts are allowed.",
                 'Set the transition\'s video to "cut" with video_frames 0.',
                 refs,
+            )
+        )
+    if plan.head is not None:
+        start = min((first for first, _ in ctx.ranges), default=0)
+        head = plan.head
+        out += _edge_transition(
+            ctx, "head", head.video, head.video_frames, ctx.record_ref(start, "head")
+        )
+    outro_range = plan.outro_range()
+    if plan.outro is not None and outro_range is not None:
+        into = plan.outro.transition
+        out += _edge_transition(
+            ctx, "outro", into.video, into.video_frames, ctx.record_ref(outro_range[0], "outro")
+        )
+    return out
+
+
+def _cut_density_params(given: Mapping[str, Any], merged: dict[str, Any]) -> dict[str, Any]:
+    check_number(merged, "window_s", above=0)
+    check_number(merged, "max_cuts", integer=True, minimum=0)
+    check_number(merged, "continuity_tolerance_frames", integer=True, minimum=0)
+    return merged
+
+
+@rule(
+    "cut-density",
+    severity="warn",
+    summary="No burst of cuts: at most max_cuts cuts in any window_s seconds of record time.",
+    params=("window_s", "max_cuts", "continuity_tolerance_frames"),
+    prepare=_cut_density_params,
+)
+def cut_density(ctx: LintContext) -> list[Finding]:
+    """Warn once per burst of cuts, not once per sliding window position.
+
+    A cut is a join that is not unbroken playback; it sits at the incoming segment's first
+    record frame. A window is half-open, ``[start, start + window_s)``, so two cuts exactly
+    ``window_s`` apart are never in one window. Overlapping offending windows (ones that share
+    a cut) merge into one finding with the burst's span and cut count.
+    """
+    fps = ctx.plan.fps
+    window = Fraction(str(ctx.params["window_s"]))
+    limit = int(ctx.params["max_cuts"])
+    tolerance = int(ctx.params["continuity_tolerance_frames"])
+    window_frames = window * fps.num / fps.den
+    cuts = sorted(
+        (ctx.ranges[incoming][0], incoming)
+        for outgoing, incoming in ctx.plan.joins()
+        if ctx.usable(outgoing)
+        and ctx.usable(incoming)
+        and not ctx.is_continuous(outgoing, incoming, tolerance)
+    )
+    bursts: list[list[int]] = []  # [first, last] positions in ``cuts``
+    for first in range(len(cuts) - limit):
+        last = first + limit
+        if cuts[last][0] - cuts[first][0] >= window_frames:
+            continue
+        if bursts and first <= bursts[-1][1]:
+            bursts[-1][1] = last
+        else:
+            bursts.append([first, last])
+    out: list[Finding] = []
+    for first, last in bursts:
+        burst = cuts[first : last + 1]
+        start, end = burst[0][0], burst[-1][0]
+        out.append(
+            ctx.finding(
+                "warn",
+                f"{len(burst)} cuts in {fps.seconds(end - start):.2f} s of record time "
+                f"({fps.timecode(start)} to {fps.timecode(end)}); at most {limit} are allowed "
+                f"in any {float(window):g} s.",
+                f"Hold the shots longer: drop or merge cuts here until no {float(window):g} s "
+                f"holds more than {limit}.",
+                [ctx.ref(incoming, "in") for _, incoming in burst],
             )
         )
     return out

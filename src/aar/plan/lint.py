@@ -131,7 +131,7 @@ def rule(
     return decorate
 
 
-def number(
+def check_number(
     params: Mapping[str, Any],
     name: str,
     *,
@@ -158,7 +158,7 @@ def number(
     return value
 
 
-def flag(params: Mapping[str, Any], name: str) -> bool:
+def check_flag(params: Mapping[str, Any], name: str) -> bool:
     """Read one true/false threshold for a ``prepare`` hook, or raise a clear ``ValueError``."""
     value = params[name]
     if not isinstance(value, bool):

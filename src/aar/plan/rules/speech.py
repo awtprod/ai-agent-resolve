@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-from aar.plan.inputs import Word
-from aar.plan.lint import Finding, LintContext, Point, Ref, rule
+import math
+from collections.abc import Mapping
+from fractions import Fraction
+from typing import Any
+
+from aar.plan.inputs import Laugh, Word
+from aar.plan.lint import Finding, LintContext, Point, Ref, check_number, rule
 
 
 def _cut_points(ctx: LintContext, tolerance: int) -> list[tuple[int, Point]]:
@@ -117,14 +122,51 @@ def no_dialogue_splice(ctx: LintContext) -> list[Finding]:
     return out
 
 
+_ANCHORS = ("onset", "end")
+
+
+def _end_on_laugh_params(given: Mapping[str, Any], merged: dict[str, Any]) -> dict[str, Any]:
+    """Check the window and translate the old ``max_after_laugh_ms`` (end anchor) name."""
+    legacy = merged.pop("max_after_laugh_ms")
+    if legacy is not None:
+        if "max_after_ms" in given:
+            raise ValueError("set max_after_ms or its old name max_after_laugh_ms, not both")
+        if merged["anchor"] != "end":
+            raise ValueError(
+                'max_after_laugh_ms is the old name of max_after_ms with anchor "end"; '
+                "use max_after_ms"
+            )
+        merged["max_after_ms"] = legacy
+    if merged["anchor"] not in _ANCHORS:
+        raise ValueError(f'anchor must be "onset" or "end", not {merged["anchor"]!r}')
+    low = check_number(merged, "min_after_ms")
+    high = check_number(merged, "max_after_ms")
+    if low > high:
+        raise ValueError(f"min_after_ms ({low:g}) is more than max_after_ms ({high:g})")
+    return merged
+
+
+def _exact(seconds: float) -> Fraction | None:
+    """A laugh time as the decimal it was written as, so window edges compare exactly."""
+    return Fraction(repr(seconds)) if math.isfinite(seconds) else None
+
+
 @rule(
     "end-on-laugh",
     severity="warn",
-    summary="The final out point lands just after the end of a laugh.",
-    params=("max_after_laugh_ms", "min_strength"),
+    summary="The final out point lands in a window after a laugh's onset or end.",
+    params=("min_strength",),
+    defaults={"anchor": "end", "min_after_ms": 0, "max_after_ms": 500, "max_after_laugh_ms": None},
+    prepare=_end_on_laugh_params,
     needs=("laughs",),
 )
 def end_on_laugh(ctx: LintContext) -> list[Finding]:
+    """Judge the out point of the content's last segment (the outro is not content).
+
+    The out point is the exclusive end of the final segment, in recording time. It must land
+    ``min_after_ms`` to ``max_after_ms`` after the anchor (a laugh's onset or end), with half
+    a frame of slack on both edges.
+    """
     laughs = ctx.laughs
     assert laughs is not None
     plan = ctx.plan
@@ -143,12 +185,22 @@ def end_on_laugh(ctx: LintContext) -> list[Finding]:
                 [ref],
             )
         ]
-    max_after = float(ctx.params["max_after_laugh_ms"]) / 1000
+    onset = ctx.params["anchor"] == "onset"
+    low_ms, high_ms = ctx.params["min_after_ms"], ctx.params["max_after_ms"]
+    low, high = Fraction(str(low_ms)) / 1000, Fraction(str(high_ms)) / 1000
     min_strength = float(ctx.params["min_strength"])
-    half_frame = plan.fps.seconds(1) / 2
-    at = plan.fps.seconds(ctx.recording_range(last)[1])
-    strong = [laugh for laugh in laughs.laughs if laugh.strength >= min_strength]
-    if any(-half_frame <= at - laugh.end_s <= max_after + half_frame for laugh in strong):
+    half_frame = Fraction(plan.fps.den, 2 * plan.fps.num)
+    at = Fraction(ctx.recording_range(last)[1] * plan.fps.den, plan.fps.num)
+
+    def anchor(laugh: Laugh) -> Fraction | None:
+        return _exact(laugh.start_s if onset else laugh.end_s)
+
+    strong = [
+        (laugh, mark)
+        for laugh in laughs.laughs
+        if laugh.strength >= min_strength and (mark := anchor(laugh)) is not None
+    ]
+    if any(low - half_frame <= at - mark <= high + half_frame for _, mark in strong):
         return []
     if not strong:
         return [
@@ -159,18 +211,28 @@ def end_on_laugh(ctx: LintContext) -> list[Finding]:
                 [ref],
             )
         ]
-    nearest = min(strong, key=lambda laugh: abs(at - laugh.end_s))
-    offset_ms = (at - nearest.end_s) * 1000
-    if offset_ms < 0:
-        how = f"{-offset_ms:.0f} ms before the nearest laugh ends ({nearest.end_s:.2f} s)"
+    _, mark = min(strong, key=lambda item: abs(at - item[1]))
+    offset_ms = float((at - mark) * 1000)
+    if onset:
+        after, before, edge = "began", "begins", "begins"
     else:
-        how = f"{offset_ms:.0f} ms after the nearest laugh ended ({nearest.end_s:.2f} s)"
-    target = _source_frame(ctx, last, nearest.end_s)
+        after, before, edge = "ended", "ends", "ends"
+    if offset_ms < 0:
+        how = f"{-offset_ms:.0f} ms before the nearest laugh {before} ({float(mark):.2f} s)"
+    else:
+        how = f"{offset_ms:.0f} ms after the nearest laugh {after} ({float(mark):.2f} s)"
+    if low == 0:
+        window = f"within {high_ms:g} ms after a laugh" + (f" {edge}" if onset else "")
+        target_text = f"the {'onset' if onset else 'end'} of that laugh"
+    else:
+        window = f"between {low_ms:g} and {high_ms:g} ms after a laugh {edge}"
+        target_text = f"{low_ms:g} ms after the {'onset' if onset else 'end'} of that laugh"
+    target = _source_frame(ctx, last, float(mark + low))
     return [
         ctx.finding(
             "warn",
-            f"The edit ends {how}; it should end within {max_after * 1000:g} ms after a laugh.",
-            f"Set the final src_out to source frame {target} (the end of that laugh).",
+            f"The edit ends {how}; it should end {window}.",
+            f"Set the final src_out to source frame {target} ({target_text}).",
             [ref],
         )
     ]

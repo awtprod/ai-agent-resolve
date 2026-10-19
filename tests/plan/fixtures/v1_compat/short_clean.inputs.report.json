@@ -1,0 +1,12 @@
+{
+  "profile": "ccn",
+  "ok": true,
+  "counts": {
+    "error": 0,
+    "warn": 0,
+    "info": 0
+  },
+  "duration_frames": 720,
+  "duration_s": 30.03,
+  "findings": []
+}

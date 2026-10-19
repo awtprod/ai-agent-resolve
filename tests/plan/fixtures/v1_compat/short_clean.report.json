@@ -1,0 +1,27 @@
+{
+  "profile": "ccn",
+  "ok": true,
+  "counts": {
+    "error": 0,
+    "warn": 0,
+    "info": 2
+  },
+  "duration_frames": 720,
+  "duration_s": 30.03,
+  "findings": [
+    {
+      "rule": "no-dialogue-splice",
+      "severity": "info",
+      "message": "Skipped: this rule needs a transcript, but none was supplied.",
+      "fix_hint": "Supply it (--transcript FILE on the CLI) to enable this check.",
+      "refs": []
+    },
+    {
+      "rule": "end-on-laugh",
+      "severity": "info",
+      "message": "Skipped: this rule needs a laugh map, but none was supplied.",
+      "fix_hint": "Supply it (--laughs FILE on the CLI) to enable this check.",
+      "refs": []
+    }
+  ]
+}
