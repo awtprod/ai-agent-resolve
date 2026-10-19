@@ -121,6 +121,17 @@ def test_add_node_in_and_add_edge_in_write_inside_the_callers_transaction(hub: H
     assert fresh.creator(node_event.payload["node_id"]) == AGENT
 
 
+def test_add_node_in_catches_up_with_other_writers_first(hub: Hub) -> None:
+    """A WorkGraph built before the transaction sees what others wrote since."""
+    graph = WorkGraph(hub.log, hub.project_id)
+    later = WorkGraph(hub.log, hub.project_id).add_node("brief", OTHER)  # another writer
+    with hub.log.transaction() as txn:
+        node_event = graph.add_node_in(txn, "recipe", AGENT)
+        graph.add_edge_in(txn, "derives_from", node_event.payload["node_id"], later.id, AGENT)
+    assert graph.node(later.id) is not None
+    assert WorkGraph(hub.log, hub.project_id).edges()[0].dst == later.id
+
+
 def test_add_node_in_and_add_edge_in_refuse_what_add_node_and_add_edge_refuse(
     hub: Hub, tmp_path: Path
 ) -> None:
@@ -355,20 +366,24 @@ def test_same_key_different_request_is_a_conflict(hub: Hub) -> None:
     )
     assert error.details["idempotency_key"] == "b"
     assert error.fix_hint
-    # The same key in another project, or for another op, is a different request too.
-    _refused(
+    assert "the request differs" in error.message
+    # The same key in another project, or for another op, is a different request too, and
+    # the refusal says what the key was used for.
+    error = _refused(
         "idempotency_conflict",
         lambda: writes.create_brief(
             hub.log, brief_data(hub.other_project_id), AGENT, idempotency_key="b"
         ),
     )
+    assert "used in project 'prj_acme'" in error.message
     brief_id = WorkGraph(hub.log, hub.project_id).nodes()[0].id
-    _refused(
+    error = _refused(
         "idempotency_conflict",
         lambda: writes.set_own_status(
             hub.log, hub.project_id, brief_id, "active", AGENT, idempotency_key="b"
         ),
     )
+    assert "used for 'brief.create'" in error.message
     assert hub.counts() == before
 
 
@@ -457,6 +472,24 @@ def test_forged_write_records_are_conflicts_never_replays(hub: Hub) -> None:
         "idempotency_conflict",
         lambda: writes.create_brief(
             hub.log, brief_data(hub.project_id), AGENT, idempotency_key="hollow"
+        ),
+    )
+    assert "cannot find" in error.message
+    # A record whose #node sub-key holds an event of another type.
+    hub.log.append(
+        "hub.write",
+        AGENT,
+        {"op": "brief.create", "request_sha256": fingerprint},
+        project_id=hub.project_id,
+        idempotency_key=writes.write_key(AGENT, "wrong-type"),
+    )
+    hub.log.append(
+        "note", AGENT, {"x": 1}, idempotency_key=writes.write_key(AGENT, "wrong-type") + "#node"
+    )
+    error = _refused(
+        "idempotency_conflict",
+        lambda: writes.create_brief(
+            hub.log, brief_data(hub.project_id), AGENT, idempotency_key="wrong-type"
         ),
     )
     assert "cannot find" in error.message
@@ -646,6 +679,60 @@ def test_recipe_params_validator_hook(hub: Hub) -> None:
         ),
     )
     assert len(error.details["problems"]) == 50 and error.details["omitted"] == 10
+
+
+def test_a_concurrent_identical_recipe_write_is_replayed_not_duplicated(hub: Hub) -> None:
+    brief_id = _brief(hub)
+    request = {"recipe": "ccn-short", "brief_id": brief_id}
+    raced: list[writes.WriteResult] = []
+
+    racing = [True]
+
+    def racing_validator(recipe: str, params: Any, brief: Any) -> list[tuple[str, str]]:
+        # Runs after the pre-check and before the transaction: the other writer wins here.
+        if racing:
+            racing.clear()
+            raced.append(
+                writes.create_recipe(
+                    hub.log, hub.project_id, request, AGENT, idempotency_key="race"
+                )
+            )
+        return []
+
+    result = writes.create_recipe(
+        hub.log,
+        hub.project_id,
+        request,
+        AGENT,
+        idempotency_key="race",
+        params_validator=racing_validator,
+    )
+    assert raced[0].replayed is False
+    assert result.replayed is True and result.body == raced[0].body
+    assert hub.node_kinds()["recipe"] == 1
+
+
+def test_a_concurrent_identical_plan_write_is_replayed_not_duplicated(
+    hub: Hub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    brief_id = _brief(hub)
+    raced: list[writes.WriteResult] = []
+    racing = [True]
+    real_put = type(hub.store).put
+
+    def racing_put(store: Any, *args: Any, **kwargs: Any) -> str:
+        # The artifact is stored between the pre-check and the transaction.
+        stored = real_put(store, *args, **kwargs)
+        if racing:
+            racing.clear()  # the other writer's own put must not race again
+            raced.append(_plan(hub, brief_id, key="race"))
+        return stored
+
+    monkeypatch.setattr(type(hub.store), "put", racing_put)
+    result = _plan(hub, brief_id, key="race")
+    assert raced[0].replayed is False
+    assert result.replayed is True and result.body == raced[0].body
+    assert hub.node_kinds()["plan"] == 1
 
 
 @pytest.mark.parametrize("crash_at", [1, 2, 3])
@@ -1054,6 +1141,10 @@ def test_plan_replay_and_conflict(hub: Hub) -> None:
     ).replayed
     _refused("idempotency_conflict", lambda: _plan(hub, brief_id, "short_broken"))
     _refused("idempotency_conflict", lambda: _plan(hub, brief_id, title="renamed"))
+    # The same plan under the same key but for another parent is another request.
+    recipe_id = _recipe(hub, brief_id)
+    before = hub.counts()
+    _refused("idempotency_conflict", lambda: _plan(hub, recipe_id))
     assert hub.counts() == before
 
 
