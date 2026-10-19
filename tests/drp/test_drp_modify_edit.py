@@ -630,10 +630,12 @@ def test_unsupported_zip_layout_is_refused(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- write safety
 
 
-def test_no_op_plan_writes_the_input_bytes(tmp_path: Path) -> None:
+def test_no_op_plan_is_refused_and_writes_nothing(tmp_path: Path) -> None:
+    # An empty plan (and any plan that leaves the file byte-identical) changes nothing, so it is
+    # refused as a no-op and no "unverified" copy of the unchanged file is written.
     outcome, out = run(H264, tmp_path)
-    assert outcome.status == "written" and outcome.changes == []
-    assert out.read_bytes() == H264.read_bytes()
+    assert [r.code for r in outcome.refusals] == ["no-op"]
+    assert outcome.changes == [] and not out.exists()
 
 
 def test_existing_output_and_force(tmp_path: Path) -> None:

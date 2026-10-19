@@ -99,7 +99,8 @@ class Rename(_Model):
     ``project`` needs no selector. The others take exactly one of ``id`` (DbId; for a timeline
     the timeline's ``id`` from ``aar drp inspect --json``) and ``name`` (current name, which must
     be unique). ``expect_name``, when given, must equal the current name. A rename to the
-    current name changes nothing and is reported with ``"unchanged": true``.
+    current name changes nothing and is reported with ``"unchanged": true``; a plan whose every
+    edit is such a no-op leaves the file byte-identical and is refused (``no-op``), writing nothing.
     """
 
     op: Literal["rename"]

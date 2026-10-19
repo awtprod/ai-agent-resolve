@@ -45,12 +45,15 @@ def test_no_op_rewrite_returns_the_input_bytes(path: Path, tmp_path: Path) -> No
     drp = read_drp(path)
     out = tmp_path / f"out{path.suffix}"
     outcome = edit_file(path, parse_plan('{"edits": []}'), out)
-    if outcome.status == "refused":
-        # Only inputs the gate can never pass for are refused, and only for that reason.
+    noisy = {i.code for i in drp.issues if i.severity != "info"}
+    if noisy:
+        # Inputs the gate can never pass for are refused for that reason, before the no-op check.
+        assert noisy <= {"blob-partial"}
         assert [r.code for r in outcome.refusals] == ["input-has-warnings"]
-        assert {i.code for i in drp.issues if i.severity != "info"} <= {"blob-partial"}
-        return
-    assert out.read_bytes() == data
+    else:
+        # An empty plan changes nothing, so a clean input is refused as a no-op; nothing is written.
+        assert [r.code for r in outcome.refusals] == ["no-op"]
+    assert not out.exists()
 
 
 def _hex_leaves(path: Path) -> list[tuple[str, str, bytes]]:

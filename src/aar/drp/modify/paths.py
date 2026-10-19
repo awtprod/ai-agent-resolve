@@ -67,18 +67,55 @@ class MapResult:
     reason: str | None = None
 
 
+# Characters whose Unicode *simple* uppercase is a single code point but whose *full* uppercase
+# (what ``str.upper`` gives) expands to several, so the per-character rule in ``ntfs_upper`` would
+# otherwise leave them unfolded. These are the Greek small letters with iota subscript
+# (ypogegrammeni); NTFS folds each onto its precomposed capital (prosgegrammeni) form, e.g.
+# U+1F80 -> U+1F88. Verified complete against the running Unicode database by
+# test_ff_simple_uppercase_table_is_the_unicode_set.
+_SIMPLE_UPPER_EXPANDING: dict[str, str] = {
+    chr(cp): chr(cp + 8) for base in (0x1F80, 0x1F90, 0x1FA0) for cp in range(base, base + 8)
+}
+_SIMPLE_UPPER_EXPANDING.update({"ᾳ": "ᾼ", "ῃ": "ῌ", "ῳ": "ῼ"})
+
+
 def ntfs_upper(name: str) -> str:
     """``name`` upper-cased one character at a time, the way NTFS compares names.
 
-    NTFS maps each UTF-16 unit through its upcase table (a simple, one-to-one mapping), so
-    ``Straße`` and ``STRASSE`` are different names, and so are ``k`` and the Kelvin sign.
-    Python's ``casefold`` and ``upper`` use full mappings (``ß`` -> ``ss``/``SS``), which would
-    call them equal. A character whose full uppercase is not one character keeps its spelling.
+    This follows Unicode *simple* (one-to-one) case mapping, which is what NTFS's ``$UpCase``
+    table does: a code point maps to a single upper-case code point or to itself, never to
+    several. So ``Straße`` and ``STRASSE`` are different names (``ß`` has no simple uppercase, it
+    folds to itself), ``ﬁ`` is not ``FI``, and ``k`` is not the Kelvin sign. Python's
+    ``str.upper``/``casefold`` use *full* case mapping, which expands those (``ß`` -> ``SS``),
+    so we take ``c.upper()`` only when it is a single code point and otherwise fall back to the
+    simple mapping (:data:`_SIMPLE_UPPER_EXPANDING`, which covers the Greek iota-subscript forms
+    whose full uppercase expands) or, failing that, to ``c`` unchanged. Dotless i (U+0131) still
+    folds to ``I``.
+
+    This is Unicode *simple* case mapping; it is close to, but not identical to, any one NTFS
+    ``$UpCase`` table (those are frozen when a volume is formatted, and differ between XP, Vista
+    and Win7-10; Win11 and exFAT tables are not established). It never *under*-folds a pair those
+    tables fold, but it OVER-folds pairs NTFS keeps distinct -- aar treats them as one name, NTFS
+    does not: U+0131 (dotless i) vs I, U+017F (long s) vs S, U+00B5 (micro) vs Greek mu, U+0345
+    and U+1FBE vs iota, the titlecase digraphs U+01C5/01C8/01CB/01F2, U+1E9B, every astral cased
+    letter (Deseret, Osage, Adlam, Warang Citi, ...), and -- on the Win7-10 table -- final sigma
+    vs sigma. These are Unicode 1.1 characters NTFS never folded, so "code points added after the
+    volume was formatted" does not excuse them.
+
+    ``ntfs_upper`` is used only to match ``path_map`` table prefixes (:class:`PathMapper`); it
+    does not decide output placement (the OS's own case rules do) and aar never writes to a media
+    file. An over-fold is therefore not a media overwrite, but it is NOT harmless: a table prefix
+    can match a path under a *different* directory that NTFS considers distinct, mapping it to the
+    wrong Mac location -- a wrong relink candidate in the new output file, which the human, the
+    post-write gate and the sandbox round trip must still catch.
     """
     out = []
     for ch in name:
         up = ch.upper()
-        out.append(up if len(up) == 1 else ch)
+        if len(up) == 1:
+            out.append(up)
+        else:
+            out.append(_SIMPLE_UPPER_EXPANDING.get(ch, ch))
     return "".join(out)
 
 
