@@ -10,8 +10,11 @@ Known, intentional, fail-closed behaviour (not bugs):
 - ``timeline.duplicate`` interrupted after ``DuplicateTimeline`` but before its custom
   resolution and colour settings were applied leaves a timeline that does not match; a rerun
   with ``if_exists="reuse"`` reports ``reuse_mismatch`` and changes nothing, because the op
-  cannot tell its own half-made copy from a human's timeline. Cleaning it up belongs to the
-  S7 job runner's checkpoints.
+  cannot tell its own half-made copy from a human's timeline. So every failure after the
+  copy was made carries the copy's unique id on the error, as
+  ``detail["created_timeline_id"]`` (:data:`CREATED_TIMELINE_ID`): a caller that wants to
+  undo the copy (``timeline.branch`` does) deletes exactly that id, never a timeline found by
+  name. Cleaning up after a plain ``timeline.duplicate`` belongs to the S7 job runner.
 - ``clip.set_input_color_space`` accepts only colour-space names it can see in use: the
   project's colour settings, clips in the listed items' bins, or ``OBSERVED_COLOR_SPACES``.
   There is no override; anything else is ``color_space_unknown``.
@@ -36,6 +39,7 @@ from aar.node.ops.framework import (
     TimelineIdentity,
     TimelineRef,
     TrackType,
+    as_op_error,
     op,
 )
 from aar.node.ops.timebase import converted_length
@@ -211,6 +215,22 @@ def _set_resolution(
     return checks, notes
 
 
+CREATED_TIMELINE_ID = "created_timeline_id"
+"""``OpError`` detail key: the unique id of the copy ``timeline.duplicate`` made before it
+failed. Set on every failure after ``DuplicateTimeline`` returned a timeline that was not in
+the project before the call and is in it now, so it is provably this call's copy; absent
+when no copy was made, or when what Resolve returned cannot be shown to be a new copy (then
+nothing may be undone)."""
+
+
+def _with_created(exc: Exception, created_id: str) -> OpError:
+    """``exc`` as an ``OpError`` naming the copy this call made (:data:`CREATED_TIMELINE_ID`)."""
+    error = as_op_error(exc)
+    extra = {k: v for k, v in error.detail.items() if k not in ("fix_hint", "trap_id")}
+    extra[CREATED_TIMELINE_ID] = created_id
+    return OpError(error.code, error.message, error.fix_hint, error.trap_id, **extra)
+
+
 @op(
     "timeline.duplicate",
     params=DuplicateParams,
@@ -220,11 +240,13 @@ def _set_resolution(
     traps=("custom-res-resets-colour-science",),
 )
 def timeline_duplicate(env: OpEnv, params: DuplicateParams) -> DuplicateResult:
-    """Duplicate a timeline, optionally giving the copy its own resolution."""
+    """Duplicate a timeline, optionally giving the copy its own resolution.
+
+    Any failure after the copy is made names it on the error (:data:`CREATED_TIMELINE_ID`).
+    """
     project = env.project()
     source = env.timeline(params.source)
     existing = [t for t in env.timelines() if t.GetName() == params.name]
-    created = False
     if existing:
         if any(t.GetUniqueId() == source.GetUniqueId() for t in existing):
             raise OpError(
@@ -239,26 +261,47 @@ def timeline_duplicate(env: OpEnv, params: DuplicateParams) -> DuplicateResult:
                 "choose another name, or pass if_exists='reuse' to pick up an earlier attempt",
             )
         return _reuse(env, source, existing[0], params)
-    else:
-        before = int(project.GetTimelineCount() or 0)
-        made = source.DuplicateTimeline(params.name)
-        if made is None:
-            raise OpError(
-                "duplicate_failed",
-                f"DuplicateTimeline({params.name!r}) returned None",
-                "check the name is unique and the source timeline is not locked",
-            )
-        uid = made.GetUniqueId()
-        matches = [t for t in env.timelines() if t.GetUniqueId() == uid]
-        count = int(project.GetTimelineCount() or 0)
-        if len(matches) != 1 or matches[0].GetName() != params.name or count != before + 1:
-            raise OpError(
-                "duplicate_unverified",
-                f"after DuplicateTimeline the project has {count} timelines (was {before}) and "
-                f"{len(matches)} with the new id",
-                "inspect the project with timeline.list",
-            )
-        dup, created = matches[0], True
+    before_ids = {str(t.GetUniqueId()) for t in env.timelines()}
+    before = int(project.GetTimelineCount() or 0)
+    made = source.DuplicateTimeline(params.name)
+    if made is None:
+        raise OpError(
+            "duplicate_failed",
+            f"DuplicateTimeline({params.name!r}) returned None",
+            "check the name is unique and the source timeline is not locked",
+        )
+    uid = made.GetUniqueId()
+    matches = [t for t in env.timelines() if t.GetUniqueId() == uid]
+    # The copy is this call's own only if Resolve handed back a timeline that was not in the
+    # project before the call and is in it now; anything else (the source itself, or a
+    # timeline the project does not hold) is never named as created, so never undone.
+    created_id = str(uid) if uid and str(uid) not in before_ids and matches else None
+    try:
+        return _finish_duplicate(env, project, source, params, matches, before)
+    except Exception as exc:
+        if created_id is None:
+            raise
+        raise _with_created(exc, created_id) from exc
+
+
+def _finish_duplicate(
+    env: OpEnv,
+    project: Any,
+    source: Any,
+    params: DuplicateParams,
+    matches: list[Any],
+    before: int,
+) -> DuplicateResult:
+    """Verify the copy ``DuplicateTimeline`` returned, then give it its resolution."""
+    count = int(project.GetTimelineCount() or 0)
+    if len(matches) != 1 or matches[0].GetName() != params.name or count != before + 1:
+        raise OpError(
+            "duplicate_unverified",
+            f"after DuplicateTimeline the project has {count} timelines (was {before}) and "
+            f"{len(matches)} with the new id",
+            "inspect the project with timeline.list",
+        )
+    dup, created = matches[0], True
     colour: list[SettingCheck] = []
     notes: list[Note] = []
     measured: Resolution | None = None

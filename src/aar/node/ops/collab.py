@@ -7,8 +7,13 @@ Three hot ops sit on top of the write-op library (DESIGN R3):
   holder that submitted it, never a value the caller passes, and the branch is recorded in
   the node's owner registry keyed by ``(project, timeline unique id)``. It is idempotent: a
   re-run reuses a branch only when the registry confirms this agent owns it, branched from
-  this very source (by id) and at the resolution asked for; a mere name match (a human
-  timeline, or a copy with a fresh id) is never reused, it just takes a version number.
+  this very source (by id) and at the resolution asked for (no resolution means the
+  source's, as for ``timeline.duplicate``); a mere name match (a human timeline, or a copy
+  with a fresh id) is never reused, it just takes a version number. Refusals that need no
+  Resolve call (no agent holder, an unusable agent id, no registry) are made at submit. If
+  the copy is made but a later step fails (its resolution will not set), the copy is
+  deleted again, by the unique id ``timeline.duplicate`` reports for it (never by name), so
+  the op leaves no unowned half-made branch behind and a retry cuts the same version.
   Merging a branch back is a human step, so the result carries a handoff note.
 - ``markers.mirror_review`` mirrors a hub review's timecoded notes to markers on the agent's
   branch. Each marker's ``customData`` carries the note id, so a re-run updates in place and
@@ -17,8 +22,11 @@ Three hot ops sit on top of the write-op library (DESIGN R3):
   data, and with ``prune`` off this review's markers that stay) before any mutation. A
   moved marker is added before the old one is deleted (by frame, after checking it is
   ours); where frames collide (a swap, an in-place change, a note onto a pruned note's
-  frame) the delete goes first. If a step fails, the error reports exactly the marker
-  writes that were applied.
+  frame) the delete goes first. If a step fails, or a Resolve call raises, the error
+  reports exactly the marker writes that were applied, read back from Resolve. A re-run
+  finishes a move an earlier run left half done (the new marker added, the old one not yet
+  deleted): when exactly one of a note's markers already is the note as asked, the others
+  are deleted. Any other duplicate is refused, never guessed at.
 - ``markers.read_review`` maps the branch's markers back to notes: the ones it mirrored, and
   the ones a human added, so the latter flow back into the hub review as new notes.
 
@@ -36,7 +44,7 @@ from pydantic import Field, model_validator
 
 from aar.hub.common import clean_text
 from aar.hub.reviews import MAX_FPS, MAX_FRAME, MAX_NOTE, is_timecode
-from aar.node.branch_registry import OwnershipConflict
+from aar.node.branch_registry import BranchRegistry, OwnershipConflict
 from aar.node.branches import (
     branch_name,
     branch_version_for,
@@ -45,6 +53,7 @@ from aar.node.branches import (
     valid_agent_id,
     valid_note_id,
 )
+from aar.node.leases import Holder
 from aar.node.ops import raw
 from aar.node.ops.framework import (
     Note,
@@ -53,10 +62,17 @@ from aar.node.ops.framework import (
     OpModel,
     TimelineIdentity,
     TimelineRef,
+    as_op_error,
     op,
 )
 from aar.node.ops.timebase import converted_length
-from aar.node.ops.write import DuplicateParams, MarkerColor, Resolution, timeline_duplicate
+from aar.node.ops.write import (
+    CREATED_TIMELINE_ID,
+    DuplicateParams,
+    MarkerColor,
+    Resolution,
+    timeline_duplicate,
+)
 
 MAX_NOTES = 1000
 MAX_TOTAL_TEXT = 1_000_000  # total marker text bytes per mirror call
@@ -104,32 +120,51 @@ def _resolution_of(timeline: Any) -> tuple[int | None, int | None]:
     )
 
 
-@op(
-    "timeline.branch", params=BranchParams, result=BranchResult, mutates=True, creates_timeline=True
-)
-def timeline_branch(env: OpEnv, params: BranchParams) -> BranchResult:
-    """Branch a human timeline to an agent copy owned by the submitting agent."""
-    holder = env.holder
+def _branch_refusal(
+    params: BranchParams, holder: Holder | None, registry: BranchRegistry | None
+) -> OpError | None:
+    """Why ``timeline.branch`` cannot run for ``holder``, decided with no Resolve call.
+
+    ``make_hot_op`` runs this at submit (the op's ``submit_check``), so a refused branch is
+    never queued and never makes the broker load or save a project; the body runs it again.
+    """
     if holder is None or holder.is_human:
-        raise OpError(
+        return OpError(
             "no_agent_holder",
             "timeline.branch must run for an agent holder; the branch is owned by it",
             "submit the op as the agent that will own the branch",
         )
-    agent_id = holder.id
-    if not valid_agent_id(agent_id):
-        raise OpError(
+    if not valid_agent_id(holder.id):
+        return OpError(
             "invalid_agent_id",
-            f"the holder id {agent_id!r} is not a usable agent branch owner",
+            f"the holder id {holder.id!r} is not a usable agent branch owner",
             "use an agent id of letters, digits, '.', '_' or '-', at most 128 characters",
         )
-    registry = env.branch_registry
     if registry is None:
-        raise OpError(
+        return OpError(
             "no_branch_registry",
             "timeline.branch needs the node's owner registry to record ownership",
             "wire the broker with a BranchRegistry (the node runtime provides one)",
         )
+    return None
+
+
+@op(
+    "timeline.branch",
+    params=BranchParams,
+    result=BranchResult,
+    mutates=True,
+    creates_timeline=True,
+    submit_check=_branch_refusal,
+)
+def timeline_branch(env: OpEnv, params: BranchParams) -> BranchResult:
+    """Branch a human timeline to an agent copy owned by the submitting agent."""
+    refusal = _branch_refusal(params, env.holder, env.branch_registry)
+    if refusal is not None:
+        raise refusal
+    assert env.holder is not None and env.branch_registry is not None
+    agent_id = env.holder.id
+    registry = env.branch_registry
     project_id = env.target.project_id
     if project_id is None:  # make_hot_op refuses this at submit; never key ownership on None
         raise OpError(
@@ -142,8 +177,12 @@ def timeline_branch(env: OpEnv, params: BranchParams) -> BranchResult:
     source = env.timeline(params.source)
     source_name = str(source.GetName())
     source_id = str(source.GetUniqueId())
+    # No resolution asked for means the source's, the rule timeline.duplicate(reuse) uses:
+    # a vertical copy is never handed back for a plain branch.
     wanted = (
-        None if params.resolution is None else (params.resolution.width, params.resolution.height)
+        _resolution_of(source)
+        if params.resolution is None
+        else (params.resolution.width, params.resolution.height)
     )
     # Names only number the versions. What may be reused is decided by the registry, by
     # unique id: a branch this agent owns, of this very source (by id), at the resolution
@@ -151,14 +190,15 @@ def timeline_branch(env: OpEnv, params: BranchParams) -> BranchResult:
     taken: set[int] = set()
     reusable: dict[int, Any] = {}
     for timeline in env.timelines():
+        uid = str(timeline.GetUniqueId())
         version = branch_version_for(str(timeline.GetName()), source_name, agent_id)
         if version is not None:
             taken.add(version)
-        owner = registry.owner(project_id, str(timeline.GetUniqueId()))
+        owner = registry.owner(project_id, uid)
         if owner is None or owner.agent_id != agent_id or owner.source_timeline_id != source_id:
             continue
-        taken.add(owner.version)
-        if wanted is None or _resolution_of(timeline) == wanted:
+        taken.add(owner.version)  # a renamed branch still holds its version
+        if _resolution_of(timeline) == wanted:
             reusable[owner.version] = timeline
 
     if reusable and params.if_exists == "reuse":
@@ -178,15 +218,19 @@ def timeline_branch(env: OpEnv, params: BranchParams) -> BranchResult:
         )
 
     version = max(taken, default=0) + 1
-    duplicated = timeline_duplicate(
-        env,
-        DuplicateParams(
-            source=params.source,
-            name=branch_name(source_name, agent_id, version),
-            resolution=params.resolution,
-            if_exists="error",  # never pick up a same-named timeline as the new branch
-        ),
-    )
+    name = branch_name(source_name, agent_id, version)
+    try:
+        duplicated = timeline_duplicate(
+            env,
+            DuplicateParams(
+                source=params.source,
+                name=name,
+                resolution=params.resolution,
+                if_exists="error",  # never pick up a same-named timeline as the new branch
+            ),
+        )
+    except OpError as exc:
+        raise _undo_half_made_branch(env, exc) from exc
     try:
         registry.register(
             project_id,
@@ -210,6 +254,41 @@ def timeline_branch(env: OpEnv, params: BranchParams) -> BranchResult:
         timeline_count=duplicated.timeline_count,
         notes=[*duplicated.notes, _HANDOFF],
     )
+
+
+def _undo_half_made_branch(env: OpEnv, exc: OpError) -> OpError:
+    """Delete, by unique id, the copy a failed ``timeline.branch`` made; say so on its error.
+
+    The duplicate can be made and a later step still fail (its resolution will not set, or
+    does not read back). That copy belongs to no one: it is not registered, so the guard
+    lets no agent edit it, and a retry would cut the next version beside it, every time.
+    Registering it instead would not help: it is not at the resolution asked for, so a
+    retry could not reuse it either. So the op undoes its own half-made work and leaves the
+    project as it found it; a retry then cuts the same version again.
+
+    Only the timeline this very call made is touched, by id: the one ``timeline.duplicate``
+    names on its error (``created_timeline_id``, the id ``DuplicateTimeline`` returned for a
+    timeline that was not in the project before). Never a timeline found by name: under
+    concurrent nodes another one can carry the same deterministic branch name. With no
+    created id on the error, nothing is deleted. The id is re-read from the project right
+    before the delete (as ``_delete`` re-reads a marker), and again after it: ``removed`` if
+    it is gone, ``left_behind`` (for a human to remove) if not.
+    """
+    created = exc.detail.get(CREATED_TIMELINE_ID)
+    if not isinstance(created, str) or not created:
+        return exc  # no copy was made, or none provably by this call: nothing to undo
+    ours = [timeline for timeline in env.timelines() if str(timeline.GetUniqueId()) == created]
+    if not ours:
+        return exc  # already gone (someone else removed it): nothing to undo
+    copy = {"name": str(ours[0].GetName()), "unique_id": created}
+    try:
+        env.media_pool().DeleteTimelines(ours[:1])
+        gone = all(str(t.GetUniqueId()) != created for t in env.timelines())
+    except Exception:  # a failed clean-up must never hide the original error
+        gone = False
+    extra = {k: v for k, v in exc.detail.items() if k not in ("fix_hint", "trap_id")}
+    extra["removed" if gone else "left_behind"] = copy
+    return OpError(exc.code, exc.message, exc.fix_hint, exc.trap_id, **extra)
 
 
 # -- markers.mirror_review -------------------------------------------------------------------
@@ -289,6 +368,11 @@ class MirrorResult(OpModel):
     review_id: str
     markers: list[MirroredMarker]
     pruned: list[PrunedMarker]
+    cleared: list[PrunedMarker] = Field(
+        default_factory=list,
+        description="Extra markers for a note that an interrupted earlier run left (its "
+        "move's new marker was added, the old one not yet deleted); this run deleted them.",
+    )
 
 
 def _timeline_fps(timeline: Any) -> float:
@@ -321,13 +405,41 @@ class _Plan:
 
 @dataclass
 class _Applied:
-    """Exactly the marker writes a mirror run made, in order, as measured from Resolve."""
+    """Exactly the marker writes a mirror run made, in order, as measured from Resolve.
+
+    ``in_flight`` is the write whose Resolve call is under way (``("add" | "delete", note
+    id, frame, custom data)``). If that call raises, :meth:`settle` reads the frame back to
+    learn whether the write landed anyway; if even the read fails, the write is listed as
+    ``unconfirmed`` rather than guessed.
+    """
 
     added: list[dict[str, Any]] = field(default_factory=list)
     deleted: list[dict[str, Any]] = field(default_factory=list)
+    unconfirmed: list[dict[str, Any]] = field(default_factory=list)
+    in_flight: tuple[str, str, int, str] | None = None
+
+    def settle(self, timeline: Any) -> None:
+        """Resolve the in-flight write after a raise, by reading its frame back."""
+        if self.in_flight is None:
+            return
+        action, note_id, frame, custom_data = self.in_flight
+        self.in_flight = None
+        entry = {"note_id": note_id, "frame": frame}
+        try:
+            there = timeline.GetMarkerCustomData(frame) == custom_data
+        except Exception:
+            self.unconfirmed.append({**entry, "action": action})
+            return
+        if action == "add" and there:
+            self.added.append(entry)
+        elif action == "delete" and not there:
+            self.deleted.append(entry)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"added": list(self.added), "deleted": list(self.deleted)}
+        out: dict[str, Any] = {"added": list(self.added), "deleted": list(self.deleted)}
+        if self.unconfirmed:
+            out["unconfirmed"] = list(self.unconfirmed)
+        return out
 
 
 @op("markers.mirror_review", params=MirrorParams, result=MirrorResult, mutates=True)
@@ -340,24 +452,14 @@ def markers_mirror_review(env: OpEnv, params: MirrorParams) -> MirrorResult:
     rid = params.review_id
 
     # Read the branch's markers once: which are ours (by note id), which belong to anyone else.
-    ours: dict[str, dict[str, Any]] = {}
-    duplicates: list[str] = []
+    found: dict[str, list[dict[str, Any]]] = {}
     other_frames: dict[int, str] = {}
     for marker in raw.read_markers(timeline):
         parsed = parse_note_marker(marker["custom_data"])
         if parsed is not None and parsed[0] == rid:
-            if parsed[1] in ours:
-                duplicates.append(parsed[1])  # two markers claim the same note: never guess
-            ours[parsed[1]] = marker
+            found.setdefault(parsed[1], []).append(marker)
         else:
             other_frames[marker["frame"]] = marker["custom_data"]
-    if duplicates:
-        raise OpError(
-            "duplicate_marker_custom_data",
-            f"review {rid!r} has more than one marker for note(s) {sorted(set(duplicates))}",
-            "remove the duplicate markers by hand, then re-run",
-            note_ids=sorted(set(duplicates)),
-        )
 
     # Resolve each note's timeline frame, in range [0, duration). Nothing is mutated here.
     desired: dict[str, tuple[int, str, str, str]] = {}
@@ -374,6 +476,8 @@ def markers_mirror_review(env: OpEnv, params: MirrorParams) -> MirrorResult:
                 frame=frame,
             )
         desired[note.note_id] = (frame, params.color, note.timecode, note.text)
+
+    ours, cleared = _one_marker_per_note(found, desired)
 
     # Pre-flight the final state, before any mutation: one marker per frame. A note may not
     # land on a human or other-review marker, on another note, nor (with prune off) on a
@@ -418,16 +522,58 @@ def markers_mirror_review(env: OpEnv, params: MirrorParams) -> MirrorResult:
 
     applied = _Applied()
     try:
-        _mirror_apply(timeline, rid, plans, prunes, applied)
-    except OpError as exc:
-        raise _with_applied(exc, applied) from exc
+        _mirror_apply(timeline, rid, plans, [*cleared, *prunes], applied)
+    except Exception as exc:  # an OpError, a GatewayError, or a Resolve call that raised
+        applied.settle(timeline)
+        raise _with_applied(as_op_error(exc), applied) from exc
     markers.extend(MirroredMarker(note_id=p.note_id, frame=p.frame, status=p.status) for p in plans)
     return MirrorResult(
         timeline=env.identity(timeline),
         review_id=rid,
         markers=sorted(markers, key=lambda m: m.frame),
         pruned=sorted(prunes, key=lambda p: p.frame),
+        cleared=sorted(cleared, key=lambda p: p.frame),
     )
+
+
+def _one_marker_per_note(
+    found: dict[str, list[dict[str, Any]]], desired: dict[str, tuple[int, str, str, str]]
+) -> tuple[dict[str, dict[str, Any]], list[PrunedMarker]]:
+    """This review's marker for each note, and the extra ones a half-finished move left.
+
+    A move adds the new marker before it deletes the old one, so a run interrupted between
+    the two leaves two markers for one note, both ours by custom data. A re-run recognises
+    that only when exactly one of them already *is* the note as asked (frame, colour,
+    timecode and text): that one is kept and the others are cleared (deleted). Any other
+    duplicate (none, or several, matching what is asked, or a note this run does not
+    mirror) is refused rather than guessed at. Nothing here touches a marker that is not
+    this review's.
+    """
+    ours: dict[str, dict[str, Any]] = {}
+    cleared: list[PrunedMarker] = []
+    ambiguous: list[str] = []
+    for note_id, markers in found.items():
+        if len(markers) == 1:
+            ours[note_id] = markers[0]
+            continue
+        want = desired.get(note_id)
+        done = [m for m in markers if (m["frame"], m["color"], m["name"], m["note"]) == want]
+        if len(done) != 1:
+            ambiguous.append(note_id)
+            continue
+        ours[note_id] = done[0]
+        cleared.extend(
+            PrunedMarker(note_id=note_id, frame=m["frame"]) for m in markers if m is not done[0]
+        )
+    if ambiguous:
+        raise OpError(
+            "duplicate_marker_custom_data",
+            f"review markers have more than one marker for note(s) {sorted(ambiguous)}, and "
+            "none of them is unambiguously the note as asked",
+            "remove the duplicate markers by hand, then re-run",
+            note_ids=sorted(ambiguous),
+        )
+    return ours, cleared
 
 
 def _mirror_apply(
@@ -471,8 +617,10 @@ def _mirror_apply(
 
 def _add(timeline: Any, plan: _Plan, applied: _Applied) -> None:
     """Add the note's marker; record it once Resolve shows it, then verify its fields."""
+    applied.in_flight = ("add", plan.note_id, plan.frame, plan.custom_data)
     ok = timeline.AddMarker(plan.frame, plan.color, plan.timecode, plan.text, 1, plan.custom_data)
     read = {m["frame"]: m for m in raw.read_markers(timeline)}.get(plan.frame)
+    applied.in_flight = None
     if read is None or read["custom_data"] != plan.custom_data:
         raise OpError(
             "add_marker_failed",
@@ -510,8 +658,11 @@ def _delete(timeline: Any, rid: str, note_id: str, frame: int, applied: _Applied
             note_id=note_id,
             frame=frame,
         )
+    applied.in_flight = ("delete", note_id, frame, custom_data)
     ok = timeline.DeleteMarkerAtFrame(frame)
-    if timeline.GetMarkerCustomData(frame) == custom_data:
+    still_there = timeline.GetMarkerCustomData(frame) == custom_data
+    applied.in_flight = None
+    if still_there:
         raise OpError(
             "marker_delete_failed",
             f"DeleteMarkerAtFrame({frame}) returned {ok}; marker {custom_data!r} is still there",

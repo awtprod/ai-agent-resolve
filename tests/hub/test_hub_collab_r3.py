@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -247,24 +248,33 @@ def test_project_board_pages_its_leases_and_says_when_it_truncated(tmp_path: Pat
         async with Client(server) as client:
             first = _payload(await client.call_tool("project_board", {"project_id": "projR"}))
             assert len(first["leases"]) == 500
-            assert first["truncated"] is True and first["next_cursor"] == 500
+            assert first["truncated"] is True and isinstance(first["next_cursor"], str)
             rest = _payload(
-                await client.call_tool("project_board", {"project_id": "projR", "cursor": 500})
+                await client.call_tool(
+                    "project_board", {"project_id": "projR", "cursor": first["next_cursor"]}
+                )
             )
             assert len(rest["leases"]) == 20
             assert rest["truncated"] is False and rest["next_cursor"] is None
             keys = [lease["key"][1] for page in (first, rest) for lease in page["leases"]]
             assert sorted(keys) == [f"tl-{i:03d}" for i in range(520)]
             small = _payload(
+                await client.call_tool("project_board", {"project_id": "projR", "limit": 5})
+            )
+            assert len(small["leases"]) == 5 and isinstance(small["next_cursor"], str)
+            following = _payload(
                 await client.call_tool(
-                    "project_board", {"project_id": "projR", "cursor": 10, "limit": 5}
+                    "project_board",
+                    {"project_id": "projR", "cursor": small["next_cursor"], "limit": 5},
                 )
             )
-            assert len(small["leases"]) == 5 and small["next_cursor"] == 15
-            negative = await client.call_tool(
-                "project_board", {"project_id": "projR", "cursor": -1}
-            )
-            assert negative.is_error is True
+            assert following["leases"] == first["leases"][5:10]
+            four = base64.urlsafe_b64encode(json.dumps(["a", "b", "c", "d"]).encode()).decode()
+            for bad in ("-1", "not a cursor", "W10=", "x" * 5000, four):
+                refused = await client.call_tool(
+                    "project_board", {"project_id": "projR", "cursor": bad}
+                )
+                assert refused.is_error is True, bad
 
     asyncio.run(body())
 

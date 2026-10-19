@@ -78,7 +78,7 @@ from aar.hub.common import (
     utcnow,
 )
 from aar.hub.events import Actor, EventLog, IdempotencyConflict
-from aar.hub.leaseboard import lease_board
+from aar.hub.leaseboard import LeaseBoard, lease_board
 from aar.hub.registry import Registry
 
 logger = logging.getLogger("aar.hub.console")
@@ -1102,12 +1102,47 @@ class Console:
         else:
             presence = Html('<p class="empty">No human activity reported.</p>')
         return fmt(
-            '<p class="meta">As of {as_of}. Expired leases are left out.</p>'
+            '<p class="meta">As of {as_of}. Expired leases, and leases a node no longer holds '
+            "by its latest snapshot, are left out.</p>{stale}"
             '<section class="card"><h2>Who holds what</h2>{leases}</section>'
             '<section class="card"><h2>Humans at work</h2>{presence}</section>',
             as_of=_when(board.as_of),
+            stale=self.stale_card(board),
             leases=leases,
             presence=presence,
+        )
+
+    @staticmethod
+    def stale_card(board: LeaseBoard) -> Html:
+        """Which nodes' leases may be out of date on this page, and why; empty if none."""
+        if not board.stale:
+            return Html("")
+        gaps = (
+            fmt(
+                "<li>Node <code>{node}</code> dropped {n} feed event(s) at {at} and has not "
+                "reconciled since.</li>",
+                node=gap.node_id,
+                n=gap.dropped,
+                at=_when(gap.at),
+            )
+            for gap in board.gaps
+        )
+        refused = (
+            fmt(
+                "<li>Node <code>{node}</code>: a second feed process (<code>{nonce}</code>) "
+                "was refused at {at}; the node's current one is <code>{owner}</code>. Two "
+                "processes must not share a node id.</li>",
+                node=entry.node_id,
+                nonce=entry.nonce,
+                at=_when(entry.at),
+                owner=entry.owner,
+            )
+            for entry in board.superseded
+        )
+        return fmt(
+            '<section class="card" role="status"><h2>This view may be stale</h2>'
+            "<ul>{items}</ul></section>",
+            items=join([*gaps, *refused]),
         )
 
     # -- approvals ---------------------------------------------------------------

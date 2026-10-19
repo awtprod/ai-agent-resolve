@@ -23,7 +23,7 @@ from aar.node.branches import (
 )
 from aar.node.broker import BrokerConfig, OpStatus
 from aar.node.collab import contention, explain_op_contention
-from aar.node.feed import EventLogTransport, NodeFeed
+from aar.node.feed import EventLogTransport, NodeFeed, wire_feed
 from aar.node.leases import Holder, LeaseManager, Scope
 from aar.node.locator import ProjectLocator
 from aar.node.ops import OpError, make_hot_op, submit_op
@@ -326,8 +326,9 @@ def test_a_human_with_the_agents_id_does_not_inherit_its_branch() -> None:
 
 def test_a_human_holder_cannot_branch() -> None:
     show = Show()
-    result = show.run("timeline.branch", {"source": show.ref("Main")}, holder=HUMAN)
-    assert result.status is OpStatus.FAILED and result.error.code == "no_agent_holder"  # GN14
+    with pytest.raises(OpError) as err:  # refused at submit (S11f LOW 8)
+        show.run("timeline.branch", {"source": show.ref("Main")}, holder=HUMAN)
+    assert err.value.code == "no_agent_holder"  # GN14
     assert len(show.project.timelines) == 2
 
 
@@ -336,13 +337,20 @@ def test_a_human_holder_cannot_branch() -> None:
 
 def test_the_outbox_needs_room_for_one_spec(tmp_path) -> None:
     with pytest.raises(ValueError, match="outbox_max"):  # N17
-        NodeFeed("node-1", EventLogTransport(EventLog(tmp_path / "hub.db")), outbox_max=0)
+        NodeFeed(
+            "node-1",
+            EventLogTransport(EventLog(tmp_path / "hub.db")),
+            lease_source=list,
+            clock=FakeClock(),
+            outbox_max=0,
+        )
 
 
 def test_the_gap_is_dated_by_its_first_drop(tmp_path, monkeypatch) -> None:
     log = EventLog(tmp_path / "hub.db")
-    feed = NodeFeed("node-1", EventLogTransport(log), wall_offset=lambda: 1.8e9, outbox_max=1)
-    leases = LeaseManager(FakeClock(), sink=feed.lease_sink)
+    feed, leases = wire_feed(
+        "node-1", EventLogTransport(log), clock=FakeClock(), wall_offset=lambda: 1.8e9, outbox_max=1
+    )
     times = iter(dt.datetime(2027, 1, 1, h, tzinfo=dt.UTC) for h in range(1, 10))
 
     class _Clock(dt.datetime):

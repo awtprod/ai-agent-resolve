@@ -14,6 +14,8 @@ read-only.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 from typing import Any
 
@@ -51,6 +53,7 @@ ELIDED = "<elided: nested deeper than 64 levels>"
 
 _MAX_PROJECT_ID = 256
 _MAX_BOARD_ROWS = 500
+_MAX_BOARD_CURSOR = 2048
 _MAX_BRANCHES_PAGE = 50
 _MAX_BRANCHES_LIMIT = 100
 _MAX_BRANCHES_BYTES = 256 * 1024
@@ -70,6 +73,26 @@ def _bounded(value: Any, depth: int = 0) -> Any:
             return ELIDED
         return [_bounded(item, depth + 1) for item in value]
     return value
+
+
+def _board_cursor(key: tuple[str, str, str]) -> str:
+    """An opaque ``project_board`` cursor: the sort key of the last lease on a page."""
+    raw = json.dumps(list(key), separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _board_after(cursor: str) -> tuple[str, str, str]:
+    """The sort key a ``project_board`` cursor names; a ``ToolError`` if it is not one."""
+    bad = ToolError("cursor must be a next_cursor value returned by project_board")
+    if not isinstance(cursor, str) or not 0 < len(cursor) <= _MAX_BOARD_CURSOR:
+        raise bad
+    try:
+        key = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
+    except (UnicodeError, binascii.Error, ValueError):
+        raise bad from None
+    if not (isinstance(key, list) and len(key) == 3 and all(isinstance(k, str) for k in key)):
+        raise bad
+    return (key[0], key[1], key[2])
 
 
 def _event_dict(event: Event) -> dict[str, Any]:
@@ -255,10 +278,13 @@ def build_server(
         name="lease_board",
         description=(
             "Who holds what on each Resolve node, and where a human is working. Returns "
-            '{"as_of": ts, "leases": [...], "presence": [...]}. A lease has node_id, scope '
-            "(instance, project, timeline), key, holder {kind: human|agent, id}, since and "
-            "expires_at; expired leases are already left out. Presence entries mean a "
-            "human is active on that node since the given time."
+            '{"as_of": ts, "stale": bool, "leases": [...], "presence": [...], "gaps": [...], '
+            '"superseded": [...]}. A lease has node_id, scope (instance, project, timeline), '
+            "key, holder {kind: human|agent, id}, since and expires_at; expired leases, and "
+            "leases a node no longer holds by its latest snapshot, are already left out. "
+            "Presence entries mean a human is active on that node since the given time. "
+            "stale means a node's feed dropped events (gaps) or a second feed process for "
+            "one node id was refused (superseded), and the node has not reconciled since."
         ),
         annotations=_READ_ONLY,
     )
@@ -273,26 +299,30 @@ def build_server(
             "its timelines, and which humans are active. project_id is the Resolve project's "
             'unique id (the first part of a lease key). Returns {"project_id": id, "as_of": '
             'ts, "stale": bool, "leases": [...], "presence": [...], "gaps": [...], '
-            '"next_cursor": N|null, "truncated": bool}; stale means a node\'s feed dropped '
-            "events and has not reconciled yet. Leases come a page at a time: pass "
-            "next_cursor back as cursor. Instance leases are left out; presence is "
-            "node-level. Use this when a hot op is refused or delayed to see who holds what."
+            '"next_cursor": str|null, "truncated": bool}; stale means a node\'s feed '
+            "dropped events and has not reconciled yet. Leases come a page at a time, at "
+            "most 500, in a fixed order: pass next_cursor back as cursor for the next page "
+            "(a lease released between pages never shifts the others). Instance leases are "
+            "left out; presence is node-level. Use this when a hot op is refused or delayed "
+            "to see who holds what."
         ),
         annotations=_READ_ONLY,
     )
     def project_board(
-        project_id: str, cursor: int = 0, limit: int = _MAX_BOARD_ROWS
+        project_id: str, cursor: str | None = None, limit: int = _MAX_BOARD_ROWS
     ) -> dict[str, Any]:
         if not isinstance(project_id, str) or not 0 < len(project_id) <= _MAX_PROJECT_ID:
             raise ToolError(f"project_id must be 1 to {_MAX_PROJECT_ID} characters")
-        if cursor < 0:
-            raise ToolError("cursor must not be negative")
+        after = None if cursor is None else _board_after(cursor)
         limit = max(1, min(_MAX_BOARD_ROWS, limit))
         board = collab_project_board(log, project_id, clock=clock)
+        # A keyset page: the leases after the cursor's sort key, not an offset, so a lease
+        # released (or expired) between pages never makes the next page skip a live one.
+        rest = [lease for lease in board.leases if after is None or lease.sort_key > after]
+        page = rest[:limit]
+        next_cursor = _board_cursor(page[-1].sort_key) if len(rest) > len(page) else None
         data = board.to_dict()
-        leases = data["leases"]
-        data["leases"] = leases[cursor : cursor + limit]
-        next_cursor = cursor + limit if cursor + limit < len(leases) else None
+        data["leases"] = [lease.to_dict() for lease in page]
         presence = data["presence"]
         data["presence"] = presence[:_MAX_BOARD_ROWS]
         return {

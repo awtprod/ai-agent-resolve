@@ -132,6 +132,10 @@ class TimelineIdentity(OpModel):
 
 
 OpFn = Callable[["OpEnv", Any], BaseModel]
+SubmitCheck = Callable[[Any, Holder | None, BranchRegistry | None], OpError | None]
+"""An op's own refusals that need no Resolve call: ``(params, holder, registry)`` -> the
+refusal, or ``None``. ``make_hot_op`` runs it at submit, so such a refused op is never queued
+and the broker never loads or saves a project for it."""
 
 
 def _outside_broker(what: str) -> OpError:
@@ -156,6 +160,8 @@ class OpSpec:
     creates_timeline: bool = False
     """The op builds a timeline from a ``source`` (``timeline.duplicate``, ``timeline.branch``),
     so the branch guard exempts it: branching off a human timeline must stay allowed."""
+    submit_check: SubmitCheck | None = field(default=None, repr=False, compare=False)
+    """Refusals decided at submit, before the op is queued (see :data:`SubmitCheck`)."""
     _body: OpFn = field(default=lambda env, params: None, repr=False, compare=False)
 
     def describe(self) -> dict[str, Any]:
@@ -182,6 +188,7 @@ def op(
     traps: tuple[str, ...] = (),
     needs_current_timeline: bool = False,
     creates_timeline: bool = False,
+    submit_check: SubmitCheck | None = None,
 ) -> Callable[[OpFn], OpFn]:
     """Register an op body under ``name``."""
     for trap_id in traps:
@@ -209,6 +216,7 @@ def op(
             traps,
             needs_current_timeline,
             creates_timeline,
+            submit_check=submit_check,
             _body=guarded,
         )
         return guarded
@@ -536,6 +544,22 @@ def _branch_refusal(
     return None
 
 
+def as_op_error(exc: Exception) -> OpError:
+    """``exc`` as an :class:`OpError`: itself, a ``GatewayError``'s code and message, or
+    ``resolve_call_failed`` for anything else a Resolve call raised. An op that must report
+    what it applied before a failure (``markers.mirror_review``) wraps every failure this
+    way, so a raise is never left without its ``applied``."""
+    if isinstance(exc, OpError):
+        return exc
+    if isinstance(exc, GatewayError):
+        return OpError(exc.code, exc.message, "see the gateway message")
+    return OpError(
+        "resolve_call_failed",
+        f"a Resolve call raised {type(exc).__name__}: {exc}",
+        "re-run once Resolve answers; the error's detail says what was applied",
+    )
+
+
 def _execute(
     spec: OpSpec,
     gateway: ResolveGateway,
@@ -551,7 +575,7 @@ def _execute(
     try:
         result = spec._body(env, params)
     except GatewayError as exc:
-        raise OpError(exc.code, exc.message, "see the gateway message") from exc
+        raise as_op_error(exc) from exc
     if not isinstance(result, spec.result):
         raise TypeError(f"op {spec.name} returned {type(result).__name__}, not {spec.result}")
     return result
@@ -574,9 +598,11 @@ def make_hot_op(
     ``holder`` owns (see :func:`_branch_refusal`), so an agent never touches a human's
     timeline or shared project state by accident. The check runs here, at submit, and raises
     before the op is queued, so a refused op never makes the broker switch project or
-    timeline. The only way past it is an explicit ``require_branch=False``, which the S7
-    runner sets after it has consumed a ``project.write`` approval token. ``branch_registry``
-    is the node's owner registry.
+    timeline. So does the op's own ``submit_check`` (e.g. ``timeline.branch`` needs an agent
+    holder with a usable id and a registry), whatever ``require_branch`` is. The only way
+    past the guard is an explicit ``require_branch=False``, which the S7 runner sets after it
+    has consumed a ``project.write`` approval token. ``branch_registry`` is the node's owner
+    registry.
     """
     spec = get_op(name)
     if not spec.hot:
@@ -590,6 +616,10 @@ def make_hot_op(
         )
     checked = params if isinstance(params, spec.params) else spec.params.model_validate(params)
     timeline, timeline_id, also_leased = _lease_timeline(spec, checked)
+    if spec.submit_check is not None:
+        refusal = spec.submit_check(checked, holder, branch_registry)
+        if refusal is not None:
+            raise refusal
     if require_branch:
         refusal = _branch_refusal(
             spec,
