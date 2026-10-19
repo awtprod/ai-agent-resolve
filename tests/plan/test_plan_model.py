@@ -40,6 +40,12 @@ def test_schema_lists_the_plan_fields_and_the_required_ones() -> None:
         "captions",
         "caption_style",
         "markers",
+        # version 2
+        "template",
+        "head",
+        "outro",
+        "audio_tracks",
+        "end_fade_frames",
     }
     assert set(schema["required"]) == {
         "project",

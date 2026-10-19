@@ -8,6 +8,7 @@ from typing import Any
 from aar.plan.lint import Finding, LintReport
 
 FIXTURES = Path(__file__).parent / "fixtures"
+V1_COMPAT = FIXTURES / "v1_compat"
 
 PlanData = dict[str, Any]
 RefTuple = tuple[int | None, str | None, str | None, str | None]
