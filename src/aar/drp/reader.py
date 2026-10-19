@@ -63,11 +63,17 @@ __all__ = [
 #   530 MB unterminated tag    1048    530 MB text or attribute value   1554
 #   101 x 5M-char attr name    1958    530 MB of ProjectName text       2060
 #   3.1M nested, 168-char names 2314   530 MB text with one 4-byte char 3070
-# so the worst case is about 3.1 GB, not 1.2 GB. The largest is the UTF-8 validity check in the
-# scanner (`data.decode`), which builds a 4-bytes-per-character copy of a member whose text
-# holds a non-BMP character; it is the same at 20f89a0. The token and XML-byte budgets are
-# per-file totals, so they bound the sum over members, not each member separately. All of these
-# limits are overridable per call in :func:`read_drp`.
+#   530 MB ProjectName, or one attribute value, with one 4-byte char    3578
+# so the worst case is about 3.6 GB (3578 MB), not 1.2 GB. One character outside the BMP is
+# enough: CPython then stores the whole str at 4 bytes per character, so every decode of the
+# 530 MB member or of a 530 MB name or value is a 2.1 GB copy. The first is the UTF-8 validity
+# check in the scanner (`data.decode`), which holds that copy next to the member bytes and the
+# zip read buffer (about 1.0 GB of its own); measured stage by stage, a read of such a file is
+# at 1.0 GB after the zip read, 3.0 GB after the check and 3.6 GB after the name or value is
+# decoded as well. fbfdcc5 peaks the same for a name (3578) and higher for an attribute value
+# (4083), so this is not new. The token and XML-byte budgets are per-file totals, so they bound
+# the sum over members, not each member separately. All of these limits are overridable per
+# call in :func:`read_drp`.
 DEFAULT_MAX_ELEMENTS = 3_000_000
 DEFAULT_MAX_TOTAL_XML_BYTES = 600 * 1024 * 1024
 DEFAULT_MAX_ISSUES_PER_CODE = 100
