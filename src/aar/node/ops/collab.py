@@ -520,14 +520,6 @@ def _delete(timeline: Any, rid: str, note_id: str, frame: int, applied: _Applied
             frame=frame,
         )
     applied.deleted.append({"note_id": note_id, "frame": frame})
-    if frame in (timeline.GetMarkers() or {}):
-        raise OpError(
-            "marker_delete_failed",
-            f"a marker is still at frame {frame} after deleting {custom_data!r}",
-            "remove the marker by hand, then re-run",
-            note_id=note_id,
-            frame=frame,
-        )
 
 
 def _with_applied(exc: OpError, applied: _Applied) -> OpError:
