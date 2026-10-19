@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -268,7 +269,8 @@ def test_project_board_pages_its_leases_and_says_when_it_truncated(tmp_path: Pat
                 )
             )
             assert following["leases"] == first["leases"][5:10]
-            for bad in ("-1", "not a cursor", "W10=", "x" * 5000):
+            four = base64.urlsafe_b64encode(json.dumps(["a", "b", "c", "d"]).encode()).decode()
+            for bad in ("-1", "not a cursor", "W10=", "x" * 5000, four):
                 refused = await client.call_tool(
                     "project_board", {"project_id": "projR", "cursor": bad}
                 )

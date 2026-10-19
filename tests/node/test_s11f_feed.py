@@ -764,3 +764,22 @@ def test_a_late_older_gap_never_replaces_the_newer_gaps_count(tmp_path: Path) ->
     deliver_feed_event(log, newer, NODE)
     deliver_feed_event(log, older, NODE)  # lands late
     assert [g.dropped for g in lease_board(log).gaps] == [3]
+
+
+def test_a_feed_is_not_reconciled_while_its_reconcile_is_still_in_flight(tmp_path: Path) -> None:
+    # S43: the gap is through, but the reconcile's snapshot is not; the feed must say so.
+    log = EventLog(tmp_path / "hub.db")
+    clock = FakeClock()
+    transport = Faulty(log)
+    feed, leases = _wired(log, transport, clock, outbox_max=1)
+    _drain(feed, clock)
+    leases.acquire(Holder.agent("a"), Scope.PROJECT, ("pa",), ttl=600)
+    leases.acquire(Holder.agent("b"), Scope.PROJECT, ("pb",), ttl=600)  # a drop
+    transport.hold = lambda spec: spec.type == EVENT_LEASE_SNAPSHOT
+    report = feed.flush()
+    assert report.delivered_gap and report.retry_at is not None
+    assert feed.pending == 1 and not feed.reconciled
+    transport.hold = lambda spec: False
+    clock.advance(BACKOFF_MAX)
+    feed.flush()
+    assert feed.reconciled and feed.pending == 0

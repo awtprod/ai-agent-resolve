@@ -181,3 +181,14 @@ def test_the_clean_up_never_deletes_a_same_named_timeline_that_was_there_before(
     assert error.code == "timeline_exists" and "removed" not in error.detail
     assert {t.GetUniqueId() for t in show.project.timelines} == before
     assert not [call for call in show.fake.calls if call[0] == "DeleteTimelines"]
+
+
+def test_reuse_returns_the_latest_of_several_owned_branches_at_the_asked_resolution() -> None:
+    # V05: with v1 and v2 both at the source's resolution, a plain re-run reuses v2.
+    show = Show()
+    first = show.make_branch()
+    second = show.ok("timeline.branch", {"source": show.ref("Main"), "if_exists": "new"})
+    assert (first.version, second.version) == (1, 2)
+    again = show.ok("timeline.branch", {"source": show.ref("Main")})
+    assert not again.created and again.version == 2
+    assert again.timeline.unique_id == second.timeline.unique_id
