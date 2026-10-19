@@ -15,7 +15,7 @@ from aar.hub.events import Actor
 from aar.node.jobs import ApprovalPolicy, JobState, Watchdog, WatchdogConfig
 
 from .fake_resolve import FakeRenderJob
-from .jobs_support import IDLE, JobWorld
+from .jobs_support import AGENT_ID, IDLE, JobWorld
 
 HUMAN = Actor("human", "andrew")
 
@@ -66,7 +66,9 @@ def test_render_completes_and_reports_measured_values(tmp_path: Path) -> None:
     world.project.render_time_ms = 7200
     original = world.project.deliver.copy()
 
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
     assert view is not None and view.state == JobState.SUCCEEDED.value, view and view.error
@@ -90,7 +92,9 @@ def test_render_failure_restores_deliver(tmp_path: Path) -> None:
     world.project.render_outcome = "fail"
     world.project.render_error = "frames offline: cam A"
     original = world.project.deliver.copy()
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
     assert view is not None and view.state == JobState.FAILED.value
@@ -104,7 +108,9 @@ def test_render_waits_for_approval_on_production(tmp_path: Path) -> None:
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
     pid = world.pid()
     original = world.project.deliver.copy()
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
     assert view is not None and view.state == JobState.WAITING.value
@@ -126,7 +132,9 @@ def test_render_waits_for_approval_on_production(tmp_path: Path) -> None:
 def test_p1a_agent_never_adopts_a_human_render_job(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     human = _human_job(world, "Main [agent]", "show_v1")
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
     assert view is not None and view.state == JobState.SUCCEEDED.value
@@ -140,7 +148,9 @@ def test_p1a_agent_never_adopts_a_human_render_job(tmp_path: Path) -> None:
 def test_p1b_completed_human_job_is_left_alone(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     human = _human_job(world, "Main [agent]", "show_v1", status="Complete")
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     assert world.runner.get(job_id).state == JobState.SUCCEEDED.value
     assert ("DeleteRenderJob", human) not in world.fake.calls
@@ -154,7 +164,9 @@ def test_p2_resume_reuses_recorded_id_even_with_filename_extension(tmp_path: Pat
     world = JobWorld(tmp_path)
     world.project.render_output_extension = ".mov"  # live 21.1 appends the container extension
     world.project.render_complete_after = 5  # still rendering when we restart
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     for _ in range(30):
         world.runner.pump()
         if world.store.get(job_id).cursor.get("render_job_id"):
@@ -177,20 +189,15 @@ def test_p2_resume_reuses_recorded_id_even_with_filename_extension(tmp_path: Pat
 
 
 def test_p7_production_broker_restore_never_renders_human_settings(tmp_path: Path) -> None:
-    from aar.node.broker import Broker, BrokerConfig
+    from aar.node.broker import BrokerConfig
 
     world = JobWorld(tmp_path)
-    world.broker = Broker(
-        world.gw,
-        leases=world.leases,
-        presence=world.presence,
-        clock=world.clock,
-        config=BrokerConfig(),  # production restore_delay
-    )
-    world.runner = world._new_runner()
+    world.restart(broker_config=BrokerConfig())  # production restore_delay
     original = world.project.deliver.copy()
     world.project.render_complete_after = 5
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     # Advance the clock past the restore delay partway through the render, forcing a broker
     # restore while the render is still polling.
     for i in range(40):
@@ -206,35 +213,21 @@ def test_p7_production_broker_restore_never_renders_human_settings(tmp_path: Pat
 
 
 def test_p16_restart_mid_render_keeps_deliver_original(tmp_path: Path) -> None:
-    from aar.node.broker import Broker, BrokerConfig
-
-    def production_broker() -> None:
-        world.broker = Broker(
-            world.gw,
-            leases=world.leases,
-            presence=world.presence,
-            clock=world.clock,
-            config=BrokerConfig(),
-        )
+    from aar.node.broker import BrokerConfig
 
     world = JobWorld(tmp_path)
-    production_broker()
-    world.runner = world._new_runner()
+    world.restart(broker_config=BrokerConfig())  # production restore_delay
     original = world.project.deliver.copy()
     world.project.render_complete_after = 6
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     for _ in range(40):
         world.runner.pump()
         if world.store.get(job_id).cursor.get("phase") == "poll":
             break
     # Node restarts mid-render.
-    world.store.close()
-    world._fresh_broker()
-    production_broker()
-    from aar.node.jobs import JobStore
-
-    world.store = JobStore(world.db_path)
-    world.runner = world._new_runner()
+    world.restart(broker_config=BrokerConfig())
     world.runner.run_until_settled()
     assert world.runner.get(job_id).state == JobState.SUCCEEDED.value
     # Let the broker's own restore run after the queue drains.
@@ -251,7 +244,9 @@ def test_p8_snapshot_preset_gone_after_build_not_mid_render(tmp_path: Path) -> N
     world = JobWorld(tmp_path)
     world.project.render_complete_after = 5
     original = world.project.deliver.copy()
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     for _ in range(40):
         world.runner.pump()
         if world.store.get(job_id).cursor.get("phase") == "poll":
@@ -267,7 +262,9 @@ def test_p9_cancel_mid_render_leaves_deliver_clean(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     world.project.render_complete_after = 50
     original = world.project.deliver.copy()
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     for _ in range(40):
         world.runner.pump()
         if world.store.get(job_id).cursor.get("phase") == "poll":
@@ -284,7 +281,7 @@ def test_p10_stall_mid_render_leaves_deliver_clean(tmp_path: Path) -> None:
     world.project.render_outcome = "hang"
     original = world.project.deliver.copy()
     job_id = world.runner.submit(
-        "render", _render_params(world, timeout_seconds=30.0), world.locator()
+        "render", _render_params(world, timeout_seconds=30.0), world.locator(), agent_id=AGENT_ID
     )
     for _ in range(15):
         world.runner.pump()
@@ -320,7 +317,9 @@ def test_p19_build_runs_on_the_jobs_timeline(tmp_path: Path) -> None:
         return orig_add()
 
     proj.SetRenderSettings, proj.AddRenderJob = set_settings, add  # type: ignore[method-assign]
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     assert world.runner.get(job_id).state == JobState.SUCCEEDED.value
     assert seen[0] == ("SetRenderSettings", "Main")
@@ -338,6 +337,7 @@ def test_p20_two_renders_same_project_do_not_cross_wire(tmp_path: Path) -> None:
             world, timeline=world.ref("Main"), target_dir="D:/A", custom_name="a_v1", cleanup=False
         ),
         world.locator(),
+        agent_id=AGENT_ID,
     )
     b = world.runner.submit(
         "render",
@@ -349,6 +349,7 @@ def test_p20_two_renders_same_project_do_not_cross_wire(tmp_path: Path) -> None:
             cleanup=False,
         ),
         world.locator(),
+        agent_id=AGENT_ID,
     )
     world.runner.run_until_settled()
     va, vb = world.runner.get(a), world.runner.get(b)
@@ -366,14 +367,17 @@ def test_p20_two_renders_same_project_do_not_cross_wire(tmp_path: Path) -> None:
 def test_p21_long_render_does_not_stall_another_project(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     world.project.render_complete_after = 10_000  # effectively never finishes in the test
-    world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.submit("render", _render_params(world), world.locator(), agent_id=AGENT_ID)
     for _ in range(30):
         world.runner.pump()
         if world.project.rendering:
             break
     assert world.project.rendering
     other = world.runner.submit(
-        "ops.sequence", {"steps": [{"op": "timeline.list", "params": {}}]}, world.locator("Other")
+        "ops.sequence",
+        {"steps": [{"op": "timeline.list", "params": {}}]},
+        world.locator("Other"),
+        agent_id=AGENT_ID,
     )
     for _ in range(14):
         world.clock.advance(10.0)
@@ -386,7 +390,9 @@ def test_p21_long_render_does_not_stall_another_project(tmp_path: Path) -> None:
 
 def test_p3b_stop_before_build_never_starts_the_render(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()  # the build op is queued, not yet run
     assert _calls(world, "AddRenderJob") == []
     control.stop(world.log, control.StopScope.all(), "STOP NOW", HUMAN)
@@ -402,7 +408,7 @@ def test_p5_step_deadline_survives_restart_while_waiting(tmp_path: Path) -> None
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1e6)))
     world.project.render_outcome = "hang"
     job_id = world.runner.submit(
-        "render", _render_params(world, timeout_seconds=30.0), world.locator()
+        "render", _render_params(world, timeout_seconds=30.0), world.locator(), agent_id=AGENT_ID
     )
     control.stop(world.log, control.StopScope.all(), "pause", HUMAN)
     world.runner.run_until_settled()
@@ -422,7 +428,9 @@ def test_p5_step_deadline_survives_restart_while_waiting(tmp_path: Path) -> None
 def test_p22_long_render_event_log_is_bounded(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     world.project.render_complete_after = 120  # a long render, polled many times
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
     assert view.state == JobState.SUCCEEDED.value

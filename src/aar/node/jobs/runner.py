@@ -39,20 +39,26 @@ import threading
 import time
 import traceback
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
-from typing import Any
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ValidationError
 
 from aar.hub.approvals import ApprovalError, ApprovalScope
 from aar.hub.control import Stopped
 from aar.hub.events import Actor
+from aar.node.branch_registry import BranchRegistry
+from aar.node.branches import valid_agent_id
 from aar.node.broker import Broker, HotOp, HotOpFailure, OpResult, OpStatus
 from aar.node.broker import OpError as BrokerOpError
 from aar.node.hublink import HubLink
 from aar.node.leases import Clock, Holder
 from aar.node.locator import ProjectLocator
 from aar.node.ops import get_op, make_hot_op
+from aar.node.ops.collab import BranchResult
+from aar.node.ops.framework import BRANCH_GUARD_CODES, OpError
 from aar.node.ops.journal import op_journal
 
 from .kinds import get_kind
@@ -73,6 +79,9 @@ from .render import live_render_id
 from .store import JobRecord, JobStore
 from .watchdog import Watchdog, WatchdogConfig
 
+if TYPE_CHECKING:
+    from aar.node.feed import NodeFeed, PresenceReporter
+
 _log = logging.getLogger(__name__)
 
 _APPROVAL_SCOPE = ApprovalScope.PROJECT_WRITE
@@ -89,7 +98,7 @@ _drain_delay = 0.0
 no test depends on the drain finishing inside the wall-clock budget (``AAR_TEST_DRAIN_DELAY``,
 see ``tests/node/conftest.py``). Always 0 in production."""
 
-_NOT_RUN = frozenset({"emergency_stop", "job_inactive", "project_stalled"})
+_NOT_RUN = frozenset({"emergency_stop", "job_inactive", "project_stalled", "hub_unreachable"})
 """Precheck refusals: the op never ran, so the step re-issues it later (not a failure)."""
 
 _JOURNALED_EVENTS = frozenset({"added", "started", "deleted", "orphaned", "restore_failed"})
@@ -99,6 +108,12 @@ _NOT_A_STATE = frozenset(
     {"build_started", "snapshot_recovered", "snapshot_deleted", "restore_failed"}
 )
 """Journal entries that record a fact without moving the build's ``state``."""
+
+_PROJECT_APPROVAL = "project"
+"""The approval key of the F15 production approval (target: the project id)."""
+
+_BRANCH_OP = "timeline.branch"
+"""The op whose results the runner records on the hub (S11's ``record_branch``)."""
 
 _RENDER_ENDED = frozenset({"render_failed", "render_job_unknown"})
 """Failure codes after which the job's render is known to be over (no orphan alert)."""
@@ -162,6 +177,9 @@ class JobView:
     stall: dict[str, Any] | None
     approval_token: str | None
     approval_consumed: bool
+    approvals: dict[str, str]
+    """Consumed approvals: ``"project"`` (F15) and one ``"op:..."`` per guarded op (P4)."""
+    agent_id: str | None
     created_at: float
     updated_at: float
     events: list[dict[str, Any]]
@@ -188,6 +206,12 @@ class _Runtime:
     """The last broker crash seen while this job's op was outstanding (the stall's cause)."""
     persisted_at: float | None = None
     """Clock time the remaining deadline was last saved while running."""
+    pending_op_name: str | None = None
+    """The name of the op ``pending_op_id`` runs (to record ``timeline.branch`` results)."""
+    verify_pending: bool = False
+    """The approvals could not be verified on load (hub unreachable): verify before running."""
+    branch_records: list[dict[str, Any]] | None = None
+    """``timeline.branch`` results not yet recorded on the hub (it was unreachable)."""
 
 
 class JobRunner:
@@ -200,16 +224,28 @@ class JobRunner:
         hublink: HubLink,
         *,
         node_id: str,
+        branch_registry: BranchRegistry,
+        feed: NodeFeed,
+        presence_reporter: PresenceReporter,
         clock: Clock = time.monotonic,
-        holder: Holder | None = None,
-        actor: Actor | None = None,
+        wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         approval: ApprovalPolicy | None = None,
         watchdog: Watchdog | None = None,
         drain_budget: float | None = _DRAIN_BUDGET,
         max_restarts: int = DEFAULT_MAX_RESTARTS,
     ) -> None:
+        """Build a runner. ``branch_registry``, ``feed`` and ``presence_reporter`` are the
+        node's single shared instances (S11 wiring, P5); :class:`aar.node.runtime.NodeRuntime`
+        assembles them. Every op runs as its job's agent (P2); the runner has no holder."""
         if not node_id:
             raise ValueError("a job runner needs a non-empty node_id")
+        if not isinstance(branch_registry, BranchRegistry):
+            raise TypeError("a job runner needs the node's BranchRegistry")
+        if feed.node_id != node_id:
+            raise ValueError(
+                f"the feed reports for node {feed.node_id!r}, the runner is node {node_id!r}: "
+                "the hub records must name one node"
+            )
         if drain_budget is not None and not (math.isfinite(drain_budget) and drain_budget > 0):
             raise ValueError("drain_budget must be a positive number of seconds, or None")
         if max_restarts < 0:
@@ -219,8 +255,12 @@ class JobRunner:
         self.hublink = hublink
         self.node_id = node_id
         self.clock = clock
-        self.holder = holder or Holder.agent(f"job-runner:{node_id}")
-        self.actor = actor or Actor("node", node_id)
+        self.wall_clock = wall_clock
+        self.actor = Actor("node", node_id)
+        """The node actor: it records branches on the hub (the feed's node id, P5)."""
+        self.branch_registry = branch_registry
+        self.feed = feed
+        self.presence_reporter = presence_reporter
         self.policy = approval or ApprovalPolicy()
         self.watchdog = watchdog or Watchdog(WatchdogConfig())
         self.max_restarts = max_restarts
@@ -236,6 +276,9 @@ class JobRunner:
         self._drain_thread: threading.Thread | None = None
         self._drain_done: threading.Event | None = None
         self._drain_errors: list[dict[str, Any]] = []
+        self._hub_sync_lock = threading.Lock()
+        self.last_flush = None
+        """The last ``FlushReport`` of the node's feed."""
         self._closed = False
         self._load()
 
@@ -263,7 +306,25 @@ class JobRunner:
                 continue
             rt = _Runtime(steps=steps, params=params)
             self._runtime[record.job_id] = rt
-            self._verify_approval(record, now)
+            if record.agent_id is None or not valid_agent_id(record.agent_id):
+                if record.state not in TERMINAL_STATES:
+                    self._fail(
+                        record,
+                        StructuredError(
+                            "no_agent_id",
+                            f"job {record.job_id} has no valid agent id ({record.agent_id!r}); "
+                            "its ops would have no agent to run as",
+                            "resubmit the job with submit(..., agent_id=<the agent's id>)",
+                        ),
+                        now,
+                    )
+                continue
+            self._requeue_branch_records(record, rt)
+            try:
+                self._verify_approval(record, now)
+            except OSError as exc:  # the hub is unreachable: verify before the job runs
+                rt.verify_pending = True
+                _log.warning("job %s: approvals not verified on load: %s", record.job_id, exc)
             if record.state is JobState.RUNNING:
                 rt.deadline_anchor = now  # the persisted remaining deadline runs on
                 self._count_restart(record, now)
@@ -309,44 +370,67 @@ class JobRunner:
             return
         self.store.save(record, [("restarted", {"restarts": record.restarts}, now)])
 
-    def _job_actor(self, job_id: str) -> Actor:
-        """The actor a job consumes its approval as: binds the hub's consume to this job."""
-        return Actor(self.actor.kind, f"{self.actor.id}#{job_id}")
+    def _job_actor(self, record: JobRecord) -> Actor:
+        """The actor a job consumes its approvals as: the job's agent, bound to this job
+        (``agent:<agent id>#<job id>``), so the hub's audit names the agent and the job, and a
+        token one job consumed never verifies for another (P2, P13b)."""
+        return Actor("agent", f"{record.agent_id}#{record.job_id}")
 
-    def _consume_verified(self, record: JobRecord, token_id: str | None) -> bool:
-        """Whether the hub shows ``token_id`` consumed by THIS job, for its scope and target."""
+    @staticmethod
+    def _approval_target(record: JobRecord, key: str) -> str:
+        """The exact ``project.write`` target an approval key needs: the project id for the
+        F15 approval, ``<project id>#op:<op>`` for an override that names one op (P4)."""
+        project = record.target.project_id or ""
+        if key == _PROJECT_APPROVAL:
+            return project
+        return op_approval_target(project, key.rsplit("/", 1)[-1])
+
+    def _consume_verified(self, record: JobRecord, token_id: str | None, key: str) -> bool:
+        """Whether the hub shows ``token_id`` consumed by THIS job, for the key's target."""
         if token_id is None:
             return False
         approval = self.hublink.approval(token_id)
         return (
             approval is not None
             and approval.consumed_at is not None
-            and approval.consumed_by == self._job_actor(record.job_id)
+            and approval.consumed_by == self._job_actor(record)
             and approval.scope is _APPROVAL_SCOPE
-            and approval.target == (record.target.project_id or "")
+            and approval.target == self._approval_target(record, key)
         )
 
     def _verify_approval(self, record: JobRecord, now: float) -> None:
-        """On load: trust ``approval_consumed`` only when the hub shows this job's own consume
-        (L1, P13b), and finish a consume a crash interrupted (L2): ``approval_pending`` is the
-        token a consume was started with; if the hub shows it consumed by this job, the
-        consume happened and is recovered, otherwise the intent is dropped."""
-        if record.approval_consumed and not self._consume_verified(record, record.approval_token):
-            record.approval_consumed = False
-            self.store.save(
-                record, [("approval_unverified", {"token_id": record.approval_token}, now)]
-            )
-        pending = record.approval_pending
-        if pending is None:
-            return
-        record.approval_pending = None
-        if not record.approval_consumed and self._consume_verified(record, pending):
-            record.approval_consumed = True
-            record.approval_token = pending
-            event = ("approval_recovered", {"token_id": pending}, now)
-        else:
-            event = ("approval_pending_dropped", {"token_id": pending}, now)
-        self.store.save(record, [event])
+        """On load: trust a consumed approval only when the hub shows this job's own consume
+        for its exact target (L1, P13b), and finish a consume a crash interrupted (L2):
+        ``approval_pending`` is the token a consume was started with (for the approval key in
+        ``approval_pending_key``); if the hub shows it consumed by this job, the consume
+        happened and is recovered, otherwise the intent is dropped. Raises ``OSError`` when the
+        hub is unreachable (the caller verifies again before the job runs)."""
+        events: list[tuple[str, dict[str, Any], float]] = []
+        verified = {
+            key: token
+            for key, token in record.approvals.items()
+            if self._consume_verified(record, token, key)
+        }
+        for key, token in record.approvals.items():
+            if key not in verified:
+                events.append(("approval_unverified", {"token_id": token, "key": key}, now))
+        if record.approval_consumed and not verified and not record.approvals:
+            events.append(("approval_unverified", {"token_id": record.approval_token}, now))
+        record.approvals = verified
+        pending, pending_key = record.approval_pending, record.approval_pending_key
+        if pending is not None:
+            key = pending_key or _PROJECT_APPROVAL
+            record.approval_pending = record.approval_pending_key = None
+            if key not in record.approvals and self._consume_verified(record, pending, key):
+                record.approvals[key] = pending
+                if record.approval_token == pending:
+                    record.approval_token = None
+                events.append(("approval_recovered", {"token_id": pending, "key": key}, now))
+            else:
+                events.append(("approval_pending_dropped", {"token_id": pending, "key": key}, now))
+        record.approval_consumed = bool(record.approvals)
+        if events:
+            self.store.save(record, events)
 
     def _parse_params(self, record: JobRecord) -> BaseModel:
         return get_kind(record.kind).params_model.model_validate(record.params)
@@ -362,10 +446,22 @@ class JobRunner:
         params: dict[str, Any] | BaseModel,
         target: ProjectLocator,
         *,
+        agent_id: str,
         priority: int = 0,
         approval_token: str | None = None,
     ) -> str:
-        """Queue a new job and return its id. The caller drives it with :meth:`pump`."""
+        """Queue a new job for the agent ``agent_id`` and return its id. The caller drives it
+        with :meth:`pump`.
+
+        Every op of the job runs as ``Holder.agent(agent_id)`` (P2): branch ownership, leases
+        and the hub audit all name the agent that asked for the work. A job without a valid
+        agent id (letters, digits, ``.``, ``_``, ``-``; no ``:``) is refused here, before it
+        exists."""
+        if not isinstance(agent_id, str) or not valid_agent_id(agent_id):
+            raise ValueError(
+                f"a job needs the id of the agent it works for (letters, digits, '.', '_' or "
+                f"'-', at most 128 characters), got {agent_id!r}"
+            )
         if target.project_id is None:
             raise ValueError("a job's target locator needs a project_id (every op asserts by id)")
         spec = get_kind(kind)
@@ -386,6 +482,7 @@ class JobRunner:
                 params=model.model_dump(mode="json"),
                 state=JobState.QUEUED,
                 approval_token=approval_token,
+                agent_id=agent_id,
                 priority=priority,
                 step_deadline=steps[0].timeout if steps else None,
                 created_at=now,
@@ -396,7 +493,12 @@ class JobRunner:
                 [
                     (
                         "submitted",
-                        {"kind": kind, "target": target.to_dict(), "steps": len(steps)},
+                        {
+                            "kind": kind,
+                            "target": target.to_dict(),
+                            "steps": len(steps),
+                            "agent_id": agent_id,
+                        },
                         now,
                     )
                 ],
@@ -540,7 +642,31 @@ class JobRunner:
             for record in self._order():
                 self._advance(record, now)
             self._run_watchdog(now)
-            return self._outcome()
+            outcome = self._outcome()
+        self._sync_hub(now)  # outside the job lock: the feed may talk to a remote hub
+        return outcome
+
+    def _sync_hub(self, now: float) -> None:
+        """Report presence and flush the lease/presence feed (S11 wiring, P5).
+
+        Both are called on every pump: ``PresenceReporter.sync`` turns the presence guard's
+        verdict (refreshed by the broker's tick) into hub presence events, then
+        ``NodeFeed.flush`` sends what is queued (it backs off by itself while the hub is
+        unreachable). A concurrent pump skips it rather than flush the same feed twice; a
+        feed error never escapes into the pump."""
+        if not self._hub_sync_lock.acquire(blocking=False):
+            return
+        try:
+            try:
+                self.presence_reporter.sync(now, self.wall_clock())
+            except Exception:  # a bad presence report must not stop the jobs
+                _log.exception("job runner %s: presence sync failed", self.node_id)
+            report = self.feed.flush()
+            if report.stopped:
+                _log.error("job runner %s: the hub replaced this node's feed", self.node_id)
+            self.last_flush = report
+        finally:
+            self._hub_sync_lock.release()
 
     def run_until_settled(self, max_pumps: int = 10000) -> list[PumpOutcome]:
         """Pump until no job can make progress on its own. For tests and batch drains."""
@@ -673,6 +799,8 @@ class JobRunner:
             self.hublink.assert_running(project=target, node_id=self.node_id)
         except Stopped as stop:
             return BrokerOpError("emergency_stop", str(stop), {"scope": str(stop.scope)})
+        except OSError as exc:  # fail closed: a stop we cannot read may be in force
+            return BrokerOpError("hub_unreachable", f"the hub cannot be reached: {exc}")
         return None
 
     def _journal(self, job_id: str, op_id: str, event: str, data: dict[str, Any]) -> bool:
@@ -682,6 +810,9 @@ class JobRunner:
             if record is None or record.readonly:
                 return False
             wanted = self._op_wanted(job_id, op_id)
+            if event == "deleting":  # render.delete_job: only the render job this job recorded
+                ours = record.cursor.get("render_job_id")
+                return wanted and ours is not None and data.get("render_job_id") == ours
             now = self.clock()
             journal = record.cursor.setdefault("journal", {})
             if event == "snapshot_saving":
@@ -731,12 +862,22 @@ class JobRunner:
 
     # -- the step machine ------------------------------------------------------------------
 
-    def _stop_of(self, job: JobRecord) -> Stopped | None:
+    def _stop_of(self, job: JobRecord) -> Stopped | OSError | None:
+        """Why the job may not run now: an emergency stop, or a hub it cannot reach (a stop it
+        cannot read may be in force, so that pauses it too: fail closed). ``None``: it may."""
         try:
             self.hublink.assert_running(project=job.target, node_id=self.node_id)
         except Stopped as stop:
             return stop
+        except OSError as exc:
+            return exc
         return None
+
+    def _enter_wait_blocked(self, job: JobRecord, why: Stopped | OSError, now: float) -> None:
+        if isinstance(why, Stopped):
+            self._enter_wait_stop(job, why, now)
+        else:
+            self._enter_wait_unreachable(job, why, now)
 
     def _pre_check_stop(self, job: JobRecord, now: float) -> None:
         """Pause a stopped job (cancelling its queued op) before the broker runs anything (H3)."""
@@ -746,7 +887,7 @@ class JobRunner:
             return
         stop = self._stop_of(job)
         if stop is not None:
-            self._enter_wait_stop(job, stop, now)
+            self._enter_wait_blocked(job, stop, now)
 
     def _advance(self, job: JobRecord, now: float) -> None:
         if job.state in TERMINAL_STATES or job.state is JobState.STALLED or job.readonly:
@@ -755,13 +896,22 @@ class JobRunner:
         if pid in self._stalled_projects:
             return  # a stalled project stops scheduling for every job in it
         rt = self._runtime[job.job_id]
+        if rt.branch_records:
+            self._retry_branch_records(job, rt, now)
+        if rt.verify_pending:
+            try:
+                self._verify_approval(job, now)
+            except OSError as exc:
+                self._enter_wait_unreachable(job, exc, now)
+                return
+            rt.verify_pending = False
 
         if rt.pending_op_id is not None:
             result = self.broker.result(rt.pending_op_id)
             if result is None:
                 stop = self._stop_of(job)
                 if stop is not None:
-                    self._enter_wait_stop(job, stop, now)  # a queued op is cancelled
+                    self._enter_wait_blocked(job, stop, now)  # a queued op is cancelled
                 elif job.state is JobState.WAITING:
                     # The stop lifted while an op it could not cancel is still out: run again,
                     # so the watchdog covers that op.
@@ -772,14 +922,17 @@ class JobRunner:
                 return  # still outstanding; the watchdog may stall it
             # The op came back: its result is ALWAYS collected, even if a stop landed while it
             # ran (P3c) -- dropping it would make the step run the op a second time.
+            op_name, rt.pending_op_name = rt.pending_op_name, None
             rt.pending_op_id = None
             rt.op_submitted_at = None
             rt.broker_error = None
             rt.op_outcome = None if _not_run(result) else OpOutcome.from_result(result)
+            if op_name == _BRANCH_OP and result.status is OpStatus.OK:
+                self._record_branch(job, rt, result.value, now)
 
         stop = self._stop_of(job)
         if stop is not None:
-            self._enter_wait_stop(job, stop, now)  # a collected outcome waits in rt.op_outcome
+            self._enter_wait_blocked(job, stop, now)  # a collected outcome waits in rt.op_outcome
             return
 
         if job.state is JobState.WAITING:
@@ -828,23 +981,40 @@ class JobRunner:
         except KeyError as exc:
             self._fail(job, StructuredError("unknown_op", str(exc), "use a registered op"), now)
             return
-        # The first mutating op against a production project consumes a human token here, at the
-        # moment of the write. A missing or refused token leaves the job waiting.
-        if (
-            spec.mutates
-            and self.policy.is_production(job.target.project_id)
-            and not job.approval_consumed
-            and not self._ensure_approval(job, now)
-        ):
-            return
+        holder = Holder.agent(job.agent_id or "")
+        override: str | None = None
         try:
-            hot = make_hot_op(
-                action.op,
-                action.params,
-                target=job.target,
-                holder=self.holder,
-                priority=job.priority,
-            )
+            try:
+                # The S11 branch guard is on, in every project (P1): the op must edit a branch
+                # this job's agent owns, or be exempt (timeline.branch/duplicate, render ops).
+                hot = make_hot_op(
+                    action.op,
+                    action.params,
+                    target=job.target,
+                    holder=holder,
+                    priority=job.priority,
+                    branch_registry=self.branch_registry,
+                )
+            except OpError as exc:
+                if exc.code not in BRANCH_GUARD_CODES:
+                    raise
+                # P4: an op the guard refuses runs only after a consumed project.write approval
+                # that names this op, then past the guard for this op alone.
+                override = _override_key(job, action)
+                if override not in job.approvals and not self._consume_approval(
+                    job, override, now, guard=exc
+                ):
+                    return
+                hot = self._override_op(job, action, holder)
+            # F15: the first mutating op against a production project needs a consumed human
+            # token, at the moment of the write. An override approval (above) is one.
+            if (
+                spec.mutates
+                and self.policy.is_production(job.target.project_id)
+                and not job.approvals
+                and not self._consume_approval(job, _PROJECT_APPROVAL, now)
+            ):
+                return
             op_id = self.broker.submit(self._wrap(job.job_id, hot))
         except HotOpFailure as exc:
             self._fail(job, StructuredError.from_broker(exc), now)
@@ -855,6 +1025,7 @@ class JobRunner:
             )
             return
         rt.pending_op_id = op_id
+        rt.pending_op_name = action.op
         rt.op_submitted_at = now
         events = self._begin_running(job, rt, now)
         # Polls are high-frequency; do not emit an event for each (bounds the log, L3).
@@ -862,8 +1033,38 @@ class JobRunner:
             events.append(
                 ("op_submitted", {"op": action.op, "key": action.key, "op_id": op_id}, now)
             )
+        if override is not None:
+            events.append(
+                (
+                    "guard_override",
+                    {
+                        "op": action.op,
+                        "key": override,
+                        "token_id": job.approvals[override],
+                        "op_id": op_id,
+                    },
+                    now,
+                )
+            )
         job.updated_at = now
         self._checkpoint(job, events, now)
+
+    def _override_op(self, job: JobRecord, action: Submit, holder: Holder) -> HotOp:
+        """The op past the branch guard. This is the ONLY production call with
+        ``require_branch=False`` (P4; pinned by a test that greps the source): it is reached
+        only once ``_consume_approval`` has consumed a ``project.write`` approval naming this
+        op for this job, and it builds exactly that one op."""
+        if _override_key(job, action) not in job.approvals:  # pragma: no cover - defence
+            raise RuntimeError("an override needs a consumed approval for this op")
+        return make_hot_op(
+            action.op,
+            action.params,
+            target=job.target,
+            holder=holder,
+            priority=job.priority,
+            require_branch=False,
+            branch_registry=self.branch_registry,
+        )
 
     # -- approval --------------------------------------------------------------------------
 
@@ -875,30 +1076,60 @@ class JobRunner:
         refused = job.waiting.detail.get("refused_token") if job.waiting is not None else None
         return token != refused
 
-    def _ensure_approval(self, job: JobRecord, now: float) -> bool:
-        target = job.target.project_id
+    def _consume_approval(
+        self, job: JobRecord, key: str, now: float, *, guard: OpError | None = None
+    ) -> bool:
+        """Consume the offered token as approval ``key`` (``"project"`` or an op override).
+
+        Returns whether the approval is now held. Otherwise the job waits: for a token, for a
+        different one (refused), or for the hub (unreachable: nothing is marked refused, and a
+        consume that may have committed is recovered from the pending intent)."""
+        target = self._approval_target(job, key)
         token = job.approval_token
+        if job.approval_pending is not None and job.approval_pending_key == key:
+            # A consume of this token was started and its answer lost (hub unreachable).
+            try:
+                if self._consume_verified(job, job.approval_pending, key):
+                    self._hold_approval(job, key, job.approval_pending, None, now)
+                    return True
+            except OSError as exc:
+                self._enter_wait_unreachable(job, exc, now)
+                return False
         if token is None or (
             job.waiting is not None and token == job.waiting.detail.get("refused_token")
         ):
-            self._enter_wait_approval(job, target, now, None)
+            self._enter_wait_approval(job, key, target, now, None, guard)
             return False
         # L2: record the intent before consuming, so a crash in between is recovered on load.
-        job.approval_pending = token
+        job.approval_pending, job.approval_pending_key = token, key
         job.updated_at = now
         self._checkpoint(
-            job, [("approval_consuming", {"token_id": token, "target": target}, now)], now
+            job,
+            [("approval_consuming", {"token_id": token, "target": target, "key": key}, now)],
+            now,
         )
         try:
             approval = self.hublink.consume_approval(
-                token, _APPROVAL_SCOPE, target or "", self._job_actor(job.job_id)
+                token, _APPROVAL_SCOPE, target, self._job_actor(job)
             )
         except ApprovalError as exc:
-            job.approval_pending = None
-            self._enter_wait_approval(job, target, now, exc)
+            job.approval_pending = job.approval_pending_key = None
+            self._enter_wait_approval(job, key, target, now, exc, guard)
             return False
+        except OSError as exc:  # unknown outcome: keep the intent, ask again when reachable
+            self._enter_wait_unreachable(job, exc, now)
+            return False
+        self._hold_approval(job, key, token, approval.consumed_at, now)
+        return True
+
+    def _hold_approval(
+        self, job: JobRecord, key: str, token: str, consumed_at: str | None, now: float
+    ) -> None:
+        job.approvals[key] = token
         job.approval_consumed = True
-        job.approval_pending = None
+        job.approval_pending = job.approval_pending_key = None
+        if job.approval_token == token:
+            job.approval_token = None  # the offered slot is spent; a later approval needs a new one
         job.updated_at = now
         self._checkpoint(
             job,
@@ -907,32 +1138,49 @@ class JobRunner:
                     "approval_consumed",
                     {
                         "token_id": token,
+                        "key": key,
                         "scope": _APPROVAL_SCOPE.value,
-                        "target": target,
-                        "consumed_at": approval.consumed_at,
+                        "target": self._approval_target(job, key),
+                        "consumed_at": consumed_at,
+                        "by": {"kind": "agent", "id": self._job_actor(job).id},
                     },
                     now,
                 )
             ],
             now,
         )
-        return True
 
     def _enter_wait_approval(
-        self, job: JobRecord, target: str | None, now: float, refusal: ApprovalError | None
+        self,
+        job: JobRecord,
+        key: str,
+        target: str,
+        now: float,
+        refusal: ApprovalError | None,
+        guard: OpError | None = None,
     ) -> None:
         token = job.approval_token
-        detail: dict[str, Any] = {"scope": _APPROVAL_SCOPE.value, "target": target}
+        detail: dict[str, Any] = {"scope": _APPROVAL_SCOPE.value, "target": target, "key": key}
+        if guard is not None:
+            op = key.rsplit("/", 1)[-1]
+            detail["op"] = op
+            detail["guard"] = {"code": guard.code, "message": guard.message}
+            need = (
+                f"op {op} is refused by the branch guard ({guard.code}: {guard.message}); it "
+                f"may run only with a human approval that names it"
+            )
+        else:
+            need = f"writing to production project {target} needs a human approval token"
         if refusal is not None:
             detail["refused_code"] = refusal.code
             detail["refused_message"] = str(refusal)
             detail["refused_token"] = token  # do not retry this token (M4)
             message = (
-                f"the approval token was refused ({refusal.code}); writing to production project "
-                f"{target} needs a valid, unconsumed human approval"
+                f"the approval token was refused ({refusal.code}); {need}: a valid, unconsumed "
+                f"'{_APPROVAL_SCOPE.value}' token on target {target!r}"
             )
         else:
-            message = f"writing to production project {target} needs a human approval token"
+            message = need
         reason = WaitReason(
             "needs_approval",
             "needs_approval",
@@ -944,6 +1192,86 @@ class JobRunner:
             detail=detail,
         )
         self._enter_wait(job, reason, now)
+
+    def _enter_wait_unreachable(self, job: JobRecord, exc: OSError, now: float) -> None:
+        reason = WaitReason(
+            "hub_unreachable",
+            "hub_unreachable",
+            f"the hub cannot be reached ({type(exc).__name__}); the job waits, fail-closed",
+            fix_hint="nothing to do by hand: the job carries on once the hub answers again",
+            detail={"exception": type(exc).__name__},
+        )
+        self._enter_wait(job, reason, now)
+
+    # -- hub records -----------------------------------------------------------------------
+
+    def _record_branch(self, job: JobRecord, rt: _Runtime, value: object, now: float) -> None:
+        """Record a ``timeline.branch`` result on the hub (P5): under the hub's ``prj_`` id
+        (looked up from the Resolve project), written as this node (the feed's node id). A
+        reused branch is recorded again: the hub keeps the first node's record and accepts
+        the same version from it (idempotent), so a record a crash lost is caught up."""
+        if not isinstance(value, BranchResult):
+            return
+        record = {
+            "source_timeline_id": value.source.unique_id,
+            "source_timeline_name": value.source.name,
+            "agent_id": value.agent_id,
+            "branch_timeline_id": value.timeline.unique_id,
+            "branch_timeline_name": value.timeline.name,
+            "version": value.version,
+            "handoff": f"job {job.job_id}",
+        }
+        if self._send_branch_record(job, record, now) == "unreachable":
+            rt.branch_records = [*(rt.branch_records or []), record]
+            self._checkpoint(job, [("branch_record_pending", record, now)], now)
+
+    def _send_branch_record(self, job: JobRecord, record: dict[str, Any], now: float) -> str:
+        """Send one record: ``"recorded"``, ``"refused"`` (alerted) or ``"unreachable"``."""
+        try:
+            hub_id = self.hublink.record_branch(job.target, self.actor, **record)
+        except OSError:  # unreachable: the caller keeps it and tries again on a later pump
+            return "unreachable"
+        except ValueError as exc:  # refused: no single hub project, or the hub said no
+            self._checkpoint(
+                job,
+                [
+                    ("branch_not_recorded", {**record, "error": str(exc)}, now),
+                    _alert(
+                        "branch_not_recorded",
+                        f"agent branch {record['branch_timeline_name']!r} could not be recorded "
+                        f"on the hub: {exc}",
+                        "register the project in the hub registry with a source naming this "
+                        "Resolve project, then record the branch",
+                        {"branch_timeline_id": record["branch_timeline_id"]},
+                        now,
+                    ),
+                ],
+                now,
+            )
+            return "refused"
+        self._checkpoint(job, [("branch_recorded", {**record, "hub_project_id": hub_id}, now)], now)
+        return "recorded"
+
+    def _retry_branch_records(self, job: JobRecord, rt: _Runtime, now: float) -> None:
+        """Send the records an unreachable hub held back, in order; stop at the first that
+        is still unreachable (no event per retry: the pending event was recorded once)."""
+        pending = list(rt.branch_records or [])
+        while pending and self._send_branch_record(job, pending[0], now) != "unreachable":
+            pending.pop(0)
+        rt.branch_records = pending or None
+
+    def _requeue_branch_records(self, record: JobRecord, rt: _Runtime) -> None:
+        """On load: branch records a previous process could not send are sent again."""
+        open_: dict[tuple[str, int], dict[str, Any]] = {}
+        for event in self.store.events(record.job_id):
+            data = event.data
+            key = (str(data.get("branch_timeline_id")), int(data.get("version") or 0))
+            if event.kind == "branch_record_pending":
+                open_[key] = {k: v for k, v in data.items() if k != "error"}
+            elif event.kind in ("branch_recorded", "branch_not_recorded"):
+                open_.pop(key, None)
+        if open_:
+            rt.branch_records = list(open_.values())
 
     # -- stop ------------------------------------------------------------------------------
 
@@ -1234,6 +1562,8 @@ class JobRunner:
             stall=record.stall.to_dict() if record.stall is not None else None,
             approval_token=record.approval_token,
             approval_consumed=record.approval_consumed,
+            approvals=dict(record.approvals),
+            agent_id=record.agent_id,
             created_at=record.created_at,
             updated_at=record.updated_at,
             events=events,
@@ -1243,6 +1573,18 @@ class JobRunner:
 
 class _Empty(BaseModel):
     """A placeholder params model for a quarantined job (it never runs)."""
+
+
+def op_approval_target(project_id: str, op: str) -> str:
+    """The ``project.write`` approval target that lets op ``op`` past the branch guard in
+    project ``project_id`` (P4): a human grants exactly this to approve exactly this op."""
+    return f"{project_id}#op:{op}"
+
+
+def _override_key(job: JobRecord, action: Submit) -> str:
+    """The approval key of one guarded op occurrence: its step, its key in the step, its op.
+    Stable across a restart, so a resubmitted op reuses the approval it already consumed."""
+    return f"op:{job.current_step}/{action.key}/{action.op}"
 
 
 def _not_run(result: OpResult) -> bool:

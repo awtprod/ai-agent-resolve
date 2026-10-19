@@ -16,25 +16,63 @@ job's project name, or one with a source whose locator names it (by ``name``, or
 the uid). A rename keeps the source locator, so it still matches; two projects with the same
 name both match, so stopping either pauses the job (an over-stop, never a missed stop).
 
+It also records each agent branch a job's ``timeline.branch`` made (S11's
+:func:`~aar.hub.collab.record_branch`), under the hub's ``prj_`` id for the job's project.
+
 The link is deliberately only these operations. Lease and presence feeds to the hub are NOT
-here; S11 owns those in a separate module.
+here; S11 owns those in :mod:`aar.node.feed`.
+
+**Error contract** (the same as :class:`aar.node.feed.FeedTransport`'s, so a remote link and a
+remote feed transport behave alike): every operation raises an ``OSError`` (``ConnectionError``,
+``TimeoutError`` ...) when the hub cannot be reached, and a ``ValueError`` when the hub refuses
+the request (for ``consume_approval``, an :class:`~aar.hub.approvals.ApprovalError` subclass;
+for ``assert_running``, :class:`~aar.hub.control.Stopped`). The job runner treats "unreachable"
+as fail-closed and temporary: the job pauses (``hub_unreachable``), nothing runs, no token is
+marked refused, and it carries on once the hub answers again. ``LocalHubLink`` maps a SQLite
+``OperationalError`` (a locked or unopenable hub database) to :class:`HubUnreachable`.
 
 Follow-up F16 (remote transport): a node on another host needs a ``HubLink`` that speaks to
-the hub over the network, with the same operations, mapping errors back to
-:class:`~aar.hub.control.Stopped` and the :class:`~aar.hub.approvals.ApprovalError` subclasses.
+the hub over the network, with the same operations and the error contract above.
 Follow-up F17: cache the registry id ↔ Resolve uid map instead of rebuilding it per check.
 """
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+import functools
+import sqlite3
+from collections.abc import Callable
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from aar.hub.approvals import Approval, ApprovalScope, consume, get_approval
+from aar.hub.collab import branches, record_branch
 from aar.hub.common import Clock, utcnow
 from aar.hub.control import ControlStatus, assert_running, status
 from aar.hub.events import Actor, EventLog
 from aar.hub.registry import Registry
 from aar.node.locator import ProjectLocator
+
+_T = TypeVar("_T")
+
+
+class HubUnreachable(ConnectionError):
+    """The hub could not be reached (an ``OSError``, per the link's error contract)."""
+
+
+class UnknownHubProject(ValueError):
+    """No single hub registry project is this Resolve project (a refusal, not a hub outage)."""
+
+
+def _reachable(fn: Callable[..., _T]) -> Callable[..., _T]:
+    """Map a SQLite outage (locked, unopenable) to :class:`HubUnreachable` (an ``OSError``)."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> _T:
+        try:
+            return fn(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            raise HubUnreachable(f"the hub database is unavailable: {exc}") from exc
+
+    return wrapper
 
 
 @runtime_checkable
@@ -63,6 +101,27 @@ class HubLink(Protocol):
         """The token's record (scope, target, who consumed it), or ``None`` if never granted."""
         ...
 
+    def record_branch(
+        self,
+        project: ProjectLocator,
+        actor: Actor,
+        *,
+        source_timeline_id: str,
+        source_timeline_name: str,
+        agent_id: str,
+        branch_timeline_id: str,
+        branch_timeline_name: str,
+        version: int,
+        handoff: str = "",
+    ) -> str:
+        """Record an agent branch under the hub's ``prj_`` id for ``project``; return that id.
+        Idempotent: a record the hub already holds exactly so (same branch, agent, version,
+        node) is not appended again.
+
+        Raises :class:`UnknownHubProject` (a ``ValueError``) when no single registry project
+        is ``project``, and the hub's ``InvalidInput`` when it refuses the record."""
+        ...
+
 
 class LocalHubLink:
     """In-process :class:`HubLink` over a shared hub :class:`~aar.hub.events.EventLog`."""
@@ -82,6 +141,7 @@ class LocalHubLink:
         }
         return sorted(ids)
 
+    @_reachable
     def assert_running(
         self, *, project: ProjectLocator | None = None, node_id: str | None = None
     ) -> None:
@@ -94,16 +154,84 @@ class LocalHubLink:
             if registry_id != project.project_id:
                 assert_running(self._log, project_id=registry_id, node_id=node_id)
 
+    @_reachable
     def control_status(self) -> ControlStatus:
         return status(self._log)
 
+    @_reachable
     def consume_approval(
         self, token_id: str, scope: ApprovalScope | str, target: str, actor: Actor
     ) -> Approval:
         return consume(self._log, token_id, scope, target, actor, clock=self._approval_clock)
 
+    @_reachable
     def approval(self, token_id: str) -> Approval | None:
         return get_approval(self._log, token_id)
+
+    def hub_project_id(self, project: ProjectLocator) -> str:
+        """The ONE registry project that is ``project``, for writing a record under it.
+
+        Unlike the (deliberately wide) stop check, a record must land on exactly one project:
+        a project whose source carries the Resolve uid wins; else the single project whose
+        display name or alias is the project's name. None or several: refused.
+        """
+        projects = Registry(self._log).list()
+        by_uid = [
+            p.id
+            for p in projects
+            if project.project_id is not None
+            and any(
+                isinstance(src.locator, dict) and project.project_id in src.locator.values()
+                for src in p.sources
+            )
+        ]
+        candidates = by_uid or [
+            p.id for p in projects if p.name == project.name or project.name in p.aliases
+        ]
+        if len(candidates) != 1:
+            raise UnknownHubProject(
+                f"{len(candidates)} hub registry projects match Resolve project "
+                f"{project.name!r} [{project.project_id}]; a branch record needs exactly one "
+                f"({sorted(candidates)})"
+            )
+        return candidates[0]
+
+    @_reachable
+    def record_branch(
+        self,
+        project: ProjectLocator,
+        actor: Actor,
+        *,
+        source_timeline_id: str,
+        source_timeline_name: str,
+        agent_id: str,
+        branch_timeline_id: str,
+        branch_timeline_name: str,
+        version: int,
+        handoff: str = "",
+    ) -> str:
+        hub_id = self.hub_project_id(project)
+        for known in branches(self._log, hub_id):
+            if (
+                known.branch_timeline_id == branch_timeline_id
+                and known.agent_id == agent_id
+                and known.version == version
+                and known.recorded_by == actor
+            ):
+                return hub_id  # already recorded exactly so: a resend adds nothing
+        record_branch(
+            self._log,
+            hub_id,
+            actor,
+            source_timeline_id=source_timeline_id,
+            source_timeline_name=source_timeline_name,
+            agent_id=agent_id,
+            branch_timeline_id=branch_timeline_id,
+            branch_timeline_name=branch_timeline_name,
+            version=version,
+            handoff=handoff,
+        )
+        return hub_id
 
 
 def _source_names(locator: object, project: ProjectLocator) -> bool:

@@ -27,14 +27,19 @@ from aar.node.jobs.model import Done, Step, StepAction, StepContext, Submit
 from aar.node.jobs.render import snapshot_preset_name  # noqa: F401
 
 from .fake_resolve import DeliverState
-from .jobs_support import JobWorld
+from .jobs_support import AGENT_ID, MAIN_REF, JobWorld
 
 HUMAN = Actor("human", "andrew")
 WAIT = 30.0
 
 
 def _markers(*frames: int) -> dict:
-    return {"steps": [{"op": "markers.add", "params": {"markers": [{"frame": f}]}} for f in frames]}
+    return {
+        "steps": [
+            {"op": "markers.add", "params": {"timeline": MAIN_REF, "markers": [{"frame": f}]}}
+            for f in frames
+        ]
+    }
 
 
 def _render_params(world: JobWorld, **over: object) -> dict:
@@ -83,7 +88,9 @@ register_kind(JobKind("test.cursor_steps", _CursorParams, _build_cursor))
 def test_each_step_starts_with_an_empty_cursor(tmp_path: Path) -> None:
     """Kills R27 (cursor not reset per step)."""
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("test.cursor_steps", {"steps": 2}, world.locator())
+    job_id = world.runner.submit(
+        "test.cursor_steps", {"steps": 2}, world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
     assert view.state == "succeeded"
@@ -93,7 +100,9 @@ def test_each_step_starts_with_an_empty_cursor(tmp_path: Path) -> None:
 def test_measured_is_the_last_steps_result(tmp_path: Path) -> None:
     """Kills R28 (measured = first result)."""
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("test.cursor_steps", {"steps": 3}, world.locator())
+    job_id = world.runner.submit(
+        "test.cursor_steps", {"steps": 3}, world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
     assert view.measured["step"] == 2 == view.results[-1]["step"]
@@ -107,7 +116,7 @@ def test_measured_is_the_last_steps_result(tmp_path: Path) -> None:
 def test_approve_reactivates_a_waiting_job_at_once(tmp_path: Path) -> None:
     """Kills R08: the view approve() returns shows the job queued, no longer waiting."""
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     assert world.runner.get(job_id).state == "waiting"
     token = grant(world.log, ApprovalScope.PROJECT_WRITE, world.pid(), 3600, "ok", HUMAN)
@@ -120,7 +129,10 @@ def test_read_only_op_on_production_needs_no_token(tmp_path: Path) -> None:
     """Kills R05 (the approval gate also gates reads)."""
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
     job_id = world.runner.submit(
-        "ops.sequence", {"steps": [{"op": "timeline.list", "params": {}}]}, world.locator()
+        "ops.sequence",
+        {"steps": [{"op": "timeline.list", "params": {}}]},
+        world.locator(),
+        agent_id=AGENT_ID,
     )
     world.runner.run_until_settled()
     assert world.runner.get(job_id).state == "succeeded"
@@ -134,12 +146,13 @@ def test_a_queued_job_counts_as_active(tmp_path: Path) -> None:
     """Kills R30: a render queued behind another render's slot is still active."""
     world = JobWorld(tmp_path)
     world.project.render_complete_after = 50
-    world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.submit("render", _render_params(world), world.locator(), agent_id=AGENT_ID)
     world.clock.advance(1.0)  # the first job is older: it takes the render slot
     second = world.runner.submit(
         "render",
         _render_params(world, timeline=world.ref("Main [agent]"), custom_name="b"),
         world.locator(),
+        agent_id=AGENT_ID,
     )
     outcome = world.runner.pump()
     assert world.runner.get(second).state == "queued"
@@ -166,7 +179,7 @@ def test_resumed_job_whose_op_still_hangs_is_watched_again(tmp_path: Path) -> No
     """Kills F35: resume keeps a still-running op tracked, RUNNING, with a fresh op window,
     so the watchdog stalls it again if it keeps hanging."""
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1.0)), drain_budget=0.5)
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.pump()
     entered, release = _hung_marker(world)
     try:
@@ -196,7 +209,7 @@ def test_stop_lifted_while_an_op_still_hangs_puts_it_back_under_the_watchdog(
 ) -> None:
     """Kills F36: the job leaves 'waiting' once the stop lifts, so a hang is still caught."""
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1.0)), drain_budget=0.5)
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.pump()
     entered, release = _hung_marker(world)
     try:
@@ -223,7 +236,7 @@ def test_a_long_stop_records_one_waiting_event_and_resume_is_labelled(tmp_path: 
     """Kills R13 (enter_wait churns: one 'waiting' event per pump) and R31 (the 'resumed'
     label is lost)."""
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.pump()
     control.stop(world.log, control.StopScope.all(), "lunch", HUMAN)
     for _ in range(20):
@@ -293,7 +306,7 @@ def test_stop_cancels_the_queued_op_before_the_broker_runs(tmp_path: Path) -> No
     """Kills P-R12: the runner itself cancels a stopped job's queued op (H3); the broker's
     precheck is only the second line of defence."""
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.pump()
     op_id = next(
         e["data"]["op_id"] for e in world.runner.get(job_id).events if e["kind"] == "op_submitted"
@@ -310,7 +323,9 @@ def test_a_long_render_poll_loop_is_not_an_op_timeout(tmp_path: Path) -> None:
     for longer than op_timeout (between short polls) is not stalled as a hung op."""
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=60.0)))
     world.project.render_complete_after = 10_000
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     for _ in range(40):
         world.clock.advance(100.0)  # pumps further apart than op_timeout; each poll is quick
         world.runner.pump()
@@ -353,6 +368,7 @@ def test_an_op_the_library_refuses_at_submit_fails_the_job_structurally(tmp_path
             ]
         },
         world.locator(),
+        agent_id=AGENT_ID,
     )
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
@@ -369,11 +385,17 @@ def test_render_params_are_validated_at_submit(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     with pytest.raises(ValueError, match="unique_id"):
         world.runner.submit(
-            "render", _render_params(world, timeline={"name": "Main"}), world.locator()
+            "render",
+            _render_params(world, timeline={"name": "Main"}),
+            world.locator(),
+            agent_id=AGENT_ID,
         )
     with pytest.raises(ValueError, match="mark_out"):
         world.runner.submit(
-            "render", _render_params(world, mark_in=10, mark_out=10), world.locator()
+            "render",
+            _render_params(world, mark_in=10, mark_out=10),
+            world.locator(),
+            agent_id=AGENT_ID,
         )
     assert world.runner.list() == [] and world.store.load_all() == []
 
@@ -387,11 +409,12 @@ def _marker_op(world: JobWorld, frame: int, precheck):
     from aar.node.leases import Holder
     from aar.node.ops import make_hot_op
 
-    hot = make_hot_op(
+    hot = make_hot_op(  # as the agent the world's registry says owns "Main": the guard passes
         "markers.add",
         {"timeline": world.ref("Main"), "markers": [{"frame": frame}]},
         target=world.locator(),
-        holder=Holder.agent("pin"),
+        holder=Holder.agent(AGENT_ID),
+        branch_registry=world.branch_registry,
     )
     return replace(hot, precheck=precheck)
 
@@ -456,7 +479,9 @@ def test_cleanup_failure_is_noted_in_measured(tmp_path: Path) -> None:
     render job that is still listed after DeleteRenderJob is reported, not claimed removed."""
     world = JobWorld(tmp_path)
     world.project.DeleteRenderJob = lambda job_id: True  # type: ignore[method-assign]
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
     assert view.state == "succeeded"
@@ -468,7 +493,9 @@ def test_start_that_does_not_start_fails_and_removes_our_job(tmp_path: Path) -> 
     """Kills O10 (start not verified): StartRendering says True but nothing renders."""
     world = JobWorld(tmp_path)
     world.project.StartRendering = lambda ids, interactive=False: True  # type: ignore[method-assign]
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
     assert view.state == "failed" and view.error["code"] == "render_not_started"
@@ -480,7 +507,9 @@ def test_failed_render_reports_resolves_error_text(tmp_path: Path) -> None:
     """Kills O20 (poll drops the error text)."""
     world = JobWorld(tmp_path)
     world.project.render_outcome = "fail"
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
     assert view.error["code"] == "render_failed"
@@ -492,7 +521,9 @@ def test_render_removed_by_a_human_mid_poll_fails_without_an_orphan_alert(tmp_pa
     """Kills O21 (an unknown job id is not refused by render.poll)."""
     world = JobWorld(tmp_path)
     world.project.render_complete_after = 50
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     for _ in range(6):
         world.runner.pump()
     assert world.store.get(job_id).cursor.get("phase") == "poll"
@@ -511,7 +542,9 @@ def test_render_poll_reports_is_rendering(tmp_path: Path) -> None:
 
     world = JobWorld(tmp_path)
     world.project.render_complete_after = 50
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     for _ in range(6):
         world.runner.pump()
     rid = world.store.get(job_id).cursor["render_job_id"]
@@ -537,7 +570,10 @@ def test_unknown_op_is_refused_at_submit(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     with pytest.raises(ValueError, match=r"no\.such\.op"):
         world.runner.submit(
-            "ops.sequence", {"steps": [{"op": "no.such.op", "params": {}}]}, world.locator()
+            "ops.sequence",
+            {"steps": [{"op": "no.such.op", "params": {}}]},
+            world.locator(),
+            agent_id=AGENT_ID,
         )
     assert world.runner.list() == [] and world.store.load_all() == []
 
@@ -556,6 +592,7 @@ def test_structured_error_lifts_fix_hint_out_of_the_detail(tmp_path: Path) -> No
             ]
         },
         world.locator(),
+        agent_id=AGENT_ID,
     )
     world.runner.run_until_settled()
     error = world.runner.get(job_id).error
@@ -606,6 +643,7 @@ def test_render_mode_and_format_are_put_back_after_a_good_build(tmp_path: Path) 
         "render",
         _render_params(world, render_format="mov", render_codec="ProRes", render_mode=1),
         world.locator(),
+        agent_id=AGENT_ID,
     )
     world.runner.run_until_settled()
     assert world.runner.get(job_id).state == "succeeded"
@@ -623,7 +661,7 @@ def test_stopped_job_with_a_hung_op_is_not_stalled_by_the_stop_time(tmp_path: Pa
     """Kills R20' (watchdog also checks waiting jobs): a stop pauses the clocks, even when an
     op it could not cancel is still out."""
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1.0)), drain_budget=0.5)
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.pump()
     entered, release = _hung_marker(world)
     try:
@@ -658,7 +696,9 @@ def test_render_that_completes_instantly_after_start_succeeds(tmp_path: Path) ->
         return ok
 
     proj.StartRendering = instant  # type: ignore[method-assign]
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     assert world.runner.get(job_id).state == "succeeded"
 
@@ -667,7 +707,9 @@ def test_adopted_job_a_human_deleted_meanwhile_fails_visibly(tmp_path: Path) -> 
     """Kills O07 (the queue listing is not verified): the journaled JobId is gone after the
     restart, so the resumed build fails with render_job_missing instead of guessing."""
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()
     world.broker.run_until_idle()  # the build ran; the node dies before the checkpoint
     world.project.render_jobs.clear()  # a human removed it while the node was down
@@ -691,7 +733,9 @@ def test_added_job_missing_from_the_queue_is_not_trusted(tmp_path: Path) -> None
         return rid
 
     proj.AddRenderJob = add_but_unlisted  # type: ignore[method-assign]
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
     assert view.state == "failed" and view.error["code"] == "add_render_job_unverified"
@@ -705,8 +749,16 @@ def test_a_single_hung_op_hits_the_step_deadline(tmp_path: Path) -> None:
     """Kills N11 (running does not anchor the step deadline): the countdown starts when the
     job starts running, so one hung op with a huge op timeout still stalls on the step."""
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1e6)), drain_budget=0.5)
-    steps = [{"op": "markers.add", "params": {"markers": [{"frame": 1}]}, "timeout": 30.0}]
-    job_id = world.runner.submit("ops.sequence", {"steps": steps}, world.locator())
+    steps = [
+        {
+            "op": "markers.add",
+            "params": {"timeline": MAIN_REF, "markers": [{"frame": 1}]},
+            "timeout": 30.0,
+        }
+    ]
+    job_id = world.runner.submit(
+        "ops.sequence", {"steps": steps}, world.locator(), agent_id=AGENT_ID
+    )
     entered, release = _hung_marker(world)
     try:
         world.runner.pump()  # submits the op: running, countdown starts
@@ -725,10 +777,16 @@ def test_next_step_gets_its_own_deadline(tmp_path: Path) -> None:
     """Kills P-R21 (the next step keeps the previous step's anchor)."""
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1e6)))
     steps = [
-        {"op": "markers.add", "params": {"markers": [{"frame": f}]}, "timeout": 100.0}
+        {
+            "op": "markers.add",
+            "params": {"timeline": MAIN_REF, "markers": [{"frame": f}]},
+            "timeout": 100.0,
+        }
         for f in (1, 2)
     ]
-    job_id = world.runner.submit("ops.sequence", {"steps": steps}, world.locator())
+    job_id = world.runner.submit(
+        "ops.sequence", {"steps": steps}, world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()  # step 0's op submitted
     world.clock.advance(80.0)  # step 0 takes 80 s of its 100
     world.runner.pump()  # step 0 completes; step 1 starts its own 100 s
@@ -743,13 +801,16 @@ def test_next_step_gets_its_own_deadline(tmp_path: Path) -> None:
 def test_higher_priority_render_takes_the_render_slot_first(tmp_path: Path) -> None:
     """Kills R29/R29' (job priority order inverted)."""
     world = JobWorld(tmp_path)
-    low = world.runner.submit("render", _render_params(world, custom_name="low"), world.locator())
+    low = world.runner.submit(
+        "render", _render_params(world, custom_name="low"), world.locator(), agent_id=AGENT_ID
+    )
     world.clock.advance(1.0)
     high = world.runner.submit(
         "render",
         _render_params(world, timeline=world.ref("Main [agent]"), custom_name="high"),
         world.locator(),
         priority=5,
+        agent_id=AGENT_ID,
     )
     world.runner.pump()
     assert world.runner.get(high).state == "running"
@@ -761,7 +822,7 @@ def test_render_slot_survives_a_restart(tmp_path: Path) -> None:
     render of the same project -- even one with a higher priority -- waits for the slot."""
     world = JobWorld(tmp_path)
     world.project.render_complete_after = 6
-    first = world.runner.submit("render", _render_params(world), world.locator())
+    first = world.runner.submit("render", _render_params(world), world.locator(), agent_id=AGENT_ID)
     for _ in range(4):
         world.runner.pump()
     assert world.store.get(first).cursor.get("phase") == "poll"
@@ -771,6 +832,7 @@ def test_render_slot_survives_a_restart(tmp_path: Path) -> None:
         _render_params(world, timeline=world.ref("Main [agent]"), custom_name="b"),
         world.locator(),
         priority=5,
+        agent_id=AGENT_ID,
     )
     runner = world.restart()
     runner.pump()
@@ -782,7 +844,7 @@ def test_render_slot_survives_a_restart(tmp_path: Path) -> None:
 def test_render_is_started_non_interactively(tmp_path: Path) -> None:
     """Kills B17b/P-O11 (StartRendering in interactive mode, which can raise modal dialogs)."""
     world = JobWorld(tmp_path)
-    world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.submit("render", _render_params(world), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     starts = [c for c in world.fake.calls if c[0] == "StartRendering"]
     assert len(starts) == 1 and starts[0][2] is False
@@ -797,7 +859,10 @@ def test_non_finite_render_timeout_is_refused_at_submit(tmp_path: Path) -> None:
         # Refused by the params validation itself, not only by the store's JSON check.
         with pytest.raises(ValueError, match=r"finite|greater than 0"):
             world.runner.submit(
-                "render", _render_params(world, timeout_seconds=bad), world.locator()
+                "render",
+                _render_params(world, timeout_seconds=bad),
+                world.locator(),
+                agent_id=AGENT_ID,
             )
     assert world.runner.list() == []
 
@@ -815,7 +880,9 @@ def test_snapshot_preset_deleted_mid_build_is_reported_as_missing(tmp_path: Path
         return real_set(settings)
 
     proj.SetRenderSettings = human_deletes_our_preset  # type: ignore[method-assign]
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
     assert view.state == "succeeded"  # the render itself is fine and tracked
@@ -861,9 +928,15 @@ def test_next_step_gets_its_own_timeout(tmp_path: Path) -> None:
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1e6)), drain_budget=0.5)
     steps = [
         {"op": "timeline.list", "params": {}, "timeout": 1000.0},
-        {"op": "markers.add", "params": {"markers": [{"frame": 1}]}, "timeout": 10.0},
+        {
+            "op": "markers.add",
+            "params": {"timeline": MAIN_REF, "markers": [{"frame": 1}]},
+            "timeout": 10.0,
+        },
     ]
-    job_id = world.runner.submit("ops.sequence", {"steps": steps}, world.locator())
+    job_id = world.runner.submit(
+        "ops.sequence", {"steps": steps}, world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()
     world.runner.pump()  # step 0 done
     entered, release = _hung_marker(world)
@@ -894,7 +967,7 @@ def test_cleanup_never_deletes_a_job_that_is_rendering(tmp_path: Path) -> None:
         return real(job_id, op_id, event, data)
 
     runner._journal = journal_fails_on_started  # type: ignore[method-assign]
-    job_id = runner.submit("render", _render_params(world), world.locator())
+    job_id = runner.submit("render", _render_params(world), world.locator(), agent_id=AGENT_ID)
     runner.run_until_settled()
     view = runner.get(job_id)
     rid = world.project.render_jobs[0].job_id
@@ -907,7 +980,9 @@ def test_adopted_render_that_failed_meanwhile_is_reported_not_restarted(tmp_path
     """Kills F48: an adopted render that FAILED while the node was down is polled (and the job
     fails with the render's own error), never started again."""
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()
     world.broker.run_until_idle()  # the build ran; the node dies before the checkpoint
     rj = world.project.render_jobs[0]
@@ -927,7 +1002,9 @@ def test_resumed_build_never_loads_a_human_preset_named_like_its_deleted_snapsho
     preset of that name (a human's, created meanwhile) as its own."""
     world = JobWorld(tmp_path)
     original = world.project.deliver.copy()
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()
     _crash_once(world, "StartRendering")  # dies after the Deliver restore deleted the snapshot
     _crash_drain(world)
@@ -947,7 +1024,9 @@ def test_snapshot_of_a_crashed_adopt_attempt_is_recovered_and_removed(tmp_path: 
     """Kills F58: a second build attempt saves a new snapshot after the first one's was
     deleted; when that attempt dies too, the third recovers and deletes it (no leak)."""
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()
     _crash_once(world, "StartRendering")  # attempt 1 dies after its restore
     _crash_drain(world)
@@ -974,7 +1053,9 @@ def test_stop_during_build_submits_the_build_once(tmp_path: Path) -> None:
         return rid
 
     world.project.AddRenderJob = add_and_stop  # type: ignore[method-assign]
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()
     world.runner.pump()
     world.project.AddRenderJob = orig  # type: ignore[method-assign]
@@ -993,7 +1074,7 @@ def test_stop_keeps_the_used_part_of_a_running_step_deadline(tmp_path: Path) -> 
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1e6)))
     world.project.render_complete_after = 10_000
     job_id = world.runner.submit(
-        "render", _render_params(world, timeout_seconds=600.0), world.locator()
+        "render", _render_params(world, timeout_seconds=600.0), world.locator(), agent_id=AGENT_ID
     )
     for _ in range(4):
         world.runner.pump()
@@ -1025,7 +1106,9 @@ def test_stall_cancels_the_jobs_queued_op_itself(tmp_path: Path) -> None:
     steps = [
         {"op": "markers.add", "params": {"timeline": world.ref("Main"), "markers": [{"frame": 1}]}}
     ]
-    job_id = world.runner.submit("ops.sequence", {"steps": steps}, world.locator())
+    job_id = world.runner.submit(
+        "ops.sequence", {"steps": steps}, world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()  # op queued, lease-blocked
     op_id = next(
         e["data"]["op_id"] for e in world.runner.get(job_id).events if e["kind"] == "op_submitted"
@@ -1041,7 +1124,7 @@ def test_a_stalled_project_runs_no_other_jobs_queued_op(tmp_path: Path) -> None:
     must not run when the hang ends (the project is stalled until a human resumes)."""
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1.0)), drain_budget=0.5)
     other = world.project.timeline("Main [agent]")
-    a = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    a = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.pump()
     entered, release = _hung_marker(world)
     try:
@@ -1053,7 +1136,9 @@ def test_a_stalled_project_runs_no_other_jobs_queued_op(tmp_path: Path) -> None:
                 "params": {"timeline": world.ref("Main [agent]"), "markers": [{"frame": 2}]},
             }
         ]
-        b = world.runner.submit("ops.sequence", {"steps": steps}, world.locator())
+        b = world.runner.submit(
+            "ops.sequence", {"steps": steps}, world.locator(), agent_id=AGENT_ID
+        )
         world.runner.pump()  # B's op queued behind A's hung op
         world.clock.advance(5.0)
         world.runner.pump()
@@ -1072,7 +1157,9 @@ def test_empty_add_render_job_id_is_refused_as_such(tmp_path: Path) -> None:
     """Kills P-O08 (an empty AddRenderJob id accepted)."""
     world = JobWorld(tmp_path)
     world.project.render_add_fails = True
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     assert world.runner.get(job_id).error["code"] == "add_render_job_failed"
 
@@ -1122,7 +1209,7 @@ def test_unknown_schema_version_is_refused_on_the_create_path_too(tmp_path: Path
 def test_refused_consume_clears_the_pending_intent(tmp_path: Path) -> None:
     """Kills N20 (approval_pending not cleared on a refusal)."""
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     token = grant(world.log, ApprovalScope.PROJECT_LOAD, world.pid(), 3600, "wrong scope", HUMAN)
     world.runner.approve(job_id, token.token_id, HUMAN)
@@ -1139,7 +1226,9 @@ def test_cancel_while_the_last_poll_is_in_flight_alerts_only_a_live_render(
     running; its late result decides the alert -- none if the render had already finished."""
     world = JobWorld(tmp_path, drain_budget=0.5)
     world.project.render_complete_after = 10_000
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     for _ in range(5):
         world.runner.pump()
     assert world.store.get(job_id).cursor.get("phase") == "poll"

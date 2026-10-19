@@ -23,7 +23,7 @@ from aar.hub import control
 from aar.hub.approvals import ApprovalScope, grant
 from aar.hub.events import Actor
 from aar.hub.registry import ProjectSource, Registry
-from aar.node.broker import Broker, BrokerConfig, OpStatus
+from aar.node.broker import BrokerConfig, OpStatus
 from aar.node.jobs import (
     ApprovalPolicy,
     JobRunner,
@@ -38,7 +38,7 @@ from aar.node.leases import Holder, Scope, timeline_key
 from aar.node.ops import submit_op
 
 from .fake_resolve import DeliverState, FakeRenderJob
-from .jobs_support import IDLE, JobWorld
+from .jobs_support import AGENT_ID, IDLE, MAIN_REF, JobWorld
 
 HUMAN = Actor("human", "andrew")
 WAIT = 30.0  # generous upper bound for an event that MUST happen; never a timing assumption
@@ -65,7 +65,12 @@ def _render_params(world: JobWorld, **over: object) -> dict:
 
 
 def _markers(*frames: int) -> dict:
-    return {"steps": [{"op": "markers.add", "params": {"markers": [{"frame": f}]}} for f in frames]}
+    return {
+        "steps": [
+            {"op": "markers.add", "params": {"timeline": MAIN_REF, "markers": [{"frame": f}]}}
+            for f in frames
+        ]
+    }
 
 
 def _calls(world: JobWorld, name: str) -> list:
@@ -90,15 +95,8 @@ def _human_job(world: JobWorld, timeline: str, name: str, status: str = "Ready")
 
 
 def _prod_broker(world: JobWorld, **cfg: object) -> None:
-    world.runner.close()
-    world.broker = Broker(
-        world.gw,
-        leases=world.leases,
-        presence=world.presence,
-        clock=world.clock,
-        config=BrokerConfig(**cfg),
-    )
-    world.runner = world._new_runner()
+    """Restart the node with a production BrokerConfig (the 15 s restore delay)."""
+    world.restart(broker_config=BrokerConfig(**cfg))
 
 
 def _pump_until(world: JobWorld, job_id: str, pred, n: int = 40) -> None:
@@ -132,7 +130,9 @@ def _op_ids(view, op: str) -> list[str]:
 def test_p1a_human_ready_job_same_name_other_timeline_untouched(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     human = _human_job(world, "Main [agent]", "show_v1")
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     v = world.runner.get(job_id)
     assert v.state == "succeeded" and len(_calls(world, "AddRenderJob")) == 1
@@ -144,7 +144,9 @@ def test_p1a_human_ready_job_same_name_other_timeline_untouched(tmp_path: Path) 
 def test_p1b_human_complete_job_same_name_untouched(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     human = _human_job(world, "Main [agent]", "show_v1", status="Complete")
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     v = world.runner.get(job_id)
     assert v.state == "succeeded" and len(_calls(world, "StartRendering")) == 1
@@ -158,7 +160,9 @@ def test_p2_crash_between_build_and_checkpoint_does_not_duplicate(tmp_path: Path
     world = JobWorld(tmp_path)
     world.project.render_output_extension = ".mov"
     world.project.render_complete_after = 50
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()  # build op queued (cursor phase=build checkpointed)
     assert world.store.get(job_id).cursor.get("phase") == "build"
     world.broker.run_until_idle()  # the build runs in the process that is about to die
@@ -181,7 +185,9 @@ def test_p2b_crash_mid_build_after_add_adopts_and_finishes(tmp_path: Path) -> No
     journaled JobId, recovers the Deliver settings from its own snapshot, and starts it."""
     world = JobWorld(tmp_path)
     original = world.project.deliver.copy()
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()  # build queued
     real_restore_load = world.project.LoadRenderPreset
 
@@ -214,7 +220,9 @@ def test_p2c_crash_inside_add_render_job_that_added_fails_visibly(tmp_path: Path
     untouched, and the Deliver settings are recovered."""
     world = JobWorld(tmp_path)
     original = world.project.deliver.copy()
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()
     real_add = world.project.AddRenderJob
 
@@ -240,7 +248,9 @@ def test_p2c_crash_inside_add_render_job_that_added_fails_visibly(tmp_path: Path
 
 def test_p2d_crash_inside_add_render_job_before_it_added_reruns(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()
     real_add = world.project.AddRenderJob
 
@@ -260,7 +270,9 @@ def test_p2d_crash_inside_add_render_job_before_it_added_reruns(tmp_path: Path) 
 def test_p2e_adopted_job_that_completed_meanwhile_is_not_restarted(tmp_path: Path) -> None:
     """Pins O19: an adopted render that already finished is polled, never started again."""
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()
     world.broker.run_until_idle()  # the build ran; the node dies before the checkpoint
     rj = world.project.render_jobs[0]
@@ -277,7 +289,7 @@ def test_p2e_adopted_job_that_completed_meanwhile_is_not_restarted(tmp_path: Pat
 
 def test_p3a_queued_write_does_not_run_after_stop(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.pump()
     control.stop(world.log, control.StopScope.all(), "STOP", HUMAN)
     world.runner.pump()
@@ -287,7 +299,7 @@ def test_p3a_queued_write_does_not_run_after_stop(tmp_path: Path) -> None:
 
 def test_p3b_queued_build_does_not_start_render_after_stop(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
-    world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.submit("render", _render_params(world), world.locator(), agent_id=AGENT_ID)
     world.runner.pump()  # build queued
     control.stop(world.log, control.StopScope.all(), "STOP", HUMAN)
     world.runner.pump()
@@ -310,7 +322,9 @@ def test_p3c_stop_pressed_during_build_does_not_lose_render_id(tmp_path: Path) -
         return rid
 
     world.project.AddRenderJob = add_and_human_hits_stop  # type: ignore[method-assign]
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()
     world.runner.pump()
     assert world.runner.get(job_id).state == "waiting"
@@ -333,7 +347,9 @@ def test_p3c_restart_while_stopped_after_build_adopts(tmp_path: Path) -> None:
         return rid
 
     world.project.AddRenderJob = add_and_stop  # type: ignore[method-assign]
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()
     world.runner.pump()
     world.project.AddRenderJob = orig  # type: ignore[method-assign]
@@ -374,9 +390,9 @@ def test_p3d_stop_takes_effect_between_ops_inside_one_batch(tmp_path: Path) -> N
         "op": "markers.add",
         "params": {"timeline": world.ref("Main [agent]"), "markers": [{"frame": 2}]},
     }
-    j1 = world.runner.submit("ops.sequence", {"steps": [one]}, world.locator())
+    j1 = world.runner.submit("ops.sequence", {"steps": [one]}, world.locator(), agent_id=AGENT_ID)
     world.clock.advance(1.0)  # j1 is older, so its op is first in the batch
-    j2 = world.runner.submit("ops.sequence", {"steps": [two]}, world.locator())
+    j2 = world.runner.submit("ops.sequence", {"steps": [two]}, world.locator(), agent_id=AGENT_ID)
     world.runner.pump()  # both ops queued (one batch for project Show)
     world.runner.pump()  # the drain starts op 1 and blocks in it; the pump returns
     assert entered.wait(WAIT)
@@ -403,7 +419,7 @@ def test_p3d_stop_takes_effect_between_ops_inside_one_batch(tmp_path: Path) -> N
 
 def test_p4a_approval_wait_does_not_burn_deadline(tmp_path: Path) -> None:
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     world.clock.advance(400.0)
     token = grant(world.log, ApprovalScope.PROJECT_WRITE, world.pid(), 3600, "ok", HUMAN)
@@ -414,7 +430,7 @@ def test_p4a_approval_wait_does_not_burn_deadline(tmp_path: Path) -> None:
 
 def test_p4b_stop_wait_does_not_burn_deadline(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     control.stop(world.log, control.StopScope.all(), "lunch", HUMAN)
     world.runner.run_until_settled()
     world.clock.advance(400.0)
@@ -427,7 +443,7 @@ def test_p4c_stop_mid_render_does_not_burn_deadline(tmp_path: Path) -> None:
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1e6)))
     world.project.render_complete_after = 10_000
     job_id = world.runner.submit(
-        "render", _render_params(world, timeout_seconds=600.0), world.locator()
+        "render", _render_params(world, timeout_seconds=600.0), world.locator(), agent_id=AGENT_ID
     )
     _pump_until(world, job_id, lambda r: r.cursor.get("phase") == "poll")
     world.clock.advance(100.0)
@@ -445,7 +461,7 @@ def test_p5_restart_while_waiting_keeps_step_watchdog(tmp_path: Path) -> None:
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1e6)))
     world.project.render_outcome = "hang"
     job_id = world.runner.submit(
-        "render", _render_params(world, timeout_seconds=30.0), world.locator()
+        "render", _render_params(world, timeout_seconds=30.0), world.locator(), agent_id=AGENT_ID
     )
     control.stop(world.log, control.StopScope.all(), "pause", HUMAN)
     world.runner.run_until_settled()
@@ -465,7 +481,7 @@ def test_p5b_restart_loop_shorter_than_deadline_still_stalls(tmp_path: Path) -> 
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1e6)))
     world.project.render_outcome = "hang"
     job_id = world.runner.submit(
-        "render", _render_params(world, timeout_seconds=30.0), world.locator()
+        "render", _render_params(world, timeout_seconds=30.0), world.locator(), agent_id=AGENT_ID
     )
     for _ in range(10):
         world.runner.pump()
@@ -490,7 +506,7 @@ def test_p5c_crash_loop_before_any_checkpoint_stalls_after_the_restart_limit(
     """The process dies in the same op every time, before anything is checkpointed (so the
     persisted deadline never moves). The persistent restart counter stalls it."""
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.pump()  # running, op queued
     real = world.main.AddMarker
 
@@ -521,7 +537,9 @@ def test_p5c_crash_loop_before_any_checkpoint_stalls_after_the_restart_limit(
 
 def test_restarts_counter_resets_when_a_step_completes(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("ops.sequence", _markers(100, 200), world.locator())
+    job_id = world.runner.submit(
+        "ops.sequence", _markers(100, 200), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()
     world.restart()
     assert world.store.get(job_id).restarts == 1
@@ -536,7 +554,7 @@ def test_restarts_counter_resets_when_a_step_completes(tmp_path: Path) -> None:
 
 def test_p6_refused_token_not_retried(tmp_path: Path) -> None:
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     token = grant(world.log, ApprovalScope.PROJECT_LOAD, world.pid(), 3600, "wrong", HUMAN)
     world.runner.approve(job_id, token.token_id, HUMAN)
@@ -558,7 +576,9 @@ def test_p7_lease_blocked_build_then_restore_renders_job_settings(tmp_path: Path
         timeline_key(world.pid(), world.main.GetUniqueId()),
         None,
     )
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()
     world.runner.pump()
     world.clock.advance(20.0)
@@ -579,7 +599,9 @@ def test_p7b_stall_resume_in_build_phase(tmp_path: Path) -> None:
         timeline_key(world.pid(), world.main.GetUniqueId()),
         None,
     )
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     for _ in range(14):
         world.runner.pump()
         world.clock.advance(10.0)
@@ -599,7 +621,9 @@ def test_p8_no_preset_left_and_deliver_restored_after_build(tmp_path: Path) -> N
     world = JobWorld(tmp_path)
     world.project.render_complete_after = 5
     original = world.project.deliver.copy()
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     _pump_until(world, job_id, lambda r: r.cursor.get("phase") == "poll")
     assert _aar_presets(world) == [] and world.project.deliver.settings == original.settings
 
@@ -608,7 +632,9 @@ def test_p9_cancel_mid_render_alerts_the_orphaned_render(tmp_path: Path) -> None
     world = JobWorld(tmp_path)
     world.project.render_complete_after = 50
     original = world.project.deliver.copy()
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     _pump_until(world, job_id, lambda r: r.cursor.get("phase") == "poll")
     rid = world.store.get(job_id).cursor["render_job_id"]
     world.runner.cancel(job_id)
@@ -625,7 +651,7 @@ def test_p10_stall_mid_render(tmp_path: Path) -> None:
     world.project.render_outcome = "hang"
     original = world.project.deliver.copy()
     job_id = world.runner.submit(
-        "render", _render_params(world, timeout_seconds=30.0), world.locator()
+        "render", _render_params(world, timeout_seconds=30.0), world.locator(), agent_id=AGENT_ID
     )
     for _ in range(15):
         world.runner.pump()
@@ -649,7 +675,7 @@ def test_p11_second_store_open_is_refused(tmp_path: Path) -> None:
 
 
 def _forge(world: JobWorld, **cols: object) -> None:
-    good = world.runner.submit("ops.sequence", _markers(300), world.locator())
+    good = world.runner.submit("ops.sequence", _markers(300), world.locator(), agent_id=AGENT_ID)
     world.runner.close()
     world.store.close()
     conn = sqlite3.connect(world.db_path)
@@ -730,7 +756,7 @@ def test_p12_quarantined_record_is_never_written(tmp_path: Path) -> None:
 
 def test_p13_forged_consumed_flag(tmp_path: Path) -> None:
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     world.runner.close()
     world.store.close()
@@ -765,7 +791,7 @@ def test_p13b_forged_flag_reusing_a_token_this_node_consumed_for_another_job(
     """Job A legitimately consumes token T. A forged row for job B (in ANOTHER project) claims
     T as its consumed approval. The consume is bound to job A, so B's claim is not verified."""
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
-    a = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    a = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     token = grant(world.log, ApprovalScope.PROJECT_WRITE, world.pid(), 3600, "A only", HUMAN)
     world.runner.approve(a, token.token_id, HUMAN)
@@ -786,6 +812,7 @@ def test_p13b_forged_flag_reusing_a_token_this_node_consumed_for_another_job(
             ]
         },
         world.locator("Other"),
+        agent_id=AGENT_ID,
     )
     _forge_consumed(world, b, token.token_id)
     runner = world.restart(approval=ApprovalPolicy(live=True))
@@ -798,12 +825,12 @@ def test_p13b_forged_flag_reusing_a_token_this_node_consumed_for_another_job(
 def test_p13c_forged_flag_reusing_another_jobs_token_in_the_same_project(tmp_path: Path) -> None:
     """Same project, same scope and target: only the per-job binding catches it."""
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
-    a = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    a = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     token = grant(world.log, ApprovalScope.PROJECT_WRITE, world.pid(), 3600, "A only", HUMAN)
     world.runner.approve(a, token.token_id, HUMAN)
     world.runner.run_until_settled()
-    b = world.runner.submit("ops.sequence", _markers(200), world.locator())
+    b = world.runner.submit("ops.sequence", _markers(200), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     _forge_consumed(world, b, token.token_id)
     runner = world.restart(approval=ApprovalPolicy(live=True))
@@ -811,13 +838,16 @@ def test_p13c_forged_flag_reusing_another_jobs_token_in_the_same_project(tmp_pat
     assert sorted(world.main.markers) == [100]  # B never wrote
     assert runner.get(b).state == "waiting"
     consumed = world.log.read(types=["approval.consumed"])
-    assert [e.actor for e in consumed] == [Actor("node", f"{world.node_id}#{a}")]
+    # The consume is audited as the job's agent, bound to job A (P2, P13b).
+    assert [e.actor for e in consumed] == [Actor("agent", f"{AGENT_ID}#{a}")]
 
 
 def test_p13d_genuine_consume_survives_restart(tmp_path: Path) -> None:
     """The binding does not break the legitimate case: a job's own consume verifies on load."""
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
-    job_id = world.runner.submit("ops.sequence", _markers(100, 200), world.locator())
+    job_id = world.runner.submit(
+        "ops.sequence", _markers(100, 200), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     token = grant(world.log, ApprovalScope.PROJECT_WRITE, world.pid(), 3600, "ok", HUMAN)
     world.runner.approve(job_id, token.token_id, HUMAN)
@@ -843,19 +873,20 @@ def test_p14_inf_timeout_rejected_no_ghost(tmp_path: Path) -> None:
                 "steps": [
                     {
                         "op": "markers.add",
-                        "params": {"markers": [{"frame": 100}]},
+                        "params": {"timeline": MAIN_REF, "markers": [{"frame": 100}]},
                         "timeout": float("inf"),
                     }
                 ]
             },
             world.locator(),
+            agent_id=AGENT_ID,
         )
     assert len(world.runner.list()) == len(world.store.load_all())
 
 
 def test_p14b_nan_in_step_params_no_ghost_no_wedge(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
-    other = world.runner.submit("ops.sequence", _markers(200), world.locator())
+    other = world.runner.submit("ops.sequence", _markers(200), world.locator(), agent_id=AGENT_ID)
     # Rejected at submit, or stored as JSON null and refused when the op is built.
     with contextlib.suppress(ValueError):
         world.runner.submit(
@@ -864,11 +895,16 @@ def test_p14b_nan_in_step_params_no_ghost_no_wedge(tmp_path: Path) -> None:
                 "steps": [
                     {
                         "op": "markers.add",
-                        "params": {"markers": [{"frame": 100}], "nan_here": float("nan")},
+                        "params": {
+                            "timeline": MAIN_REF,
+                            "markers": [{"frame": 100}],
+                            "nan_here": float("nan"),
+                        },
                     }
                 ]
             },
             world.locator(),
+            agent_id=AGENT_ID,
         )
     assert len(world.runner.list()) == len(world.store.load_all())  # no ghost job
     world.runner.run_until_settled()
@@ -900,7 +936,9 @@ def test_p15_hung_build_landing_after_stall_and_cancel_undoes_itself(tmp_path: P
     world.project.render_complete_after = 50
     original = world.project.deliver.copy()
     entered, release = _hang(world, "AddRenderJob")
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()  # build queued
     world.runner.pump()  # the drain starts the build; it hangs in AddRenderJob
     assert entered.wait(WAIT)
@@ -927,7 +965,9 @@ def test_p15b_render_started_after_cancel_is_alerted_not_silent(tmp_path: Path) 
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1.0)), drain_budget=0.5)
     world.project.render_complete_after = 50
     entered, release = _hang(world, "StartRendering")
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()
     world.runner.pump()
     assert entered.wait(WAIT)
@@ -942,7 +982,7 @@ def test_p15b_render_started_after_cancel_is_alerted_not_silent(tmp_path: Path) 
 
 def test_p15c_hung_op_does_not_block_reads(tmp_path: Path) -> None:
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1.0)), drain_budget=0.5)
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.pump()
     entered, release = threading.Event(), threading.Event()
     orig = world.main.AddMarker
@@ -973,7 +1013,9 @@ def test_p15d_stalled_job_keeps_its_hung_op_and_resumes_with_its_result(tmp_path
     uses its result instead of running it again."""
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1.0)), drain_budget=0.5)
     entered, release = _hang(world, "AddRenderJob")
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()
     world.runner.pump()
     assert entered.wait(WAIT)
@@ -998,13 +1040,11 @@ def test_p16_restart_mid_render_broker_restore(tmp_path: Path) -> None:
     _prod_broker(world)
     original = world.project.deliver.copy()
     world.project.render_complete_after = 6
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     _pump_until(world, job_id, lambda r: r.cursor.get("phase") == "poll")
-    world.runner.close()
-    world.store.close()
-    world._fresh_broker()
-    world.store = JobStore(world.db_path)
-    _prod_broker(world)
+    _prod_broker(world)  # the node restarts mid-render
     world.runner.run_until_settled()
     for _ in range(3):
         world.clock.advance(30.0)
@@ -1019,7 +1059,10 @@ def test_n_broker_restore_of_human_context_still_happens(tmp_path: Path) -> None
     _prod_broker(world)
     assert world.fake.current.GetName() == "Show"
     job_id = world.runner.submit(
-        "ops.sequence", {"steps": [{"op": "timeline.list", "params": {}}]}, world.locator("Other")
+        "ops.sequence",
+        {"steps": [{"op": "timeline.list", "params": {}}]},
+        world.locator("Other"),
+        agent_id=AGENT_ID,
     )
     world.runner.run_until_settled()
     assert world.runner.get(job_id).state == "succeeded"
@@ -1045,7 +1088,7 @@ def _show_registered(world: JobWorld, name: str = "Show", library: str = "CCN"):
 def test_p18_registry_stop_reaches_job(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     show = _show_registered(world)
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     control.stop(world.log, control.StopScope.project(show.id), "stop show", HUMAN)
     world.runner.run_until_settled()
     assert world.runner.get(job_id).state == "waiting" and world.main.markers == {}
@@ -1056,7 +1099,7 @@ def test_p18b_registry_rename_does_not_break_stop(tmp_path: Path) -> None:
     reg = Registry(world.log)
     show = _show_registered(world)
     reg.rename_project(show.id, "Show (Season 2)", HUMAN)  # display name only
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     control.stop(world.log, control.StopScope.project(show.id), "stop show", HUMAN)
     world.runner.run_until_settled()
     assert world.runner.get(job_id).state == "waiting" and world.main.markers == {}
@@ -1066,7 +1109,7 @@ def test_p18c_duplicate_registry_name_does_not_break_stop(tmp_path: Path) -> Non
     world = JobWorld(tmp_path)
     _show_registered(world, library="Archive 2024")
     current = _show_registered(world, library="CCN")
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     control.stop(world.log, control.StopScope.project(current.id), "stop show", HUMAN)
     world.runner.run_until_settled()
     assert world.runner.get(job_id).state == "waiting" and world.main.markers == {}
@@ -1082,7 +1125,9 @@ def test_p18d_stop_reaches_job_by_alias_or_uid_in_a_source(tmp_path: Path) -> No
     )
     assert world.hublink.registry_ids(world.locator()) == sorted([by_alias.id, by_uid.id])
     for pid in (by_alias.id, by_uid.id):
-        job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+        job_id = world.runner.submit(
+            "ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID
+        )
         control.stop(world.log, control.StopScope.project(pid), "stop", HUMAN)
         world.runner.run_until_settled()
         assert world.runner.get(job_id).state == "waiting"
@@ -1097,7 +1142,7 @@ def test_p18e_unrelated_registry_project_stop_does_not_pause(tmp_path: Path) -> 
     unrelated = reg.create_project(
         "Other", HUMAN, sources=[ProjectSource("cloud_library", {"library": "CCN", "name": "X"})]
     )
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     control.stop(world.log, control.StopScope.project(unrelated.id), "stop other", HUMAN)
     world.runner.run_until_settled()
     assert world.runner.get(job_id).state == "succeeded"
@@ -1124,7 +1169,7 @@ def test_p19_build_on_job_timeline(tmp_path: Path) -> None:
         return o_add()
 
     proj.SetRenderSettings, proj.AddRenderJob = s, a  # type: ignore[method-assign]
-    world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.submit("render", _render_params(world), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     assert seen == [("Set", "Main"), ("Add", "Main")]
 
@@ -1135,6 +1180,7 @@ def test_p20_two_renders_same_project(tmp_path: Path) -> None:
         "render",
         _render_params(world, target_dir="D:/A", custom_name="a_v1", cleanup=False),
         world.locator(),
+        agent_id=AGENT_ID,
     )
     b = world.runner.submit(
         "render",
@@ -1146,6 +1192,7 @@ def test_p20_two_renders_same_project(tmp_path: Path) -> None:
             cleanup=False,
         ),
         world.locator(),
+        agent_id=AGENT_ID,
     )
     world.runner.run_until_settled()
     va, vb = world.runner.get(a), world.runner.get(b)
@@ -1157,13 +1204,16 @@ def test_p20_two_renders_same_project(tmp_path: Path) -> None:
 def test_p21_render_does_not_stall_other_project(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     world.project.render_complete_after = 10_000
-    world.runner.submit("render", _render_params(world), world.locator())
+    world.runner.submit("render", _render_params(world), world.locator(), agent_id=AGENT_ID)
     for _ in range(30):
         world.runner.pump()
         if world.project.rendering:
             break
     o = world.runner.submit(
-        "ops.sequence", {"steps": [{"op": "timeline.list", "params": {}}]}, world.locator("Other")
+        "ops.sequence",
+        {"steps": [{"op": "timeline.list", "params": {}}]},
+        world.locator("Other"),
+        agent_id=AGENT_ID,
     )
     for _ in range(14):
         world.clock.advance(10.0)
@@ -1174,7 +1224,9 @@ def test_p21_render_does_not_stall_other_project(tmp_path: Path) -> None:
 def test_p22_events_bounded(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     world.project.render_complete_after = 200
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     n = len(world.store.events(job_id))
     assert n < 30  # 200 polls; a per-poll event (mutant N22) would be 200+
@@ -1241,7 +1293,9 @@ def test_n1_build_failure_at_each_step(tmp_path: Path, fault: tuple[str, str]) -
         )
     else:
         _fault(world, *fault)
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     v = world.runner.get(job_id)
     assert v.state == "failed"
@@ -1259,7 +1313,9 @@ def test_n1_start_failure_deletes_only_our_job(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     human = _human_job(world, "Main [agent]", "other")
     _fault(world, "StartRendering", "false")
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     v = world.runner.get(job_id)
     assert v.error["code"] == "start_rendering_failed"
@@ -1274,7 +1330,9 @@ def test_n1_job_we_cannot_delete_is_alerted_with_its_id(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     _fault(world, "StartRendering", "false")
     world.project.DeleteRenderJob = lambda job_id: False  # type: ignore[method-assign]
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     v = world.runner.get(job_id)
     rid = world.project.render_jobs[0].job_id
@@ -1287,7 +1345,9 @@ def test_n1b_restore_failure_does_not_mask_the_original_error(tmp_path: Path) ->
     world = JobWorld(tmp_path)
     world.project.SetRenderSettings = lambda s: False  # type: ignore[method-assign]
     world.project.DeleteRenderPreset = lambda p: False  # type: ignore[method-assign]
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     v = world.runner.get(job_id)
     assert v.error["code"] == "render_settings_failed"  # the PRIMARY error
@@ -1310,7 +1370,9 @@ def test_n1c_restore_while_rendering_refused(tmp_path: Path) -> None:
         return orig(name)
 
     proj.LoadRenderPreset = load  # type: ignore[method-assign]
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     v = world.runner.get(job_id)
     assert v.state == "succeeded" and proj.deliver.settings == original.settings
@@ -1326,7 +1388,9 @@ def test_n1c_restore_failure_after_add_keeps_tracking_the_render(tmp_path: Path)
     proj = world.project
     orig = proj.LoadRenderPreset
     proj.LoadRenderPreset = lambda name: False if name.startswith("aar-job-") else orig(name)  # type: ignore[method-assign]
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     v = world.runner.get(job_id)
     assert v.state == "succeeded"
@@ -1338,7 +1402,9 @@ def test_n1c_restore_failure_after_add_keeps_tracking_the_render(tmp_path: Path)
 def test_n2_human_preset_with_snapshot_name_is_never_loaded_or_deleted(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     original = world.project.deliver.copy()
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     name = snapshot_preset_name(job_id)
     human = DeliverState("mxf", "DNxHR", 0, {"TargetDir": "H:/Humans"})
     world.fake.presets[name] = human
@@ -1353,7 +1419,9 @@ def test_n2_human_preset_with_snapshot_name_is_never_loaded_or_deleted(tmp_path:
 
 def test_n2b_all_snapshot_names_taken_fails_without_touching_them(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     base = snapshot_preset_name(job_id)
     names = [base] + [f"{base}-{i}" for i in range(2, 11)]
     for n in names:
@@ -1371,7 +1439,9 @@ def test_n3_crash_mid_build_recovers_originals(tmp_path: Path) -> None:
     says the preset is the job's own, so the resumed build recovers the originals from it."""
     world = JobWorld(tmp_path)
     original = world.project.deliver.copy()
-    job_id = world.runner.submit("render", _render_params(world), world.locator())
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()  # build queued and checkpointed
     real = world.project.SetCurrentRenderFormatAndCodec
 
@@ -1424,6 +1494,7 @@ def test_render_ops_are_refused_in_ops_sequence(tmp_path: Path, op: str) -> None
             "ops.sequence",
             {"steps": [{"op": op, "params": {"render_job_id": human}}]},
             world.locator(),
+            agent_id=AGENT_ID,
         )
     assert [j.job_id for j in world.project.render_jobs] == [human]
 
@@ -1467,7 +1538,7 @@ def test_n5_concurrent_pumps_share_one_drain(tmp_path: Path) -> None:
             "op": "markers.add",
             "params": {"timeline": world.ref(timeline), "markers": [{"frame": frame}]},
         }
-        world.runner.submit("ops.sequence", {"steps": [step]}, world.locator())
+        world.runner.submit("ops.sequence", {"steps": [step]}, world.locator(), agent_id=AGENT_ID)
     world.runner.pump()  # both queued
     before = drains[0]
     ts = [threading.Thread(target=world.runner.pump) for _ in range(2)]
@@ -1527,7 +1598,7 @@ def test_broker_crash_is_recorded_logged_and_explains_the_stall(
     """Finding 10: a gateway error inside tick is no longer swallowed: it is logged, recorded
     once as a job event, and named in the stall when the watchdog gives up on the op."""
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=10.0)))
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.pump()  # op queued
 
     def gone():
@@ -1554,12 +1625,21 @@ def test_broker_crash_is_recorded_logged_and_explains_the_stall(
 def test_drain_budget_must_be_positive_and_finite(tmp_path: Path, budget: float) -> None:
     world = JobWorld(tmp_path)
     with pytest.raises(ValueError):
-        JobRunner(world.broker, world.store, world.hublink, node_id="n", drain_budget=budget)
+        JobRunner(
+            world.broker,
+            world.store,
+            world.hublink,
+            node_id=world.node_id,
+            branch_registry=world.branch_registry,
+            feed=world.feed,
+            presence_reporter=world.runtime.presence_reporter,
+            drain_budget=budget,
+        )
 
 
 def test_closed_runner_runs_nothing_more(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.pump()  # op queued
     assert world.runner.close()
     world.broker.run_until_idle()  # whoever ticks the old broker, the op is refused
@@ -1570,21 +1650,29 @@ def test_closed_runner_runs_nothing_more(tmp_path: Path) -> None:
 
 def test_events_json_is_readable(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     for e in world.runner.get(job_id).events:
         json.dumps(e)
 
 
-def test_v1_store_is_migrated_to_v2_in_place(tmp_path: Path) -> None:
-    """Schema v2 adds the restart counter; a v1 store (no ``restarts`` column) is migrated."""
+@pytest.mark.parametrize("old_version", [1, 2])
+def test_old_store_is_migrated_to_v3_and_agentless_jobs_never_run(
+    tmp_path: Path, old_version: int
+) -> None:
+    """Schema v3 adds the agent id and the consumed approvals; v1 (no restart counter) and v2
+    stores are migrated in place. A migrated job has no agent id, so it fails at load with
+    ``no_agent_id`` instead of running as nobody (P2)."""
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
-    world.runner.close()
+    job_id = world.submit("ops.sequence", _markers(100), world.locator())
+    world.runtime.close()
     world.store.close()
     conn = sqlite3.connect(world.db_path)
-    conn.execute("ALTER TABLE jobs DROP COLUMN restarts")
-    conn.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
+    for column in ("agent_id", "approvals", "approval_pending_key") + (
+        ("restarts",) if old_version == 1 else ()
+    ):
+        conn.execute(f"ALTER TABLE jobs DROP COLUMN {column}")
+    conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(old_version),))
     conn.commit()
     conn.close()
     world.store = JobStore(world.db_path)
@@ -1595,6 +1683,9 @@ def test_v1_store_is_migrated_to_v2_in_place(tmp_path: Path) -> None:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
     finally:
         conn.close()
-    assert version == ("2",) and "restarts" in columns
+    assert version == ("3",)
+    assert {"restarts", "agent_id", "approvals", "approval_pending_key"} <= columns
     runner.run_until_settled()
-    assert runner.get(job_id).state == "succeeded"
+    view = runner.get(job_id)
+    assert view.state == "failed" and view.error["code"] == "no_agent_id"
+    assert world.main.markers == {}

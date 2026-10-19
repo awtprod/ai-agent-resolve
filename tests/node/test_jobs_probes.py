@@ -27,7 +27,7 @@ from aar.node.jobs import (
     WatchdogConfig,
 )
 
-from .jobs_support import JobWorld
+from .jobs_support import AGENT_ID, MAIN_REF, JobWorld
 
 HUMAN = Actor("human", "andrew")
 
@@ -71,7 +71,7 @@ def test_r19_stalled_project_blocks_scheduling_across_restart(tmp_path: Path) ->
     lease = world.leases.acquire(
         Holder.human("andrew"), Scope.PROJECT, project_key(world.pid()), None
     )
-    a = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    a = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.pump()
     world.clock.advance(15.0)
     world.runner.pump()
@@ -80,7 +80,7 @@ def test_r19_stalled_project_blocks_scheduling_across_restart(tmp_path: Path) ->
 
     runner = world.restart(watchdog=Watchdog(WatchdogConfig(op_timeout=10.0)))
     assert runner.get(a).state == JobState.STALLED.value
-    b = runner.submit("ops.sequence", _markers(200), world.locator())
+    b = runner.submit("ops.sequence", _markers(200), world.locator(), agent_id=AGENT_ID)
     runner.pump()
     assert runner.get(b).state == JobState.QUEUED.value  # the stalled project blocks it
     runner.resume(a)
@@ -90,7 +90,11 @@ def test_r19_stalled_project_blocks_scheduling_across_restart(tmp_path: Path) ->
 
 
 def _markers(frame: int) -> dict:
-    return {"steps": [{"op": "markers.add", "params": {"markers": [{"frame": frame}]}}]}
+    return {
+        "steps": [
+            {"op": "markers.add", "params": {"timeline": MAIN_REF, "markers": [{"frame": frame}]}}
+        ]
+    }
 
 
 # -- P3a: an emergency stop stops an already-queued op -----------------------------------------
@@ -98,7 +102,7 @@ def _markers(frame: int) -> dict:
 
 def test_p3a_stop_prevents_a_queued_op_from_running(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.pump()  # the op is queued in the broker, not yet run
     assert world.main.markers == {}
     control.stop(world.log, control.StopScope.all(), "STOP NOW", HUMAN)
@@ -113,7 +117,7 @@ def test_p3a_stop_prevents_a_queued_op_from_running(tmp_path: Path) -> None:
 
 def test_p4a_approval_wait_does_not_burn_the_step_deadline(tmp_path: Path) -> None:
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     assert world.runner.get(job_id).state == JobState.WAITING.value
     world.clock.advance(400.0)  # a human takes ~7 min to approve; the step timeout is 300 s
@@ -127,7 +131,7 @@ def test_p4a_approval_wait_does_not_burn_the_step_deadline(tmp_path: Path) -> No
 
 def test_p4b_stop_wait_does_not_burn_the_step_deadline(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     control.stop(world.log, control.StopScope.all(), "lunch", HUMAN)
     world.runner.run_until_settled()
     world.clock.advance(400.0)
@@ -141,7 +145,7 @@ def test_p4b_stop_wait_does_not_burn_the_step_deadline(tmp_path: Path) -> None:
 
 def test_p6_refused_token_is_not_retried(tmp_path: Path) -> None:
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     token = grant(world.log, ApprovalScope.PROJECT_LOAD, world.pid(), 3600, "wrong", HUMAN)
     world.runner.approve(job_id, token.token_id, HUMAN)
@@ -157,7 +161,7 @@ def test_p6_refused_token_is_not_retried(tmp_path: Path) -> None:
 
 def test_p11_second_runner_on_same_store_is_locked_out(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
-    world.runner.submit("ops.sequence", _markers(100), world.locator())
+    world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     with pytest.raises(JobStoreLocked):
         JobStore(world.db_path)  # the first store still holds the single-writer lock
 
@@ -167,7 +171,7 @@ def test_p11_second_runner_on_same_store_is_locked_out(tmp_path: Path) -> None:
 
 def test_p12_corrupt_row_is_quarantined_not_fatal(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
-    good = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    good = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.store.close()
     conn = sqlite3.connect(world.db_path)
     row = conn.execute("SELECT * FROM jobs WHERE job_id=?", (good,)).fetchone()
@@ -193,7 +197,7 @@ def test_p12_corrupt_row_is_quarantined_not_fatal(tmp_path: Path) -> None:
 
 def test_p13_forged_consumed_flag_is_not_trusted(tmp_path: Path) -> None:
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     assert world.runner.get(job_id).state == JobState.WAITING.value
     world.store.close()
@@ -216,7 +220,7 @@ def test_p13_forged_consumed_flag_is_not_trusted(tmp_path: Path) -> None:
 
 def test_p14_non_finite_timeout_is_rejected_at_submit(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
-    other = world.runner.submit("ops.sequence", _markers(200), world.locator())
+    other = world.runner.submit("ops.sequence", _markers(200), world.locator(), agent_id=AGENT_ID)
     with pytest.raises(ValueError):
         world.runner.submit(
             "ops.sequence",
@@ -224,12 +228,13 @@ def test_p14_non_finite_timeout_is_rejected_at_submit(tmp_path: Path) -> None:
                 "steps": [
                     {
                         "op": "markers.add",
-                        "params": {"markers": [{"frame": 100}]},
+                        "params": {"timeline": MAIN_REF, "markers": [{"frame": 100}]},
                         "timeout": float("inf"),
                     }
                 ]
             },
             world.locator(),
+            agent_id=AGENT_ID,
         )
     assert len(world.runner.list()) == 1  # no ghost job was created
     world.runner.run_until_settled()  # the unrelated job runs, no wedge
@@ -242,7 +247,7 @@ def test_p14_non_finite_timeout_is_rejected_at_submit(tmp_path: Path) -> None:
 def test_p15_hung_gateway_call_does_not_block_the_pump(tmp_path: Path) -> None:
     # The production drain budget: the pump must return while the op hangs.
     world = JobWorld(tmp_path, watchdog=Watchdog(WatchdogConfig(op_timeout=1.0)), drain_budget=0.5)
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.pump()  # the op is queued, not yet run
     release = threading.Event()
     returned: list[int] = []
@@ -281,6 +286,11 @@ def test_p15_hung_gateway_call_does_not_block_the_pump(tmp_path: Path) -> None:
 
 def test_p17_runtime_op_failure_fails_the_job_and_burns_the_token(tmp_path: Path) -> None:
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
+    # The agent's registry says it owns the id, so the branch guard passes and the op itself
+    # fails at run time (the timeline is not in the project).
+    world.branch_registry.register(
+        world.pid(), "tl-does-not-exist", source_timeline_id="tl-x", agent_id=AGENT_ID, version=1
+    )
     job_id = world.runner.submit(
         "ops.sequence",
         {
@@ -295,6 +305,7 @@ def test_p17_runtime_op_failure_fails_the_job_and_burns_the_token(tmp_path: Path
             ]
         },
         world.locator(),
+        agent_id=AGENT_ID,
     )
     world.runner.run_until_settled()
     token = grant(world.log, ApprovalScope.PROJECT_WRITE, world.pid(), 3600, "ok", HUMAN)
@@ -317,7 +328,7 @@ def test_p18_project_scope_stop_reaches_the_job(tmp_path: Path) -> None:
     show = reg.create_project(
         "Show", HUMAN, sources=[ProjectSource("cloud_library", {"library": "CCN", "name": "Show"})]
     )
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     # The console's "Stop Show" button stops project:<registry id>.
     control.stop(world.log, control.StopScope.project(show.id), "stop this show", HUMAN)
     world.runner.run_until_settled()
@@ -338,7 +349,7 @@ def test_p23_crash_after_consume_is_recovered_from_the_pending_intent(tmp_path: 
     the consume; the hub shows the token consumed by THIS job, so the consume is recovered and
     the write runs once -- the human's token is not burned for nothing."""
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     token = grant(world.log, ApprovalScope.PROJECT_WRITE, world.pid(), 3600, "ok", HUMAN)
     world.runner.approve(job_id, token.token_id, HUMAN)
@@ -372,7 +383,7 @@ def test_p23b_pending_intent_for_a_token_never_consumed_is_dropped(tmp_path: Pat
     """A crash BEFORE the hub consume: the pending intent is dropped on load and the job
     consumes the (still active) token normally."""
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     token = grant(world.log, ApprovalScope.PROJECT_WRITE, world.pid(), 3600, "ok", HUMAN)
     world.runner.approve(job_id, token.token_id, HUMAN)
@@ -396,13 +407,13 @@ def test_p23c_pending_intent_consumed_by_another_job_is_not_recovered(tmp_path: 
     """The pending token was consumed by ANOTHER job (same project): not ours, so the intent
     is dropped, the consume is refused and nothing is written (fail closed)."""
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
-    a = world.runner.submit("ops.sequence", _markers(100), world.locator())
+    a = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     token = grant(world.log, ApprovalScope.PROJECT_WRITE, world.pid(), 3600, "A", HUMAN)
     world.runner.approve(a, token.token_id, HUMAN)
     world.runner.run_until_settled()
     assert world.runner.get(a).state == JobState.SUCCEEDED.value
-    b = world.runner.submit("ops.sequence", _markers(200), world.locator())
+    b = world.runner.submit("ops.sequence", _markers(200), world.locator(), agent_id=AGENT_ID)
     world.runner.run_until_settled()
     world.runner.close()
     world.store.close()

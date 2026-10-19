@@ -15,13 +15,16 @@ from aar.hub.common import utcnow
 from aar.hub.events import Actor
 from aar.node.jobs import ApprovalPolicy, JobState, Watchdog, WatchdogConfig
 
-from .jobs_support import NODE_ID, JobWorld
+from .jobs_support import AGENT_ID, MAIN_REF, NODE_ID, JobWorld
 
 HUMAN = Actor("human", "andrew")
 
 
 def _markers_job(world: JobWorld, *frames: int) -> list[dict]:
-    return [{"op": "markers.add", "params": {"markers": [{"frame": f}]}} for f in frames]
+    return [
+        {"op": "markers.add", "params": {"timeline": MAIN_REF, "markers": [{"frame": f}]}}
+        for f in frames
+    ]
 
 
 def _add_marker_frames(world: JobWorld) -> list[int]:
@@ -37,11 +40,15 @@ def test_ops_sequence_succeeds_with_measured_values(tmp_path: Path) -> None:
         "ops.sequence",
         {
             "steps": [
-                {"op": "markers.add", "params": {"markers": [{"frame": 100, "name": "cut"}]}},
+                {
+                    "op": "markers.add",
+                    "params": {"timeline": MAIN_REF, "markers": [{"frame": 100, "name": "cut"}]},
+                },
                 {"op": "timeline.list", "params": {}},
             ]
         },
         world.locator(),
+        agent_id=AGENT_ID,
     )
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
@@ -64,8 +71,16 @@ def test_op_failure_becomes_a_structured_job_error(tmp_path: Path) -> None:
     # markers.add with two markers on the same frame is refused by the op's validator.
     job_id = world.runner.submit(
         "ops.sequence",
-        {"steps": [{"op": "markers.add", "params": {"markers": [{"frame": 5}, {"frame": 5}]}}]},
+        {
+            "steps": [
+                {
+                    "op": "markers.add",
+                    "params": {"timeline": MAIN_REF, "markers": [{"frame": 5}, {"frame": 5}]},
+                }
+            ]
+        },
         world.locator(),
+        agent_id=AGENT_ID,
     )
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
@@ -95,10 +110,11 @@ def test_completed_step_is_not_rerun_after_restart(tmp_path: Path) -> None:
                         "if_exists": "error",
                     },
                 },
-                {"op": "markers.add", "params": {"markers": [{"frame": 50}]}},
+                {"op": "markers.add", "params": {"timeline": MAIN_REF, "markers": [{"frame": 50}]}},
             ]
         },
         world.locator(),
+        agent_id=AGENT_ID,
     )
     # Pump until step 0 is checkpointed (the duplicate exists), but step 1 is not done yet.
     for _ in range(6):
@@ -123,7 +139,7 @@ def test_inflight_step_reruns_idempotently_after_restart(tmp_path: Path) -> None
     earlier work (the marker already present) instead of adding it twice."""
     world = JobWorld(tmp_path)
     job_id = world.runner.submit(
-        "ops.sequence", {"steps": _markers_job(world, 100, 200)}, world.locator()
+        "ops.sequence", {"steps": _markers_job(world, 100, 200)}, world.locator(), agent_id=AGENT_ID
     )
     world.runner.pump()  # step 0's op is submitted to the broker but not yet run
     view = world.runner.get(job_id)
@@ -155,7 +171,7 @@ def test_watchdog_stalls_a_blocked_op_and_stops_the_project(tmp_path: Path) -> N
         Holder.human("andrew"), Scope.PROJECT, project_key(world.pid()), None
     )
     job_id = world.runner.submit(
-        "ops.sequence", {"steps": _markers_job(world, 100)}, world.locator()
+        "ops.sequence", {"steps": _markers_job(world, 100)}, world.locator(), agent_id=AGENT_ID
     )
     world.runner.pump()  # op submitted, but lease-blocked in the broker
     assert world.runner.get(job_id).state == JobState.RUNNING.value
@@ -169,7 +185,7 @@ def test_watchdog_stalls_a_blocked_op_and_stops_the_project(tmp_path: Path) -> N
 
     # A stalled project stops scheduling: a new job for it stays queued.
     other_id = world.runner.submit(
-        "ops.sequence", {"steps": _markers_job(world, 300)}, world.locator()
+        "ops.sequence", {"steps": _markers_job(world, 300)}, world.locator(), agent_id=AGENT_ID
     )
     world.runner.pump()
     assert world.runner.get(other_id).state == JobState.QUEUED.value
@@ -188,7 +204,7 @@ def test_watchdog_stalls_a_blocked_op_and_stops_the_project(tmp_path: Path) -> N
 def test_emergency_stop_all_pauses_then_resumes(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     job_id = world.runner.submit(
-        "ops.sequence", {"steps": _markers_job(world, 100, 200)}, world.locator()
+        "ops.sequence", {"steps": _markers_job(world, 100, 200)}, world.locator(), agent_id=AGENT_ID
     )
     control.stop(world.log, control.StopScope.all(), "safety check", HUMAN)
     world.runner.run_until_settled()
@@ -207,7 +223,7 @@ def test_emergency_stop_all_pauses_then_resumes(tmp_path: Path) -> None:
 def test_emergency_stop_node_scope(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     job_id = world.runner.submit(
-        "ops.sequence", {"steps": _markers_job(world, 100)}, world.locator()
+        "ops.sequence", {"steps": _markers_job(world, 100)}, world.locator(), agent_id=AGENT_ID
     )
     control.stop(world.log, control.StopScope.node(NODE_ID), "node paused", HUMAN)
     world.runner.run_until_settled()
@@ -220,7 +236,7 @@ def test_emergency_stop_node_scope(tmp_path: Path) -> None:
 def test_emergency_stop_midjob_pauses_at_checkpoint(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     job_id = world.runner.submit(
-        "ops.sequence", {"steps": _markers_job(world, 100, 200)}, world.locator()
+        "ops.sequence", {"steps": _markers_job(world, 100, 200)}, world.locator(), agent_id=AGENT_ID
     )
     for _ in range(4):
         world.runner.pump()
@@ -248,13 +264,13 @@ def test_production_write_waits_for_approval_then_consumes_once(tmp_path: Path) 
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
     pid = world.pid()
     job_id = world.runner.submit(
-        "ops.sequence", {"steps": _markers_job(world, 100)}, world.locator()
+        "ops.sequence", {"steps": _markers_job(world, 100)}, world.locator(), agent_id=AGENT_ID
     )
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
     assert view is not None and view.state == JobState.WAITING.value
     assert view.waiting["kind"] == "needs_approval"
-    assert view.waiting["detail"] == {"scope": "project.write", "target": pid}
+    assert view.waiting["detail"] == {"scope": "project.write", "target": pid, "key": "project"}
     assert view.approval_consumed is False
     assert world.main.markers == {}  # nothing written while waiting
     assert _add_marker_frames(world) == []
@@ -276,7 +292,7 @@ def test_approval_wrong_scope_is_refused_and_job_keeps_waiting(tmp_path: Path) -
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
     pid = world.pid()
     job_id = world.runner.submit(
-        "ops.sequence", {"steps": _markers_job(world, 100)}, world.locator()
+        "ops.sequence", {"steps": _markers_job(world, 100)}, world.locator(), agent_id=AGENT_ID
     )
     world.runner.run_until_settled()
     token = grant(world.log, ApprovalScope.PROJECT_LOAD, pid, 3600, "wrong scope", HUMAN)
@@ -295,7 +311,7 @@ def test_approval_wrong_scope_is_refused_and_job_keeps_waiting(tmp_path: Path) -
 def test_approval_wrong_target_is_refused(tmp_path: Path) -> None:
     world = JobWorld(tmp_path, approval=ApprovalPolicy(live=True))
     job_id = world.runner.submit(
-        "ops.sequence", {"steps": _markers_job(world, 100)}, world.locator()
+        "ops.sequence", {"steps": _markers_job(world, 100)}, world.locator(), agent_id=AGENT_ID
     )
     world.runner.run_until_settled()
     token = grant(world.log, ApprovalScope.PROJECT_WRITE, "proj-not-this-one", 3600, "wrong", HUMAN)
@@ -312,7 +328,7 @@ def test_sandbox_exempt_project_skips_approval(tmp_path: Path) -> None:
     pid = world.pid()
     world.runner.policy = ApprovalPolicy(live=True, sandbox_exempt=frozenset({pid}))
     job_id = world.runner.submit(
-        "ops.sequence", {"steps": _markers_job(world, 100)}, world.locator()
+        "ops.sequence", {"steps": _markers_job(world, 100)}, world.locator(), agent_id=AGENT_ID
     )
     world.runner.run_until_settled()
     view = world.runner.get(job_id)
@@ -326,7 +342,7 @@ def test_sandbox_exempt_project_skips_approval(tmp_path: Path) -> None:
 def test_cancel_stops_a_running_job(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     job_id = world.runner.submit(
-        "ops.sequence", {"steps": _markers_job(world, 100, 200)}, world.locator()
+        "ops.sequence", {"steps": _markers_job(world, 100, 200)}, world.locator(), agent_id=AGENT_ID
     )
     world.runner.pump()
     assert world.runner.cancel(job_id, "no longer needed") is True
@@ -338,7 +354,9 @@ def test_cancel_stops_a_running_job(tmp_path: Path) -> None:
 
 def test_list_filters_by_state_and_project(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
-    a = world.runner.submit("ops.sequence", {"steps": _markers_job(world, 100)}, world.locator())
+    a = world.runner.submit(
+        "ops.sequence", {"steps": _markers_job(world, 100)}, world.locator(), agent_id=AGENT_ID
+    )
     world.runner.run_until_settled()
     assert [v.job_id for v in world.runner.list(state=JobState.SUCCEEDED)] == [a]
     assert world.runner.list(project_id="nope") == []

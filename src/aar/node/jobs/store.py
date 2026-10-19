@@ -11,7 +11,8 @@ Safety properties:
   runners can never drive the same jobs and double-execute them. ``load_all`` is further
   scoped to one ``node_id``.
 - **Schema version** (L4): the version is stored and checked on open; an unknown version is
-  refused rather than silently mis-read. Version 1 stores are migrated in place to 2.
+  refused rather than silently mis-read. Version 1 and 2 stores are migrated in place to 3
+  (v2 added the restart counter; v3 the job's agent id and its consumed approvals).
 - **Poison rows** (M5/P12): a row that cannot be parsed (bad state, bad JSON, bad target) is
   loaded as a read-only *quarantined* record -- failed, with the parse error -- and is never
   written back, so one bad row cannot brick the runner and the original data is kept.
@@ -33,7 +34,7 @@ from aar.node.locator import ProjectLocator
 
 from .model import JobState, StructuredError, WaitReason
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -54,6 +55,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     approval_token     TEXT,
     approval_consumed  INTEGER NOT NULL DEFAULT 0,
     approval_pending   TEXT,
+    approval_pending_key TEXT,
+    approvals          TEXT NOT NULL DEFAULT '{}',
+    agent_id           TEXT,
     step_deadline      REAL,
     priority           INTEGER NOT NULL DEFAULT 0,
     restarts           INTEGER NOT NULL DEFAULT 0,
@@ -115,6 +119,14 @@ class JobRecord:
     approval_consumed: bool = False
     approval_pending: str | None = None
     """The token id a consume was started with but not yet confirmed (crash-safety, L2)."""
+    approval_pending_key: str | None = None
+    """What the pending consume is for: ``"project"`` (F15) or an op override key (P4)."""
+    approvals: dict[str, str] = field(default_factory=dict)
+    """Consumed approvals, approval key -> token id: ``"project"`` is the F15 production
+    approval, ``"op:<step>/<key>/<op>"`` an override that lets one op past the branch guard.
+    Verified against the hub on load; an entry the hub does not confirm is dropped."""
+    agent_id: str | None = None
+    """The agent the job works for: every op runs as ``Holder.agent(agent_id)`` (P2)."""
     step_deadline: float | None = None
     """Seconds the current step may still run; counts down only while the job is running."""
     priority: int = 0
@@ -161,12 +173,23 @@ def _record_from_row(row: sqlite3.Row) -> JobRecord:
         approval_token=row["approval_token"],
         approval_consumed=bool(row["approval_consumed"]),
         approval_pending=row["approval_pending"],
+        approval_pending_key=row["approval_pending_key"],
+        approvals=_approvals(json.loads(row["approvals"])),
+        agent_id=row["agent_id"],
         step_deadline=row["step_deadline"],
         priority=row["priority"],
         restarts=row["restarts"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+def _approvals(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+    ):
+        raise ValueError("approvals must be an object of approval key -> token id")
+    return dict(value)
 
 
 def _raw(row: sqlite3.Row, column: str) -> Any:
@@ -208,10 +231,12 @@ _UPSERT = """
 INSERT INTO jobs (
     job_id, kind, node_id, target, params, state, current_step, cursor, results,
     error, waiting, stall, approval_token, approval_consumed, approval_pending,
+    approval_pending_key, approvals, agent_id,
     step_deadline, priority, restarts, created_at, updated_at
 ) VALUES (
     :job_id, :kind, :node_id, :target, :params, :state, :current_step, :cursor, :results,
     :error, :waiting, :stall, :approval_token, :approval_consumed, :approval_pending,
+    :approval_pending_key, :approvals, :agent_id,
     :step_deadline, :priority, :restarts, :created_at, :updated_at
 )
 ON CONFLICT(job_id) DO UPDATE SET
@@ -219,6 +244,7 @@ ON CONFLICT(job_id) DO UPDATE SET
     results=excluded.results, error=excluded.error, waiting=excluded.waiting,
     stall=excluded.stall, approval_token=excluded.approval_token,
     approval_consumed=excluded.approval_consumed, approval_pending=excluded.approval_pending,
+    approval_pending_key=excluded.approval_pending_key, approvals=excluded.approvals,
     step_deadline=excluded.step_deadline, priority=excluded.priority,
     restarts=excluded.restarts, updated_at=excluded.updated_at
 """
@@ -272,8 +298,8 @@ class JobStore:
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
-            elif int(row["value"]) == 1:
-                self._migrate_v1()
+            elif int(row["value"]) in (1, 2):
+                self._migrate()
             elif int(row["value"]) != SCHEMA_VERSION:
                 raise JobStoreVersionError(
                     f"job store at {self._path!r} is schema version {row['value']}, "
@@ -285,11 +311,20 @@ class JobStore:
         else:
             self._conn.execute("COMMIT")
 
-    def _migrate_v1(self) -> None:
-        """v1 -> v2: add the ``restarts`` counter (inside the caller's transaction)."""
+    def _migrate(self) -> None:
+        """v1/v2 -> v3, inside the caller's transaction: v2 added the ``restarts`` counter, v3
+        the agent id and the consumed approvals. A migrated job has no agent id, so it loads
+        quarantined (it can never run as an agent it was not submitted for)."""
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(jobs)")}
-        if "restarts" not in columns:
-            self._conn.execute("ALTER TABLE jobs ADD COLUMN restarts INTEGER NOT NULL DEFAULT 0")
+        added = {
+            "restarts": "INTEGER NOT NULL DEFAULT 0",
+            "approval_pending_key": "TEXT",
+            "approvals": "TEXT NOT NULL DEFAULT '{}'",
+            "agent_id": "TEXT",
+        }
+        for column, decl in added.items():
+            if column not in columns:
+                self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {decl}")
         self._conn.execute(
             "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),)
         )
@@ -351,6 +386,9 @@ class JobStore:
             "approval_token": record.approval_token,
             "approval_consumed": 1 if record.approval_consumed else 0,
             "approval_pending": record.approval_pending,
+            "approval_pending_key": record.approval_pending_key,
+            "approvals": _dumps(record.approvals),
+            "agent_id": record.agent_id,
             "step_deadline": record.step_deadline,
             "priority": record.priority,
             "restarts": record.restarts,

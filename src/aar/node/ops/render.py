@@ -49,6 +49,12 @@ from aar.node.ops.framework import (
 )
 from aar.node.ops.journal import Journal, current_journal
 
+RENDER_GUARD_EXEMPTION = (
+    "render-queue: reads the timeline, never edits its content; touches only render jobs "
+    "its own aar job created (by recorded JobId) and restores the Deliver settings"
+)
+"""The branch-guard exemption of the render ops that change Resolve (S7 x S11 policy P3)."""
+
 _ALREADY_RUNNING = frozenset({"Rendering", "Complete"})
 _READY = frozenset({"Ready"})
 _SNAPSHOT_NAMES = 10
@@ -399,6 +405,7 @@ def _add(project: Any, journal: Journal) -> str:
     mutates=True,
     needs_current_timeline=True,
     traps=("deliver-clobber", "render-uses-original-media"),
+    guard_exemption=RENDER_GUARD_EXEMPTION,
 )
 def render_build(env: OpEnv, params: BuildParams) -> BuildResult:
     """Make the job's timeline current, snapshot Deliver, configure and add a render job (or
@@ -562,11 +569,30 @@ class DeleteJobResult(OpModel):
     deleted: bool
 
 
-@op("render.delete_job", params=RenderJobParams, result=DeleteJobResult, mutates=True)
+@op(
+    "render.delete_job",
+    params=RenderJobParams,
+    result=DeleteJobResult,
+    mutates=True,
+    guard_exemption=RENDER_GUARD_EXEMPTION,
+)
 def render_delete_job(env: OpEnv, params: RenderJobParams) -> DeleteJobResult:
     """Remove the render job this aar job created (its recorded id). A job already gone counts
-    as deleted. The runner only ever passes the id ``render.build`` returned, so this never
-    touches a job the agent did not create."""
+    as deleted. It runs only inside a node job, whose journal must confirm the id is the one
+    this job recorded, so it can never delete a human's render job."""
+    journal = current_journal()
+    if journal is None:
+        raise OpError(
+            "render_needs_job",
+            "render.delete_job runs only inside a node job, which proves the render job is its own",
+            "submit a 'render' job; it deletes its own completed render job",
+        )
+    if not journal("deleting", {"render_job_id": params.render_job_id}):
+        raise OpError(
+            "render_job_not_ours",
+            f"render job {params.render_job_id!r} is not the one this aar job created",
+            "a job only ever deletes the render job its own build recorded",
+        )
     project = env.project()
     present = any(str(j.get("JobId")) == params.render_job_id for j in _job_list(project))
     if not present:

@@ -162,6 +162,11 @@ class OpSpec:
     so the branch guard exempts it: branching off a human timeline must stay allowed."""
     submit_check: SubmitCheck | None = field(default=None, repr=False, compare=False)
     """Refusals decided at submit, before the op is queued (see :data:`SubmitCheck`)."""
+    guard_exemption: str | None = None
+    """A named exemption from the branch guard, with the reason it is safe (``None``: none).
+    Only for ops that never change timeline content; the render ops have it (DESIGN R3/P3):
+    they only touch the render jobs their own job created and always put the Deliver
+    settings back, and rendering reads the timeline, it does not edit it."""
     _body: OpFn = field(default=lambda env, params: None, repr=False, compare=False)
 
     def describe(self) -> dict[str, Any]:
@@ -189,8 +194,11 @@ def op(
     needs_current_timeline: bool = False,
     creates_timeline: bool = False,
     submit_check: SubmitCheck | None = None,
+    guard_exemption: str | None = None,
 ) -> Callable[[OpFn], OpFn]:
     """Register an op body under ``name``."""
+    if guard_exemption is not None and (not mutates or not guard_exemption.strip()):
+        raise ValueError(f"op {name}: a guard exemption needs a mutating op and a stated reason")
     for trap_id in traps:
         if trap_id not in TRAPS:
             raise ValueError(f"op {name}: unknown trap id {trap_id!r}")
@@ -217,6 +225,7 @@ def op(
             needs_current_timeline,
             creates_timeline,
             submit_check=submit_check,
+            guard_exemption=guard_exemption,
             _body=guarded,
         )
         return guarded
@@ -481,6 +490,10 @@ class OpEnv:
         return other
 
 
+BRANCH_GUARD_CODES = frozenset({"requires_approval", "not_an_agent_branch"})
+"""The codes :func:`make_hot_op` raises when the branch guard refuses an op. The S7 runner
+treats exactly these as "needs a ``project.write`` approval that names this op"."""
+
 _BRANCH_FIX = (
     "branch the timeline with timeline.branch and edit the copy you own, or request a "
     "project.write approval so the runner may override the guard"
@@ -507,10 +520,12 @@ def _branch_refusal(
     - An op that edits a ``timeline`` must name one, by unique id, registered to the calling
       agent in this project. Ownership is by ``(project, unique id)``, never by name, so a
       human timeline that looks like a branch, or a copy (fresh id), never passes.
+    - An op with a named ``guard_exemption`` (the render ops) never changes timeline content
+      and is exempt.
     - Any other mutating op (e.g. ``clip.set_input_color_space``) changes state every human
       timeline shares; it is refused unless the approval override is set.
     """
-    if not spec.mutates or spec.creates_timeline:
+    if not spec.mutates or spec.creates_timeline or spec.guard_exemption is not None:
         return None
     agent_id = holder.id if (holder is not None and not holder.is_human) else None
     if "timeline" not in type(params).model_fields:
