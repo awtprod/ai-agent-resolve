@@ -16,7 +16,7 @@ from aar.drp import cli as drp_cli
 from aar.drp.errors import DrpError
 from aar.drp.modify.engine import Refusal
 from aar.drp.modify.plan import MAX_PLAN_BYTES, DrpEditPlan, PlanProblem, parse_plan
-from aar.drp.modify.write import EditOutcome, edit_file
+from aar.drp.modify.write import EditOutcome, PlacementError, edit_file
 
 __all__ = [
     "EXIT_ERROR",
@@ -38,7 +38,8 @@ exit status:
   0    edited and verified (written, or with --dry-run checked and not written)
   1    refused: the plan, the input or the written file failed a check; nothing was written
   2    error: the input or the plan file cannot be read, usage error, or an internal error
-  74   the output could not be written: the --out file (then nothing was placed), or stdout
+  74   the output could not be written: the --out file (then it was not placed; an empty
+       file left at its name is listed in "left_behind"), or stdout
   141  the output pipe was closed early (for example by `head`)
 With 74 or 141 from stdout, the edit may still have completed: the file and its label
 <out>.aar.json are in place if the label exists; read it for the result.
@@ -117,7 +118,12 @@ def _edit(args: argparse.Namespace) -> int:
     except OSError as exc:
         drp_cli._warn(f"aar drp edit: cannot write the output: {exc}")
         refusal = Refusal("output-error", f"cannot write the output: {exc}")
-        return _print(_bare("error", args.file, refusal), EXIT_OUTPUT_ERROR)
+        bare = EditOutcome("error", {"path": args.file}, {}, refusals=[refusal])
+        if isinstance(exc, PlacementError):
+            bare.left_behind = exc.left_behind
+            for left in exc.left_behind:
+                drp_cli._warn(f"aar drp edit: left in place: {left.path} ({left.kind})")
+        return _print(bare.to_dict(), EXIT_OUTPUT_ERROR)
     except Exception as exc:  # an internal error must never look like a refusal (1) or success
         drp_cli._warn(f"aar drp edit: internal error: {type(exc).__name__}: {exc}")
         drp_cli._warn(traceback.format_exc())

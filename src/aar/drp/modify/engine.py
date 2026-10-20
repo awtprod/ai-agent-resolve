@@ -27,7 +27,7 @@ from aar.drp.model import DrpFile, MediaClip, Provenance, Timeline, TimelineItem
 from aar.drp.modify import encode
 from aar.drp.modify.encode import EncodeError
 from aar.drp.modify.markers import DEFAULT_BODY_VERSION, MarkerEntry, MarkerList, props
-from aar.drp.modify.paths import PathMapper, TableError
+from aar.drp.modify.paths import MapResult, PathMapper, TableError
 from aar.drp.modify.plan import (
     MAX_NAME,
     DrpEditPlan,
@@ -63,6 +63,9 @@ PATH_MAP_SCOPE = (
     "e.g. cache and capture locations), gallery stills (stills/*.xml <GalleryPath>), proxy and "
     "render-cache locations, and anything inside blobs the reader does not decode"
 )
+# Set on a touched path whose table prefix matched only after a non-ASCII case fold (see
+# aar.drp.modify.paths.MapResult.uncertain): it may be a different directory on NTFS.
+UNCERTAIN_FOLD = "non-ascii-case-fold"
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +293,7 @@ class _Planner:
         self.owned = {tl.media_clip_id for tl in drp.timelines if tl.media_clip_id}
         self.marker_lists: dict[tuple[str, str], tuple[Provenance, MarkerList, list[int]]] = {}
         self.marker_before: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self.renamed: dict[int, int] = {}  # id() of a renamed model object -> its edit index
 
     def run(self, plan: DrpEditPlan) -> Prepared:
         refusals: list[Refusal] = []
@@ -374,6 +378,24 @@ class _Planner:
             {"edit": i, "op": "rename", "target": e.target, "old": old, "new": e.new_name}
         )
 
+    def _claim(self, i: int, target: str, obj: object) -> None:
+        """One rename per object: a second one conflicts, whatever the two new names are.
+
+        Without this, ``[rename -> "B", rename -> <current name>]`` wrote ``B`` (the second
+        rename, compared with the input's name, looked like a no-op) while ``[-> "B", -> "C"]``
+        was refused as overlapping splices. The object is the model object the selector
+        resolved to, so a DbId selector and a name selector for the same object also conflict.
+        """
+        first = self.renamed.setdefault(id(obj), i)
+        if first != i:
+            raise _Refuse(
+                "conflicting-edits",
+                f"edits {first} and {i} both rename the same {target}; a plan renames an object "
+                "at most once",
+                i,
+                edits=[first, i],
+            )
+
     def _rename_target(self, i: int, e: Rename) -> str | None:
         """Splice the new name and expect the change; returns the old name."""
         sel = f"with DbId {e.id}" if e.id is not None else f"named {e.name!r}"
@@ -382,6 +404,7 @@ class _Planner:
         if e.target == "project":
             if drp.project is None:
                 raise _Refuse("target-not-found", "the file has no project.xml project", i)
+            self._claim(i, "project", drp.project)
             old = drp.project.name
             self._check_old(i, e, old)
             self._name_splice(i, drp.project.spans.get("name"), e.new_name, "the project")
@@ -392,6 +415,7 @@ class _Planner:
                 raise _Refuse("no-dbid", f"bin {sel} has no DbId, so the gate cannot match it", i)
             if not b.parent_id:
                 raise _Refuse("root-bin", "the root (Master) bin cannot be renamed in Resolve", i)
+            self._claim(i, "bin", b)
             old = b.name
             self._check_old(i, e, old)
             self._name_splice(i, b.spans.get("name"), e.new_name, f"bin {sel}")
@@ -399,12 +423,14 @@ class _Planner:
         elif e.target == "clip":
             clips = [m for m in drp.media if m.id not in self.owned]
             c = _one(clips, _sel(e, lambda x: x.id, lambda x: x.name), "media pool clip", sel, i)
+            self._claim(i, "clip", c)
             old = c.name
             self._check_old(i, e, old)
             self._name_splice(i, c.spans.get("name"), e.new_name, f"clip {sel}")
             self._expect(i, "media", "renamed", "media", c.id, "name", old, e.new_name)
         elif e.target == "timeline":
             tl = _one(drp.timelines, _sel(e, lambda x: x.id, lambda x: x.name), "timeline", sel, i)
+            self._claim(i, "timeline", tl)
             old = self._rename_timeline(i, e, tl)
         else:
             pairs = list(_items(drp))
@@ -413,6 +439,7 @@ class _Planner:
             )
             if not item.id:
                 raise _Refuse("no-dbid", f"item {sel} has no DbId, so the gate cannot match it", i)
+            self._claim(i, "item", item)
             old = item.name
             self._check_old(i, e, old)
             self._name_splice(i, item.spans.get("name"), e.new_name, f"item {sel}")
@@ -480,7 +507,7 @@ class _Planner:
             self._expect(
                 i, "timelines", "changed", "item", item.id, "media_file_path", old, result.new
             )
-            touched.append({"path": old, "new": result.new, **where})
+            touched.append({"path": old, "new": result.new, **where, **_uncertain(result)})
             mapped_items[old] = result.new
         self._item_path_clips(i, mapper, mapped_items)
         self.report.append(
@@ -510,6 +537,7 @@ class _Planner:
         model_paths = {p for p in (clip.blob_path, *clip.linked_paths) if p}
         new_paths: dict[str, str] = {}
         edits: list[tuple[Element, bytes, str, str]] = []
+        flags: dict[str, dict[str, str]] = {}
         for node in _iter_skipping(self.src.element(clip.source), _INFO_SKIP):
             blob = node.find("Clip") if node.tag in _INFO_TAGS else None
             if blob is None or blob.children or not blob.text or blob.inner_start is None:
@@ -551,6 +579,7 @@ class _Planner:
                     payload = encode.replace_field(payload, first[1], new_dir.encode("utf-8"))
                     edits.append((blob, encode.envelope(raw, payload), path, result.new))
                     new_paths[path] = result.new
+                    flags[path] = _uncertain(result)
                     continue
             unmapped.append({"path": path, "reason": reason, **where})
         if not edits:
@@ -566,7 +595,7 @@ class _Planner:
             assert blob.inner_start is not None and blob.inner_end is not None
             text = encode.hex_like(blob.inner_raw, new_raw)
             self.splices.append(Splice(member, blob.inner_start, blob.inner_end, text, i))
-            touched.append({"path": path, "new": new, **where})
+            touched.append({"path": path, "new": new, **where, **flags[path]})
         if clip.path_source == "media_pool_blob" and clip.path in new_paths:
             new_path = new_paths[clip.path]
             self._expect(i, "media", "relinked", "media", clip.id, "path", clip.path, new_path)
@@ -736,6 +765,10 @@ class _Planner:
                 self._expect(
                     edit, "markers", "changed", "marker", owner_id, ",".join(diffs), m, new[frame]
                 )
+
+
+def _uncertain(result: MapResult) -> dict[str, str]:
+    return {"uncertain": UNCERTAIN_FOLD} if result.uncertain else {}
 
 
 def _check_marker_text(i: int, values: dict[str, Any]) -> None:

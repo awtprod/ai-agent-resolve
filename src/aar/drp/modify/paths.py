@@ -10,7 +10,9 @@ components, and the longest matching prefix wins:
   keeps its own spelling; drive letters are written upper-case.
 * Mac side: compared exactly (case-sensitively), because Mac volumes can be case-sensitive.
 
-UNC paths are mapped only by an entry whose Windows side is a UNC prefix; a UNC path no entry
+A Windows-to-Mac match whose prefix needed the case fold of a non-ASCII letter is returned
+with ``uncertain`` set (see :class:`MapResult`). UNC paths are mapped only by an entry whose
+Windows side is a UNC prefix; a UNC path no entry
 covers is reported as ``unc-not-mapped``. A path that cannot be written on the other system
 (a Mac name with ``\\`` or ``:``, a Windows-reserved character or device name such as ``CON``,
 a trailing space or dot, an empty component) is reported,
@@ -20,6 +22,7 @@ never changed. Nothing here touches files; it only rewrites strings.
 from __future__ import annotations
 
 import re
+import string
 from dataclasses import dataclass
 from typing import Literal
 
@@ -34,6 +37,7 @@ _WIN_BAD = re.compile(r'[<>:"|?*\\/\x00-\x1f]')
 _WIN_RESERVED = re.compile(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$", re.I)
 _MAX_TABLE = 256
 _MAX_PREFIX = 4096
+_ASCII_UPPER = str.maketrans(string.ascii_lowercase, string.ascii_uppercase)
 
 
 class TableError(ValueError):
@@ -53,6 +57,11 @@ class _Win:
         return (ntfs_upper(self.root), *(ntfs_upper(p) for p in self.parts))
 
 
+def _ascii_key(win: _Win) -> tuple[str, ...]:
+    """Like :meth:`_Win.key`, but folding only ASCII letters (the fold every NTFS table makes)."""
+    return (win.root.translate(_ASCII_UPPER), *(p.translate(_ASCII_UPPER) for p in win.parts))
+
+
 @dataclass(frozen=True, slots=True)
 class _Mac:
     parts: tuple[str, ...]
@@ -61,10 +70,19 @@ class _Mac:
 
 @dataclass(frozen=True, slots=True)
 class MapResult:
-    """``new`` is the mapped path, or ``None`` with ``reason`` saying why it was not mapped."""
+    """``new`` is the mapped path, or ``None`` with ``reason`` saying why it was not mapped.
+
+    ``uncertain`` is set on a Windows-to-Mac match whose table prefix matched only after folding
+    the case of a non-ASCII letter. Every NTFS ``$UpCase`` table folds ASCII the same way, but
+    :func:`ntfs_upper` over-folds some non-ASCII pairs NTFS keeps apart: a row ``E:\\Media\\I``
+    matches a path under U+0131 (dotless i) in place of the ``I``, a different directory on NTFS.
+    Such a match may be a wrong relink candidate. The flag also marks folds NTFS does make
+    (``ä``/``Ä``): it means "check this", not "wrong".
+    """
 
     new: str | None
     reason: str | None = None
+    uncertain: bool = False
 
 
 # Characters whose Unicode *simple* uppercase is a single code point but whose *full* uppercase
@@ -96,11 +114,14 @@ def ntfs_upper(name: str) -> str:
     ``$UpCase`` table (those are frozen when a volume is formatted, and differ between XP, Vista
     and Win7-10; Win11 and exFAT tables are not established). It never *under*-folds a pair those
     tables fold, but it OVER-folds pairs NTFS keeps distinct -- aar treats them as one name, NTFS
-    does not: U+0131 (dotless i) vs I, U+017F (long s) vs S, U+00B5 (micro) vs Greek mu, U+0345
-    and U+1FBE vs iota, the titlecase digraphs U+01C5/01C8/01CB/01F2, U+1E9B, every astral cased
-    letter (Deseret, Osage, Adlam, Warang Citi, ...), and -- on the Win7-10 table -- final sigma
-    vs sigma. These are Unicode 1.1 characters NTFS never folded, so "code points added after the
-    volume was formatted" does not excuse them.
+    does not. The S8c validation counted 246 such BMP pairs against the Win7-10 table, plus every
+    astral cased letter. They include U+0131 (dotless i) vs I, U+017F (long s) vs S, U+00B5
+    (micro) vs Greek mu, U+0345 and U+1FBE vs iota, the titlecase digraphs U+01C5/01C8/01CB/01F2
+    and -- on the Win7-10 table -- final sigma vs sigma (all in Unicode 1.1); U+1E9B (2.0);
+    Cherokee lowercase U+AB70.. and U+13F8.. vs U+13A0.. and U+13F0.. (8.0); Georgian Mkhedruli
+    U+10D0.. vs Mtavruli U+1C90.. (11.0); and the astral Deseret (3.1), Warang Citi (7.0), Osage
+    and Adlam (9.0). The Unicode 1.1 ones predate every NTFS table, so "code points added after
+    the volume was formatted" does not excuse them.
 
     ``ntfs_upper`` is used only to match ``path_map`` table prefixes (:class:`PathMapper`); it
     does not decide output placement (the OS's own case rules do) and aar never writes to a media
@@ -219,7 +240,9 @@ class PathMapper:
         if any("/" in p or "\x00" in p for p in rest):
             return MapResult(None, "unrepresentable")
         parts = (*best.mac.parts, *rest)
-        return MapResult("/" + "/".join(parts) + ("/" if w.trailing_sep else ""))
+        n = len(best.win.parts)
+        uncertain = _ascii_key(w)[: n + 1] != _ascii_key(best.win)  # needed a non-ASCII fold
+        return MapResult("/" + "/".join(parts) + ("/" if w.trailing_sep else ""), None, uncertain)
 
     def _to_windows(self, path: str) -> MapResult:
         m = _parse_mac(path)
