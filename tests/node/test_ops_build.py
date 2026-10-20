@@ -478,8 +478,9 @@ def test_a_locked_track_is_never_written_unless_the_spec_unlocks_it() -> None:
 
 
 def test_a_locked_track_later_in_the_request_stops_it_before_any_write() -> None:
+    # Specs run audio before video; the locked video track must still stop the audio write.
     show = Show()
-    show.main.tracks["audio"][0].locked = True
+    show.main.tracks["video"][0].locked = True
     error = show.fails(
         "track.ensure",
         {
