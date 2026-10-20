@@ -57,12 +57,16 @@ Status values: `todo` · `in-progress` · `review` · `merged` · `blocked(<reas
 | S13e | Shorts compose: port the ffmpeg runner (crop path, overlays, ASS captions, gain plus limiter) with a post-run `qa.check` | S13a, S13b, S13d | todo | |
 | S13f | Host transport and path map: scp and PowerShell (`-EncodedCommand`), size and sha256 checks, both sftp path forms, an edit-PC to hub path map on `drp/modify/paths.py`; host from config only | none | in-review (round 3) | Round 3 ef9121d (rebased on b06cbeb; 2827/20, 222 host tests, fail-before 31/3 claimed): all five PowerShell single quotes doubled, GetDirectoryName in move_script, scp inside the cleanup try, strict remote parsers, claim identity dev+ino+ctime_ns+size 0, `scp -s` toggle. Audited by me: no defects found. Validator a3b490dccd4fd9ce5 (opus55, briefs/s13f-val-r3.brief.md). Implementer ac65a0190e99bf3d5 (opus48). Earlier rounds: r1 2d7bc7c, r2 be555da CHANGES-REQUIRED (2 HIGH). Merge after S8c (done); check merge-tree against dev (S13b DESIGN). |
 | S13g1 | Hub write surface: `recipe` node kind, typed brief / recipe / plan node data, agent-owned status, per-project facts store, opt-in MCP write tools and CLI | S11f | in-progress | Split from S13g on 2026-10-19. Brief aar-evidence/briefs/s13g1.brief.md; worktree aar-impl-s13g1 off 815ad68. |
-| S13g2 | Recipe runner: recipe definitions, step kinds (cold, hot port, agent, human gate), claims and resume from the event log, op nodes per step, bounded review rounds, REPORT.md and archive | S13g1 | todo | |
+| S13g2 | Recipe runner: recipe definitions, step kinds (cold, hot port, agent, human gate), claims and resume from the event log, op nodes per step, bounded review rounds, REPORT.md and archive | S13g1 | todo | Gate contract (readiness audit): `aar qa check` exit 0 allows warnings and unchecked items, so a recipe gate must read the per-check statuses, treat `unchecked` and missing transcript/laugh evidence as not-passed for required checks, and tell legitimate not-applicable skips apart. |
 | S13h | `plan.apply` compiler with a dry-run diff, plus the missing hot ops (ImportMedia, tracks, AddTransition, CDL/LUT, transforms, titles), fake-tested | S7 (with S7×S11), S13a | todo | may split Also S13b F1: skip join checks on tracks that carry no mixed audio. |
 | S13i | Render recipes: review (720p, at most 20 MB) and master, hash, transfer, `review.request` | S7, S13b, S13f | todo | |
 | S13j | Thumbnails: thumbpipe as a recipe step (no /tmp, injected outdir, vendored imports) | S13c2, S13f | todo | |
 | S13k | Publish packet and approval wait | S13g2 | todo | |
 | S14 | Spike: second Resolve instance, `-nogui`, `-rr` beside the GUI on the edit PC | none | blocked(D4 approval + idle window) | |
+| S15 | Hub to node remote link (was S7 F16): node-side `RemoteHubLink` over the tailnet and the hub endpoint it talks to; job dispatch, claim and heartbeat, approvals, emergency stop, presence and feed across hosts; an `aar node run` command; on node start, branch ownership is rebuilt from hub records (readiness audit MED: a fresh runtime starts with an empty BranchRegistry, and the test fixture re-registers OWNED, which hides it); on reconnect, in-flight work is reconciled and approvals and presence are re-checked before dispatch | S7 (with S7×S11) | todo (research running: aar-evidence/s15/RESEARCH.md) | Deployment blocker (DESIGN D6). |
+| S16a | Linux-first operation: the hub, console and cold workers start, restart and run with the Windows node absent; Resolve-dependent jobs are durable on the hub and show a visible waiting-for-node state; acceptance test: a full cold pipeline with no node connected | S15 | todo | D6 independence requirement. |
+| S16b | Linux media store: source media (audio included) ingested to the Linux hub with sha256 and availability tracking; plans and cold workers read Linux-resident copies, never a Windows-only share; outputs needed for QA and review come back by a verified transfer (reuses S13f) | S13f, S16a | todo | D6 media requirement. |
+| S11p | Event projections rebuild or replay whole histories on read paths (readiness audit, later risk): measure, then add incremental or snapshotted projections if growth bites | S11 | todo (low) | Inferred from code; not a measured regression. |
 
 ## Open decisions (DESIGN §7)
 
@@ -72,7 +76,8 @@ Status values: `todo` · `in-progress` · `review` · `merged` · `blocked(<reas
 | D2 | Hosting and who collaborates | tailnet-only hub for v1 |
 | D3 | Use the edit PC's Local Database as the sandbox | blocked; awaiting Andrew |
 | D4 | Multi-instance spike on the edit PC | blocked; awaiting Andrew |
-| D5 | GitHub remote and Prism runner | none yet; slices merge locally into `dev` after independent review |
+| D5 | GitHub remote and Prism runner | an `origin` remote now exists, with no branches pushed; nothing is pushed until Andrew says so; slices merge locally into `dev` after independent review |
+| D6 | Deployment target (confirmed by Andrew in the readiness audit, 2026-10-20) | hub, console, event/artifact storage and cold workers on the Linux hub host; Resolve plus a local node on the Windows edit PC. The Linux app must start, restart and do all non-Resolve work with the edit PC off; Resolve jobs wait durably and visibly; source media lives on Linux; reconnect reconciles and re-checks approvals and presence → S15, S16a, S16b |
 
 ## Log
 
@@ -152,3 +157,4 @@ Status values: `todo` · `in-progress` · `review` · `merged` · `blocked(<reas
 - 2026-10-19: S13a-f delivered 7491ea9 (2699/20) → validation (aee3cedcfac2cfb43, opus48).
 - 2026-10-19: S13b merged 9db17e2 (2886/20). S13c split into S13c1 (transcript + sync, a6e54735e651fd0ac) and S13c2. S13f r3 ef9121d → validation (a3b490dccd4fd9ce5). S13a-f now rebases onto 9db17e2 before merging.
 - 2026-10-20: S13a-f merged f9ff59b (3018/20); S13a-f2 opened for its LOWs. A 429 wave stopped S13c1, S8d, S13g1, S7×S11 and the S13f r3 validator mid-work; all five resumed via SendMessage (worktrees intact, commits kept).
+- 2026-10-20: Read the independent readiness audit (aar-evidence/repo-readiness-audit/7af9690/findings.json). HIGH: S7 runtime builds PresenceGuard with no input-idle provider (confirmed runtime.py:87) → added to the running S7×S11 integration. Ownership-on-restart (MED) → S15. New D6 deployment target → S15, S16a, S16b. QA-gate contract → S13g2 note. Projection replay → S11p. Origin remote exists (D5), nothing pushed.
