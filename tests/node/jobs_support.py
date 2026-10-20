@@ -83,6 +83,7 @@ class JobWorld:
         drain_budget: float | None = None,
         own_timelines: bool = True,
         broker_config: BrokerConfig = JOB_CONFIG,
+        input_idle: Any = None,
     ) -> None:
         self.fake = FakeResolve(LAYOUT, current="Show", folder=("Shows",))
         self.project = self.fake.project("Show")
@@ -98,6 +99,9 @@ class JobWorld:
         self._watchdog = watchdog or Watchdog(WatchdogConfig())
         self.drain_budget = drain_budget
         self.own_timelines = own_timelines
+        # The fake has no OS input: no provider unless a test injects one (production uses
+        # the OS one by default, see NodeRuntime).
+        self.input_idle = input_idle
         self._broker_config = broker_config
         self.runtime: NodeRuntime | None = None
         self.store = JobStore(self.db_path)
@@ -125,6 +129,7 @@ class JobWorld:
             wall_clock=self.wall,
             broker_config=self._broker_config,
             idle_window=IDLE,
+            input_idle=self.input_idle,
             approval=self._approval,
             watchdog=self._watchdog,
             drain_budget=self.drain_budget,

@@ -955,3 +955,81 @@ def test_item8_a_restart_with_the_hub_down_loads_and_verifies_later(tmp_path: Pa
     view = runner.get(job_id)
     assert view.waiting["kind"] == "needs_approval"  # verified; step 1 still needs its token
     assert list(view.approvals) == ["op:0/0:markers.add/markers.add"]
+
+
+# == presence: the OS keyboard/mouse idle provider is wired (readiness audit, HIGH) ==============
+
+
+def test_presence_the_runtime_uses_the_os_input_idle_provider_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows a runtime built with defaults gives its presence guard GetLastInputInfo;
+    off Windows there is none (the OS cannot tell). The provider is never called here."""
+    import sys
+
+    from aar.node import presence
+
+    from .fake_resolve import FakeResolve
+
+    fake = FakeResolve({"Show": ["Main"]}, current="Show", folder=("Shows",))
+    from aar.hub.events import EventLog
+    from aar.node.gateway import ScriptApiGateway
+
+    log = EventLog(str(tmp_path / "hub.db"))
+    store = JobStore(tmp_path / "jobs.db")
+    try:
+        monkeypatch.setattr(sys, "platform", "win32")
+        rt = NodeRuntime.local(ScriptApiGateway(fake), store, log, node_id="node-win")
+        try:
+            assert rt.input_idle is presence.windows_input_idle_seconds
+            assert rt.presence._input_idle is presence.windows_input_idle_seconds
+        finally:
+            rt.close()
+        monkeypatch.setattr(sys, "platform", "linux")
+        rt = NodeRuntime.local(ScriptApiGateway(fake), store, log, node_id="node-linux")
+        try:
+            assert rt.input_idle is None and rt.presence._input_idle is None
+        finally:
+            rt.close()
+        explicit = lambda: 999.0  # noqa: E731
+        rt = NodeRuntime.local(
+            ScriptApiGateway(fake), store, log, node_id="node-x", input_idle=explicit
+        )
+        try:
+            assert rt.presence._input_idle is explicit
+        finally:
+            rt.close()
+    finally:
+        store.close()
+
+
+def test_presence_recent_keyboard_input_refuses_a_hot_op(tmp_path: Path) -> None:
+    """The observed context is unchanged and the idle window has elapsed, but the OS says a
+    key was pressed 5 s ago: a human is working, so the op is held back (nothing written);
+    it runs once the input has been idle for a whole window."""
+    idle = {"seconds": 5.0}
+    world = JobWorld(tmp_path, input_idle=lambda: idle["seconds"])
+    world.presence.observe(world.gw.get_context(), world.clock())  # unchanged, window elapsed
+    assert world.presence.may_switch(world.clock()).code == "human_input"
+    job_id = world.submit("ops.sequence", _marker_job(100), world.locator())
+    for _ in range(3):
+        world.runner.pump()
+    assert world.main.markers == {} and len(world.broker.pending()) == 1
+    assert world.runner.get(job_id).state == "running"
+    idle["seconds"] = 600.0
+    world.runner.run_until_settled()
+    assert world.runner.get(job_id).state == "succeeded" and sorted(world.main.markers) == [100]
+
+
+def test_presence_a_failing_input_idle_provider_fails_closed(tmp_path: Path) -> None:
+    def broken() -> float:
+        raise OSError("GetLastInputInfo failed")
+
+    world = JobWorld(tmp_path, input_idle=broken)
+    world.presence.observe(world.gw.get_context(), world.clock())
+    decision = world.presence.may_switch(world.clock())
+    assert not decision.allowed and decision.code == "input_idle_error"
+    world.submit("ops.sequence", _marker_job(100), world.locator())
+    for _ in range(3):
+        world.runner.pump()
+    assert world.main.markers == {}  # fail closed: a provider we cannot read is a human

@@ -9,7 +9,10 @@ The wiring, in one place so nothing is left to a default by accident:
 - the :class:`~aar.node.leases.LeaseManager` and :class:`~aar.node.feed.NodeFeed` built by
   :func:`aar.node.feed.wire_feed`, bound late so each sees the other: the feed's
   ``lease_source`` is the table's ``active`` and both run on the runtime's monotonic clock;
-- one :class:`~aar.node.feed.PresenceReporter` over the broker's presence guard;
+- the broker's :class:`~aar.node.presence.PresenceGuard` consults the OS keyboard/mouse idle
+  time (``GetLastInputInfo`` on Windows, :func:`~aar.node.presence.default_input_idle_provider`)
+  unless the caller injects another provider; a provider that fails refuses (fail closed);
+- one :class:`~aar.node.feed.PresenceReporter` over that guard;
 - the pump (:meth:`aar.node.jobs.JobRunner.pump`) calls ``PresenceReporter.sync`` and then
   ``NodeFeed.flush`` on every tick -- at the end of the drain it runs, on the broker's thread,
   because the lease table, presence guard and feed are not thread-safe -- and records each
@@ -39,10 +42,20 @@ from aar.node.gateway import ResolveGateway
 from aar.node.hublink import HubLink, LocalHubLink
 from aar.node.jobs import ApprovalPolicy, JobRunner, JobStore, PumpOutcome, Watchdog
 from aar.node.jobs.runner import _DRAIN_BUDGET
-from aar.node.presence import PresenceGuard
+from aar.node.presence import InputIdleProvider, PresenceGuard, default_input_idle_provider
 
 DEFAULT_IDLE_WINDOW = 60.0
 """Seconds of quiet before the presence guard calls a human gone (the broker's default)."""
+
+
+class _OsDefault:
+    """Sentinel: use the OS input-idle provider (``None`` means: deliberately none)."""
+
+    def __repr__(self) -> str:
+        return "OS_DEFAULT"
+
+
+OS_DEFAULT = _OsDefault()
 
 
 class NodeIdInUse(RuntimeError):
@@ -68,6 +81,7 @@ class NodeRuntime:
         wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         broker_config: BrokerConfig | None = None,
         idle_window: float = DEFAULT_IDLE_WINDOW,
+        input_idle: InputIdleProvider | _OsDefault | None = OS_DEFAULT,
         human_id: str | None = None,
         approval: ApprovalPolicy | None = None,
         watchdog: Watchdog | None = None,
@@ -84,7 +98,12 @@ class NodeRuntime:
             self.node_id = node_id
             self.clock = clock
             self.feed, self.leases = wire_feed(node_id, transport, clock=clock)
-            self.presence = PresenceGuard(idle_window=idle_window)
+            # Resolved here, not at import, so the provider matches the platform it runs on.
+            self.input_idle = (
+                default_input_idle_provider() if isinstance(input_idle, _OsDefault) else input_idle
+            )
+            """Seconds since the last keyboard/mouse input (``None``: the OS cannot tell)."""
+            self.presence = PresenceGuard(idle_window=idle_window, input_idle=self.input_idle)
             self.presence_reporter = PresenceReporter(self.presence, self.feed, human_id=human_id)
             self.branch_registry = BranchRegistry()
             self.broker = Broker(
