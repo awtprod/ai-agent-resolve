@@ -315,6 +315,8 @@ How agents write to the hub (`aar.hub.writes`, `aar.hub.facts`). The MCP tools a
 
 - Before every hot op, the node checks that the expected project is the one open. It refuses to switch project or database while a human is active, unless a human forces it from the console.
 - Switching databases, creating or restoring cloud projects, and writing to a production project all need a human approval token, which is recorded in the event log.
+- **Approvals in node jobs (F15 and the branch guard).** Every op of a job runs as the job's agent, behind the branch guard, in every project. An op the guard refuses (a human's timeline, or state every timeline shares) runs only with a `project.write` approval on target `<project id>#op:<op>#step:<n>`, consumed for that one op occurrence. A mutating op against a production project also needs the job's plain `project.write` approval on the project id, consumed once per job and then good for the job's later writes. The one exception is the overridden op itself: its own override counts for it, so one human grant covers that single op, but it licenses nothing after it. Every consume is audited on the hub as `agent:<agent id>#<job id>`, and a stored approval is trusted only when the hub shows that consume for that exact scope and target.
+- **Render-job ownership.** The node's local job store is its trust root for render-job ownership: a job deletes or adopts only the render job whose Resolve `JobId` its own journal recorded there.
 - Deliver settings are recorded before a render preset loads and restored afterwards.
 - Never change Input Color Space on BRAW clips, and never sweep a colour space across a whole bin.
 - Never connect to the cloud library's database directly.

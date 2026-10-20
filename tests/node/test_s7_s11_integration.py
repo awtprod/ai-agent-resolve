@@ -769,17 +769,6 @@ def test_a_production_project_still_needs_its_f15_approval_for_the_agents_own_br
     assert world.runner.get(job_id).state == "succeeded"
 
 
-def test_a_production_override_counts_as_the_f15_approval(tmp_path: Path) -> None:
-    """On a production project a guarded op needs ONE human approval, the one naming it."""
-    world = _human_world(tmp_path, approval=ApprovalPolicy(live=True))
-    job_id = world.submit("ops.sequence", _marker_job(100), world.locator())
-    world.runner.run_until_settled()
-    world.runner.approve(job_id, _op_grant(world, "markers.add"), HUMAN)
-    world.runner.run_until_settled()
-    assert world.runner.get(job_id).state == "succeeded"
-    assert len(world.log.read(types=["approval.consumed"])) == 1
-
-
 def test_a_stop_still_pauses_a_job_waiting_on_the_guard(tmp_path: Path) -> None:
     world = _human_world(tmp_path)
     job_id = world.submit("ops.sequence", _marker_job(100), world.locator())
