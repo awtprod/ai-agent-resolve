@@ -17,7 +17,7 @@ from aar.node.ops.framework import OpError
 from aar.node.ops.render import BuildParams, _verify_size
 
 from .fake_resolve import DeliverState
-from .jobs_support import AGENT_ID, JobWorld, MAIN_REF
+from .jobs_support import AGENT_ID, MAIN_REF, JobWorld
 
 
 def _params(world: JobWorld, **over: object) -> dict:
@@ -100,8 +100,10 @@ def test_no_size_given_is_unchanged(tmp_path: Path) -> None:
 def test_size_overrides_the_delivery_preset(tmp_path: Path) -> None:
     world = JobWorld(tmp_path)
     world.fake.presets["delivery-4k"] = DeliverState(
-        "mp4", "H264", 1, {"TargetDir": "D:/Out", "CustomName": "x", "FormatWidth": 3840,
-                           "FormatHeight": 2160}
+        "mp4",
+        "H264",
+        1,
+        {"TargetDir": "D:/Out", "CustomName": "x", "FormatWidth": 3840, "FormatHeight": 2160},
     )
     view = _run(world, cleanup=False, preset="delivery-4k", width=1280, height=720)
     assert view is not None and view.state == JobState.SUCCEEDED.value, view and view.error

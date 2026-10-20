@@ -200,10 +200,10 @@ Recipes turn the existing, proven pipeline (the CCN shorts and long-form workflo
 6. Resolve build from the template: lower third, sting, outro, A5 bus.
 7. Camera match.
 8. Crossfades and loudness.
-9. Review render.
+9. Review render: `render.build` sets the output size and quality, then `aar.deliver` fits it under the review cap.
 10. QA: re-transcribe the joins, LUFS, offline frames, colour.
-11. Human review loop.
-12. Master render.
+11. Human review loop: the review render is stored, QA'd and sent for a human decision.
+12. Master render: `aar.deliver` pulls it, hashes and stores it, and records its QA facts.
 13. Shorts, then captions.
 14. Thumbnails (thumbpipe).
 15. Publish: YouTube through Command Center, Instagram through ccn-web-app.
@@ -310,11 +310,22 @@ How agents write to the hub (`aar.hub.writes`, `aar.hub.facts`). The MCP tools a
 
   The projection gives each key's current value (the last event in log order wins), who set it and when, an optional source (a recipe node and/or a stored artifact) and its last 10 changes. A retraction keeps the history. Malformed or forged events are skipped and listed. Any actor kind may record; a project holds at most 1000 keys.
 
+#### Delivery (S13i)
+
+R6 steps 9 to 12 turn a finished render into a stored, hashed, QA'd and (for review) sent artifact. Two parts carry it.
+
+- **Render output size (`render.build`, `render` job).** The build op takes an optional output size (`width`/`height`, both or neither, even, 16 to 8192), `video_quality` (a bit rate in kbit/s from 100 to 400000, or one of Least/Low/Medium/High/Best; 0 is refused, so None means automatic), `export_audio` and `audio_codec`. `_configure` writes them through `SetRenderSettings` **after** the delivery preset loads, so they override it, and the §5 Deliver snapshot carries the human's own size and quality back on restore. After `AddRenderJob` the op reads the size back off the queued job: a size the queue reports but that does not match is `render_size_ignored` (the just-added job is cleaned up), while a queue that reports no size keys is recorded as `size_verified: false` rather than failing. A resumed build adopts its journaled job and never re-applies or re-verifies the size.
+
+- **`aar.deliver` (hub-side library, `aar deliver review|master`).** Dependencies are injected (an `EditHostLike` for the verified transport, a `Transcoder` with a default two-pass `FfmpegTranscoder`, a QA callable defaulting to `aar.qa.check`, and the hub's `EventLog`, `ArtifactStore` and `Actor`). Each delivery works in `<workdir>/<project>/<deliverable>/<render_job_id>/`; the `workdir` is required, absolute and durable (never a scratch directory — the library creates none of its own), and every file it writes, including the ffmpeg two-pass logs, stays inside it.
+  - **Review.** Pull the render (skipping the pull when the local copy already matches the remote sha256; a different sha256 is `deliver_local_mismatch`, never overwritten). The review box is 1280×720 or 720×1280, chosen by the **source aspect, not by kind**; the fit keeps the aspect, uses even dimensions and never upscales. A render that already fits the box and the cap (`review_mp4_max_mb`, decimal MB) is used as is; otherwise it is transcoded two-pass H.264 + AAC 128 kbit/s + `+faststart` at `floor((cap·0.92·8/duration − 128000)/1000)` kbit/s (capped at 4000, refused below 250 as `review_cannot_fit`), retried once at 85% of that rate, and `review_over_cap` if it is still over. A partial transcode goes to a `.part` and is renamed only after ffmpeg exits 0, the output decodes, and its size is checked against the cap. QA runs with kind `review`; a failing report is `review_qa_failed` and nothing is stored or sent. The review MP4 is stored (`ArtifactStore.put`, deduped by content); its sha256 and size go to `render.hash.<deliverable>` and its size in MB to `qa.size.<deliverable>`; then a human review is requested. The facts and the review carry deterministic idempotency keys, so a full re-run after success writes nothing new and does not transcode again.
+  - **Master.** Pull (same resume rules), store with role `master`, and QA with the source kind. The hash fact is always written; a `qa.<metric>.<deliverable>` fact is written for each numeric value a check measured (integrated loudness in LUFS, true peak in dBTP, duration in s), never guessed. There is no transcode and no review request: the master is stored whether QA passes or fails, because the publish gate (step 13) is a human. Masters can be several gigabytes, so every hash and copy is streamed; `command_timeout` on the edit host has to be raised for a large master.
+  - **Errors** are a typed `DeliverError(code, message, fix_hint, **detail)`; a failure reports the `completed_steps` already done. The stable codes are `invalid_render_output`, `invalid_workdir`, `invalid_name`, `deliver_local_mismatch`, `review_cannot_fit`, `review_over_cap`, `transcode_failed` and `review_qa_failed`. The CLI exits 0 (done), 1 (QA failed), 2 (bad input or a missing tool) or 3 (a transport error). Recipe wiring is a later slice.
+
 ## 5. Safety rules (enforced in code, not just written here)
 
 - Before every hot op, the node checks that the expected project is the one open. It refuses to switch project or database while a human is active, unless a human forces it from the console.
 - Switching databases, creating or restoring cloud projects, and writing to a production project all need a human approval token, which is recorded in the event log.
-- Deliver settings are recorded before a render preset loads and restored afterwards.
+- Deliver settings are recorded before a render preset loads and restored afterwards. The recorded settings include the output size (`FormatWidth`/`FormatHeight`) and quality, so a render that sets its own size never leaves the human's size changed.
 - Never change Input Color Space on BRAW clips, and never sweep a colour space across a whole bin.
 - Never connect to the cloud library's database directly.
 - DRP writes always go to new files. Originals are never overwritten.
