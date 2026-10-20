@@ -539,11 +539,13 @@ def _settle_backup(backup: Path, sidecar: Path, out: Path, left: list[LeftBehind
     """Delete the ``--force`` snapshot of the label, unless it no longer bears our stamp.
 
     Runs when the edit ends, on every path. A snapshot moved back over the label (a failed
-    placement) is gone and needs nothing. A hard-linked snapshot shares the old label's file, so a
-    label written in place after the check shows up here: such a snapshot, or one that was never
-    ours (a refused run), is kept and named in ``left``, never deleted.
+    placement) is gone and needs nothing, and so is one already kept elsewhere; one already named
+    in ``left`` (kept by :func:`_roll_back_label` but left under its temporary name) is never
+    deleted. A hard-linked snapshot shares the old label's file, so a label written in place
+    after the check shows up here: such a snapshot, or one that was never ours (a refused run), is
+    kept and named in ``left``, never deleted.
     """
-    if not os.path.lexists(backup):
+    if not os.path.lexists(backup) or any(x.path == str(backup) for x in left):
         return
     if _is_our_sidecar(sidecar, out, read=backup):
         backup.unlink(missing_ok=True)
@@ -563,20 +565,25 @@ def _settle_backup(backup: Path, sidecar: Path, out: Path, left: list[LeftBehind
 def _keep_snapshot(backup: Path, sidecar: Path) -> Path:
     """Move a kept snapshot off its temporary-file name, so leftovers() never lists it.
 
-    The new name, ``.<label>.<8 chars>.label-snapshot.json``, is claimed with ``mkstemp``
-    (exclusive, never an existing file) and the snapshot ``os.replace``s that empty claim. If the
-    move fails the snapshot stays under its temporary name, where it is still kept and reported,
-    and a later run lists it among the leftovers.
+    The new name, ``.<label>.<8 chars>.label-snapshot.json`` (the output's name plus 39
+    characters), is claimed with ``mkstemp`` (exclusive, never an existing file) and the snapshot
+    ``os.replace``s that empty claim. If any step fails -- the claim itself (no space, a read-only
+    directory, a name past the filesystem's limit) or the move -- the snapshot stays under its
+    temporary name, where it is still kept and reported, and a later run lists it among the
+    leftovers. This never raises: it runs while the edit unwinds, and must not turn a finished
+    write or a refusal into an error.
     """
-    fd, name = tempfile.mkstemp(
-        prefix=f".{sidecar.name}.", suffix=SNAPSHOT_SUFFIX, dir=backup.parent
-    )
-    os.close(fd)
+    name: str | None = None
     try:
+        fd, name = tempfile.mkstemp(
+            prefix=f".{sidecar.name}.", suffix=SNAPSHOT_SUFFIX, dir=backup.parent
+        )
+        os.close(fd)
         os.replace(backup, name)
     except OSError:
-        with contextlib.suppress(OSError):
-            os.unlink(name)  # our own empty claim on a fresh random name
+        if name is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(name)  # our own empty claim on a fresh random name
         return backup
     return Path(name)
 
@@ -589,8 +596,11 @@ def _roll_back_label(
     The label goes back to its snapshot (``--force``) or is removed. If that cleanup fails too,
     the placement error ``exc`` still wins: the cleanup failure is added to it as a note, and the
     label left over (aar's own) is reported as ``own-label`` in ``left`` and on the raised error
-    (a :class:`PlacementError` with the same errno). A ``FileExistsError`` is returned as it is,
-    because ``edit_file`` turns it into the ``out-exists`` refusal, whose outcome carries ``left``.
+    (a :class:`PlacementError` with the same errno). When it was the ``--force`` restore that
+    failed, the snapshot is the correct label of the output still at ``--out``: it is kept
+    (:func:`_keep_snapshot`) and reported as ``label-snapshot`` too, never deleted. A
+    ``FileExistsError`` is returned as it is, because ``edit_file`` turns it into the
+    ``out-exists`` refusal, whose outcome carries ``left``.
     """
     try:
         if backup is not None:
@@ -606,15 +616,29 @@ def _roll_back_label(
             "next run for this --out reports it as orphan-sidecar (out-exists if a file is at "
             "the output name): delete it, or pass --force",
         )
-        left.append(own)
+        found = [own]
+        if backup is not None and os.path.lexists(backup):
+            kept = _keep_snapshot(backup, sidecar)
+            out_name = sidecar.name[: -len(SIDECAR_SUFFIX)]
+            found.append(
+                LeftBehind(
+                    str(kept),
+                    "label-snapshot",
+                    f"aar's earlier label, the correct label of the output still at {out_name}: "
+                    f"restoring it over {sidecar.name} failed, so {sidecar.name} now holds the "
+                    "label of an output this run did not place (own-label). Move this file over "
+                    f"{sidecar.name} to restore it",
+                )
+            )
+        left.extend(found)
         note = (
             f"aar could not roll back its label {sidecar} after this error: {cleanup!r}; the label "
             "is left over (left_behind kind own-label)"
         )
         if isinstance(exc, PlacementError):
-            exc.left_behind.append(own)
+            exc.left_behind.extend(found)
         elif isinstance(exc, OSError) and not isinstance(exc, FileExistsError):
-            wrapped = PlacementError(exc, [own])  # edit_file raises it "from exc"
+            wrapped = PlacementError(exc, list(found))  # edit_file raises it "from exc"
             wrapped.add_note(note)
             return wrapped
         exc.add_note(note)
