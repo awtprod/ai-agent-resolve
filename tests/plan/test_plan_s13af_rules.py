@@ -130,6 +130,7 @@ LOCAL_BRAW_NAMES = [
     "/acme/ep#2/a.braw",
     "/acme/a://b#1.braw",  # a scheme counts only at the start
     "bin:take #3.braw",  # a colon without the two slashes is no scheme
+    "bin:/take #3.braw",  # a scheme needs ://, not just :/
     "a.mov?f=a.braw",  # a local name: it really does end in .braw
     "a.mov#a.braw",
 ]
