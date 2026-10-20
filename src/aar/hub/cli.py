@@ -197,6 +197,24 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     _add_db(node_list)
     node_list.set_defaults(func=_node_list)
 
+    nodeapi = hub_sub.add_parser(
+        "nodeapi",
+        help="Serve the node-facing HTTP API (POST /node/v1/<op>, enrolled bearer token).",
+    )
+    nodeapi.add_argument("--db", required=True, help="Path to the SQLite event-log database.")
+    nodeapi.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Interface to bind (default: 127.0.0.1; tailnet-only, the token is a 2nd factor).",
+    )
+    nodeapi.add_argument("--port", type=int, default=8789, help="Port to bind (default: 8789).")
+    nodeapi.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Permit binding to a non-loopback interface (required for any non-loopback --host).",
+    )
+    nodeapi.set_defaults(func=_nodeapi)
+
     from aar.hub import write_cli
 
     write_cli.register(hub_sub)
@@ -298,6 +316,38 @@ def _node_list(args: argparse.Namespace) -> int:
     finally:
         log.close()
     return _print({"nodes": [record.to_dict() for record in records]})
+
+
+def _nodeapi(args: argparse.Namespace) -> int:
+    if args.host not in _LOOPBACK and not args.allow_remote:
+        return _fail(
+            "remote_bind_refused",
+            f"refusing to bind to {args.host!r} without --allow-remote: the hub is tailnet-only "
+            "(default bind is 127.0.0.1; the enrolled token is a second factor, not the only gate)",
+        )
+
+    # Import here so the core CLI does not require the optional 'hub' extra (Starlette/uvicorn).
+    from aar.hub.nodeapi import build_app
+
+    try:
+        log = _open_existing(args.db)
+    except _DatabaseUnavailable as exc:
+        return _fail("database_unavailable", str(exc))
+
+    import uvicorn
+
+    app = build_app(log)
+    # proxy_headers=False: the peer address must be the real TCP peer (loopback by default),
+    # never a forwarded header a caller controls. server_header=False keeps the banner quiet.
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        proxy_headers=False,
+        server_header=False,
+        log_level="info",
+    )
+    return 0
 
 
 def _serve(args: argparse.Namespace) -> int:
