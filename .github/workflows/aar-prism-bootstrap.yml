@@ -1,5 +1,5 @@
-name: Prism bootstrap review PR1
-run-name: Prism bootstrap review PR1
+name: Prism bootstrap review PR2
+run-name: Prism bootstrap review PR2
 on:
   push:
     branches:
@@ -14,7 +14,7 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - name: Review PR1 with installed Prism
+      - name: Review PR2 with installed Prism
         shell: bash
         run: node /home/atryan/prism-review/scripts/run-local-action.mjs
         env:
@@ -24,5 +24,5 @@ jobs:
           PRISM_OPENAI_BASE_URL: http://127.0.0.1:8317/v1
           PRISM_MODEL: gpt-6.1-sol
           PRISM_REASONING_EFFORT: high
-          PRISM_PULL_REQUEST_NUMBER: "1"
+          PRISM_PULL_REQUEST_NUMBER: "2"
           PRISM_FAIL_ON_SEVERITY: none
