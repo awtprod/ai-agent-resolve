@@ -10,6 +10,7 @@ its contents and any key material are never read here.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -19,7 +20,11 @@ from aar.host.errors import ConfigError, PathRefused
 from aar.host.powershell import DEFAULT_REMOTE_CMDLINE_MAX
 from aar.host.winpath import PathForm, _Win, normalize_root
 
-__all__ = ["EditHostConfig", "env_config"]
+__all__ = ["MAX_TIMEOUT_SECONDS", "EditHostConfig", "env_config"]
+
+# Upper bound on any timeout (seconds). 7 days: long enough for any real master transfer, finite
+# enough that inf/nan/1e300 never reach subprocess/selectors (which raise OverflowError there).
+MAX_TIMEOUT_SECONDS = 7 * 24 * 60 * 60  # 604800
 
 _ENV_ALIAS = "AAR_EDIT_SSH_ALIAS"
 _ENV_CONFIG = "AAR_EDIT_SSH_CONFIG"
@@ -35,9 +40,8 @@ _PATH_FORMS = ("drive", "slash")
 # A strict ssh host/alias: an alphanumeric start, then alphanumerics, dot, underscore, @, hyphen.
 # This refuses the characters that change scp's host:path splitting -- '/', '[', ':', spaces -- and
 # a leading '-' (which would look like an option).
-_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]*$")
-_TRUE = ("1", "true", "yes", "on")
-_FALSE = ("0", "false", "no", "off")
+# Matched with fullmatch, so a trailing newline is refused ($ would match before it).
+_ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]*")
 
 
 def _check_token(value: str, name: str) -> str:
@@ -77,24 +81,29 @@ class EditHostConfig:
     connect_timeout: int = 10
     command_timeout: float = 300.0
     cmdline_max: int = DEFAULT_REMOTE_CMDLINE_MAX
-    scp_use_sftp: bool = True
     path_map: tuple[tuple[str, str], ...] = ()
     _remote_roots_parsed: tuple[_Win, ...] = field(default=(), repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.alias, str) or not _ALIAS_RE.match(self.alias):
+        if not isinstance(self.alias, str) or not _ALIAS_RE.fullmatch(self.alias):
             raise ConfigError(
-                f"{_ENV_ALIAS} must match {_ALIAS_RE.pattern} (a plain ssh host/alias): "
+                f"{_ENV_ALIAS} must fullmatch {_ALIAS_RE.pattern} (a plain ssh host/alias): "
                 f"{self.alias!r}"
             )
         _check_token(self.ssh_config, _ENV_CONFIG)
         if self.path_form not in _PATH_FORMS:
             raise ConfigError(f"path form must be one of {_PATH_FORMS}, not {self.path_form!r}")
         _check_int(self.connect_timeout, "connect timeout")
-        if type(self.command_timeout) is bool or not (
-            isinstance(self.command_timeout, (int, float)) and self.command_timeout > 0
+        ct = self.command_timeout
+        if (
+            type(ct) is bool
+            or not isinstance(ct, (int, float))
+            or not math.isfinite(ct)
+            or not (0 < ct <= MAX_TIMEOUT_SECONDS)
         ):
-            raise ConfigError("command timeout must be a positive number (seconds)")
+            raise ConfigError(
+                f"command timeout must be a finite number of seconds in (0, {MAX_TIMEOUT_SECONDS}]"
+            )
         _check_int(self.cmdline_max, "cmdline max")
         if not self.remote_roots:
             raise ConfigError("at least one remote root is required")
@@ -154,6 +163,14 @@ def env_config(env: Mapping[str, str] | None = None) -> EditHostConfig:
     ]
     if missing:
         raise ConfigError(f"missing required environment variables: {', '.join(missing)}")
+    if _ENV_SCP_SFTP in env:
+        # The SFTP toggle was removed (S13f2 F1): scp always runs with -s. A still-set value means
+        # someone expects legacy SCP, which is unsafe, so refuse rather than silently ignore it.
+        raise ConfigError(
+            f"{_ENV_SCP_SFTP} is no longer supported: scp always uses SFTP mode (-s). "
+            f"Unset {_ENV_SCP_SFTP}. Legacy SCP is unsupported because it is unsafe "
+            "(the remote shell parses the path); the hub needs OpenSSH >= 8.7."
+        )
     connect = env.get(_ENV_CONNECT_TIMEOUT)
     command = env.get(_ENV_COMMAND_TIMEOUT)
     try:
@@ -169,7 +186,6 @@ def env_config(env: Mapping[str, str] | None = None) -> EditHostConfig:
         cmdline_max = int(cmdline) if cmdline else DEFAULT_REMOTE_CMDLINE_MAX
     except ValueError as exc:
         raise ConfigError(f"{_ENV_CMDLINE_MAX} must be an integer: {cmdline!r}") from exc
-    scp_use_sftp = _parse_bool(env.get(_ENV_SCP_SFTP), _ENV_SCP_SFTP, default=True)
     form = env.get(_ENV_PATH_FORM) or "drive"
     return EditHostConfig(
         alias=env[_ENV_ALIAS],
@@ -180,16 +196,4 @@ def env_config(env: Mapping[str, str] | None = None) -> EditHostConfig:
         connect_timeout=connect_timeout,
         command_timeout=command_timeout,
         cmdline_max=cmdline_max,
-        scp_use_sftp=scp_use_sftp,
     )
-
-
-def _parse_bool(raw: str | None, name: str, *, default: bool) -> bool:
-    if raw is None or raw.strip() == "":
-        return default
-    text = raw.strip().lower()
-    if text in _TRUE:
-        return True
-    if text in _FALSE:
-        return False
-    raise ConfigError(f"{name} must be a boolean (one of {_TRUE + _FALSE}): {raw!r}")
