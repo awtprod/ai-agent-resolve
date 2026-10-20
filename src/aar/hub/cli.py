@@ -165,6 +165,38 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     show.add_argument("review_id", help="Review id.")
     show.set_defaults(func=_review_show)
 
+    node = hub_sub.add_parser(
+        "node", help="Enrol, revoke and list the nodes allowed to call the node API."
+    )
+    node_sub = node.add_subparsers(dest="node_command", required=True)
+
+    enroll = node_sub.add_parser(
+        "enroll",
+        help="Enrol a node and print its bearer token once (only its sha256 is stored).",
+    )
+    _add_db(enroll)
+    enroll.add_argument("node_id", help="The node id (as the node reports it to the hub).")
+    _add_actor(enroll)
+    enroll.add_argument(
+        "--rotate",
+        action="store_true",
+        help="Revoke the node's current token and enrol a new one, in one transaction.",
+    )
+    enroll.set_defaults(func=_node_enroll)
+
+    revoke = node_sub.add_parser("revoke", help="Revoke a node's current token.")
+    _add_db(revoke)
+    revoke.add_argument("node_id", help="The node id to revoke.")
+    _add_actor(revoke)
+    revoke.add_argument("--reason", default="revoke", help="Why, for the audit trail.")
+    revoke.set_defaults(func=_node_revoke)
+
+    node_list = node_sub.add_parser(
+        "list", help="List enrolled nodes with enrol/revoke times and a hash prefix only."
+    )
+    _add_db(node_list)
+    node_list.set_defaults(func=_node_list)
+
     from aar.hub import write_cli
 
     write_cli.register(hub_sub)
@@ -211,6 +243,61 @@ def _init(args: argparse.Namespace) -> int:
         )
     log.close()
     return _print({"db": str(db), "artifacts": str(artifacts)})
+
+
+def _node_enroll(args: argparse.Namespace) -> int:
+    from aar.hub import nodes
+
+    try:
+        actor = _parse_actor(args.actor)
+    except ValueError as exc:
+        return _fail("invalid_actor", str(exc))
+    try:
+        log = _open_existing(args.db)
+    except _DatabaseUnavailable as exc:
+        return _fail("database_unavailable", str(exc))
+    try:
+        node_id, token = nodes.enroll(log, args.node_id, actor, rotate=args.rotate)
+    except nodes.NodeError as exc:
+        return _fail(exc.code, str(exc))
+    finally:
+        log.close()
+    # The token is printed here, once, and never stored or logged anywhere.
+    return _print({"node_id": node_id, "token": token})
+
+
+def _node_revoke(args: argparse.Namespace) -> int:
+    from aar.hub import nodes
+
+    try:
+        actor = _parse_actor(args.actor)
+    except ValueError as exc:
+        return _fail("invalid_actor", str(exc))
+    try:
+        log = _open_existing(args.db)
+    except _DatabaseUnavailable as exc:
+        return _fail("database_unavailable", str(exc))
+    try:
+        nodes.revoke(log, args.node_id, actor, reason=args.reason)
+    except nodes.NodeError as exc:
+        return _fail(exc.code, str(exc))
+    finally:
+        log.close()
+    return _print({"node_id": args.node_id, "revoked": True})
+
+
+def _node_list(args: argparse.Namespace) -> int:
+    from aar.hub import nodes
+
+    try:
+        log = _open_existing(args.db, read_only=True)
+    except _DatabaseUnavailable as exc:
+        return _fail("database_unavailable", str(exc))
+    try:
+        records = nodes.list_nodes(log)
+    finally:
+        log.close()
+    return _print({"nodes": [record.to_dict() for record in records]})
 
 
 def _serve(args: argparse.Namespace) -> int:
