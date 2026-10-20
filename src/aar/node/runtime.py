@@ -29,6 +29,7 @@ The wiring, in one place so nothing is left to a default by accident:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -42,7 +43,16 @@ from aar.node.gateway import ResolveGateway
 from aar.node.hublink import HubLink, LocalHubLink
 from aar.node.jobs import ApprovalPolicy, JobRunner, JobStore, PumpOutcome, Watchdog
 from aar.node.jobs.runner import _DRAIN_BUDGET
+from aar.node.locator import ProjectLocator
 from aar.node.presence import InputIdleProvider, PresenceGuard, default_input_idle_provider
+from aar.node.remote import (
+    DEFAULT_RESPONSE_CAP,
+    DEFAULT_TIMEOUT,
+    RemoteConfig,
+    RemoteFeedTransport,
+    RemoteHubLink,
+    _NodeClient,
+)
 
 DEFAULT_IDLE_WINDOW = 60.0
 """Seconds of quiet before the presence guard calls a human gone (the broker's default)."""
@@ -154,8 +164,74 @@ class NodeRuntime:
             **kwargs,  # type: ignore[arg-type]
         )
 
+    @classmethod
+    def remote(
+        cls,
+        gateway: ResolveGateway,
+        store: JobStore,
+        *,
+        node_id: str,
+        hub_url: str,
+        token_file: str | os.PathLike[str],
+        connect_timeout: float = DEFAULT_TIMEOUT,
+        read_timeout: float = DEFAULT_TIMEOUT,
+        response_cap: int = DEFAULT_RESPONSE_CAP,
+        **kwargs: object,
+    ) -> NodeRuntime:
+        """A runtime whose hub is on another host, reached over HTTP (``aar hub nodeapi``).
+
+        Same wiring as :meth:`local`, but the link and the feed go through
+        :class:`~aar.node.remote.RemoteHubLink` and
+        :class:`~aar.node.remote.RemoteFeedTransport` over one stdlib HTTP client. The gateway is
+        injected, as it is for ``local``. Does not add ``aar node run`` (that is S15b).
+        """
+        config = RemoteConfig(
+            hub_url=hub_url,
+            token_file=token_file,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            response_cap=response_cap,
+        )
+        client = _NodeClient(config)
+        return cls(
+            gateway,
+            store,
+            RemoteHubLink(client),
+            RemoteFeedTransport(client),
+            node_id=node_id,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
     def pump(self) -> PumpOutcome:
         return self.runner.pump()
+
+    def rebuild_branches(self, projects: tuple[ProjectLocator, ...]) -> int:
+        """Replace stale in-memory ownership with authenticated hub records.
+
+        This is called before a remote worker pumps any local job, both on process startup
+        and after reconnect. A failure leaves the new registry empty (fail closed); callers
+        must not pump until the rebuild succeeds.
+        """
+        current = self.branch_registry
+        # Hot ops already queued by the runner hold this exact registry object. Clear it in
+        # place so reconnect cannot leave such a closure pointing at stale ownership.
+        current._owners.clear()
+        fresh = BranchRegistry()
+        count = 0
+        for project in projects:
+            if project.project_id is None:
+                raise ValueError("branch rebuild projects need a project_id")
+            for branch in self.hublink.branches(project):
+                fresh.register(
+                    project.project_id,
+                    branch.branch_timeline_id,
+                    source_timeline_id=branch.source_timeline_id,
+                    agent_id=branch.agent_id,
+                    version=branch.version,
+                )
+                count += 1
+        current._owners.update(fresh._owners)
+        return count
 
     def close(self, timeout: float = 5.0) -> bool:
         """Stop the runner (no op it submitted runs any more) and free the node id. The job

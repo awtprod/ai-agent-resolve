@@ -27,7 +27,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 
-from aar.hub import approvals, control, reviews
+from aar.hub import approvals, control, jobs, reviews
 from aar.hub.artifacts import ArtifactStore
 from aar.hub.collab import branches as collab_branches
 from aar.hub.collab import project_board as collab_project_board
@@ -76,6 +76,8 @@ _MAX_BOARD_CURSOR = 2048
 _MAX_BRANCHES_PAGE = 50
 _MAX_BRANCHES_LIMIT = 100
 _MAX_BRANCHES_BYTES = 256 * 1024
+_MAX_JOBS_PAGE = 100
+_MAX_JOBS_LIMIT = 500
 
 
 def _bounded(value: Any, depth: int = 0) -> Any:
@@ -410,6 +412,45 @@ def build_server(
             if include_inactive or token.state(now) == "active"
         ]
         return {"approvals": listed, "skipped": skipped_summary(view.skipped)}
+
+    @server.tool(
+        name="jobs_list",
+        description=(
+            "List durable Resolve jobs, including waiting_for_node when its configured node "
+            "has not claimed it and node_offline when a sticky claim's lease expired. "
+            'Returns {"jobs": [...], "next_cursor": N|null}; payload params and approval '
+            "references are omitted. Optional project_id and state filters are exact."
+        ),
+        annotations=_READ_ONLY,
+    )
+    def jobs_list(
+        project_id: str | None = None,
+        state: str | None = None,
+        cursor: int = 0,
+        limit: int = _MAX_JOBS_PAGE,
+    ) -> dict[str, Any]:
+        if project_id is not None and (
+            not isinstance(project_id, str) or not 0 < len(project_id) <= _MAX_PROJECT_ID
+        ):
+            raise ToolError(f"project_id must be 1 to {_MAX_PROJECT_ID} characters")
+        if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
+            raise ToolError("cursor must be a non-negative integer")
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise ToolError("limit must be an integer")
+        limit = max(1, min(_MAX_JOBS_LIMIT, limit))
+        now = clock()
+        found = [
+            job
+            for job in jobs.list_jobs(log)
+            if (project_id is None or job.target.project_id == project_id)
+            and (state is None or job.state(now) == state)
+        ]
+        page = found[cursor : cursor + limit]
+        end = cursor + len(page)
+        return {
+            "jobs": [job.to_dict(now, include_payload=False) for job in page],
+            "next_cursor": end if end < len(found) else None,
+        }
 
     if agent_writes:
         from aar.hub.mcp_writes import register_write_tools
