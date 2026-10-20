@@ -215,13 +215,13 @@ class EditHost:
 
     def _scp_base(self) -> list[str]:
         cfg = self.config
-        # -s forces SFTP mode so the glob-escaping and no-remote-shell assumptions do not depend on
-        # the client's default (a client older than OpenSSH 8.7 would reject -s; the hub is 9.6p1).
-        # Configurable via AAR_EDIT_SCP_SFTP, default on.
-        sftp = ["-s"] if cfg.scp_use_sftp else []
+        # Always -s: force SFTP mode so the glob-escaping and no-remote-shell assumptions never
+        # depend on the client's default. A client older than OpenSSH 8.7 rejects -s and fails
+        # closed with a typed transport error; legacy SCP (which parses the remote path through the
+        # remote shell) is unsupported because it is unsafe. The hub is OpenSSH 9.6p1.
         return [
             "scp",
-            *sftp,
+            "-s",
             "-F",
             cfg.ssh_config,
             "-o",

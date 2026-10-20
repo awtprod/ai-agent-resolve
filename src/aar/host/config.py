@@ -36,8 +36,6 @@ _PATH_FORMS = ("drive", "slash")
 # This refuses the characters that change scp's host:path splitting -- '/', '[', ':', spaces -- and
 # a leading '-' (which would look like an option).
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]*$")
-_TRUE = ("1", "true", "yes", "on")
-_FALSE = ("0", "false", "no", "off")
 
 
 def _check_token(value: str, name: str) -> str:
@@ -77,7 +75,6 @@ class EditHostConfig:
     connect_timeout: int = 10
     command_timeout: float = 300.0
     cmdline_max: int = DEFAULT_REMOTE_CMDLINE_MAX
-    scp_use_sftp: bool = True
     path_map: tuple[tuple[str, str], ...] = ()
     _remote_roots_parsed: tuple[_Win, ...] = field(default=(), repr=False, compare=False)
 
@@ -154,6 +151,14 @@ def env_config(env: Mapping[str, str] | None = None) -> EditHostConfig:
     ]
     if missing:
         raise ConfigError(f"missing required environment variables: {', '.join(missing)}")
+    if _ENV_SCP_SFTP in env:
+        # The SFTP toggle was removed (S13f2 F1): scp always runs with -s. A still-set value means
+        # someone expects legacy SCP, which is unsafe, so refuse rather than silently ignore it.
+        raise ConfigError(
+            f"{_ENV_SCP_SFTP} is no longer supported: scp always uses SFTP mode (-s). "
+            f"Unset {_ENV_SCP_SFTP}. Legacy SCP is unsupported because it is unsafe "
+            "(the remote shell parses the path); the hub needs OpenSSH >= 8.7."
+        )
     connect = env.get(_ENV_CONNECT_TIMEOUT)
     command = env.get(_ENV_COMMAND_TIMEOUT)
     try:
@@ -169,7 +174,6 @@ def env_config(env: Mapping[str, str] | None = None) -> EditHostConfig:
         cmdline_max = int(cmdline) if cmdline else DEFAULT_REMOTE_CMDLINE_MAX
     except ValueError as exc:
         raise ConfigError(f"{_ENV_CMDLINE_MAX} must be an integer: {cmdline!r}") from exc
-    scp_use_sftp = _parse_bool(env.get(_ENV_SCP_SFTP), _ENV_SCP_SFTP, default=True)
     form = env.get(_ENV_PATH_FORM) or "drive"
     return EditHostConfig(
         alias=env[_ENV_ALIAS],
@@ -180,16 +184,4 @@ def env_config(env: Mapping[str, str] | None = None) -> EditHostConfig:
         connect_timeout=connect_timeout,
         command_timeout=command_timeout,
         cmdline_max=cmdline_max,
-        scp_use_sftp=scp_use_sftp,
     )
-
-
-def _parse_bool(raw: str | None, name: str, *, default: bool) -> bool:
-    if raw is None or raw.strip() == "":
-        return default
-    text = raw.strip().lower()
-    if text in _TRUE:
-        return True
-    if text in _FALSE:
-        return False
-    raise ConfigError(f"{name} must be a boolean (one of {_TRUE + _FALSE}): {raw!r}")
