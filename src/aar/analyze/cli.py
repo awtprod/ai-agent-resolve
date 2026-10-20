@@ -4,10 +4,11 @@ Exit status, as ``aar qa check``:
 
 - 0: the analysis ran and every result is usable (``sync``: every pair is ``ok``);
 - 1: it ran and something failed (``sync``: a pair is ``drift``, ``low-confidence``,
-  ``no-overlap`` or ``failed``; ``transcript``, ``faces``: the decode, the model or the
-  detector failed), including media that exists but does not decode;
+  ``no-overlap`` or ``failed``; ``transcript``, ``faces``, ``laughs``: the decode, the
+  model, the detector or the Gemini call failed), including media that does not decode;
 - 2: an input, a tool or a model cannot be located or opened, an extra is missing, a checkpoint
-  does not match, or an argument is bad;
+  does not match, an argument is bad, a paid call was not allowed (``--allow-paid``) or its
+  key is missing;
 - 74: the result could not be written (``output-error``; a checkpoint is kept).
 
 An error prints ``{"ok": false, "error": {"type", "message", "hint"}}``.
@@ -28,6 +29,8 @@ from aar import cli_io
 from aar.analyze.errors import EXIT_FAILED, AnalyzeError
 from aar.analyze.faces import MODEL_ENV as FACE_MODEL_ENV
 from aar.analyze.faces import FaceSettings, analyse_faces
+from aar.analyze.gemini import KEY_ENV
+from aar.analyze.laughs import LaughSettings, analyse_laughs
 from aar.analyze.sync import SyncSettings, sync_files
 from aar.analyze.whisper import (
     CCN_PRESET,
@@ -60,6 +63,7 @@ def register(subparsers: Any) -> None:
     _register_sync(sub)
     _register_transcript(sub)
     _register_faces(sub)
+    _register_laughs(sub)
 
 
 def _register_sync(sub: Any) -> None:
@@ -181,6 +185,45 @@ def _register_faces(sub: Any) -> None:
     _add_offset_args(run, "the faces")
     run.add_argument("--timeout-s", type=float, help="Timeout of the decode (default: scaled).")
     run.set_defaults(func=_cmd_faces)
+
+
+def _register_laughs(sub: Any) -> None:
+    d = LaughSettings()
+    run = sub.add_parser(
+        "laughs",
+        help="Audience laughs from Gemini (paid), checked against the audio envelope.",
+        description=(
+            "Writes aar.laughs/1 JSON to --out (and a LaughMap with --map-out). Calling Gemini "
+            f"is paid and needs --allow-paid and ${KEY_ENV} (environment only, no flag); "
+            "--from-raw re-parses a saved reply offline. " + _EXITS
+        ),
+    )
+    run.add_argument("media", type=Path, help="The media file (its first audio stream).")
+    run.add_argument("--out", required=True, type=Path, help="aar.laughs/1 JSON to write.")
+    run.add_argument(
+        "--work-dir", required=True, type=Path, help="Where audio.flac and raw.json go."
+    )
+    paid = run.add_mutually_exclusive_group()
+    paid.add_argument("--allow-paid", action="store_true", help="Allow the paid Gemini call.")
+    paid.add_argument("--from-raw", type=Path, help="Re-parse a saved raw.json; no network.")
+    run.add_argument("--model", default=d.model, help=f"Gemini model id (default {d.model}).")
+    run.add_argument(
+        "--include-unconfirmed",
+        action="store_true",
+        help="Put unconfirmed and unchecked laughs in the map too.",
+    )
+    run.add_argument("--map-out", type=Path, help="Also write a LaughMap JSON here.")
+    run.add_argument("--confirm-bump-db", type=float, default=d.confirm_bump_db)
+    run.add_argument("--confirm-frac", type=float, default=d.confirm_frac)
+    run.add_argument(
+        "--max-audio-s",
+        type=float,
+        default=d.max_audio_s,
+        help="Refuse longer audio before uploading it (default 4 h).",
+    )
+    _add_offset_args(run, "the laugh map")
+    run.add_argument("--timeout-s", type=float, help="Timeout of each ffmpeg call.")
+    run.set_defaults(func=_cmd_laughs)
 
 
 # ---------------------------------------------------------------- output
@@ -373,4 +416,42 @@ def _cmd_faces(args: argparse.Namespace) -> int:
         return _fail(exc)
     except OSError as exc:  # the checkpoint beside --out could not be written
         return _fail(AnalyzeError("output-error", f"cannot write beside {args.out}: {exc}"))
+    return _emit(report) or EXIT_OK
+
+
+# ---------------------------------------------------------------- laughs
+
+
+def _cmd_laughs(args: argparse.Namespace) -> int:
+    try:
+        try:
+            settings = LaughSettings(
+                model=args.model,
+                confirm_bump_db=args.confirm_bump_db,
+                confirm_frac=args.confirm_frac,
+                include_unconfirmed=args.include_unconfirmed,
+                max_audio_s=args.max_audio_s,
+                timeout_s=args.timeout_s,
+            )
+        except ValueError as exc:
+            raise _bad(str(exc)) from None
+        offset = _offset(args)
+        _check_out(args.out)
+        _check_out(args.map_out)
+        _check_input(args.media, "input")
+        report = analyse_laughs(
+            args.media,
+            args.out,
+            work_dir=args.work_dir,
+            allow_paid=args.allow_paid,
+            from_raw=args.from_raw,
+            settings=settings,
+            offset=offset,
+            recording=args.recording,
+            map_out=args.map_out,
+        )
+    except AnalyzeError as exc:
+        return _fail(exc)
+    except OSError as exc:  # the work dir could not be created or written
+        return _fail(AnalyzeError("output-error", f"cannot write the work dir or output: {exc}"))
     return _emit(report) or EXIT_OK

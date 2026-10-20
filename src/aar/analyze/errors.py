@@ -30,6 +30,8 @@ INPUT_ERRORS = frozenset(
         "model-missing",
         "model-invalid",
         "model-outside-dir",
+        "paid-not-allowed",
+        "missing-credential",
         "tool-missing",
         "input-missing",
         "invalid-argument",
