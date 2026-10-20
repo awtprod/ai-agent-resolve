@@ -45,6 +45,10 @@ WRITE_TOOL_NAMES = (
     "node_set_status",
     "facts_record",
     "facts_retract",
+    "recipe_start",
+    "step_complete",
+    "recipe_retry",
+    "recipe_cancel",
 )
 READ_TOOL_NAMES = ("facts_get", "brief_get", "plan_get")
 
@@ -108,6 +112,13 @@ def register_write_tools(
         # refusal can be an error result that still carries structured content.
         try:
             return _result(call().to_dict())
+        except writes.WriteError as exc:
+            return _refused(exc)
+
+    def run_dict(call: Any) -> CallToolResult:
+        # Recipe ops return plain JSON-ready dicts (a status view), not a WriteResult.
+        try:
+            return _result(_bounded(call()))
         except writes.WriteError as exc:
             return _refused(exc)
 
@@ -315,6 +326,104 @@ def register_write_tools(
         return run(
             lambda: facts_mod.retract_fact(
                 log, project_id, key, reason, _agent(agent_id), idempotency_key=idempotency_key
+            )
+        )
+
+    from aar.recipes import run as recipe_run
+
+    @server.tool(
+        name="recipe_start",
+        description=(
+            "Start a recipe run you created: move the recipe node to active and advance it. "
+            + _IDENTITY
+            + "recipe_node is the recipe node id (recipe_create returns it). Only the recipe's "
+            "creator or a human may start it. Returns {ok: true, op: 'recipe.start', found, "
+            "recipe_node, status, round, steps, next_actions}. " + _ERRORS
+        ),
+        annotations=_WRITE,
+    )
+    def recipe_start(agent_id: str, idempotency_key: str, recipe_node: str) -> CallToolResult:
+        return run_dict(
+            lambda: recipe_run.recipe_start(
+                log, recipe_node, _agent(agent_id), idempotency_key=idempotency_key
+            )
+        )
+
+    @server.tool(
+        name="step_complete",
+        description=(
+            "Complete an agent step by handing in its outputs. The runner validates them against "
+            "the step's expects contract (a plan node that passes the plan gate, an artifact of a "
+            "stated kind, or JSON for a model); if they fail the call is refused (expects_unmet) "
+            "and the step stays open. "
+            + _IDENTITY
+            + "recipe_node and step_id name the step; attempt is optional (the open attempt); "
+            "outputs is the object the contract wants (e.g. {plan_node: 'nd_...'} for a plan). Any "
+            "agent or a human may complete it; attribution is recorded. Returns {ok: true, op: "
+            "'recipe.step_complete', ...status view}. " + _ERRORS
+        ),
+        annotations=_WRITE,
+    )
+    def step_complete(
+        agent_id: str,
+        idempotency_key: str,
+        recipe_node: str,
+        step_id: str,
+        outputs: dict[str, Any],
+        attempt: int | None = None,
+    ) -> CallToolResult:
+        return run_dict(
+            lambda: recipe_run.step_complete(
+                log,
+                artifacts,
+                recipe_node,
+                step_id,
+                attempt,
+                outputs,
+                _agent(agent_id),
+                idempotency_key=idempotency_key,
+            )
+        )
+
+    @server.tool(
+        name="recipe_retry",
+        description=(
+            "Retry a failed step that still has attempts left: create its next attempt and "
+            "advance. "
+            + _IDENTITY
+            + "recipe_node and step_id name the step. Only the recipe's creator or a human may "
+            "retry. Refused with no_attempts_left once the step has used every attempt. Returns "
+            "{ok: true, op: 'recipe.retry', ...status view}. " + _ERRORS
+        ),
+        annotations=_WRITE,
+    )
+    def recipe_retry(
+        agent_id: str, idempotency_key: str, recipe_node: str, step_id: str
+    ) -> CallToolResult:
+        return run_dict(
+            lambda: recipe_run.recipe_retry(
+                log, recipe_node, step_id, _agent(agent_id), idempotency_key=idempotency_key
+            )
+        )
+
+    @server.tool(
+        name="recipe_cancel",
+        description=(
+            "Cancel a recipe run you created: cancel its live ops, withdraw its open reviews and "
+            "move the recipe node to cancelled. "
+            + _IDENTITY
+            + "recipe_node is the recipe node id; reason is an optional note. Only the creator or "
+            "a human may cancel. Returns {ok: true, op: 'recipe.cancel', ...status view}. "
+            + _ERRORS
+        ),
+        annotations=_WRITE,
+    )
+    def recipe_cancel(
+        agent_id: str, idempotency_key: str, recipe_node: str, reason: str = "recipe cancelled"
+    ) -> CallToolResult:
+        return run_dict(
+            lambda: recipe_run.recipe_cancel(
+                log, recipe_node, _agent(agent_id), idempotency_key=idempotency_key, reason=reason
             )
         )
 

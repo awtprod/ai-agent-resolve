@@ -411,6 +411,25 @@ def build_server(
         ]
         return {"approvals": listed, "skipped": skipped_summary(view.skipped)}
 
+    @server.tool(
+        name="recipe_status",
+        description=(
+            "Get a recipe run's status view: per step its state (waiting_on_needs, ready, running, "
+            "needs_agent, needs_human, waiting:<reason>, done, failed, cancelled), attempt, round, "
+            "op node id, an outputs summary and its error; plus next_actions saying who acts "
+            "(agent, human, worker or node) and, for agents, the tool and argument template to "
+            "call. Returns {found: true, recipe_node, status, round, steps, next_actions} or "
+            "{found: false}. It is always listed (even without --agent-writes) because agents "
+            "need it to drive a run. Read-only: a hot step shows waiting:no_node_dispatcher while "
+            "the Resolve node is unreachable from the hub."
+        ),
+        annotations=_READ_ONLY,
+    )
+    def recipe_status(recipe_node: str) -> dict[str, Any]:
+        from aar.recipes.run import recipe_status as _status
+
+        return _bounded(_status(log, recipe_node, clock=clock))
+
     if agent_writes:
         from aar.hub.mcp_writes import register_write_tools
 

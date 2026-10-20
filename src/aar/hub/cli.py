@@ -204,8 +204,20 @@ def _serve(args: argparse.Namespace) -> int:
         log.close()  # release the DB handle we just opened before bailing out
         cli_io.warn(f"aar hub serve: {exc}")
         return 2
+    # The live server plugs the recipe registry into S13g1's params-validator hook, so
+    # recipe_create refuses unregistered recipe names (unknown_recipe) and validates params
+    # against the registered recipe's model (invalid_params). Recipes register in code.
+    from aar.recipes import registry as recipe_registry
+
+    recipe_registry.load_modules(recipe_registry.modules_from_env())
     registry = Registry(log)
-    server = build_server(log, registry, artifacts, agent_writes=args.agent_writes)
+    server = build_server(
+        log,
+        registry,
+        artifacts,
+        agent_writes=args.agent_writes,
+        params_validator=recipe_registry.registry_params_validator,
+    )
     if args.agent_writes:
         cli_io.warn(
             "aar hub serve: agent write tools are ON; agent ids are self-declared "
