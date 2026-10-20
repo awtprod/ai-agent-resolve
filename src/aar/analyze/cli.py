@@ -90,6 +90,13 @@ def _register_sync(sub: Any) -> None:
         help="Fraction of eligible anchor windows that must agree.",
     )
     run.add_argument(
+        "--anchors",
+        type=int,
+        default=d.anchors,
+        help=f"Anchor windows spread over the reference (default {d.anchors}); a file much "
+        "shorter than the reference needs more, so that two fall inside it.",
+    )
+    run.add_argument(
         "--max-duration-s",
         type=float,
         default=d.max_duration_s,
@@ -195,6 +202,7 @@ def _cmd_sync(args: argparse.Namespace) -> int:
                 max_offset_s=args.max_offset_s,
                 min_ratio=args.min_ratio,
                 min_agreement=args.min_agreement,
+                anchors=args.anchors,
                 max_duration_s=args.max_duration_s,
                 timeout_s=args.timeout_s,
             )

@@ -545,6 +545,14 @@ def transcribe_file(
         ).samples
     except MediaError as exc:
         raise from_media_error(exc, f"input {media_path}") from None
+    if len(audio) >= math.floor(settings.max_duration_s * WHISPER_RATE):
+        # ffprobe did not know the length, and the decode stopped at the cap: never cut the
+        # transcript short without saying so.
+        raise AnalyzeError(
+            "input-too-long",
+            f"{media_path} decodes to at least the {settings.max_duration_s:g} s cap",
+            hint="raise --max-duration-s (audio takes 230 MB per hour in memory)",
+        )
     kwargs = settings.transcribe_kwargs()
     base_s = 0.0
     method = None

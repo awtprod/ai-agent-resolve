@@ -664,6 +664,11 @@ def analyse_pair(
                 f"(need {s.min_windows} and {s.min_agreement:.0%}), median ratio "
                 f"{best.median_ratio:.2f} (need {s.min_ratio:g})"
             )
+            if len(best.eligible) < s.min_windows:
+                reason += (
+                    f"; only {len(best.eligible)} anchor window(s) fit inside the overlap at that "
+                    "offset: raise --anchors, or sync against a reference closer in length"
+                )
         out.update(reason=reason, hint=_hint_low(s))
         return out
     coarse.update(best.to_dict())

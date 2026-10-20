@@ -610,6 +610,31 @@ def test_input_longer_than_the_cap_is_refused(tmp_path, fake, models, media, cap
     assert code == 2 and body["error"]["type"] == "input-too-long"
 
 
+@needs_ffmpeg
+def test_input_of_unknown_length_past_the_cap_is_refused(tmp_path, fake, models, monkeypatch):
+    import aar.analyze.whisper as whisper
+    from aar.media.probe import MediaInfo, Stream
+
+    def unknown_length(path: Any, **kwargs: Any) -> MediaInfo:
+        audio = Stream(index=0, kind="audio", codec="pcm_s16le", duration_s=None, channels=1)
+        return MediaInfo(
+            path=str(path),
+            format="wav",
+            duration_s=None,
+            size_bytes=1,
+            bit_rate=None,
+            streams=(audio,),
+        )
+
+    media = write_wav(tmp_path / "long.wav", tone(6.0))
+    monkeypatch.setattr(whisper, "probe", unknown_length)
+    settings = CCN_PRESET.__class__(max_duration_s=5.0)
+    with pytest.raises(AnalyzeError) as error:
+        transcribe_file(media, tmp_path / "t.json", settings=settings, model_dir=models)
+    assert error.value.type == "input-too-long" and error.value.exit_code == 2
+    assert not checkpoint_path(tmp_path / "t.json").exists() and not fake.calls
+
+
 # ---------------------------------------------------------------- the QA transcriber
 
 

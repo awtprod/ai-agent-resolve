@@ -147,6 +147,23 @@ def test_partial_overlap(tmp_path, event):
     assert confidence["windows_eligible"] < 12 and confidence["agreement"] == 1.0
 
 
+def test_a_short_clip_needs_enough_anchors_inside_it(tmp_path, event, capsys):
+    # Twelve 10 s anchors over 55 s are 4 s apart, so only one fits inside a 12 s clip: one
+    # window is not a consensus. More anchors put two inside it.
+    ref, clip = event.take(1.0, 55.0), event.take(21.0, 12.0)
+    pair = sync_arrays(tmp_path, ref, clip)
+    assert pair["status"] == "low-confidence"
+    assert "raise --anchors" in pair["reason"]
+    assert_no_number(pair)
+    code, report = run_cli(
+        capsys, "--ref", tmp_path / "ref.wav", "--other", tmp_path / "other.wav", "--fps", "25",
+        "--anchors", "40",
+    )  # fmt: skip
+    [pair] = report["pairs"]
+    assert code == 0 and pair["status"] == "ok"
+    assert pair["offset_s"] == pytest.approx(20.0, abs=30e-6)
+
+
 def test_no_overlap_when_a_file_is_shorter_than_five_seconds(tmp_path, event):
     pair = sync_arrays(tmp_path, event.take(1.0, 40.0), event.take(10.0, 3.0))
     assert pair["status"] == "no-overlap"
