@@ -51,6 +51,7 @@ from aar.node.ops.write import (
     _clips,
     _int,
     _no_repeats,
+    _with_bounce,
     _with_completed,
 )
 from aar.plan.model import Name
@@ -958,3 +959,216 @@ def transition_add(env: OpEnv, params: TransitionParams) -> TransitionResult:
     except OpError as exc:
         raise _with_completed(exc, done) from exc
     return TransitionResult(timeline=env.identity(timeline), transitions=done)
+
+
+# -- item.set_color ----------------------------------------------------------------------------
+
+_NonNeg = Annotated[float, Field(strict=True, allow_inf_nan=False, ge=0)]
+_Pos = Annotated[float, Field(strict=True, allow_inf_nan=False, gt=0)]
+NO_CDL_GETTER = "no-cdl-getter-21.1"
+
+
+class CdlSpec(OpModel):
+    """An ASC CDL with the fields and bounds of ``aar.plan.model.Cdl``: per channel
+    ``out = (in * slope + offset) ** power``, then saturation; omitted parts are identity."""
+
+    slope: tuple[_NonNeg, _NonNeg, _NonNeg] = (1.0, 1.0, 1.0)
+    offset: tuple[FiniteFloat, FiniteFloat, FiniteFloat] = (0.0, 0.0, 0.0)
+    power: tuple[_Pos, _Pos, _Pos] = (1.0, 1.0, 1.0)
+    saturation: _NonNeg = 1.0
+
+
+class ColorTarget(OpModel):
+    item: ItemRef
+    node: int = Field(default=1, strict=True, ge=1, le=32, description="1-based node index.")
+    cdl: CdlSpec | None = None
+    lut: LutPath | None = Field(default=None, description="A LUT path as Resolve lists it.")
+
+    @model_validator(mode="after")
+    def _something_on_video(self) -> ColorTarget:
+        if self.item.track_type != "video":
+            raise ValueError("colour goes on video items")
+        if self.cdl is None and self.lut is None:
+            raise ValueError("give a cdl, a lut or both")
+        return self
+
+
+class ColorParams(OpModel):
+    timeline: TimelineRef
+    targets: list[ColorTarget] = Field(min_length=1, max_length=MAX_TARGETS)
+
+    @model_validator(mode="after")
+    def _once(self) -> ColorParams:
+        _no_repeats([(t.item.item_id, t.node) for t in self.targets], "item node")
+        return self
+
+
+class CdlSent(OpModel):
+    verified: bool
+    reason: str
+    sent: dict[str, Any]
+
+
+class LutApplied(OpModel):
+    status: Literal["set", "present"]
+    requested: str
+    read_back: str
+
+
+class ColorApplied(OpModel):
+    item_id: str
+    node: int
+    nodes: int
+    status: Literal["applied", "present"]
+    cdl: CdlSent | None
+    lut: LutApplied | None
+    page_bounced: bool
+
+
+class ColorResult(OpModel):
+    timeline: TimelineIdentity
+    items: list[ColorApplied]
+    notes: list[Note]
+
+
+def _triple(values: tuple[float, float, float]) -> str:
+    return " ".join(f"{v:.6g}" for v in values)
+
+
+def cdl_payload(node: int, cdl: CdlSpec) -> dict[str, Any]:
+    """The ``SetCDL`` argument, formatted deterministically."""
+    return {
+        "NodeIndex": node,
+        "Slope": _triple(cdl.slope),
+        "Offset": _triple(cdl.offset),
+        "Power": _triple(cdl.power),
+        "Saturation": float(cdl.saturation),
+    }
+
+
+def _lut_parts(path: str) -> tuple[bool, list[str]]:
+    absolute = bool(_DRIVE.match(path) or _UNC.match(path) or path.startswith(("/", "\\")))
+    return absolute, [p for p in path_key(path).split("/") if p]
+
+
+def same_lut(read_back: str, wanted: str) -> bool:
+    """Whether ``GetLUT``'s read-back is the LUT asked for.
+
+    ``GetLUT`` returns a path relative to the LUT folder [S] (which folder is [I]), while the
+    request may be absolute. Separators and ASCII case are normalised; a relative request must
+    equal the read-back, an absolute one must end with all of the read-back's components.
+    """
+    have_abs, have = _lut_parts(read_back)
+    want_abs, want = _lut_parts(wanted)
+    if not have or not want:
+        return False
+    if want_abs and not have_abs:
+        return len(have) < len(want) and want[-len(have) :] == have
+    return have == want
+
+
+def _colour_one(
+    env: OpEnv, target: ColorTarget, item: Any, graph: Any, nodes: int, notes: list[Note]
+) -> ColorApplied:
+    where = f"item {target.item.item_id}, node {target.node}"
+    bounced = False
+    cdl: CdlSent | None = None
+    if target.cdl is not None:
+        sent = cdl_payload(target.node, target.cdl)
+        # No present check for the CDL: 21.1 has no CDL getter to compare with, and SetCDL sets
+        # absolute values, so writing the same CDL again is harmless.
+        ok, was_bounced = _with_bounce(env, lambda: item.SetCDL(sent))
+        if was_bounced:
+            bounced = True
+            notes.append(_bounce_note("SetCDL", where))
+        if not ok:
+            raise OpError(
+                "cdl_refused",
+                f"SetCDL on {where} returned False, also after a page bounce",
+                f"check the node exists and the values are in range; {_JAM_HINT}",
+                "setproperty-after-color",
+                sent=sent,
+            )
+        cdl = CdlSent(verified=False, reason=NO_CDL_GETTER, sent=sent)
+    lut: LutApplied | None = None
+    if target.lut is not None:
+        have = str(graph.GetLUT(target.node) or "")
+        if same_lut(have, target.lut):
+            lut = LutApplied(status="present", requested=target.lut, read_back=have)
+        else:
+            ok, was_bounced = _with_bounce(env, lambda: graph.SetLUT(target.node, target.lut))
+            if was_bounced:
+                bounced = True
+                notes.append(_bounce_note("SetLUT", where))
+            if not ok:
+                raise OpError(
+                    "lut_refused",
+                    f"SetLUT({target.node}, {target.lut!r}) on {where} returned False, also "
+                    "after a page bounce",
+                    "give the LUT path as Resolve lists it and refresh the LUT list "
+                    f"(Project.RefreshLUTList) so Resolve knows it; {_JAM_HINT}",
+                    "setproperty-after-color",
+                )
+            after = str(graph.GetLUT(target.node) or "")
+            if not same_lut(after, target.lut):
+                raise OpError(
+                    "lut_not_applied",
+                    f"{where} reads back LUT {after!r} after SetLUT({target.lut!r})",
+                    "set the LUT by hand on the Color page",
+                    "setproperty-after-color",
+                    read_back=after,
+                )
+            lut = LutApplied(status="set", requested=target.lut, read_back=after)
+    status: Literal["applied", "present"] = (
+        "present" if cdl is None and lut is not None and lut.status == "present" else "applied"
+    )
+    return ColorApplied(
+        item_id=target.item.item_id,
+        node=target.node,
+        nodes=nodes,
+        status=status,
+        cdl=cdl,
+        lut=lut,
+        page_bounced=bounced,
+    )
+
+
+@op(
+    "item.set_color",
+    params=ColorParams,
+    result=ColorResult,
+    mutates=True,
+    traps=("setproperty-after-color", "append-ungraded"),
+)
+def item_set_color(env: OpEnv, params: ColorParams) -> ColorResult:
+    """Set a CDL and/or a LUT on a node of video items; the LUT is read back, the CDL cannot be.
+
+    21.1 has no CDL getter, so the result says ``verified: false`` for the CDL. There is no
+    add-node call: the node must exist. ``grades.copy`` replaces the whole node graph (trap
+    ``append-ungraded``), so set colour after copying grades, not before.
+    """
+    timeline = env.timeline(params.timeline)
+    planned = []
+    for target in params.targets:
+        item = env.item(timeline, target.item)
+        graph = item.GetNodeGraph()
+        nodes = int(graph.GetNumNodes() or 0) if graph is not None else 0
+        if target.node > nodes:
+            raise OpError(
+                "node_out_of_range",
+                f"item {target.item.item_id} has {nodes} node(s); node {target.node} does not "
+                "exist",
+                "21.1 has no call that adds a node: use a node that exists, or add nodes to "
+                "the grade by hand",
+                nodes=nodes,
+                node=target.node,
+            )
+        planned.append((target, item, graph, nodes))
+    done: list[ColorApplied] = []
+    notes: list[Note] = []
+    try:
+        for target, item, graph, nodes in planned:
+            done.append(_colour_one(env, target, item, graph, nodes, notes))
+    except OpError as exc:
+        raise _with_completed(exc, done) from exc
+    return ColorResult(timeline=env.identity(timeline), items=done, notes=notes)

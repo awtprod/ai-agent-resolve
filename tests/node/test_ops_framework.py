@@ -43,6 +43,7 @@ EXPECTED = {
     "media.import": (True, True),
     "track.ensure": (True, True),
     "transition.add": (True, True),
+    "item.set_color": (True, True),
 }
 
 

@@ -16,9 +16,10 @@ import pytest
 from pydantic import ValidationError
 
 from aar.node.ops import get_op
-from aar.node.ops.build import IMPORT_GUARD_EXEMPTION
+from aar.node.ops.build import IMPORT_GUARD_EXEMPTION, CdlSpec, same_lut
+from aar.plan.model import Cdl
 
-from .fake_resolve import FakeFolder, FakeMediaPoolItem, FakeTimelineItem
+from .fake_resolve import FakeFolder, FakeMediaPoolItem, FakeNode, FakeTimelineItem
 from .ops_support import CONFIG, Show, content_writes, human_settles
 
 START = 108000
@@ -839,3 +840,228 @@ def test_transition_lists_are_bounded_and_unique() -> None:
         with pytest.raises(ValidationError):
             validate("transition.add", {"timeline": show.ref("Main"), "targets": targets})
     assert validate("transition.add", _tparams(show, one, {**one, "position": "start"}))
+
+
+# -- item.set_color ----------------------------------------------------------------------------
+
+
+def _graded(show: Show, nodes: int = 1) -> FakeTimelineItem:
+    item = show.main.place("video", 1, show.cam_a, START, 100)
+    item.graph.nodes = [FakeNode() for _ in range(nodes)]
+    return item
+
+
+CDL = {"slope": [1.1, 1.0, 0.9], "offset": [0.01, -0.02, 0.0], "power": [1, 1, 1.05]}
+
+
+def test_a_cdl_and_a_lut_are_set_and_the_lut_read_back() -> None:
+    show = Show()
+    item = _graded(show, nodes=2)
+    lut = f"{LUT_ROOT}/Film/Look.cube"
+    result = show.ok(
+        "item.set_color",
+        {
+            "timeline": show.ref("Main"),
+            "targets": [
+                {"item": ref(item), "node": 2, "cdl": {**CDL, "saturation": 1.2}, "lut": lut}
+            ],
+        },
+    )
+    (applied,) = result.items
+    sent = {
+        "NodeIndex": 2,
+        "Slope": "1.1 1 0.9",
+        "Offset": "0.01 -0.02 0",
+        "Power": "1 1 1.05",
+        "Saturation": 1.2,
+    }
+    assert applied.cdl is not None and applied.cdl.model_dump() == {
+        "verified": False,
+        "reason": "no-cdl-getter-21.1",
+        "sent": sent,
+    }
+    assert calls(show, "SetCDL") == [("SetCDL", item.GetUniqueId(), sent)]
+    assert item.cdl_on(2) == {
+        "Slope": (1.1, 1.0, 0.9),
+        "Offset": (0.01, -0.02, 0.0),
+        "Power": (1.0, 1.0, 1.05),
+        "Saturation": 1.2,
+    }
+    assert item.cdl_on(1) is None
+    # GetLUT reads back relative to the LUT folder; the op compares normalised suffixes.
+    assert applied.lut is not None and applied.lut.status == "set"
+    assert applied.lut.read_back == "Film\\Look.cube" == item.graph.nodes[1].lut
+    assert (applied.status, applied.nodes, applied.page_bounced) == ("applied", 2, False)
+
+
+def test_a_lut_already_on_the_node_is_present_with_no_call() -> None:
+    show = Show()
+    item = _graded(show)
+    params = {
+        "timeline": show.ref("Main"),
+        "targets": [{"item": ref(item), "lut": f"{LUT_ROOT}/Film/Look.cube"}],
+    }
+    show.ok("item.set_color", params)
+    show.fake.calls.clear()
+    again = show.ok("item.set_color", params)
+    assert again.items[0].status == "present" and again.items[0].lut.status == "present"
+    assert content_writes(show.fake) == []
+    relative = show.ok(
+        "item.set_color",
+        {"timeline": show.ref("Main"), "targets": [{"item": ref(item), "lut": "film/LOOK.cube"}]},
+    )
+    assert relative.items[0].status == "present" and content_writes(show.fake) == []
+
+
+def test_a_cdl_is_written_again_on_a_rerun_because_it_cannot_be_read() -> None:
+    show = Show()
+    item = _graded(show)
+    params = {"timeline": show.ref("Main"), "targets": [{"item": ref(item), "cdl": CDL}]}
+    show.ok("item.set_color", params)
+    show.fake.calls.clear()
+    again = show.ok("item.set_color", params)
+    assert again.items[0].status == "applied" and not again.items[0].cdl.verified
+    assert [c[0] for c in content_writes(show.fake)] == ["SetCDL"]
+
+
+def test_a_node_that_does_not_exist_is_refused() -> None:
+    show = Show()
+    item = _graded(show)
+    error = show.fails(
+        "item.set_color",
+        {"timeline": show.ref("Main"), "targets": [{"item": ref(item), "node": 2, "cdl": CDL}]},
+    )
+    assert (error.code, error.detail["nodes"]) == ("node_out_of_range", 1)
+    assert content_writes(show.fake) == []
+
+
+def test_a_refused_cdl_is_cdl_refused_after_a_bounce() -> None:
+    show = Show()
+    show.fake.faults.add("SetCDL:false")
+    item = _graded(show)
+    error = show.fails(
+        "item.set_color",
+        {"timeline": show.ref("Main"), "targets": [{"item": ref(item), "cdl": CDL}]},
+    )
+    assert (error.code, error.detail["trap_id"]) == ("cdl_refused", "setproperty-after-color")
+    assert len(calls(show, "SetCDL")) == 2 and item.cdl_on(1) is None
+
+
+def test_a_lut_that_does_not_stick_or_is_unknown_is_caught() -> None:
+    show = Show()
+    item = _graded(show)
+    show.fake.faults.add("SetLUT:no-op")
+    params = {"timeline": show.ref("Main"), "targets": [{"item": ref(item), "lut": "Film/a.cube"}]}
+    assert show.fails("item.set_color", params).code == "lut_not_applied"
+    show.fake.faults.clear()
+    show.fake.unknown_luts.add("Film/a.cube")
+    assert show.fails("item.set_color", params).code == "lut_refused"
+
+
+def test_colour_setters_bounce_the_page_when_they_jam() -> None:
+    show = Show()
+    item = _graded(show)
+    show.fake.human_set_page("color")
+    show.fake.human_set_page("edit")
+    human_settles(show)
+    result = show.ok(
+        "item.set_color",
+        {
+            "timeline": show.ref("Main"),
+            "targets": [{"item": ref(item), "cdl": CDL, "lut": "a.cube"}],
+        },
+    )
+    assert result.items[0].page_bounced and item.graph.nodes[0].lut == "a.cube"
+    assert [n.code for n in result.notes] == ["page_bounced"]
+    assert show.fake.page == "edit"
+
+
+def test_colour_errors_carry_the_items_done() -> None:
+    show = Show()
+    first, second = _graded(show), show.main.place("video", 1, show.cam_a, START + 100, 50)
+    show.fake.unknown_luts.add("bad.cube")
+    error = show.fails(
+        "item.set_color",
+        {
+            "timeline": show.ref("Main"),
+            "targets": [
+                {"item": ref(first), "lut": "a.cube"},
+                {"item": ref(second), "lut": "bad.cube"},
+            ],
+        },
+    )
+    assert error.code == "lut_refused"
+    assert [i["item_id"] for i in error.detail["completed"]] == [first.GetUniqueId()]
+
+
+@pytest.mark.parametrize(
+    ("read_back", "wanted", "same"),
+    [
+        ("Film\\Look.cube", f"{LUT_ROOT}/Film/Look.cube", True),
+        ("Film\\Look.cube", "x:\\ACME\\Support\\LUT\\film\\look.CUBE", True),
+        ("Film\\Look.cube", "Film/Look.cube", True),
+        ("Look.cube", "Film/Look.cube", False),
+        ("Film\\Look.cube", "Look.cube", False),
+        ("Film\\Look.cube", f"{LUT_ROOT}/Other/Look.cube", False),
+        ("", "Look.cube", False),
+        ("Film/Look.cube", "Film/Look2.cube", False),
+    ],
+)
+def test_lut_paths_compare_by_normalised_suffix(read_back: str, wanted: str, same: bool) -> None:
+    assert same_lut(read_back, wanted) is same
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"node": 0},
+        {"node": 33},
+        {"node": 1.0},
+        {"cdl": None, "lut": None},
+        {"lut": " "},
+        {"lut": "a\n.cube"},
+        {"lut": "a" * 1025},
+        {"cdl": {"slope": [-0.1, 1, 1]}},
+        {"cdl": {"power": [0, 1, 1]}},
+        {"cdl": {"saturation": -1}},
+        {"cdl": {"offset": [float("nan"), 0, 0]}},
+        {"cdl": {"slope": [float("inf"), 1, 1]}},
+        {"cdl": {"slope": [1, 1]}},
+        {"cdl": {"slope": ["1", 1, 1]}},
+        {"cdl": {"gamma": 1}},
+        {"item": {"track_type": "audio", "track": 1, "item_id": "x"}},
+    ],
+)
+def test_colour_targets_are_bounded(patch: dict[str, Any]) -> None:
+    show = Show()
+    target = {"item": {"track_type": "video", "track": 1, "item_id": "x"}, "cdl": {}, **patch}
+    target = {k: v for k, v in target.items() if v is not None}
+    with pytest.raises(ValidationError):
+        validate("item.set_color", {"timeline": show.ref("Main"), "targets": [target]})
+
+
+@pytest.mark.parametrize(
+    "cdl",
+    [
+        {},
+        {"slope": [0, 0, 0]},
+        {"slope": [2, 1, 0.5], "offset": [-1, 0, 1], "power": [0.5, 1, 2], "saturation": 0},
+        {"slope": [-0.01, 1, 1]},
+        {"power": [0, 1, 1]},
+        {"power": [-1, 1, 1]},
+        {"saturation": -0.5},
+        {"offset": [float("inf"), 0, 0]},
+        {"slope": [1, 1, 1, 1]},
+    ],
+)
+def test_cdl_spec_has_the_bounds_of_the_plan_cdl(cdl: dict[str, Any]) -> None:
+    assert set(CdlSpec.model_fields) == set(Cdl.model_fields)
+
+    def accepts(model: Any) -> bool:
+        try:
+            model.model_validate(cdl)
+        except ValidationError:
+            return False
+        return True
+
+    assert accepts(CdlSpec) == accepts(Cdl)
