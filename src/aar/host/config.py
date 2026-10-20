@@ -10,6 +10,7 @@ its contents and any key material are never read here.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -19,7 +20,11 @@ from aar.host.errors import ConfigError, PathRefused
 from aar.host.powershell import DEFAULT_REMOTE_CMDLINE_MAX
 from aar.host.winpath import PathForm, _Win, normalize_root
 
-__all__ = ["EditHostConfig", "env_config"]
+__all__ = ["MAX_TIMEOUT_SECONDS", "EditHostConfig", "env_config"]
+
+# Upper bound on any timeout (seconds). 7 days: long enough for any real master transfer, finite
+# enough that inf/nan/1e300 never reach subprocess/selectors (which raise OverflowError there).
+MAX_TIMEOUT_SECONDS = 7 * 24 * 60 * 60  # 604800
 
 _ENV_ALIAS = "AAR_EDIT_SSH_ALIAS"
 _ENV_CONFIG = "AAR_EDIT_SSH_CONFIG"
@@ -88,10 +93,16 @@ class EditHostConfig:
         if self.path_form not in _PATH_FORMS:
             raise ConfigError(f"path form must be one of {_PATH_FORMS}, not {self.path_form!r}")
         _check_int(self.connect_timeout, "connect timeout")
-        if type(self.command_timeout) is bool or not (
-            isinstance(self.command_timeout, (int, float)) and self.command_timeout > 0
+        ct = self.command_timeout
+        if (
+            type(ct) is bool
+            or not isinstance(ct, (int, float))
+            or not math.isfinite(ct)
+            or not (0 < ct <= MAX_TIMEOUT_SECONDS)
         ):
-            raise ConfigError("command timeout must be a positive number (seconds)")
+            raise ConfigError(
+                f"command timeout must be a finite number of seconds in (0, {MAX_TIMEOUT_SECONDS}]"
+            )
         _check_int(self.cmdline_max, "cmdline max")
         if not self.remote_roots:
             raise ConfigError("at least one remote root is required")
