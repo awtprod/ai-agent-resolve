@@ -5,14 +5,14 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from typing import Any
+from typing import Annotated, Any, get_args, get_origin
 
 import pytest
 from plan_support import FIXTURES, PlanData, only
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from aar.plan.lint import LintReport, all_rules
-from aar.plan.model import EditPlan, Head
+from aar.plan.model import EditPlan, Head, _not_blank
 from aar.plan.profile import Profile
 
 RunLint = Callable[..., LintReport]
@@ -428,18 +428,96 @@ def test_ordinary_lines_still_validate_and_keep_their_text(clean_data: PlanData)
     assert plan.captions[0].lines == ["I PARKED THERE", "FOR ONE MINUTE"]
 
 
+def _is_text_line(annotation: Any) -> bool:
+    """Is this the item type of a text-line list: a string that goes through ``_not_blank``?"""
+    return get_origin(annotation) is Annotated and any(
+        getattr(meta, "func", None) is _not_blank for meta in get_args(annotation)[1:]
+    )
+
+
+def text_line_paths(model: type[BaseModel], path: tuple[str, ...] = ()) -> list[tuple[str, ...]]:
+    """Every path from ``model`` to a list of text lines, found from the model's annotations.
+
+    A path ends at a ``list`` field whose items are text lines (``list[Name]``); it passes through
+    any field that holds a model, a list of models or an optional model. A text-line list added
+    to the plan later is picked up without a change here.
+    """
+    found: list[tuple[str, ...]] = []
+    for name, field in model.model_fields.items():
+        pending = [field.annotation]
+        while pending:
+            annotation = pending.pop()
+            if get_origin(annotation) is list:
+                [item] = get_args(annotation)
+                if _is_text_line(item):
+                    found.append((*path, name))
+                else:
+                    pending.append(item)
+            elif isinstance(annotation, type) and issubclass(annotation, BaseModel):
+                found.extend(text_line_paths(annotation, (*path, name)))
+            elif get_origin(annotation) is not None:  # X | None, Annotated[...]
+                pending.extend(get_args(annotation))
+    return found
+
+
+def _lines_at(node: Any, path: tuple[str, ...]) -> list[str]:
+    """The strings at ``path`` below ``node``, going through lists and skipping missing keys."""
+    if isinstance(node, list):
+        return [line for item in node for line in _lines_at(item, path)]
+    if path and isinstance(node, dict):
+        return _lines_at(node.get(path[0]), path[1:])
+    return [node] if not path and isinstance(node, str) else []
+
+
+def blank_text_lines(data: Any) -> list[str]:
+    """Every text line of the plan data that the model would refuse as blank."""
+    blank: list[str] = []
+    for path in text_line_paths(EditPlan):
+        for line in _lines_at(data, path):
+            try:
+                _not_blank(line)
+            except ValueError:
+                blank.append(line)
+    return blank
+
+
+def test_the_text_line_lists_are_found_from_the_model() -> None:
+    paths = text_line_paths(EditPlan)
+    assert {("titles", "lines"), ("captions", "lines"), ("outro", "sting", "lines")} <= set(paths)
+    assert len(paths) == len(set(paths))
+    # Names that are not lists of lines are not text-line lists.
+    assert ("outro", "audio_track") not in paths
+    assert ("audio_tracks", "name") not in paths
+
+
+def test_the_guard_sees_a_blank_line_in_every_text_line_list() -> None:
+    data = {
+        "titles": [{"lines": ["ok", " "]}, {"lines": ["\u200b"]}],
+        "captions": [{"lines": ["ok", "\ufeff\u0301"]}],
+        "outro": {"sting": {"lines": ["ok", "", "\u2060"]}},
+        "segments": [{"label": " "}],  # not a text line: ignored
+    }
+    assert blank_text_lines(data) == [" ", "\u200b", "\ufeff\u0301", "", "\u2060"]
+
+
+def test_the_guard_is_quiet_for_real_text_and_for_missing_parts() -> None:
+    assert blank_text_lines({"outro": None, "titles": None}) == []
+    assert blank_text_lines({"outro": {"sting": None}}) == []
+    assert blank_text_lines({"captions": [{"lines": ["\u00e1", "!"]}]}) == []
+    assert blank_text_lines({}) == []
+
+
 def test_no_fixture_plan_has_a_blank_text_line() -> None:
-    """The plan fixtures and goldens must keep validating: none of them uses a blank line."""
+    """The plan fixtures and goldens must keep validating: none of them uses a blank line.
+
+    Blank means what the model means: whitespace, format characters and combining marks only.
+    Every text-line list of the model is checked (titles, captions, the outro's sting).
+    """
     plans = sorted(FIXTURES.rglob("*.plan.json"))
     assert plans
     for path in plans:
         data: Any = json.loads(path.read_text(encoding="utf-8"))
-        texts = [
-            line
-            for item in [*data.get("titles", []), *data.get("captions", [])]
-            for line in item["lines"]
-        ]
-        assert all(line.strip() for line in texts), path.name
+        assert blank_text_lines(data) == [], path.name
 
 
 # --- F3: the cut rules see same-track joins only ----------------------------------------------
