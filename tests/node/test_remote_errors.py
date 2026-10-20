@@ -6,7 +6,9 @@ Unreachable (OSError) vs refused (ValueError), with real HTTP on loopback and fa
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import socket
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -18,11 +20,19 @@ from aar.hub.approvals import ApprovalAlreadyConsumed, ApprovalScope
 from aar.hub.common import InvalidInput
 from aar.hub.control import Stopped
 from aar.hub.events import Actor, EventLog
+from aar.hub.leaseboard import presence_to_hub
 from aar.node.hublink import HubUnreachable, UnknownHubProject
 from aar.node.locator import ProjectLocator
 from aar.node.remote import FeedConflict, HubRefused, NodeNotEnrolled
 
-from .remote_support import ServerThread, fault_app, hub_app, remote_link, write_token
+from .remote_support import (
+    ServerThread,
+    fault_app,
+    hub_app,
+    remote_link,
+    remote_transport,
+    write_token,
+)
 
 HUMAN = Actor("human", "andrew")
 
@@ -40,7 +50,12 @@ def _hub(tmp_path: Path, node_id: str = "node-1") -> tuple[EventLog, Path, str]:
 @pytest.mark.parametrize("status", [500, 503, 429])
 def test_5xx_429_503_are_unreachable(tmp_path: Path, status: int) -> None:
     async def responder(_: Request) -> Response:
-        return PlainTextResponse("busy", status_code=status)
+        # A parseable refusal envelope: still unreachable because the STATUS decides, not the
+        # body (so "map 503/429 to a refusal" is a killable mutation).
+        return JSONResponse(
+            {"ok": False, "error": {"type": "stopped", "message": "busy"}, "request_id": "r"},
+            status_code=status,
+        )
 
     token_file = write_token(tmp_path, "tok")
     with ServerThread(fault_app(responder)) as server:
@@ -226,3 +241,18 @@ def test_an_unknown_4xx_type_is_hub_refused(tmp_path: Path) -> None:
         with pytest.raises(HubRefused) as exc:
             link.control_status()
         assert exc.value.code == "weird_code"
+
+
+def test_feed_transport_keeps_the_idempotency_key_on_resend(tmp_path: Path) -> None:
+    log, token_file, node_id = _hub(tmp_path)
+    spec = presence_to_hub(node_id, active=True, at=datetime.now(UTC))
+    spec = dataclasses.replace(spec, idempotency_key=f"presence:{node_id}:test:1")
+    with ServerThread(hub_app(log)) as server:
+        transport = remote_transport(server.base_url, token_file)
+        transport.deliver(spec, node_id=node_id)
+        transport.deliver(spec, node_id=node_id)  # a resend of the same spec: same key
+    # The hub dedupes on the kept key: exactly one event.
+    matching = [
+        e for e in log.iter_events(types=(spec.type,)) if e.idempotency_key == spec.idempotency_key
+    ]
+    assert len(matching) == 1
