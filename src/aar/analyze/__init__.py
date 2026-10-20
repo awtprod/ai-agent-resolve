@@ -1,13 +1,16 @@
-"""Cold analysis workers: audio sync offsets (``aar.analyze.sync``) and word-level transcripts
-(``aar.analyze.whisper``), with the ``aar analyze`` CLI group.
+"""Cold analysis workers: audio sync offsets (``aar.analyze.sync``), word-level transcripts
+(``aar.analyze.whisper``), faces (``aar.analyze.faces``) and laughs (``aar.analyze.laughs``),
+with the ``aar analyze`` CLI group.
 
 They run on the hub host on local files and register no node ops (the job wiring comes later).
-numpy (extra ``analyze``) and faster-whisper (extra ``whisper``) are imported lazily, so this
-package imports without them; a command that needs a missing one fails with a typed
-``missing-extra`` error naming the extra to install.
+numpy (extra ``analyze``), faster-whisper (extra ``whisper``) and OpenCV (extra ``faces``) are
+imported lazily, so this package imports without them; a command that needs a missing one fails
+with a typed ``missing-extra`` error naming the extra to install.
 """
 
 from aar.analyze.errors import AnalyzeError
+from aar.analyze.faces import FaceSettings, analyse_faces
+from aar.analyze.laughs import LaughSettings, analyse_laughs
 from aar.analyze.sync import SyncSettings, sync_files
 from aar.analyze.whisper import (
     CCN_PRESET,
@@ -20,10 +23,14 @@ from aar.analyze.whisper import (
 __all__ = [
     "CCN_PRESET",
     "AnalyzeError",
+    "FaceSettings",
+    "LaughSettings",
     "RecordingOffset",
     "SyncSettings",
     "WhisperSettings",
     "WhisperTranscriber",
+    "analyse_faces",
+    "analyse_laughs",
     "sync_files",
     "transcribe_file",
 ]
