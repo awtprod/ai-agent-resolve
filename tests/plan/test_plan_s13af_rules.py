@@ -482,6 +482,19 @@ def test_the_design_doc_says_the_cut_rules_consider_same_track_joins_only() -> N
     assert "cut into the outro" in line
 
 
+def test_the_design_doc_says_no_dialogue_splice_also_uses_same_track_joins() -> None:
+    """The cut rules' list is not closed: the splice rule reads joins too, without counting cuts."""
+    text = DESIGN.read_text(encoding="utf-8")
+    [line] = [x for x in text.splitlines() if x.startswith("The join-based cut rules")]
+    assert "`no-dialogue-splice`" in line
+    assert "`src/aar/plan/rules/speech.py`" in line
+    assert "also uses same-track joins" in line
+    assert "unbroken continuations" in line
+    assert "does not count cuts" in line
+    # The clause is about the splice rule, so it comes after the list of cut-counting rules.
+    assert line.index("`no-dialogue-splice`") > line.index("`min-shot`")
+
+
 def test_an_overlay_entry_on_another_track_is_not_a_cut(
     clean_data: PlanData, run_lint: RunLint
 ) -> None:
