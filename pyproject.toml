@@ -14,7 +14,13 @@ dependencies = ["pydantic>=2,<3"]
 # zstd blobs with compressed blocks need zstandard; everything else in aar.drp is stdlib-only.
 drp = ["zstandard>=0.22"]
 hub = ["mcp>=2.3,<3", "starlette>=1.0,<2", "uvicorn>=0.30", "python-multipart>=0.0.18"]
-dev = ["pytest", "ruff", "ai-agent-resolve[drp,hub]"]
+# aar.analyze: sync and transcript workers. numpy is imported lazily; without it, the commands
+# that need it fail with a typed missing-extra error.
+analyze = ["numpy>=1.26,<3"]
+# faster-whisper wheels are hundreds of MB (CTranslate2), so this extra is not in dev. Models are
+# never downloaded: see aar.analyze.whisper.
+whisper = ["faster-whisper>=1.1,<2"]
+dev = ["pytest", "ruff", "ai-agent-resolve[drp,hub,analyze]"]
 
 [project.scripts]
 aar = "aar.cli:main"

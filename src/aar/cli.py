@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 
 from aar import __version__, cli_io
+from aar.analyze import cli as analyze_cli
 from aar.drp import cli as drp_cli
 from aar.host import cli as host_cli
 from aar.hub import cli as hub_cli
@@ -30,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     node_cli.register(groups)
     qa_cli.register(groups)
     host_cli.register(groups)
+    analyze_cli.register(groups)
     return parser
 
 
