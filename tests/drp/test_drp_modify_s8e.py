@@ -10,6 +10,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -38,8 +39,8 @@ def _left(x: Any) -> list[tuple[str, str]]:
     return [(e.path, e.kind) for e in getattr(x, "left_behind", [])]
 
 
-def _first_run(tmp_path: Path) -> tuple[Path, Path]:
-    out = tmp_path / "out.drp"
+def _first_run(tmp_path: Path, name: str = "out.drp") -> tuple[Path, Path]:
+    out = tmp_path / name
     assert edit_file(H264, plan(RENAME), out).status == "written"
     return out, Path(str(out) + SIDECAR_SUFFIX)
 
@@ -168,6 +169,87 @@ def test_low1_if_the_rename_fails_the_snapshot_is_kept_under_its_temporary_name(
     assert not any(n.endswith(SNAPSHOT_SUFFIX) for n in files(tmp_path))  # the claim is gone
 
 
+def _fail_snapshot_claim(monkeypatch: pytest.MonkeyPatch, err: int = errno.ENOSPC) -> None:
+    """``mkstemp`` cannot claim a kept-snapshot name (no space, read-only, name too long)."""
+    real_mkstemp = tempfile.mkstemp
+
+    def mkstemp(*a: Any, **k: Any) -> Any:
+        if k.get("suffix") == SNAPSHOT_SUFFIX:
+            raise OSError(err, os.strerror(err))
+        return real_mkstemp(*a, **k)
+
+    monkeypatch.setattr(write.tempfile, "mkstemp", mkstemp)
+
+
+def test_low1_a_failed_snapshot_claim_does_not_undo_a_written_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Round 2 (MED-1; validator repro A, inverted): the claim of the kept-snapshot name used to sit
+    # outside the guard, so a failing mkstemp escaped the end-of-run settle step and turned a
+    # finished --force write into an error (exit 74) with the snapshot unreported.
+    out, sidecar = _first_run(tmp_path)
+    real_place = write._place
+
+    def rewrite_in_place_then_place(tmp: Path, dest: Path, force: bool) -> None:
+        if dest == sidecar:
+            with open(sidecar, "r+b") as fh:
+                fh.truncate(0)
+                fh.write(HUMAN.encode())
+        real_place(tmp, dest, force)
+
+    monkeypatch.setattr(write, "_place", rewrite_in_place_then_place)
+    _fail_snapshot_claim(monkeypatch)
+    outcome = edit_file(H264, plan({**RENAME, "new_name": "y"}), out, force=True)
+    monkeypatch.undo()
+    assert outcome.status == "written" and not outcome.refusals
+    [(path, kind)] = _left(outcome)
+    assert kind == "label-snapshot" and _is_temp_name(out, Path(path).name)
+    assert Path(path).read_text() == HUMAN
+    assert not any(n.endswith(SNAPSHOT_SUFFIX) for n in files(tmp_path))
+
+
+@pytest.mark.parametrize("err", [errno.ENOSPC, errno.EROFS, errno.ENAMETOOLONG])
+def test_low1_a_failed_snapshot_claim_does_not_undo_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, err: int
+) -> None:
+    out, _ = _first_run(tmp_path)
+    _foreign_before_snapshot(monkeypatch)
+    _fail_snapshot_claim(monkeypatch, err)
+    outcome = edit_file(H264, plan({**RENAME, "new_name": "y"}), out, force=True)
+    monkeypatch.undo()
+    assert [r.code for r in outcome.refusals] == ["foreign-sidecar"]
+    [(path, kind)] = _left(outcome)
+    assert kind == "label-snapshot" and Path(path).read_text() == HUMAN
+
+
+@pytest.mark.parametrize("extra", [0, 1], ids=["name-max", "name-max-plus-1"])
+def test_low1_the_snapshot_name_at_the_filesystem_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: int
+) -> None:
+    # Validator repro B, inverted, at the exact boundary: the kept-snapshot name is the output's
+    # name plus 39 characters. At NAME_MAX it is renamed; one past it, mkstemp fails with
+    # ENAMETOOLONG and the snapshot is kept under its temporary name (output + 28, which fits),
+    # the refusal intact.
+    limit = os.pathconf(tmp_path, "PC_NAME_MAX")
+    name = "o" * (limit - 39 + extra - len(".drp")) + ".drp"
+    assert len(name) + 39 == limit + extra
+    out, _ = _first_run(tmp_path, name)
+    _foreign_before_snapshot(monkeypatch)
+    outcome = edit_file(H264, plan({**RENAME, "new_name": "y"}), out, force=True)
+    monkeypatch.undo()
+    assert [r.code for r in outcome.refusals] == ["foreign-sidecar"]
+    [(path, kind)] = _left(outcome)
+    kept = Path(path)
+    assert kind == "label-snapshot" and kept.read_text() == HUMAN
+    if extra == 0:
+        assert kept.name.endswith(SNAPSHOT_SUFFIX) and len(kept.name) == limit
+        assert leftovers(out) == []
+    else:
+        assert _is_temp_name(out, kept.name) and len(kept.name) == len(name) + 28
+        assert leftovers(out) == [kept]
+        assert not any(n.endswith(SNAPSHOT_SUFFIX) for n in files(tmp_path))
+
+
 def test_low1_the_module_uses_the_documented_snapshot_suffix() -> None:
     assert getattr(write, "SNAPSHOT_SUFFIX", None) == SNAPSHOT_SUFFIX
 
@@ -273,21 +355,52 @@ def test_low2_the_cli_exit_code_is_the_placement_errors(
     assert [(x["path"], x["kind"]) for x in result["left_behind"]] == [(str(sidecar), "own-label")]
 
 
-def test_low2_with_force_a_failed_label_restore_is_reported_too(
+def test_low2_with_force_a_failed_restore_keeps_the_old_label(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Round 2 (LOW-A; validator probe item4, inverted): the output placement fails, then
+    # restoring the old label from its snapshot fails too. The old output is still at --out and
+    # its correct label survives only in the snapshot, which used to be deleted because it bears
+    # aar's stamp. It is now kept off the temporary name and named as a label-snapshot.
     out, sidecar = _first_run(tmp_path)
-    old_out = out.read_bytes()
+    old_out, old_label = out.read_bytes(), sidecar.read_bytes()
     _fail_output_placement(monkeypatch, out)
     _fail_label_cleanup(monkeypatch, sidecar)
     with pytest.raises(OSError) as raised:
         edit_file(H264, plan({**RENAME, "new_name": "y"}), out, force=True)
     monkeypatch.undo()
-    assert raised.value.errno == errno.ENOSPC
-    assert _left(raised.value) == [(str(sidecar), "own-label")]
-    assert out.read_bytes() == old_out  # the old output is untouched
-    again = edit_file(H264, plan(RENAME), out)
-    assert [r.code for r in again.refusals] == ["out-exists"]
+    err = raised.value
+    assert err.errno == errno.ENOSPC
+    [own, snap] = _left(err)
+    assert own == (str(sidecar), "own-label") and snap[1] == "label-snapshot"
+    kept = Path(snap[0])
+    assert kept.name.endswith(SNAPSHOT_SUFFIX) and kept.read_bytes() == old_label
+    message = err.left_behind[1].message
+    assert f"output still at {out.name}" in message and f"over {sidecar.name}" in message
+    assert out.read_bytes() == old_out and sidecar.read_bytes() != old_label
+    assert leftovers(out) == []
+    # Following the message restores the old output's label.
+    os.replace(kept, sidecar)
+    assert sidecar.read_bytes() == old_label
+    assert [r.code for r in edit_file(H264, plan(RENAME), out).refusals] == ["out-exists"]
+
+
+def test_low2_a_failed_restore_whose_snapshot_cannot_be_renamed_is_still_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The same double failure, and the snapshot cannot move off its temporary name either: it is
+    # kept there and named, and the end-of-run settle step must not delete it.
+    out, sidecar = _first_run(tmp_path)
+    old_label = sidecar.read_bytes()
+    _fail_output_placement(monkeypatch, out)
+    _fail_label_cleanup(monkeypatch, sidecar)
+    _fail_snapshot_claim(monkeypatch)
+    with pytest.raises(OSError) as raised:
+        edit_file(H264, plan({**RENAME, "new_name": "y"}), out, force=True)
+    monkeypatch.undo()
+    [_, (path, kind)] = _left(raised.value)
+    assert kind == "label-snapshot" and _is_temp_name(out, Path(path).name)
+    assert Path(path).read_bytes() == old_label
 
 
 def test_low2_a_placeholder_and_the_own_label_are_both_reported(
