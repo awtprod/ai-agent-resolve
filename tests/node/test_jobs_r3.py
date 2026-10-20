@@ -1560,7 +1560,6 @@ def test_n5_concurrent_pumps_share_one_drain(tmp_path: Path) -> None:
 
 def test_n6_flock_released_when_owner_process_dies(tmp_path: Path) -> None:
     import os
-    import signal
     import subprocess
     import sys
 
@@ -1576,12 +1575,13 @@ def test_n6_flock_released_when_owner_process_dies(tmp_path: Path) -> None:
         assert p.stdout.readline().strip() == "locked"
         with pytest.raises(JobStoreLocked):
             JobStore(db)
-        p.send_signal(signal.SIGKILL)  # my own child
+        p.kill()  # my own child
         p.wait(WAIT)
         JobStore(db).close()  # the kernel released the dead owner's lock
     finally:
         if p.poll() is None:
             p.kill()
+        p.wait(WAIT)
 
 
 def test_n10_unknown_project_and_sandbox_exempt_types() -> None:
