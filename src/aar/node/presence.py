@@ -7,6 +7,16 @@ input, when an OS input-idle provider is available (``GetLastInputInfo`` on Wind
 
 It is deliberately conservative: until the context has been watched and found quiet for a
 whole idle window, a human is assumed to be present.
+
+The Windows input-idle time is per *session*: ``GetLastInputInfo`` only sees input in the
+calling process's session. A node running as a service (session 0), or in a session other
+than the active console one (another user, or a Remote Desktop session), would see no input
+at all and report a huge idle while a human types at the console. So the provider first checks
+that it runs in the active console session and raises :class:`InputIdleUnavailable` otherwise;
+the guard maps that to ``input_idle_error`` and refuses to switch (fail closed). The node must
+run in the interactive user's session (a logon task, not a service). A human working over
+Remote Desktop therefore blocks switches while connected: the safe direction, a known limit
+(revisited in S15b, where ``aar node run`` is decided).
 """
 
 from __future__ import annotations
@@ -19,6 +29,13 @@ from aar.node.gateway import ResolveContext
 
 InputIdleProvider = Callable[[], float | None]
 """Seconds since the last keyboard/mouse input, or ``None`` when the OS cannot tell."""
+
+NO_CONSOLE_SESSION = 0xFFFFFFFF
+"""``WTSGetActiveConsoleSessionId`` when no session is attached to the physical console."""
+
+
+class InputIdleUnavailable(RuntimeError):
+    """The OS input-idle time cannot be trusted for this process (the guard refuses)."""
 
 
 @dataclass(frozen=True)
@@ -120,6 +137,8 @@ class PresenceGuard:
         if self._input_idle is not None:
             try:
                 idle = self._input_idle()
+            except InputIdleUnavailable as exc:
+                return Decision(False, "input_idle_error", f"input idle unavailable: {exc}")
             except Exception as exc:
                 return Decision(False, "input_idle_error", f"input-idle provider failed: {exc!r}")
             if idle is not None and idle < self.idle_window:
@@ -136,23 +155,77 @@ def idle_seconds_from_ticks(last_input_tick: int, now_tick: int) -> float:
     return ((now_tick - last_input_tick) & 0xFFFFFFFF) / 1000.0
 
 
-def windows_input_idle_seconds() -> float | None:
-    """Seconds since the last input in this session via ``GetLastInputInfo``; ``None`` off Windows.
+def session_refusal(process_session: int | None, console_session: int | None) -> str | None:
+    """Why this process may not trust its input-idle time, or ``None`` when it may.
 
-    Only meaningful when the node runs in the interactive user's session: a service in
-    session 0 sees no input at all.
+    ``process_session`` is ``ProcessIdToSessionId(GetCurrentProcessId())`` and
+    ``console_session`` is ``WTSGetActiveConsoleSessionId()``; ``None`` means the call failed.
+    Only a process in the active console session, and not in session 0, sees the console
+    human's input.
+    """
+    if process_session is None:
+        return "ProcessIdToSessionId failed, so the node's session is unknown"
+    if console_session is None:
+        return "WTSGetActiveConsoleSessionId failed, so the console session is unknown"
+    if console_session == NO_CONSOLE_SESSION:
+        return "no session is attached to the console"
+    if process_session == 0:
+        return "the node runs in session 0 (a Windows service), which sees no user input"
+    if process_session != console_session:
+        return (
+            f"the node runs in session {process_session}, not the active console session "
+            f"{console_session} (another user, or Remote Desktop), so it cannot see the "
+            "console's input"
+        )
+    return None
+
+
+def _session_ids(windll: object) -> tuple[int | None, int | None]:
+    """``(process session, console session)``; ``None`` for a call that failed."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = windll.kernel32  # type: ignore[attr-defined]
+    process: int | None
+    try:
+        sid = wintypes.DWORD()
+        ok = kernel32.ProcessIdToSessionId(kernel32.GetCurrentProcessId(), ctypes.byref(sid))
+        process = int(sid.value) if ok else None
+    except Exception:
+        process = None
+    console: int | None
+    try:
+        kernel32.WTSGetActiveConsoleSessionId.restype = wintypes.DWORD
+        console = int(kernel32.WTSGetActiveConsoleSessionId())
+    except Exception:
+        console = None
+    return process, console
+
+
+def windows_input_idle_seconds() -> float | None:
+    """Seconds since the last input via ``GetLastInputInfo``; ``None`` off Windows.
+
+    Raises :class:`InputIdleUnavailable` unless the node runs in the active console session
+    (see :func:`session_refusal`): elsewhere the reading would be a huge, false idle.
     """
     if sys.platform != "win32":
         return None
     import ctypes
     from ctypes import wintypes
 
+    windll = ctypes.windll  # type: ignore[attr-defined]
+    refusal = session_refusal(*_session_ids(windll))
+    if refusal is not None:
+        raise InputIdleUnavailable(
+            f"{refusal}; the node must run in the interactive user's session (a logon task, "
+            "not a service)"
+        )
+
     class LASTINPUTINFO(ctypes.Structure):
         _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
 
     info = LASTINPUTINFO()
     info.cbSize = ctypes.sizeof(LASTINPUTINFO)
-    windll = ctypes.windll  # type: ignore[attr-defined]
     if not windll.user32.GetLastInputInfo(ctypes.byref(info)):
         raise ctypes.WinError()  # type: ignore[attr-defined]
     windll.kernel32.GetTickCount.restype = wintypes.DWORD
