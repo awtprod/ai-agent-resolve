@@ -3,6 +3,7 @@ measured values with stated tolerances, and hostile inputs."""
 
 from __future__ import annotations
 
+import importlib
 import os
 import time
 from collections.abc import Sequence
@@ -11,6 +12,7 @@ from typing import Any
 
 import pytest
 from media_support import (
+    FFMPEG,
     aeval,
     fake_tool,
     gapped,
@@ -23,7 +25,7 @@ from media_support import (
     truncate,
 )
 
-from aar.media import MediaToolMissing
+from aar.media import MediaError, MediaTimeout, MediaToolMissing, OutputTooLarge
 from aar.plan.inputs import Transcript, Word
 from aar.plan.model import EditPlan
 from aar.plan.profile import Profile, load_profile
@@ -587,6 +589,69 @@ def test_join_quiet_failures_outrank_unreadable_sources(tmp_path):
     entry = run(sine(tmp_path / "r.wav", -14.5), plan=plan, media_root=tmp_path).check("join-quiet")
     assert entry.status == "fail" and entry.incomplete
     assert "1 more could not be checked" in entry.message
+
+
+@posix_only
+def test_join_quiet_source_read_timeout_is_unchecked_not_failed(tmp_path, monkeypatch):
+    # The source pauses at the cut, so a completed read would pass. Only the windowed source
+    # read (the one ffmpeg call with -ss) stalls; every other call runs the real ffmpeg.
+    source = gapped(tmp_path / "a.wav", before_s=0.5, gap_s=0.1, after_s=0.5)
+    plan = _join_plan(tmp_path, source, src_in=27)
+    render_file = sine(tmp_path / "r.wav", -14.5, seconds=0.6)
+    stall = 'case " $* " in *" -ss "*) sleep 30;; esac\nexec "' + str(FFMPEG) + '" "$@"'
+    monkeypatch.setenv("AAR_FFMPEG", str(fake_tool(tmp_path, "ffmpeg", stall)))
+    started = time.monotonic()
+    report = run(render_file, plan=plan, media_root=tmp_path, timeout_s=3.0)
+    assert time.monotonic() - started < 20
+    entry = report.check("join-quiet")
+    [join] = entry.details
+    assert join["status"] == "unchecked"
+    assert "timed out after 3 s" in join["reason"]
+    assert "hint" not in join
+    assert entry.status == "warn" and entry.incomplete
+    assert entry.measured == {
+        "cuts": 1,
+        "failed": 0,
+        "unchecked": 1,
+        "unchecked_reason": "source-unreadable",
+    }
+    assert "join-quiet" in report.unchecked
+    assert report.status != "pass"
+    assert report.check("decode").status == "pass"  # the render's own calls were not stalled
+
+
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [
+        (MediaTimeout("ffmpeg timed out after 7 s", timeout_s=7.0, tool="ffmpeg"), "unchecked"),
+        (MediaError("ffmpeg exited with status 1", tool="ffmpeg", exit_code=1), "fail"),
+        (OutputTooLarge("ffmpeg wrote more than 10 bytes", tool="ffmpeg"), "fail"),
+    ],
+)
+def test_join_quiet_only_a_read_timeout_is_unchecked(tmp_path, monkeypatch, error, status):
+    def broken(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    source = gapped(tmp_path / "a.wav", before_s=0.5, gap_s=0.1, after_s=0.5)
+    # aar.qa re-exports check(), which shadows the module name, so patch the module itself.
+    monkeypatch.setattr(importlib.import_module("aar.qa.check"), "read_pcm", broken)
+    report = run(
+        sine(tmp_path / "r.wav", -14.5),
+        plan=_join_plan(tmp_path, source, src_in=27),
+        media_root=tmp_path,
+    )
+    entry = report.check("join-quiet")
+    [join] = entry.details
+    assert join["status"] == status
+    assert report.status != "pass" and entry.status != "pass"
+    if status == "unchecked":
+        assert join["reason"].startswith("reading the source audio timed out after 7 s")
+        assert entry.status == "warn" and entry.incomplete
+        assert "join-quiet" in report.unchecked
+    else:
+        assert join["reason"].startswith("could not read the source audio: ")
+        assert entry.status == "fail" and not entry.incomplete
+        assert join["hint"] == f"join 1: {join['reason']}"
 
 
 # ---------------------------------------------------------------- join re-transcription

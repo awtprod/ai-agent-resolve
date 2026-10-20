@@ -14,7 +14,6 @@ lexical-validation limit (see :mod:`aar.host.winpath` and DESIGN "Edit-PC transp
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import os
 import re
@@ -171,9 +170,16 @@ def _validate_local(path: str, roots: tuple[str, ...], *, is_dest: bool) -> str:
     return real
 
 
-def _unlink_quiet(path: str) -> None:
-    with contextlib.suppress(FileNotFoundError):
+def _unlink_quiet(path: str, *, note_to: BaseException | None = None) -> None:
+    """Best-effort unlink. A FileNotFoundError is normal; any other OSError is swallowed so it
+    never replaces the original error, and is recorded as a note on it (F2)."""
+    try:
         os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        if note_to is not None:
+            note_to.add_note(f"cleanup: could not remove {path}: {exc}")
 
 
 def _parse_tagged(stdout: str, tag: str) -> list[str]:
@@ -215,13 +221,13 @@ class EditHost:
 
     def _scp_base(self) -> list[str]:
         cfg = self.config
-        # -s forces SFTP mode so the glob-escaping and no-remote-shell assumptions do not depend on
-        # the client's default (a client older than OpenSSH 8.7 would reject -s; the hub is 9.6p1).
-        # Configurable via AAR_EDIT_SCP_SFTP, default on.
-        sftp = ["-s"] if cfg.scp_use_sftp else []
+        # Always -s: force SFTP mode so the glob-escaping and no-remote-shell assumptions never
+        # depend on the client's default. A client older than OpenSSH 8.7 rejects -s and fails
+        # closed with a typed transport error; legacy SCP (which parses the remote path through the
+        # remote shell) is unsupported because it is unsafe. The hub is OpenSSH 9.6p1.
         return [
             "scp",
-            *sftp,
+            "-s",
             "-F",
             cfg.ssh_config,
             "-o",
@@ -244,9 +250,15 @@ class EditHost:
         """Run ``script`` on the edit PC and return its cleaned stdout.
 
         Raises :class:`TransportTimeout` on timeout and :class:`RemoteCommandError` on a non-zero
-        exit. Output newlines are normalised to LF and CLIXML progress is stripped from stderr.
+        exit. A failure to even spawn ssh (an ``OSError`` from the runner, e.g. ssh not on PATH or
+        ``BlockingIOError`` on fork) is mapped once to :class:`LocalIOError` so the stat/exists
+        pre-checks never escape raw (F2). Output newlines are normalised to LF and CLIXML progress
+        is stripped from stderr.
         """
-        result = self.runner.run(self.powershell_argv(script), timeout=self._timeout(timeout))
+        try:
+            result = self.runner.run(self.powershell_argv(script), timeout=self._timeout(timeout))
+        except OSError as exc:
+            raise LocalIOError(f"could not run ssh: {exc}") from exc
         return self._finish_powershell(result)
 
     def _finish_powershell(self, result: RunResult) -> str:
@@ -295,9 +307,14 @@ class EditHost:
             raise RemoteCommandError(0, f"could not parse {_EXISTS_TAG} output: {fields!r}")
         return fields[0]
 
-    def _remote_remove_quiet(self, win: _Win) -> None:
-        with contextlib.suppress(HostError):
+    def _remote_remove_quiet(self, win: _Win, *, note_to: BaseException | None = None) -> None:
+        """Best-effort remote cleanup of a partial upload. Suppresses ``(HostError, OSError)`` so a
+        cleanup failure never replaces the original error, and records it as a note on it (F2)."""
+        try:
             self.run_powershell(remove_script(windows_literal(win)))
+        except (HostError, OSError) as exc:
+            if note_to is not None:
+                note_to.add_note(f"cleanup: remote Remove-Item failed: {exc}")
 
     # -- transfers ----------------------------------------------------------------------------
 
@@ -323,14 +340,12 @@ class EditHost:
             if digest != remote_hash:
                 raise HashMismatch(remote_hash, digest)
             self._place(tmp, dest, overwrite)
-        except HostError:
-            _unlink_quiet(tmp)
-            raise
-        except OSError as exc:  # a local filesystem failure while verifying or placing
-            _unlink_quiet(tmp)
-            raise LocalIOError(f"local I/O error completing the download: {exc}") from exc
-        except BaseException:
-            _unlink_quiet(tmp)
+        except OSError as exc:  # a runner spawn or local filesystem failure (not a HostError)
+            typed = LocalIOError(f"local I/O error completing the download: {exc}")
+            _unlink_quiet(tmp, note_to=typed)
+            raise typed from exc
+        except BaseException as exc:  # HostError, KeyboardInterrupt, ... : the original wins
+            _unlink_quiet(tmp, note_to=exc)
             raise
         return TransferResult(
             "pull",
@@ -365,14 +380,12 @@ class EditHost:
             self.run_powershell(
                 move_script(windows_literal(tmp_win), windows_literal(win), overwrite)
             )
-        except HostError:
-            self._remote_remove_quiet(tmp_win)
-            raise
-        except OSError as exc:  # a runner / local failure during the upload path
-            self._remote_remove_quiet(tmp_win)
-            raise LocalIOError(f"I/O error during the upload: {exc}") from exc
-        except BaseException:
-            self._remote_remove_quiet(tmp_win)
+        except OSError as exc:  # a runner spawn failure during the upload path (not a HostError)
+            typed = LocalIOError(f"I/O error during the upload: {exc}")
+            self._remote_remove_quiet(tmp_win, note_to=typed)
+            raise typed from exc
+        except BaseException as exc:  # HostError, KeyboardInterrupt, ... : the original wins
+            self._remote_remove_quiet(tmp_win, note_to=exc)
             raise
         return TransferResult(
             "push",
@@ -420,12 +433,10 @@ def _place_no_hardlink(tmp: str, dest: str) -> None:
 
     ``O_EXCL`` guarantees we never overwrite a pre-existing destination, and it does not follow a
     symlink planted at the name. On any failure or interrupt before the replace lands, ``dest`` is
-    removed only if it is still our empty claim -- matched by device, inode *and* ``ctime_ns``
-    (``st_ino`` alone is recycled, per S8c's inode-reuse note) and size 0. A non-empty file or a
-    file another writer created at the name is left in place (and reported via the raised error),
-    never deleted. This mirrors S8c's ``_unlink_if_ours`` in ``aar.drp.modify.write``. The residual
-    window is the empty claim itself: a crash with no cleanup could leave a zero-byte ``dest`` (the
-    verified data stays in ``tmp``, which the caller removes), but a caught interrupt removes it.
+    removed only if it is still our zero-byte claim, matched by device, inode, ``ctime_ns`` and
+    size 0. A file that is not provably ours (written into, a symlink, or a different inode) is
+    left in place and reported via the raised error (F4), never deleted. If the file cannot be
+    proven ours, it is kept.
     """
     try:
         fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -433,23 +444,53 @@ def _place_no_hardlink(tmp: str, dest: str) -> None:
         raise DestinationExists(dest) from None
     try:
         claim = os.fstat(fd)
-    finally:
+    except BaseException as exc:
+        # The fresh claim cannot be identified, so it cannot be proven ours: leave it and report it.
         os.close(fd)
+        raise _report_kept_claim(exc, dest) from None
+    os.close(fd)
     try:
         os.replace(tmp, dest)
-    except BaseException:
-        _unlink_if_claim(dest, claim)
+    except BaseException as exc:
+        if not _unlink_if_claim(dest, claim):
+            raise _report_kept_claim(exc, dest) from None
         raise
 
 
-def _unlink_if_claim(dest: str, claim: os.stat_result) -> None:
-    """Remove ``dest`` only if it is still our zero-byte O_EXCL claim (dev, inode, ctime_ns)."""
-    with contextlib.suppress(OSError):
+def _report_kept_claim(exc: BaseException, dest: str) -> BaseException:
+    """Record that ``dest`` was left in place. Returns the exception to re-raise: an ``OSError`` is
+    wrapped in a :class:`LocalIOError` whose message names the path; any other (e.g.
+    ``KeyboardInterrupt``) keeps its type with the fact added as a note (F4)."""
+    note = f"left in place (not provably ours): {dest}"
+    if isinstance(exc, OSError):
+        return LocalIOError(f"local I/O error placing the download ({exc}); {note}")
+    exc.add_note(note)
+    return exc
+
+
+def _unlink_if_claim(dest: str, claim: os.stat_result) -> bool:
+    """Remove ``dest`` only if it is still our zero-byte O_EXCL claim; return whether it was gone.
+
+    Identity is device, inode and ``ctime_ns``, plus size 0. ``ctime_ns`` narrows inode reuse but
+    does not close it within one timestamp tick (ext4 timestamps are coarse: a reused inode often
+    carries the same ``ctime_ns``), so another writer's *empty* file created in the same tick is
+    indistinguishable and would be removed; a non-empty file never is. Our own
+    ``fstat -> close -> failed replace`` never changes the identity, so a genuine claim is still
+    recognised.
+    """
+    try:
         now = os.lstat(dest)  # lstat: never follow a symlink that replaced the claim
-        same = (now.st_dev, now.st_ino, now.st_ctime_ns) == (
-            claim.st_dev,
-            claim.st_ino,
-            claim.st_ctime_ns,
-        )
-        if same and now.st_size == 0:
+    except OSError:
+        return False
+    same = (now.st_dev, now.st_ino, now.st_ctime_ns) == (
+        claim.st_dev,
+        claim.st_ino,
+        claim.st_ctime_ns,
+    )
+    if same and now.st_size == 0:
+        try:
             os.unlink(dest)
+            return True
+        except OSError:
+            return False
+    return False

@@ -82,7 +82,7 @@ def test_ssh_base_flags(tmp_path) -> None:
     ]
     assert host._scp_base() == [
         "scp",
-        "-s",  # force SFTP mode (AAR_EDIT_SCP_SFTP default on)
+        "-s",  # always SFTP mode (no toggle)
         "-F",
         str(tmp_path / "ssh.cfg"),
         "-o",
@@ -90,9 +90,6 @@ def test_ssh_base_flags(tmp_path) -> None:
         "-o",
         "ConnectTimeout=20",
     ]
-    # with sftp off, -s is dropped
-    off = build(tmp_path, FakeRunner(), connect_timeout=20, scp_use_sftp=False)
-    assert "-s" not in off._scp_base()
 
 
 def test_pull_size_mismatch_removes_temp(tmp_path) -> None:

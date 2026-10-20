@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections.abc import Callable
 from typing import Any
 
 from aar import cli_io
-from aar.host.config import env_config
+from aar.host.config import MAX_TIMEOUT_SECONDS, env_config
 from aar.host.errors import ConfigError, HostError, PathRefused, ScriptTooLong, TransportError
 from aar.host.runner import Runner, SubprocessRunner
 from aar.host.transport import EditHost, TransferResult
@@ -61,9 +62,30 @@ def register(subparsers: Any) -> None:
 
     ps = sub.add_parser("ps", help="Run a PowerShell script file on the edit PC.")
     ps.add_argument("script", help="Path to a local PowerShell script file (not an inline string).")
-    ps.add_argument("--timeout", type=float, help="Override the command timeout (seconds).")
+    ps.add_argument(
+        "--timeout",
+        type=_timeout_arg,
+        help=f"Override the command timeout: finite seconds in (0, {MAX_TIMEOUT_SECONDS}].",
+    )
     ps.add_argument("--json", action="store_true", help="Print the result as JSON.")
     ps.set_defaults(func=_cmd_ps)
+
+
+def _timeout_arg(raw: str) -> float:
+    """An argparse type for --timeout: a finite number of seconds in (0, MAX_TIMEOUT_SECONDS].
+
+    Rejects nan, inf, 0, negatives and over-large values with a usage error (exit 2) rather than
+    letting them reach subprocess, which raises OverflowError on a non-finite timeout.
+    """
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
+    if not math.isfinite(value) or not (0 < value <= MAX_TIMEOUT_SECONDS):
+        raise argparse.ArgumentTypeError(
+            f"must be a finite number of seconds in (0, {MAX_TIMEOUT_SECONDS}]: {raw!r}"
+        )
+    return value
 
 
 def _default_runner() -> Runner:
@@ -147,7 +169,11 @@ def _cmd_ps(args: argparse.Namespace) -> int:
                 EXIT_INPUT,
                 args.json,
             )
-        stdout = _host().run_powershell(script, timeout=args.timeout)
+        try:
+            stdout = _host().run_powershell(script, timeout=args.timeout)
+        except ValueError as exc:
+            # a NUL in the script (e.g. a BOM-less UTF-16 file decoded as UTF-8): typed, exit 2.
+            return _error(ValueError(f"{args.script}: {exc}"), EXIT_INPUT, args.json)
         if args.json:
             body = {"ok": True, "op": "ps", "stdout": stdout}
             return cli_io.emit(_PROG, json.dumps(body, indent=2) + "\n") or EXIT_OK
@@ -157,5 +183,7 @@ def _cmd_ps(args: argparse.Namespace) -> int:
 
 
 def _read_text(path: str) -> str:
-    with open(path, encoding="utf-8") as handle:
+    # utf-8-sig: strip a UTF-8 BOM so it is not sent as a leading U+FEFF. A non-UTF-8 file raises
+    # UnicodeDecodeError (handled in _cmd_ps as a typed exit-2 refusal).
+    with open(path, encoding="utf-8-sig") as handle:
         return handle.read()

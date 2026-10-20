@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from collections.abc import Iterable
 from typing import Annotated, Literal
 
@@ -83,9 +84,21 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+#: Unicode categories that draw nothing: format characters (zero-width space, joiners, BOM,
+#: word joiner) and non-spacing combining marks (an accent with no letter under it).
+_INVISIBLE_CATEGORIES = frozenset({"Cf", "Mn"})
+
+
 def _not_blank(value: str) -> str:
-    if not value.strip():
-        raise ValueError("must not be empty or blank")
+    """Refuse a text that shows nothing: empty, or only whitespace, format or combining marks.
+
+    A single visible character is enough, so ``"!"``, ``"a"`` and an emoji joined by a
+    zero-width joiner all pass, and so does an accented letter in either form.
+    """
+    if all(char.isspace() or unicodedata.category(char) in _INVISIBLE_CATEGORIES for char in value):
+        raise ValueError(
+            "must not be empty or blank (whitespace, zero-width and combining marks show nothing)"
+        )
     return value
 
 
@@ -103,8 +116,8 @@ FPS_TEXT_PATTERN = r"^\s*0*[1-9][0-9]*\s*(/\s*0*[1-9][0-9]*\s*)?$"
 class Fps(_Model):
     """A frame rate as a rational, e.g. ``{"num": 24000, "den": 1001}``.
 
-    A string such as ``"24000/1001"`` or ``"25"`` is also accepted on input, and so is a whole
-    number such as ``25``. The input JSON Schema lists all three forms.
+    A string such as ``"24000/1001"`` or ``"25"`` (ASCII digits only) is also accepted on input,
+    and so is a whole number such as ``25``. The input JSON Schema lists all three forms.
     """
 
     num: int = Field(gt=0, description="Numerator, e.g. 24000.")
@@ -143,7 +156,10 @@ class Fps(_Model):
     @classmethod
     def _coerce(cls, value: object) -> object:
         if isinstance(value, str):
-            match = re.fullmatch(r"\s*(\d+)\s*(?:/\s*(\d+)\s*)?", value)
+            # ASCII only, as the schema's pattern is: \d would also read Arabic-Indic digits.
+            match = (
+                re.fullmatch(r"\s*(\d+)\s*(?:/\s*(\d+)\s*)?", value) if value.isascii() else None
+            )
             if match is None:
                 raise ValueError(f"fps {value!r} is not 'N' or 'N/D'")
             return {"num": int(match.group(1)), "den": int(match.group(2) or 1)}
