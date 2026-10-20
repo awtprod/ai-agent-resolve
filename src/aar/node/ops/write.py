@@ -642,10 +642,14 @@ def _at(timeline: Any, kind: str, track: int, start: int, media_id: str) -> list
 
 
 class _Appender:
-    def __init__(self, env: OpEnv, timeline: Any, params: AppendParams) -> None:
+    """Places one planned range with ``AppendToTimeline`` and verifies it (shared with the
+    build op ``title.place``). ``repair_short`` re-appends an item that lands one frame short
+    (trap ``append-fps-short``), deleting the short item this call just placed."""
+
+    def __init__(self, env: OpEnv, timeline: Any, *, repair_short: bool) -> None:
         self.env = env
         self.timeline = timeline
-        self.params = params
+        self.repair_short = repair_short
         self.media_pool = env.media_pool()
         self.start = int(timeline.GetStartFrame())
 
@@ -719,7 +723,7 @@ class _Appender:
                 )
             )
         duration = int(item.GetEnd()) - int(item.GetStart())
-        if duration == p.frames - 1 and self.params.repair_short:
+        if duration == p.frames - 1 and self.repair_short:
             frames = facts["frames"]
             if frames is not None and rng.src_out + 1 > frames:
                 raise OpError(
@@ -874,7 +878,7 @@ def timeline_append_ranges(env: OpEnv, params: AppendParams) -> AppendResult:
     for p in window:
         _preflight(timeline, p, facts[p.rng.media.unique_id])
 
-    appender = _Appender(env, timeline, params)
+    appender = _Appender(env, timeline, repair_short=params.repair_short)
     done: list[AppendedRange] = []
     touched: dict[tuple[str, int], tuple[int, int]] = {}
     for p in window:
