@@ -37,6 +37,9 @@ EXPECTED = {
     "timeline.branch": (True, True),
     "markers.mirror_review": (True, True),
     "markers.read_review": (True, False),
+    "render.build": (True, True),
+    "render.poll": (True, False),
+    "render.delete_job": (True, True),
 }
 
 

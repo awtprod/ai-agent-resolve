@@ -145,6 +145,11 @@ class HotOp:
     timeline_id: str | None = None
     extra_timeline_ids: tuple[str, ...] = ()
     """Other timelines the op reads or writes: leased like ``timeline_id``, not selected."""
+    precheck: Callable[[], OpError | None] | None = field(default=None, compare=False)
+    """Asked right before the op would run, before any project, timeline or page switch: an
+    ``OpError`` refuses it (it is finished ``cancelled`` with that error, never run). The job
+    runner uses it so an emergency stop takes effect between ops, even inside one batch. It is
+    also asked for every queued op at the start of each tick. A precheck that raises refuses."""
 
 
 class OpStatus(StrEnum):
@@ -371,6 +376,7 @@ class Broker:
         self._presence.observe(ctx, now)
         self._check_takeover(now)
 
+        self._sweep_prechecks()
         runnable = self._runnable(notify=True)
         if not runnable:
             return self._idle_or_restore(ctx, now)
@@ -451,6 +457,28 @@ class Broker:
             del self._seq[op.id]
             self._notices.pop(f"skip:{op.id}", None)
             return True
+
+    def _refused(self, op: HotOp) -> OpError | None:
+        """What ``op``'s precheck says, if it refuses. A precheck that raises refuses too."""
+        if op.precheck is None:
+            return None
+        try:
+            return op.precheck()
+        except Exception as exc:  # fail closed: an op whose gate cannot be checked never runs
+            return OpError(
+                "precheck_failed",
+                f"the op's precheck raised {type(exc).__name__}: {exc}",
+                {"exception": type(exc).__name__},
+            )
+
+    def _sweep_prechecks(self) -> None:
+        """Finish, unrun, every queued op whose precheck refuses (called before scheduling)."""
+        with self._lock:
+            queued = [op for ops in self._queues.values() for op in ops if op.precheck is not None]
+        for op in queued:
+            refusal = self._refused(op)
+            if refusal is not None:
+                self._finish_unrun(op, OpStatus.CANCELLED, refusal)
 
     def _record(self, result: OpResult) -> None:
         with self._lock:
@@ -879,7 +907,12 @@ class Broker:
         return self._finish_unrun(op, OpStatus.FAILED, OpError(code, message, detail))
 
     def _run_op(self, op: HotOp) -> OpResult | None:
-        """Assert the context, then run ``op``. ``None``: lease-blocked, so it stays queued."""
+        """Assert the context, then run ``op``. ``None``: it did not run (lease-blocked, so it
+        stays queued; or refused by its precheck, so it was finished unrun)."""
+        refusal = self._refused(op)
+        if refusal is not None:  # before any switch: a refused op changes nothing in Resolve
+            self._finish_unrun(op, OpStatus.CANCELLED, refusal)
+            return None
         gw = self._gw
         want = op.project
         ctx = gw.get_context()

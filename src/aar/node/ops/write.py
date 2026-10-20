@@ -22,12 +22,14 @@ Known, intentional, fail-closed behaviour (not bugs):
 
 from __future__ import annotations
 
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import Field, model_validator
 
+from aar.node.gateway import GatewayError
 from aar.node.ops import raw
 from aar.node.ops.framework import (
     ItemRef,
@@ -223,12 +225,58 @@ when no copy was made, or when what Resolve returned cannot be shown to be a new
 nothing may be undone)."""
 
 
+POSSIBLE_COPIES = "possible_copies"
+"""``OpError`` detail key, report only: timelines that appeared during a failed
+``DuplicateTimeline`` and carry the requested name, but cannot be shown to be this call's copy
+(Resolve returned ``None`` or the source; or another actor made a same-named one meanwhile).
+Never deleted; named so a human or the runner can reclaim them, and a retry need not cut
+another version blindly. (Not ``left_behind``: on ``timeline.branch`` errors that key already
+means *this call's own* copy that its clean-up could not delete.)"""
+
+_TRACEBACK_CHARS = 4000
+
+
+def _reported(exc: Exception) -> OpError:
+    """``exc`` as an ``OpError``. A Resolve/gateway failure keeps its code; anything else that
+    is not an ``OpError`` (a ``TypeError``, say: maybe a bug, maybe an API surprise) becomes
+    ``op_raised`` with its type and traceback, never the transient-sounding
+    ``resolve_call_failed``, so nobody retries a deterministic failure blindly."""
+    if isinstance(exc, OpError | GatewayError):
+        return as_op_error(exc)
+    text = "".join(traceback.format_exception(exc))[-_TRACEBACK_CHARS:]
+    return OpError(
+        "op_raised",
+        f"{type(exc).__name__}: {exc}",
+        "this is not a transient Resolve failure: report it with the traceback; do not retry "
+        "until it is understood",
+        exception=type(exc).__name__,
+        traceback=text,
+    )
+
+
+def _with_detail(exc: Exception, **added: object) -> OpError:
+    """``exc`` reported (see :func:`_reported`), with ``added`` merged into its detail."""
+    error = _reported(exc)
+    extra = {k: v for k, v in error.detail.items() if k not in ("fix_hint", "trap_id")}
+    extra.update(added)
+    return OpError(error.code, error.message, error.fix_hint, error.trap_id, **extra)
+
+
 def _with_created(exc: Exception, created_id: str) -> OpError:
     """``exc`` as an ``OpError`` naming the copy this call made (:data:`CREATED_TIMELINE_ID`)."""
-    error = as_op_error(exc)
-    extra = {k: v for k, v in error.detail.items() if k not in ("fix_hint", "trap_id")}
-    extra[CREATED_TIMELINE_ID] = created_id
-    return OpError(error.code, error.message, error.fix_hint, error.trap_id, **extra)
+    return _with_detail(exc, **{CREATED_TIMELINE_ID: created_id})
+
+
+def _left_behind(env: OpEnv, before_ids: set[str], name: str) -> list[dict[str, str]]:
+    """Timelines that are new since ``before_ids`` and carry ``name`` (report only)."""
+    try:
+        return [
+            {"name": str(t.GetName()), "unique_id": str(t.GetUniqueId())}
+            for t in env.timelines()
+            if str(t.GetUniqueId()) not in before_ids and t.GetName() == name
+        ]
+    except Exception:  # reading the project failed too: report nothing rather than guess
+        return []
 
 
 @op(
@@ -265,10 +313,18 @@ def timeline_duplicate(env: OpEnv, params: DuplicateParams) -> DuplicateResult:
     before = int(project.GetTimelineCount() or 0)
     made = source.DuplicateTimeline(params.name)
     if made is None:
+        left = _left_behind(env, before_ids, params.name)
         raise OpError(
             "duplicate_failed",
-            f"DuplicateTimeline({params.name!r}) returned None",
-            "check the name is unique and the source timeline is not locked",
+            f"DuplicateTimeline({params.name!r}) returned None"
+            + (f", but {len(left)} new timeline(s) named so appeared" if left else ""),
+            "check the name is unique and the source timeline is not locked"
+            + (
+                "; the timeline(s) in left_behind may be Resolve's copy (never deleted)"
+                if left
+                else ""
+            ),
+            **({POSSIBLE_COPIES: left} if left else {}),
         )
     uid = made.GetUniqueId()
     matches = [t for t in env.timelines() if t.GetUniqueId() == uid]
@@ -279,9 +335,12 @@ def timeline_duplicate(env: OpEnv, params: DuplicateParams) -> DuplicateResult:
     try:
         return _finish_duplicate(env, project, source, params, matches, before)
     except Exception as exc:
-        if created_id is None:
-            raise
-        raise _with_created(exc, created_id) from exc
+        if created_id is not None:
+            raise _with_created(exc, created_id) from exc
+        left = _left_behind(env, before_ids, params.name)
+        if left:  # not provably ours (Resolve returned the source, say): name it, never undo
+            raise _with_detail(exc, **{POSSIBLE_COPIES: left}) from exc
+        raise
 
 
 def _finish_duplicate(
