@@ -35,6 +35,7 @@ from typing import Annotated, Any, Literal
 from pydantic import AfterValidator, Field, model_validator
 
 from aar.node.ops.framework import (
+    ItemRef,
     MediaRef,
     Note,
     OpEnv,
@@ -47,6 +48,8 @@ from aar.node.ops.framework import (
 )
 from aar.node.ops.write import (
     _JAM_HINT,
+    _clips,
+    _int,
     _no_repeats,
     _with_completed,
 )
@@ -644,3 +647,314 @@ def track_ensure(env: OpEnv, params: TrackParams) -> TrackResult:
         tracks=[done[(s.type, s.index)] for s in params.tracks],
         added=added,
     )
+
+
+# -- transition.add ----------------------------------------------------------------------------
+
+
+class TransitionTarget(OpModel):
+    item: ItemRef
+    position: Literal["start", "end"]
+    type: TransitionName = Field(
+        default="Cross Dissolve", description="The transition's name, e.g. 'Cross Dissolve'."
+    )
+    category: Literal["simple", "audio"] = Field(
+        default="simple", description="'simple' on a video item, 'audio' on an audio item."
+    )
+    alignment: Literal["left", "center", "right"] = Field(
+        description="As on the Edit page: 'left' ends on the edit, 'center' straddles it, "
+        "'right' starts on it."
+    )
+    frames: int = Field(strict=True, ge=1, le=240)
+
+    @model_validator(mode="after")
+    def _fits_item(self) -> TransitionTarget:
+        if self.item.track_type not in ("video", "audio"):
+            raise ValueError("a transition goes on a video or an audio item")
+        if (self.category == "audio") != (self.item.track_type == "audio"):
+            raise ValueError(
+                "an 'audio' transition needs an audio item, a 'simple' one a video item"
+            )
+        return self
+
+
+class TransitionParams(OpModel):
+    timeline: TimelineRef
+    targets: list[TransitionTarget] = Field(min_length=1, max_length=MAX_TARGETS)
+
+    @model_validator(mode="after")
+    def _once(self) -> TransitionParams:
+        _no_repeats([(t.item.item_id, t.position) for t in self.targets], "item edge")
+        return self
+
+
+class HandleCheck(OpModel):
+    side: Literal["outgoing", "incoming"]
+    item_id: str
+    needed: int
+    available: int | None
+
+
+class TransitionAdded(OpModel):
+    item_id: str
+    position: Literal["start", "end"]
+    status: Literal["added", "present"]
+    transition_id: str
+    record_in: int
+    record_out: int
+    duration: int
+    handles: list[HandleCheck]
+
+
+class TransitionResult(OpModel):
+    timeline: TimelineIdentity
+    transitions: list[TransitionAdded]
+
+
+def _transitions_at(timeline: Any, ref: ItemRef, edge: int) -> list[Any]:
+    """Transition items on the item's track that touch the edit at ``edge``."""
+    return [
+        t
+        for t in timeline.GetItemListInTrack(ref.track_type, ref.track) or []
+        if t.GetType() == "transition" and int(t.GetStart()) <= edge <= int(t.GetEnd())
+    ]
+
+
+def _handles(timeline: Any, target: TransitionTarget, item: Any, edge: int) -> list[HandleCheck]:
+    """What each clip at the edit needs and has, by the advisory rule: ``center`` needs
+    ``frames // 2`` on each side, ``left``/``right`` all of it on one side.
+
+    [I] The handle rules: the alignment meanings, that the part of the transition before
+    the edit shows the incoming clip early (its left offset) and the part after it holds the
+    outgoing clip on (its right offset), and that a side with no clip fades from or to black
+    and needs nothing. The read-back after AddTransition is the real check.
+    """
+    ref, uid = target.item, str(item.GetUniqueId())
+    clips = [c for c in _clips(timeline, ref.track_type, ref.track) if str(c.GetUniqueId()) != uid]
+    if target.position == "end":
+        outgoing = item
+        incoming = next((c for c in clips if int(c.GetStart()) == edge), None)
+    else:
+        outgoing = next((c for c in clips if int(c.GetEnd()) == edge), None)
+        incoming = item
+    f = target.frames
+    need_out, need_in = {"center": (f // 2, f // 2), "left": (0, f), "right": (f, 0)}[
+        target.alignment
+    ]
+    checks = []
+    if outgoing is not None:
+        checks.append(
+            HandleCheck(
+                side="outgoing",
+                item_id=str(outgoing.GetUniqueId()),
+                needed=need_out,
+                available=_int(outgoing.GetRightOffset()),
+            )
+        )
+    if incoming is not None:
+        checks.append(
+            HandleCheck(
+                side="incoming",
+                item_id=str(incoming.GetUniqueId()),
+                needed=need_in,
+                available=_int(incoming.GetLeftOffset()),
+            )
+        )
+    return checks
+
+
+def _present_or_conflict(
+    timeline: Any, target: TransitionTarget, edge: int, start: int
+) -> TransitionAdded | None:
+    """The transition already at this edge with the asked length (``present``), ``None`` if
+    there is none; a transition there of another length is never replaced."""
+    found = _transitions_at(timeline, target.item, edge)
+    if not found:
+        return None
+    if len(found) == 1 and int(found[0].GetDuration()) == target.frames:
+        t = found[0]
+        return TransitionAdded(
+            item_id=target.item.item_id,
+            position=target.position,
+            status="present",
+            transition_id=str(t.GetUniqueId()),
+            record_in=int(t.GetStart()) - start,
+            record_out=int(t.GetEnd()) - start,
+            duration=int(t.GetDuration()),
+            handles=[],
+        )
+    raise OpError(
+        "transition_conflict",
+        f"item {target.item.item_id} already has {len(found)} transition(s) at its "
+        f"{target.position} ({[int(t.GetDuration()) for t in found]} frames), not one of "
+        f"{target.frames}; it is never replaced",
+        "remove or change the existing transition by hand, or ask for its length",
+        existing=[
+            {"transition_id": str(t.GetUniqueId()), "duration": int(t.GetDuration())} for t in found
+        ],
+    )
+
+
+def _undo_transition(timeline: Any, ref: ItemRef, made: Any, reason: OpError) -> OpError:
+    """Delete the transition this call has just made, whose read-back was wrong, and return
+    ``reason`` to raise; ``transition_left_behind`` if it cannot be deleted. This is the only
+    deletion in the build ops."""
+    made_id = str(made.GetUniqueId())
+    # [I] Timeline.DeleteClips deletes transition items too. Never a ripple delete.
+    ok = timeline.DeleteClips([made], False)
+    still = any(
+        str(t.GetUniqueId()) == made_id
+        for t in timeline.GetItemListInTrack(ref.track_type, ref.track) or []
+    )
+    if ok and not still:
+        return reason
+    extra = {k: v for k, v in reason.detail.items() if k not in ("fix_hint", "trap_id")}
+    return OpError(
+        "transition_left_behind",
+        f"{reason.message}; deleting the new transition {made_id} failed, so it is still there",
+        "delete that transition by hand (only it: nothing else was changed)",
+        transition_id=made_id,
+        cause=reason.code,
+        **{k: v for k, v in extra.items() if k != "transition_id"},
+    )
+
+
+def _add_one(
+    timeline: Any, target: TransitionTarget, item: Any, edge: int, start: int
+) -> TransitionAdded:
+    ref = target.item
+    handles = _handles(timeline, target, item, edge)
+    present = _present_or_conflict(timeline, target, edge, start)
+    if present is not None:
+        return present
+    before = {
+        str(t.GetUniqueId())
+        for t in timeline.GetItemListInTrack(ref.track_type, ref.track) or []
+        if t.GetType() == "transition"
+    }
+    made = item.AddTransition(
+        {
+            "type": target.type,
+            "category": target.category,
+            "position": target.position,
+            "alignment": target.alignment,
+            "duration": target.frames,
+        }
+    )
+    if made is None:
+        appeared = [str(t.GetUniqueId()) for t in _transitions_at(timeline, ref, edge)]
+        appeared = [t for t in appeared if t not in before]
+        raise OpError(
+            "transition_refused",
+            f"AddTransition({target.type!r}, {target.category}) at the {target.position} of "
+            f"item {ref.item_id} returned None",
+            "check the transition name and category, the item's handles and that the track "
+            "is not locked",
+            **({"possible_transitions": appeared} if appeared else {}),
+        )
+    made_id = str(made.GetUniqueId())
+    on_track = any(
+        str(t.GetUniqueId()) == made_id
+        for t in timeline.GetItemListInTrack(ref.track_type, ref.track) or []
+    )
+    if str(made.GetType() or "") != "transition" or made_id in before or not on_track:
+        # Not provably a transition this call made: never deleted.
+        raise OpError(
+            "transition_unverified",
+            f"AddTransition returned {made.GetType()!r} item {made_id}, not a new transition "
+            f"on {ref.track_type} track {ref.track}",
+            "inspect the track with timeline.describe (nothing was deleted)",
+            returned_id=made_id,
+        )
+    duration = int(made.GetDuration())
+    t_start, t_end = int(made.GetStart()), int(made.GetEnd())
+    if duration != target.frames:
+        # [I] Too-short handles may give a shorter transition instead of None.
+        raise _undo_transition(
+            timeline,
+            ref,
+            made,
+            OpError(
+                "transition_short",
+                f"the new transition at the {target.position} of item {ref.item_id} is "
+                f"{duration} frames, not {target.frames}; it was deleted",
+                "trim the source range so the clips have handles, or change the alignment",
+                measured=duration,
+                wanted=target.frames,
+                handles=[h.model_dump() for h in handles],
+            ),
+        )
+    if not t_start <= edge <= t_end:
+        raise _undo_transition(
+            timeline,
+            ref,
+            made,
+            OpError(
+                "transition_misplaced",
+                f"the new transition spans [{t_start}, {t_end}), away from the edit at {edge}; "
+                "it was deleted",
+                "add it by hand on the Edit page",
+                start=t_start,
+                end=t_end,
+                edge=edge,
+            ),
+        )
+    return TransitionAdded(
+        item_id=ref.item_id,
+        position=target.position,
+        status="added",
+        transition_id=made_id,
+        record_in=t_start - start,
+        record_out=t_end - start,
+        duration=duration,
+        handles=handles,
+    )
+
+
+@op("transition.add", params=TransitionParams, result=TransitionResult, mutates=True)
+def transition_add(env: OpEnv, params: TransitionParams) -> TransitionResult:
+    """Add transitions at item edges, read back; R6 head/outro-only is plan.lint's and S13h2's.
+
+    Policy: DESIGN R6 allows only the head and outro transitions. That rule is enforced by
+    ``plan.lint`` and by the ``plan.apply`` compiler (S13h2), not by this op.
+
+    An existing transition at an edge is never replaced: the same length is ``present``,
+    another is ``transition_conflict``. A new transition whose read-back is wrong is deleted
+    again (the only deletion the build ops make).
+    """
+    timeline = env.timeline(params.timeline)
+    start = int(timeline.GetStartFrame())
+    planned = []
+    for target in params.targets:
+        item = env.item(timeline, target.item)
+        if str(item.GetType() or "") != target.item.track_type:
+            raise OpError(
+                "not_a_clip_item",
+                f"item {target.item.item_id} is a {item.GetType()!r} item, not a "
+                f"{target.item.track_type} clip",
+                "put transitions on the video or audio clips at the edit",
+            )
+        edge = int(item.GetStart()) if target.position == "start" else int(item.GetEnd())
+        _present_or_conflict(timeline, target, edge, start)
+        short = [h for h in _handles(timeline, target, item, edge) if h.available is not None]
+        short = [h for h in short if h.available < h.needed]
+        if short and not _transitions_at(timeline, target.item, edge):
+            raise OpError(
+                "transition_needs_handles",
+                f"a {target.alignment} transition of {target.frames} frames at the "
+                f"{target.position} of item {target.item.item_id} needs "
+                + ", ".join(
+                    f"{h.needed} frames of {h.side} handle (has {h.available})" for h in short
+                ),
+                "trim the source range so the clip keeps handles, or change the alignment",
+                needed={h.side: h.needed for h in short},
+                available={h.side: h.available for h in short},
+            )
+        planned.append((target, item, edge))
+    done: list[TransitionAdded] = []
+    try:
+        for target, item, edge in planned:
+            done.append(_add_one(timeline, target, item, edge, start))
+    except OpError as exc:
+        raise _with_completed(exc, done) from exc
+    return TransitionResult(timeline=env.identity(timeline), transitions=done)

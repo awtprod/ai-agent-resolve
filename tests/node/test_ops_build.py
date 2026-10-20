@@ -581,3 +581,261 @@ def test_track_lists_are_bounded_and_unique() -> None:
         with pytest.raises(ValidationError):
             validate("track.ensure", {"timeline": tl, "tracks": tracks})
     assert validate("track.ensure", {"timeline": tl, "tracks": [{"type": "video", "index": 16}]})
+
+
+# -- transition.add ----------------------------------------------------------------------------
+
+
+def _cut(show: Show, *, a_right: int | None = None, b_left: int = 5000, kind: str = "video"):
+    """Two clips of cam A meeting at START + 100 on track 1. ``a_right``: A's right handle."""
+    clip = show.cam_a
+    a_src = 1000 if a_right is None else clip.frames - 100 - a_right
+    a = show.main.place(kind, 1, clip, START, 100, src_start=a_src)
+    b = show.main.place(kind, 1, clip, START + 100, 100, src_start=b_left)
+    return a, b
+
+
+def _transitions(show: Show, kind: str = "video") -> list[FakeTimelineItem]:
+    return [i for i in show.main.GetItemListInTrack(kind, 1) if i.item_type == "transition"]
+
+
+def _tparams(show: Show, *targets: dict[str, Any]) -> dict[str, Any]:
+    return {"timeline": show.ref("Main"), "targets": list(targets)}
+
+
+def test_a_transition_is_added_at_the_edit_and_read_back() -> None:
+    show = Show()
+    a, _ = _cut(show)
+    target = {"item": ref(a), "position": "end", "alignment": "center", "frames": 12}
+    result = show.ok("transition.add", _tparams(show, target))
+    (added,) = result.transitions
+    (made,) = _transitions(show)
+    assert (added.status, added.transition_id, added.duration) == ("added", made.GetUniqueId(), 12)
+    assert (added.record_in, added.record_out) == (94, 106)
+    assert (made.start, made.end) == (START + 94, START + 106)
+    assert calls(show, "AddTransition") == [
+        (
+            "AddTransition",
+            a.GetUniqueId(),
+            {
+                "type": "Cross Dissolve",
+                "category": "simple",
+                "position": "end",
+                "alignment": "center",
+                "duration": 12,
+            },
+        )
+    ]
+    assert [(h.side, h.needed) for h in added.handles] == [("outgoing", 6), ("incoming", 6)]
+
+
+def test_a_transition_rerun_and_the_same_cut_from_the_other_side_are_present() -> None:
+    show = Show()
+    a, b = _cut(show)
+    target = {"item": ref(a), "position": "end", "alignment": "center", "frames": 12}
+    first = show.ok("transition.add", _tparams(show, target))
+    show.fake.calls.clear()
+    again = show.ok("transition.add", _tparams(show, target))
+    other_side = {"item": ref(b), "position": "start", "alignment": "center", "frames": 12}
+    from_b = show.ok("transition.add", _tparams(show, other_side))
+    for result in (again, from_b):
+        assert result.transitions[0].status == "present"
+        assert result.transitions[0].transition_id == first.transitions[0].transition_id
+    assert content_writes(show.fake) == [] and len(_transitions(show)) == 1
+
+
+def test_a_transition_of_another_length_is_a_conflict_and_never_replaced() -> None:
+    show = Show()
+    a, _ = _cut(show)
+    existing = show.main.place_transition("video", 1, START + 100, 8)
+    target = {"item": ref(a), "position": "end", "alignment": "center", "frames": 12}
+    error = show.fails("transition.add", _tparams(show, target))
+    assert error.code == "transition_conflict"
+    assert error.detail["existing"] == [{"transition_id": existing.GetUniqueId(), "duration": 8}]
+    assert content_writes(show.fake) == [] and _transitions(show) == [existing]
+
+
+def test_short_handles_are_refused_before_the_call() -> None:
+    show = Show()
+    a, _ = _cut(show, a_right=4)
+    target = {"item": ref(a), "position": "end", "alignment": "right", "frames": 10}
+    error = show.fails("transition.add", _tparams(show, target))
+    assert error.code == "transition_needs_handles"
+    assert (error.detail["needed"], error.detail["available"]) == (
+        {"outgoing": 10},
+        {"outgoing": 4},
+    )
+    assert "alignment" in error.detail["fix_hint"] and calls(show, "AddTransition") == []
+    # Left-aligned, the same transition needs only the incoming clip's handle.
+    target["alignment"] = "left"
+    assert show.ok("transition.add", _tparams(show, target)).transitions[0].duration == 10
+
+
+@pytest.mark.parametrize(
+    ("mode", "code"), [("shorten", "transition_short"), ("refuse", "transition_refused")]
+)
+def test_the_handle_check_is_advisory_and_the_read_back_decides(mode: str, code: str) -> None:
+    # An odd centred length: the advisory rule asks frames // 2 = 7 of each side, but the
+    # fake (like Resolve may) puts 8 frames after the edit, past A's 7-frame handle.
+    show = Show()
+    show.fake.transition_short_handles = mode
+    a, _ = _cut(show, a_right=7)
+    target = {"item": ref(a), "position": "end", "alignment": "center", "frames": 15}
+    error = show.fails("transition.add", _tparams(show, target))
+    assert error.code == code
+    if mode == "shorten":
+        assert (error.detail["measured"], error.detail["wanted"]) == (14, 15)
+        (deleted,) = calls(show, "DeleteClips")
+        assert len(deleted[1]) == 1
+    assert _transitions(show) == []
+
+
+def test_a_transition_refused_by_resolve_is_reported() -> None:
+    show = Show()
+    show.fake.faults.add("AddTransition:none")
+    a, _ = _cut(show)
+    target = {"item": ref(a), "position": "end", "alignment": "center", "frames": 12}
+    error = show.fails("transition.add", _tparams(show, target))
+    assert error.code == "transition_refused" and _transitions(show) == []
+
+
+@pytest.mark.parametrize(
+    ("fault", "code"),
+    [
+        ("AddTransition:short", "transition_short"),
+        ("AddTransition:misplaced", "transition_misplaced"),
+    ],
+)
+def test_a_wrong_transition_is_deleted_again(fault: str, code: str) -> None:
+    show = Show()
+    show.fake.faults.add(fault)
+    a, b = _cut(show)
+    clips = {a.GetUniqueId(), b.GetUniqueId()}
+    target = {"item": ref(a), "position": "end", "alignment": "center", "frames": 12}
+    error = show.fails("transition.add", _tparams(show, target))
+    assert error.code == code
+    (deleted,) = calls(show, "DeleteClips")
+    assert not set(deleted[1]) & clips  # only the new transition, never a clip
+    assert _transitions(show) == [] and {i.GetUniqueId() for i in show.main.items("video")} == clips
+
+
+def test_a_wrong_transition_that_cannot_be_deleted_is_left_behind_and_named() -> None:
+    show = Show()
+    show.fake.faults |= {"AddTransition:short", "DeleteClips:no-op"}
+    a, _ = _cut(show)
+    target = {"item": ref(a), "position": "end", "alignment": "center", "frames": 12}
+    error = show.fails("transition.add", _tparams(show, target))
+    (left,) = _transitions(show)
+    assert error.code == "transition_left_behind"
+    assert error.detail["transition_id"] == left.GetUniqueId()
+    assert (error.detail["cause"], error.detail["measured"]) == ("transition_short", 11)
+
+
+def test_a_returned_item_that_is_not_a_new_transition_is_never_deleted() -> None:
+    show = Show()
+    a, _ = _cut(show)
+    a.AddTransition = lambda options: a  # type: ignore[method-assign]
+    target = {"item": ref(a), "position": "end", "alignment": "center", "frames": 12}
+    error = show.fails("transition.add", _tparams(show, target))
+    assert error.code == "transition_unverified" and calls(show, "DeleteClips") == []
+    assert a in show.main.items("video")
+
+
+def test_an_audio_crossfade_and_a_fade_from_black() -> None:
+    show = Show()
+    a, _ = _cut(show, kind="audio")
+    picture = show.main.place("video", 1, show.cam_a, START, 100, src_start=0)
+    result = show.ok(
+        "transition.add",
+        _tparams(
+            show,
+            {
+                "item": ref(a),
+                "position": "end",
+                "type": "Cross Fade 0 dB",
+                "category": "audio",
+                "alignment": "center",
+                "frames": 10,
+            },
+            # The first item, from black: right-aligned it needs no handle on either side.
+            {"item": ref(picture), "position": "start", "alignment": "right", "frames": 15},
+        ),
+    )
+    assert [(t.status, t.duration) for t in result.transitions] == [("added", 10), ("added", 15)]
+    assert result.transitions[1].handles[0].side == "incoming"
+    assert len(_transitions(show, "audio")) == 1 and len(_transitions(show)) == 1
+
+
+def test_a_transition_target_must_be_a_clip() -> None:
+    show = Show()
+    _cut(show)
+    existing = show.main.place_transition("video", 1, START + 100, 8)
+    target = {"item": ref(existing), "position": "end", "alignment": "center", "frames": 8}
+    assert show.fails("transition.add", _tparams(show, target)).code == "not_a_clip_item"
+
+
+def test_transition_errors_carry_the_targets_done() -> None:
+    show = Show()
+    a, b = _cut(show)
+    show.main.place("video", 1, show.cam_a, START + 200, 100, src_start=9000)
+    real = b.AddTransition
+    b.AddTransition = lambda options: None  # type: ignore[method-assign]
+    error = show.fails(
+        "transition.add",
+        _tparams(
+            show,
+            {"item": ref(a), "position": "end", "alignment": "center", "frames": 12},
+            {"item": ref(b), "position": "end", "alignment": "center", "frames": 12},
+        ),
+    )
+    b.AddTransition = real  # type: ignore[method-assign]
+    assert error.code == "transition_refused"
+    assert [t["status"] for t in error.detail["completed"]] == ["added"]
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"frames": 0},
+        {"frames": 241},
+        {"frames": True},
+        {"frames": 12.0},
+        {"category": "fusion"},
+        {"category": "ofx"},
+        {"category": "audio"},
+        {"alignment": "middle"},
+        {"alignment": None},
+        {"position": "both"},
+        {"type": " "},
+        {"type": "x" * 65},
+        {"item": {"track_type": "subtitle", "track": 1, "item_id": "x"}},
+        {"item": {"track_type": "audio", "track": 1, "item_id": "x"}},
+        {"duration": 12},
+    ],
+)
+def test_transition_targets_are_bounded(patch: dict[str, Any]) -> None:
+    show = Show()
+    target = {
+        "item": {"track_type": "video", "track": 1, "item_id": "x"},
+        "position": "end",
+        "alignment": "center",
+        "frames": 12,
+        **patch,
+    }
+    target = {k: v for k, v in target.items() if v is not None}
+    with pytest.raises(ValidationError):
+        validate("transition.add", _tparams(show, target))
+
+
+def test_transition_lists_are_bounded_and_unique() -> None:
+    show = Show()
+    one = {"item": {"track_type": "video", "track": 1, "item_id": "x"}, "position": "end"}
+    one |= {"alignment": "center", "frames": 12}
+    for targets in (
+        [],
+        [one, one],
+        [{**one, "item": {**one["item"], "item_id": str(n)}} for n in range(51)],
+    ):
+        with pytest.raises(ValidationError):
+            validate("transition.add", {"timeline": show.ref("Main"), "targets": targets})
+    assert validate("transition.add", _tparams(show, one, {**one, "position": "start"}))

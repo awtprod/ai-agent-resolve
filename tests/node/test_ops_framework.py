@@ -42,6 +42,7 @@ EXPECTED = {
     "render.delete_job": (True, True),
     "media.import": (True, True),
     "track.ensure": (True, True),
+    "transition.add": (True, True),
 }
 
 
