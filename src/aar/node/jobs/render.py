@@ -27,7 +27,15 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from aar.node.locator import ProjectLocator
 from aar.node.ops.framework import TimelineRef
-from aar.node.ops.render import BuildResult, PollResult
+from aar.node.ops.render import (
+    MAX_DIMENSION,
+    MIN_DIMENSION,
+    AudioCodecName,
+    BuildResult,
+    PollResult,
+    VideoQuality,
+    _check_size_quality,
+)
 
 from .model import Done, Fail, Pause, Step, StepAction, StepContext, StructuredError, Submit
 
@@ -67,6 +75,11 @@ class RenderParams(BaseModel):
     render_mode: int | None = Field(default=None, ge=0, le=1)
     mark_in: int | None = Field(default=None, ge=0)
     mark_out: int | None = Field(default=None, ge=0)
+    width: int | None = Field(default=None, ge=MIN_DIMENSION, le=MAX_DIMENSION)
+    height: int | None = Field(default=None, ge=MIN_DIMENSION, le=MAX_DIMENSION)
+    video_quality: VideoQuality | None = Field(default=None)
+    export_audio: bool | None = Field(default=None)
+    audio_codec: AudioCodecName | None = Field(default=None)
     cleanup: bool = Field(default=True, description="Delete the completed render job when done.")
     timeout_seconds: float = Field(default=DEFAULT_RENDER_TIMEOUT, gt=0)
 
@@ -76,6 +89,7 @@ class RenderParams(BaseModel):
             raise ValueError("render needs the timeline's unique_id (a render mutates the project)")
         if self.mark_in is not None and self.mark_out is not None and self.mark_out <= self.mark_in:
             raise ValueError("mark_out must be greater than mark_in")
+        _check_size_quality(self.width, self.height, self.video_quality)
         import math
 
         if not math.isfinite(self.timeout_seconds):
@@ -118,6 +132,11 @@ class RenderStep(Step):
             "render_mode": p.render_mode,
             "mark_in": p.mark_in,
             "mark_out": p.mark_out,
+            "width": p.width,
+            "height": p.height,
+            "video_quality": p.video_quality,
+            "export_audio": p.export_audio,
+            "audio_codec": p.audio_codec,
         }
 
     def advance(self, ctx: StepContext) -> StepAction:

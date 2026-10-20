@@ -42,6 +42,7 @@ FAULTS = frozenset(
         "DeleteClips:no-op",  # Timeline.DeleteClips returns True, deletes nothing
         "DuplicateTimeline:detached",  # returns a timeline that is not in the project
         "LoadRenderPreset:drops-codec",  # a preset round trip resets the codec to H264
+        "SetRenderSettings:drops-size",  # the job ignores FormatWidth/FormatHeight (size not set)
         "OpenPage:keeps-jam",  # a page bounce does not clear the after-Color setter jam
         "CopyGrades:then-jam",  # CopyGrades works, then the setters jam (until a bounce)
         "CopyGrades:drops-label",  # the copy loses the first node's label
@@ -1149,14 +1150,20 @@ class FakeProject:
             mark_out = int(settings.get("MarkOut", mark_in))
         job_id = f"rj-{next(self._app.ids)}"
         output_filename = str(settings.get("CustomName", "")) + self.render_output_extension
+        # fault: Resolve accepts SetRenderSettings but the job keeps the format's default size,
+        # so a read-back sees the size was ignored (render_size_ignored).
+        drops_size = "SetRenderSettings:drops-size" in self._app.faults
+        format_width = 1920 if drops_size else int(settings.get("FormatWidth", 1920))
+        format_height = 1080 if drops_size else int(settings.get("FormatHeight", 1080))
         info: dict[str, Any] = {
             "JobId": job_id,
             "RenderJobName": str(settings.get("CustomName", "")) or job_id,
             "TimelineName": timeline.GetName() if timeline is not None else "",
             "TargetDir": str(settings.get("TargetDir", "")),
             "OutputFilename": output_filename,
-            "FormatWidth": int(settings.get("FormatWidth", 1920)),
-            "FormatHeight": int(settings.get("FormatHeight", 1080)),
+            "FormatWidth": format_width,
+            "FormatHeight": format_height,
+            "VideoQuality": settings.get("VideoQuality", 0),
             "FrameRate": f"{fps:g}" if fps is not None else "",
             "MarkIn": mark_in,
             "MarkOut": mark_out,

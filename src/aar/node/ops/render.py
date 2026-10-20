@@ -34,9 +34,9 @@ while the render goes on.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from aar.node.broker import HotOpFailure
 from aar.node.ops.framework import (
@@ -272,6 +272,38 @@ def _listed_once(project: Any, job_id: str, code: str) -> dict[str, Any]:
 
 # -- render.build ------------------------------------------------------------------------------
 
+MIN_DIMENSION = 16
+MAX_DIMENSION = 8192
+MIN_VIDEO_KBPS = 100
+MAX_VIDEO_KBPS = 400_000
+
+VideoQuality = int | Literal["Least", "Low", "Medium", "High", "Best"]
+"""Resolve ``VideoQuality``: a bit rate in kbit/s (> 0), or a named level. 0 means None here."""
+
+AudioCodecName = Annotated[str, Field(min_length=1, max_length=64)]
+"""An audio codec name (Resolve ``AudioCodec``), e.g. ``aac``; kept node-local (no hub import)."""
+
+
+def _check_size_quality(
+    width: int | None,
+    height: int | None,
+    video_quality: VideoQuality | None,
+) -> None:
+    """Shared field checks for the render size and quality (BuildParams and RenderParams)."""
+    if (width is None) != (height is None):
+        raise ValueError("width and height must be set together (both or neither)")
+    for name, value in (("width", width), ("height", height)):
+        if value is not None and value % 2 != 0:
+            raise ValueError(f"{name} must be even")
+    # A bool is an int subclass: reject it before the range check so True is not a 1 kbit/s rate.
+    if isinstance(video_quality, bool):
+        raise ValueError("video_quality must be an int bit rate or a named level, not a bool")
+    if isinstance(video_quality, int) and not (MIN_VIDEO_KBPS <= video_quality <= MAX_VIDEO_KBPS):
+        raise ValueError(
+            f"video_quality bit rate must be {MIN_VIDEO_KBPS} to {MAX_VIDEO_KBPS} kbit/s "
+            "(0 is refused; pass None for automatic)"
+        )
+
 
 class BuildParams(OpModel):
     timeline: TimelineRef
@@ -284,6 +316,11 @@ class BuildParams(OpModel):
     render_mode: int | None = Field(default=None, ge=0, le=1)
     mark_in: int | None = Field(default=None, ge=0)
     mark_out: int | None = Field(default=None, ge=0)
+    width: int | None = Field(default=None, ge=MIN_DIMENSION, le=MAX_DIMENSION)
+    height: int | None = Field(default=None, ge=MIN_DIMENSION, le=MAX_DIMENSION)
+    video_quality: VideoQuality | None = Field(default=None)
+    export_audio: bool | None = Field(default=None)
+    audio_codec: AudioCodecName | None = Field(default=None)
     adopt_render_job_id: str | None = Field(
         default=None, min_length=1, description="A prior attempt added this render job: reuse it."
     )
@@ -293,6 +330,11 @@ class BuildParams(OpModel):
     prior_pre_ids: tuple[str, ...] | None = Field(
         default=None, description="A prior attempt died inside AddRenderJob; the ids before it."
     )
+
+    @model_validator(mode="after")
+    def _check_size(self) -> BuildParams:
+        _check_size_quality(self.width, self.height, self.video_quality)
+        return self
 
 
 class BuildResult(OpModel):
@@ -307,6 +349,7 @@ class BuildResult(OpModel):
     frame_count: int | None
     frame_rate: float | None
     duration_seconds: float | None
+    size_verified: bool | None = None
 
 
 def _measured_from_info(info: dict[str, Any]) -> dict[str, Any]:
@@ -332,8 +375,47 @@ def _measured_from_info(info: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _size_settings(params: BuildParams) -> dict[str, Any]:
+    """The render-settings keys for the output size, quality and audio (only what was given)."""
+    out: dict[str, Any] = {}
+    if params.width is not None and params.height is not None:
+        out["FormatWidth"] = params.width
+        out["FormatHeight"] = params.height
+    if params.video_quality is not None:
+        out["VideoQuality"] = params.video_quality
+    if params.export_audio is not None:
+        out["ExportAudio"] = params.export_audio
+    if params.audio_codec is not None:
+        out["AudioCodec"] = params.audio_codec
+    return out
+
+
+def _verify_size(info: dict[str, Any], params: BuildParams) -> bool | None:
+    """Confirm the queued job's size matches what was asked.
+
+    ``None`` when no size was requested; ``False`` when the queue reports no size keys (not an
+    error -- the host may not echo them); ``True`` when they match. A size that is reported but
+    differs is ``render_size_ignored`` (the caller cleans up the just-added job).
+    """
+    if params.width is None:
+        return None
+    if "FormatWidth" not in info and "FormatHeight" not in info:
+        return False
+    if _int(info.get("FormatWidth")) == params.width and (
+        _int(info.get("FormatHeight")) == params.height
+    ):
+        return True
+    raise OpError(
+        "render_size_ignored",
+        f"the render queue reports {info.get('FormatWidth')!r}x{info.get('FormatHeight')!r} but "
+        f"{params.width}x{params.height} was requested; the preset or Resolve ignored the size",
+        "set the output size in the delivery preset, or check Resolve honours FormatWidth and "
+        "FormatHeight for this format",
+    )
+
+
 def _configure(project: Any, params: BuildParams) -> None:
-    """Load the delivery preset and set the job's output, range, format and mode."""
+    """Load the delivery preset and set the job's output, range, size/quality, format and mode."""
     if params.preset is not None and not project.LoadRenderPreset(params.preset):
         raise OpError(
             "preset_load_failed",
@@ -355,6 +437,15 @@ def _configure(project: Any, params: BuildParams) -> None:
             "render_settings_failed",
             f"SetRenderSettings({sorted(settings)}) returned False",
             "check the target directory is writable and the mark range is inside the timeline",
+        )
+    # After the preset loads, so the requested size/quality override whatever the preset set.
+    size = _size_settings(params)
+    if size and not project.SetRenderSettings(size):
+        raise OpError(
+            "render_settings_failed",
+            f"SetRenderSettings({sorted(size)}) returned False",
+            "check the output size (even, 16-8192), the bit rate and the audio codec are valid "
+            "for this render format",
         )
     if (
         params.render_format is not None
@@ -450,6 +541,7 @@ def render_build(env: OpEnv, params: BuildParams) -> BuildResult:
     job_id: str | None = None
     restored = False
     restore_error: dict[str, str] | None = None
+    size_verified: bool | None = None
     problems: dict[str, Any] = {}
     try:
         if params.adopt_render_job_id is not None:
@@ -471,6 +563,9 @@ def render_build(env: OpEnv, params: BuildParams) -> BuildResult:
             job_id = _add(project, journal)
             wanted = journal("added", {"render_job_id": job_id})
             info = _listed_once(project, job_id, "add_render_job_unverified")
+            # Read the size back off the just-added job; a mismatch raises and the except path
+            # cleans the job up. A resume (adopt) never re-applies or re-verifies the size.
+            size_verified = _verify_size(info, params)
             if not wanted:
                 raise _aborted("after AddRenderJob")
         # Put Deliver back BEFORE starting: the queued job keeps its own settings.
@@ -510,6 +605,7 @@ def render_build(env: OpEnv, params: BuildParams) -> BuildResult:
         adopted=adopted,
         deliver_restored=restore_error is None,
         restore_error=restore_error,
+        size_verified=size_verified,
         **_measured_from_info(info),
     )
 
