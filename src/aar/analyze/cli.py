@@ -7,7 +7,8 @@ Exit status, as ``aar qa check``:
   ``no-overlap`` or ``failed``; ``transcript``: the decode or the model failed), including
   media that exists but does not decode;
 - 2: an input, a tool or a model cannot be located or opened, an extra is missing, a checkpoint
-  does not match, or an argument is bad.
+  does not match, or an argument is bad;
+- 74: the result could not be written (``output-error``; a transcript's checkpoint is kept).
 
 An error prints ``{"ok": false, "error": {"type", "message", "hint"}}``.
 """
@@ -213,8 +214,7 @@ def _cmd_sync(args: argparse.Namespace) -> int:
         try:
             write_atomic(args.out, text)
         except OSError as exc:
-            error = AnalyzeError("output-error", f"cannot write {args.out}: {exc}")
-            return _emit({"ok": False, "error": error.to_dict()}) or cli_io.EXIT_OUTPUT_ERROR
+            return _fail(AnalyzeError("output-error", f"cannot write {args.out}: {exc}"))
     written = cli_io.emit(_PROG, text)
     if written != EXIT_OK:
         return written
@@ -282,4 +282,6 @@ def _cmd_transcript(args: argparse.Namespace) -> int:
         )
     except AnalyzeError as exc:
         return _fail(exc)
+    except OSError as exc:  # the checkpoint beside --out could not be written
+        return _fail(AnalyzeError("output-error", f"cannot write beside {args.out}: {exc}"))
     return _emit(report) or EXIT_OK

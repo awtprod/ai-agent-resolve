@@ -508,6 +508,29 @@ def test_a_corrupt_checkpoint_is_refused(tmp_path, fake, models, media, capsys):
 
 
 @needs_ffmpeg
+def test_a_failed_output_write_keeps_the_checkpoint(
+    tmp_path, fake, models, media, capsys, monkeypatch
+):
+    import aar.analyze.whisper as whisper
+
+    def full_disk(path: Path, text: str) -> None:
+        raise OSError(28, "No space left on device")
+
+    out = tmp_path / "t.json"
+    original = whisper.write_atomic
+    monkeypatch.setattr(whisper, "write_atomic", full_disk)
+    code, body = run_cli(capsys, media, "--out", out)
+    assert code == 74 and body["error"]["type"] == "output-error"
+    assert "--resume" in body["error"]["hint"]
+    assert len(read_checkpoint(checkpoint_path(out))[1]) == 8 and not out.exists()
+    monkeypatch.setattr(whisper, "write_atomic", original)
+    code, report = run_cli(capsys, media, "--out", out, "--resume")
+    assert code == 0 and report["resume"]["segments_from_checkpoint"] == 8
+    assert [w.text for w in load_transcript(out).words] == KEPT_WORDS
+    assert not checkpoint_path(out).exists()
+
+
+@needs_ffmpeg
 def test_a_failed_model_load_leaves_no_checkpoint(tmp_path, fake, models, media, capsys):
     def broken(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("Unable to open file 'model.bin'")

@@ -7,8 +7,9 @@ whose hint names the extra to install.
 
 Exit codes (the ``aar qa check`` split, docs/DESIGN.md): an error whose type is in
 ``INPUT_ERRORS`` means an input, a tool or a model could not be located or opened, or an
-argument is bad (exit 2). Every other type means the analysis ran and failed, including media
-that exists but does not decode (exit 1).
+argument is bad (exit 2). ``output-error`` (the result could not be written) exits 74, as
+``aar.cli_io`` does for a failing stdout. Every other type means the analysis ran and failed,
+including media that exists but does not decode (exit 1).
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from aar.media import MediaError, MediaInputError, MediaTimeout, MediaToolMissin
 
 EXIT_FAILED = 1
 EXIT_INPUT = 2
+EXIT_OUTPUT = 74  # as aar.cli_io: the output could not be written
 
 INPUT_ERRORS = frozenset(
     {
@@ -49,6 +51,8 @@ class AnalyzeError(RuntimeError):
 
     @property
     def exit_code(self) -> int:
+        if self.type == "output-error":
+            return EXIT_OUTPUT
         return EXIT_INPUT if self.type in INPUT_ERRORS else EXIT_FAILED
 
     def to_dict(self) -> dict[str, Any]:

@@ -601,8 +601,15 @@ def transcribe_file(
         words.extend(segment_words(record, offset.offset_s, counts))
     name = recording if recording is not None else offset.recording
     transcript = Transcript(recording=name, words=_sorted(words))
-    write_atomic(out_path, json.dumps(transcript.model_dump(mode="json"), indent=1) + "\n")
-    ckpt.unlink()
+    try:
+        write_atomic(out_path, json.dumps(transcript.model_dump(mode="json"), indent=1) + "\n")
+    except OSError as exc:
+        raise AnalyzeError(
+            "output-error",
+            f"cannot write {out_path}: {exc}",
+            hint=f"the checkpoint {ckpt} keeps every segment; fix the output and run --resume",
+        ) from exc
+    ckpt.unlink()  # only once the output is safely in place
     _fsync_dir(ckpt.parent)
     return {
         "ok": True,
