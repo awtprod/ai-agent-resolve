@@ -1,7 +1,8 @@
 # Remote Resolve node
 
 `aar node run` keeps the hub on Linux and DaVinci Resolve on a Windows edit PC. The node
-dials the hub over HTTP; the hub never connects to the PC. Jobs remain in the hub's existing
+dials the hub over HTTP for job control; media staging and return use the separate verified
+host transfer commands. Jobs remain in the hub's existing
 append-only event log while the PC is off and appear as `waiting_for_node`.
 
 ## Enrol and start
@@ -49,7 +50,8 @@ before each operation dispatch. Release cannot undo or interrupt a Resolve call 
 flight, including a call that passed that check just before release. Stop the old node and
 inspect Resolve before deciding that reassignment is safe.
 
-The read-only MCP surface also provides `jobs_list`, with bounded pagination and exact project
+With `aar hub serve --agent-writes`, agents can use `job_submit` and `job_cancel`;
+human release stays in the CLI. The read-only MCP surface also provides `jobs_list`, with bounded pagination and exact project
 or state filters. In particular it exposes `waiting_for_node` and `node_offline` without making
 either state an implicit retry.
 
