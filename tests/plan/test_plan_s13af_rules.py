@@ -313,6 +313,103 @@ def test_a_blank_line_is_refused_through_json_too(clean_data: PlanData, as_json:
     assert error["loc"] == ("captions", 0, "lines", 0)
 
 
+#: Lines that show nothing: only format characters (Cf), non-spacing marks (Mn) and whitespace.
+INVISIBLE = [
+    "\u200b",  # zero-width space
+    "\u200c",  # zero-width non-joiner
+    "\u200d",  # zero-width joiner
+    "\ufeff",  # byte order mark
+    "\u2060",  # word joiner
+    "\u00ad",  # soft hyphen
+    "\u0301",  # a lone combining acute accent
+    "\ufe0f",  # a lone variation selector
+    "\u0301\u0302",
+    "\u200b\u200d\u200c",
+    " \u200b ",
+    "\u200b\n\ufeff\t",
+    "\u00a0\u2060\u3000",
+]
+
+#: Lines that show something, however small or odd.
+VISIBLE = [
+    "!",
+    ".",
+    "a",
+    "\u00e1",  # a-acute, one character
+    "a\u0301",  # a plus a combining acute accent
+    "\U0001f469\u200d\U0001f4bb",  # woman technologist: emoji joined by a ZWJ
+    "\U0001f600",
+    "\u200ba",
+    "a\u200b",
+    "\u200b!\u200b",
+    " x ",
+    "\u0301a",
+    "\u4e2d\u6587",
+]
+
+
+@pytest.mark.parametrize("invisible", INVISIBLE, ids=ascii)
+def test_an_invisible_sting_line_is_one_error_at_that_line(
+    clean_data: PlanData, invisible: str
+) -> None:
+    with_sting(clean_data, ["Pat Example", invisible])
+    [(loc, msg)] = errors_at(clean_data)
+    assert loc == ("outro", "sting", "lines", 1)
+    assert "must not be empty or blank" in msg
+
+
+@pytest.mark.parametrize("invisible", INVISIBLE, ids=ascii)
+def test_an_invisible_title_line_is_one_error_at_that_line(
+    clean_data: PlanData, invisible: str
+) -> None:
+    clean_data["titles"][0]["lines"] = [invisible, "Stand-up comic"]
+    [(loc, msg)] = errors_at(clean_data)
+    assert loc == ("titles", 0, "lines", 0)
+    assert "must not be empty or blank" in msg
+
+
+@pytest.mark.parametrize("invisible", INVISIBLE, ids=ascii)
+@pytest.mark.parametrize("as_json", [False, True], ids=["python", "json"])
+def test_an_invisible_caption_line_is_one_error_at_that_line(
+    clean_data: PlanData, invisible: str, as_json: bool
+) -> None:
+    clean_data["captions"][1]["lines"] = ["WAIT FOR IT", invisible]
+    [error] = version_errors(clean_data, as_json=as_json)
+    assert error["loc"] == ("captions", 1, "lines", 1)
+    assert "must not be empty or blank" in str(error["msg"])
+
+
+@pytest.mark.parametrize("invisible", INVISIBLE, ids=ascii)
+def test_an_invisible_name_is_refused_wherever_a_name_is_needed(
+    clean_data: PlanData, invisible: str
+) -> None:
+    """The check is the shared ``Name`` one, so a colour space or LUT name cannot be invisible."""
+    clean_data["version"] = 2
+    clean_data["sources"][0]["color"] = {"input_color_space": invisible}
+    [(loc, _)] = errors_at(clean_data)
+    assert loc == ("sources", 0, "color", "input_color_space")
+
+
+@pytest.mark.parametrize("visible", VISIBLE, ids=ascii)
+def test_a_line_that_shows_something_is_accepted(clean_data: PlanData, visible: str) -> None:
+    with_sting(clean_data, ["Pat Example", visible])
+    clean_data["titles"][0]["lines"] = [visible]
+    clean_data["captions"][0]["lines"] = [visible, "TWO"]
+    plan = EditPlan.model_validate(clean_data)
+    assert plan.outro is not None and plan.outro.sting is not None
+    assert plan.outro.sting.lines[1] == visible
+    assert plan.titles[0].lines == [visible]
+    assert plan.captions[0].lines[0] == visible
+
+
+def test_every_invisible_line_gets_its_own_error(clean_data: PlanData) -> None:
+    clean_data["captions"][0]["lines"] = ["\u200b", "ONE", "\ufeff\u0301", "\u00e1"]
+    assert [loc for loc, _ in errors_at(clean_data)] == [
+        ("captions", 0, "lines", 0),
+        ("captions", 0, "lines", 2),
+    ]
+
+
 def test_an_empty_list_of_lines_is_still_refused(clean_data: PlanData) -> None:
     clean_data["captions"][0]["lines"] = []
     [(loc, _)] = errors_at(clean_data)
