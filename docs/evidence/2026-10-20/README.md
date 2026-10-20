@@ -21,6 +21,33 @@ shutdown checkpoint defect, a nonterminal cancellation of unclaimed work, and ma
 CLI project-input handling. These green results predate the review corrections and do
 not establish readiness by themselves.
 
+## Review corrections
+
+Commit `7333bfa11e296b889d46d2b8c72ee5c3baeefe38` corrects all three findings:
+
+- Shutdown consumes completed and late results before releasing the store lock and node
+  identity. It cannot schedule another operation. A timeout retains ownership and reports
+  incomplete shutdown; an unresolved pre-mutation marker requires human recovery on startup.
+- An authorized cancellation before claim becomes terminal on Linux, including legacy
+  cancellation events. Claimed work still requires the node's acknowledgement.
+- Both CLI paths validate the project object before opening a store or gateway.
+
+The correction passed **972 node and hub tests, with 6 skipped**, plus Ruff lint and format.
+The new regression selection failed against the previous source (**30 failures**) and
+passed after correction. Existing render, approval, presence, closed-runner and recovery
+assertions remain enforced.
+
+The parent also reran the independent reviewer's original production-path probes:
+
+| Reproduction | Corrected result |
+| --- | --- |
+| In-flight branch finishes during shutdown, then node restarts | One branch; one durable completed step; hub reports succeeded |
+| Cancel before node connects | Terminal cancelled; no local job created |
+| `--project '[]'` in both new commands | Exit 2 instead of an uncaught exception |
+
+The final cross-platform matrix runs again on the feature PR. The Actions checkpoint above
+remains attributed to its original commit; it is not presented as the final correction's CI.
+
 ## Exercised behavior
 
 - `test_linux_independence.py` generates real audio with ffmpeg, ingests it, deletes the

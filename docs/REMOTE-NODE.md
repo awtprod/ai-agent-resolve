@@ -91,6 +91,7 @@ either state an implicit retry.
   seconds for the current drain, then consumes completed and late results into durable
   checkpoints without issuing another operation. A completed step stays completed; any next
   step waits for startup. An in-flight render can still journal and restore Deliver settings.
+  Forced process termination on Windows does not run these handlers; treat it as a crash.
 - If the drain times out, `aar node run` reports **shutdown incomplete** and exits with code
   2. Programmatic `close(timeout)` returns `False`, retaining the store lock and node-id
   reservation while that process lives. Calling close again still waits for the same drain;
@@ -107,6 +108,12 @@ either state an implicit retry.
   exactly-once external execution. Read-only calls may retry. `render.build` with an existing
   journal retains its established settings/queue recovery, including ambiguous-add detection;
   a build interrupted before its first journal entry requires human recovery too.
+
+For CLI-only recovery from an uncertain operation, stop the node and inspect Resolve first,
+cancel the job through `aar hub job cancel`, and restart the node so it reconciles that
+cancellation. Restart once more after the cancellation is acknowledged to clear the old
+in-memory project stall before submitting replacement work. The programmatic human-resume
+path above is for an owner with access to the existing runner; it is not a remote MCP tool.
 
 All existing runner controls still apply: per-op presence and branch ownership, emergency
 stops, production approval consumption, project identity checks, render journaling, and
