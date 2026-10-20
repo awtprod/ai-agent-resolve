@@ -54,6 +54,27 @@ def test_astats_reads_only_the_overall_section():
     assert "Flat factor" not in stats.overall  # only in the per-channel sections
 
 
+def _astats(overall_nans: int, overall_infs: int) -> str:
+    lines = [
+        "Channel: 1",
+        "Number of NaNs: 0",
+        "Number of Infs: 4800",
+        "Overall",
+        "Peak level dB: inf",
+        f"Number of NaNs: {overall_nans}",
+        f"Number of Infs: {overall_infs}",
+    ]
+    return "\n".join(f"[Parsed_astats_0 @ 0x5d1c] {line}" for line in lines)
+
+
+def test_astats_counts_infinite_samples_as_non_finite():
+    # Overall prints the per-channel average, so 4800 Infs in one of two channels reads 2400.
+    stats = parse_astats(_astats(0, 2400))
+    assert stats.get("Number of Infs") == 2400
+    assert stats.non_finite == 2400
+    assert parse_astats(_astats(7, 2400)).non_finite == 2407
+
+
 def test_ebur128_summary_is_found_after_per_frame_lines():
     loud = parse_ebur128(sample("ebur128_framelog.txt"))
     assert loud.integrated_lufs == pytest.approx(-21.1)

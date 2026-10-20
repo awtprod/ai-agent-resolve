@@ -11,6 +11,8 @@ from typing import Any
 from pydantic import ValidationError
 
 from aar import cli_io
+from aar.analyze.errors import AnalyzeError
+from aar.analyze.whisper import WhisperTranscriber
 from aar.media import MediaError
 from aar.plan.inputs import Transcript, load_transcript
 from aar.plan.model import EditPlan
@@ -34,8 +36,10 @@ def register(subparsers: Any) -> None:
         "check",
         help="Check a render: loudness, clipping, decode, silence, size, plan joins, captions.",
         description=(
-            "Exit status: 0 no check failed (warnings and skips allowed), 1 a check failed, "
-            "2 unreadable input, invalid profile or ffmpeg/ffprobe missing."
+            "Exit status: 0 no check failed (warnings and skips allowed), 1 the checks ran and "
+            "one failed (including media that exists but does not decode), 2 an input, "
+            "ffmpeg/ffprobe or the whisper model cannot be located or opened, or the profile "
+            "is invalid."
         ),
     )
     run.add_argument(
@@ -65,6 +69,16 @@ def register(subparsers: Any) -> None:
         metavar="N",
         help="Silence threshold in dB for the longest-silence check (default: profile, -42).",
     )
+    run.add_argument(
+        "--whisper-model",
+        metavar="MODEL",
+        help=(
+            "Run join-retranscribe with this faster-whisper model (a name looked up under "
+            "--model-dir or $AAR_MODEL_DIR, or a model directory; never downloaded). Needs the "
+            "'whisper' extra. Without it join-retranscribe is skipped (no-transcriber)."
+        ),
+    )
+    run.add_argument("--model-dir", type=Path, help="Model directory for --whisper-model.")
     run.add_argument("--json", action="store_true", help="Print the report as JSON.")
     run.set_defaults(func=_cmd_check)
 
@@ -108,12 +122,20 @@ def _cmd_check(args: argparse.Namespace) -> int:
             load_transcript(args.transcript) if args.transcript else None
         )
         profile = load_profile(args.profile or (plan.profile if plan else "ccn"))
+        transcriber = None
+        if args.whisper_model is not None:
+            transcriber = WhisperTranscriber(args.whisper_model, model_dir=args.model_dir)
+        elif args.model_dir is not None:
+            return _input_error(
+                "invalid-argument", "--model-dir needs --whisper-model", [], as_json
+            )
         report = check(
             file,
             kind=args.kind,
             profile=profile,
             plan=plan,
             transcript=transcript,
+            transcriber=transcriber,
             silence_db=args.silence_db,
             media_root=args.plan.parent if args.plan else None,
         )
@@ -121,6 +143,9 @@ def _cmd_check(args: argparse.Namespace) -> int:
         return _input_error(
             "invalid-input", "input failed validation", _validation_details(exc), as_json
         )
+    except AnalyzeError as exc:  # --whisper-model: the extra or the model is missing
+        message = f"{exc} ({exc.hint})" if exc.hint else str(exc)
+        return _input_error(exc.type, message, [], as_json)
     except (OSError, json.JSONDecodeError, ProfileError, MediaError, ValueError) as exc:
         return _input_error(type(exc).__name__, str(exc), [], as_json)
     # json.dumps, not model_dump_json: a file name that is not valid UTF-8 carries lone

@@ -340,6 +340,18 @@ def test_judge_join_quiet(runs, status, at_cut, nearest):
     assert judged.nearest is (None if nearest is None else quiet[nearest])
 
 
+@pytest.mark.parametrize("order", [(0, 1), (1, 0)])
+def test_judge_join_quiet_judges_the_longest_of_several_containing_runs(order):
+    # Both runs contain src_in 1.0 within the 10 ms slack: a 65 ms pause ending 5 ms before
+    # it and a 1 ms blip starting 4 ms after it. The cut is in the 65 ms pause, so it passes.
+    runs = [_run(0.930, 0.995), _run(1.004, 1.005)]
+    quiet = [runs[i] for i in order]
+    judged = judge_join_quiet(quiet, 1.0, min_ms=60, slack_ms=10)
+    assert judged.status == "pass"
+    assert judged.at_cut is runs[0]
+    assert judged.nearest is None
+
+
 def test_judge_join_quiet_prefers_the_longer_of_two_equally_near_pauses():
     a, b = _run(0.85, 0.95), _run(1.05, 1.20)
     assert judge_join_quiet([a, b], 1.0, min_ms=60, slack_ms=10).nearest is b
