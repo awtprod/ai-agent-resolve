@@ -311,3 +311,105 @@ def test_low8_a_crash_between_the_override_consume_and_its_checkpoint_is_recover
         assert view.state == "waiting" and view.waiting["detail"]["key"] == "project"
     else:
         assert view.state == "succeeded"
+
+
+# == LOW-4: a consume whose grant is not project.write never verifies (validator VOV3) ===========
+
+
+def test_low4_a_consumed_token_of_another_scope_does_not_verify(tmp_path: Path) -> None:
+    """The hub's fold does not re-check a consume event's scope, so a forged
+    ``approval.consumed`` by the job's own actor, for the job's exact target, on a token a
+    human granted for ``project.load``, reaches the runner. ``_consume_verified`` checks the
+    grant's scope and refuses it: the stored approval is dropped and the op waits."""
+    import sqlite3
+
+    from aar.hub.approvals import EVENT_CONSUMED
+    from aar.hub.common import iso, utcnow
+    from aar.node.jobs import JobStore
+    from aar.node.jobs.runner import op_approval_target
+
+    from .jobs_support import AGENT_ID
+
+    world = _human_world(tmp_path)
+    job_id = world.submit("ops.sequence", _marker_job(100), world.locator())
+    world.runner.run_until_settled()
+    target = op_approval_target(world.pid(), "markers.add", 0)
+    token = grant(world.log, ApprovalScope.PROJECT_LOAD, target, 3600, "load only", HUMAN)
+    world.log.append(
+        EVENT_CONSUMED,
+        Actor("agent", f"{AGENT_ID}#{job_id}"),
+        {
+            "token_id": token.token_id,
+            "scope": "project.write",
+            "target": target,
+            "at": iso(utcnow()),
+        },
+        idempotency_key=f"approval-consume:{token.token_id}",
+    )
+    world.runtime.close()
+    world.store.close()
+    conn = sqlite3.connect(world.db_path)
+    key = "op:0/0:markers.add/markers.add"
+    conn.execute(
+        "UPDATE jobs SET approvals=? WHERE job_id=?", (f'{{"{key}": "{token.token_id}"}}', job_id)
+    )
+    conn.commit()
+    conn.close()
+    world.store = JobStore(world.db_path)
+    runner = world.restart()
+    runner.run_until_settled()
+    view = runner.get(job_id)
+    assert view.approvals == {} and "approval_unverified" in [e["kind"] for e in view.events]
+    assert view.state == "waiting" and world.main.markers == {}
+
+
+# == LOW-5: sandbox_exempt is an exact match (validator VOV13) ====================================
+
+
+@pytest.mark.parametrize("project_id", ["p1-prod", "P1", "p1 ", "p1\u200b", "xp1", "p"])
+def test_low5_sandbox_exempt_matches_exactly(project_id: str) -> None:
+    policy = ApprovalPolicy(live=True, sandbox_exempt=frozenset({"p1"}))
+    assert policy.is_production(project_id) is True
+    assert policy.is_production("p1") is False
+
+
+# == LOW-7: a cancel between the "adding" journal and AddRenderJob never adds (validator VRE5) ===
+
+
+def test_low7_a_cancel_at_the_adding_journal_step_never_calls_add_render_job(
+    tmp_path: Path,
+) -> None:
+    """The cancel lands inside the build, right as it journals ``adding`` (before
+    ``AddRenderJob``): the journal says the job no longer wants the render, so the build backs
+    out before adding anything, restores Deliver and leaves no preset or render job."""
+    from .jobs_support import JobWorld
+
+    world = JobWorld(tmp_path)
+    original = world.project.deliver.copy()
+    runner = world.runner
+    real_journal = runner._journal
+    job_ids: list[str] = []
+
+    def cancel_on_adding(job_id, op_id, event, data):
+        if event == "adding":
+            runner.cancel(job_id)  # the human's cancel arrives exactly now
+        return real_journal(job_id, op_id, event, data)
+
+    runner._journal = cancel_on_adding  # type: ignore[method-assign]
+    params = {
+        "timeline": world.ref("Main"),
+        "target_dir": "D:/Out",
+        "custom_name": "show_v1",
+        "mark_in": 0,
+        "mark_out": 99,
+    }
+    job_ids.append(world.submit("render", params, world.locator()))
+    world.runner.run_until_settled()
+    view = world.runner.get(job_ids[0])
+    assert view.state == "cancelled"
+    assert [c for c in world.fake.calls if c[0] == "AddRenderJob"] == []
+    assert world.project.render_jobs == []
+    assert [p for p in world.fake.presets if p.startswith("aar-job-")] == []
+    assert world.project.deliver.settings == original.settings
+    late = [e for e in view.events if e["kind"] == "late_result"]
+    assert len(late) == 1 and late[0]["data"]["code"] == "render_build_aborted"
