@@ -717,8 +717,9 @@ def deliver_feed_event(
       never take turns erasing each other's leases with their snapshots: the older one is
       refused, loudly, from the moment the newer one first speaks.
 
-    The check and the append share one transaction. A remote transport (F-S11-1) calls this
-    on the hub and must hand :class:`FeedConflict` back to the node as itself.
+    The check and the append share one transaction. The remote transport (F-S11-1,
+    :class:`aar.node.remote.RemoteFeedTransport` via ``aar hub nodeapi``, implemented in S15a)
+    calls this on the hub and hands :class:`FeedConflict` back to the node as itself.
     """
     actor = Actor("node", node_id)
     problem = _stamp_problem(spec.payload)

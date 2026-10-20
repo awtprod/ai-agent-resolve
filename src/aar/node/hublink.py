@@ -31,8 +31,11 @@ as fail-closed and temporary: the job pauses (``hub_unreachable``), nothing runs
 marked refused, and it carries on once the hub answers again. ``LocalHubLink`` maps a SQLite
 ``OperationalError`` (a locked or unopenable hub database) to :class:`HubUnreachable`.
 
-Follow-up F16 (remote transport): a node on another host needs a ``HubLink`` that speaks to
-the hub over the network, with the same operations and the error contract above.
+F16 (remote transport) is implemented in :mod:`aar.node.remote`: a node on another host gets a
+``RemoteHubLink`` that speaks to ``aar hub nodeapi`` over HTTP with the same operations and the
+same error contract (an ``OSError`` for unreachable, a ``ValueError`` for a refusal, plus
+``NodeNotEnrolled`` for a 401/403). ``branches`` below is the read S15b's branch-ownership
+rebuild uses.
 Follow-up F17: cache the registry id ↔ Resolve uid map instead of rebuilding it per check.
 """
 
