@@ -187,6 +187,8 @@ class ImportResult(OpModel):
 
 
 def _file_path(clip: Any) -> str:
+    # [I] 'File Path' reads back the imported file's full path, in some Windows spelling
+    # (separators and case may differ from the request): it is only ever compared by path_key.
     return str(clip.GetClipProperty("File Path") or "")
 
 
@@ -398,7 +400,11 @@ def _match_imports(
     wanted: list[str], returned: list[Any]
 ) -> tuple[list[tuple[str, Any]], list[str], list[dict[str, str]]]:
     """Pair returned items with requested paths by 'File Path', never by position:
-    ``(imported (path, item), failed paths, unexpected items)``."""
+    ``(imported (path, item), failed paths, unexpected items)``.
+
+    [I] ImportMedia leaves an unreadable path out silently and can return two items for one
+    file, so the list's order and length say nothing about which path each item is.
+    """
     keys = {path_key(p): p for p in wanted}
     by_key: dict[str, list[Any]] = {}
     for item in returned:
@@ -517,6 +523,7 @@ def _refuse_existing(timeline: Any, spec: TrackSpec) -> None:
     """Refusals for a track that exists, before anything is written."""
     kind, index = spec.type, spec.index
     if spec.audio_format is not None:
+        # [I] GetTrackSubType returns the same format names AddTrack takes (AUDIO_FORMATS).
         have = str(timeline.GetTrackSubType(kind, index) or "")
         if have != spec.audio_format:
             raise OpError(
@@ -738,7 +745,8 @@ def _handles(timeline: Any, target: TransitionTarget, item: Any, edge: int) -> l
     [I] The handle rules: the alignment meanings, that the part of the transition before
     the edit shows the incoming clip early (its left offset) and the part after it holds the
     outgoing clip on (its right offset), and that a side with no clip fades from or to black
-    and needs nothing. The read-back after AddTransition is the real check.
+    and needs nothing; and that GetLeftOffset/GetRightOffset count timeline frames. The
+    read-back after AddTransition is the real check.
     """
     ref, uid = target.item, str(item.GetUniqueId())
     clips = [c for c in _clips(timeline, ref.track_type, ref.track) if str(c.GetUniqueId()) != uid]
@@ -1086,7 +1094,8 @@ def _colour_one(
     if target.cdl is not None:
         sent = cdl_payload(target.node, target.cdl)
         # No present check for the CDL: 21.1 has no CDL getter to compare with, and SetCDL sets
-        # absolute values, so writing the same CDL again is harmless.
+        # absolute values, so writing the same CDL again is harmless. [I] SetCDL may jam after
+        # the Color page like the other setters, so it gets the same bounce and one retry.
         ok, was_bounced = _with_bounce(env, lambda: item.SetCDL(sent))
         if was_bounced:
             bounced = True
@@ -1404,7 +1413,7 @@ class TitleResult(OpModel):
 def _title_text(item: Any, text: str) -> tuple[bool, str]:
     """Set the Text+ ``StyledText`` of the title item's first comp: ``(changed, read back)``."""
     uid = str(item.GetUniqueId())
-    comp = item.GetFusionCompByIndex(1)
+    comp = item.GetFusionCompByIndex(1)  # [I] the template's Text+ lives in its first comp
     if comp is None:
         raise OpError(
             "title_has_no_comp",
@@ -1511,6 +1520,8 @@ def title_place(env: OpEnv, params: TitleParams) -> TitleResult:
             _preflight(timeline, p, f)
         planned.append((spec, p, reuse))
     # repair_short off: equal rates cannot land short, and a title never deletes an item.
+    # [I] AppendToTimeline places a Fusion composition clip with its exact range like any
+    # other media-pool item, and the timeline item carries a copy of the template's comp.
     appender = _Appender(env, timeline, repair_short=False)
     done: list[TitlePlaced] = []
     for spec, p, reuse in planned:
