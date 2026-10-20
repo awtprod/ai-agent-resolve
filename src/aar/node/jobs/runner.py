@@ -1025,12 +1025,15 @@ class JobRunner:
                 ):
                     return
                 hot = self._override_op(job, action, holder)
-            # F15: the first mutating op against a production project needs a consumed human
-            # token, at the moment of the write. An override approval (above) is one.
+            # F15: a mutating op against a production project needs a consumed human token, at
+            # the moment of the write: the job's plain project approval (consumed once, then it
+            # licenses the job's later writes), or -- for the overridden op itself only -- that
+            # op's own override approval. An override licenses nothing after its own op.
             if (
                 spec.mutates
                 and self.policy.is_production(job.target.project_id)
-                and not job.approvals
+                and _PROJECT_APPROVAL not in job.approvals
+                and (override is None or override not in job.approvals)
                 and not self._consume_approval(job, _PROJECT_APPROVAL, now)
             ):
                 return
