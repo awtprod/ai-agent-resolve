@@ -29,6 +29,7 @@ The wiring, in one place so nothing is left to a default by accident:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -43,6 +44,14 @@ from aar.node.hublink import HubLink, LocalHubLink
 from aar.node.jobs import ApprovalPolicy, JobRunner, JobStore, PumpOutcome, Watchdog
 from aar.node.jobs.runner import _DRAIN_BUDGET
 from aar.node.presence import InputIdleProvider, PresenceGuard, default_input_idle_provider
+from aar.node.remote import (
+    DEFAULT_RESPONSE_CAP,
+    DEFAULT_TIMEOUT,
+    RemoteConfig,
+    RemoteFeedTransport,
+    RemoteHubLink,
+    _NodeClient,
+)
 
 DEFAULT_IDLE_WINDOW = 60.0
 """Seconds of quiet before the presence guard calls a human gone (the broker's default)."""
@@ -150,6 +159,44 @@ class NodeRuntime:
             store,
             LocalHubLink(log),
             EventLogTransport(log),
+            node_id=node_id,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    @classmethod
+    def remote(
+        cls,
+        gateway: ResolveGateway,
+        store: JobStore,
+        *,
+        node_id: str,
+        hub_url: str,
+        token_file: str | os.PathLike[str],
+        connect_timeout: float = DEFAULT_TIMEOUT,
+        read_timeout: float = DEFAULT_TIMEOUT,
+        response_cap: int = DEFAULT_RESPONSE_CAP,
+        **kwargs: object,
+    ) -> NodeRuntime:
+        """A runtime whose hub is on another host, reached over HTTP (``aar hub nodeapi``).
+
+        Same wiring as :meth:`local`, but the link and the feed go through
+        :class:`~aar.node.remote.RemoteHubLink` and
+        :class:`~aar.node.remote.RemoteFeedTransport` over one stdlib HTTP client. The gateway is
+        injected, as it is for ``local``. Does not add ``aar node run`` (that is S15b).
+        """
+        config = RemoteConfig(
+            hub_url=hub_url,
+            token_file=token_file,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            response_cap=response_cap,
+        )
+        client = _NodeClient(config)
+        return cls(
+            gateway,
+            store,
+            RemoteHubLink(client),
+            RemoteFeedTransport(client),
             node_id=node_id,
             **kwargs,  # type: ignore[arg-type]
         )
