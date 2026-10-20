@@ -26,6 +26,7 @@ from __future__ import annotations
 import itertools
 import math
 import re
+import string
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Any
@@ -48,8 +49,27 @@ FAULTS = frozenset(
         "CopyGrades:drops-lut",  # the copy loses the LUT of the first node that has one
         "DuplicateTimeline:returns-source",  # the copy is made, but the source is returned
         "DeleteTimelines:fail",  # MediaPool.DeleteTimelines returns False, deletes nothing
+        # S13h1 build ops
+        "ImportMedia:partial",  # the last importable path is silently left out
+        "ImportMedia:duplicate",  # the first importable path comes back as two items
+        "AddSubFolder:fail",  # MediaPool.AddSubFolder returns None, makes nothing
+        "SetCurrentFolder:ignored",  # SetCurrentFolder returns True, the folder stays
+        "AddTrack:no-op",  # Timeline.AddTrack returns True, adds nothing
+        "SetTrackName:no-op",  # SetTrackName returns True, renames nothing
+        "SetTrackEnable:no-op",  # SetTrackEnable returns True, changes nothing
+        "SetTrackLock:no-op",  # SetTrackLock returns True, changes nothing
+        "AddTransition:none",  # TimelineItem.AddTransition returns None, adds nothing
+        "AddTransition:short",  # the transition is made one frame shorter than asked
+        "AddTransition:misplaced",  # the transition is made away from the edge asked for
+        "SetCDL:false",  # TimelineItem.SetCDL returns False, sets nothing
+        "SetInput:no-op",  # a Fusion tool's SetInput applies nothing
     }
 )
+# Audio track formats AddTrack accepts as a subtype (facts file, [I]: not stated by the stub).
+AUDIO_FORMATS = frozenset(
+    {"mono", "stereo", "5.1", "5.1film", "7.1", "7.1film"} | {f"adaptive{n}" for n in range(1, 37)}
+)
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 _TIMECODE = re.compile(r"^\d{2}:\d{2}:\d{2}[:;]\d{2}$")
 MARKER_COLORS = (
     "Blue", "Cyan", "Green", "Yellow", "Red", "Pink", "Purple", "Fuchsia",
@@ -87,6 +107,12 @@ _VIDEO_PROPS: dict[str, Any] = {
     "ZoomY": 1.0,
     "Opacity": 100.0,
     "CompositeMode": 0,
+    "RotationAngle": 0.0,
+    "FlipX": False,
+    "FlipY": False,
+    # Stored only. Whether a ganged zoom mirrors ZoomX into ZoomY is not modelled: the op
+    # writes and reads back both.
+    "ZoomGang": True,
 }
 _AUDIO_PROPS: dict[str, Any] = {
     "AudioVolumeEnabled": True,
@@ -94,7 +120,14 @@ _AUDIO_PROPS: dict[str, Any] = {
     "AudioPanEnabled": True,
     "AudioPan": 0.0,
 }
-_PROP_RANGES = {"AudioVolume": (-100.0, 30.0), "AudioPan": (-100.0, 100.0), "Opacity": (0.0, 100.0)}
+_PROP_RANGES = {
+    "AudioVolume": (-100.0, 30.0),
+    "AudioPan": (-100.0, 100.0),
+    "Opacity": (0.0, 100.0),
+    "ZoomX": (0.0, 100.0),
+    "ZoomY": (0.0, 100.0),
+    "RotationAngle": (-360.0, 360.0),
+}
 
 # Resolve's nominal float rates and the exact rates behind them.
 _EXACT_RATES = {
@@ -204,9 +237,16 @@ class FakeMediaPoolItem:
         online: str = "Online",
         proxy: str = "None",
         cloud_sync: int | str | None = None,
+        file_path: str | None = None,
+        title_text: str | None = None,
+        title_tool: str = "TextPlus",
     ) -> None:
         if kind not in _KIND_TYPE:
             raise ValueError(f"unknown clip kind {kind!r}")
+        # A Fusion title template: timeline items placed from it carry a Fusion comp whose
+        # ``title_tool`` tool (a Text+ by default) holds ``title_text`` as its StyledText.
+        self.title_text = title_text
+        self.title_tool = title_tool
         self._app = app
         self._name = name
         self._uid = f"mpi-{next(app.ids)}"
@@ -246,6 +286,12 @@ class FakeMediaPoolItem:
             "Cloud Sync": _cloud_sync_prop(cloud_sync),
             "Audio Ch": "2" if kind in ("av", "audio") else "0",
         }  # fmt: skip
+        if file_path is not None:
+            # Imported media: the clip is named after its file, and "File Path" is the path as
+            # the edit PC's filesystem spells it (model choice; Resolve's own spelling is [I]).
+            base = re.split(r"[\\/]", file_path)[-1]
+            self._name = base
+            self.props.update({"Clip Name": base, "File Name": base, "File Path": file_path})
 
     @property
     def has_video(self) -> bool:
@@ -341,8 +387,47 @@ class FakeMediaPool:
         self._app.calls.append(("SetCurrentFolder", folder.GetName()))
         if not any(f is folder for f in self._root.walk()):
             return False
+        if "SetCurrentFolder:ignored" in self._app.faults:
+            return True
         self.current = folder
         return True
+
+    def AddSubFolder(self, folder: FakeFolder, name: str) -> FakeFolder | None:
+        self._app.calls.append(("AddSubFolder", folder.GetName(), name))
+        if "AddSubFolder:fail" in self._app.faults:
+            return None
+        if not isinstance(name, str) or not name or not any(f is folder for f in self._root.walk()):
+            return None
+        made = FakeFolder(name, f"fold-{next(self._app.ids)}")
+        folder.subfolders.append(made)
+        return made
+
+    def ImportMedia(self, clipInfos: list[Any]) -> list[FakeMediaPoolItem]:
+        """Import edit-PC files (``FakeResolve.edit_files``) into the current folder.
+
+        Model choices ([I] in the facts file): a path the edit PC does not have is left out of
+        the returned list silently; a file already in the folder is imported again as a second
+        item; the items come back in request order, minus the skipped ones. Paths are looked
+        up the Windows way (either separator, ASCII case folded), and an item's "File Path" is
+        the path as the filesystem spells it, which may differ from the request.
+        """
+        infos = [dict(i) if isinstance(i, dict) else {"FilePath": i} for i in clipInfos]
+        self._app.calls.append(("ImportMedia", infos))
+        found: list[tuple[str, dict[str, Any]]] = []
+        for info in infos:
+            hit = self._app.edit_file(str(info.get("FilePath") or ""))
+            if hit is not None:
+                found.append(hit)
+        if "ImportMedia:partial" in self._app.faults and found:
+            found = found[:-1]
+        made: list[FakeMediaPoolItem] = []
+        for index, (disk_path, spec) in enumerate(found):
+            copies = 2 if index == 0 and "ImportMedia:duplicate" in self._app.faults else 1
+            for _ in range(copies):
+                clip = FakeMediaPoolItem(self._app, disk_path, file_path=disk_path, **spec)
+                self.current.clips.append(clip)
+                made.append(clip)
+        return made
 
     def DeleteTimelines(self, timelines: list[Any]) -> bool:
         self._app.calls.append(("DeleteTimelines", [t.GetUniqueId() for t in timelines]))
@@ -412,6 +497,8 @@ class FakeNode:
     label: str = ""
     lut: str = ""
     tools: tuple[str, ...] = ()
+    cdl: dict[str, Any] | None = None
+    """What ``TimelineItem.SetCDL`` last set on this node. Test-side only: 21.1 has no getter."""
 
 
 class FakeGraph:
@@ -420,7 +507,13 @@ class FakeGraph:
         self.nodes = nodes if nodes is not None else [FakeNode()]
 
     def copy(self) -> FakeGraph:
-        return FakeGraph(self._app, [FakeNode(n.label, n.lut, n.tools) for n in self.nodes])
+        return FakeGraph(
+            self._app,
+            [
+                FakeNode(n.label, n.lut, n.tools, dict(n.cdl) if n.cdl is not None else None)
+                for n in self.nodes
+            ],
+        )
 
     def GetNumNodes(self) -> int:
         return len(self.nodes)
@@ -440,7 +533,9 @@ class FakeGraph:
             return False  # Resolve only applies LUTs it has discovered
         if "SetLUT:no-op" in self._app.faults:
             return True
-        self.nodes[nodeIndex - 1].lut = lutPath
+        # GetLUT returns a relative path [S]: a LUT given by its absolute path under the LUT
+        # folder reads back relative to it (model choice: with Windows separators).
+        self.nodes[nodeIndex - 1].lut = self._app.lut_relative(lutPath)
         return True
 
     def GetNodeLabel(self, nodeIndex: int) -> str:
@@ -452,6 +547,48 @@ class FakeGraph:
         if not 1 <= nodeIndex <= len(self.nodes):
             return []
         return list(self.nodes[nodeIndex - 1].tools)
+
+
+# -- Fusion ---------------------------------------------------------------------------------
+
+
+class FakeFusionTool:
+    """A Fusion tool (``Operator``): ``GetInput`` / ``SetInput`` on named inputs."""
+
+    def __init__(self, app: FakeResolve, owner: str, tool_id: str, inputs: dict[str, Any]) -> None:
+        self._app = app
+        self._owner = owner
+        self.tool_id = tool_id
+        self.inputs = dict(inputs)
+
+    def GetInput(self, id: str, time: float | None = None) -> Any:
+        return self.inputs.get(id)
+
+    def SetInput(self, id: str, value: Any, time: float | None = None) -> None:
+        # Fusion's SetInput returns nothing (model choice), so only a read-back can tell.
+        self._app.calls.append(("SetInput", self._owner, id, value))
+        if "SetInput:no-op" in self._app.faults or id not in self.inputs:
+            return
+        self.inputs[id] = value
+
+
+class FakeFusionComp:
+    """A Fusion composition on a timeline item."""
+
+    def __init__(self, app: FakeResolve, owner: str, tools: list[FakeFusionTool]) -> None:
+        self._app = app
+        self._owner = owner
+        self.tools = tools
+
+    def FindToolByID(self, id: str) -> FakeFusionTool | None:
+        return next((t for t in self.tools if t.tool_id == id), None)
+
+    def clone(self, owner: str) -> FakeFusionComp:
+        return FakeFusionComp(
+            self._app,
+            owner,
+            [FakeFusionTool(self._app, owner, t.tool_id, t.inputs) for t in self.tools],
+        )
 
 
 # -- timelines ------------------------------------------------------------------------------
@@ -486,6 +623,11 @@ class FakeTimelineItem:
         self.angle: int | None = 1 if mpi is not None and mpi.kind == "multicam" else None
         self.source_readback_skew = app.source_readback_skew
         self.item_type: str | None = None  # "transition" for a transition item
+        self.transition_name: str | None = None  # the type AddTransition was given
+        self.comps: list[FakeFusionComp] = []
+        if mpi is not None and mpi.title_text is not None and track_type == "video":
+            tool = FakeFusionTool(app, self._uid, mpi.title_tool, {"StyledText": mpi.title_text})
+            self.comps = [FakeFusionComp(app, self._uid, [tool])]
 
     def clone(self, timeline: FakeTimeline) -> FakeTimelineItem:
         twin = FakeTimelineItem(
@@ -501,6 +643,8 @@ class FakeTimelineItem:
         twin.fades = dict(self.fades)
         twin.props = dict(self.props)
         twin.angle = self.angle
+        twin.item_type = self.item_type
+        twin.comps = [c.clone(twin._uid) for c in self.comps]
         return twin
 
     def GetType(self) -> str:
@@ -509,6 +653,8 @@ class FakeTimelineItem:
         return self.item_type or self.track_type
 
     def GetName(self) -> str:
+        if self.transition_name is not None:
+            return self.transition_name  # model choice: a transition is named by its type
         return self.mpi.GetName() if self.mpi is not None else "Generator"
 
     def GetUniqueId(self) -> str:
@@ -605,6 +751,58 @@ class FakeTimelineItem:
 
     def GetNodeGraph(self, layerIdx: int | None = None) -> FakeGraph:
         return self.graph
+
+    def SetCDL(self, CDL: dict[str, Any]) -> bool:
+        self._app.calls.append(("SetCDL", self._uid, dict(CDL)))
+        if self._app.props_stuck:
+            return False  # trap: setproperty-after-color (presumed for SetCDL)
+        if "SetCDL:false" in self._app.faults or self.track_type != "video":
+            return False
+        if set(CDL) != {"NodeIndex", "Slope", "Offset", "Power", "Saturation"}:
+            return False  # model choice: every part is required
+        node = CDL["NodeIndex"]
+        if not isinstance(node, int) or not 1 <= node <= len(self.graph.nodes):
+            return False
+        parsed: dict[str, Any] = {}
+        for key in ("Slope", "Offset", "Power"):
+            parts = str(CDL[key]).split()
+            try:
+                values = [float(p) for p in parts]
+            except ValueError:
+                return False
+            if len(values) != 3 or not all(math.isfinite(v) for v in values):
+                return False
+            parsed[key] = tuple(values)
+        parsed["Saturation"] = float(CDL["Saturation"])
+        self.graph.nodes[node - 1].cdl = parsed
+        return True
+
+    def cdl_on(self, node: int) -> dict[str, Any] | None:
+        """Test-side accessor: the CDL last set on ``node`` (Resolve 21.1 has no getter)."""
+        return self.graph.nodes[node - 1].cdl
+
+    def GetLeftOffset(self, subframePrecision: bool = False) -> int:
+        """The handle before the in point (model: source frames before ``src_start``)."""
+        if self.item_type == "transition" or self.mpi is None:
+            return 0
+        return self.src_start
+
+    def GetRightOffset(self, subframePrecision: bool = False) -> int:
+        """The handle after the out point (model: source frames after ``src_end``)."""
+        if self.item_type == "transition" or self.mpi is None:
+            return 0
+        return max(self.mpi.frames - self.src_end, 0)
+
+    def AddTransition(self, transitionOptions: dict[str, Any]) -> FakeTimelineItem | None:
+        options = dict(transitionOptions)
+        self._app.calls.append(("AddTransition", self._uid, options))
+        return self.timeline.add_transition(self, options)
+
+    def GetFusionCompCount(self) -> int:
+        return len(self.comps)
+
+    def GetFusionCompByIndex(self, compIndex: int) -> FakeFusionComp | None:
+        return self.comps[compIndex - 1] if 1 <= compIndex <= len(self.comps) else None
 
     def CopyGrades(self, tgtTimelineItems: list[FakeTimelineItem]) -> bool:
         self._app.calls.append(("CopyGrades", self._uid, [t._uid for t in tgtTimelineItems]))
@@ -721,10 +919,56 @@ class FakeTimeline:
         self._app.calls.append(("AddTrack", trackType, subTrackType))
         if trackType not in self.tracks:
             return False
+        if subTrackType is not None and (trackType != "audio" or subTrackType not in AUDIO_FORMATS):
+            return False  # model choice: only an audio track takes a subtype, a known format
+        if "AddTrack:no-op" in self._app.faults:
+            return True
         n = len(self.tracks[trackType]) + 1
         label = {"video": "Video", "audio": "Audio", "subtitle": "Subtitle"}[trackType]
+        # The subtype is stored as given; an audio track added without one gets "" (model
+        # choice: Resolve's default channel format is not known).
         self.tracks[trackType].append(FakeTrack(f"{label} {n}", subTrackType or ""))
         return True
+
+    def SetTrackName(self, trackType: str, trackIndex: int, name: str) -> bool:
+        self._app.calls.append(("SetTrackName", trackType, trackIndex, name))
+        track = self._track(trackType, trackIndex)
+        if track is None or not isinstance(name, str) or not name:
+            return False
+        if track.locked:
+            return False  # model choice: a locked track refuses edits
+        if "SetTrackName:no-op" in self._app.faults:
+            return True
+        track.name = name
+        return True
+
+    def SetTrackEnable(self, trackType: str, trackIndex: int, enabled: bool) -> bool:
+        self._app.calls.append(("SetTrackEnable", trackType, trackIndex, enabled))
+        track = self._track(trackType, trackIndex)
+        if track is None or not isinstance(enabled, bool):
+            return False
+        if track.locked:
+            return False  # model choice: a locked track refuses edits
+        if "SetTrackEnable:no-op" in self._app.faults:
+            return True
+        track.enabled = enabled
+        return True
+
+    def SetTrackLock(self, trackType: str, trackIndex: int, locked: bool) -> bool:
+        self._app.calls.append(("SetTrackLock", trackType, trackIndex, locked))
+        track = self._track(trackType, trackIndex)
+        if track is None or not isinstance(locked, bool):
+            return False
+        if "SetTrackLock:no-op" in self._app.faults:
+            return True
+        track.locked = locked
+        return True
+
+    def GetSetting(self, settingName: str | None = None) -> Any:
+        settings = self.GetSettings()
+        if settingName is None:
+            return settings
+        return settings.get(settingName, "")  # model choice: "" for an unknown key
 
     def GetSettings(self) -> dict[str, Any]:
         if self.custom_settings is None:
@@ -935,6 +1179,80 @@ class FakeTimeline:
             # trap: av-append-video-only: an 'av' append of BRAW only returns the video item;
             # the audio item is on the timeline but not in the returned list.
             return [i for i in made if i.track_type == "video"]
+        return made
+
+    # -- the transition model --------------------------------------------------------------
+
+    def track_of(self, item: FakeTimelineItem) -> FakeTrack | None:
+        index = self.track_index_of(item)
+        return self.tracks[item.track_type][index - 1] if index else None
+
+    @staticmethod
+    def _handles_fit(
+        before: FakeTimelineItem | None, after: FakeTimelineItem | None, alignment: str, n: int
+    ) -> bool:
+        """Whether an ``n``-frame transition at a cut fits the handles of the clips around it.
+
+        Model ([I] in the facts file): ``left`` ends on the cut, ``right`` starts on it,
+        ``center`` puts ``n // 2`` frames before it. The part before the cut shows the incoming
+        clip early (its left handle), the part after it holds the outgoing clip on (its right
+        handle). A side with no clip fades from or to black and needs nothing.
+        """
+        before_cut = {"left": n, "center": n // 2, "right": 0}[alignment]
+        after_cut = n - before_cut
+        fits_in = after is None or after.GetLeftOffset() >= before_cut
+        fits_out = before is None or before.GetRightOffset() >= after_cut
+        return fits_in and fits_out
+
+    def add_transition(
+        self, item: FakeTimelineItem, options: dict[str, Any]
+    ) -> FakeTimelineItem | None:
+        """``TimelineItem.AddTransition`` at one edge of ``item``; ``None`` when it fails."""
+        app = self._app
+        if "AddTransition:none" in app.faults:
+            return None
+        kind, category = options.get("type"), options.get("category")
+        position, alignment = options.get("position"), options.get("alignment")
+        n = options.get("duration")
+        if not isinstance(kind, str) or not kind or item.item_type is not None:
+            return None
+        if category not in ("simple", "fusion", "ofx", "audio"):
+            return None
+        if (category == "audio") != (item.track_type == "audio"):
+            return None  # model choice: audio transitions on audio items, the rest on video
+        if position not in ("start", "end") or alignment not in ("left", "center", "right"):
+            return None
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            return None  # model choice: the op always passes a duration
+        track = self.track_of(item)
+        if track is None or track.locked:
+            return None
+        edge = item.start if position == "start" else item.end
+        if any(t.item_type == "transition" and t.start <= edge <= t.end for t in track.items):
+            return None  # model choice: one transition per edge; it is never replaced
+        clips = [c for c in track.items if c.item_type is None and c is not item]
+        if position == "start":
+            before, after = next((c for c in clips if c.end == edge), None), item
+        else:
+            before, after = item, next((c for c in clips if c.start == edge), None)
+        if not self._handles_fit(before, after, alignment, n):
+            # Too-short handles are not documented ([I]): the knob picks the behaviour.
+            if app.transition_short_handles == "refuse":
+                return None
+            while n > 0 and not self._handles_fit(before, after, alignment, n):
+                n -= 1
+            if n == 0:
+                return None
+        if "AddTransition:short" in app.faults:
+            n = n - 1 if n > 1 else n + 1
+        start = {"left": edge - n, "center": edge - n // 2, "right": edge}[alignment]
+        if "AddTransition:misplaced" in app.faults:
+            start = edge + n + 1
+        made = FakeTimelineItem(self, item.track_type, None, start, start + n, 0, 0)
+        made.item_type = "transition"
+        made.props = {}
+        made.transition_name = kind
+        track.items.append(made)
         return made
 
     # -- test helpers ----------------------------------------------------------------------
@@ -1382,6 +1700,13 @@ class FakeResolve:
         self.load_silently_fails: set[str] = set()
         self.save_fails = False
         self.unknown_luts: set[str] = set()
+        # The LUT folder: SetLUT with an absolute path under it reads back relative to it.
+        self.lut_root = "X:/acme/Support/LUT"
+        # The edit PC's files, for MediaPool.ImportMedia: path -> FakeMediaPoolItem kwargs.
+        self.edit_files: dict[str, dict[str, Any]] = {}
+        # What AddTransition does when the handles are too short ([I]): make the longest
+        # transition that fits ("shorten") or return None ("refuse").
+        self.transition_short_handles = "shorten"
         self.faults: set[str] = set()  # names from FAULTS
         self.source_readback_skew = 0  # applied to items created from now on
         self._pm = FakeProjectManager(self)
@@ -1409,6 +1734,26 @@ class FakeResolve:
         elif page not in ("edit", "color") and "OpenPage:keeps-jam" not in self.faults:
             self.props_stuck = False
         self.page = page
+
+    # -- edit-PC filesystem and LUT folder --------------------------------------------------
+
+    @staticmethod
+    def _win_key(path: str) -> str:
+        return path.replace("\\", "/").translate(_ASCII_LOWER)
+
+    def edit_file(self, path: str) -> tuple[str, dict[str, Any]] | None:
+        """The edit PC's file at ``path`` as ``(path as the filesystem spells it, spec)``."""
+        key = self._win_key(path)
+        for disk_path, spec in self.edit_files.items():
+            if self._win_key(disk_path) == key:
+                return disk_path, spec
+        return None
+
+    def lut_relative(self, lut_path: str) -> str:
+        root = self._win_key(self.lut_root).rstrip("/") + "/"
+        if self._win_key(lut_path).startswith(root):
+            return lut_path.replace("\\", "/")[len(root) :].replace("/", "\\")
+        return lut_path
 
     # -- test helpers ----------------------------------------------------------------------
 
