@@ -809,3 +809,149 @@ def test_a_hung_hub_check_does_not_block_reads(tmp_path: Path) -> None:
     t.start()
     t.join(30)
     assert got and got[0].job_id == job_id
+
+
+# == mutant pins (integration pass) ===============================================================
+
+
+class _DeleteParams(__import__("pydantic").BaseModel):
+    render_job_id: str
+    own_id: str | None = None
+
+
+class _DeleteStep(__import__("aar.node.jobs.model", fromlist=["Step"]).Step):
+    """A (buggy) step that asks render.delete_job to delete a JobId its job did not record."""
+
+    def __init__(self, params: _DeleteParams) -> None:
+        self.name, self.timeout, self.params = "delete", 300.0, params
+
+    def advance(self, ctx):
+        from aar.node.jobs.model import Done, Fail, Submit
+
+        if ctx.outcome is None:
+            if self.params.own_id is not None:
+                ctx.cursor["render_job_id"] = self.params.own_id
+            return Submit("render.delete_job", {"render_job_id": self.params.render_job_id})
+        return Done(ctx.outcome.value_dict()) if ctx.outcome.ok else Fail(ctx.outcome.error)
+
+
+def _register_delete_kind() -> None:
+    from aar.node.jobs import JobKind, get_kind, register_kind
+
+    try:
+        get_kind("test.delete_other")
+    except KeyError:
+        register_kind(JobKind("test.delete_other", _DeleteParams, lambda p, t: [_DeleteStep(p)]))
+
+
+@pytest.mark.parametrize("own_id", [None, "rj-mine"])
+def test_p3_a_job_can_never_delete_a_render_job_it_did_not_record(
+    tmp_path: Path, own_id: str | None
+) -> None:
+    """Kills I34: even a job (here a buggy step of a test kind) that asks render.delete_job
+    for a JobId its own build did not record -- with no recorded id, or another one -- is
+    refused by the journal; the human's render job survives."""
+    _register_delete_kind()
+    world = _human_world(tmp_path)
+    world.project.render_jobs.append(FakeRenderJob("rj-human", {"JobId": "rj-human"}))
+    job_id = world.submit(
+        "test.delete_other", {"render_job_id": "rj-human", "own_id": own_id}, world.locator()
+    )
+    world.runner.run_until_settled()
+    view = world.runner.get(job_id)
+    assert view.state == "failed" and view.error["code"] == "render_job_not_ours"
+    assert [j.job_id for j in world.project.render_jobs] == ["rj-human"]
+
+
+def test_p5_a_branch_record_is_retried_on_every_pump_until_the_hub_takes_it(
+    tmp_path: Path,
+) -> None:
+    """Kills I49: no restart needed; the record survives several failed retries."""
+    world = _human_world(tmp_path)
+    show = _register(world)
+    real = LocalHubLink.record_branch
+    LocalHubLink.record_branch = lambda self, *a, **k: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        HubUnreachable("hub down")
+    )
+    try:
+        job_id = world.submit("ops.sequence", _branch_job(world), world.locator())
+        world.runner.run_until_settled()
+        for _ in range(4):
+            world.runner.pump()  # each pump retries, and fails
+    finally:
+        LocalHubLink.record_branch = real  # type: ignore[method-assign]
+    world.runner.pump()
+    assert len(branches(world.log, show.id)) == 1
+    assert "branch_recorded" in [e["kind"] for e in world.runner.get(job_id).events]
+
+
+def test_p5_the_hub_project_whose_source_carries_the_uid_wins_over_name_matches(
+    tmp_path: Path,
+) -> None:
+    """Kills I50: two registry projects are named "Show"; only one names this Resolve
+    project's uid in a source. The branch is recorded under that one, not refused."""
+    world = _human_world(tmp_path)
+    _register(world, sources=[ProjectSource("cloud_library", {"library": "Old", "name": "Show"})])
+    right = _register(world)  # local_db source carrying the uid
+    job_id = world.submit("ops.sequence", _branch_job(world), world.locator())
+    world.runner.run_until_settled()
+    assert world.runner.get(job_id).alerts == []
+    assert [b.project_id for b in branches(world.log)] == [right.id]
+
+
+def test_item8_a_hub_outage_during_the_drain_refuses_the_op_before_it_runs(
+    tmp_path: Path,
+) -> None:
+    """Kills I61: the hub answers the pump's own stop checks but not the broker's precheck on
+    the drain thread (it went down in between). The op is refused unrun -- a stop we cannot
+    read may be in force -- and runs once the hub is back."""
+    world = JobWorld(tmp_path)
+    real = LocalHubLink.assert_running
+
+    def down_on_the_drain(self, **kwargs):
+        if threading.current_thread().name.startswith("aar-drain"):
+            raise ConnectionError("hub down")
+        return real(self, **kwargs)
+
+    LocalHubLink.assert_running = down_on_the_drain  # type: ignore[method-assign]
+    try:
+        job_id = world.submit("ops.sequence", _marker_job(100), world.locator())
+        for _ in range(4):
+            world.runner.pump()
+        assert world.main.markers == {}
+        op_ids = [
+            e["data"]["op_id"]
+            for e in world.runner.get(job_id).events
+            if e["kind"] == "op_submitted"
+        ]
+        assert world.broker.result(op_ids[0]).error.code == "hub_unreachable"
+    finally:
+        LocalHubLink.assert_running = real  # type: ignore[method-assign]
+    world.runner.run_until_settled()
+    assert world.runner.get(job_id).state == "succeeded" and sorted(world.main.markers) == [100]
+
+
+def test_item8_a_restart_with_the_hub_down_loads_and_verifies_later(tmp_path: Path) -> None:
+    """Kills I65: approvals cannot be verified at load (hub unreachable); the runtime still
+    starts, the job waits on the hub, and verifies and carries on once it answers."""
+    world = _human_world(tmp_path)
+    job_id = world.submit("ops.sequence", _marker_job(100, 200), world.locator())
+    world.runner.run_until_settled()
+    world.runner.approve(job_id, _op_grant(world, "markers.add"), HUMAN)
+    world.runner.run_until_settled()  # step 0 written; step 1 waits for its own approval
+    assert sorted(world.main.markers) == [100]
+    real = LocalHubLink.approval
+    LocalHubLink.approval = lambda self, token: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        HubUnreachable("hub down")
+    )
+    try:
+        runner = world.restart()  # must not raise
+        runner.pump()
+        view = runner.get(job_id)
+        assert view.state == "waiting" and view.waiting["kind"] == "hub_unreachable"
+    finally:
+        LocalHubLink.approval = real  # type: ignore[method-assign]
+    runner.pump()
+    view = runner.get(job_id)
+    assert view.waiting["kind"] == "needs_approval"  # verified; step 1 still needs its token
+    assert list(view.approvals) == ["op:0/0:markers.add/markers.add"]

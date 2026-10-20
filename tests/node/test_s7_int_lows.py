@@ -290,3 +290,27 @@ def test_s11f_low_a_branch_whose_copy_was_lost_names_it_and_deletes_nothing(
     assert error.code == "duplicate_failed"
     assert error.detail[POSSIBLE_COPIES][0]["name"] == f"Main [agent:{AGENT.id} v1]"
     assert [c for c in show.fake.calls if c[0] == "DeleteTimelines"] == []
+
+
+def test_s11f_low_only_same_named_new_timelines_are_possible_copies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new timeline under ANOTHER name (a human making one meanwhile) is not a possible
+    copy: only a new one carrying the requested name is named (mutant S04)."""
+    from .fake_resolve import FakeTimeline
+
+    show = Show()
+    timeline_cls = type(show.main)
+    real = timeline_cls.DuplicateTimeline
+
+    def made_lost_and_a_human_timeline_appeared(self: Any, name: str) -> Any:
+        real(self, name)
+        show.project.timelines.append(
+            FakeTimeline(show.fake, "Human cut", "tl-HUMAN", show.project, start_frame=0)
+        )
+        return None
+
+    monkeypatch.setattr(timeline_cls, "DuplicateTimeline", made_lost_and_a_human_timeline_appeared)
+    error = show.fails("timeline.duplicate", {"source": show.ref("Main"), "name": "Main copy"})
+    names = [c["name"] for c in error.detail[POSSIBLE_COPIES]]
+    assert names == ["Main copy"]
