@@ -164,3 +164,68 @@ def test_report_is_a_deterministic_golden(tmp_path: Path, gold_recipe: None) -> 
         assert build_report_text(log, "nd_rec") == text
     finally:
         log.close()
+
+
+def test_report_lists_failed_attempts(tmp_path: Path, gold_recipe: None) -> None:
+    """The report shows every attempt, including failed ones with their error code."""
+    log = EventLog(tmp_path / "f.db")
+    try:
+        Registry(log).create_project("acme", Actor("human", "op-1"), project_id="prj_acme")
+
+        def ap(etype: str, payload: object, ts: str) -> None:
+            log.append(etype, A, payload, project_id="prj_acme", ts=ts)
+
+        rec = RecipeData(recipe="gold", brief_id="nd_b", params={}, max_review_rounds=3).dump()
+        ap(
+            "graph.node_added",
+            {"node_id": "nd_rec", "kind": "recipe", "status": "pending", "title": "r", "data": rec},
+            "2026-01-01T00:00:00+00:00",
+        )
+        ap(
+            "graph.node_status_changed",
+            {"node_id": "nd_rec", "to": "active"},
+            "2026-01-01T00:00:01+00:00",
+        )
+        ap(
+            "graph.node_added",
+            {
+                "node_id": "nd_c",
+                "kind": "op",
+                "status": "pending",
+                "title": "c",
+                "data": {
+                    "schema": "aar.step/1",
+                    "recipe_node": "nd_rec",
+                    "step_id": "c",
+                    "attempt": 1,
+                    "round": 1,
+                    "step_kind": "cold",
+                },
+            },
+            "2026-01-01T00:00:02+00:00",
+        )
+        ap(
+            "graph.node_status_changed",
+            {"node_id": "nd_c", "to": "active"},
+            "2026-01-01T00:00:02+00:00",
+        )
+        ap(
+            "graph.node_status_changed",
+            {"node_id": "nd_c", "to": "failed"},
+            "2026-01-01T00:00:03+00:00",
+        )
+        ap(
+            "recipe.result",
+            {
+                "op_node": "nd_c",
+                "outcome": "failed",
+                "outputs": {},
+                "artifact_ids": [],
+                "error": {"code": "boom", "message": "it broke", "fix_hint": ""},
+            },
+            "2026-01-01T00:00:03+00:00",
+        )
+        text = build_report_text(log, "nd_rec")
+        assert "round 1 attempt 1: failed [boom]" in text
+    finally:
+        log.close()

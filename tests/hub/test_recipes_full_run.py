@@ -15,6 +15,7 @@ from recipe_support import (
 from write_support import AGENT, Hub, make_hub
 
 from aar.hub.reviews import decide, scan_reviews
+from aar.hub.writes import WriteError, submit_plan
 from aar.recipes.engine import advance
 from aar.recipes.report import build_report_text
 from aar.recipes.run import recipe_start, step_complete
@@ -149,3 +150,39 @@ def test_pc_off_no_dispatcher_waits_but_cold_runs(hub: Hub, registered_recipe: A
     assert hot["state"] == "waiting:no_node_dispatcher"
     h_counts = Counter(step["state"] for step in view["steps"])
     assert h_counts["waiting:no_node_dispatcher"] == 1
+
+
+def test_step_complete_refuses_a_plan_that_fails_the_gate(hub: Hub, registered_recipe: Any) -> None:
+    fake = hot_fake()
+    recipe_node = make_run(hub)
+    recipe_start(hub.log, recipe_node, AGENT, idempotency_key="start-1", dispatcher=fake)
+    # Submit a plan that lints with errors (stored 'blocked'); it must not satisfy the agent step.
+    from write_support import plan_fixture
+
+    blocked = submit_plan(
+        hub.log,
+        hub.store,
+        hub.project_id,
+        plan_fixture("short_broken"),
+        AGENT,
+        derives_from=recipe_node,
+        idempotency_key="bad-plan",
+    )
+    plan_node = blocked.body["node"]["id"]
+    assert blocked.body["node"]["status"] == "blocked"
+    with pytest.raises(WriteError) as excinfo:
+        step_complete(
+            hub.log,
+            hub.store,
+            recipe_node,
+            "p",
+            None,
+            {"plan_node": plan_node},
+            AGENT,
+            idempotency_key="complete-bad",
+            dispatcher=fake,
+        )
+    assert excinfo.value.code == "expects_unmet"
+    # The step stays open (the agent op is still active, not done).
+    op = load_state(hub.log, recipe_node).latest_in_round("p", 1)
+    assert op.status == "active" and not op.is_done
