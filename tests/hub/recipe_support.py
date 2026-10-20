@@ -8,11 +8,9 @@ stored report fixture, and the built-in ``recipe.report``.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import pytest
 from pydantic import BaseModel, ConfigDict
 from write_support import AGENT, brief_data
 
@@ -39,7 +37,9 @@ class RecTestParams(BaseModel):
 def _cold(ctx: StepContext) -> StepOutput:
     ctx.record_fact("qa.lufs.master", {"value": -14.5, "unit": "LUFS"})
     aid = ctx.put(b"cold output bytes", mime="text/plain")
-    return StepOutput(outputs={"cold": True, "seconds": ctx.params.max_seconds}, artifact_ids=(aid,))
+    return StepOutput(
+        outputs={"cold": True, "seconds": ctx.params.max_seconds}, artifact_ids=(aid,)
+    )
 
 
 def _qa(ctx: StepContext) -> StepOutput:
@@ -60,28 +60,30 @@ def test_recipe_def() -> RecipeDef:
             StepDef(id="c", kind="cold", callable_id="rectest.cold", idempotent=True),
             StepDef(id="h", kind="hot", hot_kind="rectest.hot"),
             StepDef(
-                id="p", kind="agent", instruction="Submit an EditPlan for the short.",
+                id="p",
+                kind="agent",
+                instruction="Submit an EditPlan for the short.",
                 expects=PlanExpect(),
             ),
             StepDef(id="g", kind="gate", subject="p", on_reject="p", needs=("p",)),
             StepDef(id="q", kind="cold", callable_id="rectest.qa", needs=("g",)),
             StepDef(
-                id="report", kind="cold", callable_id="recipe.report", idempotent=True,
+                id="report",
+                kind="cold",
+                callable_id="recipe.report",
+                idempotent=True,
                 needs=("c", "h", "p", "g", "q"),
             ),
         ),
     )
 
 
-@pytest.fixture
-def test_recipe() -> Iterator[RecipeDef]:
-    """Register the test recipe and its callables for one test; clear afterwards."""
+def register_test_recipe() -> RecipeDef:
+    """Register the test recipe and its callables; return the definition (see conftest)."""
     registry.clear()
     registry.register_callable("rectest.cold", _cold)
     registry.register_callable("rectest.qa", _qa)
-    definition = registry.register(test_recipe_def())
-    yield definition
-    registry.clear()
+    return registry.register(test_recipe_def())
 
 
 def passing_qa_report() -> QAReport:
@@ -96,7 +98,9 @@ def passing_qa_report() -> QAReport:
 
 def store_qa_report(store: ArtifactStore, report: QAReport, actor: Actor) -> str:
     return store.put(
-        report.model_dump_json().encode("utf-8"), actor=actor, mime="application/json",
+        report.model_dump_json().encode("utf-8"),
+        actor=actor,
+        mime="application/json",
     )
 
 
@@ -123,7 +127,13 @@ class FixedClock:
         self.now = self.now + timedelta(seconds=seconds)
 
 
-def make_run(hub: Any, *, actor: Actor = AGENT, qa_report_sha: str | None = None) -> str:
+def make_run(
+    hub: Any,
+    *,
+    actor: Actor = AGENT,
+    qa_report_sha: str | None = None,
+    max_review_rounds: int | None = None,
+) -> str:
     """Create a brief and a recipe for the test recipe; return the recipe node id."""
     if qa_report_sha is None:
         qa_report_sha = store_qa_report(hub.store, passing_qa_report(), actor)
@@ -134,10 +144,17 @@ def make_run(hub: Any, *, actor: Actor = AGENT, qa_report_sha: str | None = None
         idempotency_key="brief-rectest",
     )
     brief_id = brief.body["node"]["id"]
+    body: dict[str, Any] = {
+        "recipe": RECIPE_NAME,
+        "brief_id": brief_id,
+        "params": {"qa_report": qa_report_sha},
+    }
+    if max_review_rounds is not None:
+        body["max_review_rounds"] = max_review_rounds
     recipe = create_recipe(
         hub.log,
         hub.project_id,
-        {"recipe": RECIPE_NAME, "brief_id": brief_id, "params": {"qa_report": qa_report_sha}},
+        body,
         actor,
         idempotency_key="recipe-rectest",
         params_validator=registry.registry_params_validator,

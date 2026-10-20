@@ -11,7 +11,6 @@ from recipe_support import (
     hot_fake,
     make_run,
     submit_test_plan,
-    test_recipe,  # noqa: F401 (fixture)
 )
 from write_support import AGENT, Hub, make_hub
 
@@ -48,7 +47,9 @@ def _run_worker_idle(hub: Hub, fake: Any) -> None:
             break
 
 
-def test_full_run_start_worker_hot_agent_reject_then_approve(hub: Hub, test_recipe: Any) -> None:
+def test_full_run_start_worker_hot_agent_reject_then_approve(
+    hub: Hub, registered_recipe: Any
+) -> None:
     fake = hot_fake()
     recipe_node = make_run(hub)
 
@@ -66,8 +67,15 @@ def test_full_run_start_worker_hot_agent_reject_then_approve(hub: Hub, test_reci
     # Round 1: the agent submits a plan and completes its step; the gate opens.
     plan_node = submit_test_plan(hub, recipe_node, AGENT, key="plan-r1")
     step_complete(
-        hub.log, hub.store, recipe_node, "p", None, {"plan_node": plan_node}, AGENT,
-        idempotency_key="complete-r1", dispatcher=fake,
+        hub.log,
+        hub.store,
+        recipe_node,
+        "p",
+        None,
+        {"plan_node": plan_node},
+        AGENT,
+        idempotency_key="complete-r1",
+        dispatcher=fake,
     )
     review1 = _open_gate_review(hub, recipe_node)
 
@@ -76,15 +84,22 @@ def test_full_run_start_worker_hot_agent_reject_then_approve(hub: Hub, test_reci
     advance(hub.log, recipe_node, actor=AGENT, dispatcher=fake)
     state = load_state(hub.log, recipe_node)
     assert state.current_round() == 2
-    p_round1 = [op for op in state.attempts_for("p") if op.round == 1][0]
+    p_round1 = next(op for op in state.attempts_for("p") if op.round == 1)
     assert p_round1.is_cancelled, "the round-1 plan attempt is superseded"
     assert not state.is_step_done("p"), "the plan must run again in round 2"
 
     # Round 2: resubmit a plan, complete, and the human approves.
     plan_node2 = submit_test_plan(hub, recipe_node, AGENT, key="plan-r2")
     step_complete(
-        hub.log, hub.store, recipe_node, "p", None, {"plan_node": plan_node2}, AGENT,
-        idempotency_key="complete-r2", dispatcher=fake,
+        hub.log,
+        hub.store,
+        recipe_node,
+        "p",
+        None,
+        {"plan_node": plan_node2},
+        AGENT,
+        idempotency_key="complete-r2",
+        dispatcher=fake,
     )
     review2 = _open_gate_review(hub, recipe_node)
     assert review2 != review1
@@ -120,7 +135,7 @@ def test_full_run_start_worker_hot_agent_reject_then_approve(hub: Hub, test_reci
     assert "qa.lufs.master" in report_text
 
 
-def test_pc_off_no_dispatcher_waits_but_cold_runs(hub: Hub, test_recipe: Any) -> None:
+def test_pc_off_no_dispatcher_waits_but_cold_runs(hub: Hub, registered_recipe: Any) -> None:
     # No dispatcher: the hot step stays pending (waiting: no_node_dispatcher), cold still runs.
     recipe_node = make_run(hub)
     recipe_start(hub.log, recipe_node, AGENT, idempotency_key="start-1")  # no dispatcher
