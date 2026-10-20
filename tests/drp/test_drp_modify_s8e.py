@@ -376,7 +376,7 @@ def test_low2_with_force_a_failed_restore_keeps_the_old_label(
     kept = Path(snap[0])
     assert kept.name.endswith(SNAPSHOT_SUFFIX) and kept.read_bytes() == old_label
     message = err.left_behind[1].message
-    assert f"output still at {out.name}" in message and f"over {sidecar.name}" in message
+    assert f"the output still at {out.name}:" in message and f"over {sidecar.name} " in message
     assert out.read_bytes() == old_out and sidecar.read_bytes() != old_label
     assert leftovers(out) == []
     # Following the message restores the old output's label.
