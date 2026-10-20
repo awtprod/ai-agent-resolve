@@ -21,7 +21,7 @@ import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from aar.host.config import EditHostConfig
+from aar.host.config import EditHostConfig, check_timeout
 from aar.host.errors import (
     DestinationExists,
     HashMismatch,
@@ -273,7 +273,11 @@ class EditHost:
         return strip_clixml(normalize_newlines(stderr.decode("utf-8", "replace")))
 
     def _timeout(self, override: float | None) -> float:
-        return override if override is not None else self.config.command_timeout
+        # A Python caller's timeout override skips config/CLI validation, so validate it here with
+        # the same bounds (NF3): a bad value is a typed ConfigError before anything runs.
+        if override is None:
+            return self.config.command_timeout
+        return check_timeout(override, "timeout")
 
     def remote_stat(self, win: _Win) -> tuple[int, str]:
         """``(size, sha256)`` of a remote file, from ``Get-Item`` and ``Get-FileHash``.
@@ -360,8 +364,13 @@ class EditHost:
         """Upload ``local`` (a hub path) to ``remote`` (an edit-PC path), verified."""
         win = validate_windows_path(remote, self.config.remote_roots_parsed)
         src = _validate_local(local, self.config.local_roots, is_dest=False)
-        size = os.path.getsize(src)
-        digest = sha256_file(src)
+        try:
+            # inside a typed guard: an unreadable source (mode 000) is a LocalIOError, not a raw
+            # PermissionError (NF5).
+            size = os.path.getsize(src)
+            digest = sha256_file(src)
+        except OSError as exc:
+            raise LocalIOError(f"could not read the local source {src}: {exc}") from exc
         if not overwrite and self.remote_exists(win):
             raise DestinationExists(remote)
         tmp_win = with_suffix(win, f".aarpart-{self._token()}")
@@ -469,7 +478,12 @@ def _report_kept_claim(exc: BaseException, dest: str) -> BaseException:
 
 
 def _unlink_if_claim(dest: str, claim: os.stat_result) -> bool:
-    """Remove ``dest`` only if it is still our zero-byte O_EXCL claim; return whether it was gone.
+    """Whether ``dest`` is gone -- because it was our zero-byte O_EXCL claim and we removed it, or
+    because it had already vanished. Returns False when a file is left that is not provably ours.
+
+    A ``FileNotFoundError`` means the claim already vanished: nothing is left, so this returns True
+    and the caller does not report "left in place" (NF7). Any other ``lstat`` error (e.g. EACCES)
+    cannot prove it ours, so it returns False and the file is kept and reported.
 
     Identity is device, inode and ``ctime_ns``, plus size 0. ``ctime_ns`` narrows inode reuse but
     does not close it within one timestamp tick (ext4 timestamps are coarse: a reused inode often
@@ -480,6 +494,8 @@ def _unlink_if_claim(dest: str, claim: os.stat_result) -> bool:
     """
     try:
         now = os.lstat(dest)  # lstat: never follow a symlink that replaced the claim
+    except FileNotFoundError:
+        return True  # already gone: nothing is left, so it is not "left in place"
     except OSError:
         return False
     same = (now.st_dev, now.st_ino, now.st_ctime_ns) == (
