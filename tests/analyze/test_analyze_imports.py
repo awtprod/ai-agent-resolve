@@ -18,7 +18,8 @@ sys.modules["faster_whisper"] = None
 sys.modules["cv2"] = None
 
 import aar, aar.cli, aar.analyze, aar.analyze.audio, aar.analyze.cli, aar.analyze.sync
-import aar.analyze.whisper, aar.analyze.faces, aar.analyze.common, aar.qa.cli
+import aar.analyze.whisper, aar.analyze.faces, aar.analyze.common, aar.analyze.laughs
+import aar.analyze.gemini, aar.qa.cli
 from aar.cli import main
 
 loaded = sorted(m for m, mod in sys.modules.items() if mod is not None
