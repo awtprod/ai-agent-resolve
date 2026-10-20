@@ -25,6 +25,16 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     hub = subparsers.add_parser("hub", help="Run and inspect the project/event/work-graph hub.")
     hub_sub = hub.add_subparsers(dest="hub_command", required=True)
 
+    init = hub_sub.add_parser(
+        "init",
+        help="Create a new, empty hub database and artifact store (refuses to overwrite).",
+    )
+    init.add_argument("--db", required=True, help="Path for the new SQLite event-log database.")
+    init.add_argument(
+        "--artifacts", required=True, help="Path for the new artifact store directory."
+    )
+    init.set_defaults(func=_init)
+
     serve = hub_sub.add_parser(
         "serve",
         help="Serve the hub over MCP (streamable HTTP); read-only unless --agent-writes.",
@@ -155,6 +165,56 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     show.add_argument("review_id", help="Review id.")
     show.set_defaults(func=_review_show)
 
+    node = hub_sub.add_parser(
+        "node", help="Enrol, revoke and list the nodes allowed to call the node API."
+    )
+    node_sub = node.add_subparsers(dest="node_command", required=True)
+
+    enroll = node_sub.add_parser(
+        "enroll",
+        help="Enrol a node and print its bearer token once (only its sha256 is stored).",
+    )
+    _add_db(enroll)
+    enroll.add_argument("node_id", help="The node id (as the node reports it to the hub).")
+    _add_actor(enroll)
+    enroll.add_argument(
+        "--rotate",
+        action="store_true",
+        help="Revoke the node's current token and enrol a new one, in one transaction.",
+    )
+    enroll.set_defaults(func=_node_enroll)
+
+    revoke = node_sub.add_parser("revoke", help="Revoke a node's current token.")
+    _add_db(revoke)
+    revoke.add_argument("node_id", help="The node id to revoke.")
+    _add_actor(revoke)
+    revoke.add_argument("--reason", default="revoke", help="Why, for the audit trail.")
+    revoke.set_defaults(func=_node_revoke)
+
+    node_list = node_sub.add_parser(
+        "list", help="List enrolled nodes with enrol/revoke times and a hash prefix only."
+    )
+    _add_db(node_list)
+    node_list.set_defaults(func=_node_list)
+
+    nodeapi = hub_sub.add_parser(
+        "nodeapi",
+        help="Serve the node-facing HTTP API (POST /node/v1/<op>, enrolled bearer token).",
+    )
+    nodeapi.add_argument("--db", required=True, help="Path to the SQLite event-log database.")
+    nodeapi.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Interface to bind (default: 127.0.0.1; tailnet-only, the token is a 2nd factor).",
+    )
+    nodeapi.add_argument("--port", type=int, default=8789, help="Port to bind (default: 8789).")
+    nodeapi.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Permit binding to a non-loopback interface (required for any non-loopback --host).",
+    )
+    nodeapi.set_defaults(func=_nodeapi)
+
     from aar.hub import write_cli
 
     write_cli.register(hub_sub)
@@ -171,6 +231,123 @@ def _add_actor(parser: argparse.ArgumentParser) -> None:
         metavar="KIND:ID",
         help="Who is acting, e.g. agent:agent-1 (kinds: human, agent, node).",
     )
+
+
+def _init(args: argparse.Namespace) -> int:
+    # Import here so the core CLI does not require the optional 'hub' extra.
+    from aar.hub.artifacts import ArtifactStore
+    from aar.hub.events import EventLog
+
+    db, artifacts = Path(args.db), Path(args.artifacts)
+    # Both paths must be absent, and nothing is created until both are checked, so a refusal
+    # never leaves a half-initialised hub behind.
+    if db.exists():
+        return _fail("db_exists", f"refusing to create a hub database over existing {args.db!r}")
+    if artifacts.exists():
+        return _fail(
+            "artifacts_exist",
+            f"refusing to create an artifact store over existing {args.artifacts!r}",
+        )
+    try:
+        log = EventLog(args.db, create=True)
+    except (OSError, sqlite3.Error) as exc:
+        return _fail("db_create_failed", f"cannot create hub database {args.db!r}: {exc}")
+    try:
+        ArtifactStore(args.artifacts, log, create=True)
+    except OSError as exc:
+        log.close()
+        return _fail(
+            "artifacts_create_failed", f"cannot create artifact store {args.artifacts!r}: {exc}"
+        )
+    log.close()
+    return _print({"db": str(db), "artifacts": str(artifacts)})
+
+
+def _node_enroll(args: argparse.Namespace) -> int:
+    from aar.hub import nodes
+
+    try:
+        actor = _parse_actor(args.actor)
+    except ValueError as exc:
+        return _fail("invalid_actor", str(exc))
+    try:
+        log = _open_existing(args.db)
+    except _DatabaseUnavailable as exc:
+        return _fail("database_unavailable", str(exc))
+    try:
+        node_id, token = nodes.enroll(log, args.node_id, actor, rotate=args.rotate)
+    except nodes.NodeError as exc:
+        return _fail(exc.code, str(exc))
+    finally:
+        log.close()
+    # The token is printed here, once, and never stored or logged anywhere.
+    return _print({"node_id": node_id, "token": token})
+
+
+def _node_revoke(args: argparse.Namespace) -> int:
+    from aar.hub import nodes
+
+    try:
+        actor = _parse_actor(args.actor)
+    except ValueError as exc:
+        return _fail("invalid_actor", str(exc))
+    try:
+        log = _open_existing(args.db)
+    except _DatabaseUnavailable as exc:
+        return _fail("database_unavailable", str(exc))
+    try:
+        nodes.revoke(log, args.node_id, actor, reason=args.reason)
+    except nodes.NodeError as exc:
+        return _fail(exc.code, str(exc))
+    finally:
+        log.close()
+    return _print({"node_id": args.node_id, "revoked": True})
+
+
+def _node_list(args: argparse.Namespace) -> int:
+    from aar.hub import nodes
+
+    try:
+        log = _open_existing(args.db, read_only=True)
+    except _DatabaseUnavailable as exc:
+        return _fail("database_unavailable", str(exc))
+    try:
+        records = nodes.list_nodes(log)
+    finally:
+        log.close()
+    return _print({"nodes": [record.to_dict() for record in records]})
+
+
+def _nodeapi(args: argparse.Namespace) -> int:
+    if args.host not in _LOOPBACK and not args.allow_remote:
+        return _fail(
+            "remote_bind_refused",
+            f"refusing to bind to {args.host!r} without --allow-remote: the hub is tailnet-only "
+            "(default bind is 127.0.0.1; the enrolled token is a second factor, not the only gate)",
+        )
+
+    # Import here so the core CLI does not require the optional 'hub' extra (Starlette/uvicorn).
+    from aar.hub.nodeapi import build_app
+
+    try:
+        log = _open_existing(args.db)
+    except _DatabaseUnavailable as exc:
+        return _fail("database_unavailable", str(exc))
+
+    import uvicorn
+
+    app = build_app(log)
+    # proxy_headers=False: the peer address must be the real TCP peer (loopback by default),
+    # never a forwarded header a caller controls. server_header=False keeps the banner quiet.
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        proxy_headers=False,
+        server_header=False,
+        log_level="info",
+    )
+    return 0
 
 
 def _serve(args: argparse.Namespace) -> int:
