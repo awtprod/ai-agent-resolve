@@ -1,5 +1,5 @@
 name: Prism Review
-run-name: ${{ github.event.pull_request.number || inputs.pull_request_number }}@${{ github.event.pull_request.head.sha || github.sha }}
+run-name: ${{ github.event.pull_request.number || inputs.pull_request_number }}@${{ github.event.pull_request.head.sha || github.sha }}:${{ github.event.pull_request.base.ref }}@${{ github.event.pull_request.base.sha }}
 
 on:
   pull_request_target:
@@ -16,7 +16,7 @@ permissions: {}
 concurrency:
   # One group per pull request. Pushes, opens, reopens, ready-for-review and base retargets cancel
   # the run in progress. A title or body edit cancels nothing: it waits behind the running review,
-  # and its report job then repeats the latest result for the head. Accepted race: an edit that
+  # and its report job then repeats the latest result for the head and base. Accepted race: an edit that
   # lands while a push's run is still pending replaces that run, and the edit's report fails closed.
   group: prism-review-${{ github.repository }}-${{ github.event.pull_request.number || inputs.pull_request_number }}
   cancel-in-progress: ${{ github.event.action != 'edited' || github.event.changes.base != null }}
@@ -217,18 +217,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pull_request_number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           # An edit does not change the diff, so this run repeats the newest decision of the other
-          # Prism runs for this head instead of reviewing again. Any API error fails the step.
+          # Prism runs for this exact head and base instead of reviewing again. Any API error fails the step.
           set -euo pipefail
           poll_seconds="${PRISM_MIRROR_POLL_SECONDS:-15}"
           wait_seconds="${PRISM_MIRROR_WAIT_SECONDS:-180}"
           marker='<!-- prism-review:incomplete -->'
           if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ && "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_NUMBER" =~ ^[0-9]+$ &&
-            "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::Missing pull request number, run id, run number or head SHA."
+            "$HEAD_SHA" =~ ^[0-9a-f]{40}$ && "$BASE_SHA" =~ ^[0-9a-f]{40}$ &&
+            -n "$BASE_REF" && ! "$BASE_REF" =~ [[:space:][:cntrl:]] ]]; then
+            echo "::error::Missing or invalid pull request number, run id, run number, head SHA, base ref or base SHA."
             exit 1
           fi
           short_sha=${HEAD_SHA:0:7}
@@ -263,20 +266,21 @@ jobs:
             exit 1
           fi
 
-          # Other runs of this workflow for this pull request and head, including manual re-reviews
-          # dispatched on the pull request branch: id, run number, status, conclusion, URL.
-          # Target-event execution SHAs name the base commit; only the immutable event title
-          # identifies their PR head. Manual runs must also execute on the exact PR head.
+          # Other runs for this exact PR/head/base ref/base SHA: id, run number, status, conclusion, URL.
+          # Target-event execution SHAs name the base commit; the immutable event title identifies
+          # the reviewed diff. Legacy head-only titles are insufficient. Manual reviews still run
+          # and publish, but workflow_dispatch has no immutable PR base, so never mirror them.
+          # Do not infer a historical base from the current API or mutable pull_requests metadata.
           list_runs() {
             local page payload count
             for page in {1..10}; do
               payload=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/runs?per_page=100&page=$page") || return 1
               count=$(jq -er '.workflow_runs | if type == "array" then length else error("missing workflow_runs") end' <<<"$payload") || return 1
-              jq -r --arg pr "$PR_NUMBER" --arg head "$HEAD_SHA" --argjson current "$GITHUB_RUN_ID" '
+              jq -r --arg pr "$PR_NUMBER" --arg head "$HEAD_SHA" \
+                --arg base_ref "$BASE_REF" --arg base "$BASE_SHA" --argjson current "$GITHUB_RUN_ID" '
                 .workflow_runs[] | select(.id != $current) |
-                select((.event == "pull_request_target" and .display_title == ($pr + "@" + $head)) or
-                  (.event == "workflow_dispatch" and .head_sha == $head and
-                    (.display_title == $pr or .display_title == ($pr + "@" + $head)))) |
+                select(.event == "pull_request_target" and
+                  .display_title == ($pr + "@" + $head + ":" + $base_ref + "@" + $base)) |
                 [.id, .run_number, .status, (.conclusion // "none"), .html_url] | @tsv' <<<"$payload" || return 1
               if [ "$count" -lt 100 ]; then return 0; fi
             done

@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import http.client
 import socket
+import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -149,6 +151,73 @@ def test_the_hub_restarting_between_calls(tmp_path: Path) -> None:
 # -- refusals (ValueError) ----------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"synthetic-alpha\nsynthetic-beta",
+        b"synthetic-alpha\r\nsynthetic-beta",
+        b"synthetic-alpha\rsynthetic-beta",
+        b"synthetic-alpha synthetic-beta",
+        b"synthetic-alpha\x00synthetic-beta",
+        b"synthetic-alpha\tsynthetic-beta",
+        b"synthetic-alpha\xc3\xa9synthetic-beta",
+        b"synthetic-alpha\xffsynthetic-beta",
+        b"synthetic-alpha" + b"x" * (4097 - len(b"synthetic-alpha")),
+        b"synthetic-alpha:synthetic-beta",
+        b"synthetic-alpha=synthetic-beta",
+    ],
+    ids=[
+        "lf",
+        "crlf",
+        "cr",
+        "space",
+        "nul",
+        "tab",
+        "non-ascii",
+        "invalid-utf8",
+        "cap-plus-one",
+        "punctuation",
+        "interior-padding",
+    ],
+)
+def test_invalid_token_is_private_and_never_connects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: bytes
+) -> None:
+    received = []
+    connections = []
+
+    async def responder(request: Request) -> Response:
+        received.append(request.headers.get("authorization"))
+        return Response(status_code=401)
+
+    connection_class = http.client.HTTPConnection
+
+    def connect(*args, **kwargs):
+        connections.append(True)
+        return connection_class(*args, **kwargs)
+
+    token_file = write_token(tmp_path, "placeholder")
+    token_file.write_bytes(raw)
+    with ServerThread(fault_app(responder)) as server:
+        monkeypatch.setattr(http.client, "HTTPConnection", connect)
+        link = remote_link(server.base_url, token_file)
+        with pytest.raises(NodeNotEnrolled) as exc:
+            link.control_status()
+        formatted = "".join(traceback.format_exception(exc.value))
+        for fragment in ("synthetic-alpha", "synthetic-beta"):
+            assert fragment not in str(exc.value)
+            assert fragment not in formatted
+        assert not connections
+        assert not received
+
+
+def test_enrolled_token_with_trailing_newline_authenticates(tmp_path: Path) -> None:
+    log, token_file, _ = _hub(tmp_path)
+    token_file.write_bytes(token_file.read_bytes() + b"\r\n")
+    with ServerThread(hub_app(log)) as server:
+        remote_link(server.base_url, token_file).control_status()
+
+
 @pytest.mark.parametrize("status", [401, 403])
 @pytest.mark.parametrize(
     "body",
@@ -178,7 +247,7 @@ def test_auth_status_is_permanent_regardless_of_body(
 @pytest.mark.parametrize("status", [401, 403])
 def test_auth_status_is_permanent_before_slow_body(tmp_path: Path, status: int) -> None:
     async def chunks():
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(5.0)
         yield b"sensitive-refusal"
 
     async def responder(_: Request) -> Response:
@@ -186,7 +255,7 @@ def test_auth_status_is_permanent_before_slow_body(tmp_path: Path, status: int) 
 
     token_file = write_token(tmp_path, "sensitive-token")
     with ServerThread(fault_app(responder)) as server:
-        link = remote_link(server.base_url, token_file, read_timeout=0.1)
+        link = remote_link(server.base_url, token_file, read_timeout=1.0)
         with pytest.raises(NodeNotEnrolled) as exc:
             link.control_status()
         assert "sensitive" not in str(exc.value)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import secrets
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -69,3 +70,28 @@ def test_empty_token_file_is_refused_without_leaking(tmp_path: Path) -> None:
     path.chmod(0o600)
     with pytest.raises(ValueError, match="empty"):
         _read_token(path)
+
+
+@pytest.mark.parametrize("token", ["tok", "abc-DEF_123", "AZaz09-._~+/=="])
+def test_ascii_bearer_tokens_allow_surrounding_file_whitespace(tmp_path: Path, token: str) -> None:
+    path = tmp_path / "token"
+    path.write_bytes(f" \t\r\n{token}\r\n ".encode("ascii"))
+    path.chmod(0o600)
+    assert _read_token(path) == token
+
+
+def test_token_file_read_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "token"
+    path.touch(mode=0o600)
+    reads = []
+
+    class BoundedReader(BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            assert 0 < size <= 4097, "token read must be bounded before allocating"
+            reads.append(size)
+            return super().read(size)
+
+    monkeypatch.setattr(Path, "open", lambda *args, **kwargs: BoundedReader(b"x" * 8192))
+    with pytest.raises(ValueError):
+        _read_token(path)
+    assert reads == [4097]

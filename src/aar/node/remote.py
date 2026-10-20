@@ -27,6 +27,7 @@ import http.client
 import json
 import math
 import os
+import re
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +58,8 @@ DEFAULT_RESPONSE_CAP = 4 << 20
 """Largest response the node will read (4 MiB); over it, the hub is treated as unreachable."""
 
 MAX_REQUEST_ID = 64
+MAX_TOKEN_FILE_BYTES = 4096
+"""Token files may contain at most 4 KiB, including surrounding ASCII whitespace."""
 _PREFIX = "/node/v1/"
 
 # Status codes the hub uses (shared with aar.hub.nodeapi).
@@ -142,10 +145,18 @@ def _read_token(token_file: Path) -> str:
                 f"{mode & 0o777:03o}); restrict it to the owner (chmod 600)"
             )
     # On Windows the POSIX mode bits are not meaningful, so the check is skipped (documented).
-    text = token_file.read_text(encoding="utf-8").strip()
-    if not text:
+    with token_file.open("rb") as stream:
+        raw = stream.read(MAX_TOKEN_FILE_BYTES + 1)
+    if len(raw) > MAX_TOKEN_FILE_BYTES:
+        raise ValueError("token file exceeds the 4 KiB cap")
+    token = raw.strip(b" \t\r\n")
+    if not token:
         raise ValueError(f"token file {token_file} is empty")
-    return text
+    # RFC 6750 b64token: validate bytes before decoding or constructing any header. This
+    # accepts generated token_urlsafe tokens without duplicating their entropy/length setting.
+    if re.fullmatch(rb"[A-Za-z0-9._~+/-]+=*", token) is None:
+        raise ValueError("token file contains an invalid bearer token")
+    return token.decode("ascii")
 
 
 class _NodeClient:
@@ -180,10 +191,11 @@ class _NodeClient:
         cfg = self._config
         try:
             token = _read_token(Path(cfg.token_file))
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError):
+            # A decoder or filesystem exception may contain private input; do not chain it.
             raise NodeNotEnrolled(
                 "the node token file is unavailable or unsafe; a human must fix it"
-            ) from exc
+            ) from None
         body = json.dumps(payload).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
