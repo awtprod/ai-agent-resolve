@@ -44,7 +44,7 @@ from collections.abc import Callable
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from aar.hub.approvals import Approval, ApprovalScope, consume, get_approval
-from aar.hub.collab import branches, record_branch
+from aar.hub.collab import Branch, branches, record_branch
 from aar.hub.common import Clock, utcnow
 from aar.hub.control import ControlStatus, assert_running, status
 from aar.hub.events import Actor, EventLog
@@ -122,6 +122,13 @@ class HubLink(Protocol):
         is ``project``, and the hub's ``InvalidInput`` when it refuses the record."""
         ...
 
+    def branches(self, project: ProjectLocator) -> list[Branch]:
+        """The hub's recorded agent branches for ``project``, oldest first (read-only).
+
+        S15b's branch-ownership rebuild (F-S11-2) reads this on node start-up. Raises
+        :class:`UnknownHubProject` when no single registry project is ``project``."""
+        ...
+
 
 class LocalHubLink:
     """In-process :class:`HubLink` over a shared hub :class:`~aar.hub.events.EventLog`."""
@@ -195,6 +202,10 @@ class LocalHubLink:
                 f"({sorted(candidates)})"
             )
         return candidates[0]
+
+    @_reachable
+    def branches(self, project: ProjectLocator) -> list[Branch]:
+        return branches(self._log, self.hub_project_id(project))
 
     @_reachable
     def record_branch(
