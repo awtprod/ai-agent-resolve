@@ -1,0 +1,28 @@
+name: Prism bootstrap review PR1
+run-name: Prism bootstrap review PR1
+on:
+  push:
+    branches:
+      - ops/aar-prism-bootstrap-20261020
+  workflow_dispatch:
+permissions: {}
+jobs:
+  review:
+    runs-on: [self-hosted, prism-review, aar-prism]
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Review PR1 with installed Prism
+        shell: bash
+        run: node /home/atryan/prism-review/scripts/run-local-action.mjs
+        env:
+          PRISM_DISTRIBUTED_PHASE: single
+          PRISM_GITHUB_TOKEN: ${{ github.token }}
+          PRISM_OPENAI_API_KEY: ${{ secrets.PRISM_REVIEW_API_KEY }}
+          PRISM_OPENAI_BASE_URL: http://127.0.0.1:8317/v1
+          PRISM_MODEL: gpt-6.1-sol
+          PRISM_REASONING_EFFORT: high
+          PRISM_PULL_REQUEST_NUMBER: "1"
+          PRISM_FAIL_ON_SEVERITY: none
