@@ -41,6 +41,10 @@ class CorruptArtifact(Exception):
     """Raised when stored content does not match the hash it is filed under."""
 
 
+class ArtifactTooLarge(ValueError):
+    """Raised when content exceeds a caller-supplied streaming size limit."""
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactMeta:
     """Recorded facts about a stored artifact."""
@@ -114,13 +118,19 @@ class ArtifactStore:
         mime: str | None = None,
         project_id: str | None = None,
         producing_op: str | None = None,
+        max_bytes: int | None = None,
     ) -> str:
         """Store content and return its SHA-256 id. Identical content is stored once (deduped).
 
         The bytes are streamed to a temp file while hashing, fsynced, then atomically
         renamed into place. If a copy already exists but is corrupt, it is repaired
-        from these bytes. The first store's metadata is the recorded metadata.
+        from these bytes. The first store's metadata is the recorded metadata. When
+        ``max_bytes`` is set, no bytes beyond that limit are written.
         """
+        if max_bytes is not None and (
+            isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0
+        ):
+            raise ValueError("max_bytes must be a positive integer or None")
         self._root.mkdir(parents=True, exist_ok=True)
         tmp = self._root / f".incoming-{secrets.token_hex(8)}.tmp"
         hasher = hashlib.sha256()
@@ -128,8 +138,13 @@ class ArtifactStore:
         try:
             with tmp.open("wb") as out:
                 for chunk in _iter_source(source):
+                    next_size = size + len(chunk)
+                    if max_bytes is not None and next_size > max_bytes:
+                        raise ArtifactTooLarge(
+                            f"source exceeds the configured limit of {max_bytes} bytes"
+                        )
                     hasher.update(chunk)
-                    size += len(chunk)
+                    size = next_size
                     out.write(chunk)
                 out.flush()
                 os.fsync(out.fileno())
