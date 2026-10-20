@@ -1,5 +1,9 @@
 """Read ops against a running Resolve Studio. Run only with ``AAR_LIVE=1``. Read-only.
 
+The S13h1 build tests at the end are the exception: they write, so they also need
+``AAR_LIVE_BUILD=1``. They work only on a scratch timeline (and a scratch bin) they create in
+the open project, and delete nothing: remove the scratch timeline and bin by hand afterwards.
+
 The ops go through the broker as always, with a config that takes nothing from the human: no
 Deliver preset is saved, the Project Manager path is not walked, nothing is saved, and the
 broker is never ticked into its restore (which would call setters). The target is the project
@@ -10,10 +14,13 @@ root, so the tests skip otherwise.
 
 from __future__ import annotations
 
+import os
+import uuid
 from typing import Any
 
 import pytest
 
+from aar.node.branch_registry import BranchRegistry
 from aar.node.broker import Broker, BrokerConfig, OpStatus
 from aar.node.gateway import ScriptApiGateway
 from aar.node.leases import Holder, LeaseManager
@@ -136,3 +143,155 @@ def test_live_cloud_read_ops(resolve: Any) -> None:
     fresh = _run(resolve, "cloud.freshness", {})
     assert fresh.folder_count == len(fresh.folders)
     assert fresh.stale_count == sum(f.stale for f in fresh.folders)
+
+
+# -- S13h1 build ops: write, on a scratch timeline this module creates --------------------------
+
+build_only = pytest.mark.skipif(
+    os.environ.get("AAR_LIVE_BUILD") != "1",
+    reason="writes to the open project: set AAR_LIVE_BUILD=1 as well as AAR_LIVE=1",
+)
+BUILD_AGENT = "live-build-test"
+
+
+def _env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        pytest.skip(f"set {name} to run this build test")
+    return value
+
+
+@pytest.fixture(scope="module")
+def scratch(resolve: Any) -> dict[str, Any]:
+    """A scratch timeline made here, registered as this test agent's branch. Never deleted."""
+    pm = resolve.GetProjectManager()
+    if pm.GetCurrentFolder() != "":
+        pytest.skip("the Project Manager is not at its root; its path would need navigation")
+    project = pm.GetCurrentProject()
+    assert project is not None, "no project is open"
+    name = f"aar-scratch-s13h1-{uuid.uuid4().hex[:8]}"
+    timeline = project.GetMediaPool().CreateEmptyTimeline(name)
+    assert timeline is not None, "CreateEmptyTimeline returned None"
+    registry = BranchRegistry()
+    uid = str(timeline.GetUniqueId())
+    registry.register(
+        str(project.GetUniqueId()), uid, source_timeline_id=uid, agent_id=BUILD_AGENT, version=1
+    )
+    print("scratch timeline (delete it by hand afterwards):", name)
+    return {
+        "ref": {"name": name, "unique_id": uid},
+        "registry": registry,
+        "locator": ProjectLocator((), str(project.GetName()), str(project.GetUniqueId())),
+    }
+
+
+def _build(resolve: Any, scratch: dict[str, Any], name: str, params: dict[str, Any]) -> Any:
+    """Run a build op with the branch guard on, on the scratch timeline only."""
+    gw = ScriptApiGateway(resolve)
+    clock = FakeClock()
+    presence = PresenceGuard(idle_window=1.0)
+    broker = Broker(
+        gw, leases=LeaseManager(clock), presence=presence, clock=clock, config=READ_ONLY
+    )
+    presence.observe(gw.get_context(), clock())
+    clock.advance(1.0)
+    op_id = submit_op(
+        broker,
+        name,
+        params,
+        target=scratch["locator"],
+        holder=Holder.agent(BUILD_AGENT),
+        require_branch=True,
+        branch_registry=scratch["registry"],
+    )
+    broker.run_until_idle()
+    result = broker.result(op_id)
+    assert result is not None, "the op did not run (a human may be working: it was deferred)"
+    assert result.status is OpStatus.OK, result.error
+    return result.value
+
+
+@build_only
+def test_live_build_tracks(resolve: Any, scratch: dict[str, Any]) -> None:
+    params = {
+        "timeline": scratch["ref"],
+        "tracks": [
+            {"type": "audio", "index": 2, "name": "aar mono", "audio_format": "mono"},
+            {"type": "video", "index": 2, "name": "aar titles"},
+        ],
+    }
+    first = _build(resolve, scratch, "track.ensure", params)
+    print("track.ensure:", first.model_dump())
+    assert [t.audio_format for t in first.tracks] == ["mono", None]
+    again = _build(resolve, scratch, "track.ensure", params)
+    assert [t.changed for t in again.tracks] == [[], []]
+
+
+@build_only
+def test_live_build_import_place_and_finish(resolve: Any, scratch: dict[str, Any]) -> None:
+    """media.import, then two appended ranges with handles, a centred dissolve at their cut,
+    a transform, a CDL and (if ``AAR_LIVE_LUT`` names one) a LUT, each read back and rerun."""
+    path = _env("AAR_LIVE_MEDIA")  # an edit-PC video file, e.g. X:/acme/media/a.mov
+    imported = _build(
+        resolve, scratch, "media.import", {"paths": [path], "bin_path": ["aar-scratch"]}
+    )
+    print("media.import:", imported.model_dump())
+    media = imported.media[0].media.model_dump()
+    rerun = _build(resolve, scratch, "media.import", {"paths": [path], "bin_path": ["aar-scratch"]})
+    assert rerun.media[0].status == "present"
+    appended = _build(
+        resolve,
+        scratch,
+        "timeline.append_ranges",
+        {
+            "timeline": scratch["ref"],
+            "ranges": [
+                {"media": media, "src_in": 100, "src_out": 200, "media_type": "video"},
+                {"media": media, "src_in": 400, "src_out": 500, "media_type": "video"},
+            ],
+        },
+    )
+    a, b = (r.video for r in appended.ranges)
+    a_ref = {"track_type": "video", "track": 1, "item_id": a.item_id}
+    b_ref = {"track_type": "video", "track": 1, "item_id": b.item_id}
+    tl = scratch["ref"]
+    target = {"item": a_ref, "position": "end", "alignment": "center", "frames": 12}
+    added = _build(resolve, scratch, "transition.add", {"timeline": tl, "targets": [target]})
+    print("transition.add:", added.model_dump())
+    again = _build(resolve, scratch, "transition.add", {"timeline": tl, "targets": [target]})
+    assert again.transitions[0].status == "present"
+    transform = {"item": b_ref, "zoom": 1.1, "rotation_deg": 2.0, "flip_h": True}
+    moved = _build(resolve, scratch, "item.set_transform", {"timeline": tl, "targets": [transform]})
+    print("item.set_transform:", moved.model_dump())
+    still = _build(resolve, scratch, "item.set_transform", {"timeline": tl, "targets": [transform]})
+    assert still.items[0].status == "present"
+    colour: dict[str, Any] = {"item": b_ref, "cdl": {"saturation": 0.95}}
+    if os.environ.get("AAR_LIVE_LUT"):
+        colour["lut"] = os.environ["AAR_LIVE_LUT"]
+    coloured = _build(resolve, scratch, "item.set_color", {"timeline": tl, "targets": [colour]})
+    print("item.set_color:", coloured.model_dump())
+    assert coloured.items[0].cdl is not None and not coloured.items[0].cdl.verified
+
+
+@build_only
+def test_live_build_title(resolve: Any, scratch: dict[str, Any]) -> None:
+    template = _env("AAR_LIVE_TITLE_TEMPLATE")  # media-pool id of a Fusion Text+ title clip
+    tl = scratch["ref"]
+    _build(
+        resolve,
+        scratch,
+        "track.ensure",
+        {"timeline": tl, "tracks": [{"type": "video", "index": 2}]},
+    )
+    title = {
+        "template": {"unique_id": template},
+        "track": 2,
+        "record_in": 30,
+        "record_out": 120,
+        "lines": ["aar line one", "aar line two"],
+    }
+    placed = _build(resolve, scratch, "title.place", {"timeline": tl, "titles": [title]})
+    print("title.place:", placed.model_dump())
+    assert placed.titles[0].text == "aar line one\naar line two"
+    again = _build(resolve, scratch, "title.place", {"timeline": tl, "titles": [title]})
+    assert again.titles[0].status == "present"
