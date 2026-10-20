@@ -19,6 +19,7 @@ _REUSED = (
     "_WIN_RESERVED",
     "_Win",
     "ntfs_upper",
+    "_ascii_key",
     "PathMapper",
 )
 
@@ -57,3 +58,12 @@ def test_ntfs_upper_is_one_to_one() -> None:
     # aar.host.winpath relies on NTFS-style per-character upcasing (not full casefold).
     assert paths.ntfs_upper("show") == "SHOW"
     assert paths.ntfs_upper("stra\u00dfe") == "STRA\u00dfE"  # eszett is not expanded to SS
+
+
+def test_ascii_key_folds_ascii_only() -> None:
+    # aar.host.winpath._within uses paths._ascii_key for root confinement (NF1): ASCII case folds,
+    # non-ASCII stays as-is (so a non-ASCII case difference does not fold into the root).
+    win = paths._parse_win("E:\\\u017fhow")  # long s
+    assert win is not None
+    key = paths._ascii_key(win)
+    assert isinstance(key, tuple) and key == ("E:", "\u017fHOW")

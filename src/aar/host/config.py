@@ -10,7 +10,6 @@ its contents and any key material are never read here.
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 from collections.abc import Mapping
@@ -20,7 +19,7 @@ from aar.host.errors import ConfigError, PathRefused
 from aar.host.powershell import DEFAULT_REMOTE_CMDLINE_MAX
 from aar.host.winpath import PathForm, _Win, normalize_root
 
-__all__ = ["MAX_TIMEOUT_SECONDS", "EditHostConfig", "env_config"]
+__all__ = ["MAX_TIMEOUT_SECONDS", "EditHostConfig", "check_timeout", "env_config"]
 
 # Upper bound on any timeout (seconds). 7 days: long enough for any real master transfer, finite
 # enough that inf/nan/1e300 never reach subprocess/selectors (which raise OverflowError there).
@@ -63,6 +62,26 @@ def _check_int(value: object, name: str) -> None:
         raise ConfigError(f"{name} must be a positive integer")
 
 
+def check_timeout(value: object, name: str = "command timeout") -> float:
+    """Validate a timeout in seconds and return it as a float; raise :class:`ConfigError` otherwise.
+
+    Shared by the config field, the ``--timeout`` argparse type and the ``run_powershell`` override
+    (NF2/NF3). The range test ``0 < value <= MAX_TIMEOUT_SECONDS`` already rejects ``nan`` and
+    ``inf`` (NaN comparisons are False, ``inf`` exceeds the cap), so no ``math.isfinite`` is needed
+    -- and ``isfinite`` would raise ``OverflowError`` on a huge int such as ``10**400`` (NF2). The
+    comparison runs on ints and floats only, so a huge int is refused without a float conversion.
+    """
+    if (
+        type(value) is bool
+        or not isinstance(value, (int, float))
+        or not (0 < value <= MAX_TIMEOUT_SECONDS)
+    ):
+        raise ConfigError(
+            f"{name} must be a number of seconds in (0, {MAX_TIMEOUT_SECONDS}]: {value!r}"
+        )
+    return float(value)
+
+
 @dataclass(frozen=True)
 class EditHostConfig:
     """A validated edit-PC transport configuration.
@@ -94,16 +113,7 @@ class EditHostConfig:
         if self.path_form not in _PATH_FORMS:
             raise ConfigError(f"path form must be one of {_PATH_FORMS}, not {self.path_form!r}")
         _check_int(self.connect_timeout, "connect timeout")
-        ct = self.command_timeout
-        if (
-            type(ct) is bool
-            or not isinstance(ct, (int, float))
-            or not math.isfinite(ct)
-            or not (0 < ct <= MAX_TIMEOUT_SECONDS)
-        ):
-            raise ConfigError(
-                f"command timeout must be a finite number of seconds in (0, {MAX_TIMEOUT_SECONDS}]"
-            )
+        check_timeout(self.command_timeout)
         _check_int(self.cmdline_max, "cmdline max")
         if not self.remote_roots:
             raise ConfigError("at least one remote root is required")

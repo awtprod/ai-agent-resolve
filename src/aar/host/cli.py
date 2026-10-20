@@ -10,12 +10,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from collections.abc import Callable
 from typing import Any
 
 from aar import cli_io
-from aar.host.config import MAX_TIMEOUT_SECONDS, env_config
+from aar.host.config import MAX_TIMEOUT_SECONDS, check_timeout, env_config
 from aar.host.errors import ConfigError, HostError, PathRefused, ScriptTooLong, TransportError
 from aar.host.runner import Runner, SubprocessRunner
 from aar.host.transport import EditHost, TransferResult
@@ -72,20 +71,19 @@ def register(subparsers: Any) -> None:
 
 
 def _timeout_arg(raw: str) -> float:
-    """An argparse type for --timeout: a finite number of seconds in (0, MAX_TIMEOUT_SECONDS].
+    """An argparse type for --timeout: a number of seconds in (0, MAX_TIMEOUT_SECONDS].
 
-    Rejects nan, inf, 0, negatives and over-large values with a usage error (exit 2) rather than
-    letting them reach subprocess, which raises OverflowError on a non-finite timeout.
+    Shares :func:`check_timeout` with config and the library override (NF3/NF6), so nan, inf, 0,
+    negatives and over-large values exit 2 with a usage error rather than reaching subprocess.
     """
     try:
         value = float(raw)
     except ValueError:
         raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
-    if not math.isfinite(value) or not (0 < value <= MAX_TIMEOUT_SECONDS):
-        raise argparse.ArgumentTypeError(
-            f"must be a finite number of seconds in (0, {MAX_TIMEOUT_SECONDS}]: {raw!r}"
-        )
-    return value
+    try:
+        return check_timeout(value, "timeout")
+    except ConfigError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def _default_runner() -> Runner:

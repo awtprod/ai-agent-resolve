@@ -3,9 +3,12 @@
 Every path from a caller is treated as hostile. A path is accepted only if it is an absolute
 drive path (or a UNC path when the configuration's roots include one), has no ``.`` / ``..`` /
 empty components, no reserved device name, no illegal or control character, no trailing dot or
-space, and resolves inside an allowed root under NTFS case rules. The parse, the NTFS upcasing
-and the path map all reuse :mod:`aar.drp.modify.paths` (owned by S8c; not edited here) so there
-is a single source of truth for Windows path rules.
+space, and resolves inside an allowed root. Root containment uses an ASCII-only case fold, so a
+root component that differs only by *non-ASCII* case (long s vs S, dotless i vs I, ``Café`` vs
+``CAFÉ``) is refused as ``outside-allowed-roots`` -- the full NTFS upcase over-folds pairs NTFS
+keeps distinct, so under-folding is the safe direction (NF1). The parse, the NTFS upcasing and the
+path map all reuse :mod:`aar.drp.modify.paths` (owned by S8c/S8d; not edited here) so there is a
+single source of truth for Windows path rules.
 
 Validation is lexical: it reasons about the path string, never about the remote filesystem.
 A junction or symlink (a reparse point) under an allowed root can therefore still redirect a
@@ -27,6 +30,7 @@ from aar.drp.modify.paths import (
     _WIN_BAD,
     _WIN_RESERVED,
     PathMapper,
+    _ascii_key,
     _irregular,
     _parse_win,
     _Win,
@@ -119,10 +123,17 @@ def normalize_root(prefix: str) -> _Win:
 
 
 def _within(path: _Win, root: _Win) -> bool:
-    """Whether ``path`` is at or under ``root`` by whole NTFS-upcased components."""
+    """Whether ``path`` is at or under ``root`` by whole components, ASCII-folded.
+
+    Root containment uses an ASCII-only case fold (``_ascii_key``): ASCII case differences fold,
+    but a non-ASCII character must match exactly. The full NTFS upcase (``_Win.key()``) over-folds
+    246+ pairs NTFS keeps distinct (long s vs S, dotless i vs I, Kelvin sign vs K, ...), which would
+    place e.g. ``E:\\\u017fhow`` inside root ``E:\\Show`` -- a different directory on NTFS. Under-
+    folding here fails closed: a root component differing only by non-ASCII case is refused (NF1).
+    """
     if path.unc != root.unc:
         return False
-    return path.key()[: len(root.parts) + 1] == root.key()
+    return _ascii_key(path)[: len(root.parts) + 1] == _ascii_key(root)
 
 
 def validate_windows_path(path: str, roots: tuple[_Win, ...]) -> _Win:
@@ -161,8 +172,9 @@ def validate_windows_path(path: str, roots: tuple[_Win, ...]) -> _Win:
     for root in roots:
         if _within(win, root):
             within = True
-            if win.key() == root.key():
-                # the path IS an allowed root (a directory), not a file under it
+            if _ascii_key(win) == _ascii_key(root):
+                # the path IS an allowed root (a directory), not a file under it (ASCII-folded; a
+                # non-ASCII-only case difference is refused above as outside-allowed-roots)
                 raise PathRefused(path, "equals-allowed-root")
     if not within:
         raise PathRefused(path, "outside-allowed-roots")
