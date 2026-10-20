@@ -77,24 +77,36 @@ def test_braw_in_the_middle_of_the_name_is_not_braw_media(
         assert only(run_lint(braw_source(clean_data, media)), RULE) == []
 
 
-#: Real BRAW references that carry a URI query, a fragment or stray whitespace after ``.braw``.
+#: Real BRAW references that carry a URI query or fragment, or stray whitespace, after ``.braw``.
 DRESSED_BRAW = [
     "file:///acme/a.braw?x=1",
     "file:///acme/a.braw#t=1",
     "file:///acme/a.braw?x=1#t=1",
     "file:///acme/a.BRAW?x=1",
+    "https://acme/x.braw#t=1",
+    "file:///acme/a%23b.braw",
+    "file:///acme/a.braw ?x=1",
+    "file:///acme/a.braw\t#t=1",
+    "file:///acme/a.braw?",
+    "file:///acme/a.braw#",
+    " file:///acme/a.braw?x=1\n",
     "a.braw ",
     "a.BRAW \n",
     " a.braw",
     "\ta.braw\r\n",
-    "a.braw ?x=1",
-    "a.braw\t#t=1",
-    "a.braw?",
-    "a.braw#",
+]
+
+#: A URI scheme is letters, digits, ``+``, ``.`` and ``-`` before ``://``, in any case.
+MIXED_CASE_SCHEMES = [
+    "FILE:///acme/a.braw?x=1",
+    "File:///acme/a.braw#t=1",
+    "Https://acme/x.BRAW#t=1",
+    "HTTPS://acme/x.braw?x=1",
+    "s3+x.y-z://acme/x.braw?x=1",
 ]
 
 
-@pytest.mark.parametrize("media", DRESSED_BRAW, ids=repr)
+@pytest.mark.parametrize("media", [*DRESSED_BRAW, *MIXED_CASE_SCHEMES], ids=repr)
 def test_a_uri_query_fragment_or_stray_whitespace_does_not_hide_braw_media(
     clean_data: PlanData, run_lint: RunLint, media: str
 ) -> None:
@@ -104,16 +116,54 @@ def test_a_uri_query_fragment_or_stray_whitespace_does_not_hide_braw_media(
     assert [r.source_id for r in finding.refs] == ["cam-a"]
 
 
-#: Media that is not BRAW: the ``.braw`` is not the end of the path.
+#: Local names that hold ``#``, ``?`` or ``:`` themselves. With no ``scheme://`` in front, the
+#: whole string is the name, so these are BRAW files, as they were before the URI handling.
+LOCAL_BRAW_NAMES = [
+    "take #3.braw",
+    "take?.braw",
+    "take #3.BRAW  ",
+    "D:\\acme\\ep#2\\a.braw",
+    "C:\\acme\\take #3.braw",
+    "C:/acme/take#3.braw",
+    "C://acme/take#3.braw",  # a doubled slash after a drive letter is still a drive
+    "\\\\acme\\share\\ep#2\\a.braw",
+    "/acme/ep#2/a.braw",
+    "/acme/a://b#1.braw",  # a scheme counts only at the start
+    "bin:take #3.braw",  # a colon without the two slashes is no scheme
+    "a.mov?f=a.braw",  # a local name: it really does end in .braw
+    "a.mov#a.braw",
+]
+
+
+@pytest.mark.parametrize("media", LOCAL_BRAW_NAMES, ids=repr)
+def test_a_local_braw_name_that_holds_a_question_mark_or_hash_is_still_braw(
+    clean_data: PlanData, run_lint: RunLint, media: str
+) -> None:
+    report = run_lint(braw_source(clean_data, media))
+    [finding] = only(report, RULE)
+    assert finding.severity == "error"
+    assert [r.source_id for r in finding.refs] == ["cam-a"]
+    assert repr(media) in finding.message
+
+
+#: Media that is not BRAW: the path (or, with no scheme, the whole name) does not end in ``.braw``.
 NOT_BRAW = [
     "a.braw.mov",
     "a.brawx",
     "braw",
-    "a.mov?f=a.braw",
-    "a.mov#a.braw",
-    "file:///acme/a.mov?f=a.braw#a.braw",
     "a.mov ",
     "a.braw/clip.mov",
+    "file:///acme/a.mov?f=a.braw",
+    "file:///acme/a.mov#a.braw",
+    "file:///acme/a.mov?f=a.braw#a.braw",
+    "FILE:///acme/a.mov?f=a.braw",
+    "https://acme/a.braw.mov?x=1",
+    "https://acme/a.brawx#t=1",
+    # With no scheme the whole string is the name, and these names do not end in .braw.
+    "a.braw?x=1",
+    "a.braw#t=1",
+    "take #3.mov",
+    "D:\\acme\\ep#2\\a.mov",
 ]
 
 

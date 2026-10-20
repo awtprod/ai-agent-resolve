@@ -4,6 +4,7 @@ its final fade, and the BRAW input colour space safety rule."""
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from fractions import Fraction
 from typing import Any
@@ -251,11 +252,25 @@ def short_end_fade(ctx: LintContext) -> list[Finding]:
     ]
 
 
+#: A URI scheme: a letter, then at least one more letter, digit, ``+``, ``.`` or ``-``, then
+#: ``://``. The second character is required so a Windows drive (``C:\``, ``C:/``, ``C://``)
+#: is never mistaken for a scheme. Case does not matter (``FILE://`` is ``file://``).
+_URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]+://")
+
+
 def _media_path(media: str) -> str:
-    """The path part of a media reference: cut at the first ``?`` or ``#``, then trimmed."""
-    for mark in ("?", "#"):
-        media = media.partition(mark)[0]
-    return media.strip()
+    """The path part of a media reference, trimmed.
+
+    Only a URI (``scheme://...``) has a query or fragment, so only then is the text cut at the
+    first ``?`` or ``#``. Anything else is a local path or a media-pool name, and ``?`` and ``#``
+    are ordinary characters in a file name: the whole string is the path.
+    """
+    media = media.strip()
+    if _URI_SCHEME.match(media):
+        for mark in ("?", "#"):
+            media = media.partition(mark)[0]
+        media = media.strip()
+    return media
 
 
 @rule(
@@ -268,10 +283,13 @@ def no_braw_input_color_space(ctx: LintContext) -> list[Finding]:
 
     This is a string check on the plan's own ``media`` text, case-insensitive, and nothing
     more: a media-pool name without an extension, or a path that hides BRAW behind another
-    name, passes. Surrounding whitespace and a URI query or fragment are not part of the path,
-    so ``file:///acme/a.braw?x=1`` is BRAW and ``a.mov?f=a.braw`` is not. Because the first
-    ``?`` or ``#`` always ends the path, a local file whose own name holds one of them
-    (``take #3.braw``) is not seen as BRAW. It is the cheap guard that belongs to the linter.
+    name, passes. Surrounding whitespace is not part of the path. A URI (``scheme://...``,
+    scheme in any case) also loses its query and fragment, so ``file:///acme/a.braw?x=1`` is
+    BRAW and ``file:///acme/a.mov?f=a.braw`` is not. Anything without a ``scheme://`` is a local
+    path, tested whole: ``?`` and ``#`` are ordinary file-name characters there, so
+    ``take #3.braw`` and ``D:\\acme\\ep#2\\a.braw`` are BRAW, a Windows drive is not a scheme,
+    and a bare ``a.braw?x=1`` (not a name that ends in ``.braw``) is not flagged. It is the cheap
+    guard that belongs to the linter.
     The authoritative check, against the real clip as Resolve reports it, belongs to the later
     compiler slice (``plan.apply``), which is the only place that can see the actual media.
     """
