@@ -17,8 +17,11 @@ import pytest
 from diff_testing import H264
 
 from aar.drp.modify import parse_plan, write
-from aar.drp.modify.write import SIDECAR_SUFFIX, SNAPSHOT_SUFFIX, edit_file, leftovers
+from aar.drp.modify.write import SIDECAR_SUFFIX, edit_file, leftovers
 
+# The kept-snapshot name is a documented contract (DESIGN), so it is spelled out here rather than
+# imported; test_low1_the_module_uses_the_documented_snapshot_suffix ties the two together.
+SNAPSHOT_SUFFIX = ".label-snapshot.json"
 RENAME = {"op": "rename", "target": "project", "new_name": "x"}
 HUMAN = '{"owner": "a human", "notes": "keep me"}'
 
@@ -163,6 +166,10 @@ def test_low1_if_the_rename_fails_the_snapshot_is_kept_under_its_temporary_name(
     assert kind == "label-snapshot" and _is_temp_name(out, Path(path).name)
     assert Path(path).read_text() == HUMAN
     assert not any(n.endswith(SNAPSHOT_SUFFIX) for n in files(tmp_path))  # the claim is gone
+
+
+def test_low1_the_module_uses_the_documented_snapshot_suffix() -> None:
+    assert getattr(write, "SNAPSHOT_SUFFIX", None) == SNAPSHOT_SUFFIX
 
 
 def test_low1_design_states_the_snapshot_name_and_old_runs() -> None:
