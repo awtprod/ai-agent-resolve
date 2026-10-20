@@ -29,6 +29,7 @@ INPUT_ERRORS = frozenset(
         "missing-extra",
         "model-missing",
         "model-invalid",
+        "model-outside-dir",
         "tool-missing",
         "input-missing",
         "invalid-argument",
