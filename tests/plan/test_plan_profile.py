@@ -29,6 +29,7 @@ CCN_RULES = [
     "no-whip-pan",
     "caption-length",
     "caption-style",
+    "no-braw-input-color-space",
     "ranges-valid",
 ]
 

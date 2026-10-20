@@ -1,5 +1,5 @@
 """Structural rules: valid ranges, chronological order, shortest shot, a short's duration and
-its final fade."""
+its final fade, and the BRAW input colour space safety rule."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from fractions import Fraction
 from typing import Any
 
-from aar.plan.lint import Finding, LintContext, check_number, rule
+from aar.plan.lint import Finding, LintContext, Ref, check_number, rule
 
 
 @rule(
@@ -249,3 +249,35 @@ def short_end_fade(ctx: LintContext) -> list[Finding]:
             [ctx.record_ref(total, "end")],
         )
     ]
+
+
+@rule(
+    "no-braw-input-color-space",
+    severity="error",
+    summary="Never set color.input_color_space on a source whose media is BRAW.",
+)
+def no_braw_input_color_space(ctx: LintContext) -> list[Finding]:
+    """Flag ``color.input_color_space`` on a source whose ``media`` ends in ``.braw``.
+
+    This is a string check on the plan's own ``media`` text, case-insensitive, and nothing
+    more: a media-pool name without an extension, or a path that hides BRAW behind another
+    name, passes. It is the cheap guard that belongs to the linter. The authoritative check,
+    against the real clip as Resolve reports it, belongs to the later compiler slice
+    (``plan.apply``), which is the only place that can see the actual media.
+    """
+    out: list[Finding] = []
+    for index, source in enumerate(ctx.plan.sources):
+        space = None if source.color is None else source.color.input_color_space
+        if space is None or not source.media.lower().endswith(".braw"):
+            continue
+        out.append(
+            ctx.finding(
+                "error",
+                f"Source {source.id!r} (sources[{index}]) is BRAW media ({source.media!r}) but "
+                f"sets color.input_color_space to {space!r}.",
+                f"Remove input_color_space from source {source.id!r}: BRAW decodes through "
+                "its own RAW settings, so an input colour space must never be set on it.",
+                [Ref(source_id=source.id)],
+            )
+        )
+    return out

@@ -184,6 +184,8 @@ Agents are the primary users. Humans get a thin supervision console.
 
 A rule's thresholds are either required (every profile listing the rule sets them) or optional with a code default. A rule can also check its threshold values, and a bad value is a profile error (exit 2) before anything is linted.
 
+The join-based cut rules (`cut-density`, `no-same-camera-jump`, `timejump-close-to-wide`, `audio-crossfade`, and the neighbour hint of `min-shot`) consider same-track joins only, meaning neighbouring segments on one track, so an overlay entry on another track and the cut into the outro are not counted as cuts.
+
 ### R6. CCN work end to end
 
 Recipes turn the existing, proven pipeline (the CCN shorts and long-form workflow, thumbpipe, the supoclip runner) into a work graph. The steps are:
