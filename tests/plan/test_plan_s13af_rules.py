@@ -128,7 +128,7 @@ LOCAL_BRAW_NAMES = [
     "C://acme/take#3.braw",  # a doubled slash after a drive letter is still a drive
     "\\\\acme\\share\\ep#2\\a.braw",
     "/acme/ep#2/a.braw",
-    "/acme/a://b#1.braw",  # a scheme counts only at the start
+    "/acme/ab://b#1.braw",  # a scheme counts only at the start of the string
     "bin:take #3.braw",  # a colon without the two slashes is no scheme
     "bin:/take #3.braw",  # a scheme needs ://, not just :/
     "a.mov?f=a.braw",  # a local name: it really does end in .braw
