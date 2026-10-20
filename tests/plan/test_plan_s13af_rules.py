@@ -623,6 +623,18 @@ def test_the_design_doc_says_no_dialogue_splice_also_uses_same_track_joins() -> 
     assert line.index("`no-dialogue-splice`") > line.index("`min-shot`")
 
 
+def test_the_design_doc_says_how_the_braw_rule_reads_the_media_text() -> None:
+    text = DESIGN.read_text(encoding="utf-8")
+    [line] = [x for x in text.splitlines() if x.startswith("  - `Source.color`")]
+    assert "`no-braw-input-color-space`" in line
+    assert "`.braw`" in line
+    assert "in any case" in line
+    assert "`scheme://...`" in line
+    assert "loses its query and fragment" in line
+    assert "tested whole" in line
+    assert "`take #3.braw`" in line
+
+
 def test_an_overlay_entry_on_another_track_is_not_a_cut(
     clean_data: PlanData, run_lint: RunLint
 ) -> None:

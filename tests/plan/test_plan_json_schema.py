@@ -192,6 +192,10 @@ def test_the_design_doc_says_the_schema_is_approximate_and_the_model_is_authorit
     assert "numeric" in line
     assert "24.0" in line
     assert "1.0" in line
+    # The text form of the frame rate is the same story, and the safe direction is named.
+    assert "non-ASCII whitespace" in line
+    assert "refused by the model but accepted by the schema" in line
+    assert "safe side" in line
 
 
 @pytest.mark.parametrize("name", ["short_clean.plan.json", "short_broken.plan.json"])
