@@ -337,8 +337,9 @@ def register_write_tools(
             "Start a recipe run you created: move the recipe node to active and advance it. "
             + _IDENTITY
             + "recipe_node is the recipe node id (recipe_create returns it). Only the recipe's "
-            "creator or a human may start it. Returns {ok: true, op: 'recipe.start', found, "
-            "recipe_node, status, round, steps, next_actions}. " + _ERRORS
+            "creator or a human may start it. Example: recipe_node 'nd_0123456789abcdef'. Returns "
+            "{ok: true, op: 'recipe.start', found, recipe_node, status, round, steps, "
+            "next_actions}. " + _ERRORS
         ),
         annotations=_WRITE,
     )
@@ -359,8 +360,9 @@ def register_write_tools(
             + _IDENTITY
             + "recipe_node and step_id name the step; attempt is optional (the open attempt); "
             "outputs is the object the contract wants (e.g. {plan_node: 'nd_...'} for a plan). Any "
-            "agent or a human may complete it; attribution is recorded. Returns {ok: true, op: "
-            "'recipe.step_complete', ...status view}. " + _ERRORS
+            "agent or a human may complete it; attribution is recorded. Example: recipe_node "
+            "'nd_0123456789abcdef', step_id 'plan', outputs {plan_node: 'nd_abc'}. Returns {ok: "
+            "true, op: 'recipe.step_complete', ...status view}. " + _ERRORS
         ),
         annotations=_WRITE,
     )
@@ -392,8 +394,9 @@ def register_write_tools(
             "advance. "
             + _IDENTITY
             + "recipe_node and step_id name the step. Only the recipe's creator or a human may "
-            "retry. Refused with no_attempts_left once the step has used every attempt. Returns "
-            "{ok: true, op: 'recipe.retry', ...status view}. " + _ERRORS
+            "retry. Refused with no_attempts_left once the step has used every attempt. Example: "
+            "recipe_node 'nd_0123456789abcdef', step_id 'build'. Returns {ok: true, op: "
+            "'recipe.retry', ...status view}. " + _ERRORS
         ),
         annotations=_WRITE,
     )
@@ -413,8 +416,8 @@ def register_write_tools(
             "move the recipe node to cancelled. "
             + _IDENTITY
             + "recipe_node is the recipe node id; reason is an optional note. Only the creator or "
-            "a human may cancel. Returns {ok: true, op: 'recipe.cancel', ...status view}. "
-            + _ERRORS
+            "a human may cancel. Example: recipe_node 'nd_0123456789abcdef'. Returns {ok: true, "
+            "op: 'recipe.cancel', ...status view}. " + _ERRORS
         ),
         annotations=_WRITE,
     )
