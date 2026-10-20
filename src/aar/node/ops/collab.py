@@ -31,8 +31,14 @@ Three hot ops sit on top of the write-op library (DESIGN R3):
   the ones a human added, so the latter flow back into the hub review as new notes.
 
 Note bounds (text length, frame, fps, timecode) are the hub review's own, imported from
-:mod:`aar.hub.reviews`. Writing markers mutates a production project; the human-approval
-gate for that is S7's. Here these ops are ``mutates=True`` and tested against the fake only.
+:mod:`aar.hub.reviews`. These ops are ``mutates=True`` and tested against the fake only.
+
+Node wiring (S7, :mod:`aar.node.runtime`): in a job, every op runs as the job's own agent with
+the node's one ``BranchRegistry``, so the branch ``timeline.branch`` cuts is owned by that agent
+and the job runner records it on the hub (:func:`aar.hub.collab.record_branch`). Mirroring
+markers onto the agent's own branch passes the branch guard; onto a human's timeline it waits
+for a ``project.write`` approval naming the op. On a production project the first write also
+needs S7's production approval (one token naming the op counts as that).
 """
 
 from __future__ import annotations
