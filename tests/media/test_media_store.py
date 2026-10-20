@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -83,6 +84,33 @@ def test_same_project_is_idempotent_and_cross_project_associations_are_independe
         (second, "renamed.mov"),
     ]
     assert len(log.read(types=["artifact.added"])) == 1
+    log.close()
+
+
+def test_symlink_parent_artifact_root_resolves_to_verified_bytes(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real" / "nested"
+    real_parent.mkdir(parents=True)
+    (tmp_path / "link").symlink_to(real_parent, target_is_directory=True)
+    artifacts = tmp_path / "link" / ".." / "artifacts"
+    db = tmp_path / "events.sqlite"
+    log = EventLog(db)
+    project = Registry(log).create_project("Fixture", HUMAN, project_id="prj_fixture").id
+    store = MediaStore(log, ArtifactStore(artifacts, log))
+    source = tmp_path / "source.mov"
+    payload = b"verified source bytes"
+    source.write_bytes(payload)
+
+    record = store.ingest(source, project_id=project, actor=AGENT)
+    decoy = tmp_path / "artifacts" / record.sha256[:2] / record.sha256[2:4] / record.sha256
+    decoy.parent.mkdir(parents=True)
+    decoy.write_bytes(b"unverified decoy")
+    source.unlink()
+
+    resolved = store.resolve(record.media_ref, project_id=project)
+    assert record.local_path == resolved
+    assert resolved != decoy
+    assert resolved.read_bytes() == payload
+    assert hashlib.sha256(resolved.read_bytes()).hexdigest() == record.sha256
     log.close()
 
 
@@ -213,3 +241,63 @@ def test_cli_prints_json_and_uses_meaningful_exit_codes(
     assert main(too_large) == 2
     error = json.loads(capsys.readouterr().err)
     assert error["error"]["code"] == "media_too_large"
+
+
+def test_cli_refuses_existing_association_with_wrong_size(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = tmp_path / "events.sqlite"
+    artifacts = tmp_path / "artifacts"
+    source = tmp_path / "source.mov"
+    payload = b"123456789"
+    source.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    media_ref = f"media:{digest}"
+    project = "prj_fixture"
+    log = EventLog(db)
+    Registry(log).create_project("Fixture", HUMAN, project_id=project)
+    ArtifactStore(artifacts, log)
+    association_key = (
+        f"media.association:{hashlib.sha256(project.encode('utf-8')).hexdigest()}:{digest}"
+    )
+    log.append(
+        EVENT_MEDIA_INGESTED,
+        HUMAN,
+        {
+            "media_ref": media_ref,
+            "artifact_id": digest,
+            "sha256": digest,
+            "size": 1,
+            "project_id": project,
+            "original_filename": source.name,
+        },
+        project_id=project,
+        idempotency_key=association_key,
+    )
+    log.close()
+
+    status = main(
+        [
+            "media",
+            "ingest",
+            str(source),
+            "--db",
+            str(db),
+            "--artifacts",
+            str(artifacts),
+            "--project",
+            project,
+            "--actor",
+            "human:operator",
+        ]
+    )
+    assert status == 1
+    error = json.loads(capsys.readouterr().err)
+    assert error["error"]["code"] == "media_store_error"
+    assert "size 1 does not match verified size 9" in error["error"]["message"]
+
+    reopened = EventLog(db, create=False)
+    associations = reopened.read(types=[EVENT_MEDIA_INGESTED])
+    assert len(associations) == 1
+    assert associations[0].payload["size"] == 1
+    reopened.close()

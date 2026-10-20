@@ -240,7 +240,7 @@ def _code_lines(path: Path) -> list[str]:
     """``path``'s source with every comment and string (docstrings too) blanked out."""
     import tokenize
 
-    lines = path.read_text().splitlines()
+    lines = path.read_text(encoding="utf-8").splitlines()
     out = [list(line) for line in lines]
     with path.open("rb") as fh:
         for tok in tokenize.tokenize(fh.readline):
@@ -301,7 +301,7 @@ def _require_branch_keywords() -> list[tuple[str, str, str]]:
     """Every ``require_branch=<expr>`` keyword argument in ``src``: (file, function, expr)."""
     found: list[tuple[str, str, str]] = []
     for path in sorted(SRC.rglob("*.py")):
-        tree = ast.parse(path.read_text(), filename=str(path))
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for func in ast.walk(tree):
             if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
                 continue
@@ -364,7 +364,9 @@ def test_p4_no_module_reaches_an_op_around_the_guard() -> None:
     found = [
         hit
         for path in sorted(SRC.rglob("*.py"))
-        for hit in _guard_bypasses(path.read_text(), path.relative_to(SRC).as_posix())
+        for hit in _guard_bypasses(
+            path.read_text(encoding="utf-8"), path.relative_to(SRC).as_posix()
+        )
     ]
     assert found == []
 
@@ -425,7 +427,7 @@ def test_p4_the_bypass_checker_catches_a_planted_case(
 ) -> None:
     planted = tmp_path / "planted.py"
     planted.write_text(snippet)
-    found = _guard_bypasses(planted.read_text(), rel)
+    found = _guard_bypasses(planted.read_text(encoding="utf-8"), rel)
     assert len(found) == 1 and caught in found[0], found
 
 
@@ -437,7 +439,7 @@ def test_p4_the_bypass_checker_allows_the_real_builder(tmp_path: Path) -> None:
         "        return _execute(spec, gateway, t, p)\n"
         "    return HotOp(project=t, fn=run, holder=h)\n"
     )
-    assert _guard_bypasses(planted.read_text(), _FRAMEWORK) == []
+    assert _guard_bypasses(planted.read_text(encoding="utf-8"), _FRAMEWORK) == []
 
 
 def test_p4_the_only_production_path_to_require_branch_false_is_the_approved_op() -> None:
@@ -455,7 +457,7 @@ def test_p4_the_only_production_path_to_require_branch_false_is_the_approved_op(
         ("aar/node/jobs/runner.py", "_override_op", "False"),
         ("aar/node/ops/framework.py", "submit_op", "require_branch"),  # forwards its argument
     ]
-    runner_src = (SRC / "aar/node/jobs/runner.py").read_text()
+    runner_src = (SRC / "aar/node/jobs/runner.py").read_text(encoding="utf-8")
     body = runner_src[runner_src.index("    def _override_op(") :]
     body = body[: body.index("\n    def ", 10)]
     assert "not in job.approvals" in body  # it refuses without the consumed approval
@@ -861,7 +863,7 @@ def test_item8_the_local_link_reports_a_locked_hub_as_unreachable(tmp_path: Path
 def test_the_runner_submits_only_through_the_framework() -> None:
     """Addendum §2: the runner never calls a private op entry point (``_execute``,
     ``_branch_refusal``, ...), so the guard, leases and audit always apply."""
-    tree = ast.parse((SRC / "aar/node/jobs/runner.py").read_text())
+    tree = ast.parse((SRC / "aar/node/jobs/runner.py").read_text(encoding="utf-8"))
     imported = {
         alias.name
         for node in ast.walk(tree)

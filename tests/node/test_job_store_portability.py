@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from aar.node.jobs import JobStore, JobStoreLocked
+from aar.node.jobs import JobStore, JobStoreLocked, file_lock
 
 WAIT_SECONDS = 15
 
@@ -101,6 +101,22 @@ def test_close_failure_still_releases_lock(tmp_path: Path) -> None:
     JobStore(db).close()
 
 
+def test_release_uses_imported_backend_after_sys_platform_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sidecar = tmp_path / "native.lock"
+    fd = file_lock.acquire_file_lock(str(sidecar))
+    changed_platform = "linux" if sys.platform == "win32" else "win32"
+
+    monkeypatch.setattr(sys, "platform", changed_platform)
+    file_lock.release_file_lock(fd)
+    with pytest.raises(OSError):
+        os.fstat(fd)
+
+    reacquired = file_lock.acquire_file_lock(str(sidecar))
+    file_lock.release_file_lock(reacquired)
+
+
 def test_windows_backend_uses_a_real_byte_without_importing_fcntl(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -115,6 +131,7 @@ def test_windows_backend_uses_a_real_byte_without_importing_fcntl(
     monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
     monkeypatch.setitem(sys.modules, "fcntl", None)
     namespace = runpy.run_path(str(helper))
+    assert namespace["_WINDOWS_BACKEND"] is True
 
     sidecar = tmp_path / "jobs.db.lock"
     fd = namespace["acquire_file_lock"](str(sidecar))

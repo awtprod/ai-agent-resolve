@@ -267,7 +267,7 @@ class MediaStore:
         media_ref = f"media:{sha256}"
         with self._artifacts.open(sha256) as handle:
             size = os.fstat(handle.fileno()).st_size
-            local_path = Path(os.path.abspath(os.fspath(handle.name)))
+            local_path = Path(handle.name).resolve(strict=True)
 
         key = _association_key(project_id, sha256)
         with self._log.transaction() as transaction:
@@ -288,6 +288,10 @@ class MediaStore:
                     idempotency_key=key,
                 )
         saved = _association(event, project_id, sha256)
+        if saved.size != size:
+            raise MediaStoreError(
+                f"stored media association size {saved.size} does not match verified size {size}"
+            )
         return MediaRecord(
             media_ref=saved.media_ref,
             sha256=saved.sha256,
@@ -322,7 +326,7 @@ class MediaStore:
         try:
             with self._artifacts.open(sha256) as handle:
                 actual_size = os.fstat(handle.fileno()).st_size
-                path = Path(os.path.abspath(os.fspath(handle.name)))
+                path = Path(handle.name).resolve(strict=True)
         except FileNotFoundError:
             return MediaAvailability(**base, available=False, reason="missing")
         except CorruptArtifact:
