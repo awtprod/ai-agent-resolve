@@ -212,9 +212,25 @@ def test_submission_persists_without_node_and_replays_after_reopen(tmp_path: Pat
         reopened.close()
 
 
-def test_cancel_only_own_job_with_idempotent_replay(log: EventLog, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "claim_first, expected_state, terminal_state",
+    [(False, "cancelled", "cancelled"), (True, "cancel_requested", None)],
+    ids=["unclaimed", "claimed"],
+)
+def test_cancel_only_own_job_with_idempotent_replay(
+    log: EventLog,
+    tmp_path: Path,
+    claim_first: bool,
+    expected_state: str,
+    terminal_state: str | None,
+) -> None:
     async def body(client: Client) -> None:
         own = _ok(await client.call_tool("job_submit", _request()))["job"]
+        if claim_first:
+            claimed, _ = jobs.claim(
+                log, "absent-edit-pc", [PROJECT["project_id"]], request_id="claim-own"
+            )
+            assert claimed is not None and claimed.job_id == own["job_id"]
         other = _ok(await client.call_tool("job_submit", _request(agent_id="other")))["job"]
         request = {
             "agent_id": "editor",
@@ -226,7 +242,7 @@ def test_cancel_only_own_job_with_idempotent_replay(log: EventLog, tmp_path: Pat
         cancelled = _ok(await client.call_tool("job_cancel", {**request, "job_id": own["job_id"]}))
         assert cancelled["ok"] is True and cancelled["op"] == "job.cancel"
         assert cancelled["replayed"] is False
-        assert cancelled["job"]["state"] == "cancel_requested"
+        assert cancelled["job"]["state"] == expected_state
         assert cancelled["job"]["cancel_reason"] == "superseded"
         _summary(cancelled["job"])
         repeated = _ok(await client.call_tool("job_cancel", {**request, "job_id": own["job_id"]}))
@@ -241,7 +257,9 @@ def test_cancel_only_own_job_with_idempotent_replay(log: EventLog, tmp_path: Pat
             await client.call_tool("job_cancel", {**request, "job_id": "job_missing"}),
             "job_not_found",
         )
-        assert jobs.fold(log)[other["job_id"]].cancel_requested is False
+        durable = jobs.fold(log)
+        assert durable[own["job_id"]].terminal_state == terminal_state
+        assert durable[other["job_id"]].cancel_requested is False
 
     _run(_server(log, tmp_path), body)
     assert len(log.read(types=[jobs.EVENT_CANCEL])) == 1
