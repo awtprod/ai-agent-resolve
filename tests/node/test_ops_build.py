@@ -19,7 +19,7 @@ from aar.node.ops import get_op
 from aar.node.ops.build import IMPORT_GUARD_EXEMPTION, CdlSpec, same_lut
 from aar.plan.model import Cdl
 
-from .fake_resolve import FakeFolder, FakeMediaPoolItem, FakeNode, FakeTimelineItem
+from .fake_resolve import FakeFolder, FakeMediaPoolItem, FakeNode, FakeTimelineItem, FakeTrack
 from .ops_support import CONFIG, Show, content_writes, human_settles
 
 START = 108000
@@ -1241,3 +1241,226 @@ def test_transform_lists_are_bounded_and_unique() -> None:
         )
         == 50
     )
+
+
+# -- title.place -------------------------------------------------------------------------------
+
+
+def _titles(show: Show, **kwargs: Any) -> FakeMediaPoolItem:
+    show.main.tracks["video"].append(FakeTrack("Video 2"))
+    spec = {"kind": "video", "frames": 600, "title_text": "Title", **kwargs}
+    return show.project.media_pool.add_clip(("Footage",), "lower third", **spec)
+
+
+def _title_params(show: Show, template: FakeMediaPoolItem, **spec: Any) -> dict[str, Any]:
+    title = {
+        "template": {"unique_id": template.GetUniqueId()},
+        "track": 2,
+        "record_in": 300,
+        "record_out": 390,
+        "lines": ["Acme Name", "Acme Role"],
+        **spec,
+    }
+    return {"timeline": show.ref("Main"), "titles": [title]}
+
+
+def _on_v2(show: Show) -> list[FakeTimelineItem]:
+    return show.main.items("video", 2)
+
+
+def test_a_title_is_placed_at_the_exact_range_and_its_text_set() -> None:
+    show = Show()
+    template = _titles(show)
+    result = show.ok("title.place", _title_params(show, template))
+    (placed,) = result.titles
+    (item,) = _on_v2(show)
+    assert (placed.status, placed.record_in, placed.record_out) == ("placed", 300, 390)
+    assert placed.item.model_dump() == {
+        "track_type": "video",
+        "track": 2,
+        "item_id": item.GetUniqueId(),
+    }
+    assert placed.text == "Acme Name\nAcme Role"
+    assert item.comps[0].tools[0].inputs["StyledText"] == "Acme Name\nAcme Role"
+    assert (item.start, item.end) == (START + 300, START + 390)
+    # Placed by AppendToTimeline with an exact range (never Insert*Title at the playhead).
+    assert calls(show, "AppendToTimeline") == [
+        (
+            "AppendToTimeline",
+            [
+                {
+                    "startFrame": 0,
+                    "endFrame": 90,
+                    "trackIndex": 2,
+                    "recordFrame": START + 300,
+                    "mediaType": 1,
+                    "mediaPoolItem": template.GetUniqueId(),
+                }
+            ],
+        )
+    ]
+    assert calls(show, "SetInput") == [("SetInput", item.GetUniqueId(), "StyledText", placed.text)]
+
+
+def test_a_title_rerun_is_present_and_new_text_updates_it_in_place() -> None:
+    show = Show()
+    template = _titles(show)
+    params = _title_params(show, template)
+    first = show.ok("title.place", params)
+    show.fake.calls.clear()
+    again = show.ok("title.place", params)
+    assert again.titles[0].status == "present"
+    assert again.titles[0].item == first.titles[0].item and content_writes(show.fake) == []
+    updated = show.ok("title.place", _title_params(show, template, lines=["Other"]))
+    assert (updated.titles[0].status, updated.titles[0].text) == ("updated", "Other")
+    assert [c[0] for c in content_writes(show.fake)] == ["SetInput"] and len(_on_v2(show)) == 1
+
+
+def test_a_title_never_overwrites_an_occupied_range() -> None:
+    show = Show()
+    template = _titles(show)
+    clip = show.main.place("video", 2, show.cam_a, START + 380, 50)
+    error = show.fails("title.place", _title_params(show, template))
+    assert error.code == "track_occupied" and error.detail["occupying"] == [clip.GetUniqueId()]
+    # The same template, but not exactly at the range: occupied too, never reused.
+    show.main.tracks["video"][1].items.remove(clip)
+    near = show.main.place("video", 2, template, START + 300, 60)
+    assert show.fails("title.place", _title_params(show, template)).code == "track_occupied"
+    # Exactly at the range, but other media: occupied, never reused.
+    show.main.tracks["video"][1].items.remove(near)
+    show.main.place("video", 2, show.cam_a, START + 300, 90)
+    assert show.fails("title.place", _title_params(show, template)).code == "track_occupied"
+    assert content_writes(show.fake) == []
+
+
+@pytest.mark.parametrize(
+    ("template_kwargs", "code"),
+    [
+        ({"frames": 60}, "template_too_short"),
+        ({"fps": 25.0}, "template_rate_mismatch"),
+        ({"kind": "still"}, "still_refused"),
+        ({"kind": "audio"}, "no_video"),
+    ],
+)
+def test_a_template_that_cannot_fill_the_range_is_refused(
+    template_kwargs: dict[str, Any], code: str
+) -> None:
+    show = Show()
+    template = _titles(show, **template_kwargs)
+    error = show.fails("title.place", _title_params(show, template))
+    assert error.code == code and calls(show, "AppendToTimeline") == []
+
+
+def test_a_title_on_a_missing_track_is_refused() -> None:
+    show = Show()
+    template = _titles(show)
+    assert show.fails("title.place", _title_params(show, template, track=3)).code == "track_missing"
+
+
+@pytest.mark.parametrize(
+    ("template_kwargs", "code"),
+    [
+        ({"title_text": None}, "title_has_no_comp"),
+        ({"title_tool": "Background"}, "title_has_no_text_tool"),
+    ],
+)
+def test_a_template_without_a_text_plus_is_refused_and_the_item_named(
+    template_kwargs: dict[str, Any], code: str
+) -> None:
+    show = Show()
+    template = _titles(show, **template_kwargs)
+    error = show.fails("title.place", _title_params(show, template))
+    (item,) = _on_v2(show)
+    assert error.code == code and error.detail["placed_item_id"] == item.GetUniqueId()
+    assert calls(show, "DeleteClips") == []
+
+
+def test_text_that_does_not_stick_is_caught_and_a_rerun_reuses_the_item() -> None:
+    show = Show()
+    template = _titles(show)
+    show.fake.faults.add("SetInput:no-op")
+    error = show.fails("title.place", _title_params(show, template))
+    (item,) = _on_v2(show)
+    assert error.code == "title_text_not_applied" and error.detail["read_back"] == "Title"
+    assert error.detail["placed_item_id"] == item.GetUniqueId()
+    show.fake.faults.clear()
+    result = show.ok("title.place", _title_params(show, template))
+    assert result.titles[0].status == "updated" and _on_v2(show) == [item]
+
+
+def test_title_errors_carry_the_titles_done() -> None:
+    show = Show()
+    template = _titles(show)
+    params = _title_params(show, template)
+    params["titles"].append({**params["titles"][0], "record_in": 500, "record_out": 590})
+    real = show.project.media_pool.AppendToTimeline
+    count = {"n": 0}
+
+    def fail_second(infos: list[Any]) -> list[Any]:
+        count["n"] += 1
+        return real(infos) if count["n"] == 1 else []
+
+    show.project.media_pool.AppendToTimeline = fail_second  # type: ignore[method-assign]
+    error = show.fails("title.place", params)
+    assert error.code == "append_failed"
+    assert [t["record_in"] for t in error.detail["completed"]] == [300]
+
+
+def test_title_place_makes_its_timeline_current() -> None:
+    show = Show()
+    template = _titles(show)
+    show.project.current_timeline = show.branch
+    human_settles(show)
+    show.ok("title.place", _title_params(show, template))
+    # AppendToTimeline works on the current timeline: the op made Main current (the broker
+    # gives the human's timeline back afterwards), and the title landed on Main.
+    assert ("SetCurrentTimeline", "Main") in show.fake.calls
+    assert len(_on_v2(show)) == 1 and show.branch.items("video", 1) == []
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"lines": []},
+        {"lines": ["a", "b", "c", "d", "e"]},
+        {"lines": ["x" * 201]},
+        {"lines": ["two\nlines"]},
+        {"lines": [" "]},
+        {"record_out": 300},
+        {"record_out": 200},
+        {"record_in": -1},
+        {"record_in": 1.0},
+        {"track": 0},
+        {"track": 17},
+        {"template": {"unique_id": ""}},
+        {"text": "x"},
+    ],
+)
+def test_title_specs_are_bounded(patch: dict[str, Any]) -> None:
+    show = Show()
+    title = {
+        "template": {"unique_id": "mpi-1"},
+        "track": 2,
+        "record_in": 300,
+        "record_out": 390,
+        "lines": ["a"],
+        **patch,
+    }
+    with pytest.raises(ValidationError):
+        validate("title.place", {"timeline": show.ref("Main"), "titles": [title]})
+
+
+def test_titles_may_not_overlap_in_one_request() -> None:
+    show = Show()
+    one = {"template": {"unique_id": "m"}, "track": 2, "record_in": 0, "record_out": 90}
+    one["lines"] = ["a"]
+    for titles in (
+        [],
+        [one, {**one, "record_in": 80, "record_out": 120}],
+        [one, {**one, "record_out": 100}],
+        [{**one, "record_in": 100 * n, "record_out": 100 * n + 90} for n in range(51)],
+    ):
+        with pytest.raises(ValidationError):
+            validate("title.place", {"timeline": show.ref("Main"), "titles": titles})
+    apart = [one, {**one, "record_in": 90, "record_out": 120}, {**one, "track": 3}]
+    assert len(validate("title.place", {"timeline": show.ref("Main"), "titles": apart}).titles) == 3

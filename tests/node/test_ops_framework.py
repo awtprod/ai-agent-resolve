@@ -45,6 +45,7 @@ EXPECTED = {
     "transition.add": (True, True),
     "item.set_color": (True, True),
     "item.set_transform": (True, True),
+    "title.place": (True, True),
 }
 
 

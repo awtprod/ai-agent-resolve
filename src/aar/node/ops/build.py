@@ -27,6 +27,7 @@ trusted.
 
 from __future__ import annotations
 
+import itertools
 import re
 import string
 from collections.abc import Callable
@@ -34,6 +35,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import AfterValidator, Field, model_validator
 
+from aar.node.ops import raw
 from aar.node.ops.framework import (
     ItemRef,
     MediaRef,
@@ -46,11 +48,18 @@ from aar.node.ops.framework import (
     TrackType,
     op,
 )
+from aar.node.ops.timebase import exact_rate
 from aar.node.ops.write import (
     _JAM_HINT,
+    AppendRange,
+    _Appender,
     _clips,
     _int,
+    _media_id,
     _no_repeats,
+    _overlapping,
+    _Planned,
+    _preflight,
     _set_properties,
     _with_bounce,
     _with_completed,
@@ -1338,3 +1347,201 @@ def item_set_transform(env: OpEnv, params: TransformParams) -> TransformResult:
             )
         )
     return TransformResult(timeline=env.identity(timeline), items=done, notes=notes)
+
+
+# -- title.place -------------------------------------------------------------------------------
+
+MAX_RECORD_FRAME = 10_000_000
+
+
+class TitleSpec(OpModel):
+    template: MediaRef = Field(
+        description="A media-pool item holding a Text+ title (a Fusion composition clip)."
+    )
+    track: int = Field(strict=True, ge=1, le=16, description="Video track.")
+    record_in: int = Field(
+        strict=True, ge=0, le=MAX_RECORD_FRAME, description="Frames from the timeline start."
+    )
+    record_out: int = Field(
+        strict=True, ge=1, le=MAX_RECORD_FRAME, description="End frame (exclusive)."
+    )
+    lines: list[TitleLine] = Field(min_length=1, max_length=4)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> TitleSpec:
+        if self.record_out <= self.record_in:
+            raise ValueError("record_out must be greater than record_in (ranges are [in, out))")
+        return self
+
+
+class TitleParams(OpModel):
+    timeline: TimelineRef
+    titles: list[TitleSpec] = Field(min_length=1, max_length=MAX_TARGETS)
+
+    @model_validator(mode="after")
+    def _apart(self) -> TitleParams:
+        _no_repeats([(t.track, t.record_in) for t in self.titles], "title slot")
+        spans = sorted((t.track, t.record_in, t.record_out) for t in self.titles)
+        for (track, _, end), (next_track, start, _) in itertools.pairwise(spans):
+            if track == next_track and start < end:
+                raise ValueError(f"two titles overlap on video track {track}")
+        return self
+
+
+class TitlePlaced(OpModel):
+    status: Literal["placed", "present", "updated"]
+    item: ItemRef
+    record_in: int
+    record_out: int
+    text: str
+
+
+class TitleResult(OpModel):
+    timeline: TimelineIdentity
+    titles: list[TitlePlaced]
+
+
+def _title_text(item: Any, text: str) -> tuple[bool, str]:
+    """Set the Text+ ``StyledText`` of the title item's first comp: ``(changed, read back)``."""
+    uid = str(item.GetUniqueId())
+    comp = item.GetFusionCompByIndex(1)
+    if comp is None:
+        raise OpError(
+            "title_has_no_comp",
+            f"title item {uid} has no Fusion composition",
+            "use a Fusion title template (a Fusion composition clip holding a Text+)",
+            item_id=uid,
+        )
+    tool = comp.FindToolByID("TextPlus")  # [I] the Text+ registry id is "TextPlus"
+    if tool is None:
+        raise OpError(
+            "title_has_no_text_tool",
+            f"the composition of title item {uid} has no Text+ tool",
+            "use a template whose composition holds a Text+ tool",
+            item_id=uid,
+        )
+    have = tool.GetInput("StyledText")  # [I] the Text+ text input is "StyledText"
+    if have == text:
+        return False, text
+    # [I] With no time, SetInput sets the constant value of an input that is not animated.
+    # Its return value is not relied on: only the read-back counts.
+    tool.SetInput("StyledText", text)
+    after = tool.GetInput("StyledText")
+    if after != text:
+        raise OpError(
+            "title_text_not_applied",
+            f"title item {uid} reads back text {after!r}, not {text!r}",
+            "set the text by hand in the Inspector; the item stays in place and a rerun reuses it",
+            item_id=uid,
+            read_back=after,
+        )
+    return True, after
+
+
+@op(
+    "title.place",
+    params=TitleParams,
+    result=TitleResult,
+    mutates=True,
+    needs_current_timeline=True,
+    traps=("append-endframe-exclusive",),
+)
+def title_place(env: OpEnv, params: TitleParams) -> TitleResult:
+    """Place Text+ title templates at exact record ranges and set their text, read back.
+
+    ``InsertTitleIntoTimeline`` / ``InsertFusionTitleIntoTimeline`` land at the playhead with
+    a default length that nothing can change afterwards, so the template is placed with
+    ``AppendToTimeline`` (the ``timeline.append_ranges`` machinery). A range that holds
+    anything else is refused, never overwritten; the same template exactly there is reused.
+    """
+    timeline = env.current_timeline(params.timeline)
+    tl_fps = (timeline.GetSettings() or {}).get("timelineFrameRate")
+    if tl_fps is None:
+        raise OpError("timeline_fps_unknown", "timelineFrameRate is not set", "check settings")
+    start = int(timeline.GetStartFrame())
+    found = env.media([t.template for t in params.titles])
+    facts = {uid: raw.read_media(mpi) for uid, (mpi, _) in found.items()}
+    planned = []
+    for index, spec in enumerate(params.titles):
+        uid = spec.template.unique_id
+        f, length = facts[uid], spec.record_out - spec.record_in
+        if f["fps"] is None or exact_rate(float(f["fps"])) != exact_rate(float(tl_fps)):
+            raise OpError(
+                "template_rate_mismatch",
+                f"title {index}: template {f['name']!r} runs at {f['fps']} fps, the timeline at "
+                f"{tl_fps}",
+                "use a title template made at the timeline's frame rate",
+            )
+        if f["frames"] is None or f["frames"] < length:
+            raise OpError(
+                "template_too_short",
+                f"title {index}: template {f['name']!r} has {f['frames']} frames, the range "
+                f"needs {length}",
+                "use a longer template, or a shorter range",
+                needed=length,
+                available=f["frames"],
+            )
+        lo, hi = start + spec.record_in, start + spec.record_out
+        occupying = _overlapping(timeline, "video", spec.track, lo, hi)
+        reuse = None
+        if occupying:
+            only = occupying[0]
+            exact = int(only.GetStart()) == lo and int(only.GetEnd()) == hi
+            if len(occupying) == 1 and exact and _media_id(only) == uid:
+                reuse = only
+            else:
+                raise OpError(
+                    "track_occupied",
+                    f"title {index}: video track {spec.track} already has {len(occupying)} "
+                    f"item(s) in [{spec.record_in}, {spec.record_out}); a title never "
+                    "overwrites",
+                    "pick a free range or another track (track.ensure adds one)",
+                    occupying=[str(i.GetUniqueId()) for i in occupying],
+                )
+        rng = AppendRange(
+            media=spec.template,
+            src_in=0,
+            src_out=length,
+            track=spec.track,
+            media_type="video",
+            record_in=spec.record_in,
+        )
+        p = _Planned(index, rng, "video", spec.record_in, length)
+        if reuse is None:
+            _preflight(timeline, p, f)
+        planned.append((spec, p, reuse))
+    # repair_short off: equal rates cannot land short, and a title never deletes an item.
+    appender = _Appender(env, timeline, repair_short=False)
+    done: list[TitlePlaced] = []
+    for spec, p, reuse in planned:
+        text = "\n".join(spec.lines)  # [I] StyledText separates lines with "\n"
+        placed_id = None
+        try:
+            if reuse is None:
+                uid = spec.template.unique_id
+                appended = appender.run(p, found[uid][0], facts[uid])
+                if appended.video is None:  # pragma: no cover - a video append places video
+                    raise OpError("append_failed", "no video item was placed", "retry")
+                placed_id = appended.video.item_id
+                item = env.item(
+                    timeline, ItemRef(track_type="video", track=spec.track, item_id=placed_id)
+                )
+            else:
+                item = reuse
+            changed, read_back = _title_text(item, text)
+        except OpError as exc:
+            more = {"placed_item_id": placed_id} if placed_id is not None else {}
+            raise _partial(exc, done, **more) from exc
+        status: Literal["placed", "present", "updated"] = (
+            "placed" if reuse is None else ("updated" if changed else "present")
+        )
+        done.append(
+            TitlePlaced(
+                status=status,
+                item=ItemRef(track_type="video", track=spec.track, item_id=str(item.GetUniqueId())),
+                record_in=int(item.GetStart()) - start,
+                record_out=int(item.GetEnd()) - start,
+                text=read_back,
+            )
+        )
+    return TitleResult(timeline=env.identity(timeline), titles=done)
