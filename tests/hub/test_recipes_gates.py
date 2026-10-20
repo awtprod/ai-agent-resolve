@@ -25,9 +25,7 @@ def _report(check: QACheck, *, also: list[QACheck] | None = None) -> QAReport:
     return build_report(file="f.mp4", kind="short", profile="ccn", media=None, checks=checks)
 
 
-def _check(
-    status: str, *, skip_reason: str | None = None, incomplete: bool = False
-) -> QACheck:
+def _check(status: str, *, skip_reason: str | None = None, incomplete: bool = False) -> QACheck:
     return QACheck(
         id="decode", status=status, message="m", skip_reason=skip_reason, incomplete=incomplete
     )
@@ -67,13 +65,18 @@ def test_qa_gate_missing_required_check_fails() -> None:
 
 def test_qa_gate_all_required_present_and_clear_passes() -> None:
     report = build_report(
-        file="f.mp4", kind="short", profile="ccn", media=None,
+        file="f.mp4",
+        kind="short",
+        profile="ccn",
+        media=None,
         checks=[
             QACheck(id="decode", status="pass", message="ok"),
             QACheck(id="loudness", status="warn", message="close"),
         ],
     )
-    assert qa_gate(report, required=("decode", "loudness"), allow_warn=frozenset({"loudness"})).passed
+    assert qa_gate(
+        report, required=("decode", "loudness"), allow_warn=frozenset({"loudness"})
+    ).passed
     assert not qa_gate(report, required=("decode", "loudness")).passed  # warn not allowed
 
 
@@ -96,8 +99,13 @@ def _plan_data(errors: int, skipped_rules: tuple[str, ...] = ()) -> PlanNodeData
         rule_profile="ccn",
         derives_from="nd_x",
         lint=LintSummary(
-            ok=errors == 0, errors=errors, warnings=0, infos=0,
-            skipped_rules=list(skipped_rules), findings=[], omitted=0,
+            ok=errors == 0,
+            errors=errors,
+            warnings=0,
+            infos=0,
+            skipped_rules=list(skipped_rules),
+            findings=[],
+            omitted=0,
         ),
     )
 
@@ -120,8 +128,13 @@ def test_plan_gate_ignores_node_status_f2(hub: Hub) -> None:
 
     brief_id = create_brief(hub.log, brief, AGENT, idempotency_key="b1").body["node"]["id"]
     result = submit_plan(
-        hub.log, hub.store, hub.project_id, plan_fixture("short_broken"), AGENT,
-        derives_from=brief_id, idempotency_key="p1",
+        hub.log,
+        hub.store,
+        hub.project_id,
+        plan_fixture("short_broken"),
+        AGENT,
+        derives_from=brief_id,
+        idempotency_key="p1",
     )
     plan_node_id = result.body["node"]["id"]
     assert result.body["node"]["status"] == "blocked"  # stored blocked by lint errors

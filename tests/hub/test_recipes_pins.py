@@ -59,8 +59,11 @@ def test_old_log_folds_to_the_same_state(tmp_path: Path) -> None:
     try:
         for event in fixture["events"]:
             log.append(
-                event["type"], Actor(*event["actor"]), event["payload"],
-                project_id=event["project_id"], ts=event["ts"],
+                event["type"],
+                Actor(*event["actor"]),
+                event["payload"],
+                project_id=event["project_id"],
+                ts=event["ts"],
             )
         graph = WorkGraph(log, fixture["project_id"])
         snap = graph.snapshot()
