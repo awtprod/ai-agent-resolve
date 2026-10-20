@@ -198,6 +198,11 @@ class _NodeClient:
                 conn.sock.settimeout(cfg.read_timeout)  # reads use the read timeout
             conn.request("POST", f"{self._base_path}{_PREFIX}{op}", body=body, headers=headers)
             response = conn.getresponse()
+            if response.status in (401, 403):
+                # Headers suffice: an untrusted, oversized or stalled body cannot make this
+                # permanent refusal retryable, and no response detail is safe to echo.
+                response.close()
+                raise NodeNotEnrolled("the hub refused this node (enrolment); a human must fix it")
             raw = response.read(cfg.response_cap + 1)
             if len(raw) > cfg.response_cap:
                 raise HubUnreachable("the hub's response is over the 4 MiB cap")
@@ -224,9 +229,6 @@ class _NodeClient:
             if isinstance(envelope, dict) and envelope.get("ok") is True:
                 return envelope
             raise HubUnreachable("the hub returned a malformed 200 envelope")
-        if status in (401, 403):
-            # No detail is trusted here: any 401/403 means the enrolment must be fixed.
-            raise NodeNotEnrolled("the hub refused this node (enrolment); a human must fix it")
         error = envelope.get("error") if isinstance(envelope, dict) else None
         error = error if isinstance(error, dict) else {}
         raise _map_refusal(status, error, body)

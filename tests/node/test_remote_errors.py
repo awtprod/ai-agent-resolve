@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse, Response
+from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from aar.hub import approvals, control, nodes
 from aar.hub.approvals import ApprovalAlreadyConsumed, ApprovalScope
@@ -147,6 +147,49 @@ def test_the_hub_restarting_between_calls(tmp_path: Path) -> None:
 
 
 # -- refusals (ValueError) ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"<html>sensitive-refusal</html>",
+        b"",
+        b"{sensitive-refusal",
+        b"\xffsensitive-refusal",
+        b"sensitive-refusal" * 1000,
+    ],
+    ids=["html", "empty", "invalid-json", "invalid-utf8", "oversized"],
+)
+def test_auth_status_is_permanent_regardless_of_body(
+    tmp_path: Path, status: int, body: bytes
+) -> None:
+    async def responder(_: Request) -> Response:
+        return Response(body, status_code=status)
+
+    token_file = write_token(tmp_path, "sensitive-token")
+    with ServerThread(fault_app(responder)) as server:
+        link = remote_link(server.base_url, token_file, response_cap=1024)
+        with pytest.raises(NodeNotEnrolled) as exc:
+            link.control_status()
+        assert "sensitive" not in str(exc.value)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_auth_status_is_permanent_before_slow_body(tmp_path: Path, status: int) -> None:
+    async def chunks():
+        await asyncio.sleep(0.6)
+        yield b"sensitive-refusal"
+
+    async def responder(_: Request) -> Response:
+        return StreamingResponse(chunks(), status_code=status)
+
+    token_file = write_token(tmp_path, "sensitive-token")
+    with ServerThread(fault_app(responder)) as server:
+        link = remote_link(server.base_url, token_file, read_timeout=0.1)
+        with pytest.raises(NodeNotEnrolled) as exc:
+            link.control_status()
+        assert "sensitive" not in str(exc.value)
 
 
 def test_401_and_403_are_node_not_enrolled(tmp_path: Path) -> None:

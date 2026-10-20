@@ -1,5 +1,5 @@
 name: Prism Review
-run-name: ${{ github.event.pull_request.number || inputs.pull_request_number }}
+run-name: ${{ github.event.pull_request.number || inputs.pull_request_number }}@${{ github.event.pull_request.head.sha || github.sha }}
 
 on:
   pull_request_target:
@@ -265,9 +265,23 @@ jobs:
 
           # Other runs of this workflow for this pull request and head, including manual re-reviews
           # dispatched on the pull request branch: id, run number, status, conclusion, URL.
+          # Target-event execution SHAs name the base commit; only the immutable event title
+          # identifies their PR head. Manual runs must also execute on the exact PR head.
           list_runs() {
-            gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/runs?head_sha=$HEAD_SHA&per_page=100" --paginate \
-              --jq ".workflow_runs[] | select(.display_title == \"$PR_NUMBER\" and .id != $GITHUB_RUN_ID) | [.id, .run_number, .status, (.conclusion // \"none\"), .html_url] | @tsv"
+            local page payload count
+            for page in {1..10}; do
+              payload=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/runs?per_page=100&page=$page") || return 1
+              count=$(jq -er '.workflow_runs | if type == "array" then length else error("missing workflow_runs") end' <<<"$payload") || return 1
+              jq -r --arg pr "$PR_NUMBER" --arg head "$HEAD_SHA" --argjson current "$GITHUB_RUN_ID" '
+                .workflow_runs[] | select(.id != $current) |
+                select((.event == "pull_request_target" and .display_title == ($pr + "@" + $head)) or
+                  (.event == "workflow_dispatch" and .head_sha == $head and
+                    (.display_title == $pr or .display_title == ($pr + "@" + $head)))) |
+                [.id, .run_number, .status, (.conclusion // "none"), .html_url] | @tsv' <<<"$payload" || return 1
+              if [ "$count" -lt 100 ]; then return 0; fi
+            done
+            echo "::error::Prism Review history exceeded the 1000-run lookup bound; refusing an incomplete history." >&2
+            return 1
           }
 
           # Wait only for runs created before this one (lower run number): later runs queue behind

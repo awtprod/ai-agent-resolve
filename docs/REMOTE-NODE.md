@@ -7,23 +7,28 @@ append-only event log while the PC is off and appear as `waiting_for_node`.
 
 ## Enrol and start
 
-On the hub, enrol the node and save the one-time token to an access-controlled file on the
-Windows PC. Do not put the token in an environment variable or a command line.
+On the Linux hub (`openclaw-server`), enrol the node and save the one-time token to an
+access-controlled file on the Windows PC (`JVL3RP2`). Do not put the token in an environment
+variable or a command line. Bind the API to the hub's tailnet IPv4 address:
 
-```text
+```bash
 aar hub node enroll edit-pc --db /srv/aar/hub.db --actor human:andrew
-aar hub nodeapi --db /srv/aar/hub.db --host 127.0.0.1 --port 8789
+aar_tailnet_ip=$(tailscale ip -4) &&
+  test -n "$aar_tailnet_ip" &&
+  aar hub nodeapi --db /srv/aar/hub.db --host "$aar_tailnet_ip" --port 8789 --allow-remote
 ```
 
-The node API binds loopback unless `--allow-remote` is explicit. It is intended to sit behind
-the tailnet; the enrolled bearer token is a second factor, not a replacement for that boundary.
+The command refuses to start if Tailscale fails or returns no address; an empty host could
+bind all interfaces. The safe default is loopback (`127.0.0.1`); a non-loopback bind requires
+explicit `--allow-remote`. Permit only the intended Windows node to reach `openclaw-server:8789`
+in tailnet ACLs. The enrolled bearer token is also required, not a replacement for that boundary.
 
 On Windows, with Resolve Studio running and `DaVinciResolveScript` importable:
 
 ```text
 aar node run ^
   --node-id edit-pc ^
-  --hub-url http://hub.tailnet:8789 ^
+  --hub-url http://openclaw-server:8789 ^
   --token-file C:\ProgramData\aar\edit-pc.token ^
   --store C:\ProgramData\aar\jobs.db ^
   --project "{\"folder_path\":[\"Shows\"],\"name\":\"Show\",\"project_id\":\"resolve-project-uid\"}"
