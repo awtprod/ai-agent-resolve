@@ -34,6 +34,19 @@ argument to `aar analyze transcript` or `aar qa check`. An EditPlan source can u
 the returned `local_path` as its `media` value. Ingest does not rewrite existing
 plans automatically.
 
+Resolve still needs a path it can read on the Windows node. Before submitting an op
+that imports media, stage the verified Linux copy with `aar host push` to a new path
+under the configured Windows media root. The transfer compares size and SHA-256;
+keep the Linux artifact as the authoritative source and use the Windows destination
+in the node op's parameters. Configure `AAR_EDIT_SSH_ALIAS`, `AAR_EDIT_SSH_CONFIG`,
+`AAR_EDIT_REMOTE_ROOTS` and `AAR_EDIT_LOCAL_ROOTS` explicitly; there is no default edit PC
+or unrestricted transfer root. See `aar host push --help` and `aar.host.config`.
+
+The queue does not silently translate a Linux path into a Windows path or fetch missing
+media during an edit. Staging is an explicit prerequisite for media-dependent hot jobs;
+cold work continues against the Linux copy while the node is absent. This reuses the
+existing verified transfer commands rather than adding a second transfer protocol.
+
 For a render already copied by the existing verified host transfer, ingest the
 Linux destination with the same command:
 

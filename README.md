@@ -4,6 +4,43 @@
 
 Created in [T3 Code](https://t3.codes).
 
+## Linux hub, Windows Resolve node
+
+The Linux host owns the event log, source media, agent MCP server and review console.
+Planning, media analysis and QA can run while the Windows edit PC is shut down. Resolve
+jobs stay in the hub queue until their assigned node can claim them. The console's **Jobs**
+page and MCP `jobs_list` show their state.
+
+This supports preparing several projects at once. Hot operations still share one Resolve
+instance and respect human activity, project identity, branch ownership and approval gates.
+Running two simultaneous Resolve instances is a separate, unverified capability.
+
+Start with the [remote node guide](docs/REMOTE-NODE.md) and
+[Linux media store guide](docs/MEDIA-STORE.md). The [slice board](PLAN.md) distinguishes
+implemented work from live tests and features still awaiting approval.
+
+For a Linux checkout with Python 3.11+ and ffmpeg installed:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[hub,analyze,drp]'
+.venv/bin/aar hub init --db ./hub/events.sqlite --artifacts ./hub/artifacts
+```
+
+Run these as separate processes against the same local database and artifact directory:
+
+```bash
+.venv/bin/aar hub serve --db ./hub/events.sqlite --artifacts ./hub/artifacts --port 8787
+.venv/bin/aar hub console --db ./hub/events.sqlite --artifacts ./hub/artifacts --port 8788
+.venv/bin/aar hub nodeapi --db ./hub/events.sqlite --port 8789
+```
+
+They bind loopback by default. Expose them only through the trusted tailnet configuration
+in the design; the node API also requires an enrolled bearer token. Add `--agent-writes`
+to the MCP server to enable job submission and other agent writes. Human approval and
+review decisions remain separate. Model-backed transcription and face detection require
+their optional extras and local models; no model download is implicit.
+
 ## Continuous integration
 
 GitHub Actions runs lint, formatting, and the full non-live test suite on Linux with Python
