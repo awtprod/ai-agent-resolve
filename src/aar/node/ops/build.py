@@ -51,6 +51,7 @@ from aar.node.ops.write import (
     _clips,
     _int,
     _no_repeats,
+    _set_properties,
     _with_bounce,
     _with_completed,
 )
@@ -1172,3 +1173,168 @@ def item_set_color(env: OpEnv, params: ColorParams) -> ColorResult:
     except OpError as exc:
         raise _with_completed(exc, done) from exc
     return ColorResult(timeline=env.identity(timeline), items=done, notes=notes)
+
+
+# -- item.set_transform ------------------------------------------------------------------------
+
+FLOAT_TOLERANCE = 1e-3
+
+
+class TransformTarget(OpModel):
+    """A static Inspector transform, with the meaning of ``aar.plan.model.Transform``."""
+
+    item: ItemRef
+    zoom: float | None = Field(
+        default=None, strict=True, allow_inf_nan=False, gt=0, le=100, description="ZoomX/ZoomY."
+    )
+    pan: FiniteFloat | None = Field(
+        default=None, description="Pixels at the timeline resolution; |pan| <= 4 x width."
+    )
+    tilt: FiniteFloat | None = Field(
+        default=None, description="Pixels at the timeline resolution; |tilt| <= 4 x height."
+    )
+    rotation_deg: float | None = Field(
+        default=None, strict=True, allow_inf_nan=False, ge=-360, le=360
+    )
+    flip_h: bool | None = Field(default=None, strict=True, description="FlipX.")
+    flip_v: bool | None = Field(default=None, strict=True, description="FlipY.")
+
+    @model_validator(mode="after")
+    def _something_on_video(self) -> TransformTarget:
+        if self.item.track_type != "video":
+            raise ValueError("a transform goes on a video item")
+        if all(v is None for v in self.wanted().values()):
+            raise ValueError("give at least one of zoom, pan, tilt, rotation_deg, flip_h, flip_v")
+        return self
+
+    def wanted(self) -> dict[str, float | bool | None]:
+        """The Resolve properties this target sets (``None``: left alone)."""
+        return {
+            "ZoomX": self.zoom,
+            "ZoomY": self.zoom,
+            "Pan": self.pan,
+            "Tilt": self.tilt,
+            "RotationAngle": self.rotation_deg,
+            "FlipX": self.flip_h,
+            "FlipY": self.flip_v,
+        }
+
+
+class TransformParams(OpModel):
+    timeline: TimelineRef
+    targets: list[TransformTarget] = Field(min_length=1, max_length=MAX_TARGETS)
+
+    @model_validator(mode="after")
+    def _once(self) -> TransformParams:
+        _no_repeats([t.item.item_id for t in self.targets], "item")
+        return self
+
+
+class TransformApplied(OpModel):
+    item_id: str
+    status: Literal["applied", "present"]
+    values: dict[str, float | bool]
+    """Every property the target names, as read back."""
+    changed: list[str]
+    page_bounced: bool
+
+
+class TransformResult(OpModel):
+    timeline: TimelineIdentity
+    items: list[TransformApplied]
+    notes: list[Note]
+
+
+def _same_value(have: Any, want: float | bool) -> bool:
+    """Floats within :data:`FLOAT_TOLERANCE`, bools exactly ([I]: FlipX/FlipY read back as
+    bools; any other type fails closed)."""
+    if isinstance(want, bool):
+        return isinstance(have, bool) and have is want
+    if isinstance(have, bool) or not isinstance(have, int | float):
+        return False
+    return abs(float(have) - want) <= FLOAT_TOLERANCE
+
+
+def _resolution(timeline: Any) -> tuple[int, int]:
+    width = _int(timeline.GetSetting("timelineResolutionWidth"))
+    height = _int(timeline.GetSetting("timelineResolutionHeight"))
+    if not width or not height or width <= 0 or height <= 0:
+        raise OpError(
+            "timeline_resolution_unknown",
+            f"the timeline resolution reads {width}x{height}",
+            "check the timeline settings",
+        )
+    return width, height
+
+
+@op(
+    "item.set_transform",
+    params=TransformParams,
+    result=TransformResult,
+    mutates=True,
+    traps=("setproperty-after-color",),
+)
+def item_set_transform(env: OpEnv, params: TransformParams) -> TransformResult:
+    """Set zoom, pan, tilt, rotation and flips on video items, read back per property."""
+    timeline = env.timeline(params.timeline)
+    if any(t.pan is not None or t.tilt is not None for t in params.targets):
+        width, height = _resolution(timeline)
+        for t in params.targets:
+            for axis, value, size, what in (
+                ("pan", t.pan, width, "width"),
+                ("tilt", t.tilt, height, "height"),
+            ):
+                if value is not None and abs(value) > 4 * size:
+                    raise OpError(
+                        "transform_out_of_range",
+                        f"item {t.item.item_id}: {axis} {value} is beyond 4 x the timeline "
+                        f"{what} ({4 * size})",
+                        f"keep |{axis}| within 4 x {size} pixels",
+                        axis=axis,
+                        value=value,
+                        limit=4 * size,
+                    )
+    planned = []
+    for target in params.targets:
+        item = env.item(timeline, target.item)
+        wanted = {k: v for k, v in target.wanted().items() if v is not None}
+        before = {k: item.GetProperty(k) for k in wanted}
+        planned.append((target, item, wanted, before))
+    done: list[TransformApplied] = []
+    notes: list[Note] = []
+    for target, item, wanted, before in planned:
+        todo = {k: v for k, v in wanted.items() if not _same_value(before[k], v)}
+        bounced = False
+        after = before
+        if todo:
+            try:
+                bounced = _set_properties(env, item, todo)
+            except OpError as exc:
+                raise _with_completed(exc, done) from exc
+            if bounced:
+                notes.append(_bounce_note("SetProperties", f"item {target.item.item_id}"))
+            after = {k: item.GetProperty(k) for k in wanted}
+            bad = [k for k, v in wanted.items() if not _same_value(after[k], v)]
+            if bad:
+                raise _with_completed(
+                    OpError(
+                        "property_not_applied",
+                        f"item {target.item.item_id}: {bad[0]} reads back {after[bad[0]]!r}, "
+                        f"wanted {wanted[bad[0]]!r}",
+                        "set it by hand in the Inspector",
+                        "setproperty-after-color",
+                        property=bad[0],
+                        properties=bad,
+                    ),
+                    done,
+                )
+        done.append(
+            TransformApplied(
+                item_id=target.item.item_id,
+                status="applied" if todo else "present",
+                values=after,
+                changed=sorted(todo),
+                page_bounced=bounced,
+            )
+        )
+    return TransformResult(timeline=env.identity(timeline), items=done, notes=notes)

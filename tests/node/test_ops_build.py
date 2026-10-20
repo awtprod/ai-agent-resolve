@@ -1065,3 +1065,179 @@ def test_cdl_spec_has_the_bounds_of_the_plan_cdl(cdl: dict[str, Any]) -> None:
         return True
 
     assert accepts(CdlSpec) == accepts(Cdl)
+
+
+# -- item.set_transform ------------------------------------------------------------------------
+
+
+def _picture(show: Show) -> FakeTimelineItem:
+    return show.main.place("video", 1, show.cam_a, START, 100)
+
+
+TRANSFORM = {"zoom": 1.25, "pan": 100.0, "tilt": -50.5, "rotation_deg": 15.0, "flip_h": True}
+
+
+def test_a_transform_is_written_and_read_back_per_property() -> None:
+    show = Show()
+    item = _picture(show)
+    result = show.ok(
+        "item.set_transform",
+        {"timeline": show.ref("Main"), "targets": [{"item": ref(item), **TRANSFORM}]},
+    )
+    (applied,) = result.items
+    wanted = {"ZoomX": 1.25, "ZoomY": 1.25, "Pan": 100.0, "Tilt": -50.5, "RotationAngle": 15.0}
+    wanted["FlipX"] = True
+    assert applied.status == "applied" and applied.values == wanted
+    assert applied.changed == sorted(wanted)
+    assert calls(show, "SetProperties") == [("SetProperties", item.GetUniqueId(), wanted)]
+    assert {k: item.props[k] for k in wanted} == wanted and item.props["FlipY"] is False
+
+
+def test_a_transform_rerun_is_present_and_only_differences_are_written() -> None:
+    show = Show()
+    item = _picture(show)
+    params = {"timeline": show.ref("Main"), "targets": [{"item": ref(item), **TRANSFORM}]}
+    show.ok("item.set_transform", params)
+    show.fake.calls.clear()
+    again = show.ok("item.set_transform", params)
+    assert (again.items[0].status, again.items[0].changed) == ("present", [])
+    assert content_writes(show.fake) == []
+    item.props["Pan"] = 100.0004  # within the 1e-3 tolerance: still present
+    changed = show.ok(
+        "item.set_transform",
+        {
+            "timeline": show.ref("Main"),
+            "targets": [{"item": ref(item), **TRANSFORM, "flip_v": True, "pan": 100.0}],
+        },
+    )
+    assert changed.items[0].changed == ["FlipY"]
+    assert calls(show, "SetProperties") == [("SetProperties", item.GetUniqueId(), {"FlipY": True})]
+
+
+def test_flips_compare_as_booleans_exactly() -> None:
+    show = Show()
+    item = _picture(show)
+    item.props["FlipX"] = 1  # not a bool: never taken for True
+    result = show.ok(
+        "item.set_transform",
+        {"timeline": show.ref("Main"), "targets": [{"item": ref(item), "flip_h": True}]},
+    )
+    assert (result.items[0].status, result.items[0].changed) == ("applied", ["FlipX"])
+    assert item.props["FlipX"] is True
+
+
+def test_pan_and_tilt_are_bounded_by_the_timeline_resolution() -> None:
+    show = Show()
+    item = _picture(show)
+    tl = show.ref("Main")
+    for patch, axis in (({"pan": 7681.0}, "pan"), ({"tilt": -4321.0}, "tilt")):
+        error = show.fails(
+            "item.set_transform", {"timeline": tl, "targets": [{"item": ref(item), **patch}]}
+        )
+        assert (error.code, error.detail["axis"]) == ("transform_out_of_range", axis)
+    assert (
+        show.ok(
+            "item.set_transform",
+            {"timeline": tl, "targets": [{"item": ref(item), "pan": 7680.0, "tilt": -4320.0}]},
+        )
+        .items[0]
+        .status
+        == "applied"
+    )
+    # A vertical timeline: the pan bound follows its own width.
+    show.main.custom_settings = {**show.project.settings, "timelineResolutionWidth": "1080"}
+    error = show.fails(
+        "item.set_transform", {"timeline": tl, "targets": [{"item": ref(item), "pan": 4321.0}]}
+    )
+    assert (error.code, error.detail["limit"]) == ("transform_out_of_range", 4320)
+    show.main.custom_settings["timelineResolutionWidth"] = ""
+    error = show.fails(
+        "item.set_transform", {"timeline": tl, "targets": [{"item": ref(item), "pan": 1.0}]}
+    )
+    assert error.code == "timeline_resolution_unknown"
+
+
+def test_a_transform_that_does_not_stick_is_property_not_applied() -> None:
+    show = Show()
+    item = _picture(show)
+    show.fake.faults.add("SetProperties:no-op")
+    error = show.fails(
+        "item.set_transform",
+        {"timeline": show.ref("Main"), "targets": [{"item": ref(item), "zoom": 1.5}]},
+    )
+    assert error.code == "property_not_applied" and error.detail["property"] == "ZoomX"
+    assert error.detail["properties"] == ["ZoomX", "ZoomY"]
+
+
+def test_a_transform_bounces_the_page_when_the_setters_jam() -> None:
+    show = Show()
+    item = _picture(show)
+    show.fake.human_set_page("color")
+    show.fake.human_set_page("edit")
+    human_settles(show)
+    result = show.ok(
+        "item.set_transform",
+        {"timeline": show.ref("Main"), "targets": [{"item": ref(item), "rotation_deg": -90.0}]},
+    )
+    assert result.items[0].page_bounced and item.props["RotationAngle"] == -90.0
+    assert [(n.code, n.trap_id) for n in result.notes] == [
+        ("page_bounced", "setproperty-after-color")
+    ]
+
+
+def test_transform_errors_carry_the_items_done() -> None:
+    show = Show()
+    first = _picture(show)
+    second = show.main.place("video", 1, show.cam_a, START + 100, 50)
+    second.props.pop("FlipX")
+    error = show.fails(
+        "item.set_transform",
+        {
+            "timeline": show.ref("Main"),
+            "targets": [{"item": ref(first), "zoom": 2.0}, {"item": ref(second), "flip_h": True}],
+        },
+    )
+    assert error.code == "set_properties_failed"
+    assert [i["item_id"] for i in error.detail["completed"]] == [first.GetUniqueId()]
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {},
+        {"zoom": 0.0},
+        {"zoom": -1.0},
+        {"zoom": 100.5},
+        {"zoom": float("nan")},
+        {"pan": float("inf")},
+        {"tilt": "1"},
+        {"rotation_deg": 360.5},
+        {"rotation_deg": -361.0},
+        {"flip_h": 1},
+        {"flip_v": "true"},
+        {"opacity": 50.0},
+        {"zoom": 1.0, "item": {"track_type": "audio", "track": 1, "item_id": "x"}},
+    ],
+)
+def test_transform_targets_are_bounded(patch: dict[str, Any]) -> None:
+    show = Show()
+    target = {"item": {"track_type": "video", "track": 1, "item_id": "x"}, **patch}
+    with pytest.raises(ValidationError):
+        validate("item.set_transform", {"timeline": show.ref("Main"), "targets": [target]})
+
+
+def test_transform_lists_are_bounded_and_unique() -> None:
+    show = Show()
+    one = {"item": {"track_type": "video", "track": 1, "item_id": "x"}, "zoom": 1.0}
+    many = [{**one, "item": {**one["item"], "item_id": str(n)}} for n in range(51)]
+    for targets in ([], [one, one], many):
+        with pytest.raises(ValidationError):
+            validate("item.set_transform", {"timeline": show.ref("Main"), "targets": targets})
+    assert (
+        len(
+            validate(
+                "item.set_transform", {"timeline": show.ref("Main"), "targets": many[:50]}
+            ).targets
+        )
+        == 50
+    )

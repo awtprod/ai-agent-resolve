@@ -44,6 +44,7 @@ EXPECTED = {
     "track.ensure": (True, True),
     "transition.add": (True, True),
     "item.set_color": (True, True),
+    "item.set_transform": (True, True),
 }
 
 
