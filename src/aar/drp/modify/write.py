@@ -57,6 +57,7 @@ __all__ = [
     "DEFAULT_MAX_INPUT_BYTES",
     "LABEL",
     "SIDECAR_SUFFIX",
+    "SNAPSHOT_SUFFIX",
     "EditOutcome",
     "LeftBehind",
     "PlacementError",
@@ -76,6 +77,9 @@ DEFAULT_MAX_INPUT_BYTES = 1024 * 1024 * 1024
 # and report, each bounded by the edit count. 16 MiB is ample headroom for a real label and, read
 # on every --force, refuses a multi-hundred-MB read bomb (a 512 MiB cap cost ~13 GiB of RSS).
 _MAX_SIDECAR_BYTES = 16 * 1024 * 1024
+# A label snapshot that is kept (it does not bear our stamp) is renamed to end in this, so the
+# temporary-file pattern of leftovers() can never match it (see _keep_snapshot).
+SNAPSHOT_SUFFIX = ".label-snapshot.json"
 # A path recorded on Windows starts with a drive and a separator (``E:\``, ``E:/``) or a
 # backslash (``\\server\share``, ``\dir``). A path recorded on POSIX starts with ``/`` or is
 # relative (see _recorded_name).
@@ -95,7 +99,13 @@ class LeftBehind:
       label removed again): delete the file once nothing else is writing to it, then run again.
     * ``label-snapshot``: a hard link (else a copy) of the label ``--force`` found at
       ``<out>.aar.json``, kept because it does not bear aar's stamp. Check it against that label,
-      then delete it.
+      then delete it. It is named ``.<out>.aar.json.<8 chars>.label-snapshot.json`` (see
+      :data:`SNAPSHOT_SUFFIX`), which :func:`leftovers` never lists, so a later run never asks for
+      it to be removed as a stale temporary file.
+    * ``own-label``: aar's own label at ``<out>.aar.json``, describing an output this run did not
+      place: placing the output failed and removing (or restoring) the label afterwards failed
+      too. The next run for that ``--out`` reports it as ``orphan-sidecar`` (``out-exists`` if a
+      file is at the output name); delete it, or pass ``--force``.
     """
 
     path: str
@@ -274,7 +284,12 @@ def _temp_pattern(name: str, suffix: str) -> re.Pattern[str]:
 
 
 def leftovers(out: Path) -> list[Path]:
-    """Temporary files an interrupted run for ``out`` left in its directory (ours by name)."""
+    """Temporary files an interrupted run for ``out`` left in its directory (ours by name).
+
+    A label snapshot a run kept on purpose (``left_behind`` kind ``label-snapshot``) ends in
+    :data:`SNAPSHOT_SUFFIX` and is never listed. A snapshot an older aar kept still has a
+    temporary-file name, and so does one a stopped run never settled: both are listed.
+    """
     sidecar = out.name + SIDECAR_SUFFIX
     patterns = (_temp_pattern(out.name, out.suffix), _temp_pattern(sidecar, ".json"))
     try:
@@ -533,15 +548,77 @@ def _settle_backup(backup: Path, sidecar: Path, out: Path, left: list[LeftBehind
     if _is_our_sidecar(sidecar, out, read=backup):
         backup.unlink(missing_ok=True)
         return
+    kept = _keep_snapshot(backup, sidecar)
     left.append(
         LeftBehind(
-            str(backup),
+            str(kept),
             "label-snapshot",
             f"a hard link (or copy) of the label that was at {sidecar.name} when --force checked "
             "it; that label does not bear aar's stamp, so this snapshot of it is kept: compare it "
             "with the label, then delete it",
         )
     )
+
+
+def _keep_snapshot(backup: Path, sidecar: Path) -> Path:
+    """Move a kept snapshot off its temporary-file name, so leftovers() never lists it.
+
+    The new name, ``.<label>.<8 chars>.label-snapshot.json``, is claimed with ``mkstemp``
+    (exclusive, never an existing file) and the snapshot ``os.replace``s that empty claim. If the
+    move fails the snapshot stays under its temporary name, where it is still kept and reported,
+    and a later run lists it among the leftovers.
+    """
+    fd, name = tempfile.mkstemp(
+        prefix=f".{sidecar.name}.", suffix=SNAPSHOT_SUFFIX, dir=backup.parent
+    )
+    os.close(fd)
+    try:
+        os.replace(backup, name)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(name)  # our own empty claim on a fresh random name
+        return backup
+    return Path(name)
+
+
+def _roll_back_label(
+    exc: BaseException, backup: Path | None, sidecar: Path, left: list[LeftBehind]
+) -> BaseException:
+    """Undo the label after placing the output failed; return the exception to raise.
+
+    The label goes back to its snapshot (``--force``) or is removed. If that cleanup fails too,
+    the placement error ``exc`` still wins: the cleanup failure is added to it as a note, and the
+    label left over (aar's own) is reported as ``own-label`` in ``left`` and on the raised error
+    (a :class:`PlacementError` with the same errno). A ``FileExistsError`` is returned as it is,
+    because ``edit_file`` turns it into the ``out-exists`` refusal, whose outcome carries ``left``.
+    """
+    try:
+        if backup is not None:
+            os.replace(backup, sidecar)
+        else:
+            sidecar.unlink(missing_ok=True)
+    except OSError as cleanup:
+        own = LeftBehind(
+            str(sidecar),
+            "own-label",
+            "aar's own label for an output this run did not place: placing the output failed, "
+            f"and removing or restoring this label afterwards failed too ({cleanup}). The "
+            "next run for this --out reports it as orphan-sidecar (out-exists if a file is at "
+            "the output name): delete it, or pass --force",
+        )
+        left.append(own)
+        note = (
+            f"aar could not roll back its label {sidecar} after this error: {cleanup!r}; the label "
+            "is left over (left_behind kind own-label)"
+        )
+        if isinstance(exc, PlacementError):
+            exc.left_behind.append(own)
+        elif isinstance(exc, OSError) and not isinstance(exc, FileExistsError):
+            wrapped = PlacementError(exc, [own])  # edit_file raises it "from exc"
+            wrapped.add_note(note)
+            return wrapped
+        exc.add_note(note)
+    return exc
 
 
 def edit_file(
@@ -663,12 +740,11 @@ def edit_file(
             _place(side_tmp, sidecar, force)
             try:
                 _place(tmp, out_path, force)
-            except BaseException:
-                if backup is not None:
-                    os.replace(backup, sidecar)
-                else:
-                    sidecar.unlink(missing_ok=True)
-                raise
+            except BaseException as exc:
+                surfaced = _roll_back_label(exc, backup, sidecar, outcome.left_behind)
+                if surfaced is exc:
+                    raise
+                raise surfaced from exc
         except FileExistsError as exc:
             outcome.status = "refused"
             outcome.output = None
