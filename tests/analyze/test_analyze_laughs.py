@@ -534,3 +534,54 @@ def test_the_settings_are_validated():
     for bad in ({"confirm_bump_db": -1.0}, {"confirm_frac": 1.5}, {"max_audio_s": 0.0}):
         with pytest.raises(ValueError):
             LaughSettings(**bad)
+
+
+def test_the_transport_scrubs_its_own_errors(stub):
+    # Each layer scrubs on its own: here the transport alone, with no pipeline around it.
+    stub.routes[("DELETE", f"/v1beta/{FILE}")] = echo_headers(400)
+    with pytest.raises(AnalyzeError) as error:
+        transport(stub).delete(REF)
+    assert error.value.type == "gemini-http" and "[redacted]" in str(error.value)
+    texts = exception_texts(error.value)
+    assert all(KEY not in text for text in texts)
+
+
+class LeakyTransport:
+    """A transport that does not scrub: the pipeline must, on every path."""
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        self.deleted: list[str] = []
+
+    def upload(self, path: Path, mime: str, display_name: str) -> FileRef:
+        return REF
+
+    def wait_active(self, ref: FileRef, timeout_s: float) -> FileRef:
+        return ref
+
+    def generate(self, model: str, ref: FileRef, prompt: str, schema: Any) -> dict[str, Any]:
+        raise AnalyzeError("gemini-http", f"denied: {self.key}", hint=f"key was {self.key}")
+
+    def delete(self, ref: FileRef) -> None:
+        self.deleted.append(ref.name)
+        raise RuntimeError(f"cannot delete with {self.key}")
+
+
+@needs_ffmpeg
+def test_the_pipeline_scrubs_what_a_transport_lets_through(tmp_path, clip):
+    leaky: list[LeakyTransport] = []
+
+    def factory(key: str) -> LeakyTransport:
+        leaky.append(LeakyTransport(key))
+        return leaky[-1]
+
+    with pytest.raises(AnalyzeError) as error:
+        analyse_laughs(
+            clip, tmp_path / "l.json", work_dir=tmp_path / "work", allow_paid=True,
+            environ={"AAR_GEMINI_API_KEY": KEY}, transport_factory=factory,
+        )  # fmt: skip
+    assert leaky[0].deleted == [FILE]  # the upload is deleted even though generate failed
+    assert error.value.type == "gemini-http" and "[redacted]" in str(error.value)
+    assert "could not be deleted" in error.value.hint
+    texts = [*exception_texts(error.value), error.value.hint, json.dumps(error.value.to_dict())]
+    assert_no_key_anywhere(tmp_path, *texts)
