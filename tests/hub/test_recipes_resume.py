@@ -155,6 +155,8 @@ def test_review_rounds_exhausted_blocks(hub: Hub, registered_recipe: Any) -> Non
     gate_op = next(op for op in state.attempts_for("g") if op.round == 1)
     assert gate_op.status == "failed"
     assert gate_op.result_error["code"] == "review_rounds_exhausted"
+    # The round counter clamps at the cap (it never overshoots to max+1).
+    assert state.current_round() == state.max_review_rounds == 1
 
 
 # -- kill mid-step, lease lapses ----------------------------------------------

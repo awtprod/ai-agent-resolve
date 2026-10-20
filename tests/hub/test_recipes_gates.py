@@ -87,6 +87,27 @@ def test_qa_gate_unchecked_cross_check() -> None:
     assert qa_gate(report, required=("decode",)).passed is True
 
 
+def test_qa_gate_fails_incomplete_on_the_flag_alone() -> None:
+    # A hand-built report where an incomplete check is NOT in unchecked: the gate must still
+    # fail it on the incomplete flag itself, not only via the report's unchecked list.
+    check = QACheck(id="decode", status="pass", message="m", incomplete=True)
+    report = QAReport(
+        file="f.mp4",
+        kind="short",
+        profile="ccn",
+        status="pass",
+        ok=True,
+        counts={},
+        unchecked=[],
+        media=None,
+        checks=[check],
+    )
+    assert "decode" not in report.unchecked
+    result = qa_gate(report, required=("decode",))
+    assert result.passed is False
+    assert "incomplete" in result.reasons[0].detail
+
+
 # -- plan_gate ----------------------------------------------------------------
 
 
