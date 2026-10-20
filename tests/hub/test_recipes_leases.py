@@ -32,12 +32,24 @@ def lease_recipes() -> Iterator[None]:
     for name, idem in (("leasetest", True), ("leasetest_ni", False)):
         registry.register(
             RecipeDef(
-                name=name, version=1, params_model=_P,
+                name=name,
+                version=1,
+                params_model=_P,
                 steps=(
-                    StepDef(id="c", kind="cold", callable_id="lease.noop", idempotent=idem,
-                            max_attempts=1),
-                    StepDef(id="report", kind="cold", callable_id="recipe.report",
-                            idempotent=True, needs=("c",)),
+                    StepDef(
+                        id="c",
+                        kind="cold",
+                        callable_id="lease.noop",
+                        idempotent=idem,
+                        max_attempts=1,
+                    ),
+                    StepDef(
+                        id="report",
+                        kind="cold",
+                        callable_id="recipe.report",
+                        idempotent=True,
+                        needs=("c",),
+                    ),
                 ),
             )
         )
@@ -57,8 +69,12 @@ def _started(hub: Hub, recipe_name: str, clock: FixedClock) -> str:
         hub.log, brief_data(hub.project_id, recipe=recipe_name), AGENT, idempotency_key="b"
     ).body["node"]["id"]
     recipe_node = create_recipe(
-        hub.log, hub.project_id, {"recipe": recipe_name, "brief_id": brief_id, "params": {}},
-        AGENT, idempotency_key="r", params_validator=registry.registry_params_validator,
+        hub.log,
+        hub.project_id,
+        {"recipe": recipe_name, "brief_id": brief_id, "params": {}},
+        AGENT,
+        idempotency_key="r",
+        params_validator=registry.registry_params_validator,
     ).body["node"]["id"]
     set_own_status(hub.log, hub.project_id, recipe_node, "active", AGENT, idempotency_key="act")
     advance(hub.log, recipe_node, actor=AGENT, clock=clock)  # creates the pending cold op "c"
@@ -73,45 +89,112 @@ def test_pending_is_claimed_then_a_live_lease_is_not_stolen(hub: Hub, lease_reci
     clock = FixedClock()
     recipe_node = _started(hub, "leasetest", clock)
     op = _cold_op(hub, recipe_node)
-    assert claim(hub.log, project_id=hub.project_id, op=op, worker=W1, idempotent=True,
-                 clock=clock, lease_s=DEFAULT_LEASE_S) is True
+    assert (
+        claim(
+            hub.log,
+            project_id=hub.project_id,
+            op=op,
+            worker=W1,
+            idempotent=True,
+            clock=clock,
+            lease_s=DEFAULT_LEASE_S,
+        )
+        is True
+    )
     # Still well within the 60s lease: a second worker must NOT steal it, idempotent or not.
     clock.tick(10)
     op = _cold_op(hub, recipe_node)
-    assert claim(hub.log, project_id=hub.project_id, op=op, worker=W2, idempotent=True,
-                 clock=clock, lease_s=DEFAULT_LEASE_S) is False
+    assert (
+        claim(
+            hub.log,
+            project_id=hub.project_id,
+            op=op,
+            worker=W2,
+            idempotent=True,
+            clock=clock,
+            lease_s=DEFAULT_LEASE_S,
+        )
+        is False
+    )
 
 
 def test_lapsed_idempotent_is_reclaimed(hub: Hub, lease_recipes: None) -> None:
     clock = FixedClock()
     recipe_node = _started(hub, "leasetest", clock)
     op = _cold_op(hub, recipe_node)
-    assert claim(hub.log, project_id=hub.project_id, op=op, worker=W1, idempotent=True,
-                 clock=clock, lease_s=1) is True
+    assert (
+        claim(
+            hub.log,
+            project_id=hub.project_id,
+            op=op,
+            worker=W1,
+            idempotent=True,
+            clock=clock,
+            lease_s=1,
+        )
+        is True
+    )
     clock.tick(5)  # lease lapsed
     op = _cold_op(hub, recipe_node)
-    assert claim(hub.log, project_id=hub.project_id, op=op, worker=W2, idempotent=True,
-                 clock=clock, lease_s=1) is True  # stolen because lapsed + idempotent
+    assert (
+        claim(
+            hub.log,
+            project_id=hub.project_id,
+            op=op,
+            worker=W2,
+            idempotent=True,
+            clock=clock,
+            lease_s=1,
+        )
+        is True
+    )  # stolen because lapsed + idempotent
 
 
 def test_lapsed_nonidempotent_is_not_reclaimed(hub: Hub, lease_recipes: None) -> None:
     clock = FixedClock()
     recipe_node = _started(hub, "leasetest_ni", clock)
     op = _cold_op(hub, recipe_node)
-    assert claim(hub.log, project_id=hub.project_id, op=op, worker=W1, idempotent=False,
-                 clock=clock, lease_s=1) is True
+    assert (
+        claim(
+            hub.log,
+            project_id=hub.project_id,
+            op=op,
+            worker=W1,
+            idempotent=False,
+            clock=clock,
+            lease_s=1,
+        )
+        is True
+    )
     clock.tick(5)
     op = _cold_op(hub, recipe_node)
-    assert claim(hub.log, project_id=hub.project_id, op=op, worker=W2, idempotent=False,
-                 clock=clock, lease_s=1) is False
+    assert (
+        claim(
+            hub.log,
+            project_id=hub.project_id,
+            op=op,
+            worker=W2,
+            idempotent=False,
+            clock=clock,
+            lease_s=1,
+        )
+        is False
+    )
 
 
 def test_reap_fails_nonidempotent_lapsed_lease_lost(hub: Hub, lease_recipes: None) -> None:
     clock = FixedClock()
     recipe_node = _started(hub, "leasetest_ni", clock)
     op = _cold_op(hub, recipe_node)
-    claim(hub.log, project_id=hub.project_id, op=op, worker=W1, idempotent=False, clock=clock,
-          lease_s=1)
+    claim(
+        hub.log,
+        project_id=hub.project_id,
+        op=op,
+        worker=W1,
+        idempotent=False,
+        clock=clock,
+        lease_s=1,
+    )
     clock.tick(5)
     advance(hub.log, recipe_node, actor=AGENT, clock=clock)  # reaps the lapsed non-idempotent claim
     op = _cold_op(hub, recipe_node)
@@ -124,8 +207,15 @@ def test_reap_leaves_idempotent_lapsed_claimable(hub: Hub, lease_recipes: None) 
     clock = FixedClock()
     recipe_node = _started(hub, "leasetest", clock)
     op = _cold_op(hub, recipe_node)
-    claim(hub.log, project_id=hub.project_id, op=op, worker=W1, idempotent=True, clock=clock,
-          lease_s=1)
+    claim(
+        hub.log,
+        project_id=hub.project_id,
+        op=op,
+        worker=W1,
+        idempotent=True,
+        clock=clock,
+        lease_s=1,
+    )
     clock.tick(5)
     advance(hub.log, recipe_node, actor=AGENT, clock=clock)
     op = _cold_op(hub, recipe_node)
