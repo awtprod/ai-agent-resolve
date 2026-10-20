@@ -71,8 +71,11 @@ def powershell_argv(script: str, *, cmdline_max: int = DEFAULT_REMOTE_CMDLINE_MA
 
     Refuses (with :class:`ScriptTooLong`) when the whole command line would not fit ``cmdline_max``
     (the usable budget for the remote DefaultShell), so the failure happens here, not as a
-    truncated command on the host.
+    truncated command on the host. A NUL in the script is refused with :class:`ValueError`: it
+    cannot be carried (a BOM-less UTF-16 ``.ps1`` decoded as UTF-8 is full of NULs).
     """
+    if "\x00" in script:
+        raise ValueError("the PowerShell script contains a NUL character")
     encoded = encode_command(script)
     command_line = " ".join((*_PS_PREFIX, encoded))
     if len(command_line) > cmdline_max:

@@ -77,6 +77,11 @@ def _unc_server_share(win: _Win) -> tuple[str, str]:
     return server, share
 
 
+def _has_lone_surrogate(text: str) -> bool:
+    """Whether ``text`` contains any UTF-16 surrogate code point (U+D800..U+DFFF)."""
+    return any(0xD800 <= ord(ch) <= 0xDFFF for ch in text)
+
+
 def _check_components(win: _Win) -> str | None:
     """Validate every component of a parsed path (UNC server/share included)."""
     if win.unc:
@@ -103,6 +108,8 @@ def normalize_root(prefix: str) -> _Win:
         raise PathRefused(str(prefix), "bad-root")
     if any(ord(ch) < 0x20 for ch in prefix):
         raise PathRefused(prefix, "bad-root")
+    if _has_lone_surrogate(prefix):
+        raise PathRefused(prefix, "invalid-unicode")
     if prefix.startswith(_DEVICE_PREFIXES):
         raise PathRefused(prefix, "bad-root")
     win = _parse_win(prefix)
@@ -129,6 +136,10 @@ def validate_windows_path(path: str, roots: tuple[_Win, ...]) -> _Win:
         raise PathRefused(str(path), "empty")
     if any(ord(ch) < 0x20 for ch in path):
         raise PathRefused(path, "control-character")
+    if _has_lone_surrogate(path):
+        # A Linux argv with invalid UTF-8 arrives as surrogateescape code points (U+DC80..U+DCFF);
+        # these cannot be UTF-16LE-encoded for -EncodedCommand. Refuse before anything is built.
+        raise PathRefused(path, "invalid-unicode")
     if path.startswith(_DEVICE_PREFIXES):
         raise PathRefused(path, "device-namespace-path")
     win = _parse_win(path)

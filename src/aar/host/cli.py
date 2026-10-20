@@ -169,7 +169,11 @@ def _cmd_ps(args: argparse.Namespace) -> int:
                 EXIT_INPUT,
                 args.json,
             )
-        stdout = _host().run_powershell(script, timeout=args.timeout)
+        try:
+            stdout = _host().run_powershell(script, timeout=args.timeout)
+        except ValueError as exc:
+            # a NUL in the script (e.g. a BOM-less UTF-16 file decoded as UTF-8): typed, exit 2.
+            return _error(ValueError(f"{args.script}: {exc}"), EXIT_INPUT, args.json)
         if args.json:
             body = {"ok": True, "op": "ps", "stdout": stdout}
             return cli_io.emit(_PROG, json.dumps(body, indent=2) + "\n") or EXIT_OK
@@ -179,5 +183,7 @@ def _cmd_ps(args: argparse.Namespace) -> int:
 
 
 def _read_text(path: str) -> str:
-    with open(path, encoding="utf-8") as handle:
+    # utf-8-sig: strip a UTF-8 BOM so it is not sent as a leading U+FEFF. A non-UTF-8 file raises
+    # UnicodeDecodeError (handled in _cmd_ps as a typed exit-2 refusal).
+    with open(path, encoding="utf-8-sig") as handle:
         return handle.read()

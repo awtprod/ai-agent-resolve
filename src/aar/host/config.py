@@ -40,7 +40,8 @@ _PATH_FORMS = ("drive", "slash")
 # A strict ssh host/alias: an alphanumeric start, then alphanumerics, dot, underscore, @, hyphen.
 # This refuses the characters that change scp's host:path splitting -- '/', '[', ':', spaces -- and
 # a leading '-' (which would look like an option).
-_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]*$")
+# Matched with fullmatch, so a trailing newline is refused ($ would match before it).
+_ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]*")
 
 
 def _check_token(value: str, name: str) -> str:
@@ -84,9 +85,9 @@ class EditHostConfig:
     _remote_roots_parsed: tuple[_Win, ...] = field(default=(), repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.alias, str) or not _ALIAS_RE.match(self.alias):
+        if not isinstance(self.alias, str) or not _ALIAS_RE.fullmatch(self.alias):
             raise ConfigError(
-                f"{_ENV_ALIAS} must match {_ALIAS_RE.pattern} (a plain ssh host/alias): "
+                f"{_ENV_ALIAS} must fullmatch {_ALIAS_RE.pattern} (a plain ssh host/alias): "
                 f"{self.alias!r}"
             )
         _check_token(self.ssh_config, _ENV_CONFIG)
