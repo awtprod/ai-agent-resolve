@@ -215,6 +215,56 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     )
     nodeapi.set_defaults(func=_nodeapi)
 
+    job = hub_sub.add_parser("job", help="Submit and inspect durable Resolve node jobs.")
+    job_sub = job.add_subparsers(dest="job_command", required=True)
+
+    job_submit = job_sub.add_parser("submit", help="Submit a validated job to one named node.")
+    _add_db(job_submit)
+    _add_actor(job_submit)
+    job_submit.add_argument("--kind", required=True, help="Registered JobRunner kind.")
+    job_submit.add_argument("--params", required=True, help="Job params as a JSON object.")
+    job_submit.add_argument("--project", required=True, help="ProjectLocator as a JSON object.")
+    job_submit.add_argument(
+        "--node", required=True, help="The only node initially allowed to claim."
+    )
+    job_submit.add_argument("--agent-id", required=True, help="Agent identity used by every op.")
+    job_submit.add_argument("--priority", type=int, default=0)
+    job_submit.add_argument("--approval-token")
+    job_submit.add_argument("--idempotency-key", required=True)
+    job_submit.set_defaults(func=_job_submit)
+
+    job_list = job_sub.add_parser("list", help="List durable jobs and derived lease state.")
+    _add_db(job_list)
+    job_list.add_argument("--state")
+    job_list.add_argument("--project-id")
+    job_list.set_defaults(func=_job_list)
+
+    job_show = job_sub.add_parser("show", help="Show one durable job.")
+    _add_db(job_show)
+    job_show.add_argument("job_id")
+    job_show.set_defaults(func=_job_show)
+
+    job_cancel = job_sub.add_parser("cancel", help="Request cancellation at the node's safe point.")
+    _add_db(job_cancel)
+    _add_actor(job_cancel)
+    job_cancel.add_argument("job_id")
+    job_cancel.add_argument("--reason", required=True)
+    job_cancel.add_argument("--idempotency-key", required=True)
+    job_cancel.set_defaults(func=_job_cancel)
+
+    job_release = job_sub.add_parser(
+        "release", help="Human-only release after checking Resolve; increments the fence."
+    )
+    _add_db(job_release)
+    _add_actor(job_release)
+    job_release.add_argument("job_id")
+    job_release.add_argument(
+        "--node", required=True, help="Node allowed to claim the new generation."
+    )
+    job_release.add_argument("--reason", required=True)
+    job_release.add_argument("--idempotency-key", required=True)
+    job_release.set_defaults(func=_job_release)
+
     from aar.hub import write_cli
 
     write_cli.register(hub_sub)
@@ -348,6 +398,106 @@ def _nodeapi(args: argparse.Namespace) -> int:
         log_level="info",
     )
     return 0
+
+
+def _job_command(action: Any, *, read_only: bool = False) -> Any:
+    """CLI adapter: open exactly one existing log and render stable JSON errors."""
+
+    def run(args: argparse.Namespace) -> int:
+        from aar.hub import jobs
+        from aar.hub.common import HumanRequired, InvalidInput
+        from aar.hub.events import IdempotencyConflict
+
+        try:
+            log = _open_existing(args.db, read_only=read_only)
+            try:
+                value = action(jobs, log, args)
+            finally:
+                log.close()
+            return _print(value)
+        except _DatabaseUnavailable as exc:
+            return _fail("database_unavailable", str(exc))
+        except HumanRequired as exc:
+            return _fail("human_required", str(exc))
+        except InvalidInput as exc:
+            return _fail("invalid_input", str(exc))
+        except IdempotencyConflict as exc:
+            return _fail("idempotency_conflict", str(exc))
+        except jobs.JobError as exc:
+            return _fail(exc.code, str(exc), 1 if isinstance(exc, jobs.JobNotFound) else 2)
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            return _fail("invalid_input", str(exc))
+
+    return run
+
+
+def _job_submit_action(jobs: Any, log: Any, args: argparse.Namespace) -> dict[str, Any]:
+    from aar.node.locator import ProjectLocator
+
+    params = json.loads(args.params)
+    project = ProjectLocator.from_dict(json.loads(args.project))
+    job, replayed = jobs.submit(
+        log,
+        _parse_actor(args.actor),
+        kind=args.kind,
+        params=params,
+        project=project,
+        agent_id=args.agent_id,
+        assigned_node=args.node,
+        priority=args.priority,
+        approval_token=args.approval_token,
+        idempotency_key=args.idempotency_key,
+    )
+    return {"job": job.to_dict(jobs.utcnow()), "replayed": replayed}
+
+
+def _job_list_action(jobs: Any, log: Any, args: argparse.Namespace) -> dict[str, Any]:
+    now = jobs.utcnow()
+    found = [
+        job
+        for job in jobs.list_jobs(log)
+        if args.project_id is None or job.target.project_id == args.project_id
+    ]
+    if args.state is not None:
+        found = [job for job in found if job.state(now) == args.state]
+    return {"jobs": [job.to_dict(now, include_payload=False) for job in found]}
+
+
+def _job_show_action(jobs: Any, log: Any, args: argparse.Namespace) -> dict[str, Any]:
+    job = jobs.get_job(log, args.job_id)
+    if job is None:
+        raise jobs.JobNotFound(f"no job {args.job_id!r}")
+    return {"job": job.to_dict(jobs.utcnow())}
+
+
+def _job_cancel_action(jobs: Any, log: Any, args: argparse.Namespace) -> dict[str, Any]:
+    job, replayed = jobs.cancel(
+        log,
+        _parse_actor(args.actor),
+        args.job_id,
+        args.reason,
+        idempotency_key=args.idempotency_key,
+    )
+    return {"job": job.to_dict(jobs.utcnow()), "replayed": replayed}
+
+
+def _job_release_action(jobs: Any, log: Any, args: argparse.Namespace) -> dict[str, Any]:
+    job, replayed = jobs.release(
+        log,
+        _parse_actor(args.actor),
+        args.job_id,
+        args.node,
+        args.reason,
+        idempotency_key=args.idempotency_key,
+    )
+    return {"job": job.to_dict(jobs.utcnow()), "replayed": replayed}
+
+
+_job_submit = _job_command(_job_submit_action)
+_job_list = _job_command(_job_list_action, read_only=True)
+_job_show = _job_command(_job_show_action, read_only=True)
+_job_cancel = _job_command(_job_cancel_action)
+_job_release = _job_command(_job_release_action)
 
 
 def _serve(args: argparse.Namespace) -> int:

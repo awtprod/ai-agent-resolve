@@ -66,7 +66,7 @@ from starlette.responses import (
 from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from aar.hub import approvals, control, reviews
+from aar.hub import approvals, control, jobs, reviews
 from aar.hub.artifacts import ArtifactStore, CorruptArtifact
 from aar.hub.common import (
     MAX_SKIPPED_LISTED,
@@ -74,6 +74,7 @@ from aar.hub.common import (
     HumanRequired,
     InvalidInput,
     SkippedEvent,
+    clean_text,
     parse_ts,
     utcnow,
 )
@@ -94,6 +95,10 @@ _IDEM_RE = re.compile(r"^[0-9a-f]{32}$")
 _UINT_RE = re.compile(r"^[0-9]{1,12}$")
 _RANGE_RE = re.compile(r"^bytes=(\d{0,18})-(\d{0,18})$")
 _PORT_RE = re.compile(r"^:\d{1,5}$")
+
+_JOBS_PAGE_SIZE = 25
+_JOB_FILTERS = ("state", "node", "project", "kind")
+_JOB_QUERY_KEYS = frozenset({"page", *_JOB_FILTERS})
 
 # Media types the console will hand to the browser as themselves. Anything else is
 # served as a download, so an agent cannot get HTML or SVG rendered as this origin.
@@ -397,6 +402,17 @@ def _map_error(exc: BaseException) -> ConsoleError | None:
         return ConsoleError(409, f"token_{exc.code}", str(exc), "Reload to see its state.")
     if isinstance(exc, control.NotStopped):
         return ConsoleError(409, "not_stopped", str(exc), "Reload: someone may have resumed it.")
+    if isinstance(exc, jobs.JobNotFound):
+        return ConsoleError(404, exc.code, str(exc))
+    if isinstance(exc, jobs.JobCorrupt):
+        return ConsoleError(
+            409,
+            exc.code,
+            f"The remote job queue is corrupt: {exc}",
+            "Inspect the append-only job events before relying on this view.",
+        )
+    if isinstance(exc, jobs.JobError):
+        return ConsoleError(409, exc.code, str(exc), "Reload to see the current job state.")
     if isinstance(exc, IdempotencyConflict):
         return ConsoleError(
             409, "form_reused", str(exc), "Reload the page and submit the fresh form."
@@ -460,6 +476,10 @@ textarea{min-height:4.5rem}
 .row{display:flex;flex-wrap:wrap;gap:.6rem}
 .row>*{flex:1 1 12rem}
 .actions{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.6rem}
+.pager{display:flex;align-items:center;justify-content:space-between;gap:.75rem;
+margin:.8rem 0;flex-wrap:wrap}
+.pager a{display:inline-block;padding:.45rem .7rem;border:1px solid var(--line);
+border-radius:6px;background:var(--card)}
 button{font:inherit;font-weight:600;padding:.6rem 1.1rem;border-radius:8px;
 border:1px solid transparent;cursor:pointer}
 button.approve{background:var(--ok);color:#fff}
@@ -561,6 +581,56 @@ def _badge(text: str, kind: str | None = None) -> Html:
 def _wants_json(request: Request) -> bool:
     accept = request.headers.get("accept", "")
     return "application/json" in accept and "text/html" not in accept
+
+
+def _jobs_query(request: Request) -> tuple[int, dict[str, str]]:
+    """Validate the small, read-only query surface of the jobs page."""
+    values: dict[str, str] = {}
+    for name, value in request.query_params.multi_items():
+        if name not in _JOB_QUERY_KEYS:
+            raise InvalidInput("query", f"unknown jobs filter {name!r}")
+        if name in values:
+            raise InvalidInput("query", f"{name!r} may appear only once")
+        values[name] = value
+
+    raw_page = values.pop("page", "1")
+    if not _UINT_RE.fullmatch(raw_page) or not 1 <= int(raw_page) <= 1_000_000:
+        raise InvalidInput("page", "must be a whole number from 1 to 1000000")
+
+    filters: dict[str, str] = {}
+    for name in _JOB_FILTERS:
+        raw = values.get(name, "")
+        if not raw:
+            continue
+        value = clean_text(raw, name, max_len=128)
+        if value != raw:
+            raise InvalidInput(name, "must not have surrounding whitespace")
+        filters[name] = value
+    return int(raw_page), filters
+
+
+def _jobs_pager(page: int, start: int, shown: int, total: int, filters: dict[str, str]) -> Html:
+    """Render bounded page links while carrying every active filter forward."""
+
+    def link(target: int, label: str) -> Html:
+        query = dict(filters)
+        if target != 1:
+            query["page"] = str(target)
+        return fmt('<a href="{href}">{label}</a>', href=url("jobs", **query), label=label)
+
+    first = link(1, "First page") if page > 1 and shown == 0 else Html("")
+    previous = link(page - 1, "Previous page") if page > 1 else Html("")
+    following = link(page + 1, "Next page") if start + shown < total else Html("")
+    if not previous and not following:
+        return Html("")
+    return fmt(
+        '<div class="pager" aria-label="Job pages">{first}{previous}'
+        '<span class="meta">Page {page}</span>{following}</div>',
+        first=first,
+        previous=previous,
+        page=page,
+        following=following,
+    )
 
 
 @dataclass
@@ -722,6 +792,7 @@ class Console:
             )
             for key, href, label in (
                 ("reviews", "/", "Reviews"),
+                ("jobs", "/jobs", "Jobs"),
                 ("leases", "/leases", "Leases"),
                 ("approvals", "/approvals", "Approvals"),
                 ("control", "/control", "STOP"),
@@ -1055,6 +1126,123 @@ class Console:
             pid=review.project_id,
         )
         return join([subject, self.review_card(ctx, review, self.project_names(ctx), detail=True)])
+
+    # -- remote jobs ---------------------------------------------------------
+
+    def jobs_body(self, ctx: _Page) -> Html:
+        page, filters = _jobs_query(ctx.request)
+        now = self.clock()
+        summaries = [job.to_dict(now, include_payload=False) for job in jobs.list_jobs(self.log)]
+        summaries = [
+            job
+            for job in summaries
+            if (not filters.get("state") or job["state"] == filters["state"])
+            and (not filters.get("node") or job["assigned_node"] == filters["node"])
+            and (not filters.get("project") or job["project"]["project_id"] == filters["project"])
+            and (not filters.get("kind") or job["kind"] == filters["kind"])
+        ]
+        total = len(summaries)
+        start = (page - 1) * _JOBS_PAGE_SIZE
+        shown = summaries[start : start + _JOBS_PAGE_SIZE]
+
+        fields = join(
+            fmt(
+                '<div><label for="jobs-{name}">{label}</label>'
+                '<input id="jobs-{name}" name="{name}" value="{value}" maxlength="128"></div>',
+                name=name,
+                label=label,
+                value=filters.get(name, ""),
+            )
+            for name, label in (
+                ("state", "State"),
+                ("node", "Assigned node"),
+                ("project", "Project ID"),
+                ("kind", "Kind"),
+            )
+        )
+        filter_form = fmt(
+            '<form method="get" action="/jobs" class="card"><h2>Filter jobs</h2>'
+            '<div class="row">{fields}</div><div class="actions">'
+            '<button class="plain" type="submit">Apply filters</button>'
+            '<a href="/jobs">Clear filters</a></div></form>',
+            fields=fields,
+        )
+
+        if shown:
+            rows = join(self.job_row(job) for job in shown)
+            table = fmt(
+                '<table class="board"><thead><tr><th>Job ID</th><th>Project</th>'
+                "<th>Node</th><th>Kind</th><th>State</th><th>Updated</th></tr></thead>"
+                "<tbody>{rows}</tbody></table>",
+                rows=rows,
+            )
+        elif total == 0 and not filters:
+            table = Html(
+                '<p class="empty card">No remote jobs have been submitted. Jobs assigned '
+                "to a Windows node will appear here even while that node is off.</p>"
+            )
+        elif total == 0:
+            table = Html('<p class="empty card">No jobs match these filters.</p>')
+        else:
+            table = Html('<p class="empty card">No jobs are on this page.</p>')
+
+        first = start + 1 if shown else 0
+        last = start + len(shown) if shown else 0
+        count = fmt(
+            '<p class="meta">Showing {first}&ndash;{last} of {total} matching job{s}. '
+            "As of {now}.</p>",
+            first=first,
+            last=last,
+            total=total,
+            s="" if total == 1 else "s",
+            now=_when(now.isoformat()),
+        )
+        pager = _jobs_pager(page, start, len(shown), total, filters)
+        help_text = Html(
+            '<section class="card"><h2>What the connection states mean</h2><dl>'
+            "<dt><code>waiting_for_node</code></dt><dd>The assigned Windows node has not "
+            "claimed the job yet.</dd>"
+            "<dt><code>node_offline</code></dt><dd>The node claimed the job, but its lease "
+            "expired. The job stays assigned there and is not retried automatically.</dd>"
+            "<dt><code>lost_on_node</code></dt><dd>The node reported that its local copy of "
+            "the claimed job is missing. The hub keeps the record; it is not retried "
+            "automatically.</dd></dl></section>"
+        )
+        return join([filter_form, count, pager, table, pager, help_text])
+
+    @staticmethod
+    def job_row(job: dict[str, object]) -> Html:
+        project = job["project"]
+        if not isinstance(project, dict):  # fold/to_dict guarantee this; keep rendering closed
+            raise jobs.JobCorrupt("a folded job has no project object")
+        folder = project.get("folder_path")
+        parts = [*folder, project.get("name")] if isinstance(folder, list) else []
+        project_name = "/".join(str(part) for part in parts)
+        project_id = project.get("project_id") or "unknown"
+        state = str(job["state"])
+        badge_kind = {
+            "succeeded": "done",
+            "failed": "failed",
+            "cancelled": "cancelled",
+            "lost_on_node": "failed",
+            "node_offline": "failed",
+            "waiting_for_node": "pending",
+            "cancel_requested": "pending",
+        }.get(state, "active")
+        return fmt(
+            '<tr><td data-label="Job ID"><span class="mono">{job_id}</span></td>'
+            '<td data-label="Project">{project}<div class="meta mono">{project_id}</div></td>'
+            '<td data-label="Node"><span class="mono">{node}</span></td>'
+            '<td data-label="Kind"><code>{kind}</code></td>'
+            '<td data-label="State">{state}</td><td data-label="Updated">{updated}</td></tr>',
+            job_id=job["job_id"],
+            project=project_name,
+            project_id=project_id,
+            node=job["assigned_node"],
+            kind=job["kind"],
+            state=_badge(state, badge_kind),
+            updated=_when(str(job["updated_at"]), short=True),
+        )
 
     # -- leases ----------------------------------------------------------------
 
@@ -1515,8 +1703,12 @@ def build_app(
         ctx = console.page_context(request)
         try:
             content = await run_in_threadpool(body, ctx)
-        except ConsoleError as exc:
-            return console.error_response(request, exc)
+        except Exception as exc:
+            mapped = _map_error(exc)
+            if mapped is None:
+                raise
+            logger.info("console read refused: %s %s: %s", request.url.path, mapped.code, exc)
+            return console.error_response(request, mapped)
         return console.render(ctx, title, nav, content)
 
     async def write(request: Request, action: Callable[[Actor, FormData, str], str]) -> Response:
@@ -1642,6 +1834,9 @@ def build_app(
     async def leases(request: Request) -> Response:
         return await page(request, "Lease board", "leases", console.leases_body)
 
+    async def jobs_page(request: Request) -> Response:
+        return await page(request, "Remote jobs", "jobs", console.jobs_body)
+
     async def approvals_page(request: Request) -> Response:
         return await page(request, "Approvals", "approvals", console.approvals_body)
 
@@ -1739,6 +1934,7 @@ def build_app(
         Route("/reviews/{project_id}/{review_id}/decide", review_decide, methods=["POST"]),
         Route("/reviews/{project_id}/{review_id}/notes", review_note, methods=["POST"]),
         Route("/artifacts/{artifact_id}", artifact, methods=["GET"]),
+        Route("/jobs", jobs_page, methods=["GET"]),
         Route("/leases", leases, methods=["GET"]),
         Route("/approvals", approvals_page, methods=["GET"]),
         Route("/approvals/grant", approvals_grant, methods=["POST"]),

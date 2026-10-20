@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import os
 import secrets
 from dataclasses import dataclass
@@ -109,10 +110,20 @@ class RemoteConfig:
             raise ValueError("hub_url must not carry credentials")
         if not parts.hostname:
             raise ValueError("hub_url must name a host")
-        if self.connect_timeout <= 0 or self.read_timeout <= 0:
+        if not all(
+            isinstance(value, int | float)
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value > 0
+            for value in (self.connect_timeout, self.read_timeout)
+        ):
             raise ValueError("timeouts must be positive")
-        if self.response_cap < 1:
-            raise ValueError("response_cap must be at least 1 byte")
+        if (
+            not isinstance(self.response_cap, int)
+            or isinstance(self.response_cap, bool)
+            or not 1 <= self.response_cap <= 64 << 20
+        ):
+            raise ValueError("response_cap must be between 1 byte and 64 MiB")
         object.__setattr__(self, "token_file", Path(self.token_file))
 
 
@@ -154,16 +165,25 @@ class _NodeClient:
         self._counter += 1
         return f"{self._nonce}-{self._counter}"[:MAX_REQUEST_ID]
 
-    def call(self, op: str, body: dict[str, Any]) -> dict[str, Any]:
+    def call(
+        self, op: str, body: dict[str, Any], *, request_id: str | None = None
+    ) -> dict[str, Any]:
         """POST one op and return the ``200`` envelope, or raise the mapped exception."""
-        request_id = self._request_id()
+        request_id = request_id or self._request_id()
+        if not isinstance(request_id, str) or not request_id or len(request_id) > MAX_REQUEST_ID:
+            raise ValueError(f"request_id must be 1 to {MAX_REQUEST_ID} characters")
         payload = {**body, "request_id": request_id}
         status, raw = self._send(op, payload)
         return self._interpret(status, raw, body)
 
     def _send(self, op: str, payload: dict[str, Any]) -> tuple[int, bytes]:
         cfg = self._config
-        token = _read_token(Path(cfg.token_file))
+        try:
+            token = _read_token(Path(cfg.token_file))
+        except (OSError, ValueError) as exc:
+            raise NodeNotEnrolled(
+                "the node token file is unavailable or unsafe; a human must fix it"
+            ) from exc
         body = json.dumps(payload).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
@@ -198,7 +218,7 @@ class _NodeClient:
             raise HubUnreachable(f"the hub returned {status}; treating it as unreachable")
         try:
             envelope = json.loads(raw)
-        except (ValueError, UnicodeDecodeError) as exc:
+        except (ValueError, UnicodeDecodeError, RecursionError) as exc:
             raise HubUnreachable(f"the hub returned {status} with a non-JSON body") from exc
         if status == 200:
             if isinstance(envelope, dict) and envelope.get("ok") is True:
@@ -400,3 +420,162 @@ class RemoteFeedTransport:
                 }
             },
         )
+
+
+class RemoteJobClient:
+    """Bounded node-job operations over the authenticated node API.
+
+    The caller never supplies a node id: the hub takes it exclusively from the bearer token.
+    ``projects`` is the node's explicit allow-list of Resolve project ids and is sent on every
+    claim/reconcile so a configuration mistake cannot turn into arbitrary project work.
+    """
+
+    def __init__(
+        self,
+        client: _NodeClient,
+        projects: tuple[str, ...],
+        *,
+        lease_seconds: float = 60.0,
+    ) -> None:
+        if (
+            not projects
+            or len(projects) > 256
+            or not all(isinstance(item, str) and 0 < len(item) <= 128 for item in projects)
+        ):
+            raise ValueError("RemoteJobClient needs at least one configured project id")
+        if len(set(projects)) != len(projects):
+            raise ValueError("configured project ids must be unique")
+        if (
+            not isinstance(lease_seconds, int | float)
+            or isinstance(lease_seconds, bool)
+            or not math.isfinite(lease_seconds)
+            or not 1 <= lease_seconds <= 3600
+        ):
+            raise ValueError("lease_seconds must be between 1 and 3600")
+        self._client = client
+        self.projects = projects
+        self.lease_seconds = float(lease_seconds)
+
+    def claim(self) -> dict[str, Any] | None:
+        result = self._client.call(
+            "job_claim",
+            {"projects": list(self.projects), "lease_seconds": self.lease_seconds},
+        )["result"]
+        if result is not None and not isinstance(result, dict):
+            raise HubUnreachable("the hub returned a malformed job claim")
+        return result
+
+    def heartbeat(self, job_id: str, generation: int) -> dict[str, Any]:
+        result = self._client.call(
+            "job_heartbeat",
+            {
+                "job_id": job_id,
+                "generation": generation,
+                "lease_seconds": self.lease_seconds,
+            },
+        )["result"]
+        if not isinstance(result, dict):
+            raise HubUnreachable("the hub returned a malformed job heartbeat")
+        return result
+
+    def report(
+        self, job_id: str, generation: int, state: str, report: dict[str, Any]
+    ) -> dict[str, Any]:
+        stack = [(report, 0)]
+        while stack:
+            value, depth = stack.pop()
+            if depth > 32:
+                raise HubRefused("invalid_result", "job report nests deeper than 32 levels")
+            if isinstance(value, dict):
+                if not all(isinstance(key, str) for key in value):
+                    raise HubRefused("invalid_result", "job report keys must be strings")
+                stack.extend((item, depth + 1) for item in value.values())
+            elif isinstance(value, list | tuple):
+                stack.extend((item, depth + 1) for item in value)
+            elif isinstance(value, float) and not math.isfinite(value):
+                raise HubRefused("invalid_result", "job report numbers must be finite")
+            elif value is not None and not isinstance(value, str | int | float | bool):
+                raise HubRefused("invalid_result", f"job report contains {type(value).__name__}")
+        encoded = json.dumps(report, allow_nan=False, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > 256 * 1024:
+            raise HubRefused("invalid_result", "job report exceeds the 256 KiB result cap")
+        result = self._client.call(
+            "job_report",
+            {"job_id": job_id, "generation": generation, "state": state, "report": report},
+        )["result"]
+        if not isinstance(result, dict):
+            raise HubUnreachable("the hub returned a malformed job report")
+        return result
+
+    def reconcile(self, summaries: list[dict[str, Any]]) -> dict[str, Any]:
+        # Each input page is a COMPLETE ID range. Output pagination is independent: a
+        # node with a mostly empty store must still discover every hub claim in its range.
+        from aar.hub.jobs import MAX_JOBS, RECONCILE_PAGE_SIZE
+
+        if not isinstance(summaries, list) or len(summaries) > MAX_JOBS:
+            raise HubRefused("too_many_local_jobs", f"reconcile supports at most {MAX_JOBS} jobs")
+        if any(
+            not isinstance(item, dict) or not isinstance(item.get("job_id"), str)
+            for item in summaries
+        ):
+            raise HubRefused("invalid_request", "reconcile summaries need job ids")
+        ordered = sorted(summaries, key=lambda item: item["job_id"])
+        if len({item["job_id"] for item in ordered}) != len(ordered):
+            raise HubRefused("invalid_request", "reconcile summary ids must be unique")
+        combined: dict[str, Any] = {"jobs": [], "known_job_ids": []}
+        start = None
+        for offset in range(0, max(1, len(ordered)), RECONCILE_PAGE_SIZE):
+            page = ordered[offset : offset + RECONCILE_PAGE_SIZE]
+            end = page[-1]["job_id"] if offset + len(page) < len(ordered) else None
+            encoded = json.dumps(page, allow_nan=False, separators=(",", ":")).encode("utf-8")
+            if len(encoded) > 512 * 1024:
+                raise HubRefused("invalid_request", "reconcile page exceeds 512 KiB")
+            cursor = None
+            for _ in range(MAX_JOBS // RECONCILE_PAGE_SIZE + 1):
+                result = self._client.call(
+                    "job_reconcile",
+                    {
+                        "jobs": page,
+                        "projects": list(self.projects),
+                        "range_start": start,
+                        "range_end": end,
+                        "cursor": cursor,
+                    },
+                ).get("result")
+                if (
+                    not isinstance(result, dict)
+                    or not isinstance(result.get("jobs"), list)
+                    or not isinstance(result.get("known_job_ids"), list)
+                    or len(result["jobs"]) > RECONCILE_PAGE_SIZE
+                    or len(result["known_job_ids"]) > RECONCILE_PAGE_SIZE
+                ):
+                    raise HubUnreachable("the hub returned malformed reconciliation pages")
+                known = result["known_job_ids"]
+                if any(
+                    not isinstance(item, str)
+                    or not item.startswith("job_")
+                    or (start is not None and item <= start)
+                    or (end is not None and item > end)
+                    or (cursor is not None and item <= cursor)
+                    for item in known
+                ):
+                    raise HubUnreachable("the hub returned reconciliation ids outside the page")
+                if known != sorted(set(known)) or any(
+                    not isinstance(item, dict) or item.get("job_id") not in known
+                    for item in result["jobs"]
+                ):
+                    raise HubUnreachable("the hub returned inconsistent reconciliation ids")
+                combined["jobs"].extend(result["jobs"])
+                combined["known_job_ids"].extend(known)
+                if len(combined["known_job_ids"]) > MAX_JOBS:
+                    raise HubUnreachable("the hub exceeded the reconciliation job limit")
+                next_cursor = result.get("next_cursor")
+                if next_cursor is None:
+                    break
+                if not known or next_cursor != max(known):
+                    raise HubUnreachable("the hub returned a non-progressing reconciliation cursor")
+                cursor = next_cursor
+            else:
+                raise HubUnreachable("the hub exceeded the reconciliation page limit")
+            start = end
+        return combined

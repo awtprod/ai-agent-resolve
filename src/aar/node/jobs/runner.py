@@ -281,6 +281,7 @@ class JobRunner:
         self.last_flush = None
         """The last ``FlushReport`` of the node's feed."""
         self._closed = False
+        self.remote_claim_check: Callable[[str], BrokerOpError | None] | None = None
         self._load()
 
     # -- startup ---------------------------------------------------------------------------
@@ -452,6 +453,8 @@ class JobRunner:
         agent_id: str,
         priority: int = 0,
         approval_token: str | None = None,
+        job_id: str | None = None,
+        generation: int | None = None,
     ) -> str:
         """Queue a new job for the agent ``agent_id`` and return its id. The caller drives it
         with :meth:`pump`.
@@ -476,7 +479,24 @@ class JobRunner:
         steps = spec.build(model, target)  # validates the plan (ops exist, timeouts are finite)
         now = self.clock()
         with self._lock:
-            job_id = "job_" + uuid.uuid4().hex
+            external = job_id is not None
+            if generation is not None and (
+                not external
+                or isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 1
+            ):
+                raise ValueError("generation requires an external job id and a positive integer")
+            job_id = job_id or "job_" + uuid.uuid4().hex
+            if (
+                not isinstance(job_id, str)
+                or not job_id.startswith("job_")
+                or len(job_id) > 128
+                or not job_id.removeprefix("job_").isalnum()
+            ):
+                raise ValueError("job_id must be 'job_' plus at most 124 letters or digits")
+            if job_id in self._jobs or self.store.get(job_id) is not None:
+                raise ValueError(f"job {job_id!r} already exists in this node store")
             record = JobRecord(
                 job_id=job_id,
                 kind=kind,
@@ -491,24 +511,74 @@ class JobRunner:
                 created_at=now,
                 updated_at=now,
             )
-            self.store.save(
-                record,
-                [
-                    (
-                        "submitted",
-                        {
-                            "kind": kind,
-                            "target": target.to_dict(),
-                            "steps": len(steps),
-                            "agent_id": agent_id,
-                        },
-                        now,
-                    )
-                ],
-            )
+            events = [
+                (
+                    "submitted",
+                    {
+                        "kind": kind,
+                        "target": target.to_dict(),
+                        "steps": len(steps),
+                        "agent_id": agent_id,
+                    },
+                    now,
+                )
+            ]
+            if external:
+                events.insert(
+                    0, ("external_assigned", {"hub_job_id": job_id, "generation": generation}, now)
+                )
+            # For an externally assigned job this is the durable hub->local mapping. It is
+            # committed before the job is put in the runner's in-memory queue or pumped.
+            self.store.save(record, events)
             self._jobs[job_id] = record
             self._runtime[job_id] = _Runtime(steps=steps, params=model)
         return job_id
+
+    def external_job_ids(self) -> set[str]:
+        """Hub-assigned job ids durably mapped into this store."""
+        with self._lock:
+            return {
+                job_id
+                for job_id in self._jobs
+                if any(event.kind == "external_assigned" for event in self.store.events(job_id))
+            }
+
+    def external_generation(self, job_id: str) -> int | None:
+        """Only an intact, unquarantined assignment event proves the durable fence."""
+        with self._lock:
+            events = self.store.events(job_id)
+            mappings = [event.data for event in events if event.kind == "external_assigned"]
+            if len(mappings) != 1 or any(e.kind == "external_quarantined" for e in events):
+                return None
+            mapping = mappings[0]
+            generation = mapping.get("generation")
+            if (
+                mapping.get("hub_job_id") != job_id
+                or isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 1
+            ):
+                return None
+            return generation
+
+    def quarantine_external(self, job_id: str, reason: str) -> bool:
+        """Quarantine any unproven local job, including legacy local submissions.
+
+        Cancellation uses the runner's existing safe path: queued ops are cancelled and an
+        already running op is tracked as a late result. Terminal history is preserved.
+        """
+        with self._lock:
+            record = self._jobs.get(job_id)
+            if record is None:
+                return False
+            if not any(event.kind == "external_quarantined" for event in self.store.events(job_id)):
+                self.store.append_events(
+                    job_id,
+                    [("external_quarantined", {"reason": reason}, self.clock())],
+                )
+            if record.state not in TERMINAL_STATES and not record.readonly:
+                self.cancel(job_id, f"quarantined: {reason}")
+            return True
 
     def get(self, job_id: str) -> JobView | None:
         with self._lock:
@@ -798,6 +868,12 @@ class JobRunner:
                 return BrokerOpError(
                     "project_stalled", f"project {target.project_id} is stalled; nothing runs"
                 )
+        # Attached remote workers must authorize EVERY op, including legacy local jobs.
+        # This runs on the broker thread immediately before dispatch, never from a cache.
+        if self.remote_claim_check is not None:
+            refused = self.remote_claim_check(job_id)
+            if refused is not None:
+                return refused
         try:
             self.hublink.assert_running(project=target, node_id=self.node_id)
         except Stopped as stop:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -52,3 +54,29 @@ def test_the_published_timeline_ref_text_states_the_id_rule(
     assert "unique_id" in text and "timeline_id_required" in text
     assert "timeline_ref_mismatch" in text
     assert "or name" not in text and "preferred" not in text
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the production gateway is Windows-only")
+def test_node_run_refuses_linux_before_creating_a_store(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = tmp_path / "jobs.db"
+    code = main(
+        [
+            "node",
+            "run",
+            "--node-id",
+            "edit-pc",
+            "--hub-url",
+            "http://127.0.0.1:8789",
+            "--token-file",
+            str(tmp_path / "token"),
+            "--store",
+            str(store),
+            "--project",
+            '{"folder_path":[],"name":"Show","project_id":"uid"}',
+        ]
+    )
+    assert code == 2
+    assert "requires Windows" in capsys.readouterr().err
+    assert not store.exists()

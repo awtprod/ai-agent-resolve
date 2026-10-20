@@ -21,16 +21,18 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 from mcp_types import CallToolResult, TextContent, ToolAnnotations
+from pydantic import StrictInt
 
 from aar.hub import facts as facts_mod
-from aar.hub import writes
+from aar.hub import jobs, writes
 from aar.hub.artifacts import ArtifactStore
-from aar.hub.common import skipped_summary
-from aar.hub.events import Actor, EventLog
+from aar.hub.common import HumanRequired, InvalidInput, skipped_summary, utcnow
+from aar.hub.events import Actor, EventLog, IdempotencyConflict
 from aar.hub.graph import WorkGraph
 from aar.hub.mcp_server import _bounded
 from aar.hub.registry import Registry
 from aar.node.branches import valid_agent_id
+from aar.node.locator import ProjectLocator
 
 # Writes append to an append-only log (never destructive) and are idempotent per key.
 _WRITE = ToolAnnotations(
@@ -45,6 +47,8 @@ WRITE_TOOL_NAMES = (
     "node_set_status",
     "facts_record",
     "facts_retract",
+    "job_submit",
+    "job_cancel",
 )
 READ_TOOL_NAMES = ("facts_get", "brief_get", "plan_get")
 
@@ -110,6 +114,144 @@ def register_write_tools(
             return _result(call().to_dict())
         except writes.WriteError as exc:
             return _refused(exc)
+
+    def run_job(op: str, call: Any) -> CallToolResult:
+        try:
+            job, replayed = call()
+            return _result(
+                writes.WriteResult(
+                    op,
+                    replayed,
+                    job.target.project_id,
+                    {"job": _bounded(job.to_dict(utcnow(), include_payload=False))},
+                ).to_dict()
+            )
+        except writes.WriteError as exc:
+            return _refused(exc)
+        except InvalidInput as exc:
+            # Queue validators may wrap Pydantic/build errors containing input values.
+            # Keep those internals out of the MCP result, including approval references.
+            return _refused(
+                writes.WriteError(
+                    "invalid_input",
+                    f"Invalid job input: {exc.field}.",
+                    "Check the named field against the tool description and job kind's "
+                    "params schema; use bounded JSON with finite numbers and an exact "
+                    "project locator containing project_id.",
+                    field=exc.field,
+                )
+            )
+        except IdempotencyConflict:
+            return _refused(
+                writes.WriteError(
+                    "idempotency_conflict",
+                    "This key already names a different job request.",
+                    "Retry the original request unchanged, or use a fresh idempotency_key.",
+                )
+            )
+        except HumanRequired:
+            return _refused(
+                writes.WriteError(
+                    "not_creator",
+                    "Only the job's creator may cancel it through agent MCP.",
+                    "Use your own job_id; another actor's job needs a human using "
+                    "`aar hub job cancel`.",
+                )
+            )
+        except jobs.JobError as exc:
+            return _result(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": exc.code,
+                        "message": "The job queue refused this request.",
+                        "fix_hint": (
+                            "Refresh jobs_list and check the job_id and current state. "
+                            "If the queue history is corrupt or full, ask a human to inspect it."
+                        ),
+                        "details": {},
+                    },
+                },
+                is_error=True,
+            )
+
+    @server.tool(
+        name="job_submit",
+        description=(
+            "Enqueue durable Resolve work for an assigned node, even while it is absent. "
+            "Submission does not execute work or grant approval: node safety gates still apply. "
+            + _IDENTITY
+            + "The execution agent_id is always your same agent_id. kind names a registered "
+            "job kind (ops.sequence or render); params is its JSON object (at most 256 KiB, "
+            "32 levels deep, finite numbers), validated by the queue and op schemas. project "
+            "is an exact locator {folder_path: [folder names], name, project_id}; project_id "
+            "is required and unknown keys are refused. assigned_node is a configured node id "
+            "(1-128 characters); priority is an integer from -1000000 to 1000000 (default 0). "
+            "approval_token optionally references an existing human approval, never grants one. "
+            "Example: kind 'ops.sequence', params {steps: [{op: 'timeline.list', params: {}}]}, "
+            "project {folder_path: ['Shows'], name: 'Show', project_id: 'resolve-show'}, "
+            "assigned_node 'edit-pc'. Returns {ok: true, op: 'job.submit', project_id, replayed, "
+            "job: bounded metadata without params or approval references}. " + _ERRORS
+        ),
+        annotations=_WRITE,
+    )
+    def job_submit(
+        agent_id: str,
+        idempotency_key: str,
+        kind: str,
+        params: dict[str, Any],
+        project: dict[str, Any],
+        assigned_node: str,
+        priority: StrictInt = 0,
+        approval_token: str | None = None,
+    ) -> CallToolResult:
+        def submit() -> tuple[jobs.HubJob, bool]:
+            actor = _agent(agent_id)
+            writes.write_key(actor, idempotency_key)
+            # ProjectLocator.from_dict accepts iterables for internal callers. MCP's
+            # JSON boundary requires an array, never a string interpreted as characters.
+            if "folder_path" in project and not isinstance(project["folder_path"], list):
+                raise InvalidInput("project.folder_path", "must be an array of folder names")
+            try:
+                target = ProjectLocator.from_dict(project)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise InvalidInput("project", "must be an exact project locator") from exc
+            return jobs.submit(
+                log,
+                actor,
+                kind=kind,
+                params=params,
+                project=target,
+                agent_id=actor.id,
+                assigned_node=assigned_node,
+                idempotency_key=idempotency_key,
+                priority=priority,
+                approval_token=approval_token,
+            )
+
+        return run_job("job.submit", submit)
+
+    @server.tool(
+        name="job_cancel",
+        description=(
+            "Request cancellation of a job created by your agent_id. The node observes "
+            "the request; this does not release or reassign its claim. "
+            + _IDENTITY
+            + "job_id is from job_submit or jobs_list; reason is 1-1000 characters. "
+            "Other actors' jobs require a human using `aar hub job cancel`. Example: job_id "
+            "'job_0123456789abcdef', reason 'superseded by a new cut'. Returns {ok: true, "
+            "op: 'job.cancel', project_id, replayed, job: bounded metadata without params "
+            "or approval references}. " + _ERRORS
+        ),
+        annotations=_WRITE,
+    )
+    def job_cancel(agent_id: str, idempotency_key: str, job_id: str, reason: str) -> CallToolResult:
+        def cancel() -> tuple[jobs.HubJob, bool]:
+            actor = _agent(agent_id)
+            writes.write_key(actor, idempotency_key)
+            return jobs.cancel(log, actor, job_id, reason, idempotency_key=idempotency_key)
+
+        return run_job("job.cancel", cancel)
 
     @server.tool(
         name="brief_create",

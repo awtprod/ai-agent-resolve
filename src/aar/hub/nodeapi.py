@@ -37,7 +37,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from aar.hub import approvals, nodes
+from aar.hub import approvals, jobs, nodes
 from aar.hub.common import Clock, InvalidInput, clean_text, utcnow
 from aar.hub.control import Stopped
 from aar.hub.events import Actor, EventLog
@@ -193,6 +193,60 @@ def _op_feed_deliver(ctx: _Ctx) -> tuple[Any, bool]:
     return None, False
 
 
+def _op_job_claim(ctx: _Ctx) -> tuple[Any, bool]:
+    job, replayed = jobs.claim(
+        ctx.log,
+        ctx.node_id,
+        _required(ctx.body, "projects"),
+        request_id=ctx.request_id,
+        lease_seconds=ctx.body.get("lease_seconds", jobs.DEFAULT_LEASE_SECONDS),
+        clock=ctx.clock,
+    )
+    return (job.to_dict(_now(ctx)) if job is not None else None), replayed
+
+
+def _op_job_heartbeat(ctx: _Ctx) -> tuple[Any, bool]:
+    job, replayed = jobs.heartbeat(
+        ctx.log,
+        ctx.node_id,
+        _required(ctx.body, "job_id"),
+        _required(ctx.body, "generation"),
+        request_id=ctx.request_id,
+        lease_seconds=ctx.body.get("lease_seconds", jobs.DEFAULT_LEASE_SECONDS),
+        clock=ctx.clock,
+    )
+    return job.to_dict(_now(ctx)), replayed
+
+
+def _op_job_report(ctx: _Ctx) -> tuple[Any, bool]:
+    job, replayed = jobs.report(
+        ctx.log,
+        ctx.node_id,
+        _required(ctx.body, "job_id"),
+        _required(ctx.body, "generation"),
+        _required(ctx.body, "state"),
+        _required(ctx.body, "report"),
+        request_id=ctx.request_id,
+        clock=ctx.clock,
+    )
+    return job.to_dict(_now(ctx)), replayed
+
+
+def _op_job_reconcile(ctx: _Ctx) -> tuple[Any, bool]:
+    result = jobs.reconcile(
+        ctx.log,
+        ctx.node_id,
+        _required(ctx.body, "jobs"),
+        _required(ctx.body, "projects"),
+        request_id=ctx.request_id,
+        clock=ctx.clock,
+        range_start=ctx.body.get("range_start"),
+        range_end=ctx.body.get("range_end"),
+        cursor=ctx.body.get("cursor"),
+    )
+    return result, False
+
+
 def _project_required(ctx: _Ctx) -> ProjectLocator:
     project = _project(ctx.body)
     if project is None:
@@ -219,6 +273,10 @@ _OPS: dict[str, Callable[[_Ctx], tuple[Any, bool]]] = {
     "record_branch": _op_record_branch,
     "branches": _op_branches,
     "feed_deliver": _op_feed_deliver,
+    "job_claim": _op_job_claim,
+    "job_heartbeat": _op_job_heartbeat,
+    "job_report": _op_job_report,
+    "job_reconcile": _op_job_reconcile,
 }
 
 
@@ -239,6 +297,9 @@ def _translate(exc: Exception) -> _ApiError:
         return _ApiError(409, ERR_UNKNOWN_HUB_PROJECT, str(exc))
     if isinstance(exc, InvalidInput):
         return _ApiError(400, ERR_INVALID_INPUT, str(exc))
+    if isinstance(exc, jobs.JobError):
+        status = 404 if isinstance(exc, jobs.JobNotFound) else 409
+        return _ApiError(status, exc.code, str(exc))
     if isinstance(exc, ValueError | KeyError | TypeError):
         return _ApiError(400, ERR_INVALID_REQUEST, str(exc))
     raise exc  # unexpected: handled as a generic 500 above
@@ -360,7 +421,7 @@ def _parse_body(raw: bytes, request: Request) -> dict[str, Any]:
         raise _ApiError(400, ERR_INVALID_REQUEST, "Content-Type must be application/json")
     try:
         value = json.loads(raw)
-    except (ValueError, UnicodeDecodeError) as exc:
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
         raise _ApiError(400, ERR_INVALID_REQUEST, f"body is not valid JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise _ApiError(400, ERR_INVALID_REQUEST, "body must be a JSON object")

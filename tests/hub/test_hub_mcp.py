@@ -32,6 +32,7 @@ TOOL_NAMES = {
     "lease_board",
     "project_board",
     "agent_branches",
+    "jobs_list",
     "approvals_list",
 }
 
