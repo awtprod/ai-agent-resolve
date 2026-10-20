@@ -90,8 +90,21 @@ def _alive(pid: int) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    with open(f"/proc/{pid}/stat") as fh:
-        return fh.read().split()[2] != "Z"
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            return fh.read().split()[2] != "Z"
+    except FileNotFoundError:
+        return False
+
+
+def _wait_dead(pid: int, timeout: float = 2.0) -> bool:
+    """Poll until ``pid`` is gone (NF4: SIGKILL after an interrupt is not instant under load)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _alive(pid):
+            return True
+        time.sleep(0.02)
+    return not _alive(pid)
 
 
 def test_low6_child_stdin_is_dev_null(tmp_path, standins) -> None:
@@ -126,7 +139,8 @@ def test_med1_real_interrupt_during_scp_pull_removes_partial_and_kills_scp(tmp_p
         _clear(old)
     assert not list(tmp_path.glob("*.aarpart-*")), "partial left after a real interrupt"
     scp = [r for r in records(standins) if r["prog"] == "scp"]
-    assert scp and not _alive(scp[-1]["pid"]), "scp stand-in still running"
+    assert scp, "scp was not launched before the interrupt"
+    assert _wait_dead(scp[-1]["pid"]), "scp stand-in still running after 2 s"
     assert time.monotonic() - t0 < 10
 
 
