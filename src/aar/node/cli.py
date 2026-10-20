@@ -139,16 +139,22 @@ def run_node(args: argparse.Namespace, *, gateway_factory: Any = _live_gateway) 
         code = worker.run(stop)
         if worker.permanently_stopped:
             cli_io.warn(f"aar node run stopped: {worker.stop_reason or 'permanent refusal'}")
-        return code
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
         if worker is not None:
-            worker.close()
+            closed = worker.close()
         else:
-            if runtime is not None:
-                runtime.close()
-            store.close()
+            closed = runtime is None or runtime.close()
+            if closed:
+                store.close()
+        if not closed:
+            cli_io.warn(
+                "aar node run: shutdown incomplete; Resolve call still active. Store lock and "
+                "node id retained until drain/checkpoint completes. Before restarting, inspect "
+                "Resolve for uncertain side effects; human recovery may be required."
+            )
+    return code if closed else 2
 
 
 def _cmd_run(args: argparse.Namespace) -> int:

@@ -50,6 +50,12 @@ before each operation dispatch. Release cannot undo or interrupt a Resolve call 
 flight, including a call that passed that check just before release. Stop the old node and
 inspect Resolve before deciding that reassignment is safe.
 
+Cancelling a job before any node claims it commits `cancelled` on the Linux hub, even with
+the Windows PC off. Cancellation and claim use the same transaction lock: if claim wins,
+the job stays `cancel_requested` until that node acknowledges cancellation. Neither case
+automatically reassigns the job. The creator or a human may cancel; request keys remain
+idempotent. Existing unclaimed cancellation events also fold to terminal `cancelled`.
+
 With `aar hub serve --agent-writes`, agents can use `job_submit` and `job_cancel`;
 human release stays in the CLI. The read-only MCP surface also provides `jobs_list`, with bounded pagination and exact project
 or state filters. In particular it exposes `waiting_for_node` and `node_offline` without making
@@ -81,8 +87,26 @@ either state an implicit retry.
   branch records for the configured projects. A failed rebuild leaves edits fail-closed.
 - Revoked or missing enrolment is a permanent refusal: the worker stops claiming. Transport
   failures fail closed and use bounded exponential backoff.
-- `SIGINT` and `SIGTERM` stop new claims, let the existing runner checkpoint at its safe
-  boundary, and close that runtime and `JobStore`.
+- `SIGINT` and `SIGTERM` stop new claims and operation dispatch. Shutdown waits up to five
+  seconds for the current drain, then consumes completed and late results into durable
+  checkpoints without issuing another operation. A completed step stays completed; any next
+  step waits for startup. An in-flight render can still journal and restore Deliver settings.
+- If the drain times out, `aar node run` reports **shutdown incomplete** and exits with code
+  2. Programmatic `close(timeout)` returns `False`, retaining the store lock and node-id
+  reservation while that process lives. Calling close again still waits for the same drain;
+  once it finishes, a successful close checkpoints its result and releases ownership. An
+  uninterruptible Resolve call is never killed by the runner. Process exit releases OS locks
+  and can interrupt local cleanup; it cannot prove that Resolve abandoned the external call.
+- Before entering a mutating operation, the runner commits an uncertainty marker. It removes
+  that marker only as the result is checkpointed. After an abrupt exit or incomplete shutdown,
+  an unfinished job with an unresolved marker stalls and blocks further work on its project:
+  the side effect may have happened even when no post-call journal entry exists. A human must
+  inspect Resolve
+  (including any still-running call), then cancel the job or explicitly call
+  `runner.resume(job_id, Actor("human", ...))` to authorize retry. This does not guarantee
+  exactly-once external execution. Read-only calls may retry. `render.build` with an existing
+  journal retains its established settings/queue recovery, including ambiguous-add detection;
+  a build interrupted before its first journal entry requires human recovery too.
 
 All existing runner controls still apply: per-op presence and branch ownership, emergency
 stops, production approval consumption, project identity checks, render journaling, and

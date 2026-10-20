@@ -325,7 +325,11 @@ def _fold_events(events: Iterable[Event]) -> dict[str, HubJob]:
             raise JobCorrupt(
                 f"event {event.id} has generation {generation}, expected {job.generation}"
             )
-        if job.terminal_state is not None:
+        if job.terminal_state is not None and not (
+            event.type == EVENT_CANCEL
+            and job.terminal_state == "cancelled"
+            and job.claimed_node is None
+        ):
             raise JobCorrupt(f"event {event.id} follows terminal job {job.job_id}")
         if event.type == EVENT_CLAIMED:
             if job.claimed_node is not None or job.lost_on_node or job.cancel_requested:
@@ -366,6 +370,12 @@ def _fold_events(events: Iterable[Event]) -> dict[str, HubJob]:
                 raise JobCorrupt(f"job {job.job_id} cancellation has no authority")
             job.cancel_requested = True
             job.cancel_reason = p.get("reason")
+            if job.claimed_node is None:
+                # The fold and append share the claim transaction's writer lock. A node
+                # acknowledgement is necessary only once a node could have begun work.
+                # Deriving this from the original event also repairs legacy cancellations.
+                job.terminal_state = "cancelled"
+                job.result = {"reason": job.cancel_reason}
         elif event.type == EVENT_LOST:
             if _node(p.get("node_id")) != job.claimed_node:
                 raise JobCorrupt(f"job {job.job_id} lost report came from the wrong node")

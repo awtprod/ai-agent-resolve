@@ -432,11 +432,9 @@ class RemoteWorker:
         return 2 if self._permanent_stop else 0
 
     def close(self, timeout: float = 5.0) -> bool:
-        if self._closed:
-            return True
         self._closed = True
         self.stop_claiming()
-        try:
-            return self.runtime.close(timeout)
-        finally:
+        if self.runtime.close(timeout):
             self.store.close()
+            return True
+        return False

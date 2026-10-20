@@ -80,6 +80,60 @@ def test_submit_is_validated_before_the_durable_event_and_replays(tmp_path: Path
     log.close()
 
 
+@pytest.mark.parametrize("actor", [AGENT, HUMAN])
+def test_cancel_unclaimed_is_terminal_on_reopen_and_replay(tmp_path: Path, actor: Actor) -> None:
+    db = tmp_path / "cancel.db"
+    with closing(EventLog(db)) as log:
+        job = _submit(log)
+        with pytest.raises(HumanRequired):
+            jobs.cancel(log, OTHER, job.job_id, "stop", idempotency_key="unauthorized")
+        cancelled, replay = jobs.cancel(log, actor, job.job_id, "stop", idempotency_key="stop")
+        assert not replay and cancelled.terminal_state == "cancelled"
+    with closing(EventLog(db, create=False)) as log:
+        again, replay = jobs.cancel(log, actor, job.job_id, "stop", idempotency_key="stop")
+        assert replay and again.state(jobs.utcnow()) == "cancelled"
+        assert jobs.claim(log, "edit-pc", ["resolve-show"], request_id="claim")[0] is None
+        assert len(log.read(types=[jobs.EVENT_CANCEL])) == 1
+
+
+def test_legacy_unclaimed_cancel_event_is_terminal(tmp_path: Path) -> None:
+    with closing(EventLog(tmp_path / "hub.db")) as log:
+        job = _submit(log)
+        log.append(
+            jobs.EVENT_CANCEL,
+            AGENT,
+            {
+                "job_id": job.job_id,
+                "generation": 1,
+                "reason": "legacy cancellation",
+            },
+        )
+        # Older hubs accepted a second authorized cancellation with a fresh request key.
+        log.append(
+            jobs.EVENT_CANCEL,
+            HUMAN,
+            {
+                "job_id": job.job_id,
+                "generation": 1,
+                "reason": "legacy repeated cancellation",
+            },
+        )
+        assert jobs.get_job(log, job.job_id).terminal_state == "cancelled"
+        assert jobs.claim(log, "edit-pc", ["resolve-show"], request_id="claim")[0] is None
+
+
+@pytest.mark.parametrize("claim_first", [False, True])
+def test_cancel_and_claim_order_is_atomic(tmp_path: Path, claim_first: bool) -> None:
+    with closing(EventLog(tmp_path / "hub.db")) as log:
+        job = _submit(log)
+        if claim_first:
+            assert jobs.claim(log, "edit-pc", ["resolve-show"], request_id="first")[0]
+        current, _ = jobs.cancel(log, AGENT, job.job_id, "stop", idempotency_key="stop")
+        assert current.terminal_state == (None if claim_first else "cancelled")
+        assert current.state(jobs.utcnow()) == ("cancel_requested" if claim_first else "cancelled")
+        assert jobs.claim(log, "edit-pc", ["resolve-show"], request_id="second")[0] is None
+
+
 def test_sticky_claim_expires_visible_but_never_requeues_and_release_fences(tmp_path: Path) -> None:
     clock = Clock()
     log = EventLog(tmp_path / "hub.db")

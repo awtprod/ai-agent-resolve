@@ -80,3 +80,83 @@ def test_node_run_refuses_linux_before_creating_a_store(
     assert code == 2
     assert "requires Windows" in capsys.readouterr().err
     assert not store.exists()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "[]",
+        "null",
+        "true",
+        "[{}]",
+        "{}",
+        '{"name":"Show","folder_path":false}',
+        '{"name":"Show","folder_path":null}',
+        '{"name":"Show","folder_path":"Shows"}',
+        '{"name":"Show","folder_path":[[]]}',
+        '{"name":[],"folder_path":[]}',
+        '{"name":"Show","project_id":true}',
+        '{"name":"Show","project_id":null}',
+    ],
+)
+@pytest.mark.parametrize("command", ["node", "hub"])
+def test_invalid_project_shape_exits_before_any_io(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str,
+    command: str,
+) -> None:
+    from aar.hub import cli as hub_cli
+    from aar.node import cli as node_cli
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid locator reached an I/O boundary")
+
+    # A malformed hub submission must fail even before opening its event log.
+    monkeypatch.setattr(hub_cli, "_open_existing", unexpected)
+    original_run = node_cli.run_node
+    monkeypatch.setattr(
+        node_cli, "run_node", lambda args: original_run(args, gateway_factory=unexpected)
+    )
+    # Keep the original function rather than the monkeypatched CLI entry.
+    if command == "node":
+        args = [
+            "node",
+            "run",
+            "--node-id",
+            "edit-pc",
+            "--hub-url",
+            "http://127.0.0.1:1",
+            "--token-file",
+            str(tmp_path / "token"),
+            "--store",
+            str(tmp_path / "store.db"),
+        ]
+    else:
+        args = [
+            "hub",
+            "job",
+            "submit",
+            "--db",
+            str(tmp_path / "hub.db"),
+            "--actor",
+            "agent:editor",
+            "--node",
+            "edit-pc",
+            "--agent-id",
+            "editor",
+            "--kind",
+            "ops.sequence",
+            "--params",
+            '{"steps":[{"op":"timeline.list"}]}',
+            "--idempotency-key",
+            "invalid",
+        ]
+    assert main([*args, "--project", raw]) == 2
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out + captured.err
+    assert any(
+        field in captured.out + captured.err for field in ("locator", "folder_path", "project_id")
+    )
+    assert list(tmp_path.iterdir()) == []

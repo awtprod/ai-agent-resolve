@@ -409,6 +409,13 @@ def _job_command(action: Any, *, read_only: bool = False) -> Any:
         from aar.hub.events import IdempotencyConflict
 
         try:
+            if action is _job_submit_action:
+                # Reject malformed CLI input before opening even the local event store.
+                from aar.node.locator import ProjectLocator
+
+                project = ProjectLocator.from_dict(json.loads(args.project))
+                if project.project_id is None:
+                    raise ValueError("--project locator needs project_id")
             log = _open_existing(args.db, read_only=read_only)
             try:
                 value = action(jobs, log, args)

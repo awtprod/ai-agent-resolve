@@ -503,22 +503,24 @@ def test_p5b_restart_loop_shorter_than_deadline_still_stalls(tmp_path: Path) -> 
 def test_p5c_crash_loop_before_any_checkpoint_stalls_after_the_restart_limit(
     tmp_path: Path,
 ) -> None:
-    """The process dies in the same op every time, before anything is checkpointed (so the
-    persisted deadline never moves). The persistent restart counter stalls it."""
+    """A read-only op can retry after process death, but the persistent restart counter
+    bounds those retries. Mutating calls now stall on the first uncertainty marker."""
     world = JobWorld(tmp_path)
-    job_id = world.runner.submit("ops.sequence", _markers(100), world.locator(), agent_id=AGENT_ID)
+    job_id = world.runner.submit(
+        "ops.sequence", {"steps": [{"op": "timeline.list"}]}, world.locator(), agent_id=AGENT_ID
+    )
     world.runner.pump()  # running, op queued
-    real = world.main.AddMarker
+    real = world.main.GetEndFrame
 
     def die(*a, **k):
         raise _Crash("the op kills the node")
 
     restarts = []
     for _ in range(10):
-        world.main.AddMarker = die  # type: ignore[method-assign]
+        world.main.GetEndFrame = die  # type: ignore[method-assign]
         with pytest.raises(_Crash):
             world.broker.run_until_idle()
-        world.main.AddMarker = real  # type: ignore[method-assign]
+        world.main.GetEndFrame = real  # type: ignore[method-assign]
         runner = world.restart()
         rec = world.store.get(job_id)
         restarts.append(rec.restarts)

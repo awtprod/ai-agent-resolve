@@ -292,6 +292,8 @@ class JobRunner:
             self._jobs[record.job_id] = record
             if not record.readonly:
                 try:
+                    if not isinstance(record.cursor, dict):
+                        raise ValueError("job cursor must be an object")
                     steps = self._build_steps(record)
                     params = self._parse_params(record)
                 except Exception as exc:  # a forged or future row must not brick the runner
@@ -322,6 +324,30 @@ class JobRunner:
                     )
                 continue
             self._requeue_branch_records(record, rt)
+            uncertain = record.cursor.get("_uncertain_op")
+            if (
+                "_uncertain_op" in record.cursor
+                and record.state not in TERMINAL_STATES
+                # render.build already recovers its saved settings and queue journal,
+                # including the pre-AddRenderJob ambiguity window. Keep that recovery.
+                and not (
+                    isinstance(uncertain, dict)
+                    and uncertain.get("op") == "render.build"
+                    and record.cursor.get("journal")
+                )
+            ):
+                self._stall(
+                    record,
+                    StructuredError(
+                        "op_uncertain",
+                        "an interrupted operation may have changed Resolve before exit",
+                        "a human must inspect Resolve, then cancel or explicitly resume to retry",
+                        detail=uncertain
+                        if isinstance(uncertain, dict)
+                        else {"malformed_marker": True},
+                    ),
+                    now,
+                )
             try:
                 self._verify_approval(record, now)
             except OSError as exc:  # the hub is unreachable: verify before the job runs
@@ -666,6 +692,10 @@ class JobRunner:
                 return None
             if record.state is not JobState.STALLED:
                 return self._view(record)
+            if "_uncertain_op" in record.cursor and self._runtime[job_id].pending_op_id is None:
+                if actor is None or actor.kind != "human":
+                    raise ValueError("uncertain side effects require explicit human recovery")
+                record.cursor.pop("_uncertain_op")
             now = self.clock()
             rt = self._runtime[job_id]
             record.stall = None
@@ -688,11 +718,34 @@ class JobRunner:
             return self._view(record)
 
     def close(self, timeout: float = 5.0) -> bool:
-        """Stop the runner: no op it submitted runs any more. Returns whether the drain ended."""
+        """Disable dispatch, drain, then durably consume results without another operation.
+
+        False retains ownership: an uninterruptible call still has the store open. Its
+        pre-call uncertainty marker survives process exit; a later close can finish safely.
+        """
         with self._drain_lock:
             self._closed = True
             done = self._drain_done
-        return done.wait(timeout) if done is not None else True
+        if done is not None and not done.wait(timeout):
+            return False
+        with self._lock:
+            now = self.clock()
+            self._note_drain_errors(now)
+            self._reconcile_late(now)
+            for record in self._order():
+                rt = self._runtime[record.job_id]
+                if rt.pending_op_id is not None and self.broker.result(rt.pending_op_id) is None:
+                    # Queued ops remain refused by the closed precheck if anyone ticks the
+                    # old broker. A crashed drain also leaves no result: keep its durable
+                    # uncertainty marker for startup recovery. Neither has an active call.
+                    rt.pending_op_id = None
+                    rt.op_submitted_at = None
+                    rt.pending_op_name = None
+                self._advance(record, now, closing=True)
+            return not self._late and not any(
+                rt.pending_op_id is not None or rt.op_outcome is not None
+                for rt in self._runtime.values()
+            )
 
     def wait_drain(self, timeout: float | None = None) -> bool:
         """Block until the current drain (if any) has finished. For tests and shutdown."""
@@ -706,10 +759,14 @@ class JobRunner:
         """Stop-check, run the broker off-thread, advance every job, then run the watchdog."""
         now = self.clock()
         with self._lock:
+            if self._closed:
+                return self._outcome()
             for record in self._order():
                 self._pre_check_stop(record, now)
         self._run_broker()  # off the pump thread, bounded; the lock is released here
         with self._lock:
+            if self._closed:
+                return self._outcome()  # close owns final result collection and persistence
             self._note_drain_errors(now)
             self._reconcile_late(now)
             for record in self._order():
@@ -832,6 +889,9 @@ class JobRunner:
             }
             events = [("late_result", data, now)]
             value = result.value if result.status is OpStatus.OK else None
+            if isinstance(value, BranchResult):
+                self._record_branch(job, self._runtime[job_id], value, now)
+            job.cursor.pop("_uncertain_op", None)
             events += self._orphan_alerts(job, value, now)
             self._checkpoint(job, events, now)
 
@@ -843,6 +903,14 @@ class JobRunner:
         journal = functools.partial(self._journal, job_id, hot.id)
 
         def run(gateway: Any) -> Any:
+            # Commit BEFORE entering any mutating op body. Neither an op_submitted event
+            # nor a post-side-effect journal closes the crash gap around an external call.
+            with self._lock:
+                record = self._jobs[job_id]
+                name = self._runtime[job_id].pending_op_name
+                if name is not None and get_op(name).mutates:
+                    record.cursor["_uncertain_op"] = {"op": name, "op_id": hot.id}
+                    self._checkpoint(record, [], self.clock())
             with op_journal(journal):
                 return inner(gateway)
 
@@ -851,8 +919,7 @@ class JobRunner:
     def _op_wanted(self, job_id: str, op_id: str) -> bool:
         record = self._jobs.get(job_id)
         return (
-            not self._closed
-            and record is not None
+            record is not None
             and record.state not in TERMINAL_STATES
             and op_id not in self._abandoned
         )
@@ -861,7 +928,7 @@ class JobRunner:
         """Right before the op runs: refuse it if the job no longer wants it or is stopped."""
         with self._lock:
             record = self._jobs.get(job_id)
-            if record is None or not self._op_wanted(job_id, op_id):
+            if self._closed or record is None or not self._op_wanted(job_id, op_id):
                 return BrokerOpError("job_inactive", f"job {job_id} no longer wants op {op_id}")
             target = record.target
             if target.project_id in self._stalled_projects:
@@ -968,18 +1035,20 @@ class JobRunner:
         if stop is not None:
             self._enter_wait_blocked(job, stop, now)
 
-    def _advance(self, job: JobRecord, now: float) -> None:
+    def _advance(self, job: JobRecord, now: float, *, closing: bool = False) -> None:
         if job.readonly:
             return
         rt = self._runtime[job.job_id]
         if rt.branch_records:  # a finished job's branch records are sent too
             self._retry_branch_records(job, rt, now)
-        if job.state in TERMINAL_STATES or job.state is JobState.STALLED:
+        if job.state in TERMINAL_STATES or (job.state is JobState.STALLED and not closing):
+            return
+        if closing and rt.pending_op_id is None and rt.op_outcome is None:
             return
         pid = job.target.project_id
-        if pid in self._stalled_projects:
+        if pid in self._stalled_projects and not closing:
             return  # a stalled project stops scheduling for every job in it
-        if rt.verify_pending:
+        if rt.verify_pending and not closing:
             try:
                 self._verify_approval(job, now)
             except OSError as exc:
@@ -1011,7 +1080,10 @@ class JobRunner:
             if op_name == _BRANCH_OP and result.status is OpStatus.OK:
                 self._record_branch(job, rt, result.value, now)
 
-        stop = self._stop_of(job)
+        if closing and rt.op_outcome is None:
+            return  # precheck refused a queued op; next startup may issue it again
+
+        stop = None if closing else self._stop_of(job)
         if stop is not None:
             self._enter_wait_blocked(job, stop, now)  # a collected outcome waits in rt.op_outcome
             return
@@ -1042,6 +1114,7 @@ class JobRunner:
         )
         rt.op_outcome = None
         action = step.advance(ctx)
+        job.cursor.pop("_uncertain_op", None)
 
         if isinstance(action, Submit):
             self._handle_submit(job, rt, step, action, now)
@@ -1053,6 +1126,8 @@ class JobRunner:
             self._note_progress(job, action, now)
         else:  # pragma: no cover - the action union is closed
             raise TypeError(f"step {step.name} returned {type(action).__name__}")
+        if closing:
+            self._checkpoint(job, [], now)
 
     def _note_progress(self, job: JobRecord, action: Pause, now: float) -> None:
         """A polling step: persist its progress mark when it changes, and forget the node
@@ -1071,6 +1146,11 @@ class JobRunner:
     def _handle_submit(
         self, job: JobRecord, rt: _Runtime, step: Step, action: Submit, now: float
     ) -> None:
+        if self._closed:
+            # Some multi-op steps update their cursor before returning Submit. Preserve
+            # that progress for startup, but never enqueue the next op during shutdown.
+            self._checkpoint(job, [], now)
+            return
         try:
             spec = get_op(action.op)
         except KeyError as exc:

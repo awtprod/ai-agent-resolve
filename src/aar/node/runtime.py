@@ -234,15 +234,15 @@ class NodeRuntime:
         return count
 
     def close(self, timeout: float = 5.0) -> bool:
-        """Stop the runner (no op it submitted runs any more) and free the node id. The job
-        store stays open; its owner closes it. Returns whether the drain ended in time."""
+        """Drain and checkpoint, then free the node id. False keeps the id reserved until
+        a later close succeeds. The job store stays open; its owner closes it on success."""
         if self._closed:
             return True
-        self._closed = True
-        try:
-            return self.runner.close(timeout)
-        finally:
+        if self.runner.close(timeout):
+            self._closed = True
             self._release()
+            return True
+        return False
 
     def _release(self) -> None:
         with _LIVE_LOCK:
