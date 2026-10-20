@@ -25,6 +25,16 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     hub = subparsers.add_parser("hub", help="Run and inspect the project/event/work-graph hub.")
     hub_sub = hub.add_subparsers(dest="hub_command", required=True)
 
+    init = hub_sub.add_parser(
+        "init",
+        help="Create a new, empty hub database and artifact store (refuses to overwrite).",
+    )
+    init.add_argument("--db", required=True, help="Path for the new SQLite event-log database.")
+    init.add_argument(
+        "--artifacts", required=True, help="Path for the new artifact store directory."
+    )
+    init.set_defaults(func=_init)
+
     serve = hub_sub.add_parser(
         "serve",
         help="Serve the hub over MCP (streamable HTTP); read-only unless --agent-writes.",
@@ -171,6 +181,36 @@ def _add_actor(parser: argparse.ArgumentParser) -> None:
         metavar="KIND:ID",
         help="Who is acting, e.g. agent:agent-1 (kinds: human, agent, node).",
     )
+
+
+def _init(args: argparse.Namespace) -> int:
+    # Import here so the core CLI does not require the optional 'hub' extra.
+    from aar.hub.artifacts import ArtifactStore
+    from aar.hub.events import EventLog
+
+    db, artifacts = Path(args.db), Path(args.artifacts)
+    # Both paths must be absent, and nothing is created until both are checked, so a refusal
+    # never leaves a half-initialised hub behind.
+    if db.exists():
+        return _fail("db_exists", f"refusing to create a hub database over existing {args.db!r}")
+    if artifacts.exists():
+        return _fail(
+            "artifacts_exist",
+            f"refusing to create an artifact store over existing {args.artifacts!r}",
+        )
+    try:
+        log = EventLog(args.db, create=True)
+    except (OSError, sqlite3.Error) as exc:
+        return _fail("db_create_failed", f"cannot create hub database {args.db!r}: {exc}")
+    try:
+        ArtifactStore(args.artifacts, log, create=True)
+    except OSError as exc:
+        log.close()
+        return _fail(
+            "artifacts_create_failed", f"cannot create artifact store {args.artifacts!r}: {exc}"
+        )
+    log.close()
+    return _print({"db": str(db), "artifacts": str(artifacts)})
 
 
 def _serve(args: argparse.Namespace) -> int:
