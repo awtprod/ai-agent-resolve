@@ -13,7 +13,7 @@ from host_support import ALIAS, FakeRunner, decode_encoded_command, make_config,
 from aar.cli import main
 from aar.host import cli as host_cli
 from aar.host import transport
-from aar.host.config import MAX_TIMEOUT_SECONDS, EditHostConfig, check_timeout, env_config
+from aar.host.config import MAX_TIMEOUT_SECONDS, EditHostConfig, env_config
 from aar.host.errors import (
     ConfigError,
     HashMismatch,
@@ -209,6 +209,10 @@ def test_nf3_good_override_reaches_the_runner(tmp_path) -> None:
 
 
 def test_nf3_check_timeout_helper_is_shared() -> None:
+    # local import: check_timeout is new in S13f3 (NF2/NF3), so importing it here (not at module
+    # level) lets the whole file still import against the base for fail-before.
+    from aar.host.config import check_timeout
+
     assert check_timeout(300) == 300.0
     with pytest.raises(ConfigError):
         check_timeout(10**400)
