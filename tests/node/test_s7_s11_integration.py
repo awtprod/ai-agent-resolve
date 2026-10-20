@@ -314,6 +314,132 @@ def _require_branch_keywords() -> list[tuple[str, str, str]]:
     return sorted(set(found))
 
 
+_OP_BUILDERS = frozenset({"make_hot_op", "submit_op"})
+_FRAMEWORK = "aar/node/ops/framework.py"
+
+
+def _called_name(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def _guard_bypasses(source: str, rel: str) -> list[str]:
+    """Ways a module could reach an op without the branch guard deciding it (S7f LOW-3):
+
+    - a ``**`` unpacking passed to ``make_hot_op`` / ``submit_op`` (it can carry
+      ``require_branch=False`` past the keyword pin);
+    - a direct ``HotOp(...)`` construction, and
+    - a direct ``_execute(...)`` call,
+      both anywhere but inside ``framework.make_hot_op`` (the one place that builds them).
+    """
+    tree = ast.parse(source, filename=rel)
+    found: list[str] = []
+
+    def walk(node: ast.AST, stack: tuple[str, ...]) -> None:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            stack = (*stack, node.name)
+        if isinstance(node, ast.Call):
+            name = _called_name(node)
+            where = f"{rel}:{node.lineno}"
+            inside_builder = rel == _FRAMEWORK and "make_hot_op" in stack
+            if name in _OP_BUILDERS and any(kw.arg is None for kw in node.keywords):
+                found.append(f"{where}: ** unpacking passed to {name}")
+            if name == "HotOp" and not inside_builder:
+                found.append(f"{where}: direct HotOp(...) construction")
+            if name == "_execute" and not inside_builder:
+                found.append(f"{where}: direct _execute(...) call")
+        for child in ast.iter_child_nodes(node):
+            walk(child, stack)
+
+    walk(tree, ())
+    return found
+
+
+def test_p4_no_module_reaches_an_op_around_the_guard() -> None:
+    """S7f LOW-3: no ``**`` into the op builders, and HotOp / _execute only inside
+    framework.make_hot_op, anywhere in src."""
+    found = [
+        hit
+        for path in sorted(SRC.rglob("*.py"))
+        for hit in _guard_bypasses(path.read_text(), path.relative_to(SRC).as_posix())
+    ]
+    assert found == []
+
+
+@pytest.mark.parametrize(
+    ("rel", "snippet", "caught"),
+    [
+        (
+            "aar/node/evil.py",
+            "from aar.node.ops import make_hot_op\n"
+            "def f(t, h):\n"
+            "    return make_hot_op('markers.add', {}, target=t, holder=h,"
+            " **{'require_branch': False})\n",
+            "** unpacking passed to make_hot_op",
+        ),
+        (
+            "aar/node/evil.py",
+            "from aar.node import ops\n"
+            "def f(b, t, h, extra):\n"
+            "    return ops.submit_op(b, 'markers.add', {}, target=t, holder=h, **extra)\n",
+            "** unpacking passed to submit_op",
+        ),
+        (
+            "aar/node/jobs/evil.py",
+            "from aar.node.broker import HotOp\n"
+            "def f(t, fn, h):\n"
+            "    return HotOp(project=t, fn=fn, holder=h)\n",
+            "direct HotOp(...) construction",
+        ),
+        (
+            "aar/node/jobs/evil.py",
+            "import aar.node.broker as b\n"
+            "def f(t, fn, h):\n"
+            "    return b.HotOp(project=t, fn=fn, holder=h)\n",
+            "direct HotOp(...) construction",
+        ),
+        (
+            "aar/node/jobs/evil.py",
+            "from aar.node.ops.framework import _execute\n"
+            "def f(spec, gw, t, p):\n"
+            "    return _execute(spec, gw, t, p)\n",
+            "direct _execute(...) call",
+        ),
+        (
+            _FRAMEWORK,  # even in framework.py, only make_hot_op may do it
+            "def submit_op(b, t, fn, h):\n    return b.submit(HotOp(project=t, fn=fn, holder=h))\n",
+            "direct HotOp(...) construction",
+        ),
+        (
+            _FRAMEWORK,
+            "def other(spec, gw, t, p):\n    return _execute(spec, gw, t, p)\n",
+            "direct _execute(...) call",
+        ),
+    ],
+)
+def test_p4_the_bypass_checker_catches_a_planted_case(
+    tmp_path: Path, rel: str, snippet: str, caught: str
+) -> None:
+    planted = tmp_path / "planted.py"
+    planted.write_text(snippet)
+    found = _guard_bypasses(planted.read_text(), rel)
+    assert len(found) == 1 and caught in found[0], found
+
+
+def test_p4_the_bypass_checker_allows_the_real_builder(tmp_path: Path) -> None:
+    planted = tmp_path / "framework.py"
+    planted.write_text(
+        "def make_hot_op(spec, gw, t, p, fn, h):\n"
+        "    def run(gateway):\n"
+        "        return _execute(spec, gateway, t, p)\n"
+        "    return HotOp(project=t, fn=run, holder=h)\n"
+    )
+    assert _guard_bypasses(planted.read_text(), _FRAMEWORK) == []
+
+
 def test_p4_the_only_production_path_to_require_branch_false_is_the_approved_op() -> None:
     """P4: no production code reaches ``require_branch=False`` except the runner's override,
     built only after a consumed approval naming the op. A grep (text) and an AST walk (any
