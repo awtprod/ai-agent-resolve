@@ -9,7 +9,7 @@ import pytest
 from aar.hub.events import Actor, EventLog, IdempotencyConflict
 from aar.hub.registry import DuplicateProjectId, Project, ProjectSource, Registry
 
-ACTOR = Actor("human", "andrew")
+ACTOR = Actor("human", "owner")
 
 
 def _registry(tmp_path: Path) -> tuple[EventLog, Registry]:
@@ -24,26 +24,26 @@ def test_project_source_rejects_unknown_kind() -> None:
 
 def test_create_assigns_stable_prefixed_id(tmp_path: Path) -> None:
     _, reg = _registry(tmp_path)
-    project = reg.create_project("QCCE 2024", ACTOR)
+    project = reg.create_project("Acme Show 2024", ACTOR)
     assert project.id.startswith("prj_")
     assert reg.get(project.id) is not None
 
 
 def test_rename_keeps_the_id(tmp_path: Path) -> None:
     _, reg = _registry(tmp_path)
-    project = reg.create_project("QCCE 2024", ACTOR)
+    project = reg.create_project("Acme Show 2024", ACTOR)
     pid = project.id
-    reg.rename_project(pid, "QCCE 2024 (recut)", ACTOR)
+    reg.rename_project(pid, "Acme Show 2024 (recut)", ACTOR)
     renamed = reg.get(pid)
     assert renamed.id == pid
-    assert renamed.name == "QCCE 2024 (recut)"
+    assert renamed.name == "Acme Show 2024 (recut)"
 
 
 def test_find_by_locator_matches_kind_locator_and_optional_host(tmp_path: Path) -> None:
     _, reg = _registry(tmp_path)
-    locator = {"library": "CCN", "project": "Roy Cooper"}
+    locator = {"library": "Acme", "project": "Acme Client"}
     source = ProjectSource("cloud_library", locator, host="edit-pc-1")
-    project = reg.create_project("Roy Cooper", ACTOR, sources=[source])
+    project = reg.create_project("Acme Client", ACTOR, sources=[source])
 
     assert reg.find_by_locator("cloud_library", locator).id == project.id
     assert reg.find_by_locator("cloud_library", locator, host="edit-pc-1").id == project.id
@@ -53,14 +53,14 @@ def test_find_by_locator_matches_kind_locator_and_optional_host(tmp_path: Path) 
 
 def test_add_source_and_alias_then_lookup(tmp_path: Path) -> None:
     _, reg = _registry(tmp_path)
-    project = reg.create_project("LNR Ep 5", ACTOR)
-    reg.add_alias(project.id, "lnr5", ACTOR)
+    project = reg.create_project("Acme Ep 5", ACTOR)
+    reg.add_alias(project.id, "acme5", ACTOR)
     reg.add_source(
-        project.id, ProjectSource("drp_file", {"path": "/exports/lnr5.drp"}, host="mac"), ACTOR
+        project.id, ProjectSource("drp_file", {"path": "/exports/acme5.drp"}, host="mac"), ACTOR
     )
 
-    assert reg.find_by_alias("lnr5").id == project.id
-    assert reg.find_by_name("LNR Ep 5").id == project.id
+    assert reg.find_by_alias("acme5").id == project.id
+    assert reg.find_by_name("Acme Ep 5").id == project.id
     stored = reg.get(project.id)
     assert stored.sources[0].kind == "drp_file"
     assert stored.sources[0].host == "mac"

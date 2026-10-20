@@ -21,7 +21,7 @@ Status `docs` means the evidence is Blackmagic documentation or the 21.1 API stu
 | #   | Fact | Status |
 | --- | ---- | ------ |
 | F1  | Blackmagic Cloud has no public API. All cloud work goes through a Resolve instance's scripting API: `LoadCloudProject`, `CreateCloudProject`, `ImportCloudProject`, `RestoreCloudProject`, and the clip property `Cloud Sync`. Presentations (review in the browser) have no API either. The only Blackmagic REST API is the camera's own. | docs |
-| F2  | The edit PC's current project library is a Blackmagic Cloud library with 33 projects, including QCCE 2024, the LNR episodes and Roy Cooper. `GetDatabaseList()` does not list it. It lists only `Local Database`, which has 0 projects. | live 2026-10-17 |
+| F2  | The edit PC's current project library is a Blackmagic Cloud library with 33 projects, show and client projects among them. `GetDatabaseList()` does not list it. It lists only `Local Database`, which has 0 projects. | live 2026-10-17 |
 | F3  | A Resolve instance has one current project and one current timeline, and most edit calls act on that current timeline. Dynamic Project Switching keeps several projects in RAM, but the API cannot list them. | docs |
 | F4  | It is unknown whether two GUI instances can run under one Windows user; community answers say no. `-nogui` headless mode and `-rr` remote render nodes both exist, but it is unknown whether either can run beside the GUI on the same PC. | UNVERIFIED (S14) |
 | F5  | Collaboration is a Resolve feature on cloud and network libraries: bin, timeline and clip locks, Live Save, chat, and Compare Timelines. The API exposes only `RefreshFolders`, `Folder.GetIsFolderStale` and `liveCollaborationMode`. There is no API for locks, presence or chat. | docs |
@@ -29,7 +29,7 @@ Status `docs` means the evidence is Blackmagic documentation or the 21.1 API stu
 | F7  | Resolve writes DRP, DRT and DRB files itself (`ExportProject`, `Timeline.Export` for DRT/FCPXML/OTIO/AAF/EDL, `Folder.Export`). It also imports them (`ImportProject`, `ImportTimelineFromFile`, `ImportFolderFromFile`). | docs |
 | F8  | 21.1 adds scripted multicam create and flatten, transitions, fades, speed, audio normalize and a native MCP server. Advanced scripting now requires Studio. | docs |
 | F9  | Today's MCP bridge stops any script after 60 s, so renders and long analyses must run as jobs and be polled. | live |
-| F10 | Several agent threads and Andrew share the one Resolve instance on the edit PC, and threads have already collided (2026-10-11). | live |
+| F10 | Several agent threads and the owner share the one Resolve instance on the edit PC, and threads have already collided (2026-10-11). | live |
 
 ## 3. Architecture
 
@@ -90,7 +90,7 @@ Work is either hot or cold:
   2. Offline: fill in a version-matched template that was exported from the target Resolve version.
 - **Validation gates every write.** Each written file is imported into the sandbox library, read back through the API and compared with the intended model. If it is visual, a frame is rendered as well. A file that has not been validated is labelled `unverified` and never offered to humans.
 - **Version gate.** A file is never stamped newer than the target host. Writing for an older DbPrjVer is refused unless a template for that version exists.
-- **Prior art.** We port the codecs from the `drp-format` JavaScript library and from Andrew's `drp_tools`. `drp_tools` supplies codecs and format notes only; it has no keyframe writer, so fader keyframes do not come from it. We do not reuse DRP-Toolkit, which is GPL.
+- **Prior art.** We port the codecs from the `drp-format` JavaScript library and from the owner's `drp_tools`. `drp_tools` supplies codecs and format notes only; it has no keyframe writer, so fader keyframes do not come from it. We do not reuse DRP-Toolkit, which is GPL.
   - **`drp-format` licence: unconfirmed.** The standalone repository `samuelgursky/drp-format` returns 404 (checked 2026-10-19). The library is vendored at `resolve-advanced/vendor/drp-format/` in `samuelgursky/davinci-resolve-mcp`. The repository's root `LICENSE` and the vendored `package.json` both say MIT, but the vendored directory has no licence file of its own and the copyright line names the repository's contributors, not the library's author. We therefore treat the licence as MIT per the host repository and unconfirmed for the directory; `tests/fixtures/drp/README.md` records the commit the four template files come from.
 - **Blocked on approval.** S8 and S9 need permission to use the edit PC's empty Local Database as the sandbox. Switching databases closes the open project.
 
@@ -225,7 +225,7 @@ Other shows get their own profiles.
 
 #### R6 decisions for S13 (2026-10-19)
 
-These are defaults taken from Andrew's recorded feedback on real CCN cuts. Each one is a profile value or a recipe parameter, so it can change without code.
+These are defaults taken from the owner's recorded feedback on real CCN cuts. Each one is a profile value or a recipe parameter, so it can change without code.
 
 - **End on the laugh means its onset.** The last frame lands between the laugh's onset and 400 ms after it: "end hard right after the punchline word or at the first hint of laugh, no dragging laugh, never fade to silence". A short's audio fade-out is a de-click (at most 1 frame), never a fade to silence. Long-forms end on the laugh, then the outro.
 - **Dissolves.** None between content segments. A transition in from black on the first segment and the transition into the outro are allowed (the real long-form build uses a 15-frame start dissolve).
@@ -332,7 +332,7 @@ How agents write to the hub (`aar.hub.writes`, `aar.hub.facts`). The MCP tools a
 | The 60 s MCP cap, hangs and crash reporters | Node-side job runner with a watchdog, not run through the MCP bridge |
 | 21.1 scripting needs Studio | The target is Studio only, as the requirement says |
 
-## 7. Decisions (these defaults hold until Andrew says otherwise)
+## 7. Decisions (these defaults hold until the owner says otherwise)
 
 1. A standalone app, which Command Center threads use as an MCP server. The alternative is to build it inside Command Center.
 2. The hub is tailnet-only for v1. People outside the tailnet will need accounts later.
