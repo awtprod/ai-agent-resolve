@@ -251,6 +251,13 @@ def short_end_fade(ctx: LintContext) -> list[Finding]:
     ]
 
 
+def _media_path(media: str) -> str:
+    """The path part of a media reference: cut at the first ``?`` or ``#``, then trimmed."""
+    for mark in ("?", "#"):
+        media = media.partition(mark)[0]
+    return media.strip()
+
+
 @rule(
     "no-braw-input-color-space",
     severity="error",
@@ -261,14 +268,17 @@ def no_braw_input_color_space(ctx: LintContext) -> list[Finding]:
 
     This is a string check on the plan's own ``media`` text, case-insensitive, and nothing
     more: a media-pool name without an extension, or a path that hides BRAW behind another
-    name, passes. It is the cheap guard that belongs to the linter. The authoritative check,
-    against the real clip as Resolve reports it, belongs to the later compiler slice
-    (``plan.apply``), which is the only place that can see the actual media.
+    name, passes. Surrounding whitespace and a URI query or fragment are not part of the path,
+    so ``file:///acme/a.braw?x=1`` is BRAW and ``a.mov?f=a.braw`` is not. Because the first
+    ``?`` or ``#`` always ends the path, a local file whose own name holds one of them
+    (``take #3.braw``) is not seen as BRAW. It is the cheap guard that belongs to the linter.
+    The authoritative check, against the real clip as Resolve reports it, belongs to the later
+    compiler slice (``plan.apply``), which is the only place that can see the actual media.
     """
     out: list[Finding] = []
     for index, source in enumerate(ctx.plan.sources):
         space = None if source.color is None else source.color.input_color_space
-        if space is None or not source.media.lower().endswith(".braw"):
+        if space is None or not _media_path(source.media).lower().endswith(".braw"):
             continue
         out.append(
             ctx.finding(

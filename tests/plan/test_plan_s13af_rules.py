@@ -77,6 +77,53 @@ def test_braw_in_the_middle_of_the_name_is_not_braw_media(
         assert only(run_lint(braw_source(clean_data, media)), RULE) == []
 
 
+#: Real BRAW references that carry a URI query, a fragment or stray whitespace after ``.braw``.
+DRESSED_BRAW = [
+    "file:///acme/a.braw?x=1",
+    "file:///acme/a.braw#t=1",
+    "file:///acme/a.braw?x=1#t=1",
+    "file:///acme/a.BRAW?x=1",
+    "a.braw ",
+    "a.BRAW \n",
+    " a.braw",
+    "\ta.braw\r\n",
+    "a.braw ?x=1",
+    "a.braw\t#t=1",
+    "a.braw?",
+    "a.braw#",
+]
+
+
+@pytest.mark.parametrize("media", DRESSED_BRAW, ids=repr)
+def test_a_uri_query_fragment_or_stray_whitespace_does_not_hide_braw_media(
+    clean_data: PlanData, run_lint: RunLint, media: str
+) -> None:
+    report = run_lint(braw_source(clean_data, media))
+    [finding] = only(report, RULE)
+    assert finding.severity == "error"
+    assert [r.source_id for r in finding.refs] == ["cam-a"]
+
+
+#: Media that is not BRAW: the ``.braw`` is not the end of the path.
+NOT_BRAW = [
+    "a.braw.mov",
+    "a.brawx",
+    "braw",
+    "a.mov?f=a.braw",
+    "a.mov#a.braw",
+    "file:///acme/a.mov?f=a.braw#a.braw",
+    "a.mov ",
+    "a.braw/clip.mov",
+]
+
+
+@pytest.mark.parametrize("media", NOT_BRAW, ids=repr)
+def test_media_whose_path_does_not_end_in_braw_still_passes(
+    clean_data: PlanData, run_lint: RunLint, media: str
+) -> None:
+    assert only(run_lint(braw_source(clean_data, media)), RULE) == []
+
+
 def test_a_v1_plan_with_braw_media_passes(clean_data: PlanData, run_lint: RunLint) -> None:
     """Version 1 has no colour field, so there is nothing to flag."""
     clean_data["sources"][0]["media"] = "media/acme_take1.braw"
