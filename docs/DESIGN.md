@@ -148,7 +148,7 @@ Agents are the primary users. Humans get a thin supervision console.
 
 #### The EditPlan (version 2)
 
-`aar plan schema` prints the JSON Schema; `src/aar/plan/model.py` is the reference. Positions and lengths are integer frames at the plan's `fps`, and every range is half-open, `[in, out)`.
+`aar plan schema` prints the JSON Schema; `src/aar/plan/model.py` is the reference. Positions and lengths are integer frames at the plan's `fps`, and every range is half-open, `[in, out)`. The published schema is an approximate contract, and the model is authoritative at the numeric edges: a JSON number such as `24.0` as the frame rate or `1.0` as the version passes the schema's `integer` test, but the model refuses it.
 
 - **Version 1 fields** (S5): `project`, `timeline`, `kind` (`longform` or `short`), `fps`, `resolution`, `profile`; `sources` (id, media, camera, shot size, recording id and origin, duration); `segments` (track, source, `src_in`/`src_out`, `record_in`, keyframed `reframe`, `gain_db`); `transitions` between neighbouring segments (video type and length, audio transition); `titles` (lower thirds are `kind: "lower-third"` with a template name, lines and a record in/out); `captions` and `caption_style`; `markers`.
 - **Version 2 adds** what the S13 producers and the `plan.apply` compiler need:

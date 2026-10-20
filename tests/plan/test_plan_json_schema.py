@@ -135,6 +135,13 @@ BAD_FPS: list[Any] = [
     None,
     {"num": 0},
     {"num": 24, "den": 0},
+    # Digits from other scripts: str.isdigit() and \d accept them, the schema's [0-9] does not.
+    "\u0662\u0664",  # Arabic-Indic 24
+    "\uff12\uff14",  # fullwidth 24
+    "\u0662\u0664/\u0661",
+    "24/\u0661",
+    "\uff12\uff14/\uff11",
+    "\u0966",  # Devanagari 0
 ]
 
 
@@ -159,6 +166,32 @@ def test_the_text_form_means_what_the_pattern_says(fps: str) -> None:
     value = Fps.model_validate(fps)
     num, _, den = fps.partition("/")
     assert (value.num, value.den) == (int(num), int(den or 1))
+
+
+@pytest.mark.parametrize(
+    "fps", ["\u0662\u0664", "\uff12\uff14", "24/\u0661", "\u00a024", "24\u3000"], ids=ascii
+)
+def test_the_model_reads_the_text_form_in_ascii_only(fps: str) -> None:
+    """A model-valid fps must never fail the published schema, so the text form is ASCII only.
+
+    The padding cases are a stricter model than the schema, whose ``\\s`` also matches a
+    no-break or ideographic space. A stricter model is the safe direction.
+    """
+    with pytest.raises(ValidationError):
+        Fps.model_validate(fps)
+
+
+DESIGN = FIXTURES.parents[2] / "docs" / "DESIGN.md"
+
+
+def test_the_design_doc_says_the_schema_is_approximate_and_the_model_is_authoritative() -> None:
+    text = DESIGN.read_text(encoding="utf-8")
+    [line] = [x for x in text.splitlines() if x.startswith("`aar plan schema` prints")]
+    assert "approximate contract" in line
+    assert "model is authoritative" in line
+    assert "numeric" in line
+    assert "24.0" in line
+    assert "1.0" in line
 
 
 @pytest.mark.parametrize("name", ["short_clean.plan.json", "short_broken.plan.json"])
