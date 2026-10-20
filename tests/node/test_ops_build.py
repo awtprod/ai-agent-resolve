@@ -1,0 +1,357 @@
+"""S13h1 build ops over the fake: media.import, track.ensure, transition.add, item.set_color,
+item.set_transform and title.place.
+
+Each op: the happy path, ``present`` on a rerun with no mutating call, every error code, the
+bounds of its params, and each fake fault on its write path (the op reports the stable code
+and never claims success). The branch guard, the AST pins and the ops.sequence run are in
+``test_ops_build_pins``.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from typing import Any
+
+import pytest
+from pydantic import ValidationError
+
+from aar.node.ops import get_op
+from aar.node.ops.build import IMPORT_GUARD_EXEMPTION
+
+from .fake_resolve import FakeFolder, FakeMediaPoolItem, FakeTimelineItem
+from .ops_support import CONFIG, Show, content_writes, human_settles
+
+START = 108000
+A_MOV = "X:/acme/media/a.mov"
+B_WAV = "X:/acme/media/b.wav"
+LUT_ROOT = "X:/acme/Support/LUT"
+# The broker restores the human's media-pool folder when it gives the context back; the import
+# tests run without that restore so they see only what the op itself does.
+NO_RESTORE = dataclasses.replace(CONFIG, restore_delay_seconds=1e9)
+
+
+def ref(item: FakeTimelineItem) -> dict[str, Any]:
+    return {
+        "track_type": item.track_type,
+        "track": item.timeline.track_index_of(item),
+        "item_id": item.GetUniqueId(),
+    }
+
+
+def calls(show: Show, name: str) -> list[tuple[Any, ...]]:
+    return [c for c in show.fake.calls if c[0] == name]
+
+
+def validate(op_name: str, params: dict[str, Any]) -> Any:
+    return get_op(op_name).params.model_validate(params)
+
+
+# -- media.import ------------------------------------------------------------------------------
+
+
+def _import_world() -> Show:
+    show = Show(config=NO_RESTORE)
+    show.fake.edit_files = {
+        A_MOV: {},
+        B_WAV: {"kind": "audio"},
+        "X:/acme/media/c.mov": {},
+    }
+    return show
+
+
+def _bin(show: Show, *path: str) -> FakeFolder:
+    return show.project.media_pool.folder(*path)
+
+
+def test_import_creates_the_bin_imports_and_matches_by_file_path() -> None:
+    show = _import_world()
+    result = show.ok(
+        "media.import",
+        {"paths": [A_MOV, "x:\\ACME\\media\\B.WAV"], "bin_path": ["Footage", "Day 3"]},
+    )
+    assert result.bins_created == ["Footage/Day 3"]
+    assert result.bin_path == ("Footage", "Day 3")
+    day3 = _bin(show, "Footage", "Day 3")
+    by_id = {c.GetUniqueId(): c for c in day3.clips}
+    assert [m.status for m in result.media] == ["imported", "imported"]
+    assert [m.path for m in result.media] == [A_MOV, "x:\\ACME\\media\\B.WAV"]
+    # Each result names the item whose File Path is that file (as the filesystem spells it).
+    assert [by_id[m.media.unique_id].props["File Path"] for m in result.media] == [A_MOV, B_WAV]
+    assert [m.file_path for m in result.media] == [A_MOV, B_WAV]
+    assert all(m.media.bin_path == ("Footage", "Day 3") for m in result.media)
+    assert calls(show, "AddSubFolder") == [("AddSubFolder", "Footage", "Day 3")]
+    assert calls(show, "ImportMedia") == [
+        ("ImportMedia", [{"FilePath": A_MOV}, {"FilePath": "x:\\ACME\\media\\B.WAV"}])
+    ]
+    # The bin was made current for the import, then the folder that was current came back.
+    assert [c[1] for c in calls(show, "SetCurrentFolder")] == ["Day 3", "Master"]
+    assert show.project.media_pool.current is show.project.media_pool.GetRootFolder()
+    assert [(n.code, n.trap_id) for n in result.notes] == [
+        ("input_color_space_default", "rcm-input-colorspace")
+    ]
+
+
+def test_import_rerun_is_present_and_makes_no_call() -> None:
+    show = _import_world()
+    params = {"paths": [A_MOV, B_WAV], "bin_path": ["Footage", "Day 3"]}
+    first = show.ok("media.import", params)
+    show.fake.calls.clear()
+    again = show.ok("media.import", params)
+    assert [m.status for m in again.media] == ["present", "present"]
+    assert [m.media.unique_id for m in again.media] == [m.media.unique_id for m in first.media]
+    assert again.bins_created == [] and again.notes == []
+    assert content_writes(show.fake) == []
+    assert calls(show, "SetCurrentFolder") == []
+    assert len(_bin(show, "Footage", "Day 3").clips) == 2
+
+
+def test_import_matches_existing_items_case_insensitively_across_separators() -> None:
+    show = _import_world()
+    existing = show.project.media_pool.add_clip(("Footage", "Day 1"), "a", file_path=A_MOV)
+    result = show.ok(
+        "media.import", {"paths": ["x:\\ACME\\MEDIA\\A.MOV"], "bin_path": ["Footage", "Day 1"]}
+    )
+    assert [(m.status, m.media.unique_id) for m in result.media] == [
+        ("present", existing.GetUniqueId())
+    ]
+    assert calls(show, "ImportMedia") == []
+
+
+def test_import_restores_the_current_folder_after_success_and_failure() -> None:
+    show = _import_world()
+    pool = show.project.media_pool
+    music = pool.folder("Music")
+    pool.current = music
+    human_settles(show)
+    show.ok("media.import", {"paths": [A_MOV], "bin_path": ["Footage", "Day 2"]})
+    assert pool.current is music
+    error = show.fails(
+        "media.import", {"paths": ["X:/acme/missing.mov", B_WAV], "bin_path": ["Footage", "Day 2"]}
+    )
+    assert error.code == "import_failed"
+    assert pool.current is music
+    assert [c[1] for c in calls(show, "SetCurrentFolder")] == ["Day 2", "Music"] * 2
+
+
+def test_import_if_present_error_refuses_before_importing_anything() -> None:
+    show = _import_world()
+    existing = show.project.media_pool.add_clip(("Footage", "Day 2"), "a", file_path=A_MOV)
+    before = dict(existing.props)
+    error = show.fails(
+        "media.import",
+        {"paths": [A_MOV, B_WAV], "bin_path": ["Footage", "Day 2"], "if_present": "error"},
+    )
+    assert error.code == "media_present"
+    assert [m["media"]["unique_id"] for m in error.detail["present"]] == [existing.GetUniqueId()]
+    assert calls(show, "ImportMedia") == [] and calls(show, "SetCurrentFolder") == []
+    assert existing.props == before
+    assert len(_bin(show, "Footage", "Day 2").clips) == 1
+
+
+def test_import_never_reimports_or_changes_an_existing_item() -> None:
+    show = _import_world()
+    pool = show.project.media_pool
+    existing = pool.add_clip(
+        ("Footage", "Day 2"), "a", file_path=A_MOV, input_color_space="Rec.709"
+    )
+    other = pool.add_clip(("Footage", "Day 2"), "kept")
+    snapshots = {c.GetUniqueId(): dict(c.props) for c in (existing, other)}
+    result = show.ok("media.import", {"paths": [A_MOV, B_WAV], "bin_path": ["Footage", "Day 2"]})
+    assert [m.status for m in result.media] == ["present", "imported"]
+    # Only the missing path went to ImportMedia; the existing items are untouched and kept.
+    assert calls(show, "ImportMedia") == [("ImportMedia", [{"FilePath": B_WAV}])]
+    folder = _bin(show, "Footage", "Day 2")
+    assert existing in folder.clips and other in folder.clips and len(folder.clips) == 3
+    assert {c.GetUniqueId(): dict(c.props) for c in (existing, other)} == snapshots
+    assert [c for c in show.fake.calls if c[0] in ("SetClipProperty", "DeleteClips")] == []
+
+
+def test_import_failed_names_the_missing_path_and_reports_the_rest_done() -> None:
+    show = _import_world()
+    # The missing path comes first: the item Resolve returns must be matched by its File
+    # Path, not taken for the first path asked.
+    error = show.fails(
+        "media.import", {"paths": ["X:/acme/missing.mov", A_MOV], "bin_path": ["Footage", "Day 2"]}
+    )
+    assert error.code == "import_failed"
+    assert error.detail["paths"] == ["X:/acme/missing.mov"]
+    assert [(m["path"], m["status"]) for m in error.detail["completed"]] == [(A_MOV, "imported")]
+    imported = error.detail["completed"][0]["media"]["unique_id"]
+    assert {
+        c.GetUniqueId(): c.props["File Path"] for c in _bin(show, "Footage", "Day 2").clips
+    } == {imported: A_MOV}
+    rerun = show.fails(
+        "media.import", {"paths": ["X:/acme/missing.mov", A_MOV], "bin_path": ["Footage", "Day 2"]}
+    )
+    assert rerun.code == "import_failed"
+    assert [(m["path"], m["status"]) for m in rerun.detail["completed"]] == [(A_MOV, "present")]
+
+
+def test_import_partial_fault_is_import_failed_never_success() -> None:
+    show = _import_world()
+    show.fake.faults.add("ImportMedia:partial")
+    error = show.fails("media.import", {"paths": [A_MOV, B_WAV], "bin_path": ["Footage", "Day 2"]})
+    assert error.code == "import_failed" and error.detail["paths"] == [B_WAV]
+    assert [m["path"] for m in error.detail["completed"]] == [A_MOV]
+
+
+def test_import_duplicate_fault_is_unexpected_and_deletes_nothing() -> None:
+    show = _import_world()
+    show.fake.faults.add("ImportMedia:duplicate")
+    error = show.fails("media.import", {"paths": [A_MOV, B_WAV], "bin_path": ["Footage", "Day 2"]})
+    assert error.code == "import_unexpected"
+    clips = _bin(show, "Footage", "Day 2").clips
+    twins = [c.GetUniqueId() for c in clips if c.props["File Path"] == A_MOV]
+    assert len(twins) == 2
+    assert sorted(u["media_id"] for u in error.detail["unexpected"]) == sorted(twins)
+    assert [m["path"] for m in error.detail["completed"]] == [B_WAV]
+    assert len(clips) == 3 and calls(show, "DeleteClips") == []
+
+
+def test_import_an_item_for_a_path_not_asked_for_is_unexpected() -> None:
+    show = _import_world()
+    pool = show.project.media_pool
+    real = pool.ImportMedia
+
+    def import_and_more(infos: list[Any]) -> list[Any]:
+        made = list(real(infos))
+        stray = FakeMediaPoolItem(show.fake, "s", file_path="X:/acme/media/stray.mov")
+        pool.current.clips.append(stray)
+        return [*made, stray]
+
+    pool.ImportMedia = import_and_more  # type: ignore[method-assign]
+    error = show.fails("media.import", {"paths": [A_MOV], "bin_path": ["Footage", "Day 2"]})
+    assert error.code == "import_unexpected"
+    assert [u["file_path"] for u in error.detail["unexpected"]] == ["X:/acme/media/stray.mov"]
+    assert [m["path"] for m in error.detail["completed"]] == [A_MOV]
+
+
+def test_import_an_item_that_is_not_in_the_bin_is_unverified() -> None:
+    show = _import_world()
+    pool = show.project.media_pool
+    real = pool.ImportMedia
+
+    def import_elsewhere(infos: list[Any]) -> list[Any]:
+        made = list(real(infos))
+        for clip in made:
+            pool.current.clips.remove(clip)
+            pool.GetRootFolder().clips.append(clip)
+        return made
+
+    pool.ImportMedia = import_elsewhere  # type: ignore[method-assign]
+    error = show.fails("media.import", {"paths": [A_MOV], "bin_path": ["Footage", "Day 2"]})
+    assert error.code == "import_unverified" and len(error.detail["media_ids"]) == 1
+
+
+def test_import_missing_bin_without_create_bins_is_refused() -> None:
+    show = _import_world()
+    error = show.fails(
+        "media.import",
+        {"paths": [A_MOV], "bin_path": ["Footage", "Day 9"], "create_bins": False},
+    )
+    assert error.code == "bin_missing" and error.detail["bin_path"] == ["Footage", "Day 9"]
+    assert content_writes(show.fake) == []
+
+
+def test_import_bin_create_and_select_faults_are_reported() -> None:
+    show = _import_world()
+    show.fake.faults.add("AddSubFolder:fail")
+    error = show.fails("media.import", {"paths": [A_MOV], "bin_path": ["New"]})
+    assert error.code == "bin_create_failed" and calls(show, "ImportMedia") == []
+    show.fake.faults = {"SetCurrentFolder:ignored"}
+    error = show.fails("media.import", {"paths": [A_MOV], "bin_path": ["Footage", "Day 2"]})
+    assert error.code == "bin_select_failed" and calls(show, "ImportMedia") == []
+
+
+def test_a_bin_that_add_sub_folder_does_not_really_make_is_caught() -> None:
+    show = _import_world()
+    pool = show.project.media_pool
+    pool.AddSubFolder = lambda folder, name: FakeFolder(name, "fold-detached")  # type: ignore[method-assign]
+    error = show.fails("media.import", {"paths": [A_MOV], "bin_path": ["New"]})
+    assert error.code == "bin_create_failed" and calls(show, "ImportMedia") == []
+
+
+def test_import_ambiguous_bin_or_item_is_refused() -> None:
+    show = _import_world()
+    pool = show.project.media_pool
+    pool.folder("Footage").subfolders.append(FakeFolder("Day 1", "fold-twin"))
+    error = show.fails("media.import", {"paths": [A_MOV], "bin_path": ["Footage", "Day 1"]})
+    assert error.code == "bin_ambiguous"
+    pool.add_clip(("Music",), "a1", file_path=A_MOV)
+    pool.add_clip(("Music",), "a2", file_path="x:\\acme\\media\\A.mov")
+    error = show.fails("media.import", {"paths": [A_MOV], "bin_path": ["Music"]})
+    assert error.code == "media_ambiguous" and len(error.detail["media_ids"]) == 2
+    assert calls(show, "ImportMedia") == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "media/a.mov",
+        "a.mov",
+        "X:media\\a.mov",
+        "/acme/media/a.mov",
+        "X:/acme/../a.mov",
+        "X:/acme/./a.mov",
+        "X:/acme//a.mov",
+        "X:/acme/media/",
+        "X:/",
+        "X:/acme/a\x00.mov",
+        "X:/acme/a\t.mov",
+        "X:/acme/a\n.mov",
+        "\\\\?\\X:\\acme\\a.mov",
+        "\\\\.\\pipe\\a",
+        "\\\\host\\share",
+        "\\\\host",
+        "//host/share/a.mov",
+        "X:/" + "a" * 1022,
+        "",
+    ],
+)
+def test_import_refuses_paths_that_are_not_absolute_edit_pc_files(path: str) -> None:
+    with pytest.raises(ValidationError):
+        validate("media.import", {"paths": [path], "bin_path": ["Footage"]})
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["X:/acme/media/a.mov", "x:\\acme\\media\\a.mov", "\\\\host\\share\\a.mov", "X:/" + "a" * 1021],
+)
+def test_import_accepts_drive_and_unc_paths(path: str) -> None:
+    assert validate("media.import", {"paths": [path], "bin_path": ["Footage"]}).paths == [path]
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"paths": [], "bin_path": ["Footage"]},
+        {"paths": [f"X:/acme/{n}.mov" for n in range(51)], "bin_path": ["Footage"]},
+        {"paths": [A_MOV, "x:\\ACME\\media\\a.MOV"], "bin_path": ["Footage"]},
+        {"paths": [A_MOV], "bin_path": []},
+        {"paths": [A_MOV], "bin_path": ["b"] * 9},
+        {"paths": [A_MOV], "bin_path": ["  "]},
+        {"paths": [A_MOV], "bin_path": ["b" * 129]},
+        {"paths": [A_MOV], "bin_path": ["Footage"], "create_bins": "yes"},
+        {"paths": [A_MOV], "bin_path": ["Footage"], "if_present": "replace"},
+        {"paths": [A_MOV], "bin_path": ["Footage"], "timeline": {"unique_id": "x"}},
+    ],
+)
+def test_import_params_are_bounded(params: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        validate("media.import", params)
+
+
+def test_import_list_bounds_accept_fifty_and_eight_deep() -> None:
+    params = {"paths": [f"X:/acme/{n}.mov" for n in range(50)], "bin_path": ["b"] * 8}
+    assert len(validate("media.import", params).paths) == 50
+
+
+def test_import_guard_exemption_text_is_pinned() -> None:
+    assert (
+        get_op("media.import").guard_exemption
+        == IMPORT_GUARD_EXEMPTION
+        == (
+            "additive: only adds media-pool items to the named bin; never alters, moves, relinks "
+            "or deletes existing items or any timeline"
+        )
+    )

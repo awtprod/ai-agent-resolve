@@ -40,6 +40,7 @@ EXPECTED = {
     "render.build": (True, True),
     "render.poll": (True, False),
     "render.delete_job": (True, True),
+    "media.import": (True, True),
 }
 
 

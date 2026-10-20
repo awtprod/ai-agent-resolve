@@ -394,8 +394,10 @@ def test_p2_ops_run_and_branches_are_owned_as_the_jobs_agent(tmp_path: Path) -> 
 
 def test_p3_exactly_the_render_ops_carry_a_guard_exemption() -> None:
     exempt = {s.name: s.guard_exemption for s in list_ops() if s.guard_exemption is not None}
-    assert set(exempt) == {"render.build", "render.delete_job"}
-    assert all(reason and "render" in reason for reason in exempt.values())
+    # S13h1 adds media.import, the one build op with an exemption (pinned in test_ops_build_pins).
+    assert set(exempt) == {"render.build", "render.delete_job", "media.import"}
+    assert all(reason and "render" in reason for n, reason in exempt.items() if n != "media.import")
+    assert exempt["media.import"].startswith("additive: only adds media-pool items")
     # The other guard pass is S11's creates_timeline, on exactly the two copy-making ops.
     assert {s.name for s in list_ops() if s.creates_timeline} == {
         "timeline.duplicate",
