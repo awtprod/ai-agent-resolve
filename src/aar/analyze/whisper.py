@@ -395,7 +395,29 @@ def _header(media: Path, settings: WhisperSettings, model_path: Path) -> dict[st
     }
 
 
-_SEGMENT_KEYS = {"start", "end", "text", "avg_logprob", "compression_ratio", "no_speech_prob"}
+_SEGMENT_NUMBERS = ("start", "end", "avg_logprob", "compression_ratio", "no_speech_prob")
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _valid_segment(seg: Any) -> bool:
+    """A checkpoint line as ``segment_record`` writes it: numbers, text and word quadruples."""
+    if not (isinstance(seg, dict) and isinstance(seg.get("text"), str)):
+        return False
+    if not all(_is_number(seg.get(key)) for key in _SEGMENT_NUMBERS):
+        return False
+    words = seg.get("words")
+    return isinstance(words, list) and all(
+        isinstance(w, list)
+        and len(w) == 4
+        and _is_number(w[0])
+        and _is_number(w[1])
+        and isinstance(w[2], str)
+        and _is_number(w[3])
+        for w in words
+    )
 
 
 def read_checkpoint(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
@@ -423,10 +445,10 @@ def read_checkpoint(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]], i
         raise corrupt("its first line is not an aar transcript checkpoint header")
     last = -math.inf
     for i, seg in enumerate(segments, start=1):
-        if not (isinstance(seg, dict) and seg.keys() >= _SEGMENT_KEYS):
-            raise corrupt(f"segment line {i} is missing fields")
-        if not isinstance(seg.get("words"), list) or seg["start"] < last:
-            raise corrupt(f"segment line {i} is malformed or out of order")
+        if not _valid_segment(seg):
+            raise corrupt(f"segment line {i} is not a segment record")
+        if seg["start"] < last:
+            raise corrupt(f"segment line {i} starts before the one above it")
         last = seg["start"]
     return header, segments, len(complete)
 

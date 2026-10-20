@@ -33,6 +33,7 @@ from aar.analyze.whisper import (
 )
 from aar.cli import main
 from aar.plan.inputs import Transcript, load_transcript
+from aar.qa import Transcriber
 
 RATE = 16000
 SECONDS = 10.0
@@ -496,15 +497,30 @@ def test_an_existing_checkpoint_is_not_overwritten_without_resume(
 
 
 @needs_ffmpeg
-def test_a_corrupt_checkpoint_is_refused(tmp_path, fake, models, media, capsys):
+@pytest.mark.parametrize(
+    "damage",
+    [
+        lambda seg: b"not json\n",
+        lambda seg: seg.replace(b'"start": 1.6', b'"start": "1.6"'),
+        lambda seg: seg.replace(b'"start": 1.6', b'"start": true'),
+        lambda seg: seg.replace(b'"text": " how are you"', b'"text": 7'),
+        lambda seg: seg.replace(b'"words": [[', b'"words": [[1.0], ['),
+        lambda seg: seg.replace(b'"start": 1.6', b'"start": 0.1'),  # out of order
+        lambda seg: b"[]\n",
+    ],
+)
+def test_a_corrupt_checkpoint_is_refused(tmp_path, fake, models, media, capsys, damage):
     out = tmp_path / "t.json"
     fake.fail_after = 2
     run_cli(capsys, media, "--out", out)
     ckpt = checkpoint_path(out)
     lines = ckpt.read_bytes().splitlines(keepends=True)
-    ckpt.write_bytes(lines[0] + b"not json\n" + lines[2])
+    damaged = damage(lines[2])
+    assert damaged != lines[2]
+    ckpt.write_bytes(lines[0] + lines[1] + damaged)
     code, body = run_cli(capsys, media, "--out", out, "--resume")
     assert code == 2 and body["error"]["type"] == "checkpoint-corrupt"
+    assert str(ckpt) in body["error"]["hint"]
 
 
 @needs_ffmpeg
@@ -641,6 +657,7 @@ def test_input_of_unknown_length_past_the_cap_is_refused(tmp_path, fake, models,
 @needs_ffmpeg
 def test_qa_transcriber_returns_file_seconds_for_one_window(fake, models, media):
     transcriber = WhisperTranscriber("medium.en", model_dir=models)
+    assert isinstance(transcriber, Transcriber)
     fake.window = (4.0, 8.0)
     words = transcriber.transcribe(media, 4.0, 8.0)
     [call] = fake.calls
