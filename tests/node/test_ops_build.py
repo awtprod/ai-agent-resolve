@@ -355,3 +355,229 @@ def test_import_guard_exemption_text_is_pinned() -> None:
             "or deletes existing items or any timeline"
         )
     )
+
+
+# -- track.ensure ------------------------------------------------------------------------------
+
+
+def test_tracks_are_appended_named_and_read_back() -> None:
+    show = Show()
+    result = show.ok(
+        "track.ensure",
+        {
+            "timeline": show.ref("Main"),
+            "tracks": [
+                {"type": "audio", "index": 3, "name": "A3 room", "audio_format": "mono"},
+                {"type": "video", "index": 2, "name": "V2 titles", "enabled": False},
+            ],
+        },
+    )
+    a3, v2 = result.tracks
+    assert (a3.type, a3.index, a3.created, a3.name, a3.audio_format) == (
+        "audio", 3, True, "A3 room", "mono"
+    )  # fmt: skip
+    assert a3.changed == ["created", "name"] and not a3.locked and a3.enabled
+    assert (v2.created, v2.name, v2.enabled, v2.audio_format) == (True, "V2 titles", False, None)
+    # Appended only, with the subtype passed for audio; the fill-in track takes it too.
+    assert calls(show, "AddTrack") == [
+        ("AddTrack", "audio", "mono"),
+        ("AddTrack", "audio", "mono"),
+        ("AddTrack", "video", None),
+    ]
+    assert [(a.type, a.index, a.audio_format) for a in result.added] == [
+        ("audio", 2, "mono"), ("audio", 3, "mono"), ("video", 2, None)
+    ]  # fmt: skip
+    assert [t.subtype for t in show.main.tracks["audio"]] == ["stereo", "mono", "mono"]
+    assert show.main.tracks["video"][1].name == "V2 titles"
+    assert not show.main.tracks["video"][1].enabled
+
+
+def test_tracks_rerun_is_present_with_no_call() -> None:
+    show = Show()
+    params = {
+        "timeline": show.ref("Main"),
+        "tracks": [
+            {"type": "audio", "index": 2, "name": "A2", "enabled": False, "locked": True},
+            {"type": "video", "index": 1, "name": "Video 1"},
+        ],
+    }
+    show.ok("track.ensure", params)
+    show.fake.calls.clear()
+    again = show.ok("track.ensure", params)
+    assert [(t.created, t.changed) for t in again.tracks] == [(False, []), (False, [])]
+    assert again.added == [] and content_writes(show.fake) == []
+
+
+def test_a_lower_spec_keeps_its_own_format() -> None:
+    show = Show()
+    show.ok(
+        "track.ensure",
+        {
+            "timeline": show.ref("Main"),
+            "tracks": [
+                {"type": "audio", "index": 3, "audio_format": "5.1"},
+                {"type": "audio", "index": 2, "audio_format": "mono"},
+            ],
+        },
+    )
+    assert [t.subtype for t in show.main.tracks["audio"]] == ["stereo", "mono", "5.1"]
+
+
+def test_an_existing_track_of_another_format_is_refused_before_any_write() -> None:
+    show = Show()
+    error = show.fails(
+        "track.ensure",
+        {
+            "timeline": show.ref("Main"),
+            "tracks": [
+                {"type": "video", "index": 2},
+                {"type": "audio", "index": 1, "audio_format": "mono", "name": "A1"},
+            ],
+        },
+    )
+    assert error.code == "track_format_mismatch"
+    assert (error.detail["have"], error.detail["wanted"]) == ("stereo", "mono")
+    assert content_writes(show.fake) == []
+
+
+def test_a_locked_track_is_never_written_unless_the_spec_unlocks_it() -> None:
+    show = Show()
+    show.main.tracks["audio"][0].locked = True
+    error = show.fails(
+        "track.ensure",
+        {"timeline": show.ref("Main"), "tracks": [{"type": "audio", "index": 1, "name": "x"}]},
+    )
+    assert error.code == "track_locked" and error.detail["fields"] == ["name"]
+    error = show.fails(
+        "track.ensure",
+        {
+            "timeline": show.ref("Main"),
+            "tracks": [{"type": "audio", "index": 1, "enabled": False, "locked": True}],
+        },
+    )
+    assert error.code == "track_locked" and error.detail["fields"] == ["enabled"]
+    assert content_writes(show.fake) == []
+    # Asking for locked=True with nothing else to change is fine (present).
+    kept = show.ok(
+        "track.ensure",
+        {"timeline": show.ref("Main"), "tracks": [{"type": "audio", "index": 1, "locked": True}]},
+    )
+    assert kept.tracks[0].changed == [] and content_writes(show.fake) == []
+    # locked=False in the same spec: unlock first, then write.
+    result = show.ok(
+        "track.ensure",
+        {
+            "timeline": show.ref("Main"),
+            "tracks": [{"type": "audio", "index": 1, "name": "dialogue", "locked": False}],
+        },
+    )
+    assert result.tracks[0].changed == ["locked", "name"]
+    assert [c[0] for c in content_writes(show.fake)] == ["SetTrackLock", "SetTrackName"]
+    assert show.main.tracks["audio"][0].name == "dialogue"
+
+
+def test_a_locked_track_later_in_the_request_stops_it_before_any_write() -> None:
+    show = Show()
+    show.main.tracks["audio"][0].locked = True
+    error = show.fails(
+        "track.ensure",
+        {
+            "timeline": show.ref("Main"),
+            "tracks": [
+                {"type": "video", "index": 1, "name": "picture"},
+                {"type": "audio", "index": 1, "name": "dialogue"},
+            ],
+        },
+    )
+    assert error.code == "track_locked" and content_writes(show.fake) == []
+
+
+def test_a_lock_asked_for_is_set_after_the_other_writes() -> None:
+    show = Show()
+    result = show.ok(
+        "track.ensure",
+        {
+            "timeline": show.ref("Main"),
+            "tracks": [{"type": "video", "index": 1, "name": "picture", "locked": True}],
+        },
+    )
+    assert result.tracks[0].changed == ["name", "locked"] and result.tracks[0].locked
+    assert [c[0] for c in content_writes(show.fake)] == ["SetTrackName", "SetTrackLock"]
+
+
+@pytest.mark.parametrize(
+    ("fault", "spec", "field"),
+    [
+        ("SetTrackName:no-op", {"name": "x"}, "name"),
+        ("SetTrackEnable:no-op", {"enabled": False}, "enabled"),
+        ("SetTrackLock:no-op", {"locked": True}, "locked"),
+    ],
+)
+def test_a_track_setter_that_does_not_stick_is_caught(
+    fault: str, spec: dict[str, Any], field: str
+) -> None:
+    show = Show()
+    show.fake.faults.add(fault)
+    error = show.fails(
+        "track.ensure",
+        {"timeline": show.ref("Main"), "tracks": [{"type": "video", "index": 1, **spec}]},
+    )
+    assert error.code == "track_not_applied" and error.detail["field"] == field
+
+
+def test_a_track_that_is_not_added_is_caught_with_the_tracks_done() -> None:
+    show = Show()
+    show.fake.faults.add("AddTrack:no-op")
+    error = show.fails(
+        "track.ensure",
+        {
+            "timeline": show.ref("Main"),
+            "tracks": [{"type": "video", "index": 1, "name": "V1"}, {"type": "video", "index": 2}],
+        },
+    )
+    assert error.code == "track_add_failed"
+    assert [(t["index"], t["name"]) for t in error.detail["completed"]] == [(1, "V1")]
+
+
+def test_a_refused_track_setter_is_track_set_failed() -> None:
+    show = Show()
+    show.main.tracks["video"][0].locked = True
+    real = show.main.GetIsTrackLocked
+    show.main.GetIsTrackLocked = lambda kind, index: False  # type: ignore[method-assign]
+    error = show.fails(
+        "track.ensure",
+        {"timeline": show.ref("Main"), "tracks": [{"type": "video", "index": 1, "name": "x"}]},
+    )
+    show.main.GetIsTrackLocked = real  # type: ignore[method-assign]
+    assert error.code == "track_set_failed" and error.detail["field"] == "name"
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"type": "video", "index": 0},
+        {"type": "video", "index": 17},
+        {"type": "video", "index": True},
+        {"type": "video", "index": 1, "name": "x" * 65},
+        {"type": "video", "index": 1, "name": " "},
+        {"type": "video", "index": 1, "audio_format": "mono"},
+        {"type": "audio", "index": 1, "audio_format": "quad"},
+        {"type": "audio", "index": 1, "enabled": "no"},
+        {"type": "audio", "index": 1, "mute": True},
+        {"type": "bus", "index": 1},
+    ],
+)
+def test_track_specs_are_bounded(spec: dict[str, Any]) -> None:
+    show = Show()
+    with pytest.raises(ValidationError):
+        validate("track.ensure", {"timeline": show.ref("Main"), "tracks": [spec]})
+
+
+def test_track_lists_are_bounded_and_unique() -> None:
+    show = Show()
+    tl = show.ref("Main")
+    many = [{"type": "audio", "index": n % 16 + 1} for n in range(51)]
+    for tracks in ([], many, [{"type": "video", "index": 2}, {"type": "video", "index": 2}]):
+        with pytest.raises(ValidationError):
+            validate("track.ensure", {"timeline": tl, "tracks": tracks})
+    assert validate("track.ensure", {"timeline": tl, "tracks": [{"type": "video", "index": 16}]})

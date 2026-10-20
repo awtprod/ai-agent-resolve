@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import re
 import string
+from collections.abc import Callable
 from typing import Annotated, Any, Literal
 
 from pydantic import AfterValidator, Field, model_validator
@@ -39,9 +40,13 @@ from aar.node.ops.framework import (
     OpEnv,
     OpError,
     OpModel,
+    TimelineIdentity,
+    TimelineRef,
+    TrackType,
     op,
 )
 from aar.node.ops.write import (
+    _JAM_HINT,
     _no_repeats,
     _with_completed,
 )
@@ -395,3 +400,247 @@ def _match_imports(
         )
     failed = [p for k, p in keys.items() if k not in by_key]
     return imported, failed, unexpected
+
+
+# -- track.ensure ------------------------------------------------------------------------------
+
+AUDIO_FORMATS: tuple[str, ...] = (
+    "mono",
+    "stereo",
+    "5.1",
+    "5.1film",
+    "7.1",
+    "7.1film",
+    *(f"adaptive{n}" for n in range(1, 37)),
+)
+"""[I] The audio channel formats ``AddTrack`` takes as a subtype (facts file)."""
+AudioFormat = Literal[*AUDIO_FORMATS]  # type: ignore[valid-type]
+
+
+class TrackSpec(OpModel):
+    type: TrackType
+    index: int = Field(strict=True, ge=1, le=16, description="1-based track index.")
+    name: TrackName | None = None
+    enabled: bool | None = Field(default=None, strict=True)
+    locked: bool | None = Field(default=None, strict=True)
+    audio_format: AudioFormat | None = Field(
+        default=None,
+        description="Audio only: the channel format the track must have (a format cannot be "
+        "changed by script, so an existing track with another one is refused).",
+    )
+
+    @model_validator(mode="after")
+    def _audio_only(self) -> TrackSpec:
+        if self.audio_format is not None and self.type != "audio":
+            raise ValueError("audio_format is for audio tracks only")
+        return self
+
+
+class TrackParams(OpModel):
+    timeline: TimelineRef
+    tracks: list[TrackSpec] = Field(min_length=1, max_length=MAX_TARGETS)
+
+    @model_validator(mode="after")
+    def _once(self) -> TrackParams:
+        _no_repeats([(t.type, t.index) for t in self.tracks], "track")
+        return self
+
+
+class TrackState(OpModel):
+    type: TrackType
+    index: int
+    created: bool
+    name: str
+    enabled: bool
+    locked: bool
+    audio_format: str | None
+    changed: list[str]
+
+
+class AddedTrack(OpModel):
+    type: TrackType
+    index: int
+    audio_format: str | None
+
+
+class TrackResult(OpModel):
+    timeline: TimelineIdentity
+    tracks: list[TrackState]
+    added: list[AddedTrack]
+    """Every track this call appended, including ones below a spec's index."""
+
+
+def _track_count(timeline: Any, kind: str) -> int:
+    return int(timeline.GetTrackCount(kind) or 0)
+
+
+def _track_state(timeline: Any, spec: TrackSpec, created: bool, changed: list[str]) -> TrackState:
+    kind, index = spec.type, spec.index
+    return TrackState(
+        type=kind,
+        index=index,
+        created=created,
+        name=str(timeline.GetTrackName(kind, index) or ""),
+        enabled=bool(timeline.GetIsTrackEnabled(kind, index)),
+        locked=bool(timeline.GetIsTrackLocked(kind, index)),
+        audio_format=str(timeline.GetTrackSubType(kind, index) or "") if kind == "audio" else None,
+        changed=changed,
+    )
+
+
+def _writes_while_locked(timeline: Any, spec: TrackSpec) -> list[str]:
+    """The fields ``spec`` would change on its (existing) track."""
+    kind, index = spec.type, spec.index
+    fields = []
+    if spec.name is not None and str(timeline.GetTrackName(kind, index) or "") != spec.name:
+        fields.append("name")
+    if spec.enabled is not None and bool(timeline.GetIsTrackEnabled(kind, index)) != spec.enabled:
+        fields.append("enabled")
+    return fields
+
+
+def _refuse_existing(timeline: Any, spec: TrackSpec) -> None:
+    """Refusals for a track that exists, before anything is written."""
+    kind, index = spec.type, spec.index
+    if spec.audio_format is not None:
+        have = str(timeline.GetTrackSubType(kind, index) or "")
+        if have != spec.audio_format:
+            raise OpError(
+                "track_format_mismatch",
+                f"audio track {index} is {have!r}, not {spec.audio_format!r}",
+                "a track's channel format cannot be changed by script: use another track "
+                "index, or change the format by hand",
+                track=index,
+                have=have,
+                wanted=spec.audio_format,
+            )
+    if spec.locked is not False and bool(timeline.GetIsTrackLocked(kind, index)):
+        fields = _writes_while_locked(timeline, spec)
+        if fields:
+            raise _locked(spec, fields)
+
+
+def _locked(spec: TrackSpec, fields: list[str]) -> OpError:
+    return OpError(
+        "track_locked",
+        f"{spec.type} track {spec.index} is locked; the spec would change {fields}",
+        "pass locked=false in the same spec to unlock it first, or unlock it by hand",
+        track_type=spec.type,
+        track=spec.index,
+        fields=fields,
+    )
+
+
+def _set_track(timeline: Any, spec: TrackSpec, field: str, value: Any) -> None:
+    """One track setter, then its getter: a False return or a different read-back raises."""
+    kind, index = spec.type, spec.index
+    calls: dict[str, tuple[Callable[[], Any], Callable[[], Any]]] = {
+        "name": (
+            lambda: timeline.SetTrackName(kind, index, value),
+            lambda: str(timeline.GetTrackName(kind, index) or ""),
+        ),
+        "enabled": (
+            lambda: timeline.SetTrackEnable(kind, index, value),
+            lambda: bool(timeline.GetIsTrackEnabled(kind, index)),
+        ),
+        "locked": (
+            lambda: timeline.SetTrackLock(kind, index, value),
+            lambda: bool(timeline.GetIsTrackLocked(kind, index)),
+        ),
+    }
+    setter, getter = calls[field]
+    if not setter():
+        raise OpError(
+            "track_set_failed",
+            f"setting {field}={value!r} on {kind} track {index} returned False",
+            f"check the track is not locked; {_JAM_HINT}",
+            track_type=kind,
+            track=index,
+            field=field,
+        )
+    after = getter()
+    if after != value:
+        raise OpError(
+            "track_not_applied",
+            f"{kind} track {index}: {field} reads back {after!r} after setting {value!r}",
+            "set it by hand in the timeline's track header",
+            track_type=kind,
+            track=index,
+            field=field,
+            wanted=value,
+            actual=after,
+        )
+
+
+def _ensure_track(timeline: Any, spec: TrackSpec, added: list[AddedTrack]) -> TrackState:
+    kind, index = spec.type, spec.index
+    created = False
+    count = _track_count(timeline, kind)
+    while count < index:
+        # Tracks are only ever appended, never deleted or reordered. The subtype is passed only
+        # when there is one.
+        args = (kind,) if spec.audio_format is None else (kind, spec.audio_format)
+        ok = timeline.AddTrack(*args)
+        after = _track_count(timeline, kind)
+        got = str(timeline.GetTrackSubType(kind, count + 1) or "") if kind == "audio" else None
+        if not ok or after != count + 1 or (spec.audio_format not in (None, got)):
+            raise OpError(
+                "track_add_failed",
+                f"AddTrack{args} left {after} {kind} track(s) (was {count}), new track "
+                f"format {got!r}",
+                "add the track by hand, then run again",
+                track_type=kind,
+                track=count + 1,
+                returned=bool(ok),
+                audio_format=got,
+            )
+        count = after
+        created = count == index
+        added.append(AddedTrack(type=kind, index=count, audio_format=got))
+    changed = ["created"] if created else []
+    locked = bool(timeline.GetIsTrackLocked(kind, index))
+    if locked and spec.locked is False:
+        _set_track(timeline, spec, "locked", False)  # unlock first, then write
+        changed.append("locked")
+        locked = False
+    fields = _writes_while_locked(timeline, spec) if locked else []
+    if fields:
+        raise _locked(spec, fields)
+    if spec.name is not None and str(timeline.GetTrackName(kind, index) or "") != spec.name:
+        _set_track(timeline, spec, "name", spec.name)
+        changed.append("name")
+    if spec.enabled is not None and bool(timeline.GetIsTrackEnabled(kind, index)) != spec.enabled:
+        _set_track(timeline, spec, "enabled", spec.enabled)
+        changed.append("enabled")
+    if spec.locked is True and not locked:
+        _set_track(timeline, spec, "locked", True)  # lock last, after the other writes
+        changed.append("locked")
+    return _track_state(timeline, spec, created, changed)
+
+
+@op("track.ensure", params=TrackParams, result=TrackResult, mutates=True)
+def track_ensure(env: OpEnv, params: TrackParams) -> TrackResult:
+    """Make sure tracks exist (appending only) and set their name, enabled and lock, read back.
+
+    There is no Fairlight mute, solo, bus or bounce call in 21.1: a disabled track is the
+    nearest scriptable state to a mute.
+    """
+    timeline = env.timeline(params.timeline)
+    for spec in params.tracks:
+        if spec.index <= _track_count(timeline, spec.type):
+            _refuse_existing(timeline, spec)
+    added: list[AddedTrack] = []
+    done: dict[tuple[str, int], TrackState] = {}
+    # Lower indexes first, so a spec's own format is used for its track rather than the
+    # fill-in format of a higher spec.
+    try:
+        for spec in sorted(params.tracks, key=lambda s: (s.type, s.index)):
+            done[(spec.type, spec.index)] = _ensure_track(timeline, spec, added)
+    except OpError as exc:
+        finished = [done[(s.type, s.index)] for s in params.tracks if (s.type, s.index) in done]
+        raise _partial(exc, finished, tracks_added=[a.model_dump() for a in added]) from exc
+    return TrackResult(
+        timeline=env.identity(timeline),
+        tracks=[done[(s.type, s.index)] for s in params.tracks],
+        added=added,
+    )

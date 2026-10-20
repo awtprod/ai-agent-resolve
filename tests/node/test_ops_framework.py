@@ -41,6 +41,7 @@ EXPECTED = {
     "render.poll": (True, False),
     "render.delete_job": (True, True),
     "media.import": (True, True),
+    "track.ensure": (True, True),
 }
 
 
