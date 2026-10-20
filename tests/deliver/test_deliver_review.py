@@ -198,6 +198,10 @@ def test_transcode_retries_once_at_a_lower_bitrate(tmp_path: Path, sources: Path
     assert transcoder.calls[1]["video_kbps"] == 412  # floor(0.85 * 485)
     assert result.transcoded is True
     assert result.video_kbps == 412
+    # On the transcode path the review differs from the source, so the hash fact holds the
+    # REVIEW file's sha256 (the stored artifact), not the source render's.
+    hash_fact = facts_view(hub.log, hub.project_id).get("render.hash.short-1")
+    assert hash_fact.current.value == {"sha256": result.artifact_id, "bytes": result.size}
 
 
 def test_over_cap_after_retry_is_refused(tmp_path: Path, sources: Path) -> None:
