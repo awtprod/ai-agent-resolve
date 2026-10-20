@@ -32,6 +32,9 @@ READ_TOOLS = {
     "project_board",
     "agent_branches",
     "approvals_list",
+    # S13g2: recipe_status is the 13th always-listed read tool. It is listed even without
+    # --agent-writes because agents need it to drive a recipe run (see DESIGN "Recipe runner").
+    "recipe_status",
 }
 WRITE_TOOLS = {
     "brief_create",
@@ -40,6 +43,11 @@ WRITE_TOOLS = {
     "node_set_status",
     "facts_record",
     "facts_retract",
+    # S13g2 recipe write tools (listed only with --agent-writes).
+    "recipe_start",
+    "step_complete",
+    "recipe_retry",
+    "recipe_cancel",
 }
 NEW_READS = {"facts_get", "brief_get", "plan_get"}
 HUMAN_ONLY_WORDS = ("decide", "approve", "grant", "revoke", "resume", "stop", "withdraw")
