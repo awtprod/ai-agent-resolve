@@ -1,9 +1,9 @@
 """Typed errors for the analysis workers, and the lazy imports of their optional extras.
 
-numpy (extra ``analyze``) and faster-whisper (extra ``whisper``) are imported only by the
-functions that need them, so ``import aar``, ``import aar.cli`` and ``import aar.analyze`` work
-without either. A command that needs a missing one raises ``AnalyzeError("missing-extra")``
-whose hint names the extra to install.
+numpy (extra ``analyze``), faster-whisper (extra ``whisper``) and OpenCV (extra ``faces``)
+are imported only by the functions that need them, so ``import aar``, ``import aar.cli`` and
+``import aar.analyze`` work without any of them. A command that needs a missing one raises
+``AnalyzeError("missing-extra")`` whose hint names the extra to install.
 
 Exit codes (the ``aar qa check`` split, docs/DESIGN.md): an error whose type is in
 ``INPUT_ERRORS`` means an input, a tool or a model could not be located or opened, or an
@@ -96,6 +96,11 @@ def _require(module: str, extra: str, purpose: str) -> ModuleType:
 def need_numpy() -> Any:
     """numpy, or ``AnalyzeError("missing-extra")`` naming the ``analyze`` extra."""
     return _require("numpy", "analyze", "audio analysis")
+
+
+def need_cv2() -> Any:
+    """cv2 (OpenCV), or ``AnalyzeError("missing-extra")`` naming the ``faces`` extra."""
+    return _require("cv2", "faces", "face detection")
 
 
 def need_faster_whisper() -> Any:
