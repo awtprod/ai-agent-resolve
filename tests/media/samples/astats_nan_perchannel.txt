@@ -1,0 +1,63 @@
+  Metadata:
+    encoder         : Lavf60.16.100
+Stream mapping:
+  Stream #0:0 -> #0:0 (pcm_f32le (native) -> pcm_s16le (native))
+Output #0, null, to 'pipe:':
+  Metadata:
+    encoder         : Lavf60.16.100
+    Metadata:
+      encoder         : Lavc60.31.102 pcm_s16le
+[Parsed_astats_0 @ 0x610dc9d35700] Channel: 1
+[Parsed_astats_0 @ 0x610dc9d35700] DC offset: -nan
+[Parsed_astats_0 @ 0x610dc9d35700] Min level: 179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000
+[Parsed_astats_0 @ 0x610dc9d35700] Max level: -179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000
+[Parsed_astats_0 @ 0x610dc9d35700] Min difference: 179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000
+[Parsed_astats_0 @ 0x610dc9d35700] Max difference: 0.000000
+[Parsed_astats_0 @ 0x610dc9d35700] Mean difference: 0.000000
+[Parsed_astats_0 @ 0x610dc9d35700] RMS difference: 0.000000
+[Parsed_astats_0 @ 0x610dc9d35700] Peak level dB: nan
+[Parsed_astats_0 @ 0x610dc9d35700] RMS level dB: -nan
+[Parsed_astats_0 @ 0x610dc9d35700] RMS peak dB: -nan
+[Parsed_astats_0 @ 0x610dc9d35700] RMS trough dB: 3082.547156
+[Parsed_astats_0 @ 0x610dc9d35700] Crest factor: -nan
+[Parsed_astats_0 @ 0x610dc9d35700] Flat factor: -nan
+[Parsed_astats_0 @ 0x610dc9d35700] Peak count: 0
+[Parsed_astats_0 @ 0x610dc9d35700] Abs Peak count: 0
+[Parsed_astats_0 @ 0x610dc9d35700] Noise floor dB: nan
+[Parsed_astats_0 @ 0x610dc9d35700] Noise floor count: 1
+[Parsed_astats_0 @ 0x610dc9d35700] Entropy: -0.000000
+[Parsed_astats_0 @ 0x610dc9d35700] Dynamic range: inf
+[Parsed_astats_0 @ 0x610dc9d35700] Zero crossings: 0
+[Parsed_astats_0 @ 0x610dc9d35700] Zero crossings rate: 0.000000
+[Parsed_astats_0 @ 0x610dc9d35700] Number of NaNs: 24000
+[Parsed_astats_0 @ 0x610dc9d35700] Number of Infs: 0
+[Parsed_astats_0 @ 0x610dc9d35700] Number of denormals: 0
+[Parsed_astats_0 @ 0x610dc9d35700] Channel: 2
+[Parsed_astats_0 @ 0x610dc9d35700] DC offset: 0.000000
+[Parsed_astats_0 @ 0x610dc9d35700] Min level: 0.000000
+[Parsed_astats_0 @ 0x610dc9d35700] Max level: 0.000000
+[Parsed_astats_0 @ 0x610dc9d35700] Min difference: 0.000000
+[Parsed_astats_0 @ 0x610dc9d35700] Max difference: 0.000000
+[Parsed_astats_0 @ 0x610dc9d35700] Mean difference: 0.000000
+[Parsed_astats_0 @ 0x610dc9d35700] RMS difference: 0.000000
+[Parsed_astats_0 @ 0x610dc9d35700] Peak level dB: -inf
+[Parsed_astats_0 @ 0x610dc9d35700] RMS level dB: -inf
+[Parsed_astats_0 @ 0x610dc9d35700] RMS peak dB: -inf
+[Parsed_astats_0 @ 0x610dc9d35700] RMS trough dB: -inf
+[Parsed_astats_0 @ 0x610dc9d35700] Crest factor: 1.000000
+[Parsed_astats_0 @ 0x610dc9d35700] Flat factor: -inf
+[Parsed_astats_0 @ 0x610dc9d35700] Peak count: 48000
+[Parsed_astats_0 @ 0x610dc9d35700] Abs Peak count: 24000
+[Parsed_astats_0 @ 0x610dc9d35700] Noise floor dB: -inf
+[Parsed_astats_0 @ 0x610dc9d35700] Noise floor count: 21601
+[Parsed_astats_0 @ 0x610dc9d35700] Entropy: -0.000000
+[Parsed_astats_0 @ 0x610dc9d35700] Dynamic range: -inf
+[Parsed_astats_0 @ 0x610dc9d35700] Zero crossings: 0
+[Parsed_astats_0 @ 0x610dc9d35700] Zero crossings rate: 0.000000
+[Parsed_astats_0 @ 0x610dc9d35700] Number of NaNs: 0
+[Parsed_astats_0 @ 0x610dc9d35700] Number of Infs: 0
+[Parsed_astats_0 @ 0x610dc9d35700] Number of denormals: 0
+[Parsed_astats_0 @ 0x610dc9d35700] Overall
+[Parsed_astats_0 @ 0x610dc9d35700] Peak level dB: -inf
+[Parsed_astats_0 @ 0x610dc9d35700] Number of NaNs: 12000.000000
+[Parsed_astats_0 @ 0x610dc9d35700] Number of Infs: 0.000000

@@ -1,0 +1,700 @@
+"""S13a-f validator follow-ups: the BRAW input-colour-space rule (F2), the plan version (F1),
+blank text lines (F5), what the cut rules count (F3) and the Head fade note (F6)."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from typing import Annotated, Any, get_args, get_origin
+
+import pytest
+from plan_support import FIXTURES, PlanData, only
+from pydantic import BaseModel, ValidationError
+
+from aar.plan.lint import LintReport, all_rules
+from aar.plan.model import EditPlan, Head, _not_blank
+from aar.plan.profile import Profile
+
+RunLint = Callable[..., LintReport]
+
+RULE = "no-braw-input-color-space"
+
+
+def braw_source(data: PlanData, media: str, *, space: str | None = "Rec.709 Gamma 2.4") -> PlanData:
+    """The clean short as a v2 plan whose first source is ``media``, with a colour override."""
+    data["version"] = 2
+    source = data["sources"][0]
+    source["media"] = media
+    if space is not None:
+        source["color"] = {"input_color_space": space}
+    return data
+
+
+@pytest.mark.parametrize(
+    "media",
+    ["media/acme_take1.braw", "media/acme_take1.BRAW", "media/acme_take1.BrAw", "A001_C002.braw"],
+)
+def test_input_color_space_on_braw_media_is_an_error(
+    clean_data: PlanData, run_lint: RunLint, media: str
+) -> None:
+    report = run_lint(braw_source(clean_data, media))
+    [finding] = only(report, RULE)
+    assert finding.severity == "error"
+    assert report.ok is False
+    assert report.counts["error"] >= 1
+    assert "'cam-a'" in finding.message
+    assert media in finding.message
+    assert "Rec.709 Gamma 2.4" in finding.message
+    assert "input_color_space" in finding.fix_hint
+    assert "'cam-a'" in finding.fix_hint
+    assert "BRAW decodes through its own RAW settings" in finding.fix_hint
+    assert [r.source_id for r in finding.refs] == ["cam-a"]
+
+
+def test_mov_with_a_colour_override_passes(clean_data: PlanData, run_lint: RunLint) -> None:
+    report = run_lint(braw_source(clean_data, "media/acme_take1.mov"))
+    assert only(report, RULE) == []
+
+
+def test_braw_without_a_colour_override_passes(clean_data: PlanData, run_lint: RunLint) -> None:
+    report = run_lint(braw_source(clean_data, "media/acme_take1.braw", space=None))
+    assert only(report, RULE) == []
+
+
+def test_braw_with_colour_but_no_input_space_passes(
+    clean_data: PlanData, run_lint: RunLint
+) -> None:
+    data = braw_source(clean_data, "media/acme_take1.braw", space=None)
+    data["sources"][0]["color"] = {"lut": "acme_look"}
+    assert only(run_lint(data), RULE) == []
+
+
+def test_braw_in_the_middle_of_the_name_is_not_braw_media(
+    clean_data: PlanData, run_lint: RunLint
+) -> None:
+    """Only the end of the media string counts: it is an extension test, not a substring test."""
+    for media in ("media/braw/acme_take1.mov", "media/acme.braw.mov", "acme_braw"):
+        assert only(run_lint(braw_source(clean_data, media)), RULE) == []
+
+
+#: Real BRAW references that carry a URI query or fragment, or stray whitespace, after ``.braw``.
+DRESSED_BRAW = [
+    "file:///acme/a.braw?x=1",
+    "file:///acme/a.braw#t=1",
+    "file:///acme/a.braw?x=1#t=1",
+    "file:///acme/a.BRAW?x=1",
+    "https://acme/x.braw#t=1",
+    "file:///acme/a%23b.braw",
+    "file:///acme/a.braw ?x=1",
+    "file:///acme/a.braw\t#t=1",
+    "file:///acme/a.braw?",
+    "file:///acme/a.braw#",
+    " file:///acme/a.braw?x=1\n",
+    "a.braw ",
+    "a.BRAW \n",
+    " a.braw",
+    "\ta.braw\r\n",
+]
+
+#: A URI scheme is letters, digits, ``+``, ``.`` and ``-`` before ``://``, in any case.
+MIXED_CASE_SCHEMES = [
+    "FILE:///acme/a.braw?x=1",
+    "File:///acme/a.braw#t=1",
+    "Https://acme/x.BRAW#t=1",
+    "HTTPS://acme/x.braw?x=1",
+    "s3+x.y-z://acme/x.braw?x=1",
+]
+
+
+@pytest.mark.parametrize("media", [*DRESSED_BRAW, *MIXED_CASE_SCHEMES], ids=repr)
+def test_a_uri_query_fragment_or_stray_whitespace_does_not_hide_braw_media(
+    clean_data: PlanData, run_lint: RunLint, media: str
+) -> None:
+    report = run_lint(braw_source(clean_data, media))
+    [finding] = only(report, RULE)
+    assert finding.severity == "error"
+    assert [r.source_id for r in finding.refs] == ["cam-a"]
+
+
+#: Local names that hold ``#``, ``?`` or ``:`` themselves. With no ``scheme://`` in front, the
+#: whole string is the name, so these are BRAW files, as they were before the URI handling.
+LOCAL_BRAW_NAMES = [
+    "take #3.braw",
+    "take?.braw",
+    "take #3.BRAW  ",
+    "D:\\acme\\ep#2\\a.braw",
+    "C:\\acme\\take #3.braw",
+    "C:/acme/take#3.braw",
+    "C://acme/take#3.braw",  # a doubled slash after a drive letter is still a drive
+    "\\\\acme\\share\\ep#2\\a.braw",
+    "/acme/ep#2/a.braw",
+    "/acme/ab://b#1.braw",  # a scheme counts only at the start of the string
+    "bin:take #3.braw",  # a colon without the two slashes is no scheme
+    "bin:/take #3.braw",  # a scheme needs ://, not just :/
+    "a.mov?f=a.braw",  # a local name: it really does end in .braw
+    "a.mov#a.braw",
+]
+
+
+@pytest.mark.parametrize("media", LOCAL_BRAW_NAMES, ids=repr)
+def test_a_local_braw_name_that_holds_a_question_mark_or_hash_is_still_braw(
+    clean_data: PlanData, run_lint: RunLint, media: str
+) -> None:
+    report = run_lint(braw_source(clean_data, media))
+    [finding] = only(report, RULE)
+    assert finding.severity == "error"
+    assert [r.source_id for r in finding.refs] == ["cam-a"]
+    assert repr(media) in finding.message
+
+
+#: Media that is not BRAW: the path (or, with no scheme, the whole name) does not end in ``.braw``.
+NOT_BRAW = [
+    "a.braw.mov",
+    "a.brawx",
+    "braw",
+    "a.mov ",
+    "a.braw/clip.mov",
+    "file:///acme/a.mov?f=a.braw",
+    "file:///acme/a.mov#a.braw",
+    "file:///acme/a.mov?f=a.braw#a.braw",
+    "FILE:///acme/a.mov?f=a.braw",
+    "https://acme/a.braw.mov?x=1",
+    "https://acme/a.brawx#t=1",
+    # With no scheme the whole string is the name, and these names do not end in .braw.
+    "a.braw?x=1",
+    "a.braw#t=1",
+    "take #3.mov",
+    "D:\\acme\\ep#2\\a.mov",
+]
+
+
+@pytest.mark.parametrize("media", NOT_BRAW, ids=repr)
+def test_media_whose_path_does_not_end_in_braw_still_passes(
+    clean_data: PlanData, run_lint: RunLint, media: str
+) -> None:
+    assert only(run_lint(braw_source(clean_data, media)), RULE) == []
+
+
+def test_a_v1_plan_with_braw_media_passes(clean_data: PlanData, run_lint: RunLint) -> None:
+    """Version 1 has no colour field, so there is nothing to flag."""
+    clean_data["sources"][0]["media"] = "media/acme_take1.braw"
+    assert clean_data["version"] == 1
+    assert only(run_lint(clean_data), RULE) == []
+
+
+def test_only_the_braw_sources_are_named(clean_data: PlanData, run_lint: RunLint) -> None:
+    data = braw_source(clean_data, "media/acme_take1.braw")
+    data["sources"][1]["color"] = {"input_color_space": "Rec.709 Gamma 2.4"}  # .mov: fine
+    data["sources"][2]["media"] = "media/acme_take3.BRAW"
+    data["sources"][2]["color"] = {"input_color_space": "Rec.709 Gamma 2.4"}
+    findings = only(run_lint(data), RULE)
+    assert [f.refs[0].source_id for f in findings] == ["cam-a", "cam-c"]
+    assert "sources[0]" in findings[0].message
+    assert "sources[2]" in findings[1].message
+
+
+def test_a_profile_with_the_rule_off_passes(
+    clean_data: PlanData, run_lint: RunLint, ccn: Profile
+) -> None:
+    ccn.rules[RULE].enabled = False
+    report = run_lint(braw_source(clean_data, "media/acme_take1.braw"), profile=ccn)
+    assert only(report, RULE) == []
+
+
+def test_a_profile_can_regrade_the_rule(
+    clean_data: PlanData, run_lint: RunLint, ccn: Profile
+) -> None:
+    ccn.rules[RULE].severity = "warn"
+    report = run_lint(braw_source(clean_data, "media/acme_take1.braw"), profile=ccn)
+    [finding] = only(report, RULE)
+    assert finding.severity == "warn"
+
+
+def test_the_rule_is_registered_as_an_error_rule_without_thresholds() -> None:
+    registered = all_rules()[RULE]
+    assert registered.severity == "error"
+    assert registered.params == ()
+    assert registered.needs == ()
+    assert "BRAW" in registered.summary
+
+
+def test_the_ccn_profile_runs_the_rule_as_an_error(ccn: Profile) -> None:
+    config = ccn.rules[RULE]
+    assert config.enabled is True
+    assert config.severity is None  # the rule's own severity, which is "error"
+    assert config.params == {}
+
+
+# --- F1: the plan version is a whole number ---------------------------------------------------
+
+
+def version_errors(data: PlanData, *, as_json: bool = False) -> list[dict[str, object]]:
+    """The errors validating ``data`` gives, through Python input or through JSON text."""
+    with pytest.raises(ValidationError) as caught:
+        if as_json:
+            EditPlan.model_validate_json(json.dumps(data))
+        else:
+            EditPlan.model_validate(data)
+    return [dict(error) for error in caught.value.errors()]
+
+
+@pytest.mark.parametrize("version", [True, False, 1.0, 2.0, 0.0, 1.5, "2", "1", 0, 3, None, [2]])
+@pytest.mark.parametrize("as_json", [False, True], ids=["python", "json"])
+def test_a_version_that_is_not_the_whole_number_1_or_2_is_one_error_at_version(
+    clean_data: PlanData, version: object, as_json: bool
+) -> None:
+    clean_data["version"] = version
+    [error] = version_errors(clean_data, as_json=as_json)
+    assert error["loc"] == ("version",)
+    assert error["type"] == "literal_error"
+    assert str(error["msg"]).startswith("Input should be 1 or 2")
+
+
+@pytest.mark.parametrize("version", ["2", "1", 0, 3, None, [2]])
+def test_any_other_bad_version_keeps_the_plain_message(
+    clean_data: PlanData, version: object
+) -> None:
+    """The "not a boolean or a decimal" note is only for a boolean or a decimal."""
+    clean_data["version"] = version
+    [error] = version_errors(clean_data)
+    assert error["msg"] == "Input should be 1 or 2"
+
+
+@pytest.mark.parametrize("version", [True, 1.0, 2.0])
+def test_the_error_for_a_boolean_or_decimal_version_says_what_is_wrong(
+    clean_data: PlanData, version: object
+) -> None:
+    clean_data["version"] = version
+    [error] = version_errors(clean_data)
+    assert "whole number" in str(error["msg"])
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["python", "json"])
+@pytest.mark.parametrize("version", [1, 2])
+def test_the_whole_numbers_1_and_2_still_work(
+    clean_data: PlanData, version: int, as_json: bool
+) -> None:
+    clean_data["version"] = version
+    if as_json:
+        plan = EditPlan.model_validate_json(json.dumps(clean_data))
+    else:
+        plan = EditPlan.model_validate(clean_data)
+    assert plan.version == version
+    assert type(plan.version) is int
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["python", "json"])
+def test_an_omitted_version_is_still_2(clean_data: PlanData, as_json: bool) -> None:
+    del clean_data["version"]
+    if as_json:
+        plan = EditPlan.model_validate_json(json.dumps(clean_data))
+    else:
+        plan = EditPlan.model_validate(clean_data)
+    assert plan.version == 2
+
+
+def test_a_bad_version_does_not_pile_a_second_error_on_a_v1_plan(clean_data: PlanData) -> None:
+    """The version is wrong, so the v1/v2 check never runs: still one error."""
+    clean_data["version"] = True
+    clean_data["template"] = "Example Template"  # a v2 field; would be a plan_version error
+    assert len(version_errors(clean_data)) == 1
+
+
+def test_the_version_schema_is_still_the_integer_1_or_2() -> None:
+    schema = EditPlan.model_json_schema()["properties"]["version"]
+    assert schema["type"] == "integer"
+    assert schema["enum"] == [1, 2]
+    assert schema["default"] == 2
+
+
+# --- F5: no blank text lines ------------------------------------------------------------------
+
+BLANKS = ["", " ", "   ", "\t", "\n", " \u00a0 "]
+
+
+def with_sting(data: PlanData, lines: list[str]) -> PlanData:
+    """A version 2 plan with an outro whose sting has these lines."""
+    data["version"] = 2
+    data["sources"].append({"id": "outro", "media": "media/outro.mov", "duration": 302})
+    data["outro"] = {"source": "outro", "sting": {"lines": lines, "start": 2, "frames": 100}}
+    return data
+
+
+def errors_at(data: PlanData) -> list[tuple[tuple[str | int, ...], str]]:
+    """(loc, message) of every error validating ``data`` gives."""
+    return [(tuple(e["loc"]), str(e["msg"])) for e in version_errors(data)]
+
+
+@pytest.mark.parametrize("blank", BLANKS)
+def test_a_blank_sting_line_is_one_error_at_that_line(clean_data: PlanData, blank: str) -> None:
+    with_sting(clean_data, ["Pat Example", blank])
+    [(loc, msg)] = errors_at(clean_data)
+    assert loc == ("outro", "sting", "lines", 1)
+    assert "blank" in msg
+
+
+@pytest.mark.parametrize("blank", BLANKS)
+def test_a_blank_title_line_is_one_error_at_that_line(clean_data: PlanData, blank: str) -> None:
+    clean_data["titles"][0]["lines"] = [blank, "Stand-up comic"]
+    [(loc, msg)] = errors_at(clean_data)
+    assert loc == ("titles", 0, "lines", 0)
+    assert "blank" in msg
+
+
+@pytest.mark.parametrize("blank", BLANKS)
+def test_a_blank_caption_line_is_one_error_at_that_line(clean_data: PlanData, blank: str) -> None:
+    clean_data["captions"][1]["lines"] = ["WAIT FOR IT", blank]
+    [(loc, msg)] = errors_at(clean_data)
+    assert loc == ("captions", 1, "lines", 1)
+    assert "blank" in msg
+
+
+def test_every_blank_line_gets_its_own_error(clean_data: PlanData) -> None:
+    clean_data["captions"][0]["lines"] = ["", "ONE", " "]
+    assert [loc for loc, _ in errors_at(clean_data)] == [
+        ("captions", 0, "lines", 0),
+        ("captions", 0, "lines", 2),
+    ]
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["python", "json"])
+def test_a_blank_line_is_refused_through_json_too(clean_data: PlanData, as_json: bool) -> None:
+    clean_data["captions"][0]["lines"] = ["  "]
+    [error] = version_errors(clean_data, as_json=as_json)
+    assert error["loc"] == ("captions", 0, "lines", 0)
+
+
+#: Lines that show nothing: only format characters (Cf), non-spacing marks (Mn) and whitespace.
+INVISIBLE = [
+    "\u200b",  # zero-width space
+    "\u200c",  # zero-width non-joiner
+    "\u200d",  # zero-width joiner
+    "\ufeff",  # byte order mark
+    "\u2060",  # word joiner
+    "\u00ad",  # soft hyphen
+    "\u0301",  # a lone combining acute accent
+    "\ufe0f",  # a lone variation selector
+    "\u0301\u0302",
+    "\u200b\u200d\u200c",
+    " \u200b ",
+    "\u200b\n\ufeff\t",
+    "\u00a0\u2060\u3000",
+]
+
+#: Lines that show something, however small or odd.
+VISIBLE = [
+    "!",
+    ".",
+    "a",
+    "\u00e1",  # a-acute, one character
+    "a\u0301",  # a plus a combining acute accent
+    "\U0001f469\u200d\U0001f4bb",  # woman technologist: emoji joined by a ZWJ
+    "\U0001f600",
+    "\u200ba",
+    "a\u200b",
+    "\u200b!\u200b",
+    " x ",
+    "\u0301a",
+    "\u4e2d\u6587",
+]
+
+
+@pytest.mark.parametrize("invisible", INVISIBLE, ids=ascii)
+def test_an_invisible_sting_line_is_one_error_at_that_line(
+    clean_data: PlanData, invisible: str
+) -> None:
+    with_sting(clean_data, ["Pat Example", invisible])
+    [(loc, msg)] = errors_at(clean_data)
+    assert loc == ("outro", "sting", "lines", 1)
+    assert "must not be empty or blank" in msg
+
+
+@pytest.mark.parametrize("invisible", INVISIBLE, ids=ascii)
+def test_an_invisible_title_line_is_one_error_at_that_line(
+    clean_data: PlanData, invisible: str
+) -> None:
+    clean_data["titles"][0]["lines"] = [invisible, "Stand-up comic"]
+    [(loc, msg)] = errors_at(clean_data)
+    assert loc == ("titles", 0, "lines", 0)
+    assert "must not be empty or blank" in msg
+
+
+@pytest.mark.parametrize("invisible", INVISIBLE, ids=ascii)
+@pytest.mark.parametrize("as_json", [False, True], ids=["python", "json"])
+def test_an_invisible_caption_line_is_one_error_at_that_line(
+    clean_data: PlanData, invisible: str, as_json: bool
+) -> None:
+    clean_data["captions"][1]["lines"] = ["WAIT FOR IT", invisible]
+    [error] = version_errors(clean_data, as_json=as_json)
+    assert error["loc"] == ("captions", 1, "lines", 1)
+    assert "must not be empty or blank" in str(error["msg"])
+
+
+@pytest.mark.parametrize("invisible", INVISIBLE, ids=ascii)
+def test_an_invisible_name_is_refused_wherever_a_name_is_needed(
+    clean_data: PlanData, invisible: str
+) -> None:
+    """The check is the shared ``Name`` one, so a colour space or LUT name cannot be invisible."""
+    clean_data["version"] = 2
+    clean_data["sources"][0]["color"] = {"input_color_space": invisible}
+    [(loc, _)] = errors_at(clean_data)
+    assert loc == ("sources", 0, "color", "input_color_space")
+
+
+@pytest.mark.parametrize("visible", VISIBLE, ids=ascii)
+def test_a_line_that_shows_something_is_accepted(clean_data: PlanData, visible: str) -> None:
+    with_sting(clean_data, ["Pat Example", visible])
+    clean_data["titles"][0]["lines"] = [visible]
+    clean_data["captions"][0]["lines"] = [visible, "TWO"]
+    plan = EditPlan.model_validate(clean_data)
+    assert plan.outro is not None and plan.outro.sting is not None
+    assert plan.outro.sting.lines[1] == visible
+    assert plan.titles[0].lines == [visible]
+    assert plan.captions[0].lines[0] == visible
+
+
+def test_every_invisible_line_gets_its_own_error(clean_data: PlanData) -> None:
+    clean_data["captions"][0]["lines"] = ["\u200b", "ONE", "\ufeff\u0301", "\u00e1"]
+    assert [loc for loc, _ in errors_at(clean_data)] == [
+        ("captions", 0, "lines", 0),
+        ("captions", 0, "lines", 2),
+    ]
+
+
+def test_an_empty_list_of_lines_is_still_refused(clean_data: PlanData) -> None:
+    clean_data["captions"][0]["lines"] = []
+    [(loc, _)] = errors_at(clean_data)
+    assert loc == ("captions", 0, "lines")
+
+
+def test_ordinary_lines_still_validate_and_keep_their_text(clean_data: PlanData) -> None:
+    """Padding inside a line is the author's business; only an all-blank line is refused."""
+    with_sting(clean_data, ["Pat Example", " Stand-up comic "])
+    clean_data["titles"][0]["lines"] = ["A", "B"]
+    clean_data["captions"][0]["lines"] = ["I PARKED THERE", "FOR ONE MINUTE"]
+    plan = EditPlan.model_validate(clean_data)
+    assert plan.outro is not None and plan.outro.sting is not None
+    assert plan.outro.sting.lines == ["Pat Example", " Stand-up comic "]
+    assert plan.titles[0].lines == ["A", "B"]
+    assert plan.captions[0].lines == ["I PARKED THERE", "FOR ONE MINUTE"]
+
+
+def _is_text_line(annotation: Any) -> bool:
+    """Is this the item type of a text-line list: a string that goes through ``_not_blank``?"""
+    return get_origin(annotation) is Annotated and any(
+        getattr(meta, "func", None) is _not_blank for meta in get_args(annotation)[1:]
+    )
+
+
+def text_line_paths(model: type[BaseModel], path: tuple[str, ...] = ()) -> list[tuple[str, ...]]:
+    """Every path from ``model`` to a list of text lines, found from the model's annotations.
+
+    A path ends at a ``list`` field whose items are text lines (``list[Name]``); it passes through
+    any field that holds a model, a list of models or an optional model. A text-line list added
+    to the plan later is picked up without a change here.
+    """
+    found: list[tuple[str, ...]] = []
+    for name, field in model.model_fields.items():
+        pending = [field.annotation]
+        while pending:
+            annotation = pending.pop()
+            if get_origin(annotation) is list:
+                [item] = get_args(annotation)
+                if _is_text_line(item):
+                    found.append((*path, name))
+                else:
+                    pending.append(item)
+            elif isinstance(annotation, type) and issubclass(annotation, BaseModel):
+                found.extend(text_line_paths(annotation, (*path, name)))
+            elif get_origin(annotation) is not None:  # X | None, Annotated[...]
+                pending.extend(get_args(annotation))
+    return found
+
+
+def _lines_at(node: Any, path: tuple[str, ...]) -> list[str]:
+    """The strings at ``path`` below ``node``, going through lists and skipping missing keys."""
+    if isinstance(node, list):
+        return [line for item in node for line in _lines_at(item, path)]
+    if path and isinstance(node, dict):
+        return _lines_at(node.get(path[0]), path[1:])
+    return [node] if not path and isinstance(node, str) else []
+
+
+def blank_text_lines(data: Any) -> list[str]:
+    """Every text line of the plan data that the model would refuse as blank."""
+    blank: list[str] = []
+    for path in text_line_paths(EditPlan):
+        for line in _lines_at(data, path):
+            try:
+                _not_blank(line)
+            except ValueError:
+                blank.append(line)
+    return blank
+
+
+def test_the_text_line_lists_are_found_from_the_model() -> None:
+    paths = text_line_paths(EditPlan)
+    assert {("titles", "lines"), ("captions", "lines"), ("outro", "sting", "lines")} <= set(paths)
+    assert len(paths) == len(set(paths))
+    # Names that are not lists of lines are not text-line lists.
+    assert ("outro", "audio_track") not in paths
+    assert ("audio_tracks", "name") not in paths
+
+
+def test_the_guard_sees_a_blank_line_in_every_text_line_list() -> None:
+    data = {
+        "titles": [{"lines": ["ok", " "]}, {"lines": ["\u200b"]}],
+        "captions": [{"lines": ["ok", "\ufeff\u0301"]}],
+        "outro": {"sting": {"lines": ["ok", "", "\u2060"]}},
+        "segments": [{"label": " "}],  # not a text line: ignored
+    }
+    assert blank_text_lines(data) == [" ", "\u200b", "\ufeff\u0301", "", "\u2060"]
+
+
+def test_the_guard_is_quiet_for_real_text_and_for_missing_parts() -> None:
+    assert blank_text_lines({"outro": None, "titles": None}) == []
+    assert blank_text_lines({"outro": {"sting": None}}) == []
+    assert blank_text_lines({"captions": [{"lines": ["\u00e1", "!"]}]}) == []
+    assert blank_text_lines({}) == []
+
+
+def test_no_fixture_plan_has_a_blank_text_line() -> None:
+    """The plan fixtures and goldens must keep validating: none of them uses a blank line.
+
+    Blank means what the model means: whitespace, format characters and combining marks only.
+    Every text-line list of the model is checked (titles, captions, the outro's sting).
+    """
+    plans = sorted(FIXTURES.rglob("*.plan.json"))
+    assert plans
+    for path in plans:
+        data: Any = json.loads(path.read_text(encoding="utf-8"))
+        assert blank_text_lines(data) == [], path.name
+
+
+# --- F3: the cut rules see same-track joins only ----------------------------------------------
+
+DESIGN = FIXTURES.parents[2] / "docs" / "DESIGN.md"
+
+#: The rules built on joins (neighbouring segments on one track), and the one that hints with them.
+JOIN_RULES = (
+    "cut-density",
+    "no-same-camera-jump",
+    "timejump-close-to-wide",
+    "audio-crossfade",
+    "min-shot",
+)
+
+
+def three_segments_two_cuts(data: PlanData) -> PlanData:
+    """Track 1 only: segments of 250, 100 and 100 frames at 25 fps, cuts at 10 s and 14 s."""
+    data["fps"] = 25
+    data["transitions"] = []
+    data["segments"] = [
+        {"source": "cam-a", "src_in": 1000, "src_out": 1250},
+        {"source": "cam-a", "src_in": 1350, "src_out": 1450},
+        {"source": "cam-a", "src_in": 1550, "src_out": 1650},
+    ]
+    return data
+
+
+def join_findings(report: LintReport) -> list[tuple[str, str, str]]:
+    return [(f.rule, f.severity, f.message) for f in report.findings if f.rule in JOIN_RULES]
+
+
+def test_the_design_doc_says_the_cut_rules_consider_same_track_joins_only() -> None:
+    text = DESIGN.read_text(encoding="utf-8")
+    [line] = [x for x in text.splitlines() if x.startswith("The join-based cut rules")]
+    for rule_id in JOIN_RULES:
+        assert f"`{rule_id}`" in line
+    assert "same-track joins only" in line
+    assert "overlay entry" in line
+    assert "cut into the outro" in line
+
+
+def test_the_design_doc_says_no_dialogue_splice_also_uses_same_track_joins() -> None:
+    """The cut rules' list is not closed: the splice rule reads joins too, without counting cuts."""
+    text = DESIGN.read_text(encoding="utf-8")
+    [line] = [x for x in text.splitlines() if x.startswith("The join-based cut rules")]
+    assert "`no-dialogue-splice`" in line
+    assert "`src/aar/plan/rules/speech.py`" in line
+    assert "also uses same-track joins" in line
+    assert "unbroken continuations" in line
+    assert "does not count cuts" in line
+    # The clause is about the splice rule, so it comes after the list of cut-counting rules.
+    assert line.index("`no-dialogue-splice`") > line.index("`min-shot`")
+
+
+def test_the_design_doc_says_how_the_braw_rule_reads_the_media_text() -> None:
+    text = DESIGN.read_text(encoding="utf-8")
+    [line] = [x for x in text.splitlines() if x.startswith("  - `Source.color`")]
+    assert "`no-braw-input-color-space`" in line
+    assert "`.braw`" in line
+    assert "in any case" in line
+    assert "`scheme://...`" in line
+    assert "loses its query and fragment" in line
+    assert "tested whole" in line
+    assert "`take #3.braw`" in line
+
+
+def test_an_overlay_entry_on_another_track_is_not_a_cut(
+    clean_data: PlanData, run_lint: RunLint
+) -> None:
+    base = three_segments_two_cuts(clean_data)
+    before = join_findings(run_lint(base))
+    # Two cuts in 10 s is the most the profile allows, so a third would warn.
+    assert not [f for f in before if f[0] == "cut-density"]
+    clean_data["segments"].append(
+        {"track": 2, "source": "cam-a", "src_in": 5000, "src_out": 5100, "record_in": 400}
+    )
+    plan = EditPlan.model_validate(clean_data)
+    assert plan.joins() == [(0, 1), (1, 2)]
+    assert join_findings(run_lint(clean_data)) == before
+
+
+def test_the_same_segment_on_the_main_track_is_a_cut(
+    clean_data: PlanData, run_lint: RunLint
+) -> None:
+    """The control for the overlay test: on track 1 it is a third cut, and it is counted."""
+    three_segments_two_cuts(clean_data)
+    clean_data["segments"].append({"source": "cam-a", "src_in": 5000, "src_out": 5100})
+    [finding] = only(run_lint(clean_data), "cut-density")
+    assert finding.message.startswith("3 cuts in ")
+
+
+def test_the_cut_into_the_outro_is_not_a_cut(clean_data: PlanData, run_lint: RunLint) -> None:
+    three_segments_two_cuts(clean_data)
+    before = join_findings(run_lint(clean_data))
+    clean_data["version"] = 2
+    clean_data["sources"].append({"id": "outro", "media": "media/outro.mov", "duration": 302})
+    # A 10-frame outro (0.4 s) is shorter than min-shot allows and follows the 2nd cut by 4 s.
+    clean_data["outro"] = {"source": "outro", "src_out": 10}
+    assert EditPlan.model_validate(clean_data).outro_range() == (450, 460)
+    assert join_findings(run_lint(clean_data)) == before
+
+
+# --- F6: the head's audio fade-in is uncapped, on purpose -------------------------------------
+
+
+def test_a_long_head_audio_fade_in_is_valid_and_is_not_a_finding(
+    clean_data: PlanData, run_lint: RunLint
+) -> None:
+    baseline = [(f.rule, f.severity, f.message) for f in run_lint(clean_data).findings]
+    clean_data["version"] = 2
+    clean_data["head"] = {"audio_fade_frames": 100_000}
+    plan = EditPlan.model_validate(clean_data)
+    assert plan.head is not None
+    assert plan.head.audio_fade_frames == 100_000
+    assert [(f.rule, f.severity, f.message) for f in run_lint(clean_data).findings] == baseline
+
+
+def test_the_head_docstring_says_the_audio_fade_in_is_uncapped() -> None:
+    doc = Head.__doc__ or ""
+    assert "audio_fade_frames" in doc
+    assert "uncapped" in doc
+
+
+def test_a_negative_head_audio_fade_is_still_an_error(clean_data: PlanData) -> None:
+    clean_data["version"] = 2
+    clean_data["head"] = {"audio_fade_frames": -1}
+    [error] = version_errors(clean_data)
+    assert error["loc"] == ("head", "audio_fade_frames")

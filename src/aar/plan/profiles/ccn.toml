@@ -1,0 +1,110 @@
+# House rules for the CCN comedy show. Thresholds live here, not in code.
+# A rule that is not listed does not run. Per rule: enabled = false switches it off and
+# severity = "error" | "warn" | "info" re-grades its findings; every other key is a threshold.
+
+name = "ccn"
+description = "CCN comedy show: continuous takes, hard cuts, crossfaded audio, end on the laugh."
+
+# Post-render QA targets for `aar qa check` (aar.qa); the plan linter does not use them.
+# Every key after review_mp4_max_mb is optional; the values below are the defaults.
+[qa]
+longform_lufs = -22.0
+short_lufs = -14.5
+lufs_tolerance = 0.5      # LU either side of the target
+review_mp4_max_mb = 20    # review renders only; 1 MB = 1,000,000 bytes
+true_peak_max_dbtp = -1.0 # ebur128 true peak (4x oversampled) must be at or below this
+clip_level_dbfs = -0.01   # a decoded sample at or above this magnitude counts as clipped
+silence_db = -42.0        # longest-silence threshold; a venue may use -36 (--silence-db)
+silence_min_s = 0.2       # shorter silences are not reported
+# longest_silence_warn_s = 2.0  # warn when the longest silence is longer; off when absent
+duration_tolerance_frames = 1        # render duration versus the plan's record duration
+join_continuity_tolerance_frames = 1 # a join this close to unbroken playback is not a cut
+join_quiet_db = -40.0     # a cut must start in a pause of the incoming source audio: a run
+join_quiet_min_ms = 60    # ... at least this long below join_quiet_db
+join_quiet_slack_ms = 10  # ... that contains src_in, allowing this much at either end of the run
+join_quiet_search_s = 0.10  # a failed cut's fix hint: nearest such pause within +- this of src_in
+join_quiet_window_ms = 10   # RMS window; a run is the union of windows below join_quiet_db
+join_windows = 3          # overlapping re-transcription windows per join (2 or 3)
+join_window_s = 4.0       # length of each window, centred on the join
+join_window_step_s = 0.5  # offset between windows
+join_window_edge_s = 0.25 # compared region = the windows' overlap less this at each end
+join_agreement_min = 0.8  # difflib ratio every window pair and window vs plan must reach
+word_straddle_s = 0.03    # a word may cross a cut or region edge by this much
+
+# Segments from one recording play in source-time order: no reordering, no imported cold opens.
+[rules.chronological]
+tolerance_frames = 0      # how far a segment may start before the previous one ended
+
+# A cut must not land inside a word, and should sit in a pause.
+[rules.no-dialogue-splice]
+min_pause_ms = 250        # the pause around a cut should be at least this long (warn)
+word_tolerance_ms = 10    # slack on word edges for transcript timing noise
+continuity_tolerance_frames = 1  # a join this close to unbroken playback is not a cut
+
+# Two adjacent shots from one camera with a time jump read as a jump cut.
+[rules.no-same-camera-jump]
+min_zoom_delta = 0.2      # allowed if the zoom factor differs at least this much across the cut
+continuity_tolerance_frames = 1
+
+# At a time jump, go from a tighter shot to a wider one.
+[rules.timejump-close-to-wide]
+min_size_step = 1         # ranks: close 0, medium 1, wide 2; incoming must be this many wider
+continuity_tolerance_frames = 1
+
+# Hard cuts between content segments. Only the way in from black and the way into the outro
+# may be a transition (the long-form build uses a 15-frame start dissolve).
+[rules.no-dissolve]
+allow_head = true         # the first segment may come in from black with a transition
+max_head_frames = 30      # ...at most this long
+allow_outro = true        # the outro may come in with a transition
+max_outro_frames = 30     # ...at most this long
+
+[rules.audio-crossfade]
+audio_type = "Cross Fade 0 dB"
+max_frames = 30
+handle_fraction = 0.5     # share of the crossfade that must exist as media on each side of the cut
+require_on_cuts = true    # a non-continuous join with no audio crossfade is an error
+continuity_tolerance_frames = 1
+
+# Rhythm: no burst of cuts ("8 cuts in 13 s" was extremely choppy) and no sliver shots.
+[rules.cut-density]
+window_s = 10             # length of the sliding window of record time, in seconds
+max_cuts = 2              # warn when any window holds more cuts than this
+continuity_tolerance_frames = 1
+
+[rules.min-shot]
+min_seconds = 1.0         # warn when a segment is shorter; fold slivers into a neighbour
+
+[rules.short-max-duration]
+max_seconds = 37          # a short must be strictly shorter than this
+
+# A short ends hard on the laugh: its last audio fade is a de-click, never a fade to silence.
+[rules.short-end-fade]
+max_frames = 1            # the longest final fade on a short, in frames
+
+# End hard right after the punchline, at the first hint of the laugh; no dragging laugh.
+[rules.end-on-laugh]
+anchor = "onset"          # measure from the laugh's onset ("onset") or its end ("end")
+min_after_ms = 0          # the out point lands at least this long after the anchor
+max_after_ms = 400        # ...and at most this long after it
+min_strength = 0.0        # ignore laughs weaker than this
+
+# Reframe keyframes: dead-zone steady camera, never a whip-pan.
+[rules.no-whip-pan]
+max_pan_speed = 0.3       # frame widths per second (centre movement)
+max_zoom_speed = 0.25     # zoom factor change per second
+
+[rules.caption-length]
+max_chars = 16
+
+[rules.caption-style]
+font = "Montserrat"
+active_hue_min = 45       # degrees; yellow
+active_hue_max = 70
+active_min_saturation = 0.6
+
+# House safety rule: never set an input colour space on BRAW media (it decodes through its own
+# RAW settings). A plan-text check only; the compiler checks the real clip.
+[rules.no-braw-input-color-space]
+
+[rules.ranges-valid]

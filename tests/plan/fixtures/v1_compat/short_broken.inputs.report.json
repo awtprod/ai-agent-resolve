@@ -1,0 +1,317 @@
+{
+  "profile": "ccn",
+  "ok": false,
+  "counts": {
+    "error": 9,
+    "warn": 2,
+    "info": 2
+  },
+  "duration_frames": 1140,
+  "duration_s": 47.547,
+  "findings": [
+    {
+      "rule": "chronological",
+      "severity": "error",
+      "message": "Segment 1 goes back in time: it starts at 00:00:41:16 of recording 'take-1' but segment 0 already played up to 00:04:20:00.",
+      "fix_hint": "Reorder or drop segments so each recording plays forward only; do not import a cold open from later in the recording.",
+      "refs": [
+        {
+          "segment": 0,
+          "item": null,
+          "point": "out",
+          "source_id": "cam-a",
+          "record_frame": 240,
+          "record_tc": "00:00:10:00",
+          "source_frame": 6240,
+          "source_tc": "00:04:20:00"
+        },
+        {
+          "segment": 1,
+          "item": null,
+          "point": "in",
+          "source_id": "cam-a",
+          "record_frame": 240,
+          "record_tc": "00:00:10:00",
+          "source_frame": 1000,
+          "source_tc": "00:00:41:16"
+        }
+      ]
+    },
+    {
+      "rule": "no-same-camera-jump",
+      "severity": "error",
+      "message": "Jump cut: segments 0 and 1 are the same camera ('A') with a time jump, and the zoom changes by only 0.00 (1 to 1); at least 0.2 is needed.",
+      "fix_hint": "Cut to another camera, or punch in at least 0.2 zoom on one side of the cut.",
+      "refs": [
+        {
+          "segment": 0,
+          "item": null,
+          "point": "out",
+          "source_id": "cam-a",
+          "record_frame": 240,
+          "record_tc": "00:00:10:00",
+          "source_frame": 6240,
+          "source_tc": "00:04:20:00"
+        },
+        {
+          "segment": 1,
+          "item": null,
+          "point": "in",
+          "source_id": "cam-a",
+          "record_frame": 240,
+          "record_tc": "00:00:10:00",
+          "source_frame": 1000,
+          "source_tc": "00:00:41:16"
+        }
+      ]
+    },
+    {
+      "rule": "timejump-close-to-wide",
+      "severity": "warn",
+      "message": "Time jump between segments 0 and 1 goes close to close; it should go to a wider shot.",
+      "fix_hint": "Reorder the angles so the cut after the jump is wider (close to wide), or move the jump to a point where the angles already differ that way.",
+      "refs": [
+        {
+          "segment": 0,
+          "item": null,
+          "point": "out",
+          "source_id": "cam-a",
+          "record_frame": 240,
+          "record_tc": "00:00:10:00",
+          "source_frame": 6240,
+          "source_tc": "00:04:20:00"
+        },
+        {
+          "segment": 1,
+          "item": null,
+          "point": "in",
+          "source_id": "cam-a",
+          "record_frame": 240,
+          "record_tc": "00:00:10:00",
+          "source_frame": 1000,
+          "source_tc": "00:00:41:16"
+        }
+      ]
+    },
+    {
+      "rule": "no-dissolve",
+      "severity": "error",
+      "message": "Video transition after segment 0 is 'dissolve' (24 frames); only hard cuts are allowed.",
+      "fix_hint": "Set the transition's video to \"cut\" with video_frames 0.",
+      "refs": [
+        {
+          "segment": 0,
+          "item": null,
+          "point": "out",
+          "source_id": "cam-a",
+          "record_frame": 240,
+          "record_tc": "00:00:10:00",
+          "source_frame": 6240,
+          "source_tc": "00:04:20:00"
+        }
+      ]
+    },
+    {
+      "rule": "audio-crossfade",
+      "severity": "error",
+      "message": "Audio transition after segment 0 is 'Constant Power', not 'Cross Fade 0 dB'.",
+      "fix_hint": "Use audio type \"Cross Fade 0 dB\".",
+      "refs": [
+        {
+          "segment": 0,
+          "item": null,
+          "point": "out",
+          "source_id": "cam-a",
+          "record_frame": 240,
+          "record_tc": "00:00:10:00",
+          "source_frame": 6240,
+          "source_tc": "00:04:20:00"
+        },
+        {
+          "segment": 1,
+          "item": null,
+          "point": "in",
+          "source_id": "cam-a",
+          "record_frame": 240,
+          "record_tc": "00:00:10:00",
+          "source_frame": 1000,
+          "source_tc": "00:00:41:16"
+        }
+      ]
+    },
+    {
+      "rule": "audio-crossfade",
+      "severity": "error",
+      "message": "Audio crossfade after segment 0 is 40 frames; the maximum is 30.",
+      "fix_hint": "Shorten it to 30 frames or fewer.",
+      "refs": [
+        {
+          "segment": 0,
+          "item": null,
+          "point": "out",
+          "source_id": "cam-a",
+          "record_frame": 240,
+          "record_tc": "00:00:10:00",
+          "source_frame": 6240,
+          "source_tc": "00:04:20:00"
+        },
+        {
+          "segment": 1,
+          "item": null,
+          "point": "in",
+          "source_id": "cam-a",
+          "record_frame": 240,
+          "record_tc": "00:00:10:00",
+          "source_frame": 1000,
+          "source_tc": "00:00:41:16"
+        }
+      ]
+    },
+    {
+      "rule": "audio-crossfade",
+      "severity": "error",
+      "message": "The join between segments 1 and 2 has no audio transition, so it is a hard audio cut.",
+      "fix_hint": "Add a transition after segment 1 with audio type \"Cross Fade 0 dB\" and at most 30 frames.",
+      "refs": [
+        {
+          "segment": 1,
+          "item": null,
+          "point": "out",
+          "source_id": "cam-a",
+          "record_frame": 480,
+          "record_tc": "00:00:20:00",
+          "source_frame": 1240,
+          "source_tc": "00:00:51:16"
+        },
+        {
+          "segment": 2,
+          "item": null,
+          "point": "in",
+          "source_id": "cam-b",
+          "record_frame": 480,
+          "record_tc": "00:00:20:00",
+          "source_frame": 1300,
+          "source_tc": "00:00:54:04"
+        }
+      ]
+    },
+    {
+      "rule": "short-max-duration",
+      "severity": "error",
+      "message": "The short runs 47.547 s (1140 frames); it must be under 37 s.",
+      "fix_hint": "Cut at least 253 frames so the total is at most 887 frames.",
+      "refs": [
+        {
+          "segment": null,
+          "item": "end",
+          "point": null,
+          "source_id": null,
+          "record_frame": 1140,
+          "record_tc": "00:00:47:12",
+          "source_frame": null,
+          "source_tc": null
+        }
+      ]
+    },
+    {
+      "rule": "end-on-laugh",
+      "severity": "warn",
+      "message": "The edit ends 1751 ms before the nearest laugh ends (84.50 s); it should end within 500 ms after a laugh.",
+      "fix_hint": "Set the final src_out to source frame 2002 (the end of that laugh).",
+      "refs": [
+        {
+          "segment": 2,
+          "item": null,
+          "point": "out",
+          "source_id": "cam-b",
+          "record_frame": 1140,
+          "record_tc": "00:00:47:12",
+          "source_frame": 1960,
+          "source_tc": "00:01:21:16"
+        }
+      ]
+    },
+    {
+      "rule": "no-whip-pan",
+      "severity": "error",
+      "message": "Whip-pan in segment 2: the frame centre moves 0.800 frame widths in 0.25 s (3.20/s); the limit is 0.3/s.",
+      "fix_hint": "Hold a steady frame, or spread the move over more time.",
+      "refs": [
+        {
+          "segment": 2,
+          "item": null,
+          "point": null,
+          "source_id": "cam-b",
+          "record_frame": 480,
+          "record_tc": "00:00:20:00",
+          "source_frame": 1300,
+          "source_tc": "00:00:54:04"
+        },
+        {
+          "segment": 2,
+          "item": null,
+          "point": null,
+          "source_id": "cam-b",
+          "record_frame": 486,
+          "record_tc": "00:00:20:06",
+          "source_frame": 1306,
+          "source_tc": "00:00:54:10"
+        }
+      ]
+    },
+    {
+      "rule": "caption-length",
+      "severity": "error",
+      "message": "Caption 0 has a 25-character line 'THIS LINE IS WAY TOO LONG'; the limit is 16.",
+      "fix_hint": "Split it into lines of at most 16 characters.",
+      "refs": [
+        {
+          "segment": null,
+          "item": "caption[0]",
+          "point": null,
+          "source_id": null,
+          "record_frame": 0,
+          "record_tc": "00:00:00:00",
+          "source_frame": null,
+          "source_tc": null
+        }
+      ]
+    },
+    {
+      "rule": "caption-style",
+      "severity": "info",
+      "message": "1 caption(s) do not use the font 'Montserrat'.",
+      "fix_hint": "Set caption_style.font (or each caption's style) to \"Montserrat\".",
+      "refs": [
+        {
+          "segment": null,
+          "item": "caption[0]",
+          "point": null,
+          "source_id": null,
+          "record_frame": 0,
+          "record_tc": "00:00:00:00",
+          "source_frame": null,
+          "source_tc": null
+        }
+      ]
+    },
+    {
+      "rule": "caption-style",
+      "severity": "info",
+      "message": "1 caption(s) do not highlight the active word in yellow.",
+      "fix_hint": "Set active_word_color to a yellow such as \"#FFE600\".",
+      "refs": [
+        {
+          "segment": null,
+          "item": "caption[0]",
+          "point": null,
+          "source_id": null,
+          "record_frame": 0,
+          "record_tc": "00:00:00:00",
+          "source_frame": null,
+          "source_tc": null
+        }
+      ]
+    }
+  ]
+}

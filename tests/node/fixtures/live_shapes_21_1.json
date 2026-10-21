@@ -1,0 +1,357 @@
+{
+ "source": "Read-only probe of the open project and timeline of a live DaVinci Resolve Studio 21.1, 2026-10-17. Only Get* calls. Names are placeholders; paths, ids and timecodes of media are left out.",
+ "project_manager": {
+  "GetCurrentFolder_at_root": ""
+ },
+ "timeline": {
+  "GetSettings_key_count": 158,
+  "GetSettings_has_useCustomSettings": false,
+  "settings": {
+   "timelineFrameRate": 29.97,
+   "timelineDropFrameTimecode": "1",
+   "timelineResolutionWidth": "1920",
+   "timelineResolutionHeight": "1080",
+   "colorScienceMode": "davinciYRGBColorManagedv2",
+   "isAutoColorManage": "0",
+   "rcmPresetMode": "Custom",
+   "colorSpaceTimeline": "DaVinci WG/Intermediate",
+   "colorSpaceOutput": "Rec.709 (Scene)",
+   "inputDRT": "None",
+   "outputDRT": "Luminance Mapping",
+   "useInverseDRT": "1",
+   "useColorSpaceAwareGradingTools": "1"
+  },
+  "GetStartFrame": 107892,
+  "GetEndFrame": 115412,
+  "GetStartTimecode": "01:00:00;00",
+  "GetTrackCount": {
+   "video": 2,
+   "audio": 2,
+   "subtitle": 0
+  },
+  "items_per_track": {
+   "video": [
+    36,
+    1
+   ],
+   "audio": [
+    42,
+    41
+   ]
+  },
+  "GetTrackSubType_audio": [
+   "stereo",
+   "stereo"
+  ],
+  "GetMarkers": {}
+ },
+ "items": [
+  {
+   "track_type": "video",
+   "track": 1,
+   "name": "clip-1",
+   "GetType": "video",
+   "GetStart": 107892,
+   "GetEnd": 108078,
+   "GetDuration": 186,
+   "GetSourceStartFrame": 2799,
+   "GetSourceEndFrame": 2986,
+   "GetLeftOffset": 2800,
+   "GetFades": {
+    "FadeIn": 15.0,
+    "FadeOut": 0.0
+   },
+   "GetProperties_count": 32,
+   "properties": {
+    "Opacity": 100.0,
+    "ZoomX": 1.0
+   },
+   "GetTrackTypeAndIndex": [
+    "video",
+    1
+   ],
+   "GetLinkedItems_count": 0,
+   "GetClipEnabled": true,
+   "node_graph": {
+    "GetNumNodes": 1,
+    "lut_set": [
+     true
+    ]
+   },
+   "clip": {
+    "Type": "Video + Audio",
+    "Video Codec": "H.265 Main 10 L4.0",
+    "Format": "QuickTime",
+    "FPS": 29.97,
+    "Frames": "18840",
+    "Start": "0",
+    "End": "18839",
+    "Input Color Space": "Rec.709 (Scene)",
+    "Input Gamma": "Rec.709",
+    "Audio Ch": "2",
+    "Proxy": "None",
+    "Online Status": "Online",
+    "Drop frame": "0"
+   }
+  },
+  {
+   "track_type": "video",
+   "track": 2,
+   "name": "compound-1",
+   "GetType": "video",
+   "GetStart": 107982,
+   "GetEnd": 108209,
+   "GetDuration": 227,
+   "GetSourceStartFrame": 0,
+   "GetSourceEndFrame": 226,
+   "GetLeftOffset": 0,
+   "GetFades": {
+    "FadeIn": 0.0,
+    "FadeOut": 0.0
+   },
+   "GetProperties_count": 32,
+   "properties": {
+    "Opacity": 100.0,
+    "ZoomX": 1.0
+   },
+   "GetTrackTypeAndIndex": [
+    "video",
+    2
+   ],
+   "GetLinkedItems_count": 0,
+   "GetClipEnabled": true,
+   "node_graph": {
+    "GetNumNodes": 1,
+    "lut_set": [
+     false
+    ]
+   },
+   "clip": {
+    "Type": "Compound",
+    "Video Codec": "",
+    "Format": "",
+    "FPS": 29.97,
+    "Frames": "227",
+    "Start": "0",
+    "End": "226",
+    "Input Color Space": "",
+    "Input Gamma": "",
+    "Audio Ch": "2",
+    "Proxy": "",
+    "Online Status": "",
+    "Drop frame": "1"
+   }
+  },
+  {
+   "track_type": "audio",
+   "track": 1,
+   "name": "clip-2",
+   "GetType": "audio",
+   "GetStart": 107892,
+   "GetEnd": 108178,
+   "GetDuration": 286,
+   "GetSourceStartFrame": 2679,
+   "GetSourceEndFrame": 2964,
+   "GetLeftOffset": 2679,
+   "GetFades": {
+    "FadeIn": 6.0,
+    "FadeOut": 0.0
+   },
+   "GetProperties_count": 15,
+   "properties": {
+    "AudioVolume": -4.255813953488381,
+    "AudioVolumeEnabled": true,
+    "AudioPan": 0.0
+   },
+   "GetTrackTypeAndIndex": [
+    "audio",
+    1
+   ],
+   "GetLinkedItems_count": 0,
+   "GetClipEnabled": true,
+   "clip": {
+    "Type": "Video + Audio",
+    "Video Codec": "Blackmagic RAW",
+    "Format": "BRAW",
+    "FPS": 29.97,
+    "Frames": "18725",
+    "Start": "0",
+    "End": "18724",
+    "Input Color Space": "Blackmagic Design Film Gen 5",
+    "Input Gamma": "Blackmagic Design Film Gen 5",
+    "Audio Ch": "2",
+    "Proxy": "6048x3200",
+    "Online Status": "Online",
+    "Drop frame": "0"
+   }
+  },
+  {
+   "track_type": "audio",
+   "track": 2,
+   "name": "clip-3",
+   "GetType": "audio",
+   "GetStart": 107892,
+   "GetEnd": 108178,
+   "GetDuration": 286,
+   "GetSourceStartFrame": 104283,
+   "GetSourceEndFrame": 104569,
+   "GetLeftOffset": 104283,
+   "GetFades": {
+    "FadeIn": 6.0,
+    "FadeOut": 0.0
+   },
+   "GetProperties_count": 15,
+   "properties": {
+    "AudioVolume": -2.5116279069767486,
+    "AudioVolumeEnabled": true,
+    "AudioPan": 0.0
+   },
+   "GetTrackTypeAndIndex": [
+    "audio",
+    2
+   ],
+   "GetLinkedItems_count": 0,
+   "GetClipEnabled": true,
+   "clip": {
+    "Type": "Audio",
+    "Video Codec": "",
+    "Format": "Wave",
+    "FPS": 29.97,
+    "Frames": "",
+    "Start": "",
+    "End": "",
+    "Input Color Space": "",
+    "Input Gamma": "",
+    "Audio Ch": "1",
+    "Proxy": "",
+    "Online Status": "Online",
+    "Drop frame": null
+   }
+  }
+ ],
+ "media_pool_clip_kinds": {
+  "note": "Across 709 clips in 38 bins. Two separate tallies, as measured: distinct (Type, Format, Video Codec), and distinct (Type, file extension). Counts left out.",
+  "type_format_codec": [
+   [
+    "Video + Audio",
+    "QuickTime",
+    "H.264 High L5.1"
+   ],
+   [
+    "Video + Audio",
+    "QuickTime",
+    "H.265 Main 10 L4.0"
+   ],
+   [
+    "Audio",
+    "Wave",
+    ""
+   ],
+   [
+    "Timeline",
+    "",
+    ""
+   ],
+   [
+    "Video + Audio",
+    "QuickTime",
+    "H.265 Main 10 L5.2"
+   ],
+   [
+    "Video + Audio",
+    "BRAW",
+    "Blackmagic RAW"
+   ],
+   [
+    "Video + Audio",
+    "QuickTime",
+    "H.264 Main L4.1"
+   ],
+   [
+    "Multicam",
+    "",
+    ""
+   ],
+   [
+    "Video + Audio",
+    "QuickTime",
+    "H.265 Main 4:4:4 L1.7"
+   ],
+   [
+    "Compound",
+    "",
+    ""
+   ],
+   [
+    "Video + Audio",
+    "QuickTime",
+    "H.264 High L3.1"
+   ],
+   [
+    "Video + Audio",
+    "QuickTime",
+    "Apple ProRes 422 LT"
+   ]
+  ],
+  "type_extension": [
+   [
+    "Video + Audio",
+    "mov"
+   ],
+   [
+    "Video + Audio",
+    "mp4"
+   ],
+   [
+    "Audio",
+    "wav"
+   ],
+   [
+    "Timeline",
+    ""
+   ],
+   [
+    "Video + Audio",
+    "braw"
+   ],
+   [
+    "Multicam",
+    ""
+   ],
+   [
+    "Compound",
+    ""
+   ]
+  ]
+ },
+ "transitions": {
+  "note": "Second read-only probe (replay of aar.node.ops.raw): GetItemListInTrack('audio', n) lists transitions as items. Values as read; positions relative to the timeline start.",
+  "items": [
+   {
+    "track_type": "audio",
+    "track": 1,
+    "GetType": "transition",
+    "record_in": 280,
+    "record_out": 292,
+    "source_frames_numeric": false,
+    "fades_present": false,
+    "AudioVolume_present": false,
+    "neighbour_clip": {
+     "record_in": 0,
+     "record_out": 286
+    }
+   }
+  ],
+  "overlap_pairs_in_first_4_items_per_audio_track_when_counted": 3
+ },
+ "items_extra": {
+  "note": "Second video item of V1 from the replay: end - start of the source readback is duration + 1 again.",
+  "video_1_second": {
+   "record_in": 186,
+   "record_out": 286,
+   "duration": 100,
+   "GetSourceStartFrame": 2813,
+   "GetSourceEndFrame": 2914
+  }
+ }
+}

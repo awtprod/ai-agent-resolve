@@ -1,0 +1,616 @@
+{
+ "events": [
+  {
+   "actor": [
+    "human",
+    "operator-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "aliases": [],
+    "name": "acme-show",
+    "project_id": "prj_acme",
+    "sources": []
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.492285+00:00",
+   "type": "project.created"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "data": {
+     "show": "acme"
+    },
+    "kind": "brief",
+    "node_id": "nd_brief",
+    "status": "pending",
+    "title": "brief"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.503659+00:00",
+   "type": "graph.node_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "data": {},
+    "kind": "plan",
+    "node_id": "nd_plan",
+    "status": "pending",
+    "title": "plan"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.508201+00:00",
+   "type": "graph.node_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "data": {},
+    "kind": "op",
+    "node_id": "nd_op",
+    "status": "pending",
+    "title": "op"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.516861+00:00",
+   "type": "graph.node_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "data": {},
+    "kind": "artifact",
+    "node_id": "nd_art",
+    "status": "pending",
+    "title": "render"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.522200+00:00",
+   "type": "graph.node_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "data": {},
+    "dst": "nd_brief",
+    "edge_id": "edg_1",
+    "src": "nd_plan",
+    "type": "derives_from"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.526001+00:00",
+   "type": "graph.edge_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "data": {},
+    "dst": "nd_plan",
+    "edge_id": "edg_2",
+    "src": "nd_op",
+    "type": "derives_from"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.541507+00:00",
+   "type": "graph.edge_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "data": {},
+    "dst": "nd_art",
+    "edge_id": "edg_3",
+    "src": "nd_op",
+    "type": "produces"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.545811+00:00",
+   "type": "graph.edge_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "data": {},
+    "dst": "nd_op",
+    "edge_id": "edg_4",
+    "src": "nd_plan",
+    "type": "blocks"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.557791+00:00",
+   "type": "graph.edge_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "node_id": "nd_plan",
+    "to": "active"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.566005+00:00",
+   "type": "graph.node_status_changed"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "node_id": "nd_plan",
+    "to": "blocked"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.570281+00:00",
+   "type": "graph.node_status_changed"
+  },
+  {
+   "actor": [
+    "human",
+    "operator-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "node_id": "nd_op",
+    "to": "active"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.583689+00:00",
+   "type": "graph.node_status_changed"
+  },
+  {
+   "actor": [
+    "human",
+    "operator-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "node_id": "nd_op",
+    "to": "done"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.596153+00:00",
+   "type": "graph.node_status_changed"
+  },
+  {
+   "actor": [
+    "human",
+    "operator-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "node_id": "nd_brief",
+    "to": "cancelled"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.607220+00:00",
+   "type": "graph.node_status_changed"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": "artifact:887270d0cbc560af35f1326d55e9dbdc35ea2301c2cd26633fb6d4932deee268",
+   "payload": {
+    "artifact_id": "887270d0cbc560af35f1326d55e9dbdc35ea2301c2cd26633fb6d4932deee268",
+    "meta": {},
+    "mime": "video/mp4",
+    "producing_op": null,
+    "project_id": "prj_acme",
+    "size": 6
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.629712+00:00",
+   "type": "artifact.added"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "data": {
+     "fps": null,
+     "renders": [
+      "887270d0cbc560af35f1326d55e9dbdc35ea2301c2cd26633fb6d4932deee268"
+     ],
+     "requested_by": "agent:agent-1",
+     "subject": "nd_op",
+     "timeline": null
+    },
+    "kind": "review",
+    "node_id": "nd_f393d18d81ba3a94",
+    "status": "active",
+    "title": "cut v1"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.644839+00:00",
+   "type": "graph.node_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "data": {},
+    "dst": "nd_op",
+    "edge_id": "edg_f96327a52c56a220",
+    "src": "nd_f393d18d81ba3a94",
+    "type": "reviews"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.649871+00:00",
+   "type": "graph.edge_added"
+  },
+  {
+   "actor": [
+    "human",
+    "operator-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "node_id": "nd_f393d18d81ba3a94",
+    "to": "done"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.658473+00:00",
+   "type": "graph.node_status_changed"
+  },
+  {
+   "actor": [
+    "human",
+    "operator-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "decision": "approve",
+    "reason": "good",
+    "review_id": "nd_f393d18d81ba3a94"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.658538+00:00",
+   "type": "review.decided"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "kind": "bogus",
+    "node_id": "nd_bad",
+    "status": "pending"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.667897+00:00",
+   "type": "graph.node_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "kind": "brief",
+    "node_id": "nd_brief",
+    "status": "pending"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.674436+00:00",
+   "type": "graph.node_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "node_id": "nd_op",
+    "to": "active"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.686936+00:00",
+   "type": "graph.node_status_changed"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "node_id": "nd_f393d18d81ba3a94",
+    "to": "failed"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.701683+00:00",
+   "type": "graph.node_status_changed"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "dst": "nd_art",
+    "edge_id": "edg_x",
+    "src": "nd_plan",
+    "type": "produces"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.710667+00:00",
+   "type": "graph.edge_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": {
+    "dst": "nd_op",
+    "edge_id": "edg_1",
+    "src": "nd_plan",
+    "type": "blocks"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.724621+00:00",
+   "type": "graph.edge_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "agent-1"
+   ],
+   "idempotency_key": null,
+   "payload": [
+    "not",
+    "an",
+    "object"
+   ],
+   "project_id": "prj_acme",
+   "ts": "2026-10-19T14:47:59.737232+00:00",
+   "type": "graph.node_added"
+  }
+ ],
+ "expected": {
+  "creators": {
+   "nd_art": [
+    "agent",
+    "agent-1"
+   ],
+   "nd_brief": [
+    "agent",
+    "agent-1"
+   ],
+   "nd_f393d18d81ba3a94": [
+    "agent",
+    "agent-1"
+   ],
+   "nd_op": [
+    "agent",
+    "agent-1"
+   ],
+   "nd_plan": [
+    "agent",
+    "agent-1"
+   ]
+  },
+  "edges": [
+   {
+    "created": "2026-10-19T14:47:59.526001+00:00",
+    "dst": "nd_brief",
+    "id": "edg_1",
+    "payload": {},
+    "src": "nd_plan",
+    "type": "derives_from"
+   },
+   {
+    "created": "2026-10-19T14:47:59.541507+00:00",
+    "dst": "nd_plan",
+    "id": "edg_2",
+    "payload": {},
+    "src": "nd_op",
+    "type": "derives_from"
+   },
+   {
+    "created": "2026-10-19T14:47:59.545811+00:00",
+    "dst": "nd_art",
+    "id": "edg_3",
+    "payload": {},
+    "src": "nd_op",
+    "type": "produces"
+   },
+   {
+    "created": "2026-10-19T14:47:59.557791+00:00",
+    "dst": "nd_op",
+    "id": "edg_4",
+    "payload": {},
+    "src": "nd_plan",
+    "type": "blocks"
+   },
+   {
+    "created": "2026-10-19T14:47:59.649871+00:00",
+    "dst": "nd_op",
+    "id": "edg_f96327a52c56a220",
+    "payload": {},
+    "src": "nd_f393d18d81ba3a94",
+    "type": "reviews"
+   }
+  ],
+  "last_change": {
+   "nd_brief": [
+    14,
+    "human",
+    "operator-1",
+    "cancelled"
+   ],
+   "nd_f393d18d81ba3a94": [
+    18,
+    "human",
+    "operator-1",
+    "done"
+   ],
+   "nd_op": [
+    13,
+    "human",
+    "operator-1",
+    "done"
+   ],
+   "nd_plan": [
+    11,
+    "agent",
+    "agent-1",
+    "blocked"
+   ]
+  },
+  "nodes": [
+   {
+    "created": "2026-10-19T14:47:59.503659+00:00",
+    "id": "nd_brief",
+    "kind": "brief",
+    "payload": {
+     "show": "acme"
+    },
+    "status": "cancelled",
+    "title": "brief",
+    "updated": "2026-10-19T14:47:59.607220+00:00"
+   },
+   {
+    "created": "2026-10-19T14:47:59.508201+00:00",
+    "id": "nd_plan",
+    "kind": "plan",
+    "payload": {},
+    "status": "blocked",
+    "title": "plan",
+    "updated": "2026-10-19T14:47:59.570281+00:00"
+   },
+   {
+    "created": "2026-10-19T14:47:59.516861+00:00",
+    "id": "nd_op",
+    "kind": "op",
+    "payload": {},
+    "status": "done",
+    "title": "op",
+    "updated": "2026-10-19T14:47:59.596153+00:00"
+   },
+   {
+    "created": "2026-10-19T14:47:59.522200+00:00",
+    "id": "nd_art",
+    "kind": "artifact",
+    "payload": {},
+    "status": "pending",
+    "title": "render",
+    "updated": "2026-10-19T14:47:59.522200+00:00"
+   },
+   {
+    "created": "2026-10-19T14:47:59.644839+00:00",
+    "id": "nd_f393d18d81ba3a94",
+    "kind": "review",
+    "payload": {
+     "fps": null,
+     "renders": [
+      "887270d0cbc560af35f1326d55e9dbdc35ea2301c2cd26633fb6d4932deee268"
+     ],
+     "requested_by": "agent:agent-1",
+     "subject": "nd_op",
+     "timeline": null
+    },
+    "status": "done",
+    "title": "cut v1",
+    "updated": "2026-10-19T14:47:59.658473+00:00"
+   }
+  ],
+  "skipped": [
+   {
+    "event_id": "01M5AA4DXKR7RKF8AF0JPGSQS8",
+    "reason": "kind is not a node kind",
+    "seq": 20,
+    "type": "graph.node_added"
+   },
+   {
+    "event_id": "01M5AA4DXTMQV8V7DS0YYN8H7T",
+    "reason": "node nd_brief already exists",
+    "seq": 21,
+    "type": "graph.node_added"
+   },
+   {
+    "event_id": "01M5AA4DY6KTHNM77Q55X20C7J",
+    "reason": "illegal transition from 'done' to 'active'",
+    "seq": 22,
+    "type": "graph.node_status_changed"
+   },
+   {
+    "event_id": "01M5AA4DYNMR7461EWBWYZ8Y8R",
+    "reason": "illegal transition from 'done' to 'failed'",
+    "seq": 23,
+    "type": "graph.node_status_changed"
+   },
+   {
+    "event_id": "01M5AA4DYYT26DWRFEACABWZ22",
+    "reason": "produces edge cannot start at a plan node",
+    "seq": 24,
+    "type": "graph.edge_added"
+   },
+   {
+    "event_id": "01M5AA4DZCZMQZS7B8SWN5ZVN3",
+    "reason": "edge_id is missing or already used",
+    "seq": 25,
+    "type": "graph.edge_added"
+   },
+   {
+    "event_id": "01M5AA4DZSW870Y2VE6QT93TEX",
+    "reason": "payload is not an object",
+    "seq": 26,
+    "type": "graph.node_added"
+   }
+  ]
+ },
+ "project_id": "prj_acme"
+}

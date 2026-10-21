@@ -1,0 +1,265 @@
+"""Test-only helpers: copy a fixture into a temp dir and edit the XML inside the zip.
+
+These write new files only (never the fixtures) and re-encode blobs with the codecs written
+from the spec in ``drp_helpers``. They are not product code.
+"""
+
+from __future__ import annotations
+
+import re
+import struct
+import zipfile
+from collections.abc import Callable
+from pathlib import Path
+
+import pytest
+from drp_helpers import ZSTD_REASON, envelope, kd, pb_len, pb_var, qstr, varint
+
+from aar.drp import blobs
+
+Edit = Callable[[bytes], bytes]
+
+
+def edit_zip(src: Path, dst: Path, edits: dict[str, Edit] | None = None, **kw: object) -> Path:
+    """Copy ``src`` to ``dst`` applying ``edits`` (member name -> bytes transform).
+
+    ``reverse=True`` writes members in reverse order; ``stored=True`` writes them
+    uncompressed. Directory entries are copied as they are.
+    """
+    edits = dict(edits or {})
+    with zipfile.ZipFile(src) as zin:
+        infos = zin.infolist()
+        if kw.get("reverse"):
+            infos = list(reversed(infos))
+        with zipfile.ZipFile(dst, "w") as zout:
+            for info in infos:
+                data = zin.read(info)
+                if info.filename in edits:
+                    data = edits.pop(info.filename)(data)
+                compress = zipfile.ZIP_STORED if kw.get("stored") else info.compress_type
+                zout.writestr(info, data, compress_type=compress)
+    assert not edits, f"members not found: {sorted(edits)}"
+    return dst
+
+
+def member_named(src: Path, prefix: str) -> str:
+    with zipfile.ZipFile(src) as z:
+        [name] = [n for n in z.namelist() if n.startswith(prefix) and not n.endswith("/")]
+    return name
+
+
+def once(old: bytes, new: bytes) -> Edit:
+    """Replace ``old`` with ``new``; it must occur exactly once."""
+
+    def run(data: bytes) -> bytes:
+        assert data.count(old) == 1, f"{old!r} occurs {data.count(old)} times"
+        return data.replace(old, new)
+
+    return run
+
+
+def every(old: bytes, new: bytes, count: int) -> Edit:
+    def run(data: bytes) -> bytes:
+        assert data.count(old) == count, f"{old!r} occurs {data.count(old)} times"
+        return data.replace(old, new)
+
+    return run
+
+
+def after(anchor: bytes, old: bytes, new: bytes) -> Edit:
+    """Replace the first ``old`` after ``anchor`` (e.g. a field inside one DbId's element)."""
+
+    def run(data: bytes) -> bytes:
+        at = data.index(anchor)
+        i = data.index(old, at)
+        return data[:i] + new + data[i + len(old) :]
+
+    return run
+
+
+def chain(*edits: Edit) -> Edit:
+    def run(data: bytes) -> bytes:
+        for e in edits:
+            data = e(data)
+        return data
+
+    return run
+
+
+def leaf_text(data: bytes, anchor: bytes, tag: bytes) -> tuple[int, int]:
+    """Byte span of the text of the first ``<tag>`` after ``anchor``."""
+    at = data.index(anchor)
+    start = data.index(b"<" + tag + b">", at) + len(tag) + 2
+    return start, data.index(b"</" + tag + b">", start)
+
+
+def flip_hex_byte(anchor: bytes, tag: bytes, index: int) -> Edit:
+    """XOR byte ``index`` of the hex blob in the first ``<tag>`` after ``anchor``."""
+
+    def run(data: bytes) -> bytes:
+        start, end = leaf_text(data, anchor, tag)
+        raw = bytearray(bytes.fromhex(data[start:end].decode()))
+        raw[index] ^= 0xFF
+        return data[:start] + raw.hex().encode() + data[end:]
+
+    return run
+
+
+_GAP = re.compile(rb">(\n *)<")
+
+
+def reindent(data: bytes) -> bytes:
+    """Deepen the indentation between elements; the text of leaves is left untouched.
+
+    Whitespace between a start tag and its own end tag (``<Notes>\n</Notes>``) is a leaf's
+    text, so it is kept as it is; so is the prolog before the root element.
+    """
+    out = []
+    pos = 0
+    root = re.search(rb"<[^?!/]", data)  # the prolog before the root is left byte for byte
+    for m in _GAP.finditer(data, root.start() if root else 0):
+        tag = data[data.rfind(b"<", 0, m.start()) : m.start() + 1]
+        opens = not tag.startswith((b"</", b"<?", b"<!")) and not tag.endswith(b"/>")
+        if opens and data.startswith(b"</", m.end() - 1):
+            continue
+        out.append(data[pos : m.start() + 1] + m.group(1) + m.group(1)[1:] + b"  ")
+        pos = m.end() - 1
+    out.append(data[pos:])
+    return b"".join(out)
+
+
+def rewrite_clip_blobs(
+    replace: Callable[[list[blobs.PbField], bytes], bytes],
+    which: set[int] | None = None,
+) -> Edit:
+    """Re-encode ``<Clip>`` blobs: decode, let ``replace`` rebuild the protobuf, recompress.
+
+    ``which`` picks blobs by position in the member (0 = first; ``None`` = all). The envelope
+    version and codec are kept, so only the protobuf content changes.
+    """
+
+    def run(data: bytes) -> bytes:
+        # The templates' Clip blobs are zstd frames with compressed blocks; re-encoding them
+        # needs zstandard, so a test that edits them skips without it.
+        zstandard = pytest.importorskip("zstandard", reason=ZSTD_REASON)
+        seen = [-1]
+
+        def repl(m: re.Match[bytes]) -> bytes:
+            seen[0] += 1
+            if which is not None and seen[0] not in which:
+                return m.group(0)
+            raw = bytes.fromhex(m.group(1).decode())
+            env = blobs.parse_envelope(raw)
+            assert env is not None and env.version is not None
+            payload = blobs.unwrap_message(raw)
+            fields = blobs.decode_protobuf(payload, nested_depth=0)
+            body = replace(fields, payload)
+            if env.codec == "zstd":
+                out = envelope(env.version, 0x81, zstandard.ZstdCompressor().compress(body))
+            else:
+                out = envelope(env.version, 0x80, body)
+            return b"<Clip>" + out.hex().encode() + b"</Clip>"
+
+        new, n = re.subn(rb"<Clip>([0-9a-f]+)</Clip>", repl, data)
+        assert n >= 1
+        return new
+
+    return run
+
+
+def set_fields(values: dict[int, bytes]) -> Callable[[list[blobs.PbField], bytes], bytes]:
+    """Protobuf rebuilder that replaces the first occurrence of some length-delimited fields."""
+
+    def build(fields: list[blobs.PbField], payload: bytes) -> bytes:
+        out = b""
+        done: set[int] = set()
+        for f in fields:
+            if f.number in values and f.number not in done:
+                out += pb_len(f.number, values[f.number])
+                done.add(f.number)
+            else:
+                out += payload[f.offset : f.end]
+        for number, value in values.items():
+            if number not in done:
+                out += pb_len(number, value)
+        return out
+
+    return build
+
+
+def marker_entry(
+    frame: int,
+    color: int,
+    name: str,
+    note: str = "",
+    extra: bytes = b"",
+    duration: bytes = b"1",
+    frame_raw: bytes | None = None,
+) -> bytes:
+    """One marker list entry.
+
+    ``extra`` is appended to the detail message (undecoded fields); ``duration`` is the raw
+    duration text; ``frame_raw`` replaces the frame's varint bytes (e.g. a padded varint).
+    """
+    detail = (
+        pb_var(1, color)
+        + pb_len(3, note.encode())
+        + pb_len(3, duration)
+        + pb_len(3, name.encode())
+        + extra
+    )
+    inner = pb_len(1, detail)
+    body = struct.pack(">II", 2, len(inner)) + inner
+    frame_field = pb_var(1, frame) if frame_raw is None else varint(1 << 3) + frame_raw
+    return pb_len(1, frame_field + pb_len(2, body))
+
+
+def markers_fields_blob(*entries: bytes) -> str:
+    blob_data = envelope(10001, 0x80, pb_len(2, b"".join(entries)))
+    return kd([("BlobData", 0x0C, struct.pack(">I", len(blob_data)) + blob_data)]).hex()
+
+
+def carrier(dbid: str, owner: str, fields_blob: str, tag: str = "Sm2SequenceLockableBlob") -> bytes:
+    """A lockable-blob element holding markers for ``owner``, wrapped like Resolve does."""
+    return (
+        f'<Element>\n     <{tag} DbId="{dbid}">\n      <FieldsBlob>{fields_blob}</FieldsBlob>\n'
+        f"      <BlobOwner>{owner}</BlobOwner>\n     </{tag}>\n    </Element>\n    "
+    ).encode()
+
+
+def add_carrier(element: bytes) -> Edit:
+    """Insert a lockable-blob element at the start of ``<LocableBlobSet>``."""
+    return once(b"<LocableBlobSet>\n    ", b"<LocableBlobSet>\n    " + element)
+
+
+def element_span(data: bytes, dbid: str) -> tuple[int, int]:
+    """Span of the ``<Element>`` wrapper around the element with this DbId (no nesting check
+    beyond the element's own closing tag)."""
+    at = data.index(f'DbId="{dbid}"'.encode())
+    tag_start = data.rindex(b"<", 0, at)
+    tag = data[tag_start + 1 : at].split()[0]
+    start = data.rindex(b"<Element>", 0, tag_start)
+    close = data.index(b"</" + tag + b">", at)
+    end = data.index(b"</Element>", close) + len(b"</Element>")
+    return start, end
+
+
+def move_element(dbid: str, before: bytes, after_anchor: bytes) -> Edit:
+    """Cut the ``<Element>`` wrapping ``dbid`` and insert it right after ``after_anchor``."""
+
+    def run(data: bytes) -> bytes:
+        start, end = element_span(data, dbid)
+        piece = data[start:end]
+        rest = data[:start] + data[end:]
+        i = rest.index(after_anchor) + len(after_anchor)
+        return rest[:i] + before + piece + rest[i:]
+
+    return run
+
+
+def kd_string(key: str, value: str) -> tuple[str, int, bytes]:
+    return (key, 0x0A, qstr(value))
+
+
+def kd_bytes(key: str, value: bytes) -> tuple[str, int, bytes]:
+    return (key, 0x0C, struct.pack(">I", len(value)) + value)

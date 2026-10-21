@@ -1,0 +1,162 @@
+"""``aar node ops``: the op listing, as text and JSON."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import pytest
+
+from aar.cli import main
+from aar.node.ops import list_ops
+
+
+def test_node_ops_json_lists_every_op_with_flags_and_params_schema(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["node", "ops", "--json"]) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert [d["name"] for d in listed] == [s.name for s in list_ops()]
+    by_name = {d["name"]: d for d in listed}
+    append = by_name["timeline.append_ranges"]
+    assert (append["hot"], append["mutates"]) == (True, True)
+    assert "append-fps-short" in append["traps"]
+    assert {"ranges", "cursor", "max_ranges"} <= set(append["params_schema"]["properties"])
+    assert append["params_schema"]["required"] == ["ranges"]
+    assert (by_name["timeline.describe"]["hot"], by_name["timeline.describe"]["mutates"]) == (
+        True,
+        False,
+    )
+
+
+def test_node_ops_text_shows_one_entry_per_op(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["node", "ops"]) == 0
+    out = capsys.readouterr().out
+    for spec in list_ops():
+        assert spec.name in out
+    assert "hot mutates" in out and "hot read" in out
+    assert "params: timeline?, ranges, cursor?" in out
+
+
+def test_node_without_a_command_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["node"]) == 2
+    assert "COMMAND" in capsys.readouterr().err
+
+
+def test_the_published_timeline_ref_text_states_the_id_rule(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Agents read this schema text: it must not say a name is enough for a write.
+    assert main(["node", "ops", "--json"]) == 0
+    listed = {d["name"]: d for d in json.loads(capsys.readouterr().out)}
+    text = listed["markers.add"]["params_schema"]["$defs"]["TimelineRef"]["description"]
+    assert "unique_id" in text and "timeline_id_required" in text
+    assert "timeline_ref_mismatch" in text
+    assert "or name" not in text and "preferred" not in text
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the production gateway is Windows-only")
+def test_node_run_refuses_linux_before_creating_a_store(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = tmp_path / "jobs.db"
+    code = main(
+        [
+            "node",
+            "run",
+            "--node-id",
+            "edit-pc",
+            "--hub-url",
+            "http://127.0.0.1:8789",
+            "--token-file",
+            str(tmp_path / "token"),
+            "--store",
+            str(store),
+            "--project",
+            '{"folder_path":[],"name":"Show","project_id":"uid"}',
+        ]
+    )
+    assert code == 2
+    assert "requires Windows" in capsys.readouterr().err
+    assert not store.exists()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "[]",
+        "null",
+        "true",
+        "[{}]",
+        "{}",
+        '{"name":"Show","folder_path":false}',
+        '{"name":"Show","folder_path":null}',
+        '{"name":"Show","folder_path":"Shows"}',
+        '{"name":"Show","folder_path":[[]]}',
+        '{"name":[],"folder_path":[]}',
+        '{"name":"Show","project_id":true}',
+        '{"name":"Show","project_id":null}',
+    ],
+)
+@pytest.mark.parametrize("command", ["node", "hub"])
+def test_invalid_project_shape_exits_before_any_io(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str,
+    command: str,
+) -> None:
+    from aar.hub import cli as hub_cli
+    from aar.node import cli as node_cli
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid locator reached an I/O boundary")
+
+    # A malformed hub submission must fail even before opening its event log.
+    monkeypatch.setattr(hub_cli, "_open_existing", unexpected)
+    original_run = node_cli.run_node
+    monkeypatch.setattr(
+        node_cli, "run_node", lambda args: original_run(args, gateway_factory=unexpected)
+    )
+    # Keep the original function rather than the monkeypatched CLI entry.
+    if command == "node":
+        args = [
+            "node",
+            "run",
+            "--node-id",
+            "edit-pc",
+            "--hub-url",
+            "http://127.0.0.1:1",
+            "--token-file",
+            str(tmp_path / "token"),
+            "--store",
+            str(tmp_path / "store.db"),
+        ]
+    else:
+        args = [
+            "hub",
+            "job",
+            "submit",
+            "--db",
+            str(tmp_path / "hub.db"),
+            "--actor",
+            "agent:editor",
+            "--node",
+            "edit-pc",
+            "--agent-id",
+            "editor",
+            "--kind",
+            "ops.sequence",
+            "--params",
+            '{"steps":[{"op":"timeline.list"}]}',
+            "--idempotency-key",
+            "invalid",
+        ]
+    assert main([*args, "--project", raw]) == 2
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out + captured.err
+    assert any(
+        field in captured.out + captured.err for field in ("locator", "folder_path", "project_id")
+    )
+    assert list(tmp_path.iterdir()) == []

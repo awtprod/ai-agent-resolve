@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai-agent-resolve"
+version = "0.0.1"
+description = "Companion app for DaVinci Resolve Studio, built mainly for AI agents to use."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["pydantic>=2,<3"]
+
+[project.optional-dependencies]
+# zstd blobs with compressed blocks need zstandard; everything else in aar.drp is stdlib-only.
+drp = ["zstandard>=0.22"]
+hub = ["mcp>=2.3,<3", "starlette>=1.0,<2", "uvicorn>=0.30", "python-multipart>=0.0.18"]
+# aar.analyze: sync and transcript workers. numpy is imported lazily; without it, the commands
+# that need it fail with a typed missing-extra error.
+analyze = ["numpy>=1.26,<3"]
+# faster-whisper wheels are hundreds of MB (CTranslate2), so this extra is not in dev. Models are
+# never downloaded: see aar.analyze.whisper.
+whisper = ["faster-whisper>=1.1,<2"]
+# aar.analyze.faces: OpenCV's YuNet face detector. The wheel is large, so it is not in dev; tests
+# inject a detector, and the one live test needs AAR_YUNET_MODEL (never downloaded).
+faces = ["opencv-python-headless>=4.9,<5", "numpy>=1.26,<3"]
+dev = ["pytest", "ruff", "ai-agent-resolve[drp,hub,analyze]"]
+
+[project.scripts]
+aar = "aar.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aar"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: needs a running DaVinci Resolve (set AAR_LIVE=1)",
+]
