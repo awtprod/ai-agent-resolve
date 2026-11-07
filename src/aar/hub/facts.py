@@ -171,7 +171,10 @@ NAMESPACES: tuple[Namespace, ...] = (
     Namespace("path.map", re.compile(rf"path\.map\.{_SEG}"), "path.map.<name>", PathMap),
     Namespace(
         "render.hash",
-        re.compile(rf"render\.hash\.{_SEG}"),
+        # The optional second segment carries the delivery role (render.hash.review.<deliverable>
+        # / render.hash.master.<deliverable>), so a review and a master of one deliverable never
+        # collide. The one-segment form (render.hash.<deliverable>) stays valid for other writers.
+        re.compile(rf"render\.hash\.{_SEG}(?:\.{_SEG})?"),
         "render.hash.<deliverable>",
         RenderHash,
     ),
