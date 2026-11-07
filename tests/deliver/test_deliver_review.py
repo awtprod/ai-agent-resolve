@@ -239,10 +239,11 @@ def test_cannot_fit_below_the_floor(tmp_path: Path, sources: Path) -> None:
             source="render_1080p.mp4",
             cap_mb=0.5,
             transcoder=transcoder,
-            duration=30.0,
+            duration=20.0,  # video budget works out to 56 kbit/s, under the 250 floor
         )
     assert exc.value.code == "review_cannot_fit"
-    assert exc.value.detail["duration_seconds"] == 30.0
+    assert exc.value.detail["duration_seconds"] == 20.0
+    assert exc.value.detail["video_kbps"] == 56
     assert exc.value.detail["cap_mb"] == 0.5
     assert transcoder.calls == []  # refused before any ffmpeg ran
 
