@@ -11,7 +11,7 @@ See ``framework`` for the contract every op follows.
 
 from __future__ import annotations
 
-from aar.node.ops import cloud, collab, read, render, write
+from aar.node.ops import build, cloud, collab, read, render, write
 from aar.node.ops.framework import (
     ItemRef,
     MediaRef,
@@ -38,6 +38,7 @@ __all__ = [
     "OpSpec",
     "TimelineIdentity",
     "TimelineRef",
+    "build",
     "cloud",
     "collab",
     "get_op",
