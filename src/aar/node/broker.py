@@ -432,7 +432,6 @@ class Broker:
             decision = self._gate(ctx, target, now)
         if decision.allowed:
             decision = self._take_control(now)
-            ctx = self._latest()  # taking control reads Resolve afresh
         if not decision.allowed:
             self._notice("defer", "deferred", decision, project=project)
             return TickOutcome(
@@ -742,7 +741,6 @@ class Broker:
         # A full read, one of the two: the snapshot keeps the human's Deliver format, codec
         # and mode, which the poll does not read.
         ctx = self._gw.get_context()
-        self._context = ctx
         preset = None
         warnings: list[str] = []
         if self.config.snapshot_deliver_preset and ctx.project is not None:

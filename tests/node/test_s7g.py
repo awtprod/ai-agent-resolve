@@ -285,6 +285,9 @@ def test_unknown_to_a_value_is_not_human_activity() -> None:
     g.observe(_cheap(), 0.0)
     assert g.observe(_full(), 2.0) is False
     assert g.observe(_cheap(), 4.0) is False  # nor a value to unknown
+    g.note_broker_context(_cheap(), 5.0)
+    assert g.observe(_cheap(), 6.0) is False  # unread stays unread: nothing to carry
+    assert g.observe(_full(render_format="mp4"), 8.0) is False
     assert g.last_human_change_at is None
 
 
@@ -411,6 +414,22 @@ def test_a_human_who_moved_since_the_last_poll_is_seen_before_a_switch() -> None
     outcome = world.broker.tick()
     assert outcome.kind is TickKind.DEFERRED and outcome.code == "human_context_change"
     assert world.fake.current is world.fake.project("A") and world.broker.snapshot is None
+
+
+def test_a_tick_between_polls_starts_from_the_brokers_own_latest_read() -> None:
+    """After the broker switched to B, a tick before the next poll knows B is open (its own
+    read replaced the poll's), so it serves B's queue first instead of switching back to A."""
+    world = World()
+    world.settle()
+    holder = Holder.agent("thread-1")
+    world.broker.submit(HotOp(world.loc("B"), lambda gw: "b1", holder))
+    assert world.broker.tick().kind is TickKind.RAN
+    world.broker.submit(HotOp(world.loc("A"), lambda gw: "a1", holder))
+    world.broker.submit(HotOp(world.loc("B"), lambda gw: "b2", holder))
+    outcome = world.broker.tick()  # same instant: no poll
+    assert outcome.kind is TickKind.RAN and outcome.project == world.loc("B").key
+    assert world.fake.current is world.fake.project("B")
+    assert [e.kind for e in world.events].count("switch") == 1  # only the first, to B
 
 
 def test_a_quiet_tick_between_polls_acts_on_the_brokers_latest_read() -> None:
