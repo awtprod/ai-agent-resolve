@@ -17,6 +17,7 @@ These pins hold the fix:
 from __future__ import annotations
 
 import ast
+import logging
 import math
 from collections.abc import Iterable
 from pathlib import Path
@@ -31,7 +32,7 @@ from aar.node.jobs import JobState
 from aar.node.leases import Holder, LeaseManager
 from aar.node.presence import PresenceGuard
 
-from .fake_resolve import FakeClock, FakeResolve
+from .fake_resolve import DeliverState, FakeClock, FakeResolve
 from .jobs_support import JobWorld
 from .test_broker import World
 
@@ -101,17 +102,19 @@ def test_deferred_job_polls_position_only_at_the_interval(tmp_path: Path) -> Non
     assert world.presence.may_switch(world.clock()).code == "human_input"
 
 
-def test_one_borrowed_context_reads_deliver_state_twice() -> None:
-    """Borrow the human's context, switch to B, run an op, restore: the snapshot and the
-    restore's check are the only full reads, so each Deliver getter is called twice."""
+def test_one_borrowed_context_reads_deliver_state_three_times() -> None:
+    """Borrow the human's context, switch to B, run an op, restore: the snapshot, the check
+    before the Deliver restore and the restore's final check are the only full reads, so each
+    Deliver getter is called three times (S7g round 2, F1). The final check cannot be folded
+    into the one before: it verifies setters that may report success without applying."""
     world = World()
     world.settle()
     world.fake.reads.clear()
     world.broker.submit(HotOp(world.loc("B"), lambda gw: "done", Holder.agent("thread-1")))
     kinds = [outcome.kind for outcome in world.broker.run_until_idle()]
     assert kinds == [TickKind.RAN, TickKind.RESTORED, TickKind.IDLE]
-    assert world.fake.reads["GetCurrentRenderMode"] == 2
-    assert world.fake.reads["GetCurrentRenderFormatAndCodec"] == 2
+    assert world.fake.reads["GetCurrentRenderMode"] == 3
+    assert world.fake.reads["GetCurrentRenderFormatAndCodec"] == 3
     report = world.broker.last_restore
     assert report is not None and report.ok, report
     assert report.final.render_measured and report.final.render_format == "mov"
@@ -145,7 +148,7 @@ def test_render_job_polls_never_read_deliver_state(tmp_path: Path) -> None:
     world.clock.advance(world.broker.config.restore_delay_seconds + 1)
     world.runner.pump()  # the queue stayed empty: the broker restores the human's context
     assert world.broker.snapshot is None
-    assert _deliver_reads(world.fake) == len(DELIVER_GETTERS)  # the restore's check, once
+    assert _deliver_reads(world.fake) == 2 * len(DELIVER_GETTERS)  # before and after the restore
 
 
 # == the static pins (decision 3) ================================================================
@@ -189,9 +192,16 @@ def _reach(methods: dict[str, ast.FunctionDef], start: str, skip: Iterable[str] 
 def test_tick_reaches_a_full_read_only_through_the_snapshot_and_the_restore() -> None:
     methods = _class(broker_module.__file__, "Broker")
     full_readers = {name for name, fn in methods.items() if "get_context" in _attributes(fn)}
-    # Each needs Deliver state: the snapshot keeps the human's format, codec and mode, and
-    # the restore checks it put them back. Every other read is a position read.
-    assert full_readers == {"_take_control", "_restore"}
+    # Each needs Deliver state: the snapshot keeps the human's format, codec and mode; the
+    # check before the restore tells a human's Deliver edit from the broker's own; the read
+    # after an op that reported changing Deliver records what it left; the restore checks it
+    # put them back. Every other read is a position read.
+    assert full_readers == {
+        "_take_control",
+        "_human_deliver_change",
+        "_note_deliver_left",
+        "_restore",
+    }
     poll_path = _reach(methods, "tick", skip=full_readers)
     assert not poll_path & full_readers
     assert {"_observe", "_look_again", "_run_batch", "_run_op", "_switch"} <= poll_path
@@ -434,7 +444,7 @@ def test_a_tick_between_polls_starts_from_the_brokers_own_latest_read() -> None:
 
 def test_a_quiet_tick_between_polls_acts_on_the_brokers_latest_read() -> None:
     """The broker's own reads replace the poll's: right after its switch to B, the next tick
-    restores from B (one look again, no Deliver read until the restore's check)."""
+    restores from B (one look again, no Deliver read until the restore's checks)."""
     world = World()
     world.settle()
     world.broker.submit(HotOp(world.loc("B"), lambda gw: "done", Holder.agent("thread-1")))
@@ -444,7 +454,170 @@ def test_a_quiet_tick_between_polls_acts_on_the_brokers_latest_read() -> None:
     assert world.broker.tick().kind is TickKind.RESTORED
     assert world.fake.current is world.fake.project("A")
     assert world.broker.last_restore is not None and world.broker.last_restore.ok
-    assert world.fake.reads["GetCurrentRenderMode"] == 1  # the restore's check only
+    assert world.fake.reads["GetCurrentRenderMode"] == 2  # the restore's two checks only
+
+
+# == a human's Deliver edit is never overwritten (round 2, F1) ===================================
+
+HUMAN_DELIVER = ("mxf", "DNxHR", 1)
+
+
+def _deliver(world: World, project: str = "A") -> tuple[str, str, int]:
+    d = world.fake.project(project).deliver
+    return (d.format, d.codec, d.mode)
+
+
+def _edit_deliver(world: World, project: str = "A") -> None:
+    """A human changes the Deliver settings only (no page or position change, no input
+    provider in ``World``): the poll cannot see it."""
+    a = world.fake.project(project)
+    a.deliver = DeliverState(*HUMAN_DELIVER, {**a.deliver.settings, "TargetDir": "F:/Mine"})
+
+
+def _restore_after(world: World, ticks: int) -> TickKind:
+    for _ in range(ticks):
+        world.clock.advance(TICK)
+        outcome = world.broker.tick()
+        if outcome.kind is TickKind.RESTORED:
+            return outcome.kind
+    return outcome.kind
+
+
+def test_val_probe_deliver_edit_while_render_queued(caplog: pytest.LogCaptureFixture) -> None:
+    """The validator's probe (s7g-val, deviation c), now asserting the edit is KEPT: the owner
+    edits A's Deliver settings while the broker holds the borrowed context in B. The poll does
+    not see it; the check before the restore does, and the restore leaves Deliver alone."""
+    world = World()
+    world.settle()
+    snapshot_deliver = _deliver(world)
+    world.broker.submit(HotOp(world.loc("B"), lambda gw: "done", Holder.agent("thread-1")))
+    assert world.broker.tick().kind is TickKind.RAN
+    _edit_deliver(world)
+    world.fake.reads.clear()
+    with caplog.at_level(logging.WARNING, logger="aar.node.broker"):
+        assert _restore_after(world, int(3 / TICK)) is TickKind.RESTORED
+    assert world.presence.last_human_change_at is None  # the poll never saw it
+    assert world.fake.current is world.fake.project("A")  # the position came back
+    assert world.fake.page == "color"
+    assert _deliver(world) == HUMAN_DELIVER  # the human's edit is kept ...
+    assert world.fake.project("A").deliver.settings["TargetDir"] == "F:/Mine"  # ... all of it
+    report = world.broker.last_restore
+    assert report is not None and report.ok, report
+    fields = {
+        "render_format": [snapshot_deliver[0], HUMAN_DELIVER[0]],
+        "render_codec": [snapshot_deliver[1], HUMAN_DELIVER[1]],
+        "render_mode": [snapshot_deliver[2], HUMAN_DELIVER[2]],
+    }
+    assert report.deliver_restore_skipped == {"reason": "human_change", "fields": fields}
+    assert report.kept_preset is None  # no op ran in A: the snapshot preset is redundant
+    assert not [p for p in world.fake.presets if p.startswith("aar-restore-")]
+    assert not world.fake.call_names().count("SetCurrentRenderFormatAndCodec")
+    restored = [e for e in world.events if e.kind == "restored"][-1]
+    assert restored.data["deliver_restore_skipped"] == report.deliver_restore_skipped
+    assert any("deliver_restore_skipped: human_change" in r.getMessage() for r in caplog.records)
+    # Only the check before the restore read Deliver state; the final check is a position read.
+    assert world.fake.reads["GetCurrentRenderMode"] == 1
+    assert world.fake.reads["GetCurrentRenderFormatAndCodec"] == 1
+
+
+def test_a_deliver_edit_in_the_borrowed_project_itself_is_kept() -> None:
+    """The broker stays in the human's project A (an op on A), the human edits Deliver there:
+    the snapshot preset is kept and named, because an op ran in A."""
+    world = World()
+    world.settle()
+    world.broker.submit(HotOp(world.loc("A"), lambda gw: "done", Holder.agent("thread-1")))
+    assert world.broker.tick().kind is TickKind.RAN
+    preset = world.broker.snapshot.deliver_preset if world.broker.snapshot else None
+    assert preset is not None
+    _edit_deliver(world)
+    assert _restore_after(world, int(3 / TICK)) is TickKind.RESTORED
+    assert _deliver(world) == HUMAN_DELIVER
+    report = world.broker.last_restore
+    assert report is not None and report.deliver_restore_skipped is not None
+    assert set(report.deliver_restore_skipped["fields"]) == {  # type: ignore[arg-type]
+        "render_format",
+        "render_codec",
+        "render_mode",
+    }
+    assert report.kept_preset == preset and preset in world.fake.presets
+
+
+def test_without_a_human_edit_the_snapshot_deliver_settings_come_back() -> None:
+    """The check must not stop the normal restore: an op that changed A's Deliver settings
+    through the gateway reported it (the gateway's setters do), so it is the broker's change
+    and the snapshot is put back over it."""
+    world = World()
+    world.settle()
+    snapshot_deliver = _deliver(world)
+
+    def clobbers_deliver(gw) -> str:
+        gw.set_render_format_and_codec("mp4", "H265")
+        return "done"
+
+    world.broker.submit(HotOp(world.loc("A"), clobbers_deliver, Holder.agent("thread-1")))
+    world.fake.reads.clear()
+    assert world.broker.tick().kind is TickKind.RAN
+    # The op said so: one full read records what it left (snapshot + that read so far).
+    assert world.fake.reads["GetCurrentRenderMode"] == 2
+    assert _restore_after(world, int(3 / TICK)) is TickKind.RESTORED
+    assert _deliver(world) == snapshot_deliver
+    report = world.broker.last_restore
+    assert report is not None and report.ok and report.deliver_restore_skipped is None
+
+
+def test_an_unreported_deliver_change_by_an_op_is_taken_for_a_humans() -> None:
+    """Fail-safe direction: op code that changes Deliver through the raw API without reporting
+    it cannot be told from a human, so the broker keeps what it finds rather than overwrite a
+    possible human edit."""
+    world = World()
+    world.settle()
+
+    def silently_clobbers(gw) -> str:
+        project = gw.resolve.GetProjectManager().GetCurrentProject()
+        assert project.SetCurrentRenderFormatAndCodec("mp4", "H265")
+        return "done"
+
+    world.broker.submit(HotOp(world.loc("A"), silently_clobbers, Holder.agent("thread-1")))
+    assert world.broker.tick().kind is TickKind.RAN
+    assert _restore_after(world, int(3 / TICK)) is TickKind.RESTORED
+    report = world.broker.last_restore
+    assert report is not None and report.deliver_restore_skipped is not None
+    assert _deliver(world)[:2] == ("mp4", "H265")
+
+
+def test_a_failed_render_build_restore_is_the_brokers_change_not_a_humans(
+    tmp_path: Path,
+) -> None:
+    """render.build drives the API directly and reports a failed Deliver restore
+    (note_deliver_changed), so the broker reads what it left once and its own restore puts the
+    human's settings back."""
+    world = JobWorld(tmp_path)
+    world.project.render_complete_after = 3
+    original = world.project.deliver.copy()
+    proj = world.project
+    load = proj.LoadRenderPreset
+    proj.LoadRenderPreset = lambda name: False if name.startswith("aar-job-") else load(name)  # type: ignore[method-assign]
+    from .test_jobs_render import _render_params
+
+    job_id = world.submit("render", _render_params(world), world.locator())
+    world.fake.reads.clear()
+    world.runner.run_until_settled()
+    view = world.runner.get(job_id)
+    assert view is not None and view.state == JobState.SUCCEEDED.value
+    assert view.measured["deliver_restore_error"]["code"] == "preset_load_failed"
+    assert (proj.deliver.format, proj.deliver.codec) == ("mov", "ProRes")  # the job's
+    # snapshot + render.build's own + the one read of what the failed build left
+    assert _deliver_reads(world.fake) == 3 * len(DELIVER_GETTERS)
+    world.clock.advance(world.broker.config.restore_delay_seconds + 1)
+    world.runner.pump()
+    report = world.broker.last_restore
+    assert report is not None and report.deliver_restore_skipped is None, report
+    assert (proj.deliver.format, proj.deliver.codec, proj.deliver.mode) == (
+        original.format,
+        original.codec,
+        original.mode,
+    )
+    assert proj.deliver.settings == original.settings
 
 
 # == the CLI flag (decision 2) ===================================================================

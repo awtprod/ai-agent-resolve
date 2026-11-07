@@ -17,6 +17,8 @@ structured results instead of guessing.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, fields, replace
 from typing import Any, Protocol, runtime_checkable
 
@@ -41,6 +43,31 @@ _MEASURED_ON_REQUEST: frozenset[str] = frozenset({"project_manager_path"})
 
 # Project Manager folders nest; anything deeper than this is treated as a broken walk.
 MAX_PM_DEPTH = 64
+
+_DELIVER_CHANGED: ContextVar[list[str] | None] = ContextVar("aar_deliver_changed", default=None)
+
+
+def note_deliver_changed(why: str) -> None:
+    """Report that the running hot op may have left the Deliver settings changed.
+
+    The gateway's own Deliver setters report themselves. Op code that drives the API directly
+    reports what it leaves changed (``render.build`` does when its own Deliver restore fails).
+    The broker then reads the Deliver settings once after the op, so its restore takes them
+    for its own change, not a human's. Outside an op body (``deliver_changes``) it does
+    nothing, so the broker's own restore never reports itself."""
+    marks = _DELIVER_CHANGED.get()
+    if marks is not None:
+        marks.append(why)
+
+
+@contextmanager
+def deliver_changes(marks: list[str]) -> Iterator[None]:
+    """Collect the ``note_deliver_changed`` reports made inside the block into ``marks``."""
+    token = _DELIVER_CHANGED.set(marks)
+    try:
+        yield
+    finally:
+        _DELIVER_CHANGED.reset(token)
 
 
 class GatewayError(Exception):
@@ -565,6 +592,7 @@ class ScriptApiGateway:
             raise GatewayError("playhead_set_failed", f"SetCurrentTimecode({timecode!r}) failed")
 
     def set_render_format_and_codec(self, render_format: str, codec: str) -> None:
+        note_deliver_changed("SetCurrentRenderFormatAndCodec")
         if not self._project().SetCurrentRenderFormatAndCodec(render_format, codec):
             raise GatewayError(
                 "render_format_failed",
@@ -572,6 +600,7 @@ class ScriptApiGateway:
             )
 
     def set_render_mode(self, mode: int) -> None:
+        note_deliver_changed("SetCurrentRenderMode")
         if not self._project().SetCurrentRenderMode(mode):
             raise GatewayError("render_mode_failed", f"SetCurrentRenderMode({mode!r}) failed")
 
@@ -599,6 +628,7 @@ class ScriptApiGateway:
             raise GatewayError("preset_save_failed", f"SaveAsNewRenderPreset({name!r}) failed")
 
     def load_render_preset(self, name: str) -> None:
+        note_deliver_changed("LoadRenderPreset")
         if not self._project().LoadRenderPreset(name):
             raise GatewayError("preset_load_failed", f"LoadRenderPreset({name!r}) failed")
 

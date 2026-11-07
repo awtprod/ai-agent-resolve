@@ -39,6 +39,7 @@ from typing import Any
 from pydantic import Field
 
 from aar.node.broker import HotOpFailure
+from aar.node.gateway import note_deliver_changed
 from aar.node.ops.framework import (
     OpEnv,
     OpError,
@@ -209,6 +210,9 @@ def _try_restore(
     except Exception as exc:
         error = _error_dict(exc)
         _note(journal, "restore_failed", {"snapshot": preset, "restore_error": error}, problems)
+        # Deliver is left as the job configured it (or half restored): tell the broker, so its
+        # own restore does not take this for a human's edit and puts the snapshot back.
+        note_deliver_changed("render.build: Deliver restore failed")
         return error
     _note(journal, "snapshot_deleted", {"snapshot": preset}, problems)
     return None
