@@ -1,8 +1,7 @@
-"""S13b F1 pin: QA join enumeration (``aar.qa.planmap.cuts``) skips joins on a track that
-carries no mixed audio -- a muted or unrouted audio track per the plan's ``audio_tracks`` --
-because that source audio never reaches the render, so a join-quiet or join-retranscribe check
-there would judge audio the viewer never hears. A plan with no ``audio_tracks`` (every v1 plan)
-is checked exactly as before.
+"""S13b F3 pin: a QA join sits on a track that carries mixed audio when that track is unmuted,
+routed to a bus, or is itself a bus. The CCN A1-A4 (muted but bussed to A5) therefore carry the
+dialogue to the mix and are checked; only a muted, unrouted, non-bus track is dropped. A plan
+with no ``audio_tracks`` (every v1 plan) is checked, as before.
 """
 
 from __future__ import annotations
@@ -36,43 +35,51 @@ def _plan(audio_tracks: list[dict], *, tracks: tuple[int, int] = (1, 1)) -> Edit
     )
 
 
-def test_v1_plan_with_no_audio_tracks_is_still_checked() -> None:
+def test_v1_plan_with_no_audio_tracks_is_checked() -> None:
     assert len(cuts(_plan([]), 1)) == 1
 
 
-def test_muted_track_join_is_skipped() -> None:
-    # The CCN topology: content on video track 1, A1 muted (feeds the bus but not the mix).
+def test_ccn_muted_but_bussed_track_is_checked() -> None:
+    # The CCN topology: A1 is muted but routed to the A5 bus, so it carries the dialogue.
     plan = _plan([{"name": "A1", "mute": True, "bus": "A5"}])
-    assert cuts(plan, 1) == []
-    assert carries_mixed_audio(plan, 1) is False
+    assert carries_mixed_audio(plan, 1) is True
+    assert len(cuts(plan, 1)) == 1
 
 
-def test_unrouted_track_join_is_skipped() -> None:
-    # Not muted, but routed to no bus -> carries no mix (e.g. an A6 bounce track).
-    plan = _plan([{"name": "A6", "mute": False, "bus": None}])
-    assert cuts(plan, 1) == []
+def test_unmuted_track_is_checked() -> None:
+    plan = _plan([{"name": "A1", "mute": False, "bus": None}])
+    assert carries_mixed_audio(plan, 1) is True
+    assert len(cuts(plan, 1)) == 1
 
 
 def test_bus_track_itself_is_checked() -> None:
     # A5 has no bus of its own but is the bus other tracks feed, so it carries the mix.
     plan = _plan([{"name": "A5", "mute": False, "bus": None}, {"name": "A1", "bus": "A5"}])
-    assert len(cuts(plan, 1)) == 1
     assert carries_mixed_audio(plan, 1) is True
-
-
-def test_routed_unmuted_track_is_checked() -> None:
-    plan = _plan([{"name": "A1", "mute": False, "bus": "A5"}])
     assert len(cuts(plan, 1)) == 1
+
+
+def test_muted_bus_track_still_carries_the_mix() -> None:
+    # Even a muted, unrouted track carries the mix if it IS the bus another track feeds.
+    plan = _plan([{"name": "A5", "mute": True, "bus": None}, {"name": "A1", "bus": "A5"}])
+    assert carries_mixed_audio(plan, 1) is True
+    assert len(cuts(plan, 1)) == 1
+
+
+def test_muted_unrouted_non_bus_track_carries_no_mix_and_is_filtered() -> None:
+    plan = _plan([{"name": "A1", "mute": True, "bus": None}])
+    assert carries_mixed_audio(plan, 1) is False
+    assert cuts(plan, 1) == []
+    # But only_mixed=False still sees the join, so the check reports skipped, not "no cuts".
+    assert len(cuts(plan, 1, only_mixed=False)) == 1
 
 
 def test_short_audio_tracks_list_falls_back_to_checking() -> None:
-    # Content on video track 2 but only one audio_tracks entry: no info -> checked.
     plan = _plan([{"name": "A1", "mute": True}], tracks=(2, 2))
     assert len(cuts(plan, 1)) == 1
 
 
-def test_mixed_tracks_only_the_muted_one_is_skipped() -> None:
-    # One join on a muted track 1, one join on a routed track 2.
+def test_mixed_tracks_only_the_no_mix_one_is_filtered() -> None:
     plan = EditPlan.model_validate(
         {
             "version": 2,
@@ -95,9 +102,10 @@ def test_mixed_tracks_only_the_muted_one_is_skipped() -> None:
                 {"track": 2, "source": "c", "src_in": 0, "src_out": 48},
                 {"track": 2, "source": "d", "src_in": 0, "src_out": 48},
             ],
+            # track 1 muted+unrouted (no mix), track 2 muted+bussed (carries mix).
             "audio_tracks": [
-                {"name": "A1", "mute": True, "bus": "A5"},
-                {"name": "A2", "mute": False, "bus": "A5"},
+                {"name": "A1", "mute": True, "bus": None},
+                {"name": "A2", "mute": True, "bus": "A5"},
             ],
         }
     )
