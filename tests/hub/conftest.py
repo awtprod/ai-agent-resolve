@@ -10,6 +10,7 @@ from collections.abc import Iterator
 
 import pytest
 from recipe_support import register_test_recipe
+from write_support import Hub, make_hub
 
 from aar.recipes import registry
 from aar.recipes.models import RecipeDef
@@ -21,3 +22,11 @@ def registered_recipe() -> Iterator[RecipeDef]:
     definition = register_test_recipe()
     yield definition
     registry.clear()
+
+
+@pytest.fixture
+def hub(tmp_path) -> Iterator[Hub]:  # type: ignore[no-untyped-def]
+    """A fresh hub for one test (used by the adopted validator probes)."""
+    made = make_hub(tmp_path)
+    yield made
+    made.log.close()

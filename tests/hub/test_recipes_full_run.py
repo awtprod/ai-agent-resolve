@@ -89,8 +89,21 @@ def test_full_run_start_worker_hot_agent_reject_then_approve(
     assert p_round1.is_cancelled, "the round-1 plan attempt is superseded"
     assert not state.is_step_done("p"), "the plan must run again in round 2"
 
-    # Round 2: resubmit a plan, complete, and the human approves.
-    plan_node2 = submit_test_plan(hub, recipe_node, AGENT, key="plan-r2")
+    # Round 2: resubmit a DIFFERENT plan deriving from round 1's rejected review (F4), complete,
+    # and the human approves.
+    from write_support import plan_fixture
+
+    plan2 = dict(plan_fixture("short_clean"))
+    plan2["timeline"] = f"{plan2.get('timeline', 'short')} [r2]"
+    plan_node2 = submit_plan(
+        hub.log,
+        hub.store,
+        hub.project_id,
+        plan2,
+        AGENT,
+        derives_from=review1,
+        idempotency_key="plan-r2",
+    ).body["node"]["id"]
     step_complete(
         hub.log,
         hub.store,
