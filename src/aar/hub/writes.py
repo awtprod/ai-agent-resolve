@@ -172,6 +172,8 @@ ERROR_CODES = frozenset(
         "unknown_fact",
         "unknown_source",
         "too_many_facts",
+        "project_exists",
+        "actor_not_allowed",
     }
 )
 

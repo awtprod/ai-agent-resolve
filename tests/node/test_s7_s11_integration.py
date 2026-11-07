@@ -656,7 +656,7 @@ def _register(world: JobWorld, *, sources: list[ProjectSource] | None = None, na
         HUMAN,
         sources=sources
         if sources is not None
-        else [ProjectSource("local_db", {"name": "Show", "uid": world.pid()})],
+        else [ProjectSource("local_db", {"name": "Show", "project_id": world.pid()})],
     )
 
 
