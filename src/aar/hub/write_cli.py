@@ -204,6 +204,10 @@ def _parse_actor(value: str) -> Any:
     kind, sep, ident = value.partition(":")
     if not sep:
         raise ValueError(f"--actor must look like KIND:ID, got {value!r}")
+    if kind == "runner":
+        # The 'runner' identity belongs to the recipe engine alone; no string surface (CLI or
+        # generic event append) may produce it, or runner-written evidence could be forged.
+        raise ValueError("actor kind 'runner' is reserved for the recipe engine")
     return Actor(kind, ident)
 
 
@@ -212,13 +216,21 @@ def _dispatch(
 ) -> dict[str, Any]:
     from aar.hub import facts, writes
     from aar.hub.cli import _open_store
+    from aar.recipes import registry as recipe_registry
 
     key = args.idempotency_key
     if command == "brief":
         result = writes.create_brief(log, request["brief"], actor, idempotency_key=key)
     elif command == "recipe":
+        # F12: validate recipe params against the registered model, like `aar hub serve`, so the
+        # CLI cannot create a recipe with params a step later chokes on.
         result = writes.create_recipe(
-            log, request["project_id"], request["recipe"], actor, idempotency_key=key
+            log,
+            request["project_id"],
+            request["recipe"],
+            actor,
+            idempotency_key=key,
+            params_validator=recipe_registry.registry_params_validator,
         )
     elif command == "plan":
         result = writes.submit_plan(

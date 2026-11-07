@@ -159,6 +159,10 @@ ERROR_CODES = frozenset(
         "expects_unmet",
         "step_not_open",
         "no_attempts_left",
+        "rounds_exhausted",
+        "outputs_too_large",
+        "review_withdrawn",
+        "runner_managed",
         "invalid_fact",
         "unknown_project",
         "unknown_parent",
@@ -1277,6 +1281,19 @@ def set_own_status(
                 "(`aar hub review withdraw`).",
                 node_id=node_id,
             )
+        # The recipe engine owns the status of its op nodes and of a started recipe node: these
+        # mirror runner evidence, so no actor (human included) may move them here, or an agent
+        # could walk a run past a human gate (S13g2 F1). A human acts through recipe_cancel and
+        # review decisions instead.
+        if _is_runner_managed(txn, project_id, node):
+            raise WriteError(
+                "runner_managed",
+                f"node {node_id!r} is managed by the recipe engine and cannot be moved here",
+                "A recipe step's op node and a started recipe node move only on runner evidence; "
+                "use recipe_cancel or decide the gate review.",
+                node_id=node_id,
+                kind=node.kind,
+            )
         if actor.kind != "human":
             if node.kind not in AGENT_OWNABLE_KINDS:
                 raise WriteError(
@@ -1317,6 +1334,25 @@ def set_own_status(
 
 def _status_body(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {key: payload.get(key) for key in ("node_id", "kind", "from", "to")}
+
+
+# The recipe engine's schema/event names, kept as literals so this module does not import
+# aar.recipes (recipes depends on hub, not the reverse).
+_RECIPE_STEP_SCHEMA = "aar.step/1"
+_RECIPE_STARTED = "recipe.started"
+
+
+def _is_runner_managed(txn: Transaction, project_id: str, node: GraphNode) -> bool:
+    """Whether ``node`` is an engine-owned op node or a started recipe node (S13g2 F1)."""
+    if node.kind == "op":
+        data = node.payload if isinstance(node.payload, dict) else {}
+        return data.get("schema") == _RECIPE_STEP_SCHEMA
+    if node.kind == "recipe":
+        for event in txn.read(0, project_id=project_id, types=[_RECIPE_STARTED]):
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            if payload.get("recipe_node") == node.id:
+                return True
+    return False
 
 
 # -- typed reads -------------------------------------------------------------------------------

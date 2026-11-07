@@ -180,15 +180,21 @@ NAMESPACES: tuple[Namespace, ...] = (
 
 
 class FactSource(StrictModel):
-    """Where a fact came from: the recipe node that learned it and/or an artifact."""
+    """Where a fact came from: the recipe node and/or op node that learned it, and/or an artifact.
+
+    A recipe step records facts through its op node, so ``op_node`` names the exact step attempt
+    (``recipe_node`` still names the run for run-level grouping). Pre-S13g2 logs carry only
+    ``recipe_node`` or ``artifact``; ``op_node`` is a new optional key no projection requires.
+    """
 
     recipe_node: NodeId | None = None
+    op_node: NodeId | None = None
     artifact: Sha256 | None = None
 
     @model_validator(mode="after")
     def _one_at_least(self) -> FactSource:
-        if self.recipe_node is None and self.artifact is None:
-            raise ValueError("a source names a recipe_node, an artifact, or both")
+        if self.recipe_node is None and self.op_node is None and self.artifact is None:
+            raise ValueError("a source names a recipe_node, an op_node, an artifact, or several")
         return self
 
 
@@ -227,6 +233,15 @@ def namespace_of(key: Any) -> Namespace:
 
 def _dump(model: BaseModel) -> dict[str, Any]:
     return model.model_dump(mode="json", by_alias=True)
+
+
+def _dump_source(source: FactSource) -> dict[str, Any]:
+    """Serialize a fact source, omitting ``op_node`` when unset so pre-S13g2 sources (recipe_node
+    and/or artifact only) serialize exactly as before; a recipe op fact carries ``op_node``."""
+    dumped = source.model_dump(mode="json", by_alias=True)
+    if dumped.get("op_node") is None:
+        dumped.pop("op_node", None)
+    return dumped
 
 
 # -- projection -----------------------------------------------------------------------
@@ -522,7 +537,7 @@ def record_fact(
     payload = {
         "key": key,
         "value": _dump(model),
-        "source": _dump(source_model) if source_model is not None else None,
+        "source": _dump_source(source_model) if source_model is not None else None,
     }
     with log.transaction() as txn:
         existing = _replayed(
@@ -559,6 +574,15 @@ def _check_source(txn: Transaction, log: EventLog, project_id: str, source: Fact
                 "Name the recipe node that learned the fact (recipe_create returns its id), "
                 "or leave recipe_node out.",
                 recipe_node=source.recipe_node,
+            )
+    if source.op_node is not None:
+        node = WorkGraph(log, project_id).node(source.op_node)
+        if node is None or node.kind != "op":
+            raise WriteError(
+                "unknown_source",
+                f"no op node {source.op_node!r} in project {project_id!r}",
+                "Name the recipe op node that learned the fact, or leave op_node out.",
+                op_node=source.op_node,
             )
     if (
         source.artifact is not None
