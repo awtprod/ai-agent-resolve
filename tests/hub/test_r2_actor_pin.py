@@ -11,9 +11,11 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-SRC = Path(__file__).resolve().parents[2] / "src" / "aar"
-# events.py defines the shared parser; aar.recipes builds the engine-only RUNNER directly.
-_PARSER_FILE = SRC / "hub" / "events.py"
+import aar
+
+# Scan the aar package that is actually importable (so under a mutant on PYTHONPATH the pin reads
+# the mutated source, not the worktree). events.py is the shared parser; recipes builds RUNNER.
+SRC = Path(aar.__file__).resolve().parent
 
 
 def _actor_calls(tree: ast.AST):
