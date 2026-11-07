@@ -364,7 +364,8 @@ class Broker:
         self._polled_at: float | None = None
         self._deliver_left: tuple[object, object, object] | None = None
         """The human project's Deliver format, codec and mode as the broker last left them:
-        the snapshot's, or what an op that reported changing them left."""
+        the snapshot's (set at every take of control), or what an op in the human's project
+        that reported changing them left. Read only by the restore."""
 
     # -- public API ------------------------------------------------------------------------
 
@@ -887,7 +888,6 @@ class Broker:
         self._snapshot = None
         self._control_since = None
         self._touched_human_project = False
-        self._deliver_left = None
         self._drained_since = None
         self._last_turn = None
         self._release_instance_lease()

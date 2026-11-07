@@ -565,6 +565,28 @@ def test_without_a_human_edit_the_snapshot_deliver_settings_come_back() -> None:
     assert report is not None and report.ok and report.deliver_restore_skipped is None
 
 
+def test_a_reported_deliver_change_in_another_project_is_not_the_humans() -> None:
+    """Deliver settings are per project: an op in B that changes B's is no reason to read
+    them, and the restore of A compares A's with the snapshot (no skip, no extra read)."""
+    world = World()
+    world.settle()
+    snapshot_deliver = _deliver(world)
+
+    def changes_b(gw) -> str:
+        gw.set_render_format_and_codec("mp4", "H265")
+        return "done"
+
+    world.broker.submit(HotOp(world.loc("B"), changes_b, Holder.agent("thread-1")))
+    world.fake.reads.clear()
+    kinds = [outcome.kind for outcome in world.broker.run_until_idle()]
+    assert kinds == [TickKind.RAN, TickKind.RESTORED, TickKind.IDLE]
+    assert _deliver(world, "B")[:2] == ("mp4", "H265")
+    assert _deliver(world) == snapshot_deliver
+    report = world.broker.last_restore
+    assert report is not None and report.ok and report.deliver_restore_skipped is None, report
+    assert world.fake.reads["GetCurrentRenderMode"] == 3  # snapshot, check, final: no more
+
+
 def test_an_unreported_deliver_change_by_an_op_is_taken_for_a_humans() -> None:
     """Fail-safe direction: op code that changes Deliver through the raw API without reporting
     it cannot be told from a human, so the broker keeps what it finds rather than overwrite a
