@@ -266,6 +266,7 @@ def test_cli_reports_incomplete_shutdown_and_retains_exclusion(
             lease_seconds=60,
             heartbeat_seconds=15,
             tick_seconds=0.25,
+            context_poll_seconds=2.0,
         )
         try:
             assert cli.run_node(args, gateway_factory=lambda: runtime.broker._gw) == 2
