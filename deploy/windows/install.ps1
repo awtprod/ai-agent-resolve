@@ -36,11 +36,56 @@ function Get-CurrentUserName {
     [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 }
 
+function Get-AllowedSids {
+    # Current user, SYSTEM, Administrators. SIDs, never names.
+    $meSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    @($meSid.Value, 'S-1-5-18', 'S-1-5-32-544')
+}
+
+function Get-AclProblems([string]$Path, [bool]$RequireProtected) {
+    # Returns a list of problems: 'UNPROTECTED' and/or every ACE SID outside the allowlist.
+    $allowed = Get-AllowedSids
+    $acl = Get-Acl -LiteralPath $Path
+    $problems = @()
+    if ($RequireProtected -and -not $acl.AreAccessRulesProtected) { $problems += 'UNPROTECTED' }
+    foreach ($rule in $acl.Access) {
+        try {
+            $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        } catch {
+            $sid = [string]$rule.IdentityReference
+        }
+        if ($allowed -notcontains $sid) { $problems += $sid }
+    }
+    @($problems | Select-Object -Unique)
+}
+
 function Set-OwnerOnlyAcl([string]$Path) {
-    # Current user, SYSTEM (S-1-5-18), Administrators (S-1-5-32-544); inheritance removed.
-    $me = Get-CurrentUserName
-    icacls $Path /inheritance:r /grant:r "${me}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "icacls failed with exit code $LASTEXITCODE" }
+    # Rebuild the root DACL from the allowlist instead of editing it: the additive icacls
+    # form leaves any existing explicit ACE (Users, Everyone) in place.
+    $sec = New-Object System.Security.AccessControl.DirectorySecurity
+    $sec.SetAccessRuleProtection($true, $false)   # protected, drop inherited ACEs
+    $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $none = [System.Security.AccessControl.PropagationFlags]::None
+    foreach ($sidText in Get-AllowedSids) {
+        $sid = New-Object System.Security.Principal.SecurityIdentifier($sidText)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sid, [System.Security.AccessControl.FileSystemRights]::FullControl, $inherit, $none,
+            [System.Security.AccessControl.AccessControlType]::Allow)
+        $sec.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $sec
+    # Descendants (an existing token, jobs.db, logs) must only inherit from the new root.
+    if (Get-ChildItem -LiteralPath $Path -Force | Select-Object -First 1) {
+        icacls "$Path\*" /reset /T /C | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "icacls /reset failed with exit code $LASTEXITCODE" }
+    }
+    $bad = Get-AclProblems $Path $true
+    if ($bad.Count -gt 0) { throw "ACL on $Path is not owner-only: $($bad -join ', ')" }
+    $token = Join-Path $Path 'edit-pc.token'
+    if (Test-Path -LiteralPath $token) {
+        $bad = Get-AclProblems $token $false
+        if ($bad.Count -gt 0) { throw "ACL on $token is not owner-only: $($bad -join ', ')" }
+    }
 }
 
 function Invoke-Git {
@@ -168,6 +213,12 @@ function Disable-Node {
 function Show-Status {
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($t) { "task: $($t.TaskName) state=$($t.State)" } else { "task '$TaskName' is not registered" }
+    if (Test-Path -LiteralPath $Root) {
+        $bad = @(Get-AclProblems $Root $true)
+        $token = Join-Path $Root 'edit-pc.token'
+        if (Test-Path -LiteralPath $token) { $bad += @(Get-AclProblems $token $false) }
+        if ($bad.Count -eq 0) { 'acl: owner-only' } else { "acl: EXTRA $(($bad | Select-Object -Unique) -join ' ')" }
+    }
     Get-NodeProcesses | ForEach-Object { "pid=$($_.ProcessId) session=$($_.SessionId) $($_.ExecutablePath) :: $($_.CommandLine)" }
     Get-ChildItem (Join-Path $Root 'logs') -Filter 'supervisor-*.log' -ErrorAction SilentlyContinue |
         Sort-Object Name | Select-Object -Last 1 | ForEach-Object { Get-Content $_.FullName -Tail 5 }

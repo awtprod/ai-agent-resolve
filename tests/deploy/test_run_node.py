@@ -478,3 +478,26 @@ def test_process_selector_matches_supervisor_base_child_but_not_foreign_pythonw(
     assert not selected(r"D:\tools\bridge\pythonw.exe", r'"D:\tools\bridge\server.py"')
     text = (DEPLOY / "windows" / "install.ps1").read_text(encoding="utf-8")
     assert "-like '*node run*' -or $_.CommandLine -like '*run_node.py*'" in text
+
+
+def test_install_acl_is_rebuilt_from_the_allowlist_and_verified() -> None:
+    text = (DEPLOY / "windows" / "install.ps1").read_text(encoding="utf-8")
+    assert "System.Security.AccessControl.DirectorySecurity" in text
+    assert "SetAccessRuleProtection($true, $false)" in text
+    assert "ContainerInherit, ObjectInherit" in text and "FullControl" in text
+    assert "Get-AllowedSids" in text and "'S-1-5-18'" in text and "'S-1-5-32-544'" in text
+    assert "WindowsIdentity]::GetCurrent().User" in text
+    assert "SecurityIdentifier" in text and "Set-Acl -LiteralPath $Path -AclObject" in text
+    assert 'icacls "$Path\\*" /reset /T /C' in text and "icacls /reset failed" in text
+    # The old additive form (kept explicit ACEs) is gone.
+    assert "/inheritance:r" not in text and "/grant:r" not in text
+    # Verification: throws on install, reported by status.
+    assert "is not owner-only" in text and "UNPROTECTED" in text
+    assert "acl: owner-only" in text and "acl: EXTRA" in text
+    assert (
+        "edit-pc.token"
+        in text.split("function Set-OwnerOnlyAcl")[1].split("function Invoke-Git")[0]
+    )
+    # Reset runs after the root DACL is set, so descendants inherit the new one.
+    body = text.split("function Set-OwnerOnlyAcl")[1]
+    assert body.index("Set-Acl") < body.index("/reset")
