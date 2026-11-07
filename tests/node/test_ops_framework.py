@@ -21,6 +21,7 @@ OTHER = Holder.agent("thread-other")
 
 EXPECTED = {
     "project.find": (True, False),
+    "project.locate": (True, False),
     "timeline.list": (True, False),
     "timeline.describe": (True, False),
     "media.find": (True, False),

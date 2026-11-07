@@ -1,4 +1,4 @@
-"""Read ops: find projects, list timelines, describe a timeline, find media.
+"""Read ops: find or locate projects, list timelines, describe a timeline, find media.
 
 None of these change Resolve, except that ``project.find`` with ``recursive=True`` walks the
 Project Manager folder tree (and puts it back where it was).
@@ -124,6 +124,51 @@ def project_find(env: OpEnv, params: ProjectFindParams) -> ProjectFindResult:
         open_project=open_name,
         open_project_id=open_id,
         notes=notes,
+    )
+
+
+# -- project.locate ---------------------------------------------------------------------------
+
+
+class ProjectLocateParams(OpModel):
+    pass
+
+
+class ProjectLocateResult(OpModel):
+    name: str
+    project_id: str
+    folder_path: tuple[str, ...] | None
+    """The Project Manager folders from the root, ``()`` at the root; ``None`` when it could
+    not be read without moving the Project Manager (``folder_path_reason`` says why)."""
+    folder_path_reason: str | None
+    pm_folder: str
+    """The Project Manager's current folder name (``""`` at the root)."""
+    locator: ProjectLocator | None
+    """The open project as a locator, when ``folder_path`` is known; what the hub registers."""
+
+
+@op(
+    "project.locate",
+    params=ProjectLocateParams,
+    result=ProjectLocateResult,
+    mutates=False,
+    traps=("pm-folder-scoped-load",),
+)
+def project_locate(env: OpEnv, params: ProjectLocateParams) -> ProjectLocateResult:
+    """Say which project is open (name, unique id, folder when provable) without moving anything."""
+    where = _gateway(env).locate_open_project()
+    locator = (
+        ProjectLocator(where.folder_path, where.name, where.project_id)
+        if where.folder_path is not None
+        else None
+    )
+    return ProjectLocateResult(
+        name=where.name,
+        project_id=where.project_id,
+        folder_path=where.folder_path,
+        folder_path_reason=where.folder_path_reason,
+        pm_folder=where.pm_folder,
+        locator=locator,
     )
 
 
