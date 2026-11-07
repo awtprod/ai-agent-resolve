@@ -310,8 +310,13 @@ def test_v23_review_qa_runs_on_the_review_file(tmp_path: Path, sources: Path) ->
     work = tmp_path / "w"
     qa = qa_pass()
     _review(
-        hub, sources, work, source="render_1080p.mp4", cap_mb=5.0,
-        transcoder=FakeTranscoder([10]), qa=qa,
+        hub,
+        sources,
+        work,
+        source="render_1080p.mp4",
+        cap_mb=5.0,
+        transcoder=FakeTranscoder([10]),
+        qa=qa,
     )
     ddir = Path(_delivery_dir(str(work), hub.project_id, "short-1", "rj-1"))
     assert qa.calls[-1][0] == str(ddir / "review.mp4")
@@ -324,8 +329,13 @@ def test_v25_review_qa_failure_reports_truthful_completed_steps(
     hub = make_hub(tmp_path)
     with pytest.raises(DeliverError) as info:
         _review(
-            hub, sources, tmp_path / "w", source="render_1080p.mp4", cap_mb=5.0,
-            transcoder=FakeTranscoder([10]), qa=qa_fail(),
+            hub,
+            sources,
+            tmp_path / "w",
+            source="render_1080p.mp4",
+            cap_mb=5.0,
+            transcoder=FakeTranscoder([10]),
+            qa=qa_fail(),
         )
     assert info.value.code == "review_qa_failed"
     assert info.value.detail["completed_steps"] == ["pull", "transcode"]
@@ -337,3 +347,17 @@ def test_v34_first_master_delivery_does_not_report_facts_resumed(
     hub = make_hub(tmp_path)
     result = _master(hub, sources, tmp_path / "w")
     assert "facts" not in result.resumed_steps
+
+
+def test_v18_v19_passlogfile_is_per_delivery_and_absolute(tmp_path: Path, sources: Path) -> None:
+    """The two-pass log path is per-delivery (inside the delivery dir) and absolute: never the
+    shared workdir root, and never a bare name in the process cwd."""
+    hub = make_hub(tmp_path)
+    work = tmp_path / "work"
+    tc = FakeTranscoder([int(0.3 * MB)])
+    _review(hub, sources, work, source="render_1080p.mp4", cap_mb=0.5, transcoder=tc)
+    passlog = tc.calls[0]["passlogfile"]
+    assert os.path.isabs(passlog)  # V19: "ffpass" in the cwd would be relative
+    ddir = _delivery_dir(str(work), hub.project_id, "short-1", "rj-1")
+    assert os.path.dirname(passlog) == ddir  # V18: the workdir root is shared across deliveries
+    assert os.path.basename(passlog) == "ffpass"
