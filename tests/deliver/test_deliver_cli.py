@@ -269,3 +269,16 @@ def test_v71_delivery_in_progress_exits_3(
         assert main(_review_argv(hub, tmp_path, sources)) == 3
     finally:
         service._release_delivery_lock(fd)
+
+
+def test_r3_1_bad_db_exits_2(
+    tmp_path: Path, sources: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A --db that cannot be opened (a missing directory) exits 2 with a typed message."""
+    hub = make_hub(tmp_path)
+    _use_fake_host(monkeypatch, sources)
+    monkeypatch.setattr(service, "_default_qa_check", qa_pass())
+    common = _common(hub, tmp_path, sources)
+    common[common.index("--db") + 1] = str(tmp_path / "missing_dir" / "hub.db")
+    argv = ["deliver", "review", *common, "--subject", hub.subject_id, "--title", "Acme"]
+    assert main(argv) == 2

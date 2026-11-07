@@ -354,6 +354,9 @@ def test_size_verified_true_reaches_the_job_measured(tmp_path: Path) -> None:
     view = _run(JobWorld(tmp_path), width=1280, height=720)
     assert view is not None and view.state == JobState.SUCCEEDED.value, view and view.error
     assert view.measured["size_verified"] is True
+    # The measured width/height the queue reported travel into the job result too (R2-6).
+    assert view.measured["measured_width"] == 1280
+    assert view.measured["measured_height"] == 720
 
 
 def test_partial_size_keys_is_a_mismatch_not_unverified(tmp_path: Path) -> None:

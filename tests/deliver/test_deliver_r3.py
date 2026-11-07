@@ -459,3 +459,134 @@ def test_v61_composed_review_qa_includes_the_size_cap_check() -> None:
         qa_pass(), "review.mp4", "short", make_profile(review_mp4_max_mb=5.0), size_bytes=100
     )
     assert any(c.id == "size-cap" for c in report.checks)
+
+
+def test_v75_non_yuv420p_h264_is_transcoded(tmp_path: Path, sources: Path) -> None:
+    """An H.264 but yuv422p .mp4 that fits the box and cap must be transcoded, not stored as is
+    (V75 drops the pixel-format gate and would keep an unplayable High 4:2:2 review)."""
+    hub = make_hub(tmp_path)
+    pc = tmp_path / "pc"
+    pc.mkdir()
+    run_tool(
+        "ffmpeg",
+        [
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=25:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv422p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-shortest",
+            str(pc / "s422.mp4"),
+        ],
+        timeout_s=120.0,
+    )
+    r = deliver_review(
+        project_id=hub.project_id,
+        subject_id=hub.subject_id,
+        deliverable="short-1",
+        actor=AGENT,
+        profile=make_profile(review_mp4_max_mb=20.0),
+        title="t",
+        timeline="Main",
+        fps=25.0,
+        kind="short",
+        render_output=render_output(pc / "s422.mp4", duration=2.0),
+        workdir=str(tmp_path / "w"),
+        edit_host=FakeEditHost(pc),
+        log=hub.log,
+        store=hub.store,
+        transcoder=FakeTranscoder([100_000]),
+        qa_check=qa_pass(),
+    )
+    assert r.transcoded is True
+
+
+def test_r3_2_redelivery_withdraws_the_prior_open_review(tmp_path: Path, sources: Path) -> None:
+    """Each re-delivery with new bytes opens a new review and withdraws the prior open one for the
+    same (project, deliverable, review role), so exactly one stays open (R3-2)."""
+    from aar.hub.reviews import list_reviews
+
+    hub = make_hub(tmp_path)
+    work = tmp_path / "w"
+    ids = []
+    for size in (400_000, 300_000, 200_000):
+        ddir = Path(service._delivery_dir(str(work), hub.project_id, "short-1", "rj-1"))
+        rev = ddir / "review.mp4"
+        if rev.exists():
+            rev.unlink()
+        r = deliver_review(
+            project_id=hub.project_id,
+            subject_id=hub.subject_id,
+            deliverable="short-1",
+            actor=AGENT,
+            profile=make_profile(review_mp4_max_mb=0.5),
+            title="t",
+            timeline="Main",
+            fps=25.0,
+            kind="short",
+            render_output=render_output(sources / "render_1080p.mp4", duration=6.0),
+            workdir=str(work),
+            edit_host=FakeEditHost(sources),
+            log=hub.log,
+            store=hub.store,
+            transcoder=FakeTranscoder([size]),
+            qa_check=qa_pass(),
+        )
+        ids.append(r.review_id)
+    reviews = list_reviews(hub.log, hub.project_id)
+    open_reviews = [rv for rv in reviews if rv.pending]
+    assert [rv.id for rv in open_reviews] == [ids[-1]]  # exactly one, the newest
+    cancelled = [rv for rv in reviews if rv.status == "cancelled"]
+    assert len(cancelled) == 2
+    for rv in cancelled:
+        assert rv.withdrawal is not None
+        assert "superseded by delivery" in rv.withdrawal.reason
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores chmod 0")
+def test_r3_3_unreadable_source_is_local_io_error(tmp_path: Path, sources: Path) -> None:
+    """An unreadable pre-pulled local source is a local_io_error, not store_unavailable (R3-3)."""
+    import shutil
+
+    hub = make_hub(tmp_path)
+    work = tmp_path / "w"
+    ddir = Path(service._delivery_dir(str(work), hub.project_id, "short-1", "rj-1"))
+    shutil.copyfile(sources / "render_720p.mp4", ddir / "source.mp4")
+    os.chmod(ddir / "source.mp4", 0)
+    try:
+        with pytest.raises(DeliverError) as exc:
+            deliver_review(
+                project_id=hub.project_id,
+                subject_id=hub.subject_id,
+                deliverable="short-1",
+                actor=AGENT,
+                profile=make_profile(review_mp4_max_mb=5.0),
+                title="t",
+                timeline="Main",
+                fps=25.0,
+                kind="short",
+                render_output=render_output(sources / "render_720p.mp4", duration=2.0),
+                workdir=str(work),
+                edit_host=FakeEditHost(sources),
+                log=hub.log,
+                store=hub.store,
+                transcoder=FakeTranscoder([10]),
+                qa_check=qa_pass(),
+            )
+        assert exc.value.code == "local_io_error"
+        assert exc.value.detail.get("completed_steps") == []
+    finally:
+        os.chmod(ddir / "source.mp4", 0o600)

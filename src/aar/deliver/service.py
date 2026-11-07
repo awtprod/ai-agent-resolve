@@ -33,7 +33,14 @@ from aar.deliver.transcode import AUDIO_KBPS, FfmpegTranscoder, Transcoder
 from aar.hub.artifacts import ArtifactStore
 from aar.hub.events import Actor, EventLog
 from aar.hub.facts import record_fact
-from aar.hub.reviews import Review, ReviewError, SubjectNotFound, request_review
+from aar.hub.reviews import (
+    Review,
+    ReviewError,
+    SubjectNotFound,
+    list_reviews,
+    request_review,
+    withdraw,
+)
 from aar.hub.writes import WriteError
 from aar.media import MediaError, MediaToolMissing, probe
 from aar.media.probe import PROBE_TIMEOUT_S
@@ -211,6 +218,42 @@ def _review_qa_report(
     )
 
 
+def _supersede_prior_reviews(
+    log: EventLog,
+    store: ArtifactStore,
+    project_id: str,
+    subject_id: str,
+    deliverable: str,
+    new_review_id: str,
+    actor: Actor,
+) -> None:
+    """Withdraw every still-open review (other than the new one) previously requested for this
+    subject whose render is this deliverable's review artifact, using the requester-withdraw path
+    and the same actor, so a human can never approve a superseded proxy (R3-2)."""
+    for review in list_reviews(log, project_id, pending_only=True):
+        if review.id == new_review_id or review.subject != subject_id:
+            continue
+        if not any(_is_review_artifact(store, rid, deliverable) for rid in review.renders):
+            continue
+        withdraw(
+            log,
+            project_id,
+            review.id,
+            f"superseded by delivery {new_review_id}",
+            actor,
+            idempotency_key=f"deliver.supersede:{new_review_id}:{review.id}",
+        )
+
+
+def _is_review_artifact(store: ArtifactStore, artifact_id: str, deliverable: str) -> bool:
+    meta = store.get_meta(artifact_id)
+    return (
+        meta is not None
+        and meta.meta.get("role") == "review"
+        and meta.meta.get("deliverable") == deliverable
+    )
+
+
 @runtime_checkable
 class EditHostLike(Protocol):
     """The slice of :class:`aar.host.EditHost` the delivery library uses (verified transport)."""
@@ -300,10 +343,21 @@ def _pull(edit_host: EditHostLike, remote: str, local: str, resumed: list[str]) 
     """
     if os.path.exists(local):
         remote_sha = edit_host.file_hash(remote).sha256.lower()
-        local_sha = _hash_file(local)
+        try:
+            local_sha = _hash_file(local)
+            local_size = os.path.getsize(local)
+        except OSError as exc:
+            # A local-filesystem read error (an unreadable leftover, a broken work dir) is not an
+            # artifact-store problem; give it its own code and a truthful hint (R3-3).
+            raise DeliverError(
+                "local_io_error",
+                f"the local file {local} could not be read: {exc}",
+                "Check the work dir is readable and remove any stale unreadable file, then re-run.",
+                local=local,
+            ) from exc
         if local_sha == remote_sha:
             resumed.append("pull")
-            return local_sha, os.path.getsize(local)
+            return local_sha, local_size
         raise DeliverError(
             "deliver_local_mismatch",
             f"{local} already exists with sha256 {local_sha} but the remote reports {remote_sha}",
@@ -652,6 +706,10 @@ def deliver_review(
             fps=fps,
             idempotency_key=keys["review"],
         )
+        # Withdraw any still-open review previously requested for this (project, deliverable, review
+        # role), so a human can never approve a stale proxy of an older delivery (R3-2). Only open
+        # reviews are touched, so a re-run (the prior ones already cancelled) is a no-op.
+        _supersede_prior_reviews(log, store, pid, subject_id, dname, review.id, actor)
         completed.append("review")
     except DeliverError as exc:
         exc.detail.setdefault("completed_steps", list(completed))

@@ -241,6 +241,8 @@ def _error(
 
 
 def _dispatch(args: argparse.Namespace, run: Any) -> int:
+    import sqlite3
+
     from aar.deliver.errors import DeliverError
     from aar.host.errors import ConfigError, HostError, TransportError
     from aar.media import MediaToolMissing
@@ -249,6 +251,18 @@ def _dispatch(args: argparse.Namespace, run: Any) -> int:
     as_json: bool = args.json
     try:
         return run()
+    except sqlite3.Error as exc:
+        # Opening the event-log db (deliver/cli.py _hub) can fail before the library runs: a bad
+        # --db path (not a sqlite file, or a missing directory) must exit 2 with a typed message,
+        # never a traceback (R3-1).
+        return _error(
+            "hub_unavailable",
+            f"the hub database could not be opened: {exc}",
+            "Pass --db pointing at a writable sqlite event-log file in an existing directory.",
+            {},
+            EXIT_INPUT,
+            as_json,
+        )
     except DeliverError as exc:
         if exc.code in _QA_CODES:
             code = EXIT_QA_FAILED
