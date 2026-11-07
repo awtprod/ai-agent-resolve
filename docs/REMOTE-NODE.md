@@ -33,8 +33,12 @@ anything:
 aar node locate
 ```
 
-If it prints `"locator": null`, the Project Manager is in a subfolder (reading the full path
-would move it); copy `project_id` and `name`, and write the `folder_path` yourself. Then, on
+It prints `project_id` and `name`, but never a verified `folder_path` (`null`, with a reason): the
+Project Manager only lists project names, so a root entry with the same name could be a different
+project, and reading the real path would move the folder you are looking at. When the root lists
+the name it also prints `candidate_folder_path: []`, an unverified guess. The operator confirms the
+folder: check in Resolve where the project lives, then pass `folder_path` explicitly (copy the
+candidate only after that check). The hub refuses a locator without `folder_path`. Then, on
 the hub (a human or an agent may register; a node may not):
 
 ```bash

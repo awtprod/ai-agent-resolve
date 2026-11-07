@@ -102,6 +102,9 @@ def _cmd_locate(args: argparse.Namespace, *, gateway_factory: Any = _live_gatewa
         "pm_folder": where.pm_folder,
         "folder_path": None if where.folder_path is None else list(where.folder_path),
         "folder_path_reason": where.folder_path_reason,
+        "candidate_folder_path": (
+            None if where.candidate_folder_path is None else list(where.candidate_folder_path)
+        ),
         "locator": None,
     }
     if where.folder_path is not None:

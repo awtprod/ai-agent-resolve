@@ -141,6 +141,9 @@ class ProjectLocateResult(OpModel):
     """The Project Manager folders from the root, ``()`` at the root; ``None`` when it could
     not be read without moving the Project Manager (``folder_path_reason`` says why)."""
     folder_path_reason: str | None
+    candidate_folder_path: tuple[str, ...] | None
+    """An unverified guess (``()`` when the root lists the project's name, which may be a
+    namesake); the operator confirms it in Resolve before registering."""
     pm_folder: str
     """The Project Manager's current folder name (``""`` at the root)."""
     locator: ProjectLocator | None
@@ -167,6 +170,7 @@ def project_locate(env: OpEnv, params: ProjectLocateParams) -> ProjectLocateResu
         project_id=where.project_id,
         folder_path=where.folder_path,
         folder_path_reason=where.folder_path_reason,
+        candidate_folder_path=where.candidate_folder_path,
         pm_folder=where.pm_folder,
         locator=locator,
     )

@@ -468,3 +468,13 @@ def test_the_same_rules_hold_at_the_cli_and_the_tool(
     code, _, err = _cli(hub, capsys, *blank)
     assert code == 2 and err["error"]["code"] == "invalid_input"
     assert len(Registry(hub.log).list()) == 2
+
+
+def test_the_cli_refuses_a_locator_without_folder_path(
+    hub: Hub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bare = json.dumps({"project_id": "uid-7", "name": "Show"})
+    code, _, err = _cli(hub, capsys, *_add_args("nf", locator=bare))
+    assert code == 2 and err["error"]["code"] == "invalid_input"
+    assert "folder_path" in err["error"]["message"]
+    assert len(Registry(hub.log).list()) == 2

@@ -120,6 +120,11 @@ class PMFolderListing:
     folders: tuple[str, ...]
 
 
+UNVERIFIED_ROOT_REASON = (
+    "unverified: the root lists a project with this name, which may be a namesake"
+)
+
+
 @dataclass(frozen=True)
 class OpenProjectLocation:
     """Where the open project is, as far as it can be read without moving anything.
@@ -134,6 +139,7 @@ class OpenProjectLocation:
     pm_folder: str
     folder_path: tuple[str, ...] | None
     folder_path_reason: str | None
+    candidate_folder_path: tuple[str, ...] | None = None
 
 
 @runtime_checkable
@@ -399,9 +405,11 @@ class ScriptApiGateway:
         which moves the folder a human is looking at) and never reads the render format or
         mode (they raise a page signal on 21.1).
 
-        The folder path is known only when the Project Manager is at the root and lists the
-        open project's name there; a name can also exist in a subfolder, so the node verifies
-        the id again when it loads the project. In a subfolder the path is ``None`` with a reason.
+        ``folder_path`` is verified, and no read-only call can verify it: the listing returns
+        names, not ids, so a root entry named like the open project may be a namesake while the
+        open project lives in a subfolder. It is therefore always ``None`` here, with a reason.
+        When the Project Manager is at the root and lists the name, ``candidate_folder_path`` is
+        ``()``: an unverified guess for the operator to confirm in Resolve.
         """
         pm = self._project_manager()
         project = self._project()
@@ -431,7 +439,14 @@ class ScriptApiGateway:
                 "the Project Manager is at the root but does not list the open project there; "
                 "it is in a subfolder",
             )
-        return OpenProjectLocation(name, project_id, folder, (), None)
+        return OpenProjectLocation(
+            name,
+            project_id,
+            folder,
+            None,
+            UNVERIFIED_ROOT_REASON,
+            candidate_folder_path=(),
+        )
 
     def open_project_manager_path(self, path: tuple[str, ...]) -> None:
         pm = self._project_manager()
