@@ -1,0 +1,80 @@
+{
+  "timeline": {
+    "name": "CCN Longform Template [agent:ccn-bot v1]",
+    "unique_id": "tl-branch-0001",
+    "fps": 24.0,
+    "drop_frame": false,
+    "start_frame": 0,
+    "end_frame": 500,
+    "duration": 500,
+    "start_timecode": "01:00:00:00",
+    "width": 1920,
+    "height": 1080
+  },
+  "tracks": [
+    {
+      "type": "video",
+      "index": 1,
+      "name": "V1",
+      "enabled": true,
+      "locked": false,
+      "subtype": "",
+      "item_count": 2,
+      "transitions": 0,
+      "truncated": false,
+      "items": [
+        {
+          "index": 0,
+          "item_id": "b0",
+          "name": "item 0",
+          "type": "Video",
+          "start": 0,
+          "end": 1,
+          "duration": 1,
+          "record_in": 0,
+          "record_out": 1,
+          "source_start": 0,
+          "source_end": 1,
+          "media_id": null,
+          "fade_in": null,
+          "fade_out": null,
+          "audio_volume_db": null,
+          "enabled": true
+        },
+        {
+          "index": 1,
+          "item_id": "b1",
+          "name": "item 1",
+          "type": "Video",
+          "start": 72,
+          "end": 73,
+          "duration": 1,
+          "record_in": 72,
+          "record_out": 73,
+          "source_start": 0,
+          "source_end": 1,
+          "media_id": null,
+          "fade_in": null,
+          "fade_out": null,
+          "audio_volume_db": null,
+          "enabled": true
+        }
+      ],
+      "gaps": [],
+      "overlaps": 0
+    }
+  ],
+  "markers": [
+    {
+      "frame": 0,
+      "color": "Blue",
+      "name": "",
+      "note": "",
+      "duration": 1,
+      "custom_data": ""
+    }
+  ],
+  "media": [],
+  "notes": [],
+  "text": ""
+}

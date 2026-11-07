@@ -1,0 +1,431 @@
+{
+  "plan": {
+    "project": "CCN",
+    "timeline": "Baking Resistance Ep1",
+    "template": "CCN Longform Template",
+    "kind": "longform",
+    "fps": {
+      "num": 24000,
+      "den": 1001
+    },
+    "segments": 4,
+    "frames": 426
+  },
+  "batch_size": 10,
+  "phase_a": {
+    "steps": [
+      {
+        "op": "timeline.branch",
+        "name": "branch",
+        "summary": "branch name 'CCN Longform Template' (no unique_id: dry-run only), reuse",
+        "params": {
+          "source": {
+            "name": "CCN Longform Template",
+            "unique_id": null
+          },
+          "if_exists": "reuse",
+          "resolution": null
+        }
+      },
+      {
+        "op": "media.import",
+        "name": "import:aar/A:0",
+        "summary": "import 1 file(s) into aar/A",
+        "params": {
+          "paths": [
+            "E:/CCN/Ep1/A001.braw"
+          ],
+          "bin_path": [
+            "aar",
+            "A"
+          ],
+          "create_bins": true,
+          "if_present": "reuse"
+        }
+      },
+      {
+        "op": "media.import",
+        "name": "import:aar/B:0",
+        "summary": "import 1 file(s) into aar/B",
+        "params": {
+          "paths": [
+            "E:/CCN/Ep1/B001.braw"
+          ],
+          "bin_path": [
+            "aar",
+            "B"
+          ],
+          "create_bins": true,
+          "if_present": "reuse"
+        }
+      },
+      {
+        "op": "media.import",
+        "name": "import:aar/A2:0",
+        "summary": "import 1 file(s) into aar/A2",
+        "params": {
+          "paths": [
+            "E:/CCN/Ep1/A002.mov"
+          ],
+          "bin_path": [
+            "aar",
+            "A2"
+          ],
+          "create_bins": true,
+          "if_present": "reuse"
+        }
+      },
+      {
+        "op": "media.import",
+        "name": "import:aar/X:0",
+        "summary": "import 1 file(s) into aar/X",
+        "params": {
+          "paths": [
+            "E:/CCN/Assets/Outro.mov"
+          ],
+          "bin_path": [
+            "aar",
+            "X"
+          ],
+          "create_bins": true,
+          "if_present": "reuse"
+        }
+      },
+      {
+        "op": "track.ensure",
+        "name": "tracks",
+        "summary": "ensure 2 video and 6 audio track(s)",
+        "params": {
+          "timeline": {
+            "name": "CCN Longform Template · agent branch",
+            "unique_id": null
+          },
+          "tracks": [
+            {
+              "type": "video",
+              "index": 1,
+              "name": null,
+              "enabled": null,
+              "locked": null,
+              "audio_format": null
+            },
+            {
+              "type": "video",
+              "index": 2,
+              "name": null,
+              "enabled": null,
+              "locked": null,
+              "audio_format": null
+            },
+            {
+              "type": "audio",
+              "index": 1,
+              "name": "A1",
+              "enabled": false,
+              "locked": null,
+              "audio_format": null
+            },
+            {
+              "type": "audio",
+              "index": 2,
+              "name": "A2",
+              "enabled": false,
+              "locked": null,
+              "audio_format": null
+            },
+            {
+              "type": "audio",
+              "index": 3,
+              "name": "A3",
+              "enabled": false,
+              "locked": null,
+              "audio_format": null
+            },
+            {
+              "type": "audio",
+              "index": 4,
+              "name": "A4",
+              "enabled": false,
+              "locked": null,
+              "audio_format": null
+            },
+            {
+              "type": "audio",
+              "index": 5,
+              "name": "A5",
+              "enabled": true,
+              "locked": null,
+              "audio_format": null
+            },
+            {
+              "type": "audio",
+              "index": 6,
+              "name": "A6",
+              "enabled": true,
+              "locked": null,
+              "audio_format": null
+            }
+          ]
+        }
+      },
+      {
+        "op": "timeline.append_ranges",
+        "name": "append:v1:0",
+        "summary": "append 5 range(s) on video track 1 (record 0..306)",
+        "params": {
+          "timeline": {
+            "name": "CCN Longform Template · agent branch",
+            "unique_id": null
+          },
+          "ranges": [
+            {
+              "media": {
+                "unique_id": "E:/CCN/Ep1/A001.braw",
+                "bin_path": [
+                  "aar",
+                  "A"
+                ]
+              },
+              "src_in": 0,
+              "src_out": 72,
+              "track": 1,
+              "media_type": "av",
+              "record_in": 0,
+              "label": "segment 0"
+            },
+            {
+              "media": {
+                "unique_id": "E:/CCN/Ep1/B001.braw",
+                "bin_path": [
+                  "aar",
+                  "B"
+                ]
+              },
+              "src_in": 72,
+              "src_out": 144,
+              "track": 1,
+              "media_type": "av",
+              "record_in": 72,
+              "label": "segment 1"
+            },
+            {
+              "media": {
+                "unique_id": "E:/CCN/Ep1/A001.braw",
+                "bin_path": [
+                  "aar",
+                  "A"
+                ]
+              },
+              "src_in": 144,
+              "src_out": 216,
+              "track": 1,
+              "media_type": "av",
+              "record_in": 144,
+              "label": "segment 2"
+            },
+            {
+              "media": {
+                "unique_id": "E:/CCN/Ep1/A002.mov",
+                "bin_path": [
+                  "aar",
+                  "A2"
+                ]
+              },
+              "src_in": 30,
+              "src_out": 120,
+              "track": 1,
+              "media_type": "av",
+              "record_in": 216,
+              "label": "segment 3"
+            },
+            {
+              "media": {
+                "unique_id": "E:/CCN/Assets/Outro.mov",
+                "bin_path": [
+                  "aar",
+                  "X"
+                ]
+              },
+              "src_in": 0,
+              "src_out": 120,
+              "track": 1,
+              "media_type": "av",
+              "record_in": 306,
+              "label": "outro"
+            }
+          ],
+          "cursor": 0,
+          "max_ranges": 25,
+          "repair_short": true
+        }
+      }
+    ],
+    "appends": [
+      {
+        "track": 1,
+        "ranges": [
+          [
+            0,
+            72
+          ],
+          [
+            72,
+            144
+          ],
+          [
+            144,
+            216
+          ],
+          [
+            216,
+            306
+          ],
+          [
+            306,
+            426
+          ]
+        ]
+      }
+    ],
+    "placements": [
+      {
+        "segment": 0,
+        "track": 1,
+        "record_in": 0,
+        "record_out": 72,
+        "frames": 72,
+        "source": "E:/CCN/Ep1/A001.braw",
+        "append_step": "append:v1:0"
+      },
+      {
+        "segment": 1,
+        "track": 1,
+        "record_in": 72,
+        "record_out": 144,
+        "frames": 72,
+        "source": "E:/CCN/Ep1/B001.braw",
+        "append_step": "append:v1:0"
+      },
+      {
+        "segment": 2,
+        "track": 1,
+        "record_in": 144,
+        "record_out": 216,
+        "frames": 72,
+        "source": "E:/CCN/Ep1/A001.braw",
+        "append_step": "append:v1:0"
+      },
+      {
+        "segment": 3,
+        "track": 1,
+        "record_in": 216,
+        "record_out": 306,
+        "frames": 90,
+        "source": "E:/CCN/Ep1/A002.mov",
+        "append_step": "append:v1:0"
+      }
+    ]
+  },
+  "phase_b": {
+    "resolved": false,
+    "intents": [
+      {
+        "kind": "colour",
+        "op": "item.set_color",
+        "target": "segment 0 (video track 1 @0)",
+        "summary": "CDL slope (1.05, 1.0, 0.95) sat 1.1, LUT 'CCN Show LUT'",
+        "resolved": false
+      },
+      {
+        "kind": "colour",
+        "op": "item.set_color",
+        "target": "segment 2 (video track 1 @144)",
+        "summary": "CDL slope (1.05, 1.0, 0.95) sat 1.1, LUT 'CCN Show LUT'",
+        "resolved": false
+      },
+      {
+        "kind": "transform",
+        "op": "item.set_transform",
+        "target": "segment 0 (video track 1 @0)",
+        "summary": "zoom 1.1, pan 0, tilt 0, rot 0, flip_h False, flip_v False",
+        "resolved": false
+      },
+      {
+        "kind": "audio_crossfade",
+        "op": "transition.add",
+        "target": "after segment 2 (audio under track 1)",
+        "summary": "Cross Fade 0 dB, center, 12 frames",
+        "resolved": false
+      },
+      {
+        "kind": "outro_transition",
+        "op": "transition.add",
+        "target": "content into outro (segment 3, record 306)",
+        "summary": "Cross Dissolve, left, 15 frames",
+        "resolved": false
+      },
+      {
+        "kind": "head_fade",
+        "op": "item.set_fades",
+        "target": "first segment 0 (video track 1)",
+        "summary": "video fade-in 15 frames (from black)",
+        "resolved": false
+      },
+      {
+        "kind": "head_fade",
+        "op": "item.set_fades",
+        "target": "first segment 0 (audio under track 1)",
+        "summary": "audio fade-in 24 frames",
+        "resolved": false
+      },
+      {
+        "kind": "end_fade",
+        "op": "item.set_fades",
+        "target": "outro (audio under track 1)",
+        "summary": "audio fade-out 2 frames (de-click)",
+        "resolved": false
+      },
+      {
+        "kind": "audio_gain",
+        "op": "item.set_audio_gain",
+        "target": "segment 2 (audio under track 1)",
+        "summary": "-2 dB",
+        "resolved": false
+      },
+      {
+        "kind": "title",
+        "op": "title.place",
+        "target": "title 0 on video track 2 (record 48..120)",
+        "summary": "template 'CCN Lower Third': Jane Doe / Head Judge",
+        "resolved": true
+      },
+      {
+        "kind": "sting",
+        "op": "title.place",
+        "target": "sting on video track 2 (record 312..360)",
+        "summary": "template 'CCN Sting': Baking Resistance",
+        "resolved": true
+      },
+      {
+        "kind": "marker",
+        "op": "markers.add",
+        "target": "record 0",
+        "summary": "Green Act 1",
+        "resolved": true
+      },
+      {
+        "kind": "marker",
+        "op": "markers.add",
+        "target": "record 144",
+        "summary": "Blue Act 2",
+        "resolved": true
+      }
+    ],
+    "steps": []
+  },
+  "notes": [
+    "template size unchecked (no --template-describe)",
+    "working timeline named by placeholder; the real branch id is a run-time value threaded from a phase-A result or --branch-describe",
+    "audio track gain_db/bus/bounce are a manual Fairlight step for A1, A2, A3, A4, A5 (track.ensure sets only name and enabled; 21.1 has no Fairlight scripting)"
+  ]
+}

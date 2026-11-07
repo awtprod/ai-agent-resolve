@@ -1,0 +1,32 @@
+plan apply: CCN / Ep1 Short 01  (template 'CCN Short Template', short, 24000/1001 fps)
+profile ccn: 2 segment(s), 240 frame(s); batch size 10
+
+PHASE A - build (5 steps)
+  1. timeline.branch  [branch]
+       branch name 'CCN Short Template' (no unique_id: dry-run only), reuse
+  2. media.import  [import:aar/A:0]
+       import 1 file(s) into aar/A
+  3. media.import  [import:aar/B:0]
+       import 1 file(s) into aar/B
+  4. track.ensure  [tracks]
+       ensure 1 video and 2 audio track(s)
+  5. timeline.append_ranges  [append:v1:0]
+       append 2 range(s) on video track 1 (record 0..120)
+  append ranges per video track:
+    track 1: 0..120, 120..240  (2 range(s), 1 batch(es))
+
+PHASE B - finish (5 actions)
+  colour           segment 0 (video track 1 @0)
+       CDL slope (1.0, 1.0, 1.0) sat 1.05
+  transform        segment 0 (video track 1 @0)
+       zoom 1.3, pan 0, tilt 0, rot 0, flip_h False, flip_v False
+  head_fade        first segment 0 (audio under track 1)
+       audio fade-in 6 frames
+  end_fade         last segment 1 (audio under track 1)
+       audio fade-out 1 frames (de-click)
+  marker           record 0
+       Red Hook
+
+NOTES / GAPS (2)
+  - template size unchecked (no --template-describe)
+  - working timeline named by placeholder; the real branch id is a run-time value threaded from a phase-A result or --branch-describe

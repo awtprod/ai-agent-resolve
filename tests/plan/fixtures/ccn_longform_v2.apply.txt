@@ -1,0 +1,53 @@
+plan apply: CCN / Baking Resistance Ep1  (template 'CCN Longform Template', longform, 24000/1001 fps)
+profile ccn: 4 segment(s), 426 frame(s); batch size 10
+
+PHASE A - build (7 steps)
+  1. timeline.branch  [branch]
+       branch name 'CCN Longform Template' (no unique_id: dry-run only), reuse
+  2. media.import  [import:aar/A:0]
+       import 1 file(s) into aar/A
+  3. media.import  [import:aar/B:0]
+       import 1 file(s) into aar/B
+  4. media.import  [import:aar/A2:0]
+       import 1 file(s) into aar/A2
+  5. media.import  [import:aar/X:0]
+       import 1 file(s) into aar/X
+  6. track.ensure  [tracks]
+       ensure 2 video and 6 audio track(s)
+  7. timeline.append_ranges  [append:v1:0]
+       append 5 range(s) on video track 1 (record 0..306)
+  append ranges per video track:
+    track 1: 0..72, 72..144, 144..216, 216..306, 306..426  (5 range(s), 1 batch(es))
+
+PHASE B - finish (13 actions)
+  colour           segment 0 (video track 1 @0)
+       CDL slope (1.05, 1.0, 0.95) sat 1.1, LUT 'CCN Show LUT'
+  colour           segment 2 (video track 1 @144)
+       CDL slope (1.05, 1.0, 0.95) sat 1.1, LUT 'CCN Show LUT'
+  transform        segment 0 (video track 1 @0)
+       zoom 1.1, pan 0, tilt 0, rot 0, flip_h False, flip_v False
+  audio_crossfade  after segment 2 (audio under track 1)
+       Cross Fade 0 dB, center, 12 frames
+  outro_transition content into outro (segment 3, record 306)
+       Cross Dissolve, left, 15 frames
+  head_fade        first segment 0 (video track 1)
+       video fade-in 15 frames (from black)
+  head_fade        first segment 0 (audio under track 1)
+       audio fade-in 24 frames
+  end_fade         outro (audio under track 1)
+       audio fade-out 2 frames (de-click)
+  audio_gain       segment 2 (audio under track 1)
+       -2 dB
+  title            title 0 on video track 2 (record 48..120)
+       template 'CCN Lower Third': Jane Doe / Head Judge
+  sting            sting on video track 2 (record 312..360)
+       template 'CCN Sting': Baking Resistance
+  marker           record 0
+       Green Act 1
+  marker           record 144
+       Blue Act 2
+
+NOTES / GAPS (3)
+  - template size unchecked (no --template-describe)
+  - working timeline named by placeholder; the real branch id is a run-time value threaded from a phase-A result or --branch-describe
+  - audio track gain_db/bus/bounce are a manual Fairlight step for A1, A2, A3, A4, A5 (track.ensure sets only name and enabled; 21.1 has no Fairlight scripting)
