@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import os
 import sqlite3
 from pathlib import Path
@@ -290,13 +291,13 @@ def test_r2_5_flock_errno_distinguishes_unsupported_from_held(
 
         return _flock
 
-    monkeypatch.setattr(service.fcntl, "flock", raiser(errno.ENOLCK))
+    monkeypatch.setattr(fcntl, "flock", raiser(errno.ENOLCK))
     with pytest.raises(DeliverError) as info:
         service._acquire_delivery_lock(str(tmp_path))
     assert info.value.code == "lock_unsupported"
     assert "ENOLCK" in info.value.message or "ENOLCK" in str(info.value.detail)
 
-    monkeypatch.setattr(service.fcntl, "flock", raiser(errno.EWOULDBLOCK))
+    monkeypatch.setattr(fcntl, "flock", raiser(errno.EWOULDBLOCK))
     with pytest.raises(DeliverError) as info:
         service._acquire_delivery_lock(str(tmp_path))
     assert info.value.code == "delivery_in_progress"
