@@ -284,17 +284,18 @@ def record_started(log: EventLog, *, project_id: str, recipe_node: str, caller: 
     return True
 
 
-def record_worker_error(log: EventLog, *, project_id: str, recipe_node: str, message: str) -> bool:
-    """Leave a bounded ``hub.write`` record (op ``recipe.worker_error``) for a swallowed per-recipe
-    worker exception, so the status view can count it (R3-3). No new event type. Idempotent per
-    (recipe, message) so a recipe that raises the same error every tick records it once."""
-    import hashlib
-
-    bounded = message[:MAX_ERROR_BYTES]
-    digest = hashlib.sha256(bounded.encode("utf-8", "ignore")).hexdigest()[:12]
-    base = f"aar.recipe.workererr/{recipe_node}/{digest}"
+def record_worker_error(
+    log: EventLog, *, project_id: str, recipe_node: str, exc_type: str, message: str
+) -> bool:
+    """Leave one bounded ``hub.write`` record (op ``recipe.worker_error``) per
+    (recipe node, exception type) for a swallowed per-recipe worker exception, so the status view
+    can surface it (R3-3) without flooding the log (R4-1). No new event type. The dedup key is the
+    exception TYPE (not the message), so a changing message records at most once; the stored
+    message is bounded to 4 KiB of escaped serialization (the round-4 stored-bytes rule)."""
+    base = f"aar.recipe.workererr/{recipe_node}/{exc_type[:64]}"
     if log.get_by_idempotency_key(base) is not None:
         return False
+    bounded = _bound_text(message, MAX_ERROR_BYTES)
     try:
         with _in_transaction(log) as txn:
             _append_record(
@@ -305,6 +306,7 @@ def record_worker_error(log: EventLog, *, project_id: str, recipe_node: str, mes
                 RUNNER,
                 request_sha256(OP_WORKER_ERROR, {"project_id": project_id, "recipe": recipe_node}),
                 recipe_node=recipe_node,
+                exc_type=exc_type[:64],
                 error=bounded,
             )
     except Exception as exc:

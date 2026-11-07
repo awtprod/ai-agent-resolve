@@ -15,6 +15,7 @@ import contextlib
 import logging
 import signal
 import threading
+import time
 from datetime import timedelta
 from typing import Any
 
@@ -349,17 +350,70 @@ def _tick(
     return False
 
 
+# Per (recipe, exception type) WARNING rate-limit state (R4-1): the monotonic time of the last
+# line logged and the occurrences suppressed since, so a recipe that fails on every tick writes at
+# most one log line per window. Bounded: stale keys are pruned once the table grows past the cap.
+_LOG_WINDOW_S = 60.0
+_LOG_STATE_MAX = 1024
+_LOG_TEXT_CHARS = 4096
+_log_state: dict[tuple[str, str], tuple[float, int]] = {}
+_log_lock = threading.Lock()
+_monotonic = time.monotonic
+
+
+def _describe(exc: BaseException) -> tuple[str, str]:
+    """``(type name, "Type: message")`` for a swallowed exception, never raising (a broken
+    ``__str__`` must not take the worker loop down) and cut to 4096 characters."""
+    exc_type = type(exc).__name__
+    try:
+        text = str(exc)
+    except Exception:
+        text = "<unprintable exception>"
+    return exc_type, f"{exc_type}: {text[:_LOG_TEXT_CHARS]}"[:_LOG_TEXT_CHARS]
+
+
+def _should_log(key: tuple[str, str]) -> tuple[bool, int]:
+    """Rate limit: ``(log it now?, occurrences suppressed since the last line)``."""
+    with _log_lock:
+        now = _monotonic()
+        last, suppressed = _log_state.get(key, (None, 0))
+        if last is not None and now - last < _LOG_WINDOW_S:
+            _log_state[key] = (last, suppressed + 1)
+            return False, 0
+        if key not in _log_state and len(_log_state) >= _LOG_STATE_MAX:
+            for stale in [k for k, (t, _) in _log_state.items() if now - t >= _LOG_WINDOW_S]:
+                del _log_state[stale]
+            if len(_log_state) >= _LOG_STATE_MAX:
+                _log_state.clear()
+        _log_state[key] = (now, 0)
+        return True, suppressed
+
+
 def _note_worker_error(log: EventLog, project_id: str, recipe_node: str, exc: Exception) -> None:
-    """Log a swallowed per-recipe worker exception (bounded) and record it for the status view."""
-    message = f"{type(exc).__name__}: {exc}"[:4096]
-    _LOG.warning("recipe %s: worker swallowed %s", recipe_node, message)
+    """Account for a swallowed per-recipe worker exception (R3-3/R4-1), never raising.
+
+    - ``logging`` WARNING for every occurrence, rate-limited to one line per (recipe, exception
+      type) per 60 s; the next line carries the "suppressed N" count of the ones in between.
+    - At most ONE ``recipe.worker_error`` hub.write record per (recipe, exception type), whatever
+      the message (see :func:`~aar.recipes.engine.record_worker_error`); a repeat writes nothing.
+    """
+    exc_type, message = _describe(exc)
     with contextlib.suppress(Exception):
-        record_worker_error(log, project_id=project_id, recipe_node=recipe_node, message=message)
+        emit, suppressed = _should_log((recipe_node, exc_type))
+        if emit:
+            extra = f" (suppressed {suppressed} since the last report)" if suppressed else ""
+            _LOG.warning("recipe %s: worker swallowed %s%s", recipe_node, message, extra)
+    with contextlib.suppress(Exception):
+        record_worker_error(
+            log,
+            project_id=project_id,
+            recipe_node=recipe_node,
+            exc_type=exc_type,
+            message=message,
+        )
 
 
 def _install_signals(stop: threading.Event) -> None:
-    import contextlib
-
     def handler(signum: int, frame: Any) -> None:
         stop.set()
 

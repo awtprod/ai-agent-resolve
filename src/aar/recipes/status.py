@@ -84,34 +84,66 @@ def status_view(
         "steps": steps_out,
         "next_actions": actions,
         "ignored": state.ignored,
-        "diagnostics": {"worker_errors": _worker_errors(log, state.project_id, recipe_node)},
+        "diagnostics": _diagnostics(log, state.project_id, recipe_node),
         "truncated": truncated,
     }
     return _enforce_total_bound(view)
 
 
-def _worker_errors(log: EventLog, project_id: str, recipe_node: str) -> list[dict[str, Any]]:
-    """The per-recipe worker exceptions the worker swallowed and recorded (R3-3), bounded."""
-    from aar.recipes.events import OP_WORKER_ERROR
+MAX_WORKER_ERRORS_LISTED = 5
+MAX_WORKER_ERROR_ENTRY_BYTES = 1024
+_MAX_EXC_TYPE_BYTES = 128
 
-    found: list[dict[str, Any]] = []
+
+def _diagnostics(log: EventLog, project_id: str, recipe_node: str) -> dict[str, Any]:
+    entries, total = _worker_errors(log, project_id, recipe_node)
+    return {"worker_errors": entries, "worker_error_count": total}
+
+
+def _worker_errors(
+    log: EventLog, project_id: str, recipe_node: str
+) -> tuple[list[dict[str, Any]], int]:
+    """The runner's ``recipe.worker_error`` records for this recipe (R3-3/R4-1): the first
+    :data:`MAX_WORKER_ERRORS_LISTED` as entries, each field bounded on STORED bytes (the same
+    escaped-JSON measure as the whole view), plus the total count of records."""
+    from aar.recipes.engine import _bound_text
+    from aar.recipes.events import OP_WORKER_ERROR, RUNNER
+
+    entries: list[dict[str, Any]] = []
+    total = 0
     for ev in log.read(0, project_id=project_id, types=["hub.write"], limit=-1):
         payload = ev.payload if isinstance(ev.payload, dict) else {}
-        if payload.get("op") == OP_WORKER_ERROR and payload.get("recipe_node") == recipe_node:
-            found.append({"error": payload.get("error")})
-            if len(found) >= 20:
-                break
-    return found
+        if payload.get("op") != OP_WORKER_ERROR or payload.get("recipe_node") != recipe_node:
+            continue
+        if ev.actor != RUNNER:  # only the runner writes these; anything else is not evidence
+            continue
+        total += 1
+        if len(entries) < MAX_WORKER_ERRORS_LISTED:
+            exc_type, error = payload.get("exc_type"), payload.get("error")
+            entries.append(
+                {
+                    "exc_type": _bound_text(exc_type, _MAX_EXC_TYPE_BYTES)
+                    if isinstance(exc_type, str)
+                    else None,
+                    "error": _bound_text(error, MAX_WORKER_ERROR_ENTRY_BYTES)
+                    if isinstance(error, str)
+                    else None,
+                }
+            )
+    return entries, total
 
 
 def _enforce_total_bound(view: dict[str, Any]) -> dict[str, Any]:
-    """Keep the whole view under :data:`MAX_VIEW_BYTES`, dropping step bodies if it must."""
+    """Keep the whole view under :data:`MAX_VIEW_BYTES`: drop the step bodies first, then the
+    worker-error entries (R4-1: ``diagnostics`` counts toward the bound; the count is kept)."""
     if len(_canon(view)) <= MAX_VIEW_BYTES:
         return view
     for entry in view["steps"]:
         entry["outputs"] = None
         entry["error"] = None
     view["truncated"] = True
+    if len(_canon(view)) > MAX_VIEW_BYTES:
+        view["diagnostics"]["worker_errors"] = []
     return view
 
 
