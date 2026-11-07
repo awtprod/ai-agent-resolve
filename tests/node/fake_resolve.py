@@ -8,7 +8,9 @@ floats for fades and ``FPS``, strings for most clip properties, ``""`` for the P
 root).
 
 Mutating calls (and Project Manager navigation and page changes) are recorded in
-``FakeResolve.calls``. Render presets are shared by all projects, like Resolve's user presets.
+``FakeResolve.calls``. ``FakeResolve.reads`` counts the reads that must not be polled (the
+Deliver getters, see S7g) and the page read every context read makes. Render presets are shared
+by all projects, like Resolve's user presets.
 ``human_*`` helpers change state the way a person at the GUI would, without the gateway.
 
 Every known trap of ``aar.node.traps`` is modelled here as it was observed on Resolve 21.1.
@@ -26,6 +28,7 @@ from __future__ import annotations
 import itertools
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Any
@@ -1076,6 +1079,7 @@ class FakeProject:
         return True
 
     def GetCurrentRenderFormatAndCodec(self) -> dict[str, str]:
+        self._app.reads["GetCurrentRenderFormatAndCodec"] += 1
         return {"format": self.deliver.format, "codec": self.deliver.codec}
 
     def SetCurrentRenderFormatAndCodec(self, format: str, codec: str) -> bool:
@@ -1086,6 +1090,9 @@ class FakeProject:
         return True
 
     def GetCurrentRenderMode(self) -> int:
+        # Live 21.1 (2026-11-07): each call raises a "Main view page is changed to 11" signal,
+        # and polling it crashed Resolve. Counted so tests can pin that nothing polls it.
+        self._app.reads["GetCurrentRenderMode"] += 1
         return self.deliver.mode
 
     def SetCurrentRenderMode(self, renderMode: int) -> bool:
@@ -1353,6 +1360,7 @@ class FakeResolve:
     ) -> None:
         self.ids = itertools.count(1)
         self.calls: list[tuple[Any, ...]] = []
+        self.reads: Counter[str] = Counter()
         self.all_projects: list[FakeProject] = []
         self.projects: dict[str, FakeProject] = {}
         self.pm_extra_folders: set[tuple[str, ...]] = set()
@@ -1392,6 +1400,7 @@ class FakeResolve:
         return self._pm
 
     def GetCurrentPage(self) -> str:
+        self.reads["GetCurrentPage"] += 1
         return self.page
 
     def OpenPage(self, pageName: str) -> bool:

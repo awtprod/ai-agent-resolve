@@ -1,9 +1,16 @@
 """Is a human working in Resolve right now?
 
-``PresenceGuard`` is fed timestamped context observations (polls of
-``ResolveGateway.get_context``) and the broker's own actions. A change of working position
-that the broker did not cause counts as human activity. So does recent keyboard or mouse
-input, when an OS input-idle provider is available (``GetLastInputInfo`` on Windows).
+``PresenceGuard`` is fed timestamped context observations (the broker's polls of
+``ResolveGateway.get_position``, every ``BrokerConfig.context_poll_seconds``) and the broker's
+own actions. A change of working position that the broker did not cause counts as human
+activity. So does recent keyboard or mouse input, when an OS input-idle provider is available
+(``GetLastInputInfo`` on Windows).
+
+A poll does not read the Deliver settings (Resolve 21.1 must not be polled for them, DESIGN
+R4), so an observation may have them unread (``ResolveContext.render_measured`` False). They
+are then never compared: a value appearing or disappearing is not a change. The last values
+read are carried across such observations of the same project, so a Deliver change between
+two observations that did read them is still a change.
 
 It is deliberately conservative: until the context has been watched and found quiet for a
 whole idle window, a human is assumed to be present.
@@ -23,7 +30,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from aar.node.gateway import ResolveContext
 
@@ -89,6 +96,7 @@ class PresenceGuard:
         """
         human = False
         previous = self._last_seen
+        context = _carry_deliver(previous, context)
         if previous is not None and not context.same_position(previous):
             human = True
             self._last_human_change_at = at
@@ -100,7 +108,10 @@ class PresenceGuard:
         return human
 
     def note_broker_context(self, context: ResolveContext, at: float) -> None:
-        """Record a position the broker itself just produced, so it is not mistaken for a human."""
+        """Record a position the broker itself just produced, so it is not mistaken for a human.
+
+        Nothing is carried over: if this read left the Deliver settings unread, they stay
+        unknown, because the broker's own op may have changed them (``render.build`` does)."""
         self._last_seen = context
         if self._first_observed_at is None:
             self._first_observed_at = at
@@ -148,6 +159,25 @@ class PresenceGuard:
                     f"keyboard/mouse input {idle:.1f}s ago (idle window {self.idle_window}s)",
                 )
         return Decision(True, "idle", f"no human activity for at least {self.idle_window}s")
+
+
+def _carry_deliver(previous: ResolveContext | None, current: ResolveContext) -> ResolveContext:
+    """``current``, with the Deliver fields last read in ``previous`` if ``current`` did not
+    read them and shows the same project. Another project's Deliver fields are never carried."""
+    if (
+        current.render_measured
+        or previous is None
+        or not previous.render_measured
+        or (previous.project, previous.project_id) != (current.project, current.project_id)
+    ):
+        return current
+    return replace(
+        current,
+        render_format=previous.render_format,
+        render_codec=previous.render_codec,
+        render_mode=previous.render_mode,
+        render_measured=True,
+    )
 
 
 def idle_seconds_from_ticks(last_input_tick: int, now_tick: int) -> float:
