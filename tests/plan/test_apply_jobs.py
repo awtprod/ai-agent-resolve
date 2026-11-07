@@ -560,6 +560,15 @@ def test_an_audio_only_append_must_carry_audio_and_no_video() -> None:
     assert _assemble_code(job, prep, LF) == "forged_phase_result"
 
 
+def test_every_append_on_another_timeline_is_a_mismatch() -> None:
+    # The branch is the prepare envelope's (N2), never taken from the appends themselves.
+    prep, job = _assemble_fixture()
+    for step in job["steps"]:
+        if step["op"] == "timeline.append_ranges":
+            step["value"]["timeline"]["unique_id"] = "tl-other"
+    assert _assemble_code(job, prep, LF) == "phase_result_mismatch"
+
+
 def test_tracks_ensured_on_another_timeline_are_a_mismatch() -> None:
     prep, job = _assemble_fixture()
     job_step(job, "tracks")["value"]["timeline"]["unique_id"] = "tl-other"

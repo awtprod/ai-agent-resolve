@@ -149,7 +149,20 @@ def test_n5_title_find_is_recursive_over_the_whole_pool() -> None:
     comp = compile_prepare(LF, template=template_describe(10, name=LF.template))
     finds = [s for s in comp.steps if s.name.startswith("find:title:")]
     assert [s.params["name"] for s in finds] == ["CCN Lower Third", "CCN Sting"]
-    assert all(s.params["bin_path"] == [] and s.params["recursive"] is True for s in finds)
+    for find in finds:
+        assert find.params["bin_path"] == []
+        assert find.params["recursive"] is True
+        assert find.params["limit"] == 200  # > 1, so a second hit is seen and refused
+
+
+def test_prepare_is_capped_at_the_step_limit() -> None:
+    # 1 branch + 500 pool-source finds = 501 steps, over the ops.sequence cap.
+    n = 500
+    srcs = [source(f"s{i}", media=f"Clip {i}", camera="A") for i in range(n)]
+    segs = [seg(src=f"s{i}", a=0, b=1) for i in range(n)]
+    p = plan(sources=srcs, segments=segs)
+    assert _code(compile_prepare, p) == "too_many_steps"
+    assert len(compile_prepare(plan(sources=srcs[:-1], segments=segs[:-1])).steps) == n
 
 
 # -- N7: two sources sharing one file are imported once -----------------------------------------
