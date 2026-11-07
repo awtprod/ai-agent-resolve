@@ -84,6 +84,19 @@ def test_second_registration_of_the_same_resolve_uid_names_the_existing_id(hub: 
 def test_a_drp_file_is_not_a_resolve_uid_and_may_repeat(hub: Hub) -> None:
     _register(hub, key="a", source_kind="drp_file", locator={"path": "/x/a.drp"})
     _register(hub, key="b", source_kind="drp_file", locator={"path": "/x/a.drp"})
+    # a file source that happens to carry a project_id key is still not a Resolve uid
+    keyed = {"path": "/x/b.drp", "project_id": "uid-1"}
+    first = _register(hub, key="c", source_kind="drt_file", locator=keyed)
+    _register(hub, key="d", source_kind="drt_file", locator=keyed)
+    assert first["ok"] and _register(hub, key="e")["ok"]  # uid-1 is still free for a local_db
+
+
+def test_the_registry_ignores_an_empty_uid_when_checking_uniqueness(hub: Hub) -> None:
+    registry = Registry(hub.log)
+    empty = ProjectSource("local_db", {"project_id": ""})
+    registry.create_project("one", HUMAN, sources=[empty])
+    registry.create_project("two", HUMAN, sources=[empty])
+    assert registry.find_by_resolve_uid("") is None
 
 
 @pytest.mark.parametrize(
@@ -354,6 +367,8 @@ def test_project_register_tool_registers_replays_and_refuses(hub: Hub) -> None:
     assert body["op"] == "project.register" and body["replayed"] is False
     pid = body["project_id"]
     assert body["project"]["sources"][0]["locator"] == LOC
+    assert body["project"]["aliases"] == ["Alt"]
+    assert body["project"]["sources"][0]["host"] == "edit-pc"
     stored = Registry(hub.log).get(pid)
     assert stored is not None and stored.created is not None
     assert [e.actor for e in hub.log.iter_events(types=["project.created"])][-1] == Actor(
