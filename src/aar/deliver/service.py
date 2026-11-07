@@ -17,11 +17,13 @@ events, puts nothing new, and does not transcode again.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import hashlib
 import math
 import os
 import re
+import sqlite3
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol, runtime_checkable
 
@@ -99,11 +101,23 @@ def _acquire_delivery_lock(work: str) -> int:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
         os.close(fd)
+        # Only "already held" (EWOULDBLOCK/EAGAIN) means another delivery is in progress. Any other
+        # errno (ENOLCK/EOPNOTSUPP on an NFS `nolock`, FUSE or SMB mount) means locking is
+        # unsupported here -- a different, non-transient error that names the errno (exit 2).
+        if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            raise DeliverError(
+                "delivery_in_progress",
+                f"another delivery is already working in {work}",
+                "Wait for the other delivery to finish, or deliver into a separate work dir.",
+                work=work,
+            ) from exc
+        name = errno.errorcode.get(exc.errno, str(exc.errno))
         raise DeliverError(
-            "delivery_in_progress",
-            f"another delivery is already working in {work}",
-            "Wait for the other delivery to finish, or deliver into a separate work dir.",
+            "lock_unsupported",
+            f"the work dir does not support flock ({name}): {work}",
+            "Use a work dir on a filesystem that supports flock (local disk), not NFS nolock/FUSE.",
             work=work,
+            errno=name,
         ) from exc
     return fd
 
@@ -132,6 +146,11 @@ def _is_review_ready(info: Any, suffix: str) -> bool:
     video = info.video
     if video is None or video.codec != "h264":
         return False
+    # Require 8-bit 4:2:0 (yuv420p): this is what every browser plays, and it excludes H.264 High
+    # 4:2:2 (yuv422p/yuv422p10le), High 4:4:4 (yuv444p) and 10-bit (yuv420p10le) -- the usual
+    # Resolve master pixel formats, which look fine to a codec-name check but will not play back.
+    if video.pix_fmt != "yuv420p":
+        return False
     audio = info.audio
     return audio is None or audio.codec == "aac"
 
@@ -143,8 +162,12 @@ def _wrap_step_error(exc: Exception, completed: list[str]) -> DeliverError:
         code, hint = "unknown_subject", "Pass a --subject that names a node in the project."
     elif isinstance(exc, WriteError):
         code, hint = "hub_write_failed", f"hub refused the write ({getattr(exc, 'code', '')})."
+    elif isinstance(exc, sqlite3.Error):
+        code, hint = "hub_unavailable", "The hub event log is locked or read-only; check the db."
     elif isinstance(exc, MediaError):
         code, hint = "media_unreadable", "Re-render; the delivered file did not probe."
+    elif isinstance(exc, OSError):  # PermissionError, ENOSPC, etc. from the artifact store
+        code, hint = "store_unavailable", "The artifact store is unwritable (permissions/disk)."
     else:  # ValueError and other review errors
         code, hint = "invalid_input", "Check the delivery inputs."
     return DeliverError(
@@ -397,20 +420,30 @@ def _record(
     replays.append(result.replayed)
 
 
-def _key_base(role: str, project_id: str, deliverable: str, render_job_id: str) -> str:
+def _key_base(
+    role: str, project_id: str, deliverable: str, render_job_id: str, content_sha256: str
+) -> str:
     """A deterministic hub idempotency key, well under the hub's 128-char limit for any input
-    length (the identifying tuple is hashed, not concatenated)."""
-    digest = hashlib.sha256(f"{project_id}|{deliverable}|{render_job_id}".encode()).hexdigest()
+    length (the identifying tuple is hashed, not concatenated). The content sha is in the hash, so
+    re-delivering the same render with different bytes (e.g. a lowered cap, an ffmpeg upgrade, or an
+    F5 rebuild) is a NEW delivery that supersedes the previous render.hash fact through the facts
+    store's normal last-writer-wins path, never a hub idempotency conflict."""
+    material = f"{project_id}|{deliverable}|{render_job_id}|{role}|{content_sha256}"
+    digest = hashlib.sha256(material.encode()).hexdigest()
     return f"deliver:{role}:{digest[:40]}"
 
 
-def _review_keys(project_id: str, deliverable: str, render_job_id: str) -> dict[str, str]:
-    base = _key_base("review", project_id, deliverable, render_job_id)
+def _review_keys(
+    project_id: str, deliverable: str, render_job_id: str, content_sha256: str
+) -> dict[str, str]:
+    base = _key_base("review", project_id, deliverable, render_job_id, content_sha256)
     return {"hash": f"{base}:hash", "qa_size": f"{base}:qa-size", "review": f"{base}:review"}
 
 
-def _master_keys(project_id: str, deliverable: str, render_job_id: str) -> dict[str, str]:
-    base = _key_base("master", project_id, deliverable, render_job_id)
+def _master_keys(
+    project_id: str, deliverable: str, render_job_id: str, content_sha256: str
+) -> dict[str, str]:
+    base = _key_base("master", project_id, deliverable, render_job_id, content_sha256)
     keys = {"hash": f"{base}:hash"}
     for metric in MASTER_QA_FACTS:
         keys[metric] = f"{base}:qa-{metric}"
@@ -574,7 +607,7 @@ def deliver_review(
         completed.append("store")
 
         # 5. facts: the review file's hash and size, under deterministic keys
-        keys = _review_keys(pid, dname, rjid)
+        keys = _review_keys(pid, dname, rjid, artifact_id)
         fact_keys: list[str] = []
         replays: list[bool] = []
         source = {"artifact": artifact_id}
@@ -625,7 +658,7 @@ def deliver_review(
         raise
     except MediaToolMissing:
         raise  # the CLI maps a missing tool to its own exit code (2)
-    except (WriteError, ReviewError, MediaError, ValueError) as exc:
+    except (WriteError, ReviewError, MediaError, ValueError, sqlite3.Error, OSError) as exc:
         raise _wrap_step_error(exc, completed) from exc
 
     finally:
@@ -718,7 +751,7 @@ def deliver_master(
         completed.append("qa")
 
         # 4. facts: the hash is always written; a QA fact only for a measured value
-        keys = _master_keys(pid, dname, rjid)
+        keys = _master_keys(pid, dname, rjid, artifact_id)
         fact_keys: list[str] = []
         replays: list[bool] = []
         source = {"artifact": artifact_id}
@@ -755,7 +788,7 @@ def deliver_master(
         raise
     except MediaToolMissing:
         raise  # the CLI maps a missing tool to its own exit code (2)
-    except (WriteError, ReviewError, MediaError, ValueError) as exc:
+    except (WriteError, ReviewError, MediaError, ValueError, sqlite3.Error, OSError) as exc:
         raise _wrap_step_error(exc, completed) from exc
 
     finally:

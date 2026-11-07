@@ -28,6 +28,7 @@ class Stream:
     sample_rate: int | None = None
     channels: int | None = None
     attached_pic: bool = False
+    pix_fmt: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -122,6 +123,7 @@ def parse_probe_json(data: dict[str, Any], path: str, size_bytes: int) -> MediaI
                 sample_rate=_int(raw.get("sample_rate")),
                 channels=_int(raw.get("channels")),
                 attached_pic=bool(disposition.get("attached_pic")),
+                pix_fmt=(str(raw["pix_fmt"]) if raw.get("pix_fmt") else None),
             )
         )
     return MediaInfo(

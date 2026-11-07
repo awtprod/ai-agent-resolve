@@ -350,6 +350,8 @@ class BuildResult(OpModel):
     frame_rate: float | None
     duration_seconds: float | None
     size_verified: bool | None = None
+    measured_width: int | None = None
+    measured_height: int | None = None
 
 
 def _measured_from_info(info: dict[str, Any]) -> dict[str, Any]:
@@ -610,6 +612,8 @@ def render_build(env: OpEnv, params: BuildParams) -> BuildResult:
         deliver_restored=restore_error is None,
         restore_error=restore_error,
         size_verified=size_verified,
+        measured_width=_int(info.get("FormatWidth")),
+        measured_height=_int(info.get("FormatHeight")),
         **_measured_from_info(info),
     )
 

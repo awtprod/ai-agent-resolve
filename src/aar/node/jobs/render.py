@@ -159,6 +159,8 @@ class RenderStep(Step):
             v = out.value_dict()
             cur["render_job_id"] = v["render_job_id"]
             cur["size_verified"] = v.get("size_verified")
+            cur["measured_width"] = v.get("measured_width")
+            cur["measured_height"] = v.get("measured_height")
             if v.get("restore_error"):
                 cur["deliver_restore_error"] = v["restore_error"]
             cur["base"] = {
@@ -186,8 +188,11 @@ class RenderStep(Step):
             if status in _DONE_OK:
                 cur["measured"] = {k: v.get(k) for k in _MEASURED_KEYS}
                 # size_verified is a build-time read-back (True/False/None), carried through to
-                # the job result so the hub can see whether the output size was confirmed.
+                # the job result so the hub can see whether the output size was confirmed, with the
+                # measured width and height the queue reported (R2-6).
                 cur["measured"]["size_verified"] = cur.get("size_verified")
+                cur["measured"]["measured_width"] = cur.get("measured_width")
+                cur["measured"]["measured_height"] = cur.get("measured_height")
                 if cur.get("deliver_restore_error"):
                     cur["measured"]["deliver_restore_error"] = cur["deliver_restore_error"]
                 if p.cleanup:

@@ -171,11 +171,12 @@ NAMESPACES: tuple[Namespace, ...] = (
     Namespace("path.map", re.compile(rf"path\.map\.{_SEG}"), "path.map.<name>", PathMap),
     Namespace(
         "render.hash",
-        # The optional second segment carries the delivery role (render.hash.review.<deliverable>
-        # / render.hash.master.<deliverable>), so a review and a master of one deliverable never
-        # collide. The one-segment form (render.hash.<deliverable>) stays valid for other writers.
-        re.compile(rf"render\.hash\.{_SEG}(?:\.{_SEG})?"),
-        "render.hash.<deliverable>",
+        # An optional leading role segment -- only `review` or `master` -- carries the delivery role
+        # (render.hash.review.<deliverable> / render.hash.master.<deliverable>), so a review and a
+        # master of one deliverable never collide. The plain render.hash.<deliverable> form stays
+        # valid for other writers; any other role word is refused.
+        re.compile(rf"render\.hash\.(?:(?:review|master)\.)?{_SEG}"),
+        "render.hash.[review|master.]<deliverable>",
         RenderHash,
     ),
     Namespace("qa", re.compile(rf"qa\.{_SEG}\.{_SEG}"), "qa.<metric>.<deliverable>", QaMetric),
