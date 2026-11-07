@@ -273,7 +273,7 @@ def test_install_script_never_writes_the_token_and_registers_interactive() -> No
     text = (DEPLOY / "windows" / "install.ps1").read_text(encoding="utf-8")
     assert "-LogonType Interactive" in text
     assert "Disable-ScheduledTask" in text
-    assert "S-1-5-18" in text and "S-1-5-32-544" in text and "/inheritance:r" in text
+    assert "S-1-5-18" in text and "S-1-5-32-544" in text and "SetAccessRuleProtection" in text
     assert "WriteAllText($token" not in text
     assert "edit-pc.token'))" in text  # only tested for existence in `enable`
 
