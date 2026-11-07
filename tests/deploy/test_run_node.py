@@ -405,4 +405,76 @@ def test_install_disable_kills_the_whole_tree_only_under_root() -> None:
     assert "disable FAILED" in text
     # Status and disable share the one selector; neither filters on a bare process name.
     assert text.count("Get-NodeProcesses") >= 4
-    assert "run_node.py*'" not in text
+    # The command-line marker only counts together with the root or the store path.
+    assert "IndexOf($store" in text and "IndexOf($prefix" in text
+    assert "Name -eq 'pythonw.exe'" not in text and "Name='pythonw.exe'" not in text
+
+
+def test_utf16_projects_file_idles_then_resumes_when_fixed(tmp_path: Path) -> None:
+    sup, clock, launched = _sup(tmp_path, running=True, runtime=1, projects=None)
+    loc = {"name": "P", "project_id": "p1", "folder_path": []}
+    sup.cfg.projects_file.write_text(json.dumps([loc]), encoding="utf-16")  # PS5 Out-File
+    sup.step()
+    assert clock.sleeps == [60] and not launched
+    log = (sup.cfg.log_dir / "supervisor-20261107.log").read_text(encoding="utf-8")
+    assert "projects file unreadable" in log
+    sup.cfg.projects_file.write_text(json.dumps([loc]), encoding="utf-8")
+    sup.step()
+    assert len(launched) == 1
+
+
+def test_bom_prefixed_utf8_files_parse(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "run_node.json"
+    cfg_path.write_text(json.dumps(GOOD), encoding="utf-8-sig")
+    assert cfg_path.read_bytes().startswith(b"\xef\xbb\xbf")
+    cfg = rn.load_config(cfg_path)
+    loc = {"name": "P", "project_id": "p1", "folder_path": []}
+    cfg.projects_file.write_text(json.dumps([loc]), encoding="utf-8-sig")
+    sup = rn.Supervisor(cfg, now=lambda: datetime.datetime(2026, 11, 7))
+    assert [json.loads(x) for x in sup.projects()] == [loc]
+
+
+def test_load_config_turns_utf16_into_config_error(tmp_path: Path) -> None:
+    p = tmp_path / "run_node.json"
+    p.write_text(json.dumps(GOOD), encoding="utf-16")
+    with pytest.raises(rn.ConfigError):
+        rn.load_config(p)
+
+
+def test_exception_inside_step_is_logged_and_the_loop_continues(tmp_path: Path) -> None:
+    sup, clock, _ = _sup(tmp_path, running=True, runtime=0, projects="[]")
+    calls = {"n": 0}
+
+    def flaky() -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom")
+        if calls["n"] == 3:
+            raise KeyboardInterrupt
+
+    sup.step = flaky  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        sup.run()
+    assert calls["n"] == 3  # survived the RuntimeError, then the interrupt propagated
+    assert clock.sleeps == [30.0]
+    log = (sup.cfg.log_dir / "supervisor-20261107.log").read_text(encoding="utf-8")
+    assert "step failed: RuntimeError: boom" in log
+
+
+def test_process_selector_matches_supervisor_base_child_but_not_foreign_pythonw() -> None:
+    """Mirror Get-NodeProcesses' rule in Python on realistic lines, and pin the script text."""
+    root = "C:\\ProgramData\\aar\\"
+    store = root + "jobs.db"
+
+    def selected(exe: str, cmd: str) -> bool:
+        under = exe.lower().startswith(root.lower())
+        marker = "node run" in cmd or "run_node.py" in cmd
+        named = store.lower() in cmd.lower() or root.lower() in cmd.lower()
+        return under or (marker and named)
+
+    base_child = (r"C:\Python313\pythonw.exe", r'"C:\ProgramData\aar\run_node.py"')
+    assert selected(*base_child)
+    assert selected(r"C:\Python313\python.exe", f"python.exe aar node run --store {store}")
+    assert not selected(r"D:\tools\bridge\pythonw.exe", r'"D:\tools\bridge\server.py"')
+    text = (DEPLOY / "windows" / "install.ps1").read_text(encoding="utf-8")
+    assert "-like '*node run*' -or $_.CommandLine -like '*run_node.py*'" in text

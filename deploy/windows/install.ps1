@@ -122,7 +122,7 @@ function Enable-Node {
 function Get-NodeProcesses {
     # Every process that belongs to this install, and nothing else:
     #  (a) its executable lives under $Root (venv python.exe/pythonw.exe/aar.exe), or
-    #  (b) its command line has `node run` together with $Root or the configured store path
+    #  (b) its command line has `node run` or `run_node.py` together with $Root or the configured store path
     #      (catches the base-interpreter child the venv redirector spawns, whose executable is
     #      outside $Root).
     # Other Python processes (for example the Resolve MCP bridge's pythonw.exe) match neither.
@@ -140,7 +140,7 @@ function Get-NodeProcesses {
     @(Get-CimInstance Win32_Process | Where-Object {
         $_.ProcessId -ne $PID -and (
             ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) -or
-            ($_.CommandLine -and $_.CommandLine -like '*node run*' -and
+            ($_.CommandLine -and ($_.CommandLine -like '*node run*' -or $_.CommandLine -like '*run_node.py*') -and
                 ($_.CommandLine.IndexOf($store, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
                  $_.CommandLine.IndexOf($prefix, [System.StringComparison]::OrdinalIgnoreCase) -ge 0))
         )

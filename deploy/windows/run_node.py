@@ -18,6 +18,7 @@ across upgrades of the app and only ever launches it as a subprocess with a list
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import json
 import os
@@ -60,8 +61,8 @@ class Config:
 def load_config(path: Path) -> Config:
     path = Path(path)
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, ValueError) as exc:  # UTF-16 files fail to decode
         raise ConfigError(f"cannot read config {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise ConfigError(f"config {path} must be a JSON object")
@@ -310,8 +311,8 @@ class Supervisor:
 
     def projects(self) -> list[str]:
         try:
-            text = self.cfg.projects_file.read_text(encoding="utf-8")
-        except OSError as exc:
+            text = self.cfg.projects_file.read_text(encoding="utf-8-sig")  # PS5 writes a BOM
+        except (OSError, UnicodeError) as exc:
             self.log(f"projects file unreadable: {exc}")
             return []
         locs, error = parse_projects(text)
@@ -343,7 +344,15 @@ class Supervisor:
     def run(self) -> None:
         self.log("supervisor start")
         while True:
-            self.step()
+            try:
+                self.step()
+            except Exception as exc:  # KeyboardInterrupt/SystemExit still propagate
+                self.backoff = next_backoff(0, self.backoff)
+                with contextlib.suppress(Exception):  # never die because the log is unwritable
+                    self.log(
+                        f"step failed: {type(exc).__name__}: {exc}; backing off {self.backoff:.0f}s"
+                    )
+                self._sleep(self.backoff)
 
 
 def main(argv: list[str] | None = None) -> int:
