@@ -38,7 +38,7 @@ from aar.node.leases import Holder, Scope, timeline_key
 from aar.node.ops import submit_op
 
 from .fake_resolve import DeliverState, FakeRenderJob
-from .jobs_support import AGENT_ID, IDLE, MAIN_REF, JobWorld
+from .jobs_support import AGENT_ID, IDLE, MAIN_REF, JobWorld, open_store_when_released
 
 HUMAN = Actor("human", "andrew")
 WAIT = 30.0  # generous upper bound for an event that MUST happen; never a timing assumption
@@ -1123,7 +1123,7 @@ def test_p18d_stop_reaches_job_by_alias_or_uid_in_a_source(tmp_path: Path) -> No
     by_alias = reg.create_project("Season Two", HUMAN)
     reg.add_alias(by_alias.id, "Show", HUMAN)
     by_uid = reg.create_project(
-        "Renamed elsewhere", HUMAN, sources=[ProjectSource("local_db", {"uid": world.pid()})]
+        "Renamed elsewhere", HUMAN, sources=[ProjectSource("local_db", {"project_id": world.pid()})]
     )
     assert world.hublink.registry_ids(world.locator()) == sorted([by_alias.id, by_uid.id])
     for pid in (by_alias.id, by_uid.id):
@@ -1579,7 +1579,9 @@ def test_n6_flock_released_when_owner_process_dies(tmp_path: Path) -> None:
             JobStore(db)
         p.kill()  # my own child
         p.wait(WAIT)
-        JobStore(db).close()  # the kernel released the dead owner's lock
+        # The kernel released the dead owner's lock. On a Windows venv the redirector's child
+        # is the real owner and outlives p.wait() briefly, hence the bounded poll.
+        open_store_when_released(db).close()
     finally:
         if p.poll() is None:
             p.kill()

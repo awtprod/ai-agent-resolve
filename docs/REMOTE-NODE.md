@@ -23,6 +23,36 @@ bind all interfaces. The safe default is loopback (`127.0.0.1`); a non-loopback 
 explicit `--allow-remote`. Permit only the intended Windows node to reach `openclaw-server:8789`
 in tailnet ACLs. The enrolled bearer token is also required, not a replacement for that boundary.
 
+Register the Resolve project before the node starts. `aar node run` refuses to start
+(`UnknownHubProject`) until the hub registry holds a project whose source locator carries the
+Resolve project's unique id. On the Windows PC, with the project open and Resolve running,
+print its locator; this reads the name and unique id and does not load, switch or navigate
+anything:
+
+```text
+aar node locate
+```
+
+It prints `project_id` and `name`, but never a verified `folder_path` (`null`, with a reason): the
+Project Manager only lists project names, so a root entry with the same name could be a different
+project, and reading the real path would move the folder you are looking at. When the root lists
+the name it also prints `candidate_folder_path: []`, an unverified guess. The operator confirms the
+folder: check in Resolve where the project lives, then pass `folder_path` explicitly (copy the
+candidate only after that check). The hub refuses a locator without `folder_path`. Then, on
+the hub (a human or an agent may register; a node may not):
+
+```bash
+aar hub project add --db /srv/aar/hub.db --actor human:andrew --name "Show" \
+  --source-kind local_db --host edit-pc --idempotency-key reg-show-1 \
+  --locator '{"folder_path":["Shows"],"name":"Show","project_id":"resolve-project-uid"}'
+```
+
+One Resolve unique id maps to one hub project: registering it again is refused with
+`project_exists` and the existing `prj_...` id. `aar hub project list|show|alias|source|rename`
+manage what is registered. An agent served with `aar hub serve --agent-writes` can do the same
+with the `project_register` tool; a live node can answer `project.locate` for the project it has
+open (an op, so it needs the project's id as its target; `aar node locate` does not).
+
 On Windows, with Resolve Studio running and `DaVinciResolveScript` importable:
 
 ```text

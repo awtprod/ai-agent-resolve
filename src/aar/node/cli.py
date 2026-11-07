@@ -25,6 +25,14 @@ def register(subparsers: Any) -> None:
     ops.add_argument("--json", action="store_true", help="Print JSON, with each params schema.")
     ops.set_defaults(func=_cmd_ops)
 
+    locate = sub.add_parser(
+        "locate",
+        help="Print the project open in Resolve as a locator to register in the hub.",
+        description="Reads the open project's name, unique id and (when provable) folder path "
+        "without loading, switching or navigating anything. Run on the Windows node.",
+    )
+    locate.set_defaults(func=_cmd_locate)
+
     run = sub.add_parser("run", help="Run the outbound-only durable job worker beside Resolve.")
     run.add_argument("--node-id", required=True)
     run.add_argument("--hub-url", required=True)
@@ -75,6 +83,37 @@ def _live_gateway() -> Any:
     from aar.node.gateway import ScriptApiGateway
 
     return ScriptApiGateway(dvr.scriptapp("Resolve"))
+
+
+def _cmd_locate(args: argparse.Namespace, *, gateway_factory: Any = _live_gateway) -> int:
+    from aar.node.gateway import GatewayError, ScriptApiGateway
+
+    try:
+        gateway = gateway_factory()
+        if not isinstance(gateway, ScriptApiGateway):
+            raise RuntimeError(f"{type(gateway).__name__} cannot locate the open project")
+        where = gateway.locate_open_project()
+    except (OSError, RuntimeError, GatewayError) as exc:
+        cli_io.warn(f"aar node locate: {exc}")
+        return 2
+    body: dict[str, Any] = {
+        "name": where.name,
+        "project_id": where.project_id,
+        "pm_folder": where.pm_folder,
+        "folder_path": None if where.folder_path is None else list(where.folder_path),
+        "folder_path_reason": where.folder_path_reason,
+        "candidate_folder_path": (
+            None if where.candidate_folder_path is None else list(where.candidate_folder_path)
+        ),
+        "locator": None,
+    }
+    if where.folder_path is not None:
+        body["locator"] = {
+            "folder_path": list(where.folder_path),
+            "name": where.name,
+            "project_id": where.project_id,
+        }
+    return cli_io.emit(_PROG, json.dumps(body, indent=2, sort_keys=True) + "\n")
 
 
 def run_node(args: argparse.Namespace, *, gateway_factory: Any = _live_gateway) -> int:

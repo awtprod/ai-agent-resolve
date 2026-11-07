@@ -1,0 +1,8 @@
+{
+  "hub_url": "http://HUB-TAILNET-IP:8789",
+  "node_id": "edit-pc",
+  "token_file": "edit-pc.token",
+  "store": "jobs.db",
+  "projects_file": "projects.json",
+  "log_dir": "logs"
+}

@@ -210,3 +210,26 @@ class JobWorld:
         base = {"color": "Blue", "duration": 1, "note": "", "name": "", "customData": ""}
         base.update(over)
         return base
+
+
+def open_store_when_released(path: Path, *, timeout: float = 30.0) -> Any:
+    """Open a ``JobStore`` once a killed owner's lock is gone, polling for at most ``timeout``.
+
+    On a Windows venv ``sys.executable`` is the venv redirector, which spawns the base
+    interpreter as a *child*. Killing (or waiting on) the redirector therefore returns before the
+    real owner has died, and the kernel frees the file lock a moment later. The lock MUST still
+    be released: a store that stays locked past ``timeout`` re-raises ``JobStoreLocked``. On
+    POSIX the first attempt succeeds, so this is exactly the old immediate open.
+    """
+    import time
+
+    from aar.node.jobs import JobStore, JobStoreLocked
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return JobStore(path)
+        except JobStoreLocked:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
