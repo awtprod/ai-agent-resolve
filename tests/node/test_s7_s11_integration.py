@@ -525,7 +525,10 @@ def test_p3_exactly_the_render_ops_carry_a_guard_exemption() -> None:
     # S13h1 adds media.import, the one build op with an exemption (pinned in test_ops_build_pins).
     assert set(exempt) == {"render.build", "render.delete_job", "media.import"}
     assert all(reason and "render" in reason for n, reason in exempt.items() if n != "media.import")
-    assert exempt["media.import"].startswith("additive: only adds media-pool items")
+    assert exempt["media.import"].startswith(
+        "additive: only adds media-pool items to the named bin and, with create_bins, the "
+        "missing bins on its path;"
+    )
     # The other guard pass is S11's creates_timeline, on exactly the two copy-making ops.
     assert {s.name for s in list_ops() if s.creates_timeline} == {
         "timeline.duplicate",

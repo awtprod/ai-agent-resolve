@@ -352,8 +352,9 @@ def test_import_guard_exemption_text_is_pinned() -> None:
         get_op("media.import").guard_exemption
         == IMPORT_GUARD_EXEMPTION
         == (
-            "additive: only adds media-pool items to the named bin; never alters, moves, relinks "
-            "or deletes existing items or any timeline"
+            "additive: only adds media-pool items to the named bin and, with create_bins, the "
+            "missing bins on its path; never alters, moves, relinks or deletes existing items or "
+            "any timeline"
         )
     )
 

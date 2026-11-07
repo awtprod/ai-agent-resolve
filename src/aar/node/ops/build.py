@@ -108,8 +108,8 @@ def _bounce_note(call: str, where: str) -> Note:
 # -- media.import ------------------------------------------------------------------------------
 
 IMPORT_GUARD_EXEMPTION = (
-    "additive: only adds media-pool items to the named bin; never alters, moves, relinks or "
-    "deletes existing items or any timeline"
+    "additive: only adds media-pool items to the named bin and, with create_bins, the missing "
+    "bins on its path; never alters, moves, relinks or deletes existing items or any timeline"
 )
 EDIT_PATH_MAX = 1024
 _DRIVE = re.compile(r"^[A-Za-z]:[\\/](?P<rest>.*)$", re.S)

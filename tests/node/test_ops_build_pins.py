@@ -101,8 +101,9 @@ def test_media_import_is_the_only_new_op_with_a_guard_exemption() -> None:
     exempt = {name: get_op(name).guard_exemption for name in NEW_OPS}
     assert {name for name, reason in exempt.items() if reason is not None} == {"media.import"}
     assert exempt["media.import"] == (
-        "additive: only adds media-pool items to the named bin; never alters, moves, relinks "
-        "or deletes existing items or any timeline"
+        "additive: only adds media-pool items to the named bin and, with create_bins, the "
+        "missing bins on its path; never alters, moves, relinks or deletes existing items or "
+        "any timeline"
     )
     for name in NEW_OPS:
         spec = get_op(name)
