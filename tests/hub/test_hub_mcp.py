@@ -32,6 +32,7 @@ TOOL_NAMES = {
     "lease_board",
     "project_board",
     "agent_branches",
+    "jobs_list",
     "approvals_list",
     # S13g2: recipe_status is the 13th read tool, always listed so agents can drive a run.
     "recipe_status",
@@ -50,10 +51,10 @@ def _seed(tmp_path: Path) -> tuple[EventLog, Registry, ArtifactStore, str, str]:
     registry = Registry(log)
     artifacts = ArtifactStore(tmp_path / "artifacts", log)
 
-    locator = {"library": "CCN", "project": "QCCE 2024"}
+    locator = {"library": "Acme", "project": "Acme Show 2024"}
     source = ProjectSource("cloud_library", locator, host="edit-pc-1")
     project = registry.create_project(
-        "QCCE 2024", Actor("human", "andrew"), sources=[source], aliases=["qcce"]
+        "Acme Show 2024", Actor("human", "owner"), sources=[source], aliases=["acme"]
     )
 
     graph = WorkGraph(log, project.id)
@@ -103,11 +104,11 @@ def test_in_process_client_round_trip(tmp_path: Path) -> None:
             )
 
             projects = _payload(await client.call_tool("projects_list", {}))["projects"]
-            assert any(p["id"] == project_id and p["name"] == "QCCE 2024" for p in projects)
+            assert any(p["id"] == project_id and p["name"] == "Acme Show 2024" for p in projects)
 
             got = _payload(await client.call_tool("project_get", {"project_id": project_id}))
             assert got["found"] is True
-            assert got["project"]["aliases"] == ["qcce"]
+            assert got["project"]["aliases"] == ["acme"]
 
             missing = _payload(await client.call_tool("project_get", {"project_id": "prj_nope"}))
             assert missing["found"] is False

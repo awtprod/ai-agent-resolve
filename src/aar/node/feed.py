@@ -52,9 +52,10 @@ event it cannot map; if one still cannot be mapped it is dropped and gap-flagged
 raised.
 
 Delivery is behind :class:`FeedTransport`. In process, :class:`EventLogTransport` hands
-each spec to the hub's :func:`~aar.hub.leaseboard.deliver_feed_event`; a remote node would
-implement the same one-method protocol over HTTP (follow-up F-S11-1). Lease and presence
-only; pulling jobs and approval tokens are S7's ``aar.node.hublink``.
+each spec to the hub's :func:`~aar.hub.leaseboard.deliver_feed_event`; a remote node uses
+:class:`aar.node.remote.RemoteFeedTransport`, the same one-method protocol over HTTP
+(F-S11-1, implemented in S15a), which keeps the spec's idempotency key on every resend.
+Lease and presence only; pulling jobs and approval tokens are S7's ``aar.node.hublink``.
 """
 
 from __future__ import annotations
