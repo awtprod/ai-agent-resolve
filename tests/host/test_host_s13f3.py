@@ -8,7 +8,14 @@ import json
 import os
 
 import pytest
-from host_support import ALIAS, FakeRunner, decode_encoded_command, make_config, sha256_upper
+from host_support import (
+    ALIAS,
+    FakeRunner,
+    decode_encoded_command,
+    fail_fstat_on_claim,
+    make_config,
+    sha256_upper,
+)
 
 from aar.cli import main
 from aar.host import cli as host_cli
@@ -341,7 +348,7 @@ def test_p23_claim_unlink_failure_is_reported(tmp_path, monkeypatch) -> None:
 @pytest.mark.parametrize("exc", [lambda: OSError(errno.EIO, "io"), lambda: KeyboardInterrupt()])
 def test_p24_fstat_failure_is_reported(tmp_path, monkeypatch, exc) -> None:
     _no_link(monkeypatch)
-    monkeypatch.setattr(transport.os, "fstat", lambda *a, **k: (_ for _ in ()).throw(exc()))
+    fail_fstat_on_claim(monkeypatch, tmp_path / "out.mp4", exc)
     with pytest.raises(BaseException) as info:
         _host(tmp_path, StepRunner({})).pull(REMOTE, str(tmp_path / "out.mp4"))
     text = str(info.value) + " ".join(getattr(info.value, "__notes__", []))
