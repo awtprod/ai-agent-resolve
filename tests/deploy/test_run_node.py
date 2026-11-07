@@ -283,38 +283,119 @@ def test_kill_on_close_job_is_a_noop_off_windows() -> None:
         def __getattr__(self, name):  # any kernel32 call would be a bug
             raise AssertionError(f"kernel32.{name} called off Windows")
 
-    assert rn.kill_on_close_job(os_name="posix", kernel32=Boom()) is None
+    assert rn.kill_on_close_job(os_name="posix", kernel32=Boom()) == (None, None)
     if rn.os.name != "nt":
-        assert rn.kill_on_close_job() is None
+        assert rn.kill_on_close_job() == (None, None)
 
 
-def test_kill_on_close_job_failure_paths_return_none() -> None:
-    closed: list[int] = []
+class _Fn:
+    """A kernel32 function that, like ctypes, only behaves if its prototype was declared."""
 
-    class K32:
-        def __init__(self, job, set_ok, assign_ok):
-            self.job, self.set_ok, self.assign_ok = job, set_ok, assign_ok
+    def __init__(self, name, impl, want_args, want_res):
+        self.name, self.impl, self.want_args, self.want_res = name, impl, want_args, want_res
+        self.argtypes = None
+        self.restype = None
+        self.calls: list[tuple] = []
 
-        def CreateJobObjectW(self, *a):
-            return self.job
+    def __call__(self, *args):
+        assert self.argtypes is not None, f"{self.name}: argtypes not declared"
+        assert self.restype is not None, f"{self.name}: restype not declared"
+        assert list(self.argtypes) == list(self.want_args), f"{self.name}: wrong argtypes"
+        assert self.restype is self.want_res, f"{self.name}: wrong restype"
+        assert len(args) == len(self.argtypes), f"{self.name}: arity"
+        self.calls.append(args)
+        return self.impl(*args)
 
-        def SetInformationJobObject(self, *a):
-            return self.set_ok
 
-        def GetCurrentProcess(self):
-            return -1
+class _K32:
+    def __init__(self, *, job=0x1_0000_0001, set_ok=1, assign_ok=1):
+        import ctypes
+        from ctypes import wintypes as w
 
-        def AssignProcessToJobObject(self, *a):
-            return self.assign_ok
+        H, B, D, P = w.HANDLE, w.BOOL, w.DWORD, w.LPVOID
+        self.closed: list[int] = []
+        self.CreateJobObjectW = _Fn("CreateJobObjectW", lambda a, b: job, [P, w.LPCWSTR], H)
+        self.SetInformationJobObject = _Fn(
+            "SetInformationJobObject", lambda *a: set_ok, [H, ctypes.c_int, P, D], B
+        )
+        self.AssignProcessToJobObject = _Fn(
+            "AssignProcessToJobObject", lambda *a: assign_ok, [H, H], B
+        )
+        # 64-bit pseudo-handle (HANDLE)-1, as a HANDLE restype returns it.
+        self.GetCurrentProcess = _Fn("GetCurrentProcess", lambda: 0xFFFFFFFFFFFFFFFF, [], H)
+        self.CloseHandle = _Fn("CloseHandle", lambda h: self.closed.append(h) or 1, [H], B)
 
-        def CloseHandle(self, h):
-            closed.append(h)
 
-    assert rn.kill_on_close_job("nt", K32(0, 1, 1)) is None
-    assert rn.kill_on_close_job("nt", K32(5, 0, 1)) is None
-    assert rn.kill_on_close_job("nt", K32(6, 1, 0)) is None
-    assert closed == [5, 6]
-    assert rn.kill_on_close_job("nt", K32(7, 1, 1)) == 7
+def test_kill_on_close_job_declares_prototypes_and_keeps_64_bit_handles() -> None:
+    k = _K32()
+    job, reason = rn.kill_on_close_job("nt", k)
+    assert (job, reason) == (0x1_0000_0001, None)  # not truncated to 32 bits
+    assert k.AssignProcessToJobObject.calls == [(0x1_0000_0001, 0xFFFFFFFFFFFFFFFF)]
+    assert k.CreateJobObjectW.calls == [(None, None)] and not k.closed
+
+
+def test_fake_kernel32_rejects_undeclared_prototypes() -> None:
+    k = _K32()
+    with pytest.raises(AssertionError, match="argtypes not declared"):
+        k.CreateJobObjectW(None, None)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "call", "closed"),
+    [
+        ({"job": 0}, "CreateJobObjectW", []),
+        ({"set_ok": 0}, "SetInformationJobObject", [0x1_0000_0001]),
+        ({"assign_ok": 0}, "AssignProcessToJobObject", [0x1_0000_0001]),
+    ],
+)
+def test_kill_on_close_job_failures_carry_a_reason(monkeypatch, kwargs, call, closed) -> None:
+    monkeypatch.setattr(rn, "_last_error", lambda: 5)
+    k = _K32(**kwargs)
+    job, reason = rn.kill_on_close_job("nt", k)
+    assert job is None and reason == f"{call} failed: winerror 5"
+    assert k.closed == closed
+
+
+def test_self_test_job_reports_failure_reason(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        rn, "kill_on_close_job", lambda: (None, "AssignProcessToJobObject failed: winerror 5")
+    )
+    assert rn.self_test_job() == 1
+    assert (
+        capsys.readouterr().out.strip() == "job=failed: AssignProcessToJobObject failed: winerror 5"
+    )
+
+
+def test_self_test_job_spawns_a_sleeper_and_does_not_wait(monkeypatch, capsys) -> None:
+    spawned: list[list[str]] = []
+
+    class FakePopen:
+        pid = 4242
+
+        def __init__(self, argv, **kw):
+            spawned.append(argv)
+
+        def wait(self, *a, **k):  # pragma: no cover
+            raise AssertionError("self test must not wait for the child")
+
+    monkeypatch.setattr(rn, "kill_on_close_job", lambda: (123, None))
+    monkeypatch.setattr(rn.subprocess, "Popen", FakePopen)
+    assert rn.self_test_job() == 0
+    assert capsys.readouterr().out.strip() == "job=ok child=4242"
+    assert spawned[0][0] == sys.executable and "time.sleep(30)" in spawned[0][2]
+
+
+def test_main_dispatches_self_test_flag(monkeypatch) -> None:
+    monkeypatch.setattr(rn, "self_test_job", lambda: 9)
+    assert rn.main(["--self-test-job"]) == 9
+
+
+def test_job_failure_is_logged_to_supervisor_and_node_logs(tmp_path: Path) -> None:
+    sup, _, _ = _sup(tmp_path, running=False, runtime=0, projects="[]")
+    sup.log_both("supervisor: job object unavailable: X failed: winerror 5")
+    for name in ("supervisor", "node"):
+        text = (sup.cfg.log_dir / f"{name}-20261107.log").read_text(encoding="utf-8")
+        assert "supervisor: job object unavailable: X failed: winerror 5" in text
 
 
 def test_install_disable_kills_the_whole_tree_only_under_root() -> None:

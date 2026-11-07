@@ -89,5 +89,14 @@ store, so the pair and the base-interpreter child are all found. No other Python
 The worker is its own process tree (`aar.exe` -> venv `python.exe` -> base `python.exe`), started
 by the supervisor with `subprocess.run`. To stop it with the supervisor, `run_node.py` places
 itself in a Windows job object with `KILL_ON_JOB_CLOSE` at start-up, so children inherit the job
-and die when the supervisor does. This is a no-op off Windows and non-fatal if it fails; `disable`
-does not rely on it.
+and die when the supervisor does. This is a no-op off Windows and non-fatal if it fails (the failure reason is logged to both
+the supervisor and node logs as `supervisor: job object unavailable: ...`); `disable` does not
+rely on it.
+
+**`Stop-ScheduledTask` (and ending the task in Task Scheduler) does NOT kill child processes on
+this PC.** Measured 2026-11-07: the worker stays alive. That is why both the job object and
+`disable`'s process enumeration exist.
+
+Check the job object on a PC with `python run_node.py --self-test-job`: it prints
+`job=ok child=<pid>` (or `job=failed: <reason>`) and exits without waiting; the child sleeper
+must be gone moments later.

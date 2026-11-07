@@ -141,25 +141,57 @@ def build_env(cfg: Config, base: Mapping[str, str] | None = None) -> dict[str, s
     return env
 
 
-def kill_on_close_job(os_name: str = os.name, kernel32: Any = None) -> Any:
-    """Put THIS process in a Windows job object with KILL_ON_JOB_CLOSE; return the handle.
+def _last_error() -> int:
+    import ctypes
+
+    return getattr(ctypes, "get_last_error", lambda: 0)()
+
+
+def _declare_job_api(k32: Any, wintypes: Any) -> None:
+    """Declare argtypes/restype. Without them ctypes passes and returns C ints, which truncates
+    64-bit HANDLEs and turns GetCurrentProcess()'s pseudo-handle (HANDLE)-1 into 32-bit -1."""
+    import ctypes
+
+    H, B, D, P = wintypes.HANDLE, wintypes.BOOL, wintypes.DWORD, wintypes.LPVOID
+    k32.CreateJobObjectW.argtypes = [P, wintypes.LPCWSTR]
+    k32.CreateJobObjectW.restype = H
+    k32.SetInformationJobObject.argtypes = [H, ctypes.c_int, P, D]
+    k32.SetInformationJobObject.restype = B
+    k32.AssignProcessToJobObject.argtypes = [H, H]
+    k32.AssignProcessToJobObject.restype = B
+    k32.GetCurrentProcess.argtypes = []
+    k32.GetCurrentProcess.restype = H
+    k32.CloseHandle.argtypes = [H]
+    k32.CloseHandle.restype = B
+
+
+def kill_on_close_job(os_name: str = os.name, kernel32: Any = None) -> tuple[Any, str | None]:
+    """Put THIS process in a Windows job object with KILL_ON_JOB_CLOSE.
+
+    Returns ``(handle, None)`` on success, ``(None, reason)`` on a Windows failure, and
+    ``(None, None)`` off Windows (nothing to do, not an error).
 
     The worker (aar.exe -> venv python -> base python) is a separate process tree that nothing
-    reaps if the supervisor dies. Children inherit the supervisor's job, so when the supervisor
-    exits and the (never closed) handle goes away, Windows kills the whole tree. Assigning the
-    supervisor itself, rather than each worker after Popen, leaves no window in which a child
-    escapes. A no-op returning None off Windows or if any call fails (a failure is logged by
-    the caller, never fatal). ``os_name`` and ``kernel32`` are seams for tests.
+    reaps if the supervisor dies, and Stop-ScheduledTask does not kill it either. Children
+    inherit the supervisor's job, so when the supervisor exits and the (never closed) handle
+    goes away, Windows kills the whole tree. Assigning the supervisor itself, rather than each
+    worker after Popen, leaves no window in which a child escapes. ``os_name`` and ``kernel32``
+    are seams for tests.
     """
     if os_name != "nt":
-        return None
+        return None, None
     import ctypes
     from ctypes import wintypes
 
     k32 = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
+    _declare_job_api(k32, wintypes)
+
+    def fail(call: str) -> tuple[None, str]:
+        return None, f"{call} failed: winerror {_last_error()}"
+
     job = k32.CreateJobObjectW(None, None)
     if not job:
-        return None
+        return fail("CreateJobObjectW")
 
     class _Basic(ctypes.Structure):
         _fields_ = [
@@ -189,13 +221,34 @@ def kill_on_close_job(os_name: str = os.name, kernel32: Any = None) -> Any:
 
     info = _Extended()
     info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-    ok = k32.SetInformationJobObject(
+    if not k32.SetInformationJobObject(
         job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info), ctypes.sizeof(info)
+    ):
+        result = fail("SetInformationJobObject")
+    elif not k32.AssignProcessToJobObject(job, k32.GetCurrentProcess()):
+        result = fail("AssignProcessToJobObject")
+    else:
+        return job, None
+    k32.CloseHandle(job)
+    return result
+
+
+def self_test_job(out: Any = None) -> int:
+    """``run_node.py --self-test-job``: bind a job, spawn a 30 s sleeper, exit WITHOUT waiting.
+
+    When this process exits the job handle closes, so the sleeper must die. The operator checks
+    that ``child=<pid>`` is gone. Prints ``job=ok child=<pid>`` or ``job=failed: <reason>``.
+    """
+    out = out or sys.stdout
+    job, reason = kill_on_close_job()
+    if job is None:
+        print(f"job=failed: {reason or 'not Windows'}", file=out, flush=True)
+        return 1
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], creationflags=_no_window()
     )
-    if not ok or not k32.AssignProcessToJobObject(job, k32.GetCurrentProcess()):
-        k32.CloseHandle(job)
-        return None
-    return job
+    print(f"job=ok child={child.pid}", file=out, flush=True)
+    return 0
 
 
 def _no_window() -> int:
@@ -240,6 +293,13 @@ class Supervisor:
         self.cfg.log_dir.mkdir(parents=True, exist_ok=True)
         path = self.cfg.log_dir / f"supervisor-{stamp:%Y%m%d}.log"
         with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{stamp.isoformat(timespec='seconds')} {msg}\n")
+
+    def log_both(self, msg: str) -> None:
+        """Log to the supervisor log AND the node log, so the failure is seen in either."""
+        self.log(msg)
+        stamp = self._now()
+        with open(self.cfg.log_dir / f"node-{stamp:%Y%m%d}.log", "a", encoding="utf-8") as f:
             f.write(f"{stamp.isoformat(timespec='seconds')} {msg}\n")
 
     def _launch_subprocess(self, cmd: list[str], env: dict[str, str], log_path: Path) -> int:
@@ -288,6 +348,8 @@ class Supervisor:
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
+    if args[:1] == ["--self-test-job"]:
+        return self_test_job()
     config_path = Path(args[0]) if args else Path(__file__).resolve().with_name("run_node.json")
     try:
         cfg = load_config(config_path)
@@ -295,9 +357,12 @@ def main(argv: list[str] | None = None) -> int:
         print(exc, file=sys.stderr)
         return 2
     sup = Supervisor(cfg)
-    job = kill_on_close_job()  # keep the handle referenced for the life of the process
+    job, reason = kill_on_close_job()  # keep the handle referenced for the life of the process
     if os.name == "nt":
-        sup.log("worker tree bound to supervisor (job object)" if job else "job object failed")
+        if job is None:
+            sup.log_both(f"supervisor: job object unavailable: {reason}")
+        else:
+            sup.log("worker tree bound to supervisor (job object)")
     sup.job = job
     sup.run()
     return 0
