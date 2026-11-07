@@ -1,5 +1,6 @@
-"""``import aar``, ``aar.cli`` and ``aar.analyze`` work with numpy and faster-whisper absent, and
-a command that needs one fails with a typed ``missing-extra`` error naming the extra."""
+"""``import aar``, ``aar.cli`` and ``aar.analyze`` work with numpy, faster-whisper and OpenCV
+absent, and a command that needs one fails with a typed ``missing-extra`` error naming the
+extra."""
 
 from __future__ import annotations
 
@@ -14,18 +15,21 @@ from contextlib import redirect_stdout
 
 sys.modules["numpy"] = None  # import numpy now raises ImportError
 sys.modules["faster_whisper"] = None
+sys.modules["cv2"] = None
 
 import aar, aar.cli, aar.analyze, aar.analyze.audio, aar.analyze.cli, aar.analyze.sync
-import aar.analyze.whisper, aar.qa.cli
+import aar.analyze.whisper, aar.analyze.faces, aar.analyze.common, aar.analyze.laughs
+import aar.analyze.gemini, aar.qa.cli
 from aar.cli import main
 
 loaded = sorted(m for m, mod in sys.modules.items() if mod is not None
-                and m.split(".")[0] in ("numpy", "faster_whisper", "ctranslate2"))
+                and m.split(".")[0] in ("numpy", "faster_whisper", "ctranslate2", "cv2"))
 results = {"loaded": loaded}
 media = sys.argv[1]
 for name, argv in {
     "sync": ["analyze", "sync", "--ref", media, "--other", media, "--fps", "25"],
     "transcript": ["analyze", "transcript", media, "--out", media + ".json"],
+    "faces": ["analyze", "faces", media, "--out", media + ".f.json", "--model", media],
 }.items():
     out = io.StringIO()
     with redirect_stdout(out):
@@ -48,7 +52,7 @@ def test_imports_and_typed_errors_without_numpy_or_faster_whisper(tmp_path: Path
     assert done.returncode == 0, done.stderr
     results = json.loads(done.stdout)
     assert results["loaded"] == []
-    for name, extra in (("sync", "analyze"), ("transcript", "whisper")):
+    for name, extra in (("sync", "analyze"), ("transcript", "whisper"), ("faces", "faces")):
         code, body = results[name]["code"], results[name]["body"]
         assert code == 2, name
         assert body["ok"] is False

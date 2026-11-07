@@ -21,7 +21,6 @@ Safety properties:
 
 from __future__ import annotations
 
-import fcntl
 import json
 import sqlite3
 import threading
@@ -32,6 +31,7 @@ from typing import Any
 
 from aar.node.locator import ProjectLocator
 
+from .file_lock import FileLockUnavailable, acquire_file_lock, release_file_lock
 from .model import JobState, StructuredError, WaitReason
 
 SCHEMA_VERSION = 3
@@ -275,17 +275,12 @@ class JobStore:
             raise
 
     def _take_file_lock(self) -> int:
-        import os
-
-        fd = os.open(self._path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            os.close(fd)
+            return acquire_file_lock(self._path + ".lock")
+        except FileLockUnavailable as exc:
             raise JobStoreLocked(
                 f"another process holds the job store lock for {self._path!r}"
             ) from exc
-        return fd
 
     def _init_version(self) -> None:
         self._conn.execute("BEGIN IMMEDIATE")
@@ -348,19 +343,17 @@ class JobStore:
             )
 
     def close(self) -> None:
-        import os
-
         with self._lock:
             conn = getattr(self, "_conn", None)
-            if conn is not None:
-                conn.close()
             fd = getattr(self, "_lock_fd", None)
-            if fd is not None:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                finally:
-                    os.close(fd)
-                self._lock_fd = None
+            self._conn = None
+            self._lock_fd = None
+            try:
+                if conn is not None:
+                    conn.close()
+            finally:
+                if fd is not None:
+                    release_file_lock(fd)
 
     # -- writes ----------------------------------------------------------------------------
 

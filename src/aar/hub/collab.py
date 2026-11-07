@@ -50,12 +50,13 @@ and these recorders. The wiring it does (tested in ``tests/node/test_s7_s11_inte
    open node id (``NodeIdInUse``). The hub admits a new process of a node id and refuses
    the one it replaced (:class:`~aar.hub.leaseboard.FeedConflict`, and the node shows
    ``stale``); the refused feed stops, and its process must be stopped.
-8. The remote transport (F-S11-1) runs :func:`~aar.hub.leaseboard.deliver_feed_event` on
-   the hub and reports back to the node: "unreachable" as an ``OSError`` (the feed keeps
-   the spec and backs off), "refused" as a ``ValueError`` (quarantined), and a
-   ``FeedConflict`` as itself (the feed stops). It must keep a spec's idempotency key on
-   every resend; the feed reuses keys, orders its events itself (``feed.seq``) and drains
-   under lost acks (S11f), so a late or duplicate delivery is harmless.
+8. The remote transport (F-S11-1, :class:`aar.node.remote.RemoteFeedTransport`, implemented
+   in S15a) runs :func:`~aar.hub.leaseboard.deliver_feed_event` on the hub via
+   ``aar hub nodeapi`` and reports back to the node: "unreachable" as an ``OSError`` (the feed
+   keeps the spec and backs off), "refused" as a ``ValueError`` (quarantined), and a
+   ``FeedConflict`` as itself (the feed stops). It keeps a spec's idempotency key on every
+   resend; the feed reuses keys, orders its events itself (``feed.seq``) and drains under lost
+   acks (S11f), so a late or duplicate delivery is harmless.
 
 The node's ``HubLink`` (approvals, stops, branch records) follows the same error contract
 as the feed transport: ``OSError`` unreachable (the job waits, fail-closed), ``ValueError``

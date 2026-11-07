@@ -25,6 +25,16 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     hub = subparsers.add_parser("hub", help="Run and inspect the project/event/work-graph hub.")
     hub_sub = hub.add_subparsers(dest="hub_command", required=True)
 
+    init = hub_sub.add_parser(
+        "init",
+        help="Create a new, empty hub database and artifact store (refuses to overwrite).",
+    )
+    init.add_argument("--db", required=True, help="Path for the new SQLite event-log database.")
+    init.add_argument(
+        "--artifacts", required=True, help="Path for the new artifact store directory."
+    )
+    init.set_defaults(func=_init)
+
     serve = hub_sub.add_parser(
         "serve",
         help="Serve the hub over MCP (streamable HTTP); read-only unless --agent-writes.",
@@ -155,6 +165,106 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     show.add_argument("review_id", help="Review id.")
     show.set_defaults(func=_review_show)
 
+    node = hub_sub.add_parser(
+        "node", help="Enrol, revoke and list the nodes allowed to call the node API."
+    )
+    node_sub = node.add_subparsers(dest="node_command", required=True)
+
+    enroll = node_sub.add_parser(
+        "enroll",
+        help="Enrol a node and print its bearer token once (only its sha256 is stored).",
+    )
+    _add_db(enroll)
+    enroll.add_argument("node_id", help="The node id (as the node reports it to the hub).")
+    _add_actor(enroll)
+    enroll.add_argument(
+        "--rotate",
+        action="store_true",
+        help="Revoke the node's current token and enrol a new one, in one transaction.",
+    )
+    enroll.set_defaults(func=_node_enroll)
+
+    revoke = node_sub.add_parser("revoke", help="Revoke a node's current token.")
+    _add_db(revoke)
+    revoke.add_argument("node_id", help="The node id to revoke.")
+    _add_actor(revoke)
+    revoke.add_argument("--reason", default="revoke", help="Why, for the audit trail.")
+    revoke.set_defaults(func=_node_revoke)
+
+    node_list = node_sub.add_parser(
+        "list", help="List enrolled nodes with enrol/revoke times and a hash prefix only."
+    )
+    _add_db(node_list)
+    node_list.set_defaults(func=_node_list)
+
+    nodeapi = hub_sub.add_parser(
+        "nodeapi",
+        help="Serve the node-facing HTTP API (POST /node/v1/<op>, enrolled bearer token).",
+    )
+    nodeapi.add_argument("--db", required=True, help="Path to the SQLite event-log database.")
+    nodeapi.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Interface to bind (default: 127.0.0.1; tailnet-only, the token is a 2nd factor).",
+    )
+    nodeapi.add_argument("--port", type=int, default=8789, help="Port to bind (default: 8789).")
+    nodeapi.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Permit binding to a non-loopback interface (required for any non-loopback --host).",
+    )
+    nodeapi.set_defaults(func=_nodeapi)
+
+    job = hub_sub.add_parser("job", help="Submit and inspect durable Resolve node jobs.")
+    job_sub = job.add_subparsers(dest="job_command", required=True)
+
+    job_submit = job_sub.add_parser("submit", help="Submit a validated job to one named node.")
+    _add_db(job_submit)
+    _add_actor(job_submit)
+    job_submit.add_argument("--kind", required=True, help="Registered JobRunner kind.")
+    job_submit.add_argument("--params", required=True, help="Job params as a JSON object.")
+    job_submit.add_argument("--project", required=True, help="ProjectLocator as a JSON object.")
+    job_submit.add_argument(
+        "--node", required=True, help="The only node initially allowed to claim."
+    )
+    job_submit.add_argument("--agent-id", required=True, help="Agent identity used by every op.")
+    job_submit.add_argument("--priority", type=int, default=0)
+    job_submit.add_argument("--approval-token")
+    job_submit.add_argument("--idempotency-key", required=True)
+    job_submit.set_defaults(func=_job_submit)
+
+    job_list = job_sub.add_parser("list", help="List durable jobs and derived lease state.")
+    _add_db(job_list)
+    job_list.add_argument("--state")
+    job_list.add_argument("--project-id")
+    job_list.set_defaults(func=_job_list)
+
+    job_show = job_sub.add_parser("show", help="Show one durable job.")
+    _add_db(job_show)
+    job_show.add_argument("job_id")
+    job_show.set_defaults(func=_job_show)
+
+    job_cancel = job_sub.add_parser("cancel", help="Request cancellation at the node's safe point.")
+    _add_db(job_cancel)
+    _add_actor(job_cancel)
+    job_cancel.add_argument("job_id")
+    job_cancel.add_argument("--reason", required=True)
+    job_cancel.add_argument("--idempotency-key", required=True)
+    job_cancel.set_defaults(func=_job_cancel)
+
+    job_release = job_sub.add_parser(
+        "release", help="Human-only release after checking Resolve; increments the fence."
+    )
+    _add_db(job_release)
+    _add_actor(job_release)
+    job_release.add_argument("job_id")
+    job_release.add_argument(
+        "--node", required=True, help="Node allowed to claim the new generation."
+    )
+    job_release.add_argument("--reason", required=True)
+    job_release.add_argument("--idempotency-key", required=True)
+    job_release.set_defaults(func=_job_release)
+
     from aar.hub import write_cli
 
     write_cli.register(hub_sub)
@@ -171,6 +281,230 @@ def _add_actor(parser: argparse.ArgumentParser) -> None:
         metavar="KIND:ID",
         help="Who is acting, e.g. agent:agent-1 (kinds: human, agent, node).",
     )
+
+
+def _init(args: argparse.Namespace) -> int:
+    # Import here so the core CLI does not require the optional 'hub' extra.
+    from aar.hub.artifacts import ArtifactStore
+    from aar.hub.events import EventLog
+
+    db, artifacts = Path(args.db), Path(args.artifacts)
+    # Both paths must be absent, and nothing is created until both are checked, so a refusal
+    # never leaves a half-initialised hub behind.
+    if db.exists():
+        return _fail("db_exists", f"refusing to create a hub database over existing {args.db!r}")
+    if artifacts.exists():
+        return _fail(
+            "artifacts_exist",
+            f"refusing to create an artifact store over existing {args.artifacts!r}",
+        )
+    try:
+        log = EventLog(args.db, create=True)
+    except (OSError, sqlite3.Error) as exc:
+        return _fail("db_create_failed", f"cannot create hub database {args.db!r}: {exc}")
+    try:
+        ArtifactStore(args.artifacts, log, create=True)
+    except OSError as exc:
+        log.close()
+        return _fail(
+            "artifacts_create_failed", f"cannot create artifact store {args.artifacts!r}: {exc}"
+        )
+    log.close()
+    return _print({"db": str(db), "artifacts": str(artifacts)})
+
+
+def _node_enroll(args: argparse.Namespace) -> int:
+    from aar.hub import nodes
+
+    try:
+        actor = _parse_actor(args.actor)
+    except ValueError as exc:
+        return _fail("invalid_actor", str(exc))
+    try:
+        log = _open_existing(args.db)
+    except _DatabaseUnavailable as exc:
+        return _fail("database_unavailable", str(exc))
+    try:
+        node_id, token = nodes.enroll(log, args.node_id, actor, rotate=args.rotate)
+    except nodes.NodeError as exc:
+        return _fail(exc.code, str(exc))
+    finally:
+        log.close()
+    # The token is printed here, once, and never stored or logged anywhere.
+    return _print({"node_id": node_id, "token": token})
+
+
+def _node_revoke(args: argparse.Namespace) -> int:
+    from aar.hub import nodes
+
+    try:
+        actor = _parse_actor(args.actor)
+    except ValueError as exc:
+        return _fail("invalid_actor", str(exc))
+    try:
+        log = _open_existing(args.db)
+    except _DatabaseUnavailable as exc:
+        return _fail("database_unavailable", str(exc))
+    try:
+        nodes.revoke(log, args.node_id, actor, reason=args.reason)
+    except nodes.NodeError as exc:
+        return _fail(exc.code, str(exc))
+    finally:
+        log.close()
+    return _print({"node_id": args.node_id, "revoked": True})
+
+
+def _node_list(args: argparse.Namespace) -> int:
+    from aar.hub import nodes
+
+    try:
+        log = _open_existing(args.db, read_only=True)
+    except _DatabaseUnavailable as exc:
+        return _fail("database_unavailable", str(exc))
+    try:
+        records = nodes.list_nodes(log)
+    finally:
+        log.close()
+    return _print({"nodes": [record.to_dict() for record in records]})
+
+
+def _nodeapi(args: argparse.Namespace) -> int:
+    if args.host not in _LOOPBACK and not args.allow_remote:
+        return _fail(
+            "remote_bind_refused",
+            f"refusing to bind to {args.host!r} without --allow-remote: the hub is tailnet-only "
+            "(default bind is 127.0.0.1; the enrolled token is a second factor, not the only gate)",
+        )
+
+    # Import here so the core CLI does not require the optional 'hub' extra (Starlette/uvicorn).
+    from aar.hub.nodeapi import build_app
+
+    try:
+        log = _open_existing(args.db)
+    except _DatabaseUnavailable as exc:
+        return _fail("database_unavailable", str(exc))
+
+    import uvicorn
+
+    app = build_app(log)
+    # proxy_headers=False: the peer address must be the real TCP peer (loopback by default),
+    # never a forwarded header a caller controls. server_header=False keeps the banner quiet.
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        proxy_headers=False,
+        server_header=False,
+        log_level="info",
+    )
+    return 0
+
+
+def _job_command(action: Any, *, read_only: bool = False) -> Any:
+    """CLI adapter: open exactly one existing log and render stable JSON errors."""
+
+    def run(args: argparse.Namespace) -> int:
+        from aar.hub import jobs
+        from aar.hub.common import HumanRequired, InvalidInput
+        from aar.hub.events import IdempotencyConflict
+
+        try:
+            if action is _job_submit_action:
+                # Reject malformed CLI input before opening even the local event store.
+                from aar.node.locator import ProjectLocator
+
+                project = ProjectLocator.from_dict(json.loads(args.project))
+                if project.project_id is None:
+                    raise ValueError("--project locator needs project_id")
+            log = _open_existing(args.db, read_only=read_only)
+            try:
+                value = action(jobs, log, args)
+            finally:
+                log.close()
+            return _print(value)
+        except _DatabaseUnavailable as exc:
+            return _fail("database_unavailable", str(exc))
+        except HumanRequired as exc:
+            return _fail("human_required", str(exc))
+        except InvalidInput as exc:
+            return _fail("invalid_input", str(exc))
+        except IdempotencyConflict as exc:
+            return _fail("idempotency_conflict", str(exc))
+        except jobs.JobError as exc:
+            return _fail(exc.code, str(exc), 1 if isinstance(exc, jobs.JobNotFound) else 2)
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            return _fail("invalid_input", str(exc))
+
+    return run
+
+
+def _job_submit_action(jobs: Any, log: Any, args: argparse.Namespace) -> dict[str, Any]:
+    from aar.node.locator import ProjectLocator
+
+    params = json.loads(args.params)
+    project = ProjectLocator.from_dict(json.loads(args.project))
+    job, replayed = jobs.submit(
+        log,
+        _parse_actor(args.actor),
+        kind=args.kind,
+        params=params,
+        project=project,
+        agent_id=args.agent_id,
+        assigned_node=args.node,
+        priority=args.priority,
+        approval_token=args.approval_token,
+        idempotency_key=args.idempotency_key,
+    )
+    return {"job": job.to_dict(jobs.utcnow()), "replayed": replayed}
+
+
+def _job_list_action(jobs: Any, log: Any, args: argparse.Namespace) -> dict[str, Any]:
+    now = jobs.utcnow()
+    found = [
+        job
+        for job in jobs.list_jobs(log)
+        if args.project_id is None or job.target.project_id == args.project_id
+    ]
+    if args.state is not None:
+        found = [job for job in found if job.state(now) == args.state]
+    return {"jobs": [job.to_dict(now, include_payload=False) for job in found]}
+
+
+def _job_show_action(jobs: Any, log: Any, args: argparse.Namespace) -> dict[str, Any]:
+    job = jobs.get_job(log, args.job_id)
+    if job is None:
+        raise jobs.JobNotFound(f"no job {args.job_id!r}")
+    return {"job": job.to_dict(jobs.utcnow())}
+
+
+def _job_cancel_action(jobs: Any, log: Any, args: argparse.Namespace) -> dict[str, Any]:
+    job, replayed = jobs.cancel(
+        log,
+        _parse_actor(args.actor),
+        args.job_id,
+        args.reason,
+        idempotency_key=args.idempotency_key,
+    )
+    return {"job": job.to_dict(jobs.utcnow()), "replayed": replayed}
+
+
+def _job_release_action(jobs: Any, log: Any, args: argparse.Namespace) -> dict[str, Any]:
+    job, replayed = jobs.release(
+        log,
+        _parse_actor(args.actor),
+        args.job_id,
+        args.node,
+        args.reason,
+        idempotency_key=args.idempotency_key,
+    )
+    return {"job": job.to_dict(jobs.utcnow()), "replayed": replayed}
+
+
+_job_submit = _job_command(_job_submit_action)
+_job_list = _job_command(_job_list_action, read_only=True)
+_job_show = _job_command(_job_show_action, read_only=True)
+_job_cancel = _job_command(_job_cancel_action)
+_job_release = _job_command(_job_release_action)
 
 
 def _serve(args: argparse.Namespace) -> int:

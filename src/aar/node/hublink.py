@@ -31,8 +31,11 @@ as fail-closed and temporary: the job pauses (``hub_unreachable``), nothing runs
 marked refused, and it carries on once the hub answers again. ``LocalHubLink`` maps a SQLite
 ``OperationalError`` (a locked or unopenable hub database) to :class:`HubUnreachable`.
 
-Follow-up F16 (remote transport): a node on another host needs a ``HubLink`` that speaks to
-the hub over the network, with the same operations and the error contract above.
+F16 (remote transport) is implemented in :mod:`aar.node.remote`: a node on another host gets a
+``RemoteHubLink`` that speaks to ``aar hub nodeapi`` over HTTP with the same operations and the
+same error contract (an ``OSError`` for unreachable, a ``ValueError`` for a refusal, plus
+``NodeNotEnrolled`` for a 401/403). ``branches`` below is the read S15b's branch-ownership
+rebuild uses.
 Follow-up F17: cache the registry id ↔ Resolve uid map instead of rebuilding it per check.
 """
 
@@ -44,7 +47,7 @@ from collections.abc import Callable
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from aar.hub.approvals import Approval, ApprovalScope, consume, get_approval
-from aar.hub.collab import branches, record_branch
+from aar.hub.collab import Branch, branches, record_branch
 from aar.hub.common import Clock, utcnow
 from aar.hub.control import ControlStatus, assert_running, status
 from aar.hub.events import Actor, EventLog
@@ -122,6 +125,13 @@ class HubLink(Protocol):
         is ``project``, and the hub's ``InvalidInput`` when it refuses the record."""
         ...
 
+    def branches(self, project: ProjectLocator) -> list[Branch]:
+        """The hub's recorded agent branches for ``project``, oldest first (read-only).
+
+        S15b's branch-ownership rebuild (F-S11-2) reads this on node start-up. Raises
+        :class:`UnknownHubProject` when no single registry project is ``project``."""
+        ...
+
 
 class LocalHubLink:
     """In-process :class:`HubLink` over a shared hub :class:`~aar.hub.events.EventLog`."""
@@ -195,6 +205,10 @@ class LocalHubLink:
                 f"({sorted(candidates)})"
             )
         return candidates[0]
+
+    @_reachable
+    def branches(self, project: ProjectLocator) -> list[Branch]:
+        return branches(self._log, self.hub_project_id(project))
 
     @_reachable
     def record_branch(

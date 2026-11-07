@@ -9,7 +9,7 @@ unique id, so the gateway can verify it loaded the right one.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -70,10 +70,16 @@ class ProjectLocator:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ProjectLocator:
+        if not isinstance(data, Mapping):
+            raise ValueError("project locator must be a JSON object")
         unknown = set(data) - {"folder_path", "name", "project_id"}
         if unknown:
             raise ValueError(f"unknown project locator keys: {sorted(unknown)}")
-        path: Iterable[str] = data.get("folder_path") or ()
+        path = data.get("folder_path", ())
+        if not isinstance(path, list | tuple):
+            raise ValueError("project locator folder_path must be an array of non-empty strings")
+        if "name" not in data:
+            raise ValueError("project locator needs a non-empty name")
         return cls(tuple(path), data["name"], data.get("project_id"))
 
     def __str__(self) -> str:

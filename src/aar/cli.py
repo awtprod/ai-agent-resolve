@@ -34,6 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
     host_cli.register(groups)
     analyze_cli.register(groups)
     deliver_cli.register(groups)
+    # Keep the source-media store out of import-only/library paths; its CLI is needed
+    # only while constructing the command inventory.
+    from aar.media import cli as media_cli
+
+    media_cli.register(groups)
     return parser
 
 

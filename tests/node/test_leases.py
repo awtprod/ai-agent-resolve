@@ -19,7 +19,7 @@ from aar.node.leases import (
 from .fake_resolve import FakeClock
 
 ANDREW = Holder.human("andrew")
-NICOLE = Holder.human("nicole")
+EDITOR = Holder.human("editor-2")
 AGENT_1 = Holder.agent("thread-1")
 AGENT_2 = Holder.agent("thread-2")
 
@@ -128,15 +128,15 @@ def test_agent_can_never_preempt_a_human(leases: LeaseManager) -> None:
 def test_human_displaces_human_only_with_force(leases: LeaseManager) -> None:
     first = leases.acquire(ANDREW, Scope.PROJECT, project_key("A"), ttl=60)
     with pytest.raises(LeaseConflict):
-        leases.acquire(NICOLE, Scope.PROJECT, project_key("A"), ttl=60)
+        leases.acquire(EDITOR, Scope.PROJECT, project_key("A"), ttl=60)
     assert leases.active() == [first]
-    forced = leases.acquire(NICOLE, Scope.PROJECT, project_key("A"), ttl=60, force=True)
+    forced = leases.acquire(EDITOR, Scope.PROJECT, project_key("A"), ttl=60, force=True)
     assert leases.active() == [forced]
 
 
 def test_failed_human_acquire_does_not_revoke_any_agent_lease(leases: LeaseManager) -> None:
     agent_lease = leases.acquire(AGENT_1, Scope.TIMELINE, timeline_key("A", "main"), ttl=60)
-    human_lease = leases.acquire(NICOLE, Scope.TIMELINE, timeline_key("A", "alt"), ttl=60)
+    human_lease = leases.acquire(EDITOR, Scope.TIMELINE, timeline_key("A", "alt"), ttl=60)
     with pytest.raises(LeaseConflict):
         leases.acquire(ANDREW, Scope.PROJECT, project_key("A"), ttl=60)
     assert {lease.id for lease in leases.active()} == {agent_lease.id, human_lease.id}
