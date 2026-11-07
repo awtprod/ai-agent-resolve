@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import contextlib
 import errno
-import fcntl
 import hashlib
 import math
 import os
@@ -99,10 +98,26 @@ def _is_under(path: str, root: str) -> bool:
     return common == root
 
 
+def _require_posix() -> None:
+    """Delivery runs on the Linux hub. Refuse on Windows before any lock or file work, with a
+    typed error (exit 2); this also keeps the POSIX-only ``fcntl`` import off the Windows path, so
+    ``aar`` (which imports the deliver CLI to register its commands) still loads there."""
+    if os.name == "nt":
+        raise DeliverError(
+            "unsupported_platform",
+            "aar deliver runs on the Linux hub, not on Windows",
+            "Run the delivery on the hub; the Windows node renders and the hub delivers.",
+            platform=os.name,
+        )
+
+
 def _acquire_delivery_lock(work: str) -> int:
     """Take the exclusive per-delivery lock, returning its fd. A second concurrent delivery of the
     same render job gets ``delivery_in_progress``; the lock is an ``flock``, so a crashed delivery
     releases it (the kernel closes the fd) and a later resume is never blocked by a stale file."""
+    _require_posix()
+    import fcntl  # POSIX-only; imported lazily so `aar` still loads on Windows
+
     fd = os.open(os.path.join(work, ".deliver.lock"), os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -130,6 +145,8 @@ def _acquire_delivery_lock(work: str) -> int:
 
 
 def _release_delivery_lock(fd: int) -> None:
+    import fcntl  # only reached after a successful POSIX acquire
+
     with contextlib.suppress(OSError):
         fcntl.flock(fd, fcntl.LOCK_UN)
     with contextlib.suppress(OSError):
@@ -549,6 +566,7 @@ def deliver_review(
             "Pass a source kind.",
             field="kind",
         )
+    _require_posix()
     _check_workdir(workdir)
     pid = _segment(project_id, "project_id", _PATH_SEGMENT)
     dname = _segment(deliverable, "deliverable", _FACT_SEGMENT)
@@ -766,6 +784,7 @@ def deliver_master(
             "Pass a source kind.",
             field="kind",
         )
+    _require_posix()
     _check_workdir(workdir)
     pid = _segment(project_id, "project_id", _PATH_SEGMENT)
     dname = _segment(deliverable, "deliverable", _FACT_SEGMENT)

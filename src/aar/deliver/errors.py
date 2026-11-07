@@ -16,6 +16,7 @@ ERROR_CODES = (
     "hub_unavailable",  # the hub event log is locked, read-only or not a db (sqlite3 error)
     "store_unavailable",  # the artifact store is unwritable (OSError/PermissionError from put)
     "local_io_error",  # a local-filesystem read/write error not from the hub or artifact store
+    "unsupported_platform",  # aar deliver was run on Windows; delivery runs on the Linux hub
     "review_cannot_fit",  # the review cannot meet the cap even at the floor bit rate
     "review_over_cap",  # the transcode stayed over the cap after the retry
     "transcode_failed",  # ffmpeg exited non-zero or the output did not decode
