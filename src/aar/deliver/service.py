@@ -68,7 +68,9 @@ _MIME = {".mp4": "video/mp4", ".mov": "video/quicktime", ".mkv": "video/x-matros
 # (no "/tmp" literal, so the AST pin that forbids a shared-temp literal still holds). $TMPDIR is
 # deliberately NOT read at runtime: operators and test harnesses routinely repoint it at durable
 # storage, so refusing it would reject legitimate work dirs; the default temp root (/tmp) is here.
-_TEMP_ROOTS = (
+# This is a module-level constant so a test harness that legitimately works under /tmp (pytest's
+# default tmp_path, as CI uses) can clear it; production keeps the real roots.
+FORBIDDEN_WORKDIR_ROOTS: tuple[str, ...] = (
     os.sep + "tmp",
     os.sep + "var" + os.sep + "tmp",
     os.sep + "dev" + os.sep + "shm",
@@ -77,7 +79,7 @@ _REVIEW_READY_SUFFIXES = (".mp4", ".mov")  # MP4-family containers a browser can
 
 
 def _temp_roots() -> tuple[str, ...]:
-    return tuple(os.path.realpath(r) for r in _TEMP_ROOTS)
+    return tuple(os.path.realpath(r) for r in FORBIDDEN_WORKDIR_ROOTS)
 
 
 def _is_under(path: str, root: str) -> bool:

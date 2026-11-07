@@ -21,6 +21,7 @@ from deliver_support import (
     render_output,
 )
 
+from aar.deliver import service
 from aar.deliver.errors import DeliverError
 from aar.deliver.service import (
     _delivery_dir,
@@ -232,7 +233,16 @@ def test_v29_v30_v31_hostile_ids_refused(tmp_path: Path, sources: Path, field: s
         os.sep + "dev" + os.sep + "shm" + os.sep + "aar-w",
     ],
 )
-def test_v32_relative_and_temp_workdirs_refused(tmp_path: Path, sources: Path, workdir: str):
+def test_v32_relative_and_temp_workdirs_refused(
+    tmp_path: Path, sources: Path, workdir: str, monkeypatch: pytest.MonkeyPatch
+):
+    # Restore the real production roots: the autouse conftest fixture clears them so the other
+    # tests may work under /tmp (as CI's default basetemp does), but F8 must still refuse them.
+    monkeypatch.setattr(
+        service,
+        "FORBIDDEN_WORKDIR_ROOTS",
+        (os.sep + "tmp", os.sep + "var" + os.sep + "tmp", os.sep + "dev" + os.sep + "shm"),
+    )
     hub = make_hub(tmp_path)
     with pytest.raises(DeliverError) as info:
         deliver_review(
@@ -247,6 +257,35 @@ def test_v32_relative_and_temp_workdirs_refused(tmp_path: Path, sources: Path, w
             kind="short",
             render_output=render_output(sources / "render_720p.mp4"),
             workdir=workdir,
+            edit_host=FakeEditHost(sources),
+            log=hub.log,
+            store=hub.store,
+            transcoder=FakeTranscoder([10]),
+            qa_check=qa_pass(),
+        )
+    assert info.value.code == "invalid_workdir"
+
+
+def test_f8_real_tmp_path_workdir_is_refused(
+    tmp_path: Path, sources: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the roots active (fixture effectively disabled by pointing them at tmp_path's own root),
+    a real pytest tmp_path work dir is refused -- the case CI hits, where tmp_path is under /tmp."""
+    monkeypatch.setattr(service, "FORBIDDEN_WORKDIR_ROOTS", (os.path.realpath(tmp_path),))
+    hub = make_hub(tmp_path)
+    with pytest.raises(DeliverError) as info:
+        deliver_review(
+            project_id=hub.project_id,
+            subject_id=hub.subject_id,
+            deliverable="short-1",
+            actor=AGENT,
+            profile=make_profile(),
+            title="t",
+            timeline=None,
+            fps=None,
+            kind="short",
+            render_output=render_output(sources / "render_720p.mp4"),
+            workdir=str(tmp_path / "work"),
             edit_host=FakeEditHost(sources),
             log=hub.log,
             store=hub.store,

@@ -7,6 +7,17 @@ from pathlib import Path
 import pytest
 from deliver_support import make_source
 
+from aar.deliver import service
+
+
+@pytest.fixture(autouse=True)
+def _allow_tmp_workdir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear the forbidden-workdir roots for the delivery tests, which use pytest's ``tmp_path`` as
+    the work dir -- and that is under the system temp root (``/tmp``) with the default basetemp CI
+    uses. Production keeps the real roots; the dedicated F8 tests restore them explicitly to assert
+    the refusal."""
+    monkeypatch.setattr(service, "FORBIDDEN_WORKDIR_ROOTS", ())
+
 
 @pytest.fixture(scope="session")
 def sources(tmp_path_factory: pytest.TempPathFactory) -> Path:
