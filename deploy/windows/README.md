@@ -46,7 +46,7 @@ Put the exact locators in `projects.json` (the hub's `register` step lists them)
 ```powershell
 .\install.ps1 enable
 .\install.ps1 status
-.\install.ps1 disable      # stops the task and any supervisor
+.\install.ps1 disable      # stops the task, the supervisor AND the whole worker tree; fails if any remain
 ```
 
 ## Why an interactive logon task
@@ -65,14 +65,17 @@ spawn the base interpreter as a **child**. You will see two processes per Python
 launcher and the real interpreter. Killing the launcher does not stop the child at once; the
 child dies a moment later (probed on 2026-11-07 with a launcher-kill script). Consequences: (1) file locks
 such as the job store's are released slightly after the parent exits, so tests and tooling poll
-instead of assuming immediate release; (2) `disable` stops by command line, which matches both
-processes of the pair.
+instead of assuming immediate release; (2) `disable` and `status` select processes by
+executable path under `C:\ProgramData\aar`, plus `node run` command lines naming that root or the
+store, so the pair and the base-interpreter child are all found. No other Python on the PC is touched.
 
 ## Resolve 21.1 traps (S7g)
 
+- **Render-mode polling crashes Resolve 21.1.** Each `Project.GetCurrentRenderMode()` call logs
+  "Main view page is changed to 11"; polling it at about 2.5 calls/s crashed Resolve after about
+  270 calls (2026-11-07). `GetCurrentRenderFormatAndCodec` is untested and suspect. **Keep the
+  worker task disabled until S7g lands and a live soak passes.**
 - Studio only: 21.1 scripting needs Studio (DESIGN F8).
-- `GetCurrentRenderMode` and `GetCurrentRenderFormatAndCodec` raise a page signal on 21.1; the
-  node must not call them where it can avoid it (see `src/aar/node/gateway.py`).
 - Resolve's scripting server takes a while to come up after launch; the supervisor waits
   20 s after it sees `Resolve.exe`.
 - `RESOLVE_SCRIPT_API`, `RESOLVE_SCRIPT_LIB` and `PYTHONPATH=<api>\Modules` must be set for the
@@ -81,5 +84,10 @@ processes of the pair.
 - The Project Manager folder is captured but not restored (PLAN S3 gap), and a project is
   loaded by name inside the current folder.
 
-This list is the part I could verify from the repo and briefs; the original S7g evidence file
-was not available to the implementer, so extend it from there.
+## Worker lifetime
+
+The worker is its own process tree (`aar.exe` -> venv `python.exe` -> base `python.exe`), started
+by the supervisor with `subprocess.run`. To stop it with the supervisor, `run_node.py` places
+itself in a Windows job object with `KILL_ON_JOB_CLOSE` at start-up, so children inherit the job
+and die when the supervisor does. This is a no-op off Windows and non-fatal if it fails; `disable`
+does not rely on it.

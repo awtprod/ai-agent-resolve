@@ -276,3 +276,52 @@ def test_install_script_never_writes_the_token_and_registers_interactive() -> No
     assert "S-1-5-18" in text and "S-1-5-32-544" in text and "/inheritance:r" in text
     assert "WriteAllText($token" not in text
     assert "edit-pc.token'))" in text  # only tested for existence in `enable`
+
+
+def test_kill_on_close_job_is_a_noop_off_windows() -> None:
+    class Boom:
+        def __getattr__(self, name):  # any kernel32 call would be a bug
+            raise AssertionError(f"kernel32.{name} called off Windows")
+
+    assert rn.kill_on_close_job(os_name="posix", kernel32=Boom()) is None
+    if rn.os.name != "nt":
+        assert rn.kill_on_close_job() is None
+
+
+def test_kill_on_close_job_failure_paths_return_none() -> None:
+    closed: list[int] = []
+
+    class K32:
+        def __init__(self, job, set_ok, assign_ok):
+            self.job, self.set_ok, self.assign_ok = job, set_ok, assign_ok
+
+        def CreateJobObjectW(self, *a):
+            return self.job
+
+        def SetInformationJobObject(self, *a):
+            return self.set_ok
+
+        def GetCurrentProcess(self):
+            return -1
+
+        def AssignProcessToJobObject(self, *a):
+            return self.assign_ok
+
+        def CloseHandle(self, h):
+            closed.append(h)
+
+    assert rn.kill_on_close_job("nt", K32(0, 1, 1)) is None
+    assert rn.kill_on_close_job("nt", K32(5, 0, 1)) is None
+    assert rn.kill_on_close_job("nt", K32(6, 1, 0)) is None
+    assert closed == [5, 6]
+    assert rn.kill_on_close_job("nt", K32(7, 1, 1)) == 7
+
+
+def test_install_disable_kills_the_whole_tree_only_under_root() -> None:
+    text = (DEPLOY / "windows" / "install.ps1").read_text(encoding="utf-8")
+    assert "function Get-NodeProcesses" in text
+    assert "ExecutablePath.StartsWith($prefix" in text and "*node run*" in text
+    assert "disable FAILED" in text
+    # Status and disable share the one selector; neither filters on a bare process name.
+    assert text.count("Get-NodeProcesses") >= 4
+    assert "run_node.py*'" not in text

@@ -119,21 +119,56 @@ function Enable-Node {
     Show-Status
 }
 
+function Get-NodeProcesses {
+    # Every process that belongs to this install, and nothing else:
+    #  (a) its executable lives under $Root (venv python.exe/pythonw.exe/aar.exe), or
+    #  (b) its command line has `node run` together with $Root or the configured store path
+    #      (catches the base-interpreter child the venv redirector spawns, whose executable is
+    #      outside $Root).
+    # Other Python processes (for example the Resolve MCP bridge's pythonw.exe) match neither.
+    $prefix = ($Root.TrimEnd('\') + '\')
+    $store = Join-Path $Root 'jobs.db'
+    $cfg = Join-Path $Root 'run_node.json'
+    if (Test-Path $cfg) {
+        try {
+            $c = Get-Content $cfg -Raw | ConvertFrom-Json
+            if ($c.store) {
+                $store = if ([System.IO.Path]::IsPathRooted($c.store)) { $c.store } else { Join-Path $Root $c.store }
+            }
+        } catch { }
+    }
+    @(Get-CimInstance Win32_Process | Where-Object {
+        $_.ProcessId -ne $PID -and (
+            ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) -or
+            ($_.CommandLine -and $_.CommandLine -like '*node run*' -and
+                ($_.CommandLine.IndexOf($store, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+                 $_.CommandLine.IndexOf($prefix, [System.StringComparison]::OrdinalIgnoreCase) -ge 0))
+        )
+    })
+}
+
 function Disable-Node {
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     Disable-ScheduledTask -TaskName $TaskName | Out-Null
-    Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" |
-        Where-Object { $_.CommandLine -like '*run_node.py*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+    # The worker is its own process tree (aar.exe -> venv python -> base python), not a child
+    # job of the supervisor, so killing run_node.py alone would orphan it. Kill the whole set.
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        $procs = Get-NodeProcesses
+        if ($procs.Count -eq 0) { break }
+        foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Seconds 2
+    }
+    $left = Get-NodeProcesses
     Show-Status
+    if ($left.Count -gt 0) {
+        throw ('disable FAILED: still running: ' + (($left | ForEach-Object { "$($_.Name)#$($_.ProcessId)" }) -join ', '))
+    }
 }
 
 function Show-Status {
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($t) { "task: $($t.TaskName) state=$($t.State)" } else { "task '$TaskName' is not registered" }
-    Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe' OR Name='aar.exe'" |
-        Where-Object { $_.CommandLine -like '*run_node.py*' -or $_.CommandLine -like '*node run*' } |
-        ForEach-Object { "pid=$($_.ProcessId) session=$($_.SessionId) $($_.Name)" }
+    Get-NodeProcesses | ForEach-Object { "pid=$($_.ProcessId) session=$($_.SessionId) $($_.ExecutablePath) :: $($_.CommandLine)" }
     Get-ChildItem (Join-Path $Root 'logs') -Filter 'supervisor-*.log' -ErrorAction SilentlyContinue |
         Sort-Object Name | Select-Object -Last 1 | ForEach-Object { Get-Content $_.FullName -Tail 5 }
 }

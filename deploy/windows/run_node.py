@@ -35,6 +35,8 @@ REQUIRED_KEYS = ("hub_url", "node_id", "token_file", "store", "projects_file", "
 
 INITIAL_BACKOFF = 15.0
 MAX_BACKOFF = 300.0
+JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9  # JobObjectExtendedLimitInformation
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 HEALTHY_SECONDS = 600.0  # a worker that ran longer than this resets the backoff
 
 
@@ -139,6 +141,63 @@ def build_env(cfg: Config, base: Mapping[str, str] | None = None) -> dict[str, s
     return env
 
 
+def kill_on_close_job(os_name: str = os.name, kernel32: Any = None) -> Any:
+    """Put THIS process in a Windows job object with KILL_ON_JOB_CLOSE; return the handle.
+
+    The worker (aar.exe -> venv python -> base python) is a separate process tree that nothing
+    reaps if the supervisor dies. Children inherit the supervisor's job, so when the supervisor
+    exits and the (never closed) handle goes away, Windows kills the whole tree. Assigning the
+    supervisor itself, rather than each worker after Popen, leaves no window in which a child
+    escapes. A no-op returning None off Windows or if any call fails (a failure is logged by
+    the caller, never fatal). ``os_name`` and ``kernel32`` are seams for tests.
+    """
+    if os_name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
+    job = k32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+
+    class _Basic(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint64) for n in ("r", "w", "o", "rb", "wb", "ob")]
+
+    class _Extended(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _Basic),
+            ("IoInfo", _IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    info = _Extended()
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    ok = k32.SetInformationJobObject(
+        job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info), ctypes.sizeof(info)
+    )
+    if not ok or not k32.AssignProcessToJobObject(job, k32.GetCurrentProcess()):
+        k32.CloseHandle(job)
+        return None
+    return job
+
+
 def _no_window() -> int:
     return getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -174,6 +233,7 @@ class Supervisor:
         self._monotonic = monotonic
         self._now = now
         self.backoff = INITIAL_BACKOFF
+        self.job: Any = None
 
     def log(self, msg: str) -> None:
         stamp = self._now()
@@ -234,7 +294,12 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(exc, file=sys.stderr)
         return 2
-    Supervisor(cfg).run()
+    sup = Supervisor(cfg)
+    job = kill_on_close_job()  # keep the handle referenced for the life of the process
+    if os.name == "nt":
+        sup.log("worker tree bound to supervisor (job object)" if job else "job object failed")
+    sup.job = job
+    sup.run()
     return 0
 
 
