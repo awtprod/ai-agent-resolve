@@ -147,7 +147,7 @@ def _registered(log: EventLog, fake: FakeResolve) -> ProjectLocator:
         "Show",
         HUMAN,
         project_id="prj_show",
-        sources=[ProjectSource("local_db", {"name": "Show", "uid": project_id})],
+        sources=[ProjectSource("local_db", {"name": "Show", "project_id": project_id})],
     )
     return ProjectLocator(project.folder, "Show", project_id)
 
