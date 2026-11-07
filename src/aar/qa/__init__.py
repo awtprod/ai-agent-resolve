@@ -5,6 +5,7 @@ See ``aar.qa.check`` for the checks and docs/DESIGN.md "Media QA" for their defi
 
 from aar.qa.check import (
     JoinQuiet,
+    JoinScan,
     agreement,
     check,
     evaluate_duration,
@@ -12,8 +13,10 @@ from aar.qa.check import (
     evaluate_quiet_run,
     evaluate_silence,
     evaluate_size,
+    join_quiet_window,
     judge_join_quiet,
     resolve_media,
+    scan_join_quiet,
     suggest_src_in,
     tokens,
 )
@@ -25,6 +28,7 @@ __all__ = [
     "CHECK_IDS",
     "Cut",
     "JoinQuiet",
+    "JoinScan",
     "KeptWord",
     "Kind",
     "QACheck",
@@ -41,9 +45,11 @@ __all__ = [
     "evaluate_quiet_run",
     "evaluate_silence",
     "evaluate_size",
+    "join_quiet_window",
     "judge_join_quiet",
     "kept_words",
     "resolve_media",
+    "scan_join_quiet",
     "straddled_words",
     "suggest_src_in",
     "tokens",
