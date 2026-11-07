@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -50,8 +51,26 @@ _REGISTRY_TYPES = (
 )
 
 
+# Source kinds whose locator carries a Resolve project's unique id (``project_id``).
+RESOLVE_SOURCE_KINDS = frozenset({"cloud_library", "local_db"})
+
+
 class DuplicateProjectId(ValueError):
     """Raised when an explicit project id is reused for a new project."""
+
+
+class DuplicateResolveProject(ValueError):
+    """Raised when a Resolve project's unique id is already registered under another project.
+
+    ``existing_id`` is the registry id (``prj_...``) that already holds it.
+    """
+
+    def __init__(self, resolve_uid: str, existing_id: str) -> None:
+        super().__init__(
+            f"Resolve project {resolve_uid!r} is already registered as {existing_id!r}"
+        )
+        self.resolve_uid = resolve_uid
+        self.existing_id = existing_id
 
 
 def new_project_id() -> str:
@@ -99,6 +118,14 @@ class Project:
             "aliases": list(self.aliases),
             "created": self.created,
         }
+
+
+def source_resolve_uid(source: ProjectSource) -> str | None:
+    """The Resolve project unique id a source carries, or ``None`` (other kinds, no id)."""
+    if source.kind not in RESOLVE_SOURCE_KINDS or not isinstance(source.locator, dict):
+        return None
+    uid = source.locator.get("project_id")
+    return uid if isinstance(uid, str) and uid else None
 
 
 def _reduce(
@@ -273,6 +300,8 @@ class Registry:
             pid = project_id or new_project_id()
             if pid in self._projects:
                 raise DuplicateProjectId(f"project id already exists: {pid!r}")
+            for source in sources or []:
+                self._refuse_taken_uid(source, pid)
             payload = {
                 "project_id": pid,
                 "name": name,
@@ -317,6 +346,7 @@ class Registry:
             {"project_id": project_id, "source": source.to_dict()},
             actor,
             idempotency_key,
+            guard=lambda: self._refuse_taken_uid(source, project_id),
         )
 
     def add_alias(
@@ -355,6 +385,13 @@ class Registry:
                     return project
         return None
 
+    def find_by_resolve_uid(self, resolve_uid: str) -> Project | None:
+        """Return the project with a source that carries this Resolve unique id, or ``None``."""
+        for project in self.list():
+            if any(source_resolve_uid(source) == resolve_uid for source in project.sources):
+                return project
+        return None
+
     def find_by_alias(self, alias: str) -> Project | None:
         """Return the project with this alias, or ``None``."""
         for project in self._projects.values():
@@ -378,6 +415,8 @@ class Registry:
         payload: dict[str, Any],
         actor: Actor,
         idempotency_key: str | None,
+        *,
+        guard: Callable[[], None] | None = None,
     ) -> Project:
         with self._log.transaction() as txn:
             self._catch_up(txn)
@@ -395,6 +434,8 @@ class Registry:
                         actor=actor,
                     )
                     return self._projects[project_id]
+            if guard is not None:
+                guard()
             self._refuse_unless_foldable(event_type, actor, payload)
             event = txn.append(
                 event_type,
@@ -405,6 +446,17 @@ class Registry:
             )
         self._apply(event)
         return self._projects[project_id]
+
+    def _refuse_taken_uid(self, source: ProjectSource, owner_id: str) -> None:
+        """Refuse a source whose Resolve unique id another project already holds."""
+        uid = source_resolve_uid(source)
+        if uid is None:
+            return
+        for project in self.list():
+            if project.id != owner_id and any(
+                source_resolve_uid(held) == uid for held in project.sources
+            ):
+                raise DuplicateResolveProject(uid, project.id)
 
     def _refuse_unless_foldable(
         self, event_type: str, actor: Actor, payload: dict[str, Any]

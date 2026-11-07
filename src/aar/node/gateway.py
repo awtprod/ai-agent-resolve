@@ -162,6 +162,28 @@ class PMFolderListing:
     folders: tuple[str, ...]
 
 
+UNVERIFIED_ROOT_REASON = (
+    "unverified: the root lists a project with this name, which may be a namesake"
+)
+
+
+@dataclass(frozen=True)
+class OpenProjectLocation:
+    """Where the open project is, as far as it can be read without moving anything.
+
+    ``folder_path`` is ``None`` when proving it would navigate the Project Manager;
+    ``folder_path_reason`` then says why. ``pm_folder`` is the current Project Manager
+    folder's name (``""`` at the root), which is all ``GetCurrentFolder`` returns.
+    """
+
+    name: str
+    project_id: str
+    pm_folder: str
+    folder_path: tuple[str, ...] | None
+    folder_path_reason: str | None
+    candidate_folder_path: tuple[str, ...] | None = None
+
+
 @runtime_checkable
 class ResolveGateway(Protocol):
     """The minimal Resolve surface the broker needs. Mutators raise ``GatewayError`` on failure."""
@@ -425,6 +447,58 @@ class ScriptApiGateway:
         path = tuple(reversed(names))
         self._descend(pm, path)
         return path
+
+    def locate_open_project(self) -> OpenProjectLocation:
+        """Name, unique id and (when provable) folder path of the open project, read-only.
+
+        Reads ``GetCurrentProject``, ``GetName``, ``GetUniqueId``, ``GetCurrentFolder`` and
+        ``GetProjectListInCurrentFolder`` only. It never loads or switches a project, never
+        navigates the Project Manager (``get_project_manager_path`` walks to the root and back,
+        which moves the folder a human is looking at) and never reads the render format or
+        mode (they raise a page signal on 21.1).
+
+        ``folder_path`` is verified, and no read-only call can verify it: the listing returns
+        names, not ids, so a root entry named like the open project may be a namesake while the
+        open project lives in a subfolder. It is therefore always ``None`` here, with a reason.
+        When the Project Manager is at the root and lists the name, ``candidate_folder_path`` is
+        ``()``: an unverified guess for the operator to confirm in Resolve.
+        """
+        pm = self._project_manager()
+        project = self._project()
+        name, project_id = str(project.GetName() or ""), str(project.GetUniqueId() or "")
+        if not name or not project_id:
+            raise GatewayError(
+                "project_unidentified", "the open project reports no name or unique id"
+            )
+        folder = self._pm_folder_name(pm)
+        listed = [str(n) for n in (pm.GetProjectListInCurrentFolder() or [])]
+        if folder != "":
+            return OpenProjectLocation(
+                name,
+                project_id,
+                folder,
+                None,
+                f"the Project Manager is in folder {folder!r}, and reading its full path walks "
+                "to the root and back (it moves the folder); pass folder_path by hand or put "
+                "the Project Manager at the root",
+            )
+        if name not in listed:
+            return OpenProjectLocation(
+                name,
+                project_id,
+                folder,
+                None,
+                "the Project Manager is at the root but does not list the open project there; "
+                "it is in a subfolder",
+            )
+        return OpenProjectLocation(
+            name,
+            project_id,
+            folder,
+            None,
+            UNVERIFIED_ROOT_REASON,
+            candidate_folder_path=(),
+        )
 
     def open_project_manager_path(self, path: tuple[str, ...]) -> None:
         pm = self._project_manager()

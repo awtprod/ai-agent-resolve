@@ -1123,7 +1123,7 @@ def test_p18d_stop_reaches_job_by_alias_or_uid_in_a_source(tmp_path: Path) -> No
     by_alias = reg.create_project("Season Two", HUMAN)
     reg.add_alias(by_alias.id, "Show", HUMAN)
     by_uid = reg.create_project(
-        "Renamed elsewhere", HUMAN, sources=[ProjectSource("local_db", {"uid": world.pid()})]
+        "Renamed elsewhere", HUMAN, sources=[ProjectSource("local_db", {"project_id": world.pid()})]
     )
     assert world.hublink.registry_ids(world.locator()) == sorted([by_alias.id, by_uid.id])
     for pid in (by_alias.id, by_uid.id):

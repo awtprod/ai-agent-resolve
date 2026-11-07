@@ -30,7 +30,7 @@ AGENT = Actor("agent", "thread-1#job-1")
 def world(tmp_path: Path) -> SimpleNamespace:
     log = EventLog(str(tmp_path / "hub.db"))
     show = Registry(log).create_project(
-        "Show", HUMAN, sources=[ProjectSource("local_db", {"name": "Show", "uid": "uid-1"})]
+        "Show", HUMAN, sources=[ProjectSource("local_db", {"name": "Show", "project_id": "uid-1"})]
     )
     loc = ProjectLocator(("Shows",), "Show", "uid-1")
     _, token = nodes.enroll(log, "node-1", HUMAN)

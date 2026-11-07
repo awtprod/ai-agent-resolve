@@ -43,6 +43,7 @@ WRITE_TOOLS = {
     "facts_retract",
     "job_submit",
     "job_cancel",
+    "project_register",
 }
 NEW_READS = {"facts_get", "brief_get", "plan_get"}
 HUMAN_ONLY_WORDS = ("decide", "approve", "grant", "revoke", "resume", "stop", "withdraw")

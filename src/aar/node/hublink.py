@@ -51,7 +51,7 @@ from aar.hub.collab import Branch, branches, record_branch
 from aar.hub.common import Clock, utcnow
 from aar.hub.control import ControlStatus, assert_running, status
 from aar.hub.events import Actor, EventLog
-from aar.hub.registry import Registry
+from aar.hub.registry import ProjectSource, Registry, source_resolve_uid
 from aar.node.locator import ProjectLocator
 
 _T = TypeVar("_T")
@@ -147,7 +147,7 @@ class LocalHubLink:
             for found in Registry(self._log).list()
             if found.name == project.name
             or project.name in found.aliases
-            or any(_source_names(source.locator, project) for source in found.sources)
+            or any(_source_names(source, project) for source in found.sources)
         }
         return sorted(ids)
 
@@ -190,10 +190,7 @@ class LocalHubLink:
             p.id
             for p in projects
             if project.project_id is not None
-            and any(
-                isinstance(src.locator, dict) and project.project_id in src.locator.values()
-                for src in p.sources
-            )
+            and any(source_resolve_uid(src) == project.project_id for src in p.sources)
         ]
         candidates = by_uid or [
             p.id for p in projects if p.name == project.name or project.name in p.aliases
@@ -248,10 +245,14 @@ class LocalHubLink:
         return hub_id
 
 
-def _source_names(locator: object, project: ProjectLocator) -> bool:
-    """Whether a registry source locator names ``project`` (by name, or by its Resolve uid)."""
-    if not isinstance(locator, dict):
+def _source_names(source: ProjectSource, project: ProjectLocator) -> bool:
+    """Whether a registry source names ``project``: by locator name, or by its Resolve uid.
+
+    Only cloud_library/local_db sources identify a live project by uid (``source_resolve_uid``,
+    the same helper registration uses); a file source never matches by uid.
+    """
+    if not isinstance(source.locator, dict):
         return False
-    if locator.get("name") == project.name:
+    if source.locator.get("name") == project.name:
         return True
-    return project.project_id is not None and project.project_id in locator.values()
+    return project.project_id is not None and source_resolve_uid(source) == project.project_id
