@@ -438,3 +438,24 @@ def test_v34_master_facts_resumed_only_when_all_replay(tmp_path: Path, sources: 
         qa_check=qa,
     )
     assert "facts" not in r.resumed_steps
+
+
+def test_key_base_depends_on_project_role_and_content() -> None:
+    """The idempotency key base separates project, role and content (V62/V63/R2-1): any of them
+    changing yields a different key, so deliveries never collide or wrongly replay."""
+    kb = service._key_base
+    base = kb("review", "p1", "d1", "r1", "sha-a")
+    assert base.startswith("deliver:review:")
+    assert kb("review", "p2", "d1", "r1", "sha-a") != base  # project matters (V62)
+    assert kb("master", "p1", "d1", "r1", "sha-a") != base  # role matters (V63)
+    assert kb("review", "p1", "d1", "r1", "sha-b") != base  # content matters (R2-1)
+    assert kb("review", "p1", "d1", "r1", "sha-a") == base  # deterministic
+
+
+def test_v61_composed_review_qa_includes_the_size_cap_check() -> None:
+    """The composed review QA report carries a size-cap check (V61 drops it). The cap is also
+    enforced structurally before QA, but the report must still surface it."""
+    report = service._review_qa_report(
+        qa_pass(), "review.mp4", "short", make_profile(review_mp4_max_mb=5.0), size_bytes=100
+    )
+    assert any(c.id == "size-cap" for c in report.checks)
