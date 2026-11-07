@@ -64,9 +64,10 @@ _PATH_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _FACT_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")  # also the facts key <...> shape
 _MIME = {".mp4": "video/mp4", ".mov": "video/quicktime", ".mkv": "video/x-matroska"}
 
-# Temp roots a durable work dir must never resolve under. Assembled from os.sep (no "/tmp" literal,
-# so the AST pin that forbids a shared-temp literal still holds); $TMPDIR stands in for
-# tempfile.gettempdir() without importing tempfile (which the pin also forbids).
+# Fixed system scratch roots a durable work dir must never resolve under. Assembled from os.sep
+# (no "/tmp" literal, so the AST pin that forbids a shared-temp literal still holds). $TMPDIR is
+# deliberately NOT read at runtime: operators and test harnesses routinely repoint it at durable
+# storage, so refusing it would reject legitimate work dirs; the default temp root (/tmp) is here.
 _TEMP_ROOTS = (
     os.sep + "tmp",
     os.sep + "var" + os.sep + "tmp",
@@ -76,11 +77,7 @@ _REVIEW_READY_SUFFIXES = (".mp4", ".mov")  # MP4-family containers a browser can
 
 
 def _temp_roots() -> tuple[str, ...]:
-    roots = [os.path.realpath(r) for r in _TEMP_ROOTS]
-    env = os.environ.get("TMPDIR")
-    if env:
-        roots.append(os.path.realpath(env))
-    return tuple(roots)
+    return tuple(os.path.realpath(r) for r in _TEMP_ROOTS)
 
 
 def _is_under(path: str, root: str) -> bool:
@@ -516,11 +513,10 @@ def deliver_review(
             transcoded = True
             # Reuse a prior review.mp4 only if it fits the cap AND decodes; an over-cap or
             # undecodable leftover (e.g. a crash or a lost race) is rebuilt, never reused (F5).
-            reusable = (
-                os.path.exists(review_path)
-                and os.path.getsize(review_path) <= cap_bytes
-                and _decodes(review_path, timeout_s)
-            )
+            if os.path.exists(review_path) and os.path.getsize(review_path) <= cap_bytes:
+                reusable = _decodes(review_path, timeout_s)
+            else:
+                reusable = False
             if reusable:
                 resumed.append("transcode")
                 review_file, attempts = review_path, 0

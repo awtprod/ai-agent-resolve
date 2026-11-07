@@ -15,12 +15,19 @@ from deliver_support import (
     Hub,
     make_hub,
     make_profile,
+    make_source,
+    qa_fail,
     qa_pass,
     render_output,
 )
 
 from aar.deliver.errors import DeliverError
-from aar.deliver.service import _video_kbps, deliver_master, deliver_review
+from aar.deliver.service import (
+    _delivery_dir,
+    _video_kbps,
+    deliver_master,
+    deliver_review,
+)
 from aar.hub.facts import facts_view
 
 MB = 1_000_000
@@ -263,3 +270,70 @@ def test_v38_mov_master_mime_follows_suffix(tmp_path: Path, sources: Path) -> No
     shutil.copyfile(sources / "render_720p.mp4", edit / "master.mov")
     result = _master(hub, edit, tmp_path / "w", source="master.mov")
     assert hub.store.get_meta(result.artifact_id).mime == "video/quicktime"
+
+
+def _ddir(hub: Hub, workdir: Path) -> Path:
+    d = Path(_delivery_dir(str(workdir), hub.project_id, "short-1", "rj-1"))
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def test_v16_over_cap_leftover_review_is_rebuilt(tmp_path: Path, sources: Path) -> None:
+    hub = make_hub(tmp_path)
+    work = tmp_path / "w"
+    ddir = _ddir(hub, work)
+    shutil.copyfile(sources / "render_1080p.mp4", ddir / "source.mp4")
+    make_source(ddir / "review.mp4", width=1280, height=720, duration=3.0, video_kbps=2000)
+    cap_mb = 0.5
+    assert (ddir / "review.mp4").stat().st_size > cap_mb * MB
+    tc = FakeTranscoder([int(0.3 * MB)])
+    result = _review(hub, sources, work, source="render_1080p.mp4", cap_mb=cap_mb, transcoder=tc)
+    assert tc.calls != []
+    assert "transcode" not in result.resumed_steps
+
+
+def test_v17_resume_reuse_still_reports_video_kbps(tmp_path: Path, sources: Path) -> None:
+    hub = make_hub(tmp_path)
+    work = tmp_path / "w"
+    ddir = _ddir(hub, work)
+    shutil.copyfile(sources / "render_1080p.mp4", ddir / "source.mp4")
+    make_source(ddir / "review.mp4", width=1280, height=720, duration=1.0, video_kbps=200)
+    tc = FakeTranscoder([int(0.3 * MB)])
+    result = _review(hub, sources, work, source="render_1080p.mp4", cap_mb=0.5, transcoder=tc)
+    assert "transcode" in result.resumed_steps
+    assert tc.calls == []
+    assert result.video_kbps is not None
+
+
+def test_v23_review_qa_runs_on_the_review_file(tmp_path: Path, sources: Path) -> None:
+    hub = make_hub(tmp_path)
+    work = tmp_path / "w"
+    qa = qa_pass()
+    _review(
+        hub, sources, work, source="render_1080p.mp4", cap_mb=5.0,
+        transcoder=FakeTranscoder([10]), qa=qa,
+    )
+    ddir = Path(_delivery_dir(str(work), hub.project_id, "short-1", "rj-1"))
+    assert qa.calls[-1][0] == str(ddir / "review.mp4")
+    assert qa.calls[-1][0] != str(ddir / "source.mp4")
+
+
+def test_v25_review_qa_failure_reports_truthful_completed_steps(
+    tmp_path: Path, sources: Path
+) -> None:
+    hub = make_hub(tmp_path)
+    with pytest.raises(DeliverError) as info:
+        _review(
+            hub, sources, tmp_path / "w", source="render_1080p.mp4", cap_mb=5.0,
+            transcoder=FakeTranscoder([10]), qa=qa_fail(),
+        )
+    assert info.value.code == "review_qa_failed"
+    assert info.value.detail["completed_steps"] == ["pull", "transcode"]
+
+
+def test_v34_first_master_delivery_does_not_report_facts_resumed(
+    tmp_path: Path, sources: Path
+) -> None:
+    hub = make_hub(tmp_path)
+    result = _master(hub, sources, tmp_path / "w")
+    assert "facts" not in result.resumed_steps
