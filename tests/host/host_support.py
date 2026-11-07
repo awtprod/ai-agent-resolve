@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from aar.host.config import EditHostConfig
@@ -121,3 +123,29 @@ class FakeRunner:
             with open(dest, "wb") as handle:
                 handle.write(self.scp_payload)
         return RunResult(0, b"", b"")
+
+
+def fail_fstat_on_claim(monkeypatch, dest, make_exc: Callable[[], BaseException]) -> None:
+    """Make ``os.fstat`` raise ``make_exc()`` only for the descriptor opened on ``dest``.
+
+    ``os`` is one process-wide module, so ``transport.os.fstat`` is ``os.fstat``. pytest 9.2's
+    output capture calls ``os.fstat`` while tearing a test down; a blanket failing fake would
+    escape into pytest itself (KeyboardInterrupt, session aborted). Every other fd delegates to
+    the real ``os.fstat``.
+    """
+    real_open, real_fstat = os.open, os.fstat
+    claim_fds: set[int] = set()
+
+    def fake_open(path, *a, **k):
+        fd = real_open(path, *a, **k)
+        if os.fspath(path) == os.fspath(dest):
+            claim_fds.add(fd)
+        return fd
+
+    def fake_fstat(fd, *a, **k):
+        if fd in claim_fds:
+            raise make_exc()
+        return real_fstat(fd, *a, **k)
+
+    monkeypatch.setattr(os, "open", fake_open)
+    monkeypatch.setattr(os, "fstat", fake_fstat)

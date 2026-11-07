@@ -40,6 +40,12 @@ EXPECTED = {
     "render.build": (True, True),
     "render.poll": (True, False),
     "render.delete_job": (True, True),
+    "media.import": (True, True),
+    "track.ensure": (True, True),
+    "transition.add": (True, True),
+    "item.set_color": (True, True),
+    "item.set_transform": (True, True),
+    "title.place": (True, True),
 }
 
 
