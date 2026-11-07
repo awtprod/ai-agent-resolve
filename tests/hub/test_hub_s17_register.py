@@ -391,3 +391,80 @@ def test_project_register_tool_registers_replays_and_refuses(hub: Hub) -> None:
     badagent = _call(hub, "project_register", _tool_args("m4", agent_id="a b"), agent_writes=True)
     assert badagent.structured_content["error"]["code"] == "invalid_input"
     assert len(Registry(hub.log).list()) == 3
+
+
+# -- round 2: one definition of "same Resolve uid" (F1) -----------------------------------------
+
+
+def test_a_file_source_carrying_a_live_uid_does_not_make_the_node_ambiguous(hub: Hub) -> None:
+    keyed = {"path": "/x/b.drp", "project_id": "uid-1"}
+    _register(hub, key="c", name="FileProj", source_kind="drt_file", locator=keyed)
+    real = _register(hub, key="e")["project_id"]
+    link = LocalHubLink(hub.log)
+    locator = ProjectLocator(("Shows", "2026"), "Show", "uid-1")
+    assert link.hub_project_id(locator) == real
+    # the file project is not "Show" by display name either, so the stop check sees one candidate
+    assert link.registry_ids(locator) == [real]
+
+
+def test_the_stop_lookup_ignores_a_uid_value_in_a_file_source(hub: Hub) -> None:
+    _register(hub, key="c", name="FileProj", source_kind="drp_file", locator={"x": "uid-9"})
+    real = _register(hub, key="e", locator={**LOC, "project_id": "uid-9", "name": "Renamed"})
+    link = LocalHubLink(hub.log)
+    ids = link.registry_ids(ProjectLocator((), "Elsewhere", "uid-9"))
+    assert ids == [real["project_id"]]
+
+
+# -- round 2: names, segments and sizes (F3) ----------------------------------------------------
+
+BAD_TEXT = ["   ", "\t", " \n ", "a\x00b", "a\x01b", "a\x1fb", "a\x7fb"]
+
+
+@pytest.mark.parametrize("text", BAD_TEXT)
+def test_blank_and_control_text_is_refused_everywhere(hub: Hub, text: str) -> None:
+    before = hub.counts()
+    for over in (
+        {"name": text},
+        {"aliases": [text]},
+        {"host": text},
+        {"locator": {**LOC, "name": text}},
+        {"locator": {**LOC, "folder_path": ["ok", text]}},
+        {"locator": {**LOC, "project_id": text}},
+    ):
+        err = _refused(hub, "invalid_input", **over)
+        assert err.details["field"] in {"name", "alias", "host", "locator"}
+    assert hub.counts() == before
+
+
+def test_folder_path_depth_and_segment_length_are_capped(hub: Hub) -> None:
+    ok_deep = {**LOC, "project_id": "deep", "folder_path": ["f"] * 64}
+    assert _register(hub, key="d1", locator=ok_deep)["ok"]
+    too_deep = {**LOC, "project_id": "deeper", "folder_path": ["f"] * 65}
+    assert _refused(hub, "invalid_input", key="d2", locator=too_deep).details["field"] == "locator"
+    ok_long = {**LOC, "project_id": "long", "folder_path": ["x" * 255]}
+    assert _register(hub, key="d3", locator=ok_long)["ok"]
+    too_long = {**LOC, "project_id": "longer", "folder_path": ["x" * 256]}
+    _refused(hub, "invalid_input", key="d4", locator=too_long)
+    _refused(hub, "invalid_input", key="d5", locator={**LOC, "project_id": "u" * 129})
+    _refused(hub, "invalid_input", key="d6", locator={**LOC, "name": "n" * 501})
+
+
+def test_the_same_rules_hold_at_the_cli_and_the_tool(
+    hub: Hub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for bad in (
+        {**LOC, "folder_path": ["f"] * 65},
+        {**LOC, "folder_path": ["x" * 256]},
+        {**LOC, "name": "  "},
+        {**LOC, "name": "a\x00b"},
+    ):
+        code, _, err = _cli(hub, capsys, *_add_args("c1", locator=json.dumps(bad)))
+        assert code == 2 and err["error"]["code"] == "invalid_input"
+        result = _call(hub, "project_register", _tool_args("t1", locator=bad), agent_writes=True)
+        assert result.is_error is True
+        assert result.structured_content["error"]["code"] == "invalid_input"
+    blank = _add_args("c2")
+    blank[blank.index("--name") + 1] = "  "
+    code, _, err = _cli(hub, capsys, *blank)
+    assert code == 2 and err["error"]["code"] == "invalid_input"
+    assert len(Registry(hub.log).list()) == 2

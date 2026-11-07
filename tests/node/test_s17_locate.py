@@ -130,3 +130,28 @@ def test_node_locate_reports_an_unavailable_resolve(
 def test_node_locate_is_registered_on_the_cli(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["node", "locate", "--help"]) == 0
     assert "without loading" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(("name", "uid"), [("", "uid"), ("Show", ""), ("", "")])
+def test_an_unidentified_open_project_is_refused(
+    monkeypatch: pytest.MonkeyPatch, name: str, uid: str
+) -> None:
+    fake = _fake(())
+    monkeypatch.setattr(FakeProject, "GetName", lambda self: name)
+    monkeypatch.setattr(FakeProject, "GetUniqueId", lambda self: uid)
+    with pytest.raises(GatewayError) as err:
+        ScriptApiGateway(fake).locate_open_project()
+    assert err.value.code == "project_unidentified"
+
+
+@pytest.mark.parametrize("where", [(), ("Shows",), ("Shows", "2026")])
+def test_locate_never_reads_the_render_getters(
+    monkeypatch: pytest.MonkeyPatch, where: tuple[str, ...]
+) -> None:
+    called: list[str] = []
+    for getter in ("GetCurrentRenderMode", "GetCurrentRenderFormatAndCodec"):
+        monkeypatch.setattr(FakeProject, getter, lambda self, g=getter: called.append(g))
+    fake = _fake(where)
+    ScriptApiGateway(fake).locate_open_project()
+    node_cli._cmd_locate(None, gateway_factory=lambda: ScriptApiGateway(fake))  # type: ignore[arg-type]
+    assert called == []

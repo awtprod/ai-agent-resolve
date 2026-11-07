@@ -36,6 +36,9 @@ from aar.hub.writes import WriteError, WriteResult, check_actor, check_id, write
 from aar.node.locator import ProjectLocator
 
 OP_REGISTER = "project.register"
+MAX_FOLDER_SEGMENTS = 64
+MAX_SEGMENT_CHARS = 255
+MAX_UID_CHARS = 128
 _ACTOR_KINDS_ALLOWED = frozenset({"human", "agent"})
 
 
@@ -52,15 +55,42 @@ def check_registrant(actor: Actor) -> Actor:
     return actor
 
 
+def _has_control(value: str) -> bool:
+    """NUL and the other C0 control characters (and DEL), which no name should carry."""
+    return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+
+
 def _text(value: Any, field: str, *, limit: int = MAX_NAME_CHARS) -> str:
-    if not isinstance(value, str) or not value or len(value) > limit:
+    if not isinstance(value, str) or not value.strip() or len(value) > limit or _has_control(value):
         raise WriteError(
             "invalid_input",
-            f"{field} must be non-empty text of at most {limit} characters, got {value!r:.80}",
-            f"Pass a non-empty {field}.",
+            f"{field} must be text of 1-{limit} characters, not blank and without control "
+            f"characters, got {value!r:.80}",
+            f"Pass a printable, non-blank {field}.",
             field=field,
         )
     return value
+
+
+def _check_locator_text(locator: Mapping[str, Any]) -> None:
+    """The size and character rules ProjectLocator does not have (it only needs non-empty)."""
+    for key, limit in (("name", MAX_NAME_CHARS), ("project_id", MAX_UID_CHARS)):
+        value = locator.get(key)
+        if isinstance(value, str):
+            _text(value, f"locator.{key}", limit=limit)
+    path = locator.get("folder_path")
+    if isinstance(path, list | tuple):
+        if len(path) > MAX_FOLDER_SEGMENTS:
+            raise WriteError(
+                "invalid_input",
+                f"locator.folder_path has {len(path)} segments, at most {MAX_FOLDER_SEGMENTS}",
+                "Send the Project Manager folder names from the root, not more than "
+                f"{MAX_FOLDER_SEGMENTS} deep.",
+                field="locator",
+            )
+        for segment in path:
+            if isinstance(segment, str):
+                _text(segment, "locator.folder_path segment", limit=MAX_SEGMENT_CHARS)
 
 
 def build_source(kind: Any, locator: Any, host: Any = None) -> ProjectSource:
@@ -92,6 +122,11 @@ def build_source(kind: Any, locator: Any, host: Any = None) -> ProjectSource:
             "project open in Resolve.",
             field="locator",
         )
+    try:
+        _check_locator_text(locator)
+    except WriteError as exc:
+        exc.details["field"] = "locator"
+        raise
     try:
         parsed = ProjectLocator.from_dict(locator)
     except (TypeError, ValueError) as exc:
