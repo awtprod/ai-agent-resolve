@@ -57,6 +57,7 @@ from aar.recipes.events import (
     OP_RESULT,
     OP_REVIEW_OPEN,
     OP_START,
+    OP_WORKER_ERROR,
     OUTCOME_DONE,
     OUTCOME_FAILED,
     RUNNER,
@@ -85,11 +86,12 @@ _MAX_OUTPUT_DEPTH = 64
 
 
 def _canonical(value: Any) -> bytes:
-    """Canonical UTF-8 JSON. ``allow_nan=False`` so NaN/±inf raise rather than emit invalid JSON;
+    """The STORED canonical JSON of ``value`` (the escaped form the log writes, R3-1), as bytes.
+
+    Bounds are measured on this stored form, so non-ASCII content gets less room (an emoji escapes
+    to ~12 bytes). ``allow_nan=False`` makes NaN/±inf raise rather than emit invalid JSON;
     ``sort_keys`` raises ``TypeError`` on non-string keys."""
-    return json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
-    ).encode("utf-8")
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
 def _within_depth(value: Any, limit: int) -> bool:
@@ -137,18 +139,28 @@ _OUTPUT_ERRORS = {
 }
 
 
+def _stored_len(value: str) -> int:
+    """Bytes the log stores for ``value`` (escaped JSON string, incl. quotes)."""
+    return len(json.dumps(value).encode("utf-8"))
+
+
 def _bound_text(value: Any, limit: int) -> Any:
-    """Truncate a string to ``limit`` UTF-8 bytes; pass non-strings through."""
-    if not isinstance(value, str):
+    """Truncate a string so its STORED (escaped JSON) form fits ``limit`` bytes (R3-1); pass
+    non-strings through. Non-ASCII content gets less room, which is acceptable."""
+    if not isinstance(value, str) or _stored_len(value) <= limit:
         return value
-    raw = value.encode("utf-8")
-    if len(raw) <= limit:
-        return value
-    return raw[:limit].decode("utf-8", "ignore")
+    lo, hi = 0, len(value)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _stored_len(value[:mid]) <= limit:
+            lo = mid
+        else:
+            hi = mid - 1
+    return value[:lo]
 
 
 def _bound_error(error: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Keep only ``{code, message, fix_hint}`` and cap each text field to 4 KiB of UTF-8 (F6)."""
+    """Keep only ``{code, message, fix_hint}`` and cap each field to 4 KiB of stored JSON (F6)."""
     if not isinstance(error, dict):
         return error
     bounded = {
@@ -269,6 +281,36 @@ def record_started(log: EventLog, *, project_id: str, recipe_node: str, caller: 
             recipe_node=recipe_node,
             caller=_caller_ref(caller),
         )
+    return True
+
+
+def record_worker_error(log: EventLog, *, project_id: str, recipe_node: str, message: str) -> bool:
+    """Leave a bounded ``hub.write`` record (op ``recipe.worker_error``) for a swallowed per-recipe
+    worker exception, so the status view can count it (R3-3). No new event type. Idempotent per
+    (recipe, message) so a recipe that raises the same error every tick records it once."""
+    import hashlib
+
+    bounded = message[:MAX_ERROR_BYTES]
+    digest = hashlib.sha256(bounded.encode("utf-8", "ignore")).hexdigest()[:12]
+    base = f"aar.recipe.workererr/{recipe_node}/{digest}"
+    if log.get_by_idempotency_key(base) is not None:
+        return False
+    try:
+        with _in_transaction(log) as txn:
+            _append_record(
+                txn,
+                base,
+                OP_WORKER_ERROR,
+                project_id,
+                RUNNER,
+                request_sha256(OP_WORKER_ERROR, {"project_id": project_id, "recipe": recipe_node}),
+                recipe_node=recipe_node,
+                error=bounded,
+            )
+    except Exception as exc:
+        if _is_conflict(exc):
+            return False
+        raise
     return True
 
 
@@ -847,6 +889,9 @@ def _drive_one_hot(
             params=dict(step.hot_params or {}),
             agent_id=RUNNER.id,
         )
+        # R3-4: a submit that returns a non-string reference is a bad response, not a submit.
+        if not isinstance(job_ref, str):
+            return _count_bad_poll(log, state, op, caller)
         _record_hot_submitted(log, state.project_id, op, caller, job_ref)
         changed = True
         view = dispatcher.poll(job_ref)
@@ -856,34 +901,22 @@ def _drive_one_hot(
         return changed
     state_value = getattr(view, "state", None)
     if view is None or not isinstance(state_value, str) or state_value not in HOT_STATES:
-        # N8: a None or garbage poll response is not a crash and not a step failure (yet). Record
-        # it; after MAX_BAD_POLLS consecutive bad responses the step fails dispatcher_bad_response.
-        if _record_bad_poll(log, state.project_id, op, caller):
-            changed = True
-        if op.bad_polls + 1 >= MAX_BAD_POLLS and record_result(
-            log,
-            project_id=state.project_id,
-            op_id=op.op_id,
-            actor=caller,
-            outcome=OUTCOME_FAILED,
-            error={
-                "code": "dispatcher_bad_response",
-                "message": f"the node dispatcher returned {MAX_BAD_POLLS} unusable responses",
-                "fix_hint": "Check the node; retry the step once it reports properly.",
-            },
-        ):
-            changed = True
-        return changed
+        # N8: a None or garbage poll response is not a crash and not a step failure (yet).
+        return changed or _count_bad_poll(log, state, op, caller)
     if view.is_terminal:
         if view.state == "done":
             result = view.result
+            outputs = result.outputs if result is not None else {}
+            # R3-4: a done poll whose outputs are not a dict is a bad response, not a result.
+            if not isinstance(outputs, dict):
+                return changed or _count_bad_poll(log, state, op, caller)
             if record_result(
                 log,
                 project_id=state.project_id,
                 op_id=op.op_id,
                 actor=caller,
                 outcome=OUTCOME_DONE,
-                outputs=dict(result.outputs) if result else {},
+                outputs=dict(outputs),
                 artifact_ids=result.artifact_ids if result else (),
             ):
                 changed = True
@@ -896,6 +929,26 @@ def _drive_one_hot(
             error=view.error or {"code": "hot_failed", "message": ""},
         ):
             changed = True
+    return changed
+
+
+def _count_bad_poll(log: EventLog, state: RunState, op: OpAttempt, caller: Actor) -> bool:
+    """Count one bad dispatcher response (None/garbage poll, non-string job_ref, or a done poll
+    with non-dict outputs); fail the step dispatcher_bad_response after MAX_BAD_POLLS (N8/R3-4)."""
+    changed = _record_bad_poll(log, state.project_id, op, caller)
+    if op.bad_polls + 1 >= MAX_BAD_POLLS and record_result(
+        log,
+        project_id=state.project_id,
+        op_id=op.op_id,
+        actor=caller,
+        outcome=OUTCOME_FAILED,
+        error={
+            "code": "dispatcher_bad_response",
+            "message": f"the node dispatcher returned {MAX_BAD_POLLS} unusable responses",
+            "fix_hint": "Check the node; retry the step once it reports properly.",
+        },
+    ):
+        changed = True
     return changed
 
 

@@ -11,6 +11,8 @@ let the current step finish.
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import signal
 import threading
 from datetime import timedelta
@@ -33,10 +35,13 @@ from aar.recipes.engine import (
     heartbeat,
     op_lease_live,
     record_result,
+    record_worker_error,
 )
 from aar.recipes.events import OUTCOME_DONE, OUTCOME_FAILED
 from aar.recipes.models import RecipeDef, StepDef
 from aar.recipes.state import OpAttempt, RunState, load_state
+
+_LOG = logging.getLogger("aar.recipes.worker")
 
 
 def active_recipes(log: EventLog) -> list[tuple[str, str]]:
@@ -299,7 +304,8 @@ def _tick(
         # N3: one recipe's failure (a raising dispatcher, a bad advance) must never stop the loop.
         try:
             advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
-        except Exception:
+        except Exception as exc:
+            _note_worker_error(log, _project_id, recipe_node, exc)
             continue
     for project_id, recipe_node in recipes:
         try:
@@ -335,11 +341,20 @@ def _tick(
             )
             advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
             return True
-        except Exception:
+        except Exception as exc:
             # The step result is recorded in _run_step; anything else (a per-recipe fault) is
-            # swallowed so the worker goes on to the next recipe (N3).
+            # logged, recorded for the status view, and swallowed so the worker goes on (N3/R3-3).
+            _note_worker_error(log, project_id, recipe_node, exc)
             continue
     return False
+
+
+def _note_worker_error(log: EventLog, project_id: str, recipe_node: str, exc: Exception) -> None:
+    """Log a swallowed per-recipe worker exception (bounded) and record it for the status view."""
+    message = f"{type(exc).__name__}: {exc}"[:4096]
+    _LOG.warning("recipe %s: worker swallowed %s", recipe_node, message)
+    with contextlib.suppress(Exception):
+        record_worker_error(log, project_id=project_id, recipe_node=recipe_node, message=message)
 
 
 def _install_signals(stop: threading.Event) -> None:

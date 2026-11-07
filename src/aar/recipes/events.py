@@ -55,6 +55,9 @@ OP_HEARTBEAT = "recipe.heartbeat"
 OP_HOT_INTENT = "recipe.hot_intent"
 OP_HOT_SUBMITTED = "recipe.hot_submitted"
 OP_HOT_BAD_POLL = "recipe.hot_bad_poll"
+# A hub.write record (not a new event type) the worker leaves when it swallows a per-recipe
+# exception, so the status view can count it (R3-3).
+OP_WORKER_ERROR = "recipe.worker_error"
 OP_RESULT = "recipe.result"
 OP_REVIEW_OPEN = "recipe.review_open"
 OP_STEP_COMPLETE = "recipe.step_complete"

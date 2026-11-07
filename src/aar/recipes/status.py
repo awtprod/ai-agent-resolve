@@ -84,9 +84,24 @@ def status_view(
         "steps": steps_out,
         "next_actions": actions,
         "ignored": state.ignored,
+        "diagnostics": {"worker_errors": _worker_errors(log, state.project_id, recipe_node)},
         "truncated": truncated,
     }
     return _enforce_total_bound(view)
+
+
+def _worker_errors(log: EventLog, project_id: str, recipe_node: str) -> list[dict[str, Any]]:
+    """The per-recipe worker exceptions the worker swallowed and recorded (R3-3), bounded."""
+    from aar.recipes.events import OP_WORKER_ERROR
+
+    found: list[dict[str, Any]] = []
+    for ev in log.read(0, project_id=project_id, types=["hub.write"], limit=-1):
+        payload = ev.payload if isinstance(ev.payload, dict) else {}
+        if payload.get("op") == OP_WORKER_ERROR and payload.get("recipe_node") == recipe_node:
+            found.append({"error": payload.get("error")})
+            if len(found) >= 20:
+                break
+    return found
 
 
 def _enforce_total_bound(view: dict[str, Any]) -> dict[str, Any]:
@@ -101,8 +116,9 @@ def _enforce_total_bound(view: dict[str, Any]) -> dict[str, Any]:
 
 
 def _canon(value: Any) -> bytes:
+    # The STORED (escaped) form the log writes, so bounds are measured on stored bytes (R3-1).
     try:
-        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     except (TypeError, ValueError):
         return b"\x00" * (MAX_VIEW_BYTES + 1)
 

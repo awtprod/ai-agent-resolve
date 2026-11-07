@@ -108,11 +108,10 @@ def _canonical(value: Any) -> str:
     # allow_nan=False: NaN/Infinity cannot round-trip through JSON, so an event that
     # carried one could never compare equal to its own reload. Reject it at the point
     # of serialization (append) rather than store a value that breaks idempotency.
-    # ensure_ascii=False: store UTF-8, so a bound measured in UTF-8 bytes equals the stored
-    # size (F6); otherwise non-ASCII text (emoji) would store several times larger escaped.
-    return json.dumps(
-        value, sort_keys=True, separators=(",", ":"), allow_nan=False, ensure_ascii=False
-    )
+    # ensure_ascii=True (the released form): changing it would change the stored bytes and the
+    # request/plan fingerprints, breaking idempotent retries of every non-ASCII event the released
+    # hub wrote (R3-1). Recipe output/error/summary bounds are measured on THIS stored form instead.
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def canonical_json(value: Any) -> str:
@@ -128,10 +127,7 @@ def _canonical_lenient(value: Any) -> str:
     # Comparison-only canonical form for the STORED side: tolerates a legacy stored
     # NaN/inf (allow_nan=True) so matching never raises on old data. Still distinguishes
     # True/1 and 1/1.0, because json.dumps renders them as "true"/"1"/"1.0" either way.
-    # ensure_ascii=False to match the stored (UTF-8) form.
-    return json.dumps(
-        value, sort_keys=True, separators=(",", ":"), allow_nan=True, ensure_ascii=False
-    )
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=True)
 
 
 def _sqlite_uri(path: str, cwd: str, flavour: type[PurePath] = Path) -> str:
