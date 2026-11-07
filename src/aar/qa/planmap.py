@@ -74,8 +74,31 @@ def is_continuous(
     return abs(gap) <= tolerance
 
 
+def carries_mixed_audio(plan: EditPlan, video_track: int) -> bool:
+    """Whether a content join on ``video_track`` carries audio that reaches the mix (S13b F1).
+
+    A plan does not name the audio track of a segment, so the convention is positional: video
+    track ``N`` carries its audio on ``audio_tracks[N-1]`` (A1 first). That audio reaches the mix
+    unless the track is muted or is not routed to a bus (``bus`` is ``None``); a track that is
+    itself a bus (named by another track's ``bus``) does carry the mix. With no ``audio_tracks``
+    entry for the track -- an empty list, as every v1 plan has, or a short one -- there is no
+    routing information, so the join is checked, exactly as before this fix.
+    """
+    tracks = plan.audio_tracks
+    if not tracks or video_track > len(tracks):
+        return True
+    entry = tracks[video_track - 1]
+    if entry.mute:
+        return False
+    bus_names = {t.bus for t in tracks if t.bus is not None}
+    return entry.bus is not None or entry.name in bus_names
+
+
 def cuts(plan: EditPlan, tolerance_frames: int) -> list[Cut]:
-    """Every non-continuous join between usable segments, in ``plan.joins()`` order."""
+    """Every non-continuous join between usable segments whose track carries mixed audio, in
+    ``plan.joins()`` order. Joins on a muted or unrouted track are skipped (S13b F1): their
+    source audio never reaches the render, so a quiet-pause or re-transcribe check there would
+    judge audio the viewer never hears."""
     sources = plan.source_map()
     ranges = plan.record_ranges()
     found: list[Cut] = []
@@ -83,6 +106,8 @@ def cuts(plan: EditPlan, tolerance_frames: int) -> list[Cut]:
         if not (_usable(plan, sources, outgoing) and _usable(plan, sources, incoming)):
             continue
         if is_continuous(plan, sources, outgoing, incoming, tolerance_frames):
+            continue
+        if not carries_mixed_audio(plan, plan.segments[incoming].track):
             continue
         seg = plan.segments[incoming]
         out_seg = plan.segments[outgoing]
