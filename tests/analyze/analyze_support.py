@@ -97,3 +97,25 @@ def lowpass(samples: np.ndarray, corner_hz: float, rate: int = RATE) -> np.ndarr
     freqs = np.fft.rfftfreq(len(samples), 1 / rate)
     spec /= np.sqrt(1 + (freqs / corner_hz) ** 8)
     return np.fft.irfft(spec, len(samples))
+
+
+def laugh_clip(
+    seconds: float = 20.0,
+    *,
+    laugh: tuple[float, float] | None = (12.237, 15.5),
+    room_dbfs: float = -30.0,
+    laugh_dbfs: float = -18.0,
+    rate: int = RATE,
+    seed: int = 5,
+) -> np.ndarray:
+    """Steady speech-band room noise at ``room_dbfs`` RMS with a laugh-like noise burst at
+    ``laugh_dbfs`` RMS from sample ``round(laugh[0] * rate)`` to ``laugh[1]``."""
+    rng = np.random.default_rng(seed)
+    n = round(seconds * rate)
+    room = band_noise(n, rate, rng, 150.0, 3500.0)
+    room *= 10 ** (room_dbfs / 20) / np.sqrt(np.mean(room**2))
+    if laugh is not None:
+        a, b = round(laugh[0] * rate), round(laugh[1] * rate)
+        burst = band_noise(b - a, rate, rng, 300.0, 3000.0)
+        room[a:b] = burst * 10 ** (laugh_dbfs / 20) / np.sqrt(np.mean(burst**2))
+    return room

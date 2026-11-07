@@ -478,7 +478,7 @@ def consume(
                         "attempt": secrets.token_hex(8),
                     },
                     # One consume row per token, enforced by the database's unique key.
-                    idempotency_key=f"approval-consume:{token_id}",
+                    idempotency_key=_consume_key(token_id),
                 )
             except IdempotencyConflict:
                 refusal = ApprovalAlreadyConsumed(
@@ -503,3 +503,123 @@ def consume(
     if token is None:  # pragma: no cover - consumed above
         raise ApprovalNotFound(token_id, f"no approval token {token_id!r}")
     return token
+
+
+def _consume_key(token_id: str) -> str:
+    """The idempotency key of a token's one consume row. Shared by :func:`consume` and the
+    node-API path, so both find and refuse the same single row."""
+    return f"approval-consume:{token_id}"
+
+
+# A via_node is an already-validated enrolled node id; this bound mirrors
+# aar.hub.leaseboard.MAX_NODE_ID without importing it (that module pulls in aar.node.leases).
+_MAX_VIA_NODE = 128
+
+
+def _is_node_replay(
+    prior: Event, actor: Actor, scope: ApprovalScope, target: str, via_node: str
+) -> bool:
+    """Whether ``prior`` (a stored ``approval.consumed``) is a replay of this exact request.
+
+    A replay matches the first consume's on-behalf-of actor, scope and target, and the node it
+    came through (brief item 4). ``via_node`` is only ever present on node-API consumes, so a
+    consume first made locally (``LocalHubLink``) never looks like a remote replay.
+    """
+    payload = prior.payload
+    return (
+        prior.type == EVENT_CONSUMED
+        and prior.actor == actor
+        and isinstance(payload, dict)
+        and payload.get("scope") == scope.value
+        and payload.get("target") == target
+        and payload.get("via_node") == via_node
+    )
+
+
+def consume_for_node(
+    log: EventLog,
+    token_id: str,
+    scope: ApprovalScope | str,
+    target: str,
+    actor: Actor,
+    *,
+    via_node: str,
+    request_id: str | None = None,
+    clock: Clock = utcnow,
+) -> tuple[Approval, bool]:
+    """Consume a token on behalf of a node, idempotent across a lost ack (S15a item 4).
+
+    Like :func:`consume`, but tolerant of the one retry a remote node makes when the hub
+    committed the consume and the reply was lost. A retry whose token, scope, target and
+    on-behalf-of ``actor`` match the recorded consume, and which comes through the same node
+    (``via_node``), returns the first result with ``replayed=True`` and writes nothing. Any
+    other second consume is refused and audited exactly as :func:`consume` does.
+
+    The authenticated node id is written as ``via_node`` in the ``approval.consumed`` payload,
+    in the same transaction as the consume, so the replay fingerprint and the write are atomic.
+    Returns ``(approval, replayed)``. :func:`consume`'s semantics are unchanged for its existing
+    (local) callers; this is a separate function used only by the node API.
+    """
+    token_id = _token_id(token_id)
+    scope = _scope(scope)
+    target = clean_text(target, "target", max_len=MAX_TARGET)
+    via_node = clean_text(via_node, "via_node", max_len=_MAX_VIA_NODE)
+    key = _consume_key(token_id)
+    replayed = False
+    refusal: ApprovalError | None = None
+    with log.transaction() as txn:
+        now = clock()
+        token = _token_in(txn, token_id)
+        if token is None:
+            raise ApprovalNotFound(token_id, f"no approval token {token_id!r}")
+        if token.consumed_at is not None:
+            prior = txn.find_by_idempotency_key(key)
+            if prior is not None and _is_node_replay(prior, actor, scope, target, via_node):
+                return token, True  # a replay of the first consume: write nothing
+            refusal = ApprovalAlreadyConsumed(token_id, f"token {token_id} was already consumed")
+        else:
+            refusal = _refusal(token, token_id, scope, target, now)
+            if refusal is None:
+                try:
+                    txn.append(
+                        EVENT_CONSUMED,
+                        actor,
+                        {
+                            "token_id": token_id,
+                            "scope": scope.value,
+                            "target": target,
+                            "via_node": via_node,
+                            "request_id": request_id,
+                            "at": iso(now),
+                        },
+                        idempotency_key=key,
+                    )
+                except IdempotencyConflict:
+                    # A consume of this token raced us between the fold and the append.
+                    prior = txn.find_by_idempotency_key(key)
+                    if prior is not None and _is_node_replay(prior, actor, scope, target, via_node):
+                        token, replayed = _token_in(txn, token_id), True
+                    else:
+                        refusal = ApprovalAlreadyConsumed(
+                            token_id, f"token {token_id} was already consumed"
+                        )
+                else:
+                    token = _token_in(txn, token_id)
+        if refusal is not None:
+            txn.append(
+                EVENT_CONSUME_REFUSED,
+                actor,
+                {
+                    "token_id": token_id,
+                    "scope": scope.value,
+                    "target": target,
+                    "code": refusal.code,
+                    "via_node": via_node,
+                    "at": iso(now),
+                },
+            )
+    if refusal is not None:
+        raise refusal
+    if token is None:  # pragma: no cover - consumed above
+        raise ApprovalNotFound(token_id, f"no approval token {token_id!r}")
+    return token, replayed

@@ -502,7 +502,7 @@ def write_key(actor: Actor, idempotency_key: Any) -> str:
             "invalid_input",
             f"idempotency_key must be 1-{MAX_KEY} characters of A-Z a-z 0-9 . _ : / - "
             f"starting with a letter or digit, got {idempotency_key!r:.80}",
-            "Choose a key that names this one request, e.g. 'brief-qcce-2024-longform'. "
+            "Choose a key that names this one request, e.g. 'brief-acme-2024-longform'. "
             "Send the same key again only to retry the same request.",
             field="idempotency_key",
         )

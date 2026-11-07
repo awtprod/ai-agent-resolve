@@ -96,6 +96,7 @@ _TINY = 1e-30
 _MAD_SIGMA = 1.4826  # median absolute deviation to standard deviation, for normal noise
 _INLIER_FLOOR_S = 0.001
 _CANDIDATES_SHOWN = 5
+ELIGIBLE_SLACK_S = 0.001  # far above sub-sample jitter (µs), far below agree_s (0.25 s)
 
 SIGN_CONVENTION = (
     "offset_s is where the other file's first sample falls on the reference's clock "
@@ -542,13 +543,16 @@ def _searched(base: WindowResult, a0: int, peak: Peak, rate: int) -> WindowResul
 
 
 def _eligible(windows: list[WindowResult], n_other_s: float, offset: float) -> list[int]:
-    """Windows that are not silent and lie wholly inside the other file at ``offset``."""
+    """Windows that are not silent and lie wholly inside the other file at ``offset``, give or
+    take ``ELIGIBLE_SLACK_S``: the consensus offset carries microseconds of sub-sample jitter,
+    which must not decide whether a window that fits exactly counts."""
     out = []
     for i, w in enumerate(windows):
         if w.state == "silent":
             continue
         start_in_other = w.ref_start_s - offset
-        if start_in_other >= 0 and start_in_other + w.length_s <= n_other_s + 1e-9:
+        end_in_other = start_in_other + w.length_s
+        if start_in_other >= -ELIGIBLE_SLACK_S and end_in_other <= n_other_s + ELIGIBLE_SLACK_S:
             out.append(i)
     return out
 

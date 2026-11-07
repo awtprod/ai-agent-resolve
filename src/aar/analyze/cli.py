@@ -4,11 +4,12 @@ Exit status, as ``aar qa check``:
 
 - 0: the analysis ran and every result is usable (``sync``: every pair is ``ok``);
 - 1: it ran and something failed (``sync``: a pair is ``drift``, ``low-confidence``,
-  ``no-overlap`` or ``failed``; ``transcript``: the decode or the model failed), including
-  media that exists but does not decode;
+  ``no-overlap`` or ``failed``; ``transcript``, ``faces``, ``laughs``: the decode, the
+  model, the detector or the Gemini call failed), including media that does not decode;
 - 2: an input, a tool or a model cannot be located or opened, an extra is missing, a checkpoint
-  does not match, or an argument is bad;
-- 74: the result could not be written (``output-error``; a transcript's checkpoint is kept).
+  does not match, an argument is bad, a paid call was not allowed (``--allow-paid``) or its
+  key is missing;
+- 74: the result could not be written (``output-error``; a checkpoint is kept).
 
 An error prints ``{"ok": false, "error": {"type", "message", "hint"}}``.
 """
@@ -26,6 +27,10 @@ from pydantic import ValidationError
 
 from aar import cli_io
 from aar.analyze.errors import EXIT_FAILED, AnalyzeError
+from aar.analyze.faces import MODEL_ENV as FACE_MODEL_ENV
+from aar.analyze.faces import FaceSettings, analyse_faces
+from aar.analyze.gemini import KEY_ENV
+from aar.analyze.laughs import LaughSettings, analyse_laughs
 from aar.analyze.sync import SyncSettings, sync_files
 from aar.analyze.whisper import (
     CCN_PRESET,
@@ -51,11 +56,14 @@ _EXITS = (
 def register(subparsers: Any) -> None:
     """Add the ``analyze`` command group to the top-level parser."""
     analyze = subparsers.add_parser(
-        "analyze", help="Cold analysis: audio sync offsets and word-level transcripts."
+        "analyze",
+        help="Cold analysis: audio sync offsets, word-level transcripts, faces and laughs.",
     )
     sub = analyze.add_subparsers(dest="analyze_command", metavar="COMMAND", required=True)
     _register_sync(sub)
     _register_transcript(sub)
+    _register_faces(sub)
+    _register_laughs(sub)
 
 
 def _register_sync(sub: Any) -> None:
@@ -123,12 +131,7 @@ def _register_transcript(sub: Any) -> None:
     run.add_argument("--model", default=d.model, help=f"Model name or path (default {d.model}).")
     run.add_argument("--model-dir", type=Path, help=f"Model directory (default ${MODEL_DIR_ENV}).")
     run.add_argument("--threads", type=int, default=d.cpu_threads, help="CPU threads (0: default).")
-    run.add_argument("--plan", type=Path, help="EditPlan JSON: take the offset from --source.")
-    run.add_argument("--source", help="The plan source this file is (with --plan).")
-    run.add_argument(
-        "--offset-s", type=float, help="Seconds to add to file time (not with --plan)."
-    )
-    run.add_argument("--recording", help="Recording name for the transcript (default: the plan's).")
+    _add_offset_args(run, "the transcript")
     run.add_argument("--resume", action="store_true", help="Continue from the checkpoint.")
     run.add_argument("--beam-size", type=int, default=d.beam_size)
     run.add_argument("--language", default=d.language, help="Language code ('' to detect).")
@@ -143,6 +146,84 @@ def _register_transcript(sub: Any) -> None:
     run.add_argument("--max-duration-s", type=float, default=d.max_duration_s)
     run.add_argument("--timeout-s", type=float, help="Timeout of the decode (default: scaled).")
     run.set_defaults(func=_cmd_transcript)
+
+
+def _add_offset_args(run: Any, what: str) -> None:
+    """Recording time: ``--plan`` with ``--source``, or ``--offset-s``, and ``--recording``."""
+    run.add_argument("--plan", type=Path, help="EditPlan JSON: take the offset from --source.")
+    run.add_argument("--source", help="The plan source this file is (with --plan).")
+    run.add_argument(
+        "--offset-s", type=float, help="Seconds to add to file time (not with --plan)."
+    )
+    run.add_argument("--recording", help=f"Recording name for {what} (default: the plan's).")
+
+
+def _register_faces(sub: Any) -> None:
+    d = FaceSettings()
+    run = sub.add_parser(
+        "faces",
+        help="Faces in sampled frames (OpenCV YuNet), in recording time; resumable.",
+        description=(
+            "Writes aar.faces/1 JSON to --out and prints a short report. The YuNet model is "
+            f"--model or ${FACE_MODEL_ENV}, an existing .onnx file; it is never downloaded. "
+            "Needs the 'faces' extra. " + _EXITS
+        ),
+    )
+    run.add_argument("media", type=Path, help="The video file.")
+    run.add_argument("--out", required=True, type=Path, help="aar.faces/1 JSON to write.")
+    run.add_argument("--model", type=Path, help=f"YuNet .onnx file (default ${FACE_MODEL_ENV}).")
+    run.add_argument(
+        "--sample-fps",
+        default="2",
+        help="Frames sampled per second, e.g. 2 or 1/2 (default 2).",
+    )
+    run.add_argument("--max-side", type=int, default=d.max_side, help="Longest frame side.")
+    run.add_argument("--score", type=float, default=d.score, help="Detector score threshold.")
+    run.add_argument("--nms", type=float, default=d.nms, help="Detector NMS threshold.")
+    run.add_argument("--top-k", type=int, default=d.top_k, help="Detector top-k before NMS.")
+    run.add_argument("--resume", action="store_true", help="Continue from the checkpoint.")
+    _add_offset_args(run, "the faces")
+    run.add_argument("--timeout-s", type=float, help="Timeout of the decode (default: scaled).")
+    run.set_defaults(func=_cmd_faces)
+
+
+def _register_laughs(sub: Any) -> None:
+    d = LaughSettings()
+    run = sub.add_parser(
+        "laughs",
+        help="Audience laughs from Gemini (paid), checked against the audio envelope.",
+        description=(
+            "Writes aar.laughs/1 JSON to --out (and a LaughMap with --map-out). Calling Gemini "
+            f"is paid and needs --allow-paid and ${KEY_ENV} (environment only, no flag); "
+            "--from-raw re-parses a saved reply offline. " + _EXITS
+        ),
+    )
+    run.add_argument("media", type=Path, help="The media file (its first audio stream).")
+    run.add_argument("--out", required=True, type=Path, help="aar.laughs/1 JSON to write.")
+    run.add_argument(
+        "--work-dir", required=True, type=Path, help="Where audio.flac and raw.json go."
+    )
+    paid = run.add_mutually_exclusive_group()
+    paid.add_argument("--allow-paid", action="store_true", help="Allow the paid Gemini call.")
+    paid.add_argument("--from-raw", type=Path, help="Re-parse a saved raw.json; no network.")
+    run.add_argument("--model", default=d.model, help=f"Gemini model id (default {d.model}).")
+    run.add_argument(
+        "--include-unconfirmed",
+        action="store_true",
+        help="Put unconfirmed and unchecked laughs in the map too.",
+    )
+    run.add_argument("--map-out", type=Path, help="Also write a LaughMap JSON here.")
+    run.add_argument("--confirm-bump-db", type=float, default=d.confirm_bump_db)
+    run.add_argument("--confirm-frac", type=float, default=d.confirm_frac)
+    run.add_argument(
+        "--max-audio-s",
+        type=float,
+        default=d.max_audio_s,
+        help="Refuse longer audio before uploading it (default 4 h).",
+    )
+    _add_offset_args(run, "the laugh map")
+    run.add_argument("--timeout-s", type=float, help="Timeout of each ffmpeg call.")
+    run.set_defaults(func=_cmd_laughs)
 
 
 # ---------------------------------------------------------------- output
@@ -292,4 +373,85 @@ def _cmd_transcript(args: argparse.Namespace) -> int:
         return _fail(exc)
     except OSError as exc:  # the checkpoint beside --out could not be written
         return _fail(AnalyzeError("output-error", f"cannot write beside {args.out}: {exc}"))
+    return _emit(report) or EXIT_OK
+
+
+# ---------------------------------------------------------------- faces
+
+
+def _face_settings(args: argparse.Namespace) -> FaceSettings:
+    try:
+        sample_fps = Fraction(args.sample_fps)
+    except (ValueError, ZeroDivisionError):
+        raise _bad(f"--sample-fps {args.sample_fps!r} is not a number or N/D") from None
+    try:
+        return FaceSettings(
+            sample_fps=sample_fps,
+            max_side=args.max_side,
+            score=args.score,
+            nms=args.nms,
+            top_k=args.top_k,
+            timeout_s=args.timeout_s,
+        )
+    except ValueError as exc:
+        raise _bad(str(exc)) from None
+
+
+def _cmd_faces(args: argparse.Namespace) -> int:
+    try:
+        settings = _face_settings(args)
+        offset = _offset(args)
+        _check_out(args.out)
+        _check_input(args.media, "input")
+        report = analyse_faces(
+            args.media,
+            args.out,
+            model=args.model,
+            settings=settings,
+            offset=offset,
+            recording=args.recording,
+            resume=args.resume,
+        )
+    except AnalyzeError as exc:
+        return _fail(exc)
+    except OSError as exc:  # the checkpoint beside --out could not be written
+        return _fail(AnalyzeError("output-error", f"cannot write beside {args.out}: {exc}"))
+    return _emit(report) or EXIT_OK
+
+
+# ---------------------------------------------------------------- laughs
+
+
+def _cmd_laughs(args: argparse.Namespace) -> int:
+    try:
+        try:
+            settings = LaughSettings(
+                model=args.model,
+                confirm_bump_db=args.confirm_bump_db,
+                confirm_frac=args.confirm_frac,
+                include_unconfirmed=args.include_unconfirmed,
+                max_audio_s=args.max_audio_s,
+                timeout_s=args.timeout_s,
+            )
+        except ValueError as exc:
+            raise _bad(str(exc)) from None
+        offset = _offset(args)
+        _check_out(args.out)
+        _check_out(args.map_out)
+        _check_input(args.media, "input")
+        report = analyse_laughs(
+            args.media,
+            args.out,
+            work_dir=args.work_dir,
+            allow_paid=args.allow_paid,
+            from_raw=args.from_raw,
+            settings=settings,
+            offset=offset,
+            recording=args.recording,
+            map_out=args.map_out,
+        )
+    except AnalyzeError as exc:
+        return _fail(exc)
+    except OSError as exc:  # the work dir could not be created or written
+        return _fail(AnalyzeError("output-error", f"cannot write the work dir or output: {exc}"))
     return _emit(report) or EXIT_OK

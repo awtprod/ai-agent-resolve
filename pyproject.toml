@@ -20,6 +20,9 @@ analyze = ["numpy>=1.26,<3"]
 # faster-whisper wheels are hundreds of MB (CTranslate2), so this extra is not in dev. Models are
 # never downloaded: see aar.analyze.whisper.
 whisper = ["faster-whisper>=1.1,<2"]
+# aar.analyze.faces: OpenCV's YuNet face detector. The wheel is large, so it is not in dev; tests
+# inject a detector, and the one live test needs AAR_YUNET_MODEL (never downloaded).
+faces = ["opencv-python-headless>=4.9,<5", "numpy>=1.26,<3"]
 dev = ["pytest", "ruff", "ai-agent-resolve[drp,hub,analyze]"]
 
 [project.scripts]

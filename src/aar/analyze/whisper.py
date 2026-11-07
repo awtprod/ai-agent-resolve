@@ -49,27 +49,38 @@ run see the same samples.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, replace
-from fractions import Fraction
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from aar.analyze.audio import read_mono
+from aar.analyze.common import (
+    CHECKPOINT_SUFFIX,
+    RecordingOffset,
+    append_record,
+    check_header,
+    checkpoint_header,
+    checkpoint_path,
+    explicit_offset,
+    finish_checkpoint,
+    is_number,
+    offset_from_plan,
+    start_checkpoint,
+    trim_checkpoint,
+    write_atomic,
+)
+from aar.analyze.common import read_checkpoint as read_common
 from aar.analyze.errors import AnalyzeError, from_media_error, need_faster_whisper
 from aar.media import MediaError, probe, timeout_for
 from aar.media.tools import require_regular_file
 from aar.plan.inputs import Transcript, Word
-from aar.plan.model import EditPlan
 
 MODEL_DIR_ENV = "AAR_MODEL_DIR"
 WHISPER_RATE = 16000
-CHECKPOINT_SUFFIX = ".ckpt.jsonl"
-CHECKPOINT_VERSION = 1
 _KIND = "aar.analyze.transcript"
 
 
@@ -180,11 +191,29 @@ def _looks_like_path(model: str) -> bool:
     return any(sep in model for sep in seps) or model.startswith((".", "~"))
 
 
+def _contained(path: Path, root: Path, model: str) -> Path:
+    """``path`` resolved, refused (``model-outside-dir``) when it or its ``model.bin`` resolves
+    outside the model directory: a name looked up in the shared directory must stay in it."""
+    home = root.resolve()
+    resolved = path.resolve()
+    for found in (resolved, (path / "model.bin").resolve()):
+        if not found.is_relative_to(home):
+            raise AnalyzeError(
+                "model-outside-dir",
+                f"model {model!r} under {root} resolves to {found}, outside the model directory "
+                "(a symlink or a refs/main pointing out of it)",
+                hint="fix the shared model directory, or pass the model directory itself as a "
+                "path if it really lives elsewhere",
+            )
+    return resolved
+
+
 def resolve_model(model: str, model_dir: str | os.PathLike[str] | None = None) -> Path:
     """The local directory of ``model`` (a name or a path); never downloads.
 
     Raises ``AnalyzeError("model-missing")`` with a hint naming ``AAR_MODEL_DIR`` and the
-    layout expected.
+    layout expected. A name found in the directory must resolve inside it (symlinks and
+    ``refs/main`` included), else ``model-outside-dir``; an explicit path is taken as given.
     """
     layout = (
         f"<dir>/{model}/model.bin, <dir>/faster-whisper-{model}/model.bin or the Hugging Face "
@@ -212,11 +241,11 @@ def resolve_model(model: str, model_dir: str | os.PathLike[str] | None = None) -
     looked: list[Path] = [root / model, root / f"faster-whisper-{model}"]
     for path in looked:
         if _has_model(path):
-            return path.resolve()
+            return _contained(path, root, model)
     repo = root / f"models--Systran--faster-whisper-{model}"
     snap = _hf_snapshot(repo) if repo.is_dir() else None
     if snap is not None and _has_model(snap):
-        return snap.resolve()
+        return _contained(snap, root, model)
     looked.append(repo / "snapshots")
     raise AnalyzeError(
         "model-missing",
@@ -313,186 +342,46 @@ def _sorted(words: Iterable[Word]) -> list[Word]:
     return sorted(words, key=lambda w: (w.start_s, w.end_s))
 
 
-# ---------------------------------------------------------------- recording time
-
-
-@dataclass(frozen=True)
-class RecordingOffset:
-    """Seconds added to file time to get recording time, and where they came from."""
-
-    offset_s: float = 0.0
-    source: Literal["none", "offset-s", "plan"] = "none"
-    recording: str | None = None
-    detail: dict[str, Any] | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        out: dict[str, Any] = {"offset_s": self.offset_s, "from": self.source}
-        if self.detail:
-            out.update(self.detail)
-        if self.source == "none":
-            out["note"] = "no plan source or --offset-s was given: times are file seconds"
-        return out
-
-
-def offset_from_plan(plan: EditPlan, source_id: str) -> RecordingOffset:
-    """``recording_origin / fps`` of a plan source, with the exact rational fps."""
-    source = plan.source_map().get(source_id)
-    if source is None:
-        known = ", ".join(repr(s.id) for s in plan.sources) or "none"
-        raise AnalyzeError(
-            "invalid-argument", f"the plan has no source {source_id!r} (sources: {known})"
-        )
-    fps = Fraction(plan.fps.num, plan.fps.den)
-    offset = float(Fraction(source.recording_origin) / fps)
-    return RecordingOffset(
-        offset_s=offset,
-        source="plan",
-        recording=source.recording_id if source.recording_id is not None else source.id,
-        detail={
-            "source": source.id,
-            "recording_origin": source.recording_origin,
-            "fps": f"{plan.fps.num}/{plan.fps.den}",
-        },
-    )
-
-
-def explicit_offset(offset_s: float) -> RecordingOffset:
-    if not math.isfinite(offset_s):
-        raise AnalyzeError("invalid-argument", "--offset-s must be a finite number of seconds")
-    return RecordingOffset(offset_s=float(offset_s), source="offset-s")
-
-
 # ---------------------------------------------------------------- checkpoint
 
 
-def checkpoint_path(out: Path) -> Path:
-    return out.with_name(out.name + CHECKPOINT_SUFFIX)
-
-
-def _fsync_dir(path: Path) -> None:
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:  # pragma: no cover - not every platform opens directories
-        return
-    try:
-        os.fsync(fd)
-    except OSError:  # pragma: no cover
-        pass
-    finally:
-        os.close(fd)
-
-
 def _header(media: Path, settings: WhisperSettings, model_path: Path) -> dict[str, Any]:
-    st = media.stat()
     decode = {**settings.decode_settings(), "model_path": str(model_path)}
-    digest = hashlib.sha256(json.dumps(decode, sort_keys=True).encode("utf-8")).hexdigest()
-    return {
-        "aar_checkpoint": CHECKPOINT_VERSION,
-        "kind": _KIND,
-        "input": {"size": st.st_size, "mtime_ns": st.st_mtime_ns},
-        "settings_sha256": digest,
-        "settings": decode,
-    }
+    return checkpoint_header(_KIND, media, decode)
 
 
 _SEGMENT_NUMBERS = ("start", "end", "avg_logprob", "compression_ratio", "no_speech_prob")
-
-
-def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def _valid_segment(seg: Any) -> bool:
     """A checkpoint line as ``segment_record`` writes it: numbers, text and word quadruples."""
     if not (isinstance(seg, dict) and isinstance(seg.get("text"), str)):
         return False
-    if not all(_is_number(seg.get(key)) for key in _SEGMENT_NUMBERS):
+    if not all(is_number(seg.get(key)) for key in _SEGMENT_NUMBERS):
         return False
     words = seg.get("words")
     return isinstance(words, list) and all(
         isinstance(w, list)
         and len(w) == 4
-        and _is_number(w[0])
-        and _is_number(w[1])
+        and is_number(w[0])
+        and is_number(w[1])
         and isinstance(w[2], str)
-        and _is_number(w[3])
+        and is_number(w[3])
         for w in words
     )
 
 
+def _check_segment(seg: Any, previous: Any) -> str | None:
+    if not _valid_segment(seg):
+        return "is not a segment record"
+    if previous is not None and seg["start"] < previous["start"]:
+        return "starts before the one above it"
+    return None
+
+
 def read_checkpoint(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
-    """(header, complete segments, byte length of the complete lines). A trailing line without
-    its newline (a run killed mid-write) is not complete and is ignored."""
-    data = path.read_bytes()
-    complete = data[: data.rfind(b"\n") + 1]
-    lines = complete.splitlines()
-
-    def corrupt(why: str) -> AnalyzeError:
-        return AnalyzeError(
-            "checkpoint-corrupt",
-            f"checkpoint {path} is not usable: {why}",
-            hint=f"delete {path} to start over",
-        )
-
-    if not lines:
-        raise corrupt("it has no complete header line")
-    try:
-        header = json.loads(lines[0])
-        segments = [json.loads(line) for line in lines[1:]]
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise corrupt(f"a complete line is not JSON ({exc})") from None
-    if not (isinstance(header, dict) and header.get("kind") == _KIND):
-        raise corrupt("its first line is not an aar transcript checkpoint header")
-    last = -math.inf
-    for i, seg in enumerate(segments, start=1):
-        if not _valid_segment(seg):
-            raise corrupt(f"segment line {i} is not a segment record")
-        if seg["start"] < last:
-            raise corrupt(f"segment line {i} starts before the one above it")
-        last = seg["start"]
-    return header, segments, len(complete)
-
-
-def _check_header(path: Path, found: dict[str, Any], expected: dict[str, Any]) -> None:
-    differs = [
-        key
-        for key in ("aar_checkpoint", "input", "settings_sha256")
-        if found.get(key) != expected[key]
-    ]
-    if differs:
-        what = {
-            "aar_checkpoint": "checkpoint format",
-            "input": "input file (size or mtime)",
-            "settings_sha256": "model or decode settings",
-        }
-        raise AnalyzeError(
-            "checkpoint-mismatch",
-            f"checkpoint {path} was written for a different "
-            + " and ".join(what[k] for k in differs)
-            + "; refusing to splice two runs",
-            hint=f"re-run with the original input and settings, or delete {path} to start over",
-        )
-
-
-def _append(handle: Any, record: dict[str, Any]) -> None:
-    handle.write((json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8"))
-    handle.flush()
-    os.fsync(handle.fileno())
-
-
-def write_atomic(path: Path, text: str) -> None:
-    """Write ``text`` to a temporary file beside ``path``, fsync it and move it into place."""
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-    _fsync_dir(path.parent)
+    """(header, complete segments, byte length of complete lines): ``aar.analyze.common``."""
+    return read_common(path, kind=_KIND, what="segment", check=_check_segment)
 
 
 # ---------------------------------------------------------------- full file
@@ -553,7 +442,7 @@ def transcribe_file(
                 hint=f"pass --resume to continue it, or delete {ckpt} to start over",
             )
         found, segments, good = read_checkpoint(ckpt)
-        _check_header(ckpt, found, header)
+        check_header(ckpt, found, header)
         resumed = True
     from_checkpoint = len(segments)
     resume_s = segments[-1]["end"] if segments else 0.0
@@ -588,12 +477,9 @@ def transcribe_file(
     # The checkpoint is created (or trimmed) only now, so a run that could not load the model
     # or decode the input leaves nothing behind.
     if resumed:
-        with open(ckpt, "r+b") as fh:  # drop a half-written last line
-            fh.truncate(good)
+        trim_checkpoint(ckpt, good)
     else:
-        with open(ckpt, "wb") as fh:
-            _append(fh, header)
-        _fsync_dir(ckpt.parent)
+        start_checkpoint(ckpt, header)
     skipped = 0
     try:
         stream, _info = model.transcribe(audio, **kwargs)
@@ -603,7 +489,7 @@ def transcribe_file(
                 if record["end"] <= resume_s and resume_s > 0:
                     skipped += 1  # the resumed decode repeated a segment we already have
                     continue
-                _append(fh, record)
+                append_record(fh, record)
                 segments.append(record)
     except Exception as exc:
         raise AnalyzeError(
@@ -639,8 +525,7 @@ def transcribe_file(
             f"cannot write {out_path}: {exc}",
             hint=f"the checkpoint {ckpt} keeps every segment; fix the output and run --resume",
         ) from exc
-    ckpt.unlink()  # only once the output is safely in place
-    _fsync_dir(ckpt.parent)
+    finish_checkpoint(ckpt)  # only once the output is safely in place
     return {
         "ok": True,
         "output": str(out_path),

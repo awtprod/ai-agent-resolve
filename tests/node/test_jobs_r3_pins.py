@@ -711,7 +711,10 @@ def test_adopted_job_a_human_deleted_meanwhile_fails_visibly(tmp_path: Path) -> 
         "render", _render_params(world), world.locator(), agent_id=AGENT_ID
     )
     world.runner.pump()
-    world.broker.run_until_idle()  # the build ran; the node dies before the checkpoint
+    # Leave a journal without an OpResult. A graceful close now checkpoints a returned
+    # build, so merely bypassing pump no longer models process death at this boundary.
+    _crash_once(world, "StartRendering")
+    _crash_drain(world)
     world.project.render_jobs.clear()  # a human removed it while the node was down
     world.project.rendering = False
     runner = world.restart()
