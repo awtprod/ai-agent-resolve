@@ -8,7 +8,7 @@ import os
 from types import SimpleNamespace
 
 import pytest
-from host_support import FakeRunner, make_config, sha256_upper
+from host_support import FakeRunner, fail_fstat_on_claim, make_config, sha256_upper
 
 from aar.host import transport
 from aar.host.errors import LocalIOError
@@ -105,10 +105,8 @@ def test_lstat_failure_keeps_and_reports_the_claim(tmp_path, monkeypatch) -> Non
 
 def test_fstat_failure_leaves_a_reported_claim(tmp_path, monkeypatch) -> None:
     _no_link(monkeypatch)
-    monkeypatch.setattr(
-        transport.os, "fstat", lambda *a, **k: (_ for _ in ()).throw(OSError(errno.EIO, "io"))
-    )
     dest = tmp_path / "out.mp4"
+    fail_fstat_on_claim(monkeypatch, dest, lambda: OSError(errno.EIO, "io"))
     with pytest.raises(LocalIOError) as info:
         _host(tmp_path).pull(REMOTE, str(dest))
     assert not dest.exists() or str(dest) in str(info.value)

@@ -181,6 +181,14 @@ CONTENT_WRITES = frozenset(
         "SetClipProperty",
         "Timeline.SetSettings",
         "Project.SetSettings",
+        "ImportMedia",
+        "AddSubFolder",
+        "SetTrackName",
+        "SetTrackEnable",
+        "SetTrackLock",
+        "AddTransition",
+        "SetCDL",
+        "SetInput",
     }
 )
 
