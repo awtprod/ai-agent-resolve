@@ -101,6 +101,20 @@ def test_node_api_body_actor_refuses_runner() -> None:
     assert got.startswith("refused"), got
 
 
+def test_node_api_body_actor_refuses_a_human() -> None:
+    """R04: the shared parser's allow-set is enforced -- the node API forbids a human body actor."""
+    from aar.hub import nodeapi
+
+    ctx = SimpleNamespace(body={"actor": {"kind": "human", "id": "operator-1"}}, node_id="node-1")
+    try:
+        nodeapi._body_actor(ctx)  # type: ignore[arg-type]
+        got = "accepted"
+    except Exception as exc:
+        got = f"refused: {type(exc).__name__}"
+    _obs("node API _body_actor({kind: human})", got)
+    assert got.startswith("refused"), got
+
+
 def test_mcp_agent_id_cannot_be_runner(hub: Any, registered_recipe: Any) -> None:
     server = build_server(hub.log, Registry(hub.log), hub.store, agent_writes=True)
 

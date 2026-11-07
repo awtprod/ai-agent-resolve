@@ -115,23 +115,30 @@ def _stored_result_sizes(hub: Any) -> list[int]:
 
 def test_unicode_heavy_agent_outputs(hub: Any, bound_recipe: str) -> None:
     rn = bound_recipe
-    over = _complete(hub, rn, {"json": {"s": "é" * (33 * 1024)}}, "u1")  # 66 KiB UTF-8
-    emoji = "\U0001f600" * 16000  # 64,000 B UTF-8 (just under the bound)
-    under = _complete(hub, rn, {"json": {"s": emoji}}, "u2")
+    over = _complete(hub, rn, {"json": {"s": "é" * (33 * 1024)}}, "u1")  # ~198 KiB escaped
+    # R3-1 stored-bytes rule: a surrogate pair escapes to 12 bytes, so 16k emoji is ~192 KiB stored
+    # and over the 64 KiB bound. A small ASCII output is accepted and stored under 64 KiB.
+    emoji = "\U0001f600" * 16000
+    big_emoji = _complete(hub, rn, {"json": {"s": emoji}}, "u2")
+    ok = _complete(hub, rn, {"json": {"s": "a" * 1024}}, "u3")
     sizes = _stored_result_sizes(hub)
     view = status_view(hub.log, rn)
     _obs(
         "unicode",
         {
             "66KiB_e_acute": over,
-            "64000B_emoji": under,
+            "16k_emoji": big_emoji,
+            "small_ascii": ok,
             "stored recipe.result payload bytes": sizes,
             "status view bytes": len(json.dumps(view)),
         },
     )
+    # Both non-ASCII heavy outputs exceed the bound measured on the stored (escaped) JSON.
     assert over == "outputs_too_large"
-    # The bound is measured on UTF-8 canonical JSON; the log stores ensure_ascii JSON.
-    assert max(sizes) <= 64 * 1024, f"stored recipe.result is {max(sizes)} bytes"
+    assert big_emoji == "outputs_too_large"
+    assert ok == "accepted"
+    # Every stored recipe.result payload is within the 64 KiB stored-bytes bound.
+    assert sizes and max(sizes) <= 64 * 1024, f"stored recipe.result sizes {sizes}"
 
 
 @pytest.mark.parametrize("depth", [900, 5000, 50000])
