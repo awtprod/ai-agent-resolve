@@ -926,6 +926,21 @@ def test_a_cdl_is_written_again_on_a_rerun_because_it_cannot_be_read() -> None:
     assert [c[0] for c in content_writes(show.fake)] == ["SetCDL"]
 
 
+def test_a_cdl_beside_a_lut_already_present_is_applied_not_present() -> None:
+    # The LUT needs no call, but the CDL is always sent (it cannot be read back), so the target
+    # is "applied": an unverifiable write is never reported as "present".
+    show = Show()
+    item = _graded(show)
+    item.graph.nodes[0].lut = "Film\\Look.cube"
+    target = {"item": ref(item), "cdl": CDL, "lut": f"{LUT_ROOT}/Film/Look.cube"}
+    result = show.ok("item.set_color", {"timeline": show.ref("Main"), "targets": [target]})
+    (applied,) = result.items
+    assert applied.status == "applied"
+    assert applied.lut is not None and applied.lut.status == "present"
+    assert applied.cdl is not None and not applied.cdl.verified
+    assert [c[0] for c in content_writes(show.fake)] == ["SetCDL"]
+
+
 def test_a_node_that_does_not_exist_is_refused() -> None:
     show = Show()
     item = _graded(show)
@@ -1351,6 +1366,46 @@ def test_a_template_that_cannot_fill_the_range_is_refused(
     template = _titles(show, **template_kwargs)
     error = show.fails("title.place", _title_params(show, template))
     assert error.code == code and calls(show, "AppendToTimeline") == []
+
+
+def test_a_template_exactly_as_long_as_the_range_fills_it() -> None:
+    # [300, 390) needs 90 frames: a 90-frame template is enough, one frame less is not.
+    show = Show()
+    result = show.ok("title.place", _title_params(show, _titles(show, frames=90)))
+    (item,) = _on_v2(show)
+    assert result.titles[0].status == "placed"
+    assert (item.start, item.end) == (START + 300, START + 390)
+    show = Show()
+    error = show.fails("title.place", _title_params(show, _titles(show, frames=89)))
+    assert (error.code, error.detail["needed"], error.detail["available"]) == (
+        "template_too_short",
+        90,
+        89,
+    )
+    assert calls(show, "AppendToTimeline") == []
+
+
+def test_a_title_that_lands_short_is_left_in_place_never_deleted() -> None:
+    # Equal rates should not land short, but if an append ever does, title.place does not run
+    # the append-fps-short repair (which deletes the short item and appends again): the item
+    # stays where it landed and the error says how long it is.
+    show = Show()
+    template = _titles(show)
+    pool = show.project.media_pool
+    real = pool.AppendToTimeline
+
+    def one_short(infos: list[Any]) -> list[Any]:
+        made = real(infos)
+        for placed in made:
+            placed.end -= 1
+        return made
+
+    pool.AppendToTimeline = one_short  # type: ignore[method-assign]
+    error = show.fails("title.place", _title_params(show, template))
+    (item,) = _on_v2(show)
+    assert error.code == "length_mismatch"
+    assert (item.start, item.end) == (START + 300, START + 389)
+    assert calls(show, "DeleteClips") == [] and len(calls(show, "AppendToTimeline")) == 1
 
 
 def test_a_title_on_a_missing_track_is_refused() -> None:
