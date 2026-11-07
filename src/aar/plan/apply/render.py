@@ -1,11 +1,10 @@
-"""Render a compiled plan as the stable dry-run diff (text and JSON).
+"""Render the compiled three-phase build as the stable dry-run diff (text and JSON).
 
-The text form is golden-tested, so every line here is a contract. With a ``--branch-describe``
-(a ``timeline.describe`` of an existing agent branch) the diff also reports idempotency: an
-append, title or marker already on the branch is "present", not re-added, so a re-apply only
-does what is missing. (Transitions, colour, transforms, gain and fades have no reliable
-read-back in a describe -- 21.1 has no CDL getter -- so the ops confirm those as present by
-their own read-back at run time; the preview marks them "re-sent".)
+Unresolved references (ids an earlier phase has not yet produced) are printed, clearly marked,
+so a preview of a later phase is still useful; a submission of such a phase is refused. With a
+``--branch-describe`` the diff reports idempotency the way decision 5 asks: it lists only what is
+missing, and "present" means a full identity match (track, record_in, source in/out, and media
+when it is resolved).
 """
 
 from __future__ import annotations
@@ -14,90 +13,90 @@ import json
 from typing import Any
 
 from aar.node.ops.read import DescribeResult
-from aar.plan.apply.compile import BuildCompilation, FinishCompilation
+from aar.plan.apply.compile import Compilation, title_track
+from aar.plan.apply.refs import find_unresolved, is_unresolved, show
 from aar.plan.model import EditPlan
 
-_RESENT_KINDS = frozenset(
-    {
-        "colour",
-        "transform",
-        "transition",
-        "audio_crossfade",
-        "outro_transition",
-        "head_fade",
-        "end_fade",
-        "audio_gain",
-    }
-)
 
-
-def _appended(build: BuildCompilation) -> list[tuple[int, int, int]]:
-    """Every appended range (content segments and the outro) as ``(track, record_in,
-    record_out)``, read from the steps so previews match the ``timeline.append_ranges`` step."""
-    rows: list[tuple[int, int, int]] = []
-    for step in build.steps:
+def _appended(assemble: Compilation) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for step in assemble.steps:
         if step.op != "timeline.append_ranges":
             continue
         for rng in step.params["ranges"]:
-            record_in = rng["record_in"]
-            rows.append((rng["track"], record_in, record_in + (rng["src_out"] - rng["src_in"])))
+            rows.append(rng)
     return rows
 
 
-def _append_groups(build: BuildCompilation) -> dict[int, list[tuple[int, int]]]:
-    groups: dict[int, list[tuple[int, int]]] = {}
-    for track, record_in, record_out in _appended(build):
-        groups.setdefault(track, []).append((record_in, record_out))
-    return groups
+def _media_id(media: Any) -> str | None:
+    if is_unresolved(media):
+        return None
+    return media.get("unique_id")
 
 
-def _present_items(describe: DescribeResult) -> set[tuple[int, int]]:
-    """``(track, record_in)`` of every item already on a video track of the branch."""
-    present: set[tuple[int, int]] = set()
+# -- idempotency (F11) -------------------------------------------------------------------------
+
+
+def _present_items(describe: DescribeResult) -> dict[int, list[Any]]:
+    by_track: dict[int, list[Any]] = {}
     for track in describe.tracks:
-        if track.type != "video":
-            continue
         for item in track.items:
-            present.add((track.index, item.record_in))
-    return present
+            by_track.setdefault(track.index, []).append(item)
+    return by_track
 
 
-def _present_markers(describe: DescribeResult) -> set[int]:
-    return {marker.frame for marker in describe.markers}
+def _item_present(
+    items: list[Any], record_in: int, src_in: int, src_out: int, media_id: str | None
+) -> bool:
+    for item in items:
+        if item.record_in != record_in:
+            continue
+        if item.source_start not in (None, src_in) or item.source_end not in (None, src_out):
+            continue
+        if media_id is not None and item.media_id not in (None, media_id):
+            continue
+        return True
+    return False
 
 
 def idempotency(
-    plan: EditPlan,
-    build: BuildCompilation,
-    finish: FinishCompilation,
-    describe: DescribeResult,
+    plan: EditPlan, assemble: Compilation, finish: Compilation, describe: DescribeResult
 ) -> dict[str, Any]:
-    """What a re-apply would skip (present) versus do (missing), from the branch describe."""
-    present = _present_items(describe)
-    marker_frames = _present_markers(describe)
-    title_track = max((p.track for p in build.placements), default=0) + 1
+    by_track = _present_items(describe)
+    marker_frames = {m.frame for m in describe.markers}
+    missing_appends: list[str] = []
+    present_appends = 0
+    for rng in _appended(assemble):
+        items = by_track.get(rng["track"], [])
+        if _item_present(
+            items, rng["record_in"], rng["src_in"], rng["src_out"], _media_id(rng["media"])
+        ):
+            present_appends += 1
+        else:
+            missing_appends.append(f"track {rng['track']} @ {rng['record_in']} ({rng['label']})")
 
-    appends = {"present": 0, "missing": 0}
-    for track, record_in, _ in _appended(build):
-        appends["present" if (track, record_in) in present else "missing"] += 1
-
-    markers = {"present": 0, "missing": 0}
-    titles = {"present": 0, "missing": 0}
-    resent = 0
+    t_track = title_track(plan)
+    missing_titles: list[str] = []
+    present_titles = 0
     for intent in finish.intents:
-        if intent.kind == "marker":
-            frame = int(intent.target.rsplit(" ", 1)[1])
-            markers["present" if frame in marker_frames else "missing"] += 1
-        elif intent.kind in ("title", "sting"):
-            here = (title_track, _title_record_in(intent)) in present
-            titles["present" if here else "missing"] += 1
-        elif intent.kind in _RESENT_KINDS:
-            resent += 1
-    return {"appends": appends, "titles": titles, "markers": markers, "re_sent": resent}
+        if intent.kind not in ("title", "sting"):
+            continue
+        record_in = _title_record_in(intent)
+        if any(i.record_in == record_in for i in by_track.get(t_track, [])):
+            present_titles += 1
+        else:
+            missing_titles.append(intent.target)
+
+    missing_markers = [f"record {m.record}" for m in plan.markers if m.record not in marker_frames]
+    present_markers = len(plan.markers) - len(missing_markers)
+    return {
+        "appends": {"present": present_appends, "missing": missing_appends},
+        "titles": {"present": present_titles, "missing": missing_titles},
+        "markers": {"present": present_markers, "missing": missing_markers},
+    }
 
 
 def _title_record_in(intent: Any) -> int:
-    # target looks like "... (record <in>..<out>)"
     span = intent.target.rsplit("record ", 1)[1].rstrip(")")
     return int(span.split("..", 1)[0])
 
@@ -105,10 +104,27 @@ def _title_record_in(intent: Any) -> int:
 # -- text --------------------------------------------------------------------------------------
 
 
+def _phase_block(lines: list[str], comp: Compilation, label: str) -> None:
+    lines.append(
+        f"PHASE {comp.phase} - {label} ({len(comp.steps)} steps, "
+        f"{comp.unresolved} unresolved ref(s))"
+    )
+    for number, step in enumerate(comp.steps, start=1):
+        marks = [show(inner_wrap(i)) for _, i in find_unresolved(step.params)]
+        suffix = f"  [UNRESOLVED: {', '.join(marks)}]" if marks else ""
+        lines.append(f"  {number}. {step.op}  [{step.name}]{suffix}")
+        lines.append(f"       {step.summary}")
+
+
+def inner_wrap(inner: dict[str, Any]) -> dict[str, Any]:
+    return {"__unresolved__": inner}
+
+
 def render_text(
     plan: EditPlan,
-    build: BuildCompilation,
-    finish: FinishCompilation,
+    prepare: Compilation,
+    assemble: Compilation,
+    finish: Compilation,
     *,
     branch_describe: DescribeResult | None = None,
 ) -> str:
@@ -120,68 +136,90 @@ def render_text(
     )
     lines.append(
         f"profile {plan.profile}: {len(plan.segments)} segment(s), "
-        f"{plan.total_frames()} frame(s); batch size {build.batch_size}"
+        f"{plan.total_frames()} frame(s); batch size {_BATCH}"
     )
     lines.append("")
 
-    lines.append(f"PHASE A - build ({len(build.steps)} steps)")
-    for number, step in enumerate(build.steps, start=1):
-        lines.append(f"  {number}. {step.op}  [{step.name}]")
-        lines.append(f"       {step.summary}")
-    lines.append("  append ranges per video track:")
-    groups = _append_groups(build)
-    for track in sorted(groups):
-        ranges = groups[track]
-        batches = -(-len(ranges) // build.batch_size)
-        shown = ", ".join(f"{a}..{b}" for a, b in ranges)
-        lines.append(f"    track {track}: {shown}  ({len(ranges)} range(s), {batches} batch(es))")
+    _phase_block(lines, prepare, "prepare")
+    lines.append("")
+    _phase_block(lines, assemble, "assemble")
+    lines.append("  append ranges per video/audio track:")
+    for track_line in _append_lines(assemble):
+        lines.append(f"    {track_line}")
     lines.append("")
 
-    lines.append(f"PHASE B - finish ({len(finish.intents)} actions)")
+    lines.append(
+        f"PHASE finish - finish ({len(finish.steps)} steps, {finish.unresolved} unresolved ref(s))"
+    )
     for intent in finish.intents:
-        lines.append(f"  {intent.kind:16} {intent.target}")
+        flag = "" if intent.resolved else "  [unresolved]"
+        lines.append(f"  {intent.kind:20} {intent.target}{flag}")
         lines.append(f"       {intent.summary}")
-    if finish.resolved:
-        lines.append(f"  (resolved into {len(finish.steps)} grouped step(s))")
     lines.append("")
 
-    notes = [*build.notes, *finish.notes]
+    notes = [*prepare.notes, *assemble.notes, *finish.notes]
+    warnings = [*prepare.warnings, *assemble.warnings, *finish.warnings]
+    lines.append(f"WARNINGS ({len(warnings)})")
+    for w in warnings:
+        lines.append(f"  ! {w}")
     lines.append(f"NOTES / GAPS ({len(notes)})")
     for note in notes:
         lines.append(f"  - {note}")
 
     if branch_describe is not None:
         lines.append("")
-        status = idempotency(plan, build, finish, branch_describe)
-        lines.append(f"IDEMPOTENCY (vs branch {branch_describe.timeline.name!r})")
+        status = idempotency(plan, assemble, finish, branch_describe)
         lines.append(
-            f"  appends: {status['appends']['present']} present, "
-            f"{status['appends']['missing']} to add"
+            f"IDEMPOTENCY (vs branch {branch_describe.timeline.name!r}) - only what is missing"
         )
-        lines.append(
-            f"  titles:  {status['titles']['present']} present, "
-            f"{status['titles']['missing']} to add"
-        )
-        lines.append(
-            f"  markers: {status['markers']['present']} present, "
-            f"{status['markers']['missing']} to add"
-        )
-        lines.append(f"  colour/transforms/transitions/fades: {status['re_sent']} re-sent")
-
+        for kind in ("appends", "titles", "markers"):
+            miss = status[kind]["missing"]
+            lines.append(f"  {kind}: {status[kind]['present']} present, {len(miss)} to add")
+            for item in miss:
+                lines.append(f"    + {item}")
     return "\n".join(lines) + "\n"
+
+
+_BATCH = 10
+
+
+def _append_lines(assemble: Compilation) -> list[str]:
+    groups: dict[tuple[str, int], list[tuple[int, int]]] = {}
+    for rng in _appended(assemble):
+        kind = "V" if rng["media_type"] in ("av", "video") else "A"
+        rec_out = rng["record_in"] + (rng["src_out"] - rng["src_in"])
+        groups.setdefault((kind, rng["track"]), []).append((rng["record_in"], rec_out))
+    out = []
+    for (kind, track), ranges in sorted(groups.items()):
+        shown = ", ".join(f"{a}..{b}" for a, b in ranges)
+        out.append(f"{kind}{track}: {shown}  ({len(ranges)} range(s))")
+    return out
 
 
 # -- json --------------------------------------------------------------------------------------
 
 
+def _phase_json(comp: Compilation) -> dict[str, Any]:
+    return {
+        "phase": comp.phase,
+        "unresolved": comp.unresolved,
+        "steps": [
+            {"op": s.op, "name": s.name, "summary": s.summary, "params": s.params}
+            for s in comp.steps
+        ],
+        "notes": comp.notes,
+        "warnings": comp.warnings,
+    }
+
+
 def render_json(
     plan: EditPlan,
-    build: BuildCompilation,
-    finish: FinishCompilation,
+    prepare: Compilation,
+    assemble: Compilation,
+    finish: Compilation,
     *,
     branch_describe: DescribeResult | None = None,
 ) -> dict[str, Any]:
-    groups = _append_groups(build)
     body: dict[str, Any] = {
         "plan": {
             "project": plan.project,
@@ -192,30 +230,16 @@ def render_json(
             "segments": len(plan.segments),
             "frames": plan.total_frames(),
         },
-        "batch_size": build.batch_size,
-        "phase_a": {
-            "steps": [
-                {"op": s.op, "name": s.name, "summary": s.summary, "params": s.params}
-                for s in build.steps
-            ],
-            "appends": [
-                {"track": track, "ranges": [[a, b] for a, b in groups[track]]}
-                for track in sorted(groups)
-            ],
-            "placements": [p.model_dump() for p in build.placements],
-        },
-        "phase_b": {
-            "resolved": finish.resolved,
+        "prepare": _phase_json(prepare),
+        "assemble": _phase_json(assemble),
+        "finish": {
+            **_phase_json(finish),
             "intents": [i.model_dump() for i in finish.intents],
-            "steps": [
-                {"op": s.op, "name": s.name, "summary": s.summary, "params": s.params}
-                for s in finish.steps
-            ],
+            "placements": [p.model_dump() for p in assemble.placements],
         },
-        "notes": [*build.notes, *finish.notes],
     }
     if branch_describe is not None:
-        body["idempotency"] = idempotency(plan, build, finish, branch_describe)
+        body["idempotency"] = idempotency(plan, assemble, finish, branch_describe)
     return body
 
 

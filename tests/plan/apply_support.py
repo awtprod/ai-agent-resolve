@@ -1,91 +1,119 @@
-"""Helpers for the ``aar.plan.apply`` tests: synthesize the phase-A results and the template /
-branch describes that the compiler takes as inputs, without touching Resolve.
-
-``synth_phase_a`` mirrors what a real phase-A run returns: one append result whose ranges carry
-a video item and an audio item for each placement, with stable ``item_id``s derived from the
-placement, so phase B can resolve them by ``(track, record_in)``.
+"""Helpers for the three-phase ``aar.plan.apply`` tests: synthesize the prepare and assemble
+result files (and the template / branch describes) the compiler reads, without touching Resolve.
 """
 
 from __future__ import annotations
 
-from aar.node.ops.framework import TimelineIdentity
-from aar.node.ops.read import (
-    DescribeResult,
-    ItemInfo,
-    MarkerInfo,
-    TimelineInfo,
-    TrackInfo,
-)
-from aar.node.ops.write import AppendedRange, AppendResult, PlacedItem
-from aar.plan.apply.compile import BuildCompilation
+from typing import Any
 
-BRANCH_NAME = "CCN Longform Template [agent:ccn-bot v1]"
+from aar.node.ops.framework import MediaRef, TimelineIdentity
+from aar.node.ops.read import DescribeResult, ItemInfo, MarkerInfo, TimelineInfo, TrackInfo
+from aar.node.ops.write import AppendedRange, AppendResult, PlacedItem
+from aar.plan.apply import PrepareResult, compile_assemble
+from aar.plan.apply.inputs import AssembleResult, FoundTitle, ImportedSource
+from aar.plan.model import EditPlan
+
 BRANCH_UID = "tl-branch-0001"
 
 
-def _placed(track: int, record_in: int, record_out: int, item_id: str, ttype: str) -> PlacedItem:
-    return PlacedItem(
-        item_id=item_id,
-        track_type=ttype,  # type: ignore[arg-type]
-        track=track,
-        start=record_in,
-        end=record_out,
-        duration=record_out - record_in,
-        record_in=record_in,
-        record_out=record_out,
-        source_start=0,
-        source_end=record_out - record_in,
+def _branch_name(plan: EditPlan) -> str:
+    return f"{plan.template} [agent:ccn-bot v1]"
+
+
+def synth_prepare(plan: EditPlan, *, unique_id: str = BRANCH_UID) -> PrepareResult:
+    """Phase-1 result: the branch, one pool item per source, one pool item per title template."""
+    sources = [
+        ImportedSource(
+            source_id=s.id,
+            media=MediaRef(unique_id=f"pool-{s.id}", bin_path=None),
+            file_path=s.media,
+        )
+        for s in plan.sources
+    ]
+    templates: list[str] = []
+    for title in plan.titles:
+        if title.template and title.template not in templates:
+            templates.append(title.template)
+    sting = plan.outro.sting if plan.outro is not None else None
+    if sting is not None and sting.template and sting.template not in templates:
+        templates.append(sting.template)
+    titles = [
+        FoundTitle(template=name, media=MediaRef(unique_id=f"title-{name}", bin_path=None))
+        for name in templates
+    ]
+    return PrepareResult(
+        branch=TimelineIdentity(name=_branch_name(plan), unique_id=unique_id),
+        sources=sources,
+        titles=titles,
     )
 
 
-def synth_phase_a(
-    build: BuildCompilation, *, name: str = BRANCH_NAME, unique_id: str = BRANCH_UID
-) -> list[AppendResult]:
-    """One append result that places a video and an audio item for every range phase A appended
-    (content segments *and* the outro), mirroring a real run."""
+def _placed(track: int, rin: int, rout: int, item_id: str, ttype: str) -> PlacedItem:
+    return PlacedItem(
+        item_id=item_id,
+        track_type=ttype,
+        track=track,
+        start=rin,
+        end=rout,
+        duration=rout - rin,
+        record_in=rin,
+        record_out=rout,
+        source_start=0,
+        source_end=rout - rin,
+    )
+
+
+def synth_assemble(
+    plan: EditPlan, prepare: PrepareResult, *, batch_size: int = 10
+) -> AssembleResult:
+    """Phase-2 result: a video and/or audio item for every range phase 2 would append."""
+    comp = compile_assemble(plan, prepare=prepare, batch_size=batch_size)
     ranges: list[AppendedRange] = []
     index = 0
-    for step in build.steps:
+    for step in comp.steps:
         if step.op != "timeline.append_ranges":
             continue
         for rng in step.params["ranges"]:
-            track = rng["track"]
-            record_in = rng["record_in"]
+            track, rin = rng["track"], rng["record_in"]
             frames = rng["src_out"] - rng["src_in"]
-            record_out = record_in + frames
-            key = f"{track}:{record_in}"
+            rout = rin + frames
+            mt = rng["media_type"]
+            video = _placed(track, rin, rout, f"V{track}:{rin}", "video") if mt != "audio" else None
+            audio = (
+                [_placed(track, rin, rout, f"A{track}:{rin}", "audio")]
+                if mt in ("av", "audio")
+                else []
+            )
             ranges.append(
                 AppendedRange(
                     index=index,
                     status="appended",
-                    planned_record_in=record_in,
-                    planned_record_out=record_out,
+                    planned_record_in=rin,
+                    planned_record_out=rout,
                     planned_frames=frames,
-                    end_frame_used=record_out,
-                    video=_placed(track, record_in, record_out, f"V{key}", "video"),
-                    audio=[_placed(track, record_in, record_out, f"A{key}", "audio")],
+                    end_frame_used=rout,
+                    video=video,
+                    audio=audio,
                     notes=[],
                 )
             )
             index += 1
-    return [
-        AppendResult(
-            timeline=TimelineIdentity(name=name, unique_id=unique_id),
-            timeline_fps=24.0,
-            cursor=0,
-            next_cursor=None,
-            done=True,
-            ranges=ranges,
-            gaps=[],
-            notes=[],
-        )
-    ]
+    result = AppendResult(
+        timeline=prepare.branch,
+        timeline_fps=24.0,
+        cursor=0,
+        next_cursor=None,
+        done=True,
+        ranges=ranges,
+        gaps=[],
+        notes=[],
+    )
+    return AssembleResult(branch=prepare.branch, appends=[result])
 
 
 def template_describe(
-    item_count: int, *, name: str = "CCN Longform Template", unique_id: str = "tl-template-0001"
+    item_count: int, *, name: str, unique_id: str = "tl-template-0001"
 ) -> DescribeResult:
-    """A describe of the template with ``item_count`` items spread on one video track."""
     items = [
         ItemInfo(
             index=i,
@@ -144,32 +172,62 @@ def template_describe(
 
 
 def branch_describe(
-    present_record_ins: list[int],
+    plan: EditPlan,
+    prepare: PrepareResult,
     *,
+    present_labels: set[str],
     marker_frames: list[int] | None = None,
 ) -> DescribeResult:
-    """A describe of an agent branch that already holds items at ``present_record_ins`` on video
-    track 1, for the idempotency diff."""
-    items = [
-        ItemInfo(
-            index=i,
-            item_id=f"b{i}",
-            name=f"item {i}",
-            type="Video",
-            start=r,
-            end=r + 1,
-            duration=1,
-            record_in=r,
-            record_out=r + 1,
-            source_start=0,
-            source_end=1,
-            media_id=None,
-            fade_in=None,
-            fade_out=None,
-            audio_volume_db=None,
+    """A describe of an agent branch holding, with full identity (record_in, source in/out,
+    media id), only the appended ranges whose label is in ``present_labels``."""
+    comp = compile_assemble(plan, prepare=prepare)
+    by_track: dict[int, list[ItemInfo]] = {}
+    idx = 0
+    for step in comp.steps:
+        if step.op != "timeline.append_ranges":
+            continue
+        for rng in step.params["ranges"]:
+            if rng["label"] not in present_labels:
+                continue
+            rin = rng["record_in"]
+            rout = rin + (rng["src_out"] - rng["src_in"])
+            by_track.setdefault(rng["track"], []).append(
+                ItemInfo(
+                    index=idx,
+                    item_id=f"b{idx}",
+                    name=rng["label"],
+                    type="Video",
+                    start=rin,
+                    end=rout,
+                    duration=rout - rin,
+                    record_in=rin,
+                    record_out=rout,
+                    source_start=rng["src_in"],
+                    source_end=rng["src_out"],
+                    media_id=rng["media"]["unique_id"],
+                    fade_in=None,
+                    fade_out=None,
+                    audio_volume_db=None,
+                    enabled=True,
+                )
+            )
+            idx += 1
+    tracks = [
+        TrackInfo(
+            type="video",
+            index=t,
+            name=f"V{t}",
             enabled=True,
+            locked=False,
+            subtype="",
+            item_count=len(items),
+            transitions=0,
+            truncated=False,
+            items=items,
+            gaps=[],
+            overlaps=0,
         )
-        for i, r in enumerate(present_record_ins)
+        for t, items in sorted(by_track.items())
     ]
     markers = [
         MarkerInfo(frame=f, color="Blue", name="", note="", duration=1, custom_data="")
@@ -177,8 +235,8 @@ def branch_describe(
     ]
     return DescribeResult(
         timeline=TimelineInfo(
-            name=BRANCH_NAME,
-            unique_id=BRANCH_UID,
+            name=prepare.branch.name,
+            unique_id=prepare.branch.unique_id,
             fps=24.0,
             drop_frame=False,
             start_frame=0,
@@ -188,24 +246,13 @@ def branch_describe(
             width=1920,
             height=1080,
         ),
-        tracks=[
-            TrackInfo(
-                type="video",
-                index=1,
-                name="V1",
-                enabled=True,
-                locked=False,
-                subtype="",
-                item_count=len(items),
-                transitions=0,
-                truncated=False,
-                items=items,
-                gaps=[],
-                overlaps=0,
-            )
-        ],
+        tracks=tracks,
         markers=markers,
         media=[],
         notes=[],
         text="",
     )
+
+
+def as_dict(obj: Any) -> Any:
+    return obj.model_dump(mode="json")

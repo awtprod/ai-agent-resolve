@@ -1,90 +1,54 @@
-"""Compile a linted EditPlan v2 into ordered Resolve build-op steps (phase A and phase B).
+"""Compile a linted EditPlan v2 into Resolve build-op steps, in three phases that each compile
+only from the real results of the phases before them (round 2).
 
-Nothing here talks to Resolve. Every op's params are built from the op's own validated model,
-so a step that compiles is a step the op (and ``aar hub job submit``) will accept.
+* **prepare** -- ``timeline.branch`` (from the template's real unique_id), ``media.import`` for
+  every source, ``media.find`` for every title template the plan uses. Inputs: plan, template
+  describe.
+* **assemble** -- ``track.ensure`` + ``timeline.append_ranges`` against the *real* branch
+  timeline and *real* pool unique_ids from the prepare result. Inputs: plan, prepare result.
+* **finish** -- transitions, ``clip.set_input_color_space``, colour, transform, ``title.place``
+  (real template pool ids), gain, fades, markers, each addressing an item resolved from the
+  assemble result by ``(track, record_in)``. Inputs: plan, prepare result, assemble result.
 
-Why two phases
---------------
-The finishing ops (``transition.add``, ``item.set_color`` and the rest) address a timeline item
-by its ``item_id``, which Resolve only mints when the clip is appended. So phase A branches,
-imports, ensures tracks and appends; phase B addresses the items phase A created, matched from
-phase A's *verified* append results by ``(track, record_in)``.
-
-Run-time-id seams (see PROGRESS.md gaps)
-----------------------------------------
-``ops.sequence`` runs each step with static params and does not thread one step's result into
-the next. Three ids are therefore run-time values the compiler cannot know from the plan alone:
-
-* the **template's** ``unique_id`` that ``timeline.branch`` needs -- supplied by
-  ``--template-describe`` (a ``timeline.describe`` of the template);
-* the **branched working timeline's** identity, which every later step must name -- taken from a
-  phase-A append result or a ``--branch-describe``; without one the dry-run uses a named
-  placeholder and ``--submit`` refuses (see :func:`~aar.plan.apply.submit.build_submission`);
-* each **imported clip's** ``unique_id`` that ``timeline.append_ranges`` needs -- which
-  ``media.import`` only returns at run time. The compiler keys append media by the plan's
-  ``Source.media`` string (what the rest of ``aar`` already treats as the clip reference); a
-  faithful run needs a job kind that threads the import result. Listed as a gap; no op is added.
+A reference an earlier phase has not produced is a typed :mod:`~aar.plan.apply.refs` unresolved
+marker, never a guessed value. A dry-run prints it; a submission is refused if any survives.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, get_args
 
 from pydantic import TypeAdapter, ValidationError
 
+from aar.node.ops import get_op
 from aar.node.ops.build import (
-    AudioFormat,  # noqa: F401  (imported so build.py registers before we read its models)
-    CdlSpec,
-    ColorParams,
-    ColorTarget,
+    AudioFormat,  # noqa: F401  (import registers build.py's ops before we read them)
     EditPath,
-    ImportParams,
-    TitleParams,
-    TitleSpec,
-    TrackParams,
-    TrackSpec,
-    TransformParams,
-    TransformTarget,
-    TransitionParams,
-    TransitionTarget,
     path_key,
 )
-from aar.node.ops.collab import BranchParams
-from aar.node.ops.framework import ItemRef, MediaRef, TimelineRef
+from aar.node.ops.framework import MediaRef, TimelineRef
 from aar.node.ops.read import DescribeResult
-from aar.node.ops.write import (
-    AppendParams,
-    AppendRange,
-    AppendResult,
-    FadesParams,
-    FadeTarget,
-    GainParams,
-    GainTarget,
-    MarkerColor,
-    MarkersParams,
-    MarkerSpec,
-    PlacedItem,
-)
+from aar.node.ops.write import MarkerColor
 from aar.plan.apply.errors import CompileError
-from aar.plan.apply.model import FinishIntent, SegmentPlacement, Step
+from aar.plan.apply.inputs import AssembleResult, PrepareResult
+from aar.plan.apply.model import FinishIntent, Phase, SegmentPlacement, Step
+from aar.plan.apply.refs import find_unresolved, unresolved
 from aar.plan.model import Cdl, EditPlan, Source
 
 DEFAULT_BATCH = 10
 MAX_BATCH = 10
-"""``AppendToTimeline`` hung Resolve 21.1 on large batches (2026-11-05): never more than 10
-ranges per ``timeline.append_ranges`` step."""
+"""AppendToTimeline hung 21.1 on large batches (2026-11-05): at most 10 ranges per step."""
 
 TEMPLATE_MAX_ITEMS = 30
-"""``DuplicateTimeline`` hung 21.1 on a 91-item timeline (2026-11-04). A template is small;
-refuse to branch one over 30 items."""
+"""DuplicateTimeline hung 21.1 on a 91-item timeline (2026-11-04)."""
+
+MAX_STEPS = 500
+"""``OpSequenceParams`` caps a job at 500 steps."""
 
 IMPORT_ROOT = "aar"
-"""Top media-pool bin the compiler imports source media under: ``aar/<camera>``."""
-
-_WORKING_SUFFIX = "agent branch"
 
 _EDIT_PATH = TypeAdapter(EditPath)
 _VIDEO_TRANSITIONS = {
@@ -96,41 +60,23 @@ _VIDEO_TRANSITIONS = {
 _MARKER_COLORS = frozenset(get_args(MarkerColor))
 
 
-@dataclass(frozen=True)
-class BranchRef:
-    """The branched working timeline's identity, from a phase-A result or ``--branch-describe``."""
-
-    name: str
-    unique_id: str
-
-    def ref(self) -> TimelineRef:
-        return TimelineRef(name=self.name, unique_id=self.unique_id)
-
-
 @dataclass
-class BuildCompilation:
-    """Phase A: the ordered steps plus where each segment landed and any gaps found."""
+class Compilation:
+    """One phase's compiled steps, with the dry-run extras and any gaps found."""
 
+    phase: Phase
     steps: list[Step]
-    placements: list[SegmentPlacement]
-    notes: list[str]
-    working: TimelineRef
-    template_items: int | None
-    batch_size: int
+    notes: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    placements: list[SegmentPlacement] = field(default_factory=list)
+    intents: list[FinishIntent] = field(default_factory=list)
 
-
-@dataclass
-class FinishCompilation:
-    """Phase B: the finishing intents, the steps (empty until an item id resolves) and gaps."""
-
-    intents: list[FinishIntent]
-    steps: list[Step]
-    notes: list[str]
-    resolved: bool
+    @property
+    def unresolved(self) -> int:
+        return sum(len(find_unresolved(step.params)) for step in self.steps)
 
 
 def plan_hash(plan: EditPlan) -> str:
-    """A stable sha256 over the plan's canonical JSON, for idempotency keys."""
     canonical = json.dumps(
         plan.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), ensure_ascii=False
     )
@@ -138,90 +84,33 @@ def plan_hash(plan: EditPlan) -> str:
 
 
 def template_item_count(describe: DescribeResult) -> int:
-    """Total timeline items the template describe reports, across all tracks."""
     return sum(track.item_count for track in describe.tracks)
 
 
-# -- phase A -----------------------------------------------------------------------------------
+# -- shared plan geometry ----------------------------------------------------------------------
 
 
-def compile_build(
-    plan: EditPlan,
-    *,
-    template: DescribeResult | None = None,
-    branch: BranchRef | None = None,
-    batch_size: int = DEFAULT_BATCH,
-) -> BuildCompilation:
-    """Compile phase A: branch the template, import media, ensure tracks, append the ranges."""
-    if not 1 <= batch_size <= MAX_BATCH:
+def video_tracks(plan: EditPlan) -> list[int]:
+    tracks = {seg.track for seg in plan.segments}
+    if plan.outro is not None:
+        tracks.add(plan.outro.track)
+    return sorted(tracks)
+
+
+def title_track(plan: EditPlan) -> int:
+    """The one overlay track for titles and the sting: above the top content track. The single
+    source of truth, shared with the renderer (F11)."""
+    return max(video_tracks(plan) or [0]) + 1
+
+
+def _check_title_track(plan: EditPlan) -> None:
+    if (plan.titles or _has_sting(plan)) and title_track(plan) > 16:
         raise CompileError(
-            "batch_size_invalid",
-            f"batch size {batch_size} is out of range (1..{MAX_BATCH})",
-            f"AppendToTimeline hung 21.1 on large batches; keep it at 1..{MAX_BATCH}",
-            batch_size=batch_size,
+            "title_track_out_of_range",
+            f"titles would land on video track {title_track(plan)}, over the 16-track limit",
+            "reduce the number of content video tracks",
+            track=title_track(plan),
         )
-    if plan.template is None:
-        raise CompileError(
-            "missing_template",
-            "the plan has no template to build from",
-            "set the plan's 'template' (the timeline timeline.branch starts from)",
-        )
-
-    notes: list[str] = []
-    template_items = _check_template(template, notes)
-    working = _working_ref(plan, branch)
-    if branch is None:
-        notes.append(
-            "working timeline named by placeholder; the real branch id is a run-time value "
-            "threaded from a phase-A result or --branch-describe"
-        )
-
-    steps: list[Step] = []
-    steps.append(_branch_step(plan, template))
-    steps.extend(_import_steps(plan, notes))
-    steps.append(_track_step(plan, working, notes))
-
-    append_steps, placements = _append_steps(plan, working, batch_size, notes)
-    steps.extend(append_steps)
-    return BuildCompilation(steps, placements, notes, working, template_items, batch_size)
-
-
-def _check_template(template: DescribeResult | None, notes: list[str]) -> int | None:
-    if template is None:
-        notes.append("template size unchecked (no --template-describe)")
-        return None
-    items = template_item_count(template)
-    if items > TEMPLATE_MAX_ITEMS:
-        raise CompileError(
-            "template_too_large",
-            f"the template has {items} items, over the {TEMPLATE_MAX_ITEMS} limit",
-            "DuplicateTimeline hung 21.1 on a 91-item timeline (2026-11-04); branch a small "
-            "template",
-            items=items,
-            limit=TEMPLATE_MAX_ITEMS,
-        )
-    return items
-
-
-def _working_ref(plan: EditPlan, branch: BranchRef | None) -> TimelineRef:
-    if branch is not None:
-        return branch.ref()
-    return TimelineRef(name=f"{plan.template} · {_WORKING_SUFFIX}")
-
-
-def _branch_step(plan: EditPlan, template: DescribeResult | None) -> Step:
-    if template is not None:
-        source = TimelineRef(name=template.timeline.name, unique_id=template.timeline.unique_id)
-        where = f"unique_id {template.timeline.unique_id}"
-    else:
-        source = TimelineRef(name=plan.template)
-        where = f"name {plan.template!r} (no unique_id: dry-run only)"
-    params = BranchParams(source=source, if_exists="reuse")
-    return _step("A", "timeline.branch", "branch", params, f"branch {where}, reuse")
-
-
-def _import_bin(source: Source) -> tuple[str, ...]:
-    return (IMPORT_ROOT, source.camera or "sources")
 
 
 def _is_edit_path(media: str) -> bool:
@@ -232,81 +121,201 @@ def _is_edit_path(media: str) -> bool:
     return True
 
 
+def _import_bin(source: Source) -> tuple[str, ...]:
+    return (IMPORT_ROOT, source.camera or "sources")
+
+
+def _title_templates(plan: EditPlan) -> list[str]:
+    names: list[str] = []
+    for title in plan.titles:
+        if title.template is not None and title.template not in names:
+            names.append(title.template)
+    if plan.outro is not None and plan.outro.sting is not None:
+        sting = plan.outro.sting
+        if sting.template is not None and sting.template not in names:
+            names.append(sting.template)
+    return names
+
+
+def _audio_index(plan: EditPlan, name: str | None) -> int | None:
+    for index, track in enumerate(plan.audio_tracks, start=1):
+        if track.name == name:
+            return index
+    return None
+
+
+# -- phase 1: prepare --------------------------------------------------------------------------
+
+
+def compile_prepare(plan: EditPlan, *, template: DescribeResult | None = None) -> Compilation:
+    if plan.template is None:
+        raise CompileError(
+            "missing_template",
+            "the plan has no template to build from",
+            "set the plan's 'template' (the timeline timeline.branch starts from)",
+        )
+    notes: list[str] = []
+    steps: list[Step] = []
+
+    if template is not None:
+        if template.timeline.name != plan.template:
+            raise CompileError(
+                "template_name_mismatch",
+                f"the template describe is of {template.timeline.name!r}, not the plan's "
+                f"template {plan.template!r}",
+                "describe the timeline the plan names as its template",
+                described=template.timeline.name,
+                expected=plan.template,
+            )
+        items = template_item_count(template)
+        if items > TEMPLATE_MAX_ITEMS:
+            raise CompileError(
+                "template_too_large",
+                f"the template has {items} items, over the {TEMPLATE_MAX_ITEMS} limit",
+                "DuplicateTimeline hung 21.1 on a 91-item timeline; branch a small template",
+                items=items,
+                limit=TEMPLATE_MAX_ITEMS,
+            )
+        source: Any = {"name": template.timeline.name, "unique_id": template.timeline.unique_id}
+        notes.append(f"template {plan.template!r} has {items} item(s) (<= {TEMPLATE_MAX_ITEMS})")
+    else:
+        source = unresolved(
+            "timeline",
+            f"template {plan.template!r} unique_id; pass --template-describe (also size-checks it)",
+        )
+        notes.append("template size unchecked (no --template-describe)")
+
+    steps.append(
+        _step(
+            "prepare",
+            "timeline.branch",
+            "branch",
+            {"source": source, "if_exists": "reuse"},
+            f"branch {plan.template!r} (reuse)",
+        )
+    )
+    steps.extend(_import_steps(plan, notes))
+    for index, name in enumerate(_title_templates(plan)):
+        steps.append(
+            _step(
+                "prepare",
+                "media.find",
+                f"find-title:{index}",
+                {"name": name, "recursive": True, "limit": 200},
+                f"find title template {name!r}",
+            )
+        )
+    if not _title_templates(plan) and (plan.titles or _has_sting(plan)):
+        notes.append(
+            "a title/sting has no template name; it cannot be placed (title.place needs one)"
+        )
+    return Compilation("prepare", steps, notes)
+
+
+def _has_sting(plan: EditPlan) -> bool:
+    return plan.outro is not None and plan.outro.sting is not None
+
+
 def _import_steps(plan: EditPlan, notes: list[str]) -> list[Step]:
     bins: dict[tuple[str, ...], list[str]] = {}
+    skipped = []
     for source in plan.sources:
         if not _is_edit_path(source.media):
+            skipped.append(source.id)
             continue
         paths = bins.setdefault(_import_bin(source), [])
         if all(path_key(p) != path_key(source.media) for p in paths):
             paths.append(source.media)
-    if not bins:
-        notes.append("no sources are edit-PC paths; media is assumed present in the pool")
+    if skipped:
+        notes.append(
+            f"sources not given as edit-PC paths are assumed already in the pool: "
+            f"{', '.join(skipped)}"
+        )
     steps: list[Step] = []
     for bin_path, paths in bins.items():
         for batch_index, batch in enumerate(_chunk(paths, 50)):
-            params = ImportParams(
-                paths=batch, bin_path=list(bin_path), create_bins=True, if_present="reuse"
+            steps.append(
+                _step(
+                    "prepare",
+                    "media.import",
+                    f"import:{'/'.join(bin_path)}:{batch_index}",
+                    {
+                        "paths": batch,
+                        "bin_path": list(bin_path),
+                        "create_bins": True,
+                        "if_present": "reuse",
+                    },
+                    f"import {len(batch)} file(s) into {'/'.join(bin_path)}",
+                )
             )
-            name = f"import:{'/'.join(bin_path)}:{batch_index}"
-            summary = f"import {len(batch)} file(s) into {'/'.join(bin_path)}"
-            steps.append(_step("A", "media.import", name, params, summary))
     return steps
 
 
-def _video_tracks(plan: EditPlan) -> list[int]:
-    tracks = {seg.track for seg in plan.segments}
-    if plan.outro is not None:
-        tracks.add(plan.outro.track)
-    return sorted(tracks)
+# -- phase 2: assemble -------------------------------------------------------------------------
 
 
-def _title_track(plan: EditPlan) -> int:
-    """Titles and the sting overlay above the content: one track past the top content track."""
-    content = _video_tracks(plan) or [1]
-    return max(content) + 1
+def compile_assemble(
+    plan: EditPlan, *, prepare: PrepareResult | None = None, batch_size: int = DEFAULT_BATCH
+) -> Compilation:
+    _check_batch(batch_size)
+    _check_title_track(plan)
+    notes: list[str] = []
+    warnings: list[str] = []
+    working = prepare.branch_ref() if prepare is not None else None
+    tl = _tl(working, "the branch; run phase 'prepare' and pass --prepare-result")
+    source_media = prepare.source_media() if prepare is not None else {}
+
+    steps: list[Step] = [_track_step(plan, tl, warnings)]
+    append_steps, placements = _append_steps(plan, tl, source_media, batch_size, notes)
+    steps.extend(append_steps)
+    _check_steps(steps)
+    return Compilation("assemble", steps, notes, warnings, placements=placements)
 
 
-def _track_step(plan: EditPlan, working: TimelineRef, notes: list[str]) -> Step:
-    specs: list[TrackSpec] = []
-    top_video = _video_tracks(plan)
-    for index in range(1, (max(top_video, default=0) or 1) + 1):
-        specs.append(TrackSpec(type="video", index=index))
-    if plan.titles or (plan.outro is not None and plan.outro.sting is not None):
-        specs.append(TrackSpec(type="video", index=_title_track(plan)))
-    manual: list[str] = []
+def _track_step(plan: EditPlan, tl: Any, warnings: list[str]) -> Step:
+    specs: list[dict[str, Any]] = []
+    for index in range(1, (max(video_tracks(plan), default=0) or 1) + 1):
+        specs.append({"type": "video", "index": index})
+    if plan.titles or _has_sting(plan):
+        specs.append({"type": "video", "index": title_track(plan)})
     for index, track in enumerate(plan.audio_tracks, start=1):
-        specs.append(TrackSpec(type="audio", index=index, name=track.name, enabled=not track.mute))
-        if track.gain_db or track.bus is not None:
-            manual.append(track.name)
-    if manual:
-        notes.append(
-            f"audio track gain_db/bus/bounce are a manual Fairlight step for {', '.join(manual)} "
-            "(track.ensure sets only name and enabled; 21.1 has no Fairlight scripting)"
-        )
-    params = TrackParams(timeline=working, tracks=specs)
+        # Never apply mute: it is template state in 21.1, and disabling a bus-fed track would
+        # render the show silent (F5). track.ensure only creates and names the track here.
+        specs.append({"type": "audio", "index": index, "name": track.name})
+        if track.mute:
+            warnings.append(
+                f"audio track {track.name!r} is marked mute in the plan; mute is template state "
+                "in 21.1, so it is not applied -- verify it in the template"
+            )
     summary = (
-        f"ensure {sum(s.type == 'video' for s in specs)} video and "
-        f"{sum(s.type == 'audio' for s in specs)} audio track(s)"
+        f"ensure {sum(s['type'] == 'video' for s in specs)} video and "
+        f"{sum(s['type'] == 'audio' for s in specs)} audio track(s)"
     )
-    return _step("A", "track.ensure", "tracks", params, summary)
+    return _step("assemble", "track.ensure", "tracks", {"timeline": tl, "tracks": specs}, summary)
 
 
-def _media_ref(plan: EditPlan, source: Source) -> MediaRef:
-    bin_path = _import_bin(source) if _is_edit_path(source.media) else None
-    return MediaRef(unique_id=source.media, bin_path=bin_path)
+def _media_ref(plan: EditPlan, source: Source, source_media: dict[str, Any]) -> Any:
+    imported = source_media.get(source.id)
+    if imported is not None:
+        return imported.media.model_dump(mode="json")
+    if source.id in source_media or not _is_edit_path(source.media):
+        # A pool-name source already in the pool: use it as given (its media is a pool id/name).
+        return MediaRef(unique_id=source.media, bin_path=None).model_dump(mode="json")
+    return unresolved(
+        "media",
+        f"pool unique_id for source {source.id!r} ({source.media}); run phase 'prepare'",
+    )
 
 
 def _append_steps(
-    plan: EditPlan, working: TimelineRef, batch_size: int, notes: list[str]
+    plan: EditPlan, tl: Any, source_media: dict[str, Any], batch_size: int, notes: list[str]
 ) -> tuple[list[Step], list[SegmentPlacement]]:
     ranges = plan.record_ranges()
     sources = plan.source_map()
     steps: list[Step] = []
     placements: list[SegmentPlacement] = []
-    # Per track, in record order (segment list order is record order).
-    for track in _video_tracks(plan):
-        on_track: list[tuple[int | None, AppendRange]] = []
+    for track in video_tracks(plan):
+        on_track: list[tuple[int | None, dict[str, Any]]] = []
         for index, seg in enumerate(plan.segments):
             if seg.track != track:
                 continue
@@ -319,58 +328,118 @@ def _append_steps(
                     segment=index,
                     source=seg.source,
                 )
-            record_in = ranges[index][0]
-            rng = AppendRange(
-                media=_media_ref(plan, source),
-                src_in=seg.src_in,
-                src_out=seg.src_out,
-                track=track,
-                media_type="av",
-                record_in=record_in,
-                label=f"segment {index}",
+            if seg.length <= 0:
+                raise CompileError(
+                    "zero_length_segment",
+                    f"segment {index} has a non-positive length ({seg.src_in}..{seg.src_out})",
+                    "give src_out greater than src_in",
+                    segment=index,
+                )
+            on_track.append(
+                (
+                    index,
+                    _range(
+                        _media_ref(plan, source, source_media),
+                        seg.src_in,
+                        seg.src_out,
+                        track,
+                        "av",
+                        ranges[index][0],
+                        f"segment {index}",
+                    ),
+                )
             )
-            on_track.append((index, rng))
-        if plan.outro is not None and plan.outro.track == track:
-            on_track.append((None, _outro_range(plan, working)))
-        _batch_track(track, working, on_track, batch_size, ranges, steps, placements)
+        _batch_track(track, tl, on_track, batch_size, ranges, steps, placements)
+    _outro_append(plan, tl, source_media, steps, notes)
     if not placements:
         notes.append("no video segments to append")
     return steps, placements
 
 
-def _outro_range(plan: EditPlan, _working: TimelineRef) -> AppendRange:
-    assert plan.outro is not None
+def _outro_append(
+    plan: EditPlan, tl: Any, source_media: dict[str, Any], steps: list[Step], notes: list[str]
+) -> None:
     outro = plan.outro
+    if outro is None:
+        return
     source = plan.source_map()[outro.source]
     end = outro.src_out if outro.src_out is not None else source.duration
     assert end is not None, "a validated plan knows the outro's length"
-    return AppendRange(
-        media=_media_ref(plan, source),
-        src_in=outro.src_in,
-        src_out=end,
-        track=outro.track,
-        media_type="av",
-        record_in=plan.content_frames(),
-        label="outro",
+    start = plan.content_frames()
+    media = _media_ref(plan, source, source_media)
+    # The outro's picture on its video track, and its sound on the named audio track (the A5 bus
+    # in CCN), never on A1 (F4).
+    steps.append(
+        _step(
+            "assemble",
+            "timeline.append_ranges",
+            f"append:outro-v{outro.track}",
+            {
+                "timeline": tl,
+                "ranges": [_range(media, outro.src_in, end, outro.track, "video", start, "outro")],
+            },
+            f"append outro video on track {outro.track} (record {start})",
+        )
     )
+    audio_index = _audio_index(plan, outro.audio_track)
+    if audio_index is None:
+        notes.append(
+            f"outro.audio_track {outro.audio_track!r} is not in audio_tracks; the outro audio is "
+            "not placed (it must not fall back to A1)"
+        )
+        return
+    steps.append(
+        _step(
+            "assemble",
+            "timeline.append_ranges",
+            f"append:outro-a{audio_index}",
+            {
+                "timeline": tl,
+                "ranges": [
+                    _range(media, outro.src_in, end, audio_index, "audio", start, "outro-audio")
+                ],
+            },
+            f"append outro audio on audio track {audio_index} ({outro.audio_track})",
+        )
+    )
+
+
+def _range(
+    media: Any, src_in: int, src_out: int, track: int, media_type: str, record_in: int, label: str
+) -> dict[str, Any]:
+    return {
+        "media": media,
+        "src_in": src_in,
+        "src_out": src_out,
+        "track": track,
+        "media_type": media_type,
+        "record_in": record_in,
+        "label": label,
+    }
 
 
 def _batch_track(
     track: int,
-    working: TimelineRef,
-    on_track: list[tuple[int | None, AppendRange]],
+    tl: Any,
+    on_track: list[tuple[int | None, dict[str, Any]]],
     batch_size: int,
     ranges: list[tuple[int, int]],
     steps: list[Step],
     placements: list[SegmentPlacement],
 ) -> None:
     for batch_index, batch in enumerate(_chunk(on_track, batch_size)):
-        name = f"append:v{track}:{batch_index}"
         rngs = [rng for _, rng in batch]
-        params = AppendParams(timeline=working, ranges=rngs)
-        first, last = rngs[0].record_in, rngs[-1].record_in
-        summary = f"append {len(rngs)} range(s) on video track {track} (record {first}..{last})"
-        steps.append(_step("A", "timeline.append_ranges", name, params, summary))
+        name = f"append:v{track}:{batch_index}"
+        first, last = rngs[0]["record_in"], rngs[-1]["record_in"]
+        steps.append(
+            _step(
+                "assemble",
+                "timeline.append_ranges",
+                name,
+                {"timeline": tl, "ranges": rngs},
+                f"append {len(rngs)} range(s) on video track {track} (record {first}..{last})",
+            )
+        )
         for seg_index, rng in batch:
             if seg_index is None:
                 continue
@@ -380,122 +449,170 @@ def _batch_track(
                     track=track,
                     record_in=ranges[seg_index][0],
                     record_out=ranges[seg_index][1],
-                    frames=rng.src_out - rng.src_in,
-                    source=rng.media.unique_id,
+                    frames=rng["src_out"] - rng["src_in"],
+                    source=rng["label"],
                     append_step=name,
                 )
             )
 
 
-# -- phase B -----------------------------------------------------------------------------------
+# -- phase 3: finish ---------------------------------------------------------------------------
 
 
 @dataclass
 class _Resolver:
-    """Maps ``(video track, record_in)`` to the appended items phase A verified."""
-
-    by_key: dict[tuple[int, int], PlacedItem]
-    audio_by_key: dict[tuple[int, int], list[PlacedItem]]
+    video: dict[tuple[int, int], str]
+    content_audio: dict[tuple[int, int], list[str]]
+    audio_only: dict[tuple[int, int], list[str]]
     ambiguous: set[tuple[int, int]]
     timeline: TimelineRef
 
-    def video(self, track: int, record_in: int) -> PlacedItem:
+    def video_item(self, track: int, record_in: int) -> dict[str, Any]:
         key = (track, record_in)
         if key in self.ambiguous:
             raise CompileError(
                 "segment_double_matched",
                 f"two appended ranges match video track {track} at record {record_in}",
-                "phase A appended the same slot twice; re-run phase A cleanly",
+                "phase 2 appended the same slot twice; re-run it cleanly",
                 track=track,
                 record_in=record_in,
             )
-        item = self.by_key.get(key)
+        item = self.video.get(key)
         if item is None:
             raise CompileError(
                 "segment_unmatched",
                 f"no appended item on video track {track} at record {record_in}",
-                "give the phase-A result that appended this segment",
+                "give the phase-2 (assemble) result that appended this segment",
                 track=track,
                 record_in=record_in,
             )
-        return item
+        return {"track_type": "video", "track": track, "item_id": item}
 
-    def audio(self, track: int, record_in: int) -> list[PlacedItem]:
-        return self.audio_by_key.get((track, record_in), [])
+    def content_audio_items(self, track: int, record_in: int) -> list[dict[str, Any]]:
+        return [
+            {"track_type": "audio", "track": track, "item_id": i}
+            for i in self.content_audio.get((track, record_in), [])
+        ]
+
+    def audio_only_items(self, track: int, record_in: int) -> list[dict[str, Any]]:
+        return [
+            {"track_type": "audio", "track": track, "item_id": i}
+            for i in self.audio_only.get((track, record_in), [])
+        ]
 
 
-def _resolver(phase_a_results: list[AppendResult]) -> _Resolver:
-    by_key: dict[tuple[int, int], PlacedItem] = {}
-    audio_by_key: dict[tuple[int, int], list[PlacedItem]] = {}
+def _resolver(plan: EditPlan, assemble: AssembleResult) -> _Resolver:
+    video: dict[tuple[int, int], str] = {}
+    content_audio: dict[tuple[int, int], list[str]] = {}
+    audio_only: dict[tuple[int, int], list[str]] = {}
     ambiguous: set[tuple[int, int]] = set()
-    timeline: TimelineRef | None = None
-    for result in phase_a_results:
-        timeline = TimelineRef(name=result.timeline.name, unique_id=result.timeline.unique_id)
+    branch_id = assemble.branch.unique_id
+    timeline = assemble.branch_ref()
+    for result in assemble.appends:
+        if result.timeline.unique_id != branch_id:
+            raise CompileError(
+                "phase_result_mismatch",
+                f"an append result is from timeline {result.timeline.unique_id!r}, not the "
+                f"assemble branch {branch_id!r}",
+                "every result must come from the same branch timeline",
+            )
         for appended in result.ranges:
             if appended.video is not None:
                 key = (appended.video.track, appended.planned_record_in)
-                if key in by_key:
+                if key in video:
                     ambiguous.add(key)
-                by_key[key] = appended.video
-                audio_by_key[key] = list(appended.audio)
-    if timeline is None:
-        raise CompileError(
-            "missing_phase_a_result",
-            "the phase-A result holds no append results, so no timeline is known",
-            "give a phase-A result from a run of compile_build's steps",
-        )
-    return _Resolver(by_key, audio_by_key, ambiguous, timeline)
+                video[key] = appended.video.item_id
+                content_audio[key] = [p.item_id for p in appended.audio]
+            elif appended.audio:
+                key = (appended.audio[0].track, appended.planned_record_in)
+                audio_only.setdefault(key, []).extend(p.item_id for p in appended.audio)
+    return _Resolver(video, content_audio, audio_only, ambiguous, timeline)
 
 
 def compile_finish(
     plan: EditPlan,
-    phase_a_results: list[AppendResult] | None = None,
     *,
+    prepare: PrepareResult | None = None,
+    assemble: AssembleResult | None = None,
     batch_size: int = DEFAULT_BATCH,
-) -> FinishCompilation:
-    """Compile phase B. With ``phase_a_results`` it emits steps addressing resolved item ids;
-    without, it emits only the intents for a dry-run."""
-    notes: list[str] = []
-    resolver = _resolver(phase_a_results) if phase_a_results else None
-    builder = _FinishBuilder(plan, resolver, notes)
+) -> Compilation:
+    _check_batch(batch_size)
+    if (
+        prepare is not None
+        and assemble is not None
+        and prepare.branch.unique_id != assemble.branch.unique_id
+    ):
+        raise CompileError(
+            "phase_result_mismatch",
+            "the prepare and assemble results are from different branch timelines",
+            "pass the prepare and assemble results of the same build",
+        )
+    resolver = _resolver(plan, assemble) if assemble is not None else None
+    if resolver is not None:
+        _check_all_segments_matched(plan, resolver)
+    builder = _Finish(plan, prepare, resolver)
     builder.run()
-    steps = builder.to_steps(batch_size) if resolver is not None else []
-    return FinishCompilation(builder.intents, steps, notes, resolver is not None)
+    steps = builder.to_steps(plan)
+    _check_steps(steps)
+    return Compilation("finish", steps, builder.notes, builder.warnings, intents=builder.intents)
 
 
-@dataclass
-class _Action:
-    kind: str
-    op: str
-    target: str
-    summary: str
-    # The op target model, with its item ref filled once resolved (None until then).
-    make_target: Any
+def _check_all_segments_matched(plan: EditPlan, resolver: _Resolver) -> None:
+    """Every content segment must be matched exactly once in the assemble result, finishing op
+    or not (F8)."""
+    ranges = plan.record_ranges()
+    for index, seg in enumerate(plan.segments):
+        resolver.video_item(seg.track, ranges[index][0])  # raises unmatched / double_matched
 
 
-class _FinishBuilder:
-    """Walks the plan once, producing a :class:`FinishIntent` (and, when resolved, an op target)
-    for every colour, transform, transition, title, gain, fade and marker."""
-
-    def __init__(self, plan: EditPlan, resolver: _Resolver | None, notes: list[str]) -> None:
+class _Finish:
+    def __init__(self, plan: EditPlan, prepare: PrepareResult | None, resolver: _Resolver | None):
         self.plan = plan
+        self.prepare = prepare
         self.resolver = resolver
-        self.notes = notes
+        self.titles = prepare.title_media() if prepare is not None else {}
+        self.imports = prepare.source_media() if prepare is not None else {}
         self.ranges = plan.record_ranges()
+        self.notes: list[str] = []
+        self.warnings: list[str] = []
         self.intents: list[FinishIntent] = []
-        self._targets: dict[str, list[Any]] = {
-            "transition.add": [],
-            "item.set_color": [],
-            "item.set_transform": [],
-            "item.set_audio_gain": [],
-            "item.set_fades": [],
-            "title.place": [],
-            "markers.add": [],
+        self._t: dict[str, list[dict[str, Any]]] = {
+            op: []
+            for op in (
+                "transition.add",
+                "clip.set_input_color_space",
+                "item.set_color",
+                "item.set_transform",
+                "item.set_audio_gain",
+                "item.set_fades",
+                "title.place",
+                "markers.add",
+            )
         }
+
+    # -- resolution helpers --------------------------------------------------------------------
+
+    def _video(self, track: int, record_in: int, what: str) -> Any:
+        if self.resolver is None:
+            return unresolved("item", f"{what}; run phase 'assemble' and pass --assemble-result")
+        return self.resolver.video_item(track, record_in)
+
+    def _content_audio(self, track: int, record_in: int) -> list[Any] | None:
+        if self.resolver is None:
+            return None
+        return self.resolver.content_audio_items(track, record_in)
+
+    def _resolved(self, ref: Any) -> bool:
+        return not find_unresolved(ref)
+
+    def _emit(self, op: str, target: Any, intent: FinishIntent) -> None:
+        self.intents.append(intent)
+        self._t[op].append(target)
 
     # -- walk ----------------------------------------------------------------------------------
 
     def run(self) -> None:
+        self._colour_spaces()
         self._colours()
         self._transforms()
         self._transitions()
@@ -503,25 +620,48 @@ class _FinishBuilder:
         self._audio_gain()
         self._titles()
         self._markers()
+        self._captions()
 
-    def _video_item(self, track: int, record_in: int) -> ItemRef | None:
-        if self.resolver is None:
-            return None
-        placed = self.resolver.video(track, record_in)
-        return ItemRef(track_type="video", track=placed.track, item_id=placed.item_id)
+    # -- F6: input colour space ----------------------------------------------------------------
 
-    def _audio_items(self, track: int, record_in: int) -> list[ItemRef]:
-        if self.resolver is None:
-            return []
-        return [
-            ItemRef(track_type="audio", track=p.track, item_id=p.item_id)
-            for p in self.resolver.audio(track, record_in)
-        ]
-
-    def _emit(self, op: str, target: Any | None, intent: FinishIntent) -> None:
-        self.intents.append(intent)
-        if target is not None:
-            self._targets[op].append(target)
+    def _colour_spaces(self) -> None:
+        by_space: dict[str, list[tuple[str, Any]]] = {}
+        for source in self.plan.sources:
+            if source.color is None or source.color.input_color_space is None:
+                continue
+            space = source.color.input_color_space
+            imported = self.imports.get(source.id)
+            if imported is not None:
+                if _is_braw(imported.file_path):
+                    self.notes.append(
+                        f"source {source.id!r} is BRAW ({imported.file_path}); input colour space "
+                        "not set (house safety rule)"
+                    )
+                    continue
+                item: Any = imported.media.model_dump(mode="json")
+            elif _is_braw(source.media):
+                self.notes.append(
+                    f"source {source.id!r} looks BRAW ({source.media}); input colour space not set"
+                )
+                continue
+            else:
+                item = unresolved(
+                    "media", f"pool item for source {source.id!r}; run phase 'prepare'"
+                )
+            by_space.setdefault(space, []).append((source.id, item))
+        for space, items in by_space.items():
+            resolved = all(self._resolved(i) for _, i in items)
+            self._emit(
+                "clip.set_input_color_space",
+                {"items": [i for _, i in items], "color_space": space},
+                FinishIntent(
+                    kind="input_colour_space",
+                    op="clip.set_input_color_space",
+                    target=f"sources {', '.join(s for s, _ in items)}",
+                    summary=f"input colour space {space!r} (non-BRAW only)",
+                    resolved=resolved,
+                ),
+            )
 
     # -- colour --------------------------------------------------------------------------------
 
@@ -531,20 +671,15 @@ class _FinishBuilder:
             if source is None or source.color is None:
                 continue
             color = source.color
-            if color.input_color_space is not None:
-                self.notes.append(
-                    f"source {source.id!r} input_color_space is not compiled: item.set_color has "
-                    "no such field (21.1); set it by hand, never on BRAW"
-                )
             if color.cdl is None and color.lut is None:
                 continue
             record_in = self.ranges[index][0]
-            item = self._video_item(seg.track, record_in)
-            target = (
-                ColorTarget(item=item, cdl=_cdl(color.cdl), lut=color.lut)
-                if item is not None
-                else None
-            )
+            item = self._video(seg.track, record_in, f"segment {index} colour")
+            target: Any = {"item": item}
+            if color.cdl is not None:
+                target["cdl"] = _cdl_dict(color.cdl)
+            if color.lut is not None:
+                target["lut"] = color.lut
             self._emit(
                 "item.set_color",
                 target,
@@ -553,7 +688,7 @@ class _FinishBuilder:
                     op="item.set_color",
                     target=_seg_target(index, seg.track, record_in),
                     summary=_colour_summary(color.cdl, color.lut),
-                    resolved=item is not None,
+                    resolved=self._resolved(item),
                 ),
             )
 
@@ -565,41 +700,67 @@ class _FinishBuilder:
                 continue
             tf = seg.transform
             record_in = self.ranges[index][0]
-            item = self._video_item(seg.track, record_in)
-            target = (
-                TransformTarget(
-                    item=item,
-                    zoom=tf.zoom,
-                    pan=tf.pan,
-                    tilt=tf.tilt,
-                    rotation_deg=tf.rotation_deg,
-                    flip_h=tf.flip_h,
-                    flip_v=tf.flip_v,
-                )
-                if item is not None
-                else None
-            )
+            item = self._video(seg.track, record_in, f"segment {index} transform")
             self._emit(
                 "item.set_transform",
-                target,
+                {
+                    "item": item,
+                    "zoom": tf.zoom,
+                    "pan": tf.pan,
+                    "tilt": tf.tilt,
+                    "rotation_deg": tf.rotation_deg,
+                    "flip_h": tf.flip_h,
+                    "flip_v": tf.flip_v,
+                },
                 FinishIntent(
                     kind="transform",
                     op="item.set_transform",
                     target=_seg_target(index, seg.track, record_in),
-                    summary=(
-                        f"zoom {tf.zoom:g}, pan {tf.pan:g}, tilt {tf.tilt:g}, "
-                        f"rot {tf.rotation_deg:g}, flip_h {tf.flip_h}, flip_v {tf.flip_v}"
-                    ),
-                    resolved=item is not None,
+                    summary=f"zoom {tf.zoom:g}, pan {tf.pan:g}, tilt {tf.tilt:g}, "
+                    f"rot {tf.rotation_deg:g}, flip_h {tf.flip_h}, flip_v {tf.flip_v}",
+                    resolved=self._resolved(item),
                 ),
             )
 
     # -- transitions ---------------------------------------------------------------------------
 
     def _transitions(self) -> None:
+        self._head_transition()
         for tx in self.plan.transitions:
             self._content_transition(tx)
         self._outro_transition()
+
+    def _head_transition(self) -> None:
+        head = self.plan.head
+        first = _first_content_segment(self.plan)
+        if head is None or first is None or head.video == "cut":
+            return
+        name = _VIDEO_TRANSITIONS.get(head.video)
+        if name is None:
+            self.notes.append(f"head transition {head.video!r} has no 21.1 name; manual step")
+            return
+        index, track, record_in = first
+        # Head from black: transition.add on the first item's start, right-aligned, so the
+        # missing outgoing (black) needs no handle (API fact build.py _handles: right=(f,0)).
+        item = self._video(track, record_in, f"head on segment {index}")
+        self._emit(
+            "transition.add",
+            {
+                "item": item,
+                "position": "start",
+                "type": name,
+                "category": "simple",
+                "alignment": "right",
+                "frames": head.video_frames,
+            },
+            FinishIntent(
+                kind="head_transition",
+                op="transition.add",
+                target=f"head from black on segment {index} (video track {track})",
+                summary=f"{name}, right (from black), {head.video_frames} frames",
+                resolved=self._resolved(item),
+            ),
+        )
 
     def _content_transition(self, tx: Any) -> None:
         seg = self.plan.segments[tx.after]
@@ -607,178 +768,206 @@ class _FinishBuilder:
         if tx.video != "cut":
             name = _VIDEO_TRANSITIONS.get(tx.video)
             if name is None:
-                self.notes.append(
-                    f"segment {tx.after}: video transition {tx.video!r} has no 21.1 name; "
-                    "left as a manual step"
-                )
+                self.notes.append(f"segment {tx.after}: transition {tx.video!r} has no 21.1 name")
             else:
-                item = self._video_item(seg.track, record_in)
-                target = (
-                    TransitionTarget(
-                        item=item,
-                        position="end",
-                        type=name,
-                        category="simple",
-                        alignment="center",
-                        frames=tx.video_frames,
-                    )
-                    if item is not None
-                    else None
-                )
+                align = self._alignment(tx.after, tx.video_frames, f"segment {tx.after} dissolve")
+                item = self._video(seg.track, record_in, f"segment {tx.after} dissolve")
                 self._emit(
                     "transition.add",
-                    target,
+                    {
+                        "item": item,
+                        "position": "end",
+                        "type": name,
+                        "category": "simple",
+                        "alignment": align,
+                        "frames": tx.video_frames,
+                    },
                     FinishIntent(
                         kind="transition",
                         op="transition.add",
                         target=f"after segment {tx.after} (video track {seg.track})",
-                        summary=f"{name}, center, {tx.video_frames} frames",
-                        resolved=item is not None,
+                        summary=f"{name}, {align}, {tx.video_frames} frames",
+                        resolved=self._resolved(item),
                     ),
                 )
         if tx.audio is not None and tx.audio.frames > 0:
             self._audio_crossfade(tx.after, seg.track, record_in, tx.audio)
 
     def _audio_crossfade(self, after: int, track: int, record_in: int, audio: Any) -> None:
-        items = self._audio_items(track, record_in)
-        made_target = items[0] if items else None
-        target = (
-            TransitionTarget(
-                item=made_target,
-                position="end",
-                type=audio.type,
-                category="audio",
-                alignment="center",
-                frames=audio.frames,
+        align = self._alignment(after, audio.frames, f"segment {after} crossfade")
+        items = self._content_audio(track, record_in)
+        refs = (
+            items
+            if items is not None
+            else [unresolved("item", f"audio of segment {after}; run phase 'assemble'")]
+        )
+        if items is not None and not items:
+            self.notes.append(f"segment {after}: no audio item to crossfade")
+            return
+        for position, ref in enumerate(refs):
+            self._emit(
+                "transition.add",
+                {
+                    "item": ref,
+                    "position": "end",
+                    "type": audio.type,
+                    "category": "audio",
+                    "alignment": align,
+                    "frames": audio.frames,
+                },
+                FinishIntent(
+                    kind="audio_crossfade",
+                    op="transition.add",
+                    target=f"after segment {after} (audio item {position})",
+                    summary=f"{audio.type}, {align}, {audio.frames} frames",
+                    resolved=self._resolved(ref),
+                ),
             )
-            if made_target is not None
-            else None
-        )
-        self._emit(
-            "transition.add",
-            target,
-            FinishIntent(
-                kind="audio_crossfade",
-                op="transition.add",
-                target=f"after segment {after} (audio under track {track})",
-                summary=f"{audio.type}, center, {audio.frames} frames",
-                resolved=made_target is not None,
-            ),
-        )
 
     def _outro_transition(self) -> None:
         outro = self.plan.outro
         if outro is None or outro.transition.video == "cut":
             return
         name = _VIDEO_TRANSITIONS.get(outro.transition.video)
-        content_end = self.plan.content_frames()
-        # The transition sits on the last content item that ends at the content boundary.
         last = _last_content_segment(self.plan)
         if name is None or last is None:
             if name is None:
-                self.notes.append(
-                    f"outro transition {outro.transition.video!r} has no 21.1 name; manual step"
-                )
+                self.notes.append(f"outro transition {outro.transition.video!r} has no 21.1 name")
             return
         index, track, record_in = last
-        item = self._video_item(track, record_in)
-        target = (
-            TransitionTarget(
-                item=item,
-                position="end",
-                type=name,
-                category="simple",
-                alignment="left",
-                frames=outro.transition.video_frames,
-            )
-            if item is not None
-            else None
-        )
+        align = self._alignment(index, outro.transition.video_frames, "outro transition")
+        item = self._video(track, record_in, "outro transition")
         self._emit(
             "transition.add",
-            target,
+            {
+                "item": item,
+                "position": "end",
+                "type": name,
+                "category": "simple",
+                "alignment": align,
+                "frames": outro.transition.video_frames,
+            },
             FinishIntent(
                 kind="outro_transition",
                 op="transition.add",
-                target=f"content into outro (segment {index}, record {content_end})",
-                summary=f"{name}, left, {outro.transition.video_frames} frames",
-                resolved=item is not None,
+                target=f"content into outro (segment {index})",
+                summary=f"{name}, {align}, {outro.transition.video_frames} frames",
+                resolved=self._resolved(item),
             ),
         )
+
+    def _alignment(self, outgoing_index: int, frames: int, what: str) -> str:
+        """Choose an alignment from the handles the plan's source ranges actually have, and
+        refuse when none fits (F7). Outgoing tail = source.duration - src_out; incoming head =
+        the next same-track segment's src_in (0 for the outro, which starts at source frame 0)."""
+        sources = self.plan.source_map()
+        out_seg = self.plan.segments[outgoing_index]
+        out_src = sources.get(out_seg.source)
+        tail = (
+            None
+            if out_src is None or out_src.duration is None
+            else out_src.duration - out_seg.src_out
+        )
+        head = self._incoming_head(outgoing_index)
+        half = frames // 2
+        if _fits(tail, half) and _fits(head, half):
+            return "center"
+        if _fits(tail, frames):
+            return "right"
+        if _fits(head, frames):
+            return "left"
+        raise CompileError(
+            "no_handle_for_transition",
+            f"{what}: no alignment fits a {frames}-frame transition (outgoing tail {tail}, "
+            f"incoming head {head})",
+            "shorten the transition or give the source ranges more handle",
+            outgoing_tail=tail,
+            incoming_head=head,
+            frames=frames,
+        )
+
+    def _incoming_head(self, outgoing_index: int) -> int | None:
+        track = self.plan.segments[outgoing_index].track
+        for index in range(outgoing_index + 1, len(self.plan.segments)):
+            if self.plan.segments[index].track == track:
+                return self.plan.segments[index].src_in
+        if self.plan.outro is not None and self.plan.outro.track == track:
+            return self.plan.outro.src_in
+        return None
 
     # -- head / end fades ----------------------------------------------------------------------
 
     def _head_and_end_fades(self) -> None:
-        self._head_fade()
-        self._end_fade()
-
-    def _head_fade(self) -> None:
         head = self.plan.head
         first = _first_content_segment(self.plan)
-        if head is None or first is None:
-            return
-        index, track, record_in = first
-        video_frames = head.video_frames if head.video != "cut" else 0
-        if video_frames > 0:
-            item = self._video_item(track, record_in)
-            target = FadeTarget(item=item, fade_in=video_frames) if item is not None else None
-            self._emit(
-                "item.set_fades",
-                target,
-                FinishIntent(
-                    kind="head_fade",
-                    op="item.set_fades",
-                    target=f"first segment {index} (video track {track})",
-                    summary=f"video fade-in {video_frames} frames (from black)",
-                    resolved=item is not None,
-                ),
+        if head is not None and first is not None and head.audio_fade_frames > 0:
+            index, track, record_in = first
+            # Audio fade-in from silence: no audio-from-silence transition primitive exists
+            # (AddTransition audio needs an adjacent clip), so the clip fade handle is used.
+            self.notes.append(
+                "head audio fade uses the clip fade handle (item.set_fades); 21.1 has no "
+                "audio transition from silence"
             )
-        if head.audio_fade_frames > 0:
-            for audio in self._audio_items(track, record_in) or [None]:
-                target = (
-                    FadeTarget(item=audio, fade_in=head.audio_fade_frames)
-                    if audio is not None
-                    else None
-                )
-                self._emit(
-                    "item.set_fades",
-                    target,
-                    FinishIntent(
-                        kind="head_fade",
-                        op="item.set_fades",
-                        target=f"first segment {index} (audio under track {track})",
-                        summary=f"audio fade-in {head.audio_fade_frames} frames",
-                        resolved=audio is not None,
-                    ),
+            self._fades(
+                track, record_in, fade_in=head.audio_fade_frames, target=f"first segment {index}"
+            )
+        if self.plan.end_fade_frames and self.plan.end_fade_frames > 0:
+            track, record_in, where = self._end_item()
+            if track is not None:
+                self._fades(
+                    track,
+                    record_in,
+                    fade_out=self.plan.end_fade_frames,
+                    target=where,
+                    audio_only=self.plan.outro is not None,
                 )
 
-    def _end_fade(self) -> None:
-        if self.plan.end_fade_frames is None or self.plan.end_fade_frames <= 0:
-            return
+    def _end_item(self) -> tuple[int | None, int, str]:
         if self.plan.outro is not None:
-            track, record_in = self.plan.outro.track, self.plan.content_frames()
-            where = "outro"
+            index = _audio_index(self.plan, self.plan.outro.audio_track)
+            if index is None:
+                return None, 0, "outro"
+            return index, self.plan.content_frames(), "outro audio"
+        last = _last_content_segment(self.plan)
+        if last is None:
+            return None, 0, ""
+        idx, track, record_in = last
+        return track, record_in, f"last segment {idx}"
+
+    def _fades(
+        self,
+        track: int,
+        record_in: int,
+        *,
+        fade_in: int | None = None,
+        fade_out: int | None = None,
+        target: str,
+        audio_only: bool = False,
+    ) -> None:
+        if self.resolver is None:
+            items: list[Any] = [unresolved("item", f"audio of {target}; run phase 'assemble'")]
+        elif audio_only:
+            items = self.resolver.audio_only_items(track, record_in)
         else:
-            last = _last_content_segment(self.plan)
-            if last is None:
-                return
-            index, track, record_in = last
-            where = f"last segment {index}"
-        for audio in self._audio_items(track, record_in) or [None]:
-            target = (
-                FadeTarget(item=audio, fade_out=self.plan.end_fade_frames)
-                if audio is not None
-                else None
-            )
+            items = self.resolver.content_audio_items(track, record_in)
+        if self.resolver is not None and not items:
+            self.notes.append(f"{target}: no audio item to fade")
+            return
+        for position, ref in enumerate(items):
+            fade: dict[str, Any] = {"item": ref}
+            if fade_in is not None:
+                fade["fade_in"] = fade_in
+            if fade_out is not None:
+                fade["fade_out"] = fade_out
             self._emit(
                 "item.set_fades",
-                target,
+                fade,
                 FinishIntent(
-                    kind="end_fade",
+                    kind="fade",
                     op="item.set_fades",
-                    target=f"{where} (audio under track {track})",
-                    summary=f"audio fade-out {self.plan.end_fade_frames} frames (de-click)",
-                    resolved=audio is not None,
+                    target=f"{target} (audio item {position})",
+                    summary=f"fade_in {fade_in} fade_out {fade_out}",
+                    resolved=self._resolved(ref),
                 ),
             )
 
@@ -788,45 +977,62 @@ class _FinishBuilder:
         for index, seg in enumerate(self.plan.segments):
             if seg.gain_db == 0.0:
                 continue
+            if not -100.0 <= seg.gain_db <= 30.0:
+                raise CompileError(
+                    "gain_out_of_range",
+                    f"segment {index} gain {seg.gain_db:+g} dB is outside -100..+30",
+                    "item.set_audio_gain clamps clip gain to [-100, 30] dB",
+                    segment=index,
+                    gain_db=seg.gain_db,
+                )
             record_in = self.ranges[index][0]
-            for audio in self._audio_items(seg.track, record_in) or [None]:
-                target = GainTarget(item=audio, gain_db=seg.gain_db) if audio is not None else None
+            items = self._content_audio(seg.track, record_in)
+            refs = (
+                items
+                if items is not None
+                else [unresolved("item", f"audio of segment {index}; run phase 'assemble'")]
+            )
+            if items is not None and not items:
+                self.notes.append(f"segment {index}: no audio item for gain")
+                continue
+            for position, ref in enumerate(refs):
                 self._emit(
                     "item.set_audio_gain",
-                    target,
+                    {"item": ref, "gain_db": seg.gain_db},
                     FinishIntent(
                         kind="audio_gain",
                         op="item.set_audio_gain",
-                        target=f"segment {index} (audio under track {seg.track})",
+                        target=f"segment {index} (audio item {position})",
                         summary=f"{seg.gain_db:+g} dB",
-                        resolved=audio is not None,
+                        resolved=self._resolved(ref),
                     ),
                 )
 
     # -- titles --------------------------------------------------------------------------------
 
     def _titles(self) -> None:
-        track = _title_track(self.plan)
-        for index, title in enumerate(self.plan.titles):
+        _check_title_track(self.plan)
+        track = title_track(self.plan)
+        for index, t in enumerate(self.plan.titles):
             self._one_title(
                 f"title {index}",
-                title.template,
+                t.template,
                 track,
-                title.record_in,
-                title.record_out,
-                title.lines,
+                t.record_in,
+                t.record_out,
+                list(t.lines),
                 kind="title",
             )
-        outro = self.plan.outro
-        if outro is not None and outro.sting is not None:
-            start = self.plan.content_frames() + outro.sting.start
+        if _has_sting(self.plan):
+            sting = self.plan.outro.sting  # type: ignore[union-attr]
+            start = self.plan.content_frames() + sting.start
             self._one_title(
                 "sting",
-                outro.sting.template,
+                sting.template,
                 track,
                 start,
-                start + outro.sting.frames,
-                outro.sting.lines,
+                start + sting.frames,
+                list(sting.lines),
                 kind="sting",
             )
 
@@ -842,29 +1048,36 @@ class _FinishBuilder:
         kind: str,
     ) -> None:
         if template is None:
-            self.notes.append(
-                f"{label} has no template name; cannot place it (title.place needs one)"
-            )
+            self.notes.append(f"{label} has no template name; cannot place it")
             return
         if len(lines) > 4:
             self.notes.append(f"{label} has {len(lines)} lines; title.place allows at most 4")
             return
-        spec = TitleSpec(
-            template=MediaRef(unique_id=template),
-            track=track,
-            record_in=record_in,
-            record_out=record_out,
-            lines=lines,
-        )
+        media = self.titles.get(template)
+        if media is not None:
+            ref: Any = media.model_dump(mode="json")
+        elif self.prepare is not None:
+            self.notes.append(f"{label}: template {template!r} not in the prepare result; skipped")
+            return
+        else:
+            ref = unresolved(
+                "title_template", f"pool id of title template {template!r}; run phase 'prepare'"
+            )
         self._emit(
             "title.place",
-            spec,
+            {
+                "template": ref,
+                "track": track,
+                "record_in": record_in,
+                "record_out": record_out,
+                "lines": lines,
+            },
             FinishIntent(
                 kind=kind,
                 op="title.place",
                 target=f"{label} on video track {track} (record {record_in}..{record_out})",
                 summary=f"template {template!r}: {' / '.join(lines)}",
-                resolved=True,
+                resolved=self._resolved(ref),
             ),
         )
 
@@ -872,75 +1085,124 @@ class _FinishBuilder:
 
     def _markers(self) -> None:
         for index, marker in enumerate(self.plan.markers):
-            color = marker.color
-            if color is None:
+            color = marker.color or "Blue"
+            if color not in _MARKER_COLORS:
+                self.notes.append(f"marker {index} colour {color!r} is not a Resolve colour; Blue")
                 color = "Blue"
-            elif color not in _MARKER_COLORS:
-                self.notes.append(
-                    f"marker {index} colour {color!r} is not a Resolve marker colour; using Blue"
-                )
-                color = "Blue"
-            spec = MarkerSpec(
-                frame=marker.record,
-                color=color,
-                name=marker.name,
-                note=marker.note or "",
-                duration=marker.duration,
-            )
             self._emit(
                 "markers.add",
-                spec,
+                {
+                    "frame": marker.record,
+                    "color": color,
+                    "name": marker.name,
+                    "note": marker.note or "",
+                    "duration": marker.duration,
+                },
                 FinishIntent(
                     kind="marker",
                     op="markers.add",
                     target=f"record {marker.record}",
-                    summary=f"{color}{(' ' + marker.name) if marker.name else ''}",
+                    summary=f"{color}{(' ' + marker.name) if marker.name else ''} "
+                    f"({marker.duration}f)",
                     resolved=True,
                 ),
             )
 
+    # -- captions (F12) ------------------------------------------------------------------------
+
+    def _captions(self) -> None:
+        if self.plan.captions:
+            self.notes.append(
+                f"{len(self.plan.captions)} caption(s) are not applied by plan.apply "
+                "(ffmpeg compose, S13e)"
+            )
+            self.intents.append(
+                FinishIntent(
+                    kind="captions",
+                    op="(none)",
+                    target=f"{len(self.plan.captions)} caption(s)",
+                    summary="not applied by plan.apply (ffmpeg compose, S13e)",
+                    resolved=True,
+                )
+            )
+
     # -- steps ---------------------------------------------------------------------------------
 
-    def to_steps(self, batch_size: int) -> list[Step]:
-        assert self.resolver is not None
-        timeline = self.resolver.timeline
-        self._targets["item.set_fades"] = _merge_fades(self._targets["item.set_fades"])
+    def to_steps(self, plan: EditPlan) -> list[Step]:
+        if self.resolver is None:
+            tl: Any = unresolved("timeline", "the branch; run phase 'assemble'")
+        else:
+            tl = self.resolver.timeline.model_dump(mode="json")
+        self._t["item.set_fades"] = _merge_fades(self._t["item.set_fades"])
         steps: list[Step] = []
-        steps.extend(self._grouped("transition.add", TransitionParams, "targets", timeline, 50))
-        steps.extend(self._grouped("item.set_color", ColorParams, "targets", timeline, 50))
-        steps.extend(self._grouped("item.set_transform", TransformParams, "targets", timeline, 50))
-        steps.extend(self._grouped("item.set_audio_gain", GainParams, "targets", timeline, 500))
-        steps.extend(self._grouped("item.set_fades", FadesParams, "targets", timeline, 500))
-        steps.extend(self._grouped("title.place", TitleParams, "titles", timeline, 50))
-        steps.extend(self._grouped("markers.add", MarkersParams, "markers", timeline, 1000))
+        # transitions first: colour (incl. input colour space) is set after grades, titles land
+        # on their own track, the rest address the resolved items.
+        steps.extend(self._grouped("transition.add", "targets", tl, 50))
+        steps.extend(self._colour_space_steps())
+        for op, field_name, cap in (
+            ("item.set_color", "targets", 50),
+            ("item.set_transform", "targets", 50),
+            ("item.set_audio_gain", "targets", 500),
+            ("item.set_fades", "targets", 500),
+            ("title.place", "titles", 50),
+            ("markers.add", "markers", 1000),
+        ):
+            steps.extend(self._grouped(op, field_name, tl, cap))
         return steps
 
-    def _grouped(
-        self, op: str, params_model: Any, field_name: str, timeline: TimelineRef, cap: int
-    ) -> list[Step]:
-        targets = self._targets[op]
+    def _colour_space_steps(self) -> list[Step]:
+        # One step per colour space: clip.set_input_color_space takes one color_space per call
+        # and no timeline (it keys live pool items).
+        steps = []
+        for index, payload in enumerate(self._t["clip.set_input_color_space"]):
+            steps.append(
+                _step(
+                    "finish",
+                    "clip.set_input_color_space",
+                    f"clip.set_input_color_space:{index}",
+                    payload,
+                    f"input colour space {payload['color_space']!r} on "
+                    f"{len(payload['items'])} item(s)",
+                )
+            )
+        return steps
+
+    def _grouped(self, op: str, field_name: str, tl: Any, cap: int) -> list[Step]:
         steps: list[Step] = []
-        for batch_index, batch in enumerate(_chunk(targets, cap)):
-            kwargs: dict[str, Any] = {field_name: batch, "timeline": timeline}
-            params = params_model(**kwargs)
-            name = f"{op}:{batch_index}"
-            summary = f"{op} on {len(batch)} target(s)"
-            steps.append(_step("B", op, name, params, summary))
+        for batch_index, batch in enumerate(_chunk(self._t[op], cap)):
+            params: dict[str, Any] = {field_name: batch, "timeline": tl}
+            steps.append(
+                _step(
+                    "finish", op, f"{op}:{batch_index}", params, f"{op} on {len(batch)} target(s)"
+                )
+            )
         return steps
 
 
 # -- helpers -----------------------------------------------------------------------------------
 
 
-def _cdl(cdl: Cdl | None) -> CdlSpec | None:
-    if cdl is None:
-        return None
-    return CdlSpec(
-        slope=tuple(cdl.slope),
-        offset=tuple(cdl.offset),
-        power=tuple(cdl.power),
-        saturation=cdl.saturation,
-    )
+def _tl(working: TimelineRef | None, hint: str) -> Any:
+    if working is not None:
+        return working.model_dump(mode="json")
+    return unresolved("timeline", hint)
+
+
+def _fits(available: int | None, need: int) -> bool:
+    return available is None or available >= need
+
+
+def _is_braw(path: str) -> bool:
+    return path.strip().lower().split("?", 1)[0].endswith(".braw")
+
+
+def _cdl_dict(cdl: Cdl) -> dict[str, Any]:
+    return {
+        "slope": list(cdl.slope),
+        "offset": list(cdl.offset),
+        "power": list(cdl.power),
+        "saturation": cdl.saturation,
+    }
 
 
 def _colour_summary(cdl: Cdl | None, lut: str | None) -> str:
@@ -957,7 +1219,6 @@ def _seg_target(index: int, track: int, record_in: int) -> str:
 
 
 def _first_content_segment(plan: EditPlan) -> tuple[int, int, int] | None:
-    """The earliest content item: least record_in, then lowest track."""
     ranges = plan.record_ranges()
     best: tuple[int, int, int] | None = None
     for index, seg in enumerate(plan.segments):
@@ -968,44 +1229,75 @@ def _first_content_segment(plan: EditPlan) -> tuple[int, int, int] | None:
 
 
 def _last_content_segment(plan: EditPlan) -> tuple[int, int, int] | None:
-    """The latest content item by record_out, then highest track."""
     ranges = plan.record_ranges()
     best: tuple[int, int, int] | None = None
     best_key: tuple[int, int] | None = None
     for index, seg in enumerate(plan.segments):
         key = (ranges[index][1], seg.track)
         if best_key is None or key > best_key:
-            best_key = key
-            best = (index, seg.track, ranges[index][0])
+            best_key, best = key, (index, seg.track, ranges[index][0])
     return best
 
 
-def _merge_fades(targets: list[FadeTarget]) -> list[FadeTarget]:
-    """One ``FadeTarget`` per item: a clip at the very end of a one-item timeline can take both a
-    head fade-in and an end fade-out, and ``item.set_fades`` refuses a repeated item."""
-    merged: dict[str, FadeTarget] = {}
+def _merge_fades(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One fade target per item: an item at the timeline end can take both a head fade-in and an
+    end fade-out, and item.set_fades refuses a repeated item."""
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
     for target in targets:
-        prior = merged.get(target.item.item_id)
-        if prior is None:
-            merged[target.item.item_id] = target
-            continue
-        merged[target.item.item_id] = FadeTarget(
-            item=target.item,
-            fade_in=target.fade_in if target.fade_in is not None else prior.fade_in,
-            fade_out=target.fade_out if target.fade_out is not None else prior.fade_out,
-        )
-    return list(merged.values())
+        item = target["item"]
+        key = json.dumps(item, sort_keys=True)
+        if key not in merged:
+            merged[key] = dict(target)
+            order.append(key)
+        else:
+            merged[key].update({k: v for k, v in target.items() if k != "item"})
+    return [merged[k] for k in order]
 
 
 def _chunk(items: list[Any], size: int) -> list[list[Any]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
-def _step(phase: str, op: str, name: str, params: Any, summary: str) -> Step:
-    return Step(
-        phase=phase,  # type: ignore[arg-type]
-        op=op,
-        name=name,
-        params=params.model_dump(mode="json"),
-        summary=summary,
-    )
+def _check_batch(batch_size: int) -> None:
+    if not 1 <= batch_size <= MAX_BATCH:
+        raise CompileError(
+            "batch_size_invalid",
+            f"batch size {batch_size} is out of range (1..{MAX_BATCH})",
+            f"AppendToTimeline hung 21.1 on large batches; keep it at 1..{MAX_BATCH}",
+            batch_size=batch_size,
+        )
+
+
+def _check_steps(steps: list[Step]) -> None:
+    if len(steps) > MAX_STEPS:
+        raise CompileError(
+            "too_many_steps",
+            f"the phase compiled to {len(steps)} steps, over the {MAX_STEPS} ops.sequence limit",
+            "split the build, or raise fewer per-segment finishing ops",
+            steps=len(steps),
+            limit=MAX_STEPS,
+        )
+
+
+def _step(phase: Phase, op: str, name: str, params: dict[str, Any], summary: str) -> Step:
+    if not find_unresolved(params):
+        params = get_op(op).params.model_validate(params).model_dump(mode="json")
+    return Step(phase=phase, op=op, name=name, params=params, summary=summary)
+
+
+# expose for the renderer / submit
+__all__ = [
+    "DEFAULT_BATCH",
+    "MAX_BATCH",
+    "MAX_STEPS",
+    "TEMPLATE_MAX_ITEMS",
+    "Compilation",
+    "compile_assemble",
+    "compile_finish",
+    "compile_prepare",
+    "plan_hash",
+    "template_item_count",
+    "title_track",
+    "video_tracks",
+]

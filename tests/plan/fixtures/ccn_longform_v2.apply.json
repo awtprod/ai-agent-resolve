@@ -11,17 +11,18 @@
     "segments": 4,
     "frames": 426
   },
-  "batch_size": 10,
-  "phase_a": {
+  "prepare": {
+    "phase": "prepare",
+    "unresolved": 0,
     "steps": [
       {
         "op": "timeline.branch",
         "name": "branch",
-        "summary": "branch name 'CCN Longform Template' (no unique_id: dry-run only), reuse",
+        "summary": "branch 'CCN Longform Template' (reuse)",
         "params": {
           "source": {
             "name": "CCN Longform Template",
-            "unique_id": null
+            "unique_id": "tl-template-0001"
           },
           "if_exists": "reuse",
           "resolution": null
@@ -92,13 +93,49 @@
         }
       },
       {
+        "op": "media.find",
+        "name": "find-title:0",
+        "summary": "find title template 'CCN Lower Third'",
+        "params": {
+          "bin_path": [],
+          "name": "CCN Lower Third",
+          "name_contains": null,
+          "path_contains": null,
+          "recursive": true,
+          "limit": 200
+        }
+      },
+      {
+        "op": "media.find",
+        "name": "find-title:1",
+        "summary": "find title template 'CCN Sting'",
+        "params": {
+          "bin_path": [],
+          "name": "CCN Sting",
+          "name_contains": null,
+          "path_contains": null,
+          "recursive": true,
+          "limit": 200
+        }
+      }
+    ],
+    "notes": [
+      "template 'CCN Longform Template' has 10 item(s) (<= 30)"
+    ],
+    "warnings": []
+  },
+  "assemble": {
+    "phase": "assemble",
+    "unresolved": 0,
+    "steps": [
+      {
         "op": "track.ensure",
         "name": "tracks",
         "summary": "ensure 2 video and 6 audio track(s)",
         "params": {
           "timeline": {
-            "name": "CCN Longform Template · agent branch",
-            "unique_id": null
+            "name": "CCN Longform Template [agent:ccn-bot v1]",
+            "unique_id": "tl-branch-0001"
           },
           "tracks": [
             {
@@ -121,7 +158,7 @@
               "type": "audio",
               "index": 1,
               "name": "A1",
-              "enabled": false,
+              "enabled": null,
               "locked": null,
               "audio_format": null
             },
@@ -129,7 +166,7 @@
               "type": "audio",
               "index": 2,
               "name": "A2",
-              "enabled": false,
+              "enabled": null,
               "locked": null,
               "audio_format": null
             },
@@ -137,7 +174,7 @@
               "type": "audio",
               "index": 3,
               "name": "A3",
-              "enabled": false,
+              "enabled": null,
               "locked": null,
               "audio_format": null
             },
@@ -145,7 +182,7 @@
               "type": "audio",
               "index": 4,
               "name": "A4",
-              "enabled": false,
+              "enabled": null,
               "locked": null,
               "audio_format": null
             },
@@ -153,7 +190,7 @@
               "type": "audio",
               "index": 5,
               "name": "A5",
-              "enabled": true,
+              "enabled": null,
               "locked": null,
               "audio_format": null
             },
@@ -161,7 +198,7 @@
               "type": "audio",
               "index": 6,
               "name": "A6",
-              "enabled": true,
+              "enabled": null,
               "locked": null,
               "audio_format": null
             }
@@ -171,20 +208,17 @@
       {
         "op": "timeline.append_ranges",
         "name": "append:v1:0",
-        "summary": "append 5 range(s) on video track 1 (record 0..306)",
+        "summary": "append 4 range(s) on video track 1 (record 0..216)",
         "params": {
           "timeline": {
-            "name": "CCN Longform Template · agent branch",
-            "unique_id": null
+            "name": "CCN Longform Template [agent:ccn-bot v1]",
+            "unique_id": "tl-branch-0001"
           },
           "ranges": [
             {
               "media": {
-                "unique_id": "E:/CCN/Ep1/A001.braw",
-                "bin_path": [
-                  "aar",
-                  "A"
-                ]
+                "unique_id": "pool-camA",
+                "bin_path": null
               },
               "src_in": 0,
               "src_out": 72,
@@ -195,11 +229,8 @@
             },
             {
               "media": {
-                "unique_id": "E:/CCN/Ep1/B001.braw",
-                "bin_path": [
-                  "aar",
-                  "B"
-                ]
+                "unique_id": "pool-camB",
+                "bin_path": null
               },
               "src_in": 72,
               "src_out": 144,
@@ -210,11 +241,8 @@
             },
             {
               "media": {
-                "unique_id": "E:/CCN/Ep1/A001.braw",
-                "bin_path": [
-                  "aar",
-                  "A"
-                ]
+                "unique_id": "pool-camA",
+                "bin_path": null
               },
               "src_in": 144,
               "src_out": 216,
@@ -225,11 +253,8 @@
             },
             {
               "media": {
-                "unique_id": "E:/CCN/Ep1/A002.mov",
-                "bin_path": [
-                  "aar",
-                  "A2"
-                ]
+                "unique_id": "pool-camA2",
+                "bin_path": null
               },
               "src_in": 30,
               "src_out": 120,
@@ -237,19 +262,32 @@
               "media_type": "av",
               "record_in": 216,
               "label": "segment 3"
-            },
+            }
+          ],
+          "cursor": 0,
+          "max_ranges": 25,
+          "repair_short": true
+        }
+      },
+      {
+        "op": "timeline.append_ranges",
+        "name": "append:outro-v1",
+        "summary": "append outro video on track 1 (record 306)",
+        "params": {
+          "timeline": {
+            "name": "CCN Longform Template [agent:ccn-bot v1]",
+            "unique_id": "tl-branch-0001"
+          },
+          "ranges": [
             {
               "media": {
-                "unique_id": "E:/CCN/Assets/Outro.mov",
-                "bin_path": [
-                  "aar",
-                  "X"
-                ]
+                "unique_id": "pool-outroclip",
+                "bin_path": null
               },
               "src_in": 0,
               "src_out": 120,
               "track": 1,
-              "media_type": "av",
+              "media_type": "video",
               "record_in": 306,
               "label": "outro"
             }
@@ -258,139 +296,378 @@
           "max_ranges": 25,
           "repair_short": true
         }
+      },
+      {
+        "op": "timeline.append_ranges",
+        "name": "append:outro-a5",
+        "summary": "append outro audio on audio track 5 (A5)",
+        "params": {
+          "timeline": {
+            "name": "CCN Longform Template [agent:ccn-bot v1]",
+            "unique_id": "tl-branch-0001"
+          },
+          "ranges": [
+            {
+              "media": {
+                "unique_id": "pool-outroclip",
+                "bin_path": null
+              },
+              "src_in": 0,
+              "src_out": 120,
+              "track": 5,
+              "media_type": "audio",
+              "record_in": 306,
+              "label": "outro-audio"
+            }
+          ],
+          "cursor": 0,
+          "max_ranges": 25,
+          "repair_short": true
+        }
       }
     ],
-    "appends": [
-      {
-        "track": 1,
-        "ranges": [
-          [
-            0,
-            72
-          ],
-          [
-            72,
-            144
-          ],
-          [
-            144,
-            216
-          ],
-          [
-            216,
-            306
-          ],
-          [
-            306,
-            426
-          ]
-        ]
-      }
-    ],
-    "placements": [
-      {
-        "segment": 0,
-        "track": 1,
-        "record_in": 0,
-        "record_out": 72,
-        "frames": 72,
-        "source": "E:/CCN/Ep1/A001.braw",
-        "append_step": "append:v1:0"
-      },
-      {
-        "segment": 1,
-        "track": 1,
-        "record_in": 72,
-        "record_out": 144,
-        "frames": 72,
-        "source": "E:/CCN/Ep1/B001.braw",
-        "append_step": "append:v1:0"
-      },
-      {
-        "segment": 2,
-        "track": 1,
-        "record_in": 144,
-        "record_out": 216,
-        "frames": 72,
-        "source": "E:/CCN/Ep1/A001.braw",
-        "append_step": "append:v1:0"
-      },
-      {
-        "segment": 3,
-        "track": 1,
-        "record_in": 216,
-        "record_out": 306,
-        "frames": 90,
-        "source": "E:/CCN/Ep1/A002.mov",
-        "append_step": "append:v1:0"
-      }
+    "notes": [],
+    "warnings": [
+      "audio track 'A1' is marked mute in the plan; mute is template state in 21.1, so it is not applied -- verify it in the template",
+      "audio track 'A2' is marked mute in the plan; mute is template state in 21.1, so it is not applied -- verify it in the template",
+      "audio track 'A3' is marked mute in the plan; mute is template state in 21.1, so it is not applied -- verify it in the template",
+      "audio track 'A4' is marked mute in the plan; mute is template state in 21.1, so it is not applied -- verify it in the template"
     ]
   },
-  "phase_b": {
-    "resolved": false,
+  "finish": {
+    "phase": "finish",
+    "unresolved": 0,
+    "steps": [
+      {
+        "op": "transition.add",
+        "name": "transition.add:0",
+        "summary": "transition.add on 3 target(s)",
+        "params": {
+          "timeline": {
+            "name": "CCN Longform Template [agent:ccn-bot v1]",
+            "unique_id": "tl-branch-0001"
+          },
+          "targets": [
+            {
+              "item": {
+                "track_type": "video",
+                "track": 1,
+                "item_id": "V1:0"
+              },
+              "position": "start",
+              "type": "Cross Dissolve",
+              "category": "simple",
+              "alignment": "right",
+              "frames": 15
+            },
+            {
+              "item": {
+                "track_type": "audio",
+                "track": 1,
+                "item_id": "A1:144"
+              },
+              "position": "end",
+              "type": "Cross Fade 0 dB",
+              "category": "audio",
+              "alignment": "center",
+              "frames": 12
+            },
+            {
+              "item": {
+                "track_type": "video",
+                "track": 1,
+                "item_id": "V1:216"
+              },
+              "position": "end",
+              "type": "Cross Dissolve",
+              "category": "simple",
+              "alignment": "right",
+              "frames": 15
+            }
+          ]
+        }
+      },
+      {
+        "op": "item.set_color",
+        "name": "item.set_color:0",
+        "summary": "item.set_color on 2 target(s)",
+        "params": {
+          "timeline": {
+            "name": "CCN Longform Template [agent:ccn-bot v1]",
+            "unique_id": "tl-branch-0001"
+          },
+          "targets": [
+            {
+              "item": {
+                "track_type": "video",
+                "track": 1,
+                "item_id": "V1:0"
+              },
+              "node": 1,
+              "cdl": {
+                "slope": [
+                  1.05,
+                  1.0,
+                  0.95
+                ],
+                "offset": [
+                  0.0,
+                  0.0,
+                  0.01
+                ],
+                "power": [
+                  1.0,
+                  1.0,
+                  1.0
+                ],
+                "saturation": 1.1
+              },
+              "lut": "CCN Show LUT"
+            },
+            {
+              "item": {
+                "track_type": "video",
+                "track": 1,
+                "item_id": "V1:144"
+              },
+              "node": 1,
+              "cdl": {
+                "slope": [
+                  1.05,
+                  1.0,
+                  0.95
+                ],
+                "offset": [
+                  0.0,
+                  0.0,
+                  0.01
+                ],
+                "power": [
+                  1.0,
+                  1.0,
+                  1.0
+                ],
+                "saturation": 1.1
+              },
+              "lut": "CCN Show LUT"
+            }
+          ]
+        }
+      },
+      {
+        "op": "item.set_transform",
+        "name": "item.set_transform:0",
+        "summary": "item.set_transform on 1 target(s)",
+        "params": {
+          "timeline": {
+            "name": "CCN Longform Template [agent:ccn-bot v1]",
+            "unique_id": "tl-branch-0001"
+          },
+          "targets": [
+            {
+              "item": {
+                "track_type": "video",
+                "track": 1,
+                "item_id": "V1:0"
+              },
+              "zoom": 1.1,
+              "pan": 0.0,
+              "tilt": 0.0,
+              "rotation_deg": 0.0,
+              "flip_h": false,
+              "flip_v": false
+            }
+          ]
+        }
+      },
+      {
+        "op": "item.set_audio_gain",
+        "name": "item.set_audio_gain:0",
+        "summary": "item.set_audio_gain on 1 target(s)",
+        "params": {
+          "timeline": {
+            "name": "CCN Longform Template [agent:ccn-bot v1]",
+            "unique_id": "tl-branch-0001"
+          },
+          "targets": [
+            {
+              "item": {
+                "track_type": "audio",
+                "track": 1,
+                "item_id": "A1:144"
+              },
+              "gain_db": -2.0
+            }
+          ],
+          "tolerance_db": 0.05
+        }
+      },
+      {
+        "op": "item.set_fades",
+        "name": "item.set_fades:0",
+        "summary": "item.set_fades on 2 target(s)",
+        "params": {
+          "timeline": {
+            "name": "CCN Longform Template [agent:ccn-bot v1]",
+            "unique_id": "tl-branch-0001"
+          },
+          "targets": [
+            {
+              "item": {
+                "track_type": "audio",
+                "track": 1,
+                "item_id": "A1:0"
+              },
+              "fade_in": 24,
+              "fade_out": null
+            },
+            {
+              "item": {
+                "track_type": "audio",
+                "track": 5,
+                "item_id": "A5:306"
+              },
+              "fade_in": null,
+              "fade_out": 2
+            }
+          ]
+        }
+      },
+      {
+        "op": "title.place",
+        "name": "title.place:0",
+        "summary": "title.place on 2 target(s)",
+        "params": {
+          "timeline": {
+            "name": "CCN Longform Template [agent:ccn-bot v1]",
+            "unique_id": "tl-branch-0001"
+          },
+          "titles": [
+            {
+              "template": {
+                "unique_id": "title-CCN Lower Third",
+                "bin_path": null
+              },
+              "track": 2,
+              "record_in": 48,
+              "record_out": 120,
+              "lines": [
+                "Jane Doe",
+                "Head Judge"
+              ]
+            },
+            {
+              "template": {
+                "unique_id": "title-CCN Sting",
+                "bin_path": null
+              },
+              "track": 2,
+              "record_in": 312,
+              "record_out": 360,
+              "lines": [
+                "Baking Resistance"
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "op": "markers.add",
+        "name": "markers.add:0",
+        "summary": "markers.add on 2 target(s)",
+        "params": {
+          "timeline": {
+            "name": "CCN Longform Template [agent:ccn-bot v1]",
+            "unique_id": "tl-branch-0001"
+          },
+          "markers": [
+            {
+              "frame": 0,
+              "color": "Green",
+              "name": "Act 1",
+              "note": "",
+              "duration": 1,
+              "custom_data": null
+            },
+            {
+              "frame": 144,
+              "color": "Blue",
+              "name": "Act 2",
+              "note": "",
+              "duration": 1,
+              "custom_data": null
+            }
+          ]
+        }
+      }
+    ],
+    "notes": [
+      "head audio fade uses the clip fade handle (item.set_fades); 21.1 has no audio transition from silence"
+    ],
+    "warnings": [],
     "intents": [
       {
         "kind": "colour",
         "op": "item.set_color",
         "target": "segment 0 (video track 1 @0)",
         "summary": "CDL slope (1.05, 1.0, 0.95) sat 1.1, LUT 'CCN Show LUT'",
-        "resolved": false
+        "resolved": true
       },
       {
         "kind": "colour",
         "op": "item.set_color",
         "target": "segment 2 (video track 1 @144)",
         "summary": "CDL slope (1.05, 1.0, 0.95) sat 1.1, LUT 'CCN Show LUT'",
-        "resolved": false
+        "resolved": true
       },
       {
         "kind": "transform",
         "op": "item.set_transform",
         "target": "segment 0 (video track 1 @0)",
         "summary": "zoom 1.1, pan 0, tilt 0, rot 0, flip_h False, flip_v False",
-        "resolved": false
+        "resolved": true
+      },
+      {
+        "kind": "head_transition",
+        "op": "transition.add",
+        "target": "head from black on segment 0 (video track 1)",
+        "summary": "Cross Dissolve, right (from black), 15 frames",
+        "resolved": true
       },
       {
         "kind": "audio_crossfade",
         "op": "transition.add",
-        "target": "after segment 2 (audio under track 1)",
+        "target": "after segment 2 (audio item 0)",
         "summary": "Cross Fade 0 dB, center, 12 frames",
-        "resolved": false
+        "resolved": true
       },
       {
         "kind": "outro_transition",
         "op": "transition.add",
-        "target": "content into outro (segment 3, record 306)",
-        "summary": "Cross Dissolve, left, 15 frames",
-        "resolved": false
+        "target": "content into outro (segment 3)",
+        "summary": "Cross Dissolve, right, 15 frames",
+        "resolved": true
       },
       {
-        "kind": "head_fade",
+        "kind": "fade",
         "op": "item.set_fades",
-        "target": "first segment 0 (video track 1)",
-        "summary": "video fade-in 15 frames (from black)",
-        "resolved": false
+        "target": "first segment 0 (audio item 0)",
+        "summary": "fade_in 24 fade_out None",
+        "resolved": true
       },
       {
-        "kind": "head_fade",
+        "kind": "fade",
         "op": "item.set_fades",
-        "target": "first segment 0 (audio under track 1)",
-        "summary": "audio fade-in 24 frames",
-        "resolved": false
-      },
-      {
-        "kind": "end_fade",
-        "op": "item.set_fades",
-        "target": "outro (audio under track 1)",
-        "summary": "audio fade-out 2 frames (de-click)",
-        "resolved": false
+        "target": "outro audio (audio item 0)",
+        "summary": "fade_in None fade_out 2",
+        "resolved": true
       },
       {
         "kind": "audio_gain",
         "op": "item.set_audio_gain",
-        "target": "segment 2 (audio under track 1)",
+        "target": "segment 2 (audio item 0)",
         "summary": "-2 dB",
-        "resolved": false
+        "resolved": true
       },
       {
         "kind": "title",
@@ -410,22 +687,54 @@
         "kind": "marker",
         "op": "markers.add",
         "target": "record 0",
-        "summary": "Green Act 1",
+        "summary": "Green Act 1 (1f)",
         "resolved": true
       },
       {
         "kind": "marker",
         "op": "markers.add",
         "target": "record 144",
-        "summary": "Blue Act 2",
+        "summary": "Blue Act 2 (1f)",
         "resolved": true
       }
     ],
-    "steps": []
-  },
-  "notes": [
-    "template size unchecked (no --template-describe)",
-    "working timeline named by placeholder; the real branch id is a run-time value threaded from a phase-A result or --branch-describe",
-    "audio track gain_db/bus/bounce are a manual Fairlight step for A1, A2, A3, A4, A5 (track.ensure sets only name and enabled; 21.1 has no Fairlight scripting)"
-  ]
+    "placements": [
+      {
+        "segment": 0,
+        "track": 1,
+        "record_in": 0,
+        "record_out": 72,
+        "frames": 72,
+        "source": "segment 0",
+        "append_step": "append:v1:0"
+      },
+      {
+        "segment": 1,
+        "track": 1,
+        "record_in": 72,
+        "record_out": 144,
+        "frames": 72,
+        "source": "segment 1",
+        "append_step": "append:v1:0"
+      },
+      {
+        "segment": 2,
+        "track": 1,
+        "record_in": 144,
+        "record_out": 216,
+        "frames": 72,
+        "source": "segment 2",
+        "append_step": "append:v1:0"
+      },
+      {
+        "segment": 3,
+        "track": 1,
+        "record_in": 216,
+        "record_out": 306,
+        "frames": 90,
+        "source": "segment 3",
+        "append_step": "append:v1:0"
+      }
+    ]
+  }
 }

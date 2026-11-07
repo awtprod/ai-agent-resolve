@@ -1,125 +1,167 @@
-"""``aar plan apply`` end to end: golden dry-run text and JSON, lint refusal, exit codes, the
-idempotency diff, and the ``--submit`` payload."""
+"""``aar plan apply`` end to end: golden output, lint refusal, --submit guards, idempotency."""
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from typing import Any
 
 import pytest
+from apply_builders import plan_data, seg
 from plan_support import FIXTURES
 
 from aar.cli import main
 
 LONGFORM = str(FIXTURES / "ccn_longform_v2.plan.json")
 SHORT = str(FIXTURES / "short_v2.plan.json")
+TEMPLATE = str(FIXTURES / "ccn_longform_v2.template.json")
+PREPARE = str(FIXTURES / "ccn_longform_v2.prepare.json")
+ASSEMBLE = str(FIXTURES / "ccn_longform_v2.assemble.json")
+BRANCH = str(FIXTURES / "ccn_longform_v2.branch.json")
+LF_INPUTS = [
+    "--template-describe",
+    TEMPLATE,
+    "--prepare-result",
+    PREPARE,
+    "--assemble-result",
+    ASSEMBLE,
+]
+SHORT_INPUTS = [
+    "--template-describe",
+    str(FIXTURES / "short_v2.template.json"),
+    "--prepare-result",
+    str(FIXTURES / "short_v2.prepare.json"),
+    "--assemble-result",
+    str(FIXTURES / "short_v2.assemble.json"),
+]
 
 
 def _golden(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
 
 
-def test_longform_dry_run_matches_golden(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["plan", "apply", LONGFORM]) == 0
+def test_longform_golden(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["plan", "apply", LONGFORM, *LF_INPUTS]) == 0
     assert capsys.readouterr().out == _golden("ccn_longform_v2.apply.txt")
 
 
-def test_short_dry_run_matches_golden(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["plan", "apply", SHORT]) == 0
+def test_short_golden(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["plan", "apply", SHORT, *SHORT_INPUTS]) == 0
     assert capsys.readouterr().out == _golden("short_v2.apply.txt")
 
 
-def test_longform_json_matches_golden(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["plan", "apply", LONGFORM, "--json"]) == 0
+def test_longform_json_golden(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["plan", "apply", LONGFORM, *LF_INPUTS, "--json"]) == 0
     assert capsys.readouterr().out == _golden("ccn_longform_v2.apply.json")
 
 
-def test_json_dry_run_is_valid_json(capsys: pytest.CaptureFixture[str]) -> None:
-    main(["plan", "apply", SHORT, "--json"])
-    body = json.loads(capsys.readouterr().out)
-    assert body["plan"]["kind"] == "short"
-    assert body["phase_a"]["steps"][0]["op"] == "timeline.branch"
-    assert body["phase_b"]["resolved"] is False
-
-
-def test_apply_refuses_a_plan_with_lint_errors(capsys: pytest.CaptureFixture[str]) -> None:
-    # The pre-v2 broken short has range errors.
+@pytest.mark.parametrize("extra", [[], ["--json"]])
+def test_lint_refusal_exits_2(capsys: pytest.CaptureFixture[str], extra: list[str]) -> None:
     broken = str(FIXTURES / "short_broken.plan.json")
-    code = main(["plan", "apply", broken])
+    assert main(["plan", "apply", broken, *extra]) == 2
+    cap = capsys.readouterr()
+    if extra:
+        assert json.loads(cap.out)["ok"] is False
+    else:
+        assert "lint_errors" in cap.err
+
+
+@pytest.mark.parametrize("phase", ["prepare", "assemble", "finish"])
+def test_submit_without_inputs_refused(capsys: pytest.CaptureFixture[str], phase: str) -> None:
+    assert main(["plan", "apply", LONGFORM, "--submit", phase]) == 2
+    assert "unresolved_reference" in capsys.readouterr().err
+
+
+def test_submit_assemble_needs_prepare_result(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(
+        ["plan", "apply", LONGFORM, "--template-describe", TEMPLATE, "--submit", "assemble"]
+    )
     assert code == 2
-    err = capsys.readouterr().err
-    assert "lint_errors" in err
+    assert "unresolved_reference" in capsys.readouterr().err
 
 
-def test_resolved_dry_run_shows_grouped_steps(capsys: pytest.CaptureFixture[str]) -> None:
-    code = main(
-        [
-            "plan",
-            "apply",
-            LONGFORM,
-            "--phase-a-result",
-            str(FIXTURES / "ccn_longform_v2.phase-a.json"),
-        ]
-    )
-    assert code == 0
+def test_submit_finish_needs_results(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(["plan", "apply", LONGFORM, "--prepare-result", PREPARE, "--submit", "finish"])
+    assert code == 2
+    assert "unresolved_reference" in capsys.readouterr().err
+
+
+def _walk(obj: Any, key: str) -> list[Any]:
+    found: list[Any] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == key:
+                found.append(v)
+            found.extend(_walk(v, key))
+    elif isinstance(obj, list):
+        for v in obj:
+            found.extend(_walk(v, key))
+    return found
+
+
+@pytest.mark.parametrize("phase", ["prepare", "assemble", "finish"])
+def test_submit_with_all_inputs(capsys: pytest.CaptureFixture[str], phase: str) -> None:
+    assert main(["plan", "apply", LONGFORM, *LF_INPUTS, "--submit", phase, "--json"]) == 0
     out = capsys.readouterr().out
-    assert "resolved into 7 grouped step(s)" in out
+    body = json.loads(out)
+    assert body["kind"] == "ops.sequence"
+    assert body["phase"] == phase
+    assert body["idempotency_key"].startswith("plan.apply:")
+    assert body["params"]["steps"]
+    assert "__unresolved__" not in out
+    plan_paths = {s["media"] for s in json.loads(Path(LONGFORM).read_text())["sources"]}
+    uids = _walk(body["params"], "unique_id")
+    assert not plan_paths & {u for u in uids if isinstance(u, str)}
+    for step in body["params"]["steps"]:
+        assert not plan_paths & {
+            u for u in _walk(step["params"], "unique_id") if isinstance(u, str)
+        }
 
 
-def test_branch_describe_prints_idempotency(capsys: pytest.CaptureFixture[str]) -> None:
-    code = main(
-        [
-            "plan",
-            "apply",
-            LONGFORM,
-            "--branch-describe",
-            str(FIXTURES / "ccn_longform_v2.branch.json"),
-        ]
-    )
-    assert code == 0
+def test_submit_text_mode(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["plan", "apply", LONGFORM, *LF_INPUTS, "--submit", "finish"]) == 0
     out = capsys.readouterr().out
-    assert "IDEMPOTENCY" in out
-    assert "appends: 2 present, 3 to add" in out  # 5 appends, 0 and 72 already present
+    assert "idempotency-key: plan.apply:" in out
+
+
+def test_idempotency_diff_lists_only_missing(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["plan", "apply", LONGFORM, *LF_INPUTS, "--branch-describe", BRANCH]) == 0
+    out = capsys.readouterr().out
+    assert "only what is missing" in out
+    assert "appends: 2 present, 4 to add" in out
+    assert "(segment 2)" in out and "(segment 3)" in out
+    assert "(segment 0)" not in out.split("IDEMPOTENCY")[1]
     assert "markers: 1 present, 1 to add" in out
 
 
-def test_submit_phase_a_refused_without_template_describe(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    code = main(["plan", "apply", LONGFORM, "--submit", "A"])
-    assert code == 2
-    assert "template_size_unchecked" in capsys.readouterr().err
-
-
-def test_submit_phase_b_refused_without_phase_a_result(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    code = main(["plan", "apply", LONGFORM, "--submit", "B"])
-    assert code == 2
-    assert "missing_phase_a_result" in capsys.readouterr().err
-
-
-def test_submit_phase_b_builds_a_valid_ops_sequence(capsys: pytest.CaptureFixture[str]) -> None:
+def test_template_describe_wrong_name_refused(capsys: pytest.CaptureFixture[str]) -> None:
     code = main(
-        [
-            "plan",
-            "apply",
-            LONGFORM,
-            "--submit",
-            "B",
-            "--json",
-            "--phase-a-result",
-            str(FIXTURES / "ccn_longform_v2.phase-a.json"),
-        ]
+        ["plan", "apply", SHORT, "--template-describe", TEMPLATE]  # longform template, short plan
     )
-    assert code == 0
-    body = json.loads(capsys.readouterr().out)
-    assert body["kind"] == "ops.sequence"
-    assert body["idempotency_key"].startswith("plan.apply:")
-    assert body["idempotency_key"].endswith(":B")
-    assert len(body["params"]["steps"]) == 7
-
-
-def test_batch_size_over_ten_refused(capsys: pytest.CaptureFixture[str]) -> None:
-    code = main(["plan", "apply", LONGFORM, "--batch-size", "11"])
     assert code == 2
-    assert "batch_size_invalid" in capsys.readouterr().err
+    assert "template_name_mismatch" in capsys.readouterr().err
+
+
+def _write(tmp_path: Path, data: dict[str, Any]) -> str:
+    path = tmp_path / "hostile.plan.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return str(path)
+
+
+def test_hostile_gain_exits_2_typed(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = _write(tmp_path, plan_data(segments=[seg(gain_db=45.0)]))
+    assert main(["plan", "apply", path]) == 2
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_hostile_title_track_17_exits_2_typed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    segs = [seg(track=t, a=t * 100, b=t * 100 + 24) for t in range(1, 17)]
+    data = plan_data(
+        segments=segs,
+        titles=[{"lines": ["Hi"], "record_in": 0, "record_out": 10, "template": "T"}],
+    )
+    path = _write(tmp_path, data)
+    assert main(["plan", "apply", path]) == 2
+    assert "Traceback" not in capsys.readouterr().err

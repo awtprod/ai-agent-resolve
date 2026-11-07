@@ -15,11 +15,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
-Phase = Literal["A", "B"]
+Phase = Literal["prepare", "assemble", "finish"]
 
 
 class Step(BaseModel):
-    """One compiled build op: its params already validate against the op's own model."""
+    """One compiled build op. ``params`` is a JSON-ready dict; it validates against the op's own
+    model at submit time, after the unresolved scan passes."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -28,7 +29,8 @@ class Step(BaseModel):
     name: str
     """Stable step name; unique within a phase, used as the ``ops.sequence`` idempotency key."""
     params: dict[str, Any]
-    """The op params, JSON-dumped from the op's validated model."""
+    """The op params. May carry :mod:`aar.plan.apply.refs` unresolved markers in a dry-run of a
+    later phase; a submission payload is refused if any survive."""
     summary: str
     """A one-line human rendering of the key params, for the dry-run."""
 

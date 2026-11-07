@@ -11,13 +11,14 @@ from pydantic import ValidationError
 
 from aar import cli_io
 from aar.node.ops.read import DescribeResult
-from aar.node.ops.write import AppendResult
 from aar.plan.apply import (
-    BranchRef,
+    AssembleResult,
     CompileError,
+    PrepareResult,
     build_submission,
-    compile_build,
+    compile_assemble,
     compile_finish,
+    compile_prepare,
 )
 from aar.plan.apply.render import dumps_json, render_json, render_text
 from aar.plan.inputs import LaughMap, Transcript, load_laughs, load_transcript
@@ -55,9 +56,10 @@ def register(subparsers: Any) -> None:
     apply = sub.add_parser(
         "apply",
         help="Compile a linted EditPlan v2 into Resolve build-op steps (dry-run).",
-        description="Lints first (refuses a plan with lint errors), then compiles phase A "
-        "(branch, import, tracks, append) and phase B (transitions, colour, transforms, "
-        "titles, gain, fades, markers). Exit: 0 ok, 2 refused.",
+        description="Lints first (refuses a plan with lint errors), then compiles three phases: "
+        "prepare (branch, import, find title templates), assemble (tracks, append), finish "
+        "(transitions, colour, transforms, titles, gain, fades, markers). Each later phase needs "
+        "the earlier phases' real result files. Exit: 0 ok, 2 refused.",
     )
     apply.add_argument("plan", type=Path, help="EditPlan JSON file.")
     apply.add_argument("--profile", help="Profile name or .toml path (default: the plan's).")
@@ -66,12 +68,17 @@ def register(subparsers: Any) -> None:
     apply.add_argument(
         "--template-describe",
         type=Path,
-        help="A timeline.describe result of the template (its unique_id and size).",
+        help="A timeline.describe of the template (its unique_id and size); phase 'prepare' input.",
     )
     apply.add_argument(
-        "--phase-a-result",
+        "--prepare-result",
         type=Path,
-        help="A phase-A append result (one AppendResult or a list), to resolve phase-B ids.",
+        help="The phase-'prepare' result (branch identity, imported sources, found titles).",
+    )
+    apply.add_argument(
+        "--assemble-result",
+        type=Path,
+        help="The phase-'assemble' result (the append results), to resolve finish item ids.",
     )
     apply.add_argument(
         "--branch-describe",
@@ -85,9 +92,9 @@ def register(subparsers: Any) -> None:
     apply.add_argument("--json", action="store_true", help="Print the dry-run as JSON.")
     apply.add_argument(
         "--submit",
-        choices=["A", "B"],
-        help="Build and validate the ops.sequence submission for a phase (thin; for manual "
-        "use with 'aar hub job submit').",
+        choices=["prepare", "assemble", "finish"],
+        help="Build and validate the ops.sequence submission for one phase (refused if any "
+        "reference is unresolved; thin, for manual use with 'aar hub job submit').",
     )
     apply.set_defaults(func=_cmd_apply)
 
@@ -160,22 +167,12 @@ def _load_describe(path: Path) -> DescribeResult:
     return DescribeResult.model_validate_json(path.read_text(encoding="utf-8"))
 
 
-def _load_phase_a(path: Path) -> list[AppendResult]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    rows = data if isinstance(data, list) else [data]
-    return [AppendResult.model_validate(row) for row in rows]
+def _sha(path: Path | None) -> list[str]:
+    if path is None:
+        return []
+    import hashlib
 
-
-def _branch_ref(
-    phase_a: list[AppendResult] | None, branch_describe: DescribeResult | None
-) -> BranchRef | None:
-    if phase_a:
-        tl = phase_a[0].timeline
-        return BranchRef(name=tl.name, unique_id=tl.unique_id)
-    if branch_describe is not None:
-        tl = branch_describe.timeline
-        return BranchRef(name=tl.name, unique_id=tl.unique_id)
-    return None
+    return [hashlib.sha256(path.read_bytes()).hexdigest()]
 
 
 def _compile_refusal(exc: CompileError, as_json: bool) -> int:
@@ -197,7 +194,16 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         laughs: LaughMap | None = load_laughs(args.laughs) if args.laughs else None
         profile = load_profile(args.profile or plan.profile)
         template = _load_describe(args.template_describe) if args.template_describe else None
-        phase_a = _load_phase_a(args.phase_a_result) if args.phase_a_result else None
+        prepare_res = (
+            PrepareResult.model_validate_json(args.prepare_result.read_text(encoding="utf-8"))
+            if args.prepare_result
+            else None
+        )
+        assemble_res = (
+            AssembleResult.model_validate_json(args.assemble_result.read_text(encoding="utf-8"))
+            if args.assemble_result
+            else None
+        )
         branch_describe = _load_describe(args.branch_describe) if args.branch_describe else None
     except ValidationError as exc:
         return _input_error(
@@ -209,7 +215,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
     report = lint(plan, profile, transcript=transcript, laughs=laughs)
     if not report.ok:
         if as_json:
-            body = {"ok": False, "error": {"type": "lint-errors", "report": report.model_dump()}}
+            body = {"ok": False, "error": {"type": "lint_errors", "report": report.model_dump()}}
             return cli_io.emit(_PROG, json.dumps(body, indent=2) + "\n") or EXIT_REFUSED
         cli_io.warn(f"refused (lint_errors): the plan has {report.counts['error']} lint error(s)")
         for finding in report.findings:
@@ -220,55 +226,60 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         if finding.severity == "warn":
             cli_io.warn(f"warning {finding.rule}: {finding.message}")
 
-    branch = _branch_ref(phase_a, branch_describe)
     try:
-        build = compile_build(plan, template=template, branch=branch, batch_size=args.batch_size)
-        finish = compile_finish(plan, phase_a, batch_size=args.batch_size)
+        prepare = compile_prepare(plan, template=template)
+        assemble = compile_assemble(plan, prepare=prepare_res, batch_size=args.batch_size)
+        finish = compile_finish(
+            plan, prepare=prepare_res, assemble=assemble_res, batch_size=args.batch_size
+        )
         if args.submit is not None:
-            return _do_submit(args, plan, build, finish, template, phase_a, branch, as_json)
+            return _do_submit(args, plan, prepare, assemble, finish, as_json)
     except CompileError as exc:
         return _compile_refusal(exc, as_json)
+    except ValidationError as exc:
+        return _input_error(
+            "invalid-compile",
+            "a compiled op param failed validation",
+            _validation_details(exc),
+            as_json,
+        )
 
     if as_json:
-        out = dumps_json(render_json(plan, build, finish, branch_describe=branch_describe))
+        out = dumps_json(
+            render_json(plan, prepare, assemble, finish, branch_describe=branch_describe)
+        )
     else:
-        out = render_text(plan, build, finish, branch_describe=branch_describe)
+        out = render_text(plan, prepare, assemble, finish, branch_describe=branch_describe)
     return cli_io.emit(_PROG, out)
+
+
+_SUBMIT_INPUTS = {
+    "prepare": lambda a: _sha(a.template_describe),
+    "assemble": lambda a: _sha(a.prepare_result),
+    "finish": lambda a: _sha(a.prepare_result) + _sha(a.assemble_result),
+}
 
 
 def _do_submit(
     args: argparse.Namespace,
     plan: EditPlan,
-    build: Any,
+    prepare: Any,
+    assemble: Any,
     finish: Any,
-    template: DescribeResult | None,
-    phase_a: list[AppendResult] | None,
-    branch: BranchRef | None,
     as_json: bool,
 ) -> int:
-    if args.submit == "B" and phase_a is None:
-        return _compile_refusal(
-            CompileError(
-                "missing_phase_a_result",
-                "cannot submit phase B without --phase-a-result",
-                "run phase A, then pass its result as --phase-a-result",
-            ),
-            as_json,
-        )
-    steps = build.steps if args.submit == "A" else finish.steps
+    phase = args.submit
+    steps = {"prepare": prepare, "assemble": assemble, "finish": finish}[phase].steps
     if not steps:
-        cli_io.warn(f"phase {args.submit} compiled to no steps; nothing to submit")
+        cli_io.warn(f"phase {phase!r} compiled to no steps; nothing to submit")
         return EXIT_OK
-    submission = build_submission(
-        plan, args.submit, steps, template_described=template is not None, branch=branch
-    )
+    submission = build_submission(plan, phase, steps, input_hashes=_SUBMIT_INPUTS[phase](args))
     if as_json:
         body = {
             "ok": True,
             "kind": submission.kind,
             "idempotency_key": submission.idempotency_key,
             "phase": submission.phase,
-            "warnings": submission.warnings,
             "params": submission.params,
         }
         return cli_io.emit(_PROG, json.dumps(body, indent=2) + "\n")
@@ -276,12 +287,9 @@ def _do_submit(
         f"submission ready: kind {submission.kind}, phase {submission.phase}, "
         f"{len(submission.params['steps'])} step(s)",
         f"idempotency-key: {submission.idempotency_key}",
-    ]
-    lines.extend(f"warning: {w}" for w in submission.warnings)
-    lines.append(
         "enqueue with: aar hub job submit --kind ops.sequence --params <file> "
-        f"--idempotency-key {submission.idempotency_key} ..."
-    )
+        f"--idempotency-key {submission.idempotency_key} ...",
+    ]
     return cli_io.emit(_PROG, "\n".join(lines) + "\n")
 
 
