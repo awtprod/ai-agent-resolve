@@ -211,18 +211,33 @@ def _check_id_shape(unique_id: str, what: str, *, forbid: set[str]) -> None:
     """A real Resolve unique id never contains ``/``, ``\\`` or ``:`` and is never a string the
     plan supplied (a media path or pool name, a source id, a template name) -- that would be a
     name passed through as an id (R1/N4, the W01 shape)."""
-    if _ID_FORBIDDEN.search(unique_id) or unique_id in forbid:
+    if not unique_id.strip() or _ID_FORBIDDEN.search(unique_id) or unique_id in forbid:
         raise CompileError(
             "forged_phase_result",
-            f"{what} id {unique_id!r} is not a Resolve unique id (it is path-shaped or a plan "
-            "string)",
+            f"{what} id {unique_id!r} is not a Resolve unique id (it is empty, path-shaped or a "
+            "plan string)",
             "a phase result must carry the real pool unique ids the ops returned",
             value=unique_id,
         )
 
 
+def plan_strings(plan: EditPlan) -> set[str]:
+    """Every string the plan supplies that could be passed through as an id."""
+    out = set(title_templates(plan)) | ({plan.template} if plan.template else set())
+    out |= {plan.project, plan.timeline}
+    for source in plan.sources:
+        out |= _source_strings(source)
+    return out
+
+
+def check_branch_id(unique_id: str, plan: EditPlan) -> None:
+    """The branch timeline id gets the same forged-id rule as pool and title ids (O1)."""
+    _check_id_shape(unique_id, "branch timeline", forbid=plan_strings(plan))
+
+
 def validate_prepare(prepare: PrepareResult, plan: EditPlan) -> None:
     _check_sha(prepare, plan)
+    check_branch_id(prepare.branch.unique_id, plan)
     by_id = {s.id: s for s in plan.sources}
     templates = set(title_templates(plan))
     plan_names = templates | ({plan.template} if plan.template else set())
@@ -279,6 +294,7 @@ def validate_prepare(prepare: PrepareResult, plan: EditPlan) -> None:
 
 def validate_assemble(assemble: AssembleResult, plan: EditPlan) -> None:
     _check_sha(assemble, plan)
+    check_branch_id(assemble.branch.unique_id, plan)
     for result in assemble.appends:
         if result.timeline.unique_id != assemble.branch.unique_id:
             raise CompileError(

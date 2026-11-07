@@ -17,6 +17,8 @@ from apply_support import (
     job_step,
     media_info,
     prepare_job,
+    synth_assemble,
+    synth_prepare,
     template_describe,
 )
 
@@ -26,6 +28,7 @@ from aar.plan.apply import (
     CompileError,
     PrepareResult,
     build_submission,
+    compile_assemble,
     compile_finish,
     phase_result_from_job,
     plan_hash,
@@ -606,3 +609,102 @@ def test_prepare_needs_the_template_describe() -> None:
 def test_finish_is_not_built_from_a_job() -> None:
     with pytest.raises(ValueError, match="prepare/assemble"):
         phase_result_from_job(prepare_job(P, TD), P, "finish", template=TD)
+
+
+# -- O1: the branch timeline id gets the forged-id rule ------------------------------------------
+
+_BAD_BRANCH_IDS = [
+    "E:/x",
+    "a/b",
+    "a\\b",
+    "t:1",
+    LF.template,
+    LF.project,
+    LF.timeline,
+    LF.sources[0].id,
+    LF.sources[0].camera,
+    LF.sources[0].media,
+    "CCN Lower Third",
+    "",
+    " ",
+    "\t\n",
+]
+
+
+@pytest.mark.parametrize("uid", _BAD_BRANCH_IDS)
+def test_o1_job_builder_refuses_a_forged_branch_id(uid: str) -> None:
+    job = prepare_job(LF, LF_TD, uid=uid)
+    assert _prepare_code(job, LF, LF_TD) == "forged_phase_result"
+
+
+@pytest.mark.parametrize("uid", _BAD_BRANCH_IDS)
+def test_o1_hand_written_prepare_file_refuses_a_forged_branch_id(uid: str) -> None:
+    bad = synth_prepare(LF, unique_id=uid)
+    for fn in (compile_assemble, compile_finish):
+        with pytest.raises(CompileError) as ei:
+            fn(LF, prepare=bad)
+        assert ei.value.code == "forged_phase_result"
+
+
+@pytest.mark.parametrize("uid", _BAD_BRANCH_IDS)
+def test_o1_hand_written_assemble_file_refuses_a_forged_branch_id(uid: str) -> None:
+    good = synth_prepare(LF)
+    asm = synth_assemble(LF, good)
+    bad = asm.model_copy(update={"branch": asm.branch.model_copy(update={"unique_id": uid})})
+    with pytest.raises(CompileError) as ei:
+        compile_finish(LF, prepare=good, assemble=bad)
+    assert ei.value.code == "forged_phase_result"
+
+
+@pytest.mark.parametrize("uid", _BAD_BRANCH_IDS)
+def test_o1_assemble_builder_refuses_a_prepare_envelope_with_a_forged_branch(uid: str) -> None:
+    good = _prepare(prepare_job(LF, LF_TD), LF, LF_TD)
+    job = assemble_job(LF, good)
+    bad = good.model_copy(update={"branch": good.branch.model_copy(update={"unique_id": uid})})
+    assert _assemble_code(job, bad, LF) == "forged_phase_result"
+
+
+def _all_branch_paths(prep: PrepareResult, good: PrepareResult, a: AssembleResult) -> None:
+    calls = (
+        lambda: compile_assemble(LF, prepare=prep),
+        lambda: compile_finish(LF, prepare=prep),
+        lambda: compile_finish(LF, prepare=good, assemble=a),
+        lambda: phase_result_from_job(assemble_job(LF, good), LF, "assemble", prepare=prep),
+    )
+    for call in calls:
+        with contextlib.suppress(CompileError):
+            call()
+
+
+def test_o1_no_untyped_error_escapes_for_any_branch_id() -> None:
+    good = synth_prepare(LF)
+    asm = synth_assemble(LF, good)
+    for uid in [*_BAD_BRANCH_IDS, "\x00", "\u200b", "x" * 5000, "tl-ok"]:
+        with contextlib.suppress(CompileError):
+            phase_result_from_job(prepare_job(LF, LF_TD, uid=uid), LF, "prepare", template=LF_TD)
+        prep = synth_prepare(LF, unique_id=uid)
+        a = asm.model_copy(update={"branch": asm.branch.model_copy(update={"unique_id": uid})})
+        _all_branch_paths(prep, good, a)
+
+
+def test_o1_an_ordinary_branch_id_is_accepted() -> None:
+    ok = _prepare(prepare_job(LF, LF_TD, uid="5f1c2e3a-0b9d-4c55-9a51-0d6c3a1f2b7e"), LF, LF_TD)
+    assert compile_assemble(LF, prepare=ok).phase == "assemble"
+
+
+# -- O2: an av append must come back with its linked audio ----------------------------------------
+
+
+def test_o2_av_append_with_no_linked_audio_is_incomplete_and_names_the_segment() -> None:
+    prep, job = _assemble_fixture()
+    value = _append_value(job)
+    index = next(
+        i
+        for i, r in enumerate(job_step(job, "append:v1:0")["params"]["ranges"])
+        if r["media_type"] == "av"
+    )
+    value["ranges"][index]["audio"] = []
+    with pytest.raises(CompileError) as ei:
+        phase_result_from_job(job, LF, "assemble", prepare=prep)
+    assert ei.value.code == "incomplete_job_result"
+    assert "segment" in ei.value.message

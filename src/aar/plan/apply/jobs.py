@@ -39,6 +39,7 @@ from aar.plan.apply.inputs import (
     FoundTitle,
     ImportedSource,
     PrepareResult,
+    check_branch_id,
     classify_media,
     find_source_step,
     find_title_step,
@@ -101,7 +102,7 @@ def phase_result_from_job(
         result: PrepareResult | AssembleResult = PrepareResult(
             plan_sha256=plan_hash(plan),
             job_id=job.job_id,
-            branch=_branch(results, template),
+            branch=_branch(results, template, plan),
             sources=_sources(results, expected, plan),
             titles=_titles(results, expected, plan),
         )
@@ -208,7 +209,9 @@ def _forged(message: str, hint: str, **details: Any) -> CompileError:
 # -- prepare -----------------------------------------------------------------------------------
 
 
-def _branch(results: dict[str, BaseModel], template: DescribeResult) -> TimelineIdentity:
+def _branch(
+    results: dict[str, BaseModel], template: DescribeResult, plan: EditPlan
+) -> TimelineIdentity:
     branch = _typed(results, BRANCH_STEP, BranchResult)
     if branch.source.unique_id != template.timeline.unique_id:
         raise CompileError(
@@ -224,6 +227,7 @@ def _branch(results: dict[str, BaseModel], template: DescribeResult) -> Timeline
             "the branch result names the template itself as the branch timeline",
             "phase 2 must never write into the template; re-run phase 'prepare'",
         )
+    check_branch_id(branch.timeline.unique_id, plan)  # O1: before any envelope is built
     return branch.timeline
 
 
@@ -401,6 +405,16 @@ def _append(result: AppendResult, step: Step) -> AppendResult:
         if want["media_type"] == "audio":
             shape_ok = video is None and bool(audio)
         else:
+            if want["media_type"] == "av" and not audio:
+                raise CompileError(
+                    "incomplete_job_result",
+                    f"append step {step.name!r} range {index} ({want.get('label')!r}) came back "
+                    "with no linked audio; finish would silently drop its crossfade, head fade "
+                    "and gain",
+                    "re-run the phase so the av append links its audio",
+                    step=step.name,
+                    range=index,
+                )
             shape_ok = (
                 video is not None and video.track_type == "video" and video.track == want["track"]
             )
