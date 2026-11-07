@@ -1,0 +1,319 @@
+{
+  "ok": true,
+  "fps": "30000/1001",
+  "sign": "offset_s is where the other file's first sample falls on the reference's clock (reference time = other time + offset_s); other.recording_origin = reference.recording_origin + offset_s * fps",
+  "settings": {
+    "rate": 8000,
+    "band_hz": [
+      150.0,
+      3500.0
+    ],
+    "max_offset_s": 600.0,
+    "max_duration_s": 7200.0,
+    "anchors": 12,
+    "anchor_s": 10.0,
+    "guard_s": 0.02,
+    "phat_eps": 0.001,
+    "agree_s": 0.25,
+    "min_ratio": 2.0,
+    "min_agreement": 0.6,
+    "min_windows": 2,
+    "window_s": 6.0,
+    "step_s": 2.0,
+    "search_s": 0.25,
+    "max_windows": 120,
+    "min_confirm": 0.5,
+    "min_overlap_s": 5.0,
+    "silence_dbfs": -60.0,
+    "timeout_s": null
+  },
+  "reference": {
+    "file": "longform_a.wav",
+    "recording_origin": 0,
+    "duration_s": 40.0,
+    "decoded_s": 40.0,
+    "truncated": false,
+    "non_finite_samples": 0
+  },
+  "pairs": [
+    {
+      "file": "longform_b.wav",
+      "duration_s": 40.0,
+      "decoded_s": 40.0,
+      "truncated": false,
+      "non_finite_samples": 0,
+      "status": "ok",
+      "level_dbfs": {
+        "reference": -30.3,
+        "other": -36.4
+      },
+      "coarse": {
+        "windows": [
+          {
+            "ref_start_s": 0.0,
+            "state": "searched",
+            "offset_s": -23.598004,
+            "ratio": 1.652,
+            "peak": 0.118545,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 2.7273,
+            "state": "searched",
+            "offset_s": 2.002007,
+            "ratio": 1.421,
+            "peak": 0.137108,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 5.4545,
+            "state": "searched",
+            "offset_s": 2.002014,
+            "ratio": 1.32,
+            "peak": 0.147781,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 8.1819,
+            "state": "searched",
+            "offset_s": -20.298,
+            "ratio": 1.093,
+            "peak": 0.157045,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 10.9091,
+            "state": "searched",
+            "offset_s": -14.597997,
+            "ratio": 1.099,
+            "peak": 0.119005,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 13.6364,
+            "state": "searched",
+            "offset_s": 2.002006,
+            "ratio": 1.979,
+            "peak": 0.210712,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 16.3636,
+            "state": "searched",
+            "offset_s": 2.002004,
+            "ratio": 2.03,
+            "peak": 0.229808,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 19.0909,
+            "state": "searched",
+            "offset_s": 2.002004,
+            "ratio": 1.919,
+            "peak": 0.239705,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 21.8181,
+            "state": "searched",
+            "offset_s": 2.002006,
+            "ratio": 3.231,
+            "peak": 0.241811,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 24.5455,
+            "state": "searched",
+            "offset_s": 2.002006,
+            "ratio": 2.801,
+            "peak": 0.260689,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 27.2727,
+            "state": "searched",
+            "offset_s": 2.002018,
+            "ratio": 3.493,
+            "peak": 0.304898,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 30.0,
+            "state": "searched",
+            "offset_s": 2.002017,
+            "ratio": 3.602,
+            "peak": 0.272346,
+            "polarity": -1
+          }
+        ],
+        "silent": 0,
+        "at_edge": 0,
+        "offset_s": 2.002006,
+        "windows_agreeing": 9,
+        "windows_eligible": 11,
+        "agreement": 0.818,
+        "median_ratio": 2.03
+      },
+      "drift": {
+        "windows": 16,
+        "silent": 0,
+        "unsearchable": 0,
+        "low_confidence": 0,
+        "measured": true,
+        "ppm": 0.176,
+        "residual_rms_ms": 0.0098,
+        "used": 16,
+        "outliers": 0,
+        "confirmed": 1.0,
+        "detail": [
+          {
+            "ref_start_s": 2.002,
+            "state": "searched",
+            "offset_s": 2.002,
+            "ratio": 11.717,
+            "peak": 0.281797,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 4.002,
+            "state": "searched",
+            "offset_s": 2.002002,
+            "ratio": 4.473,
+            "peak": 0.327425,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 6.002,
+            "state": "searched",
+            "offset_s": 2.002001,
+            "ratio": 4.782,
+            "peak": 0.372342,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 8.002,
+            "state": "searched",
+            "offset_s": 2.002024,
+            "ratio": 6.459,
+            "peak": 0.19666,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 10.002,
+            "state": "searched",
+            "offset_s": 2.002017,
+            "ratio": 3.776,
+            "peak": 0.247425,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 12.002,
+            "state": "searched",
+            "offset_s": 2.002028,
+            "ratio": 3.421,
+            "peak": 0.261112,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 14.002,
+            "state": "searched",
+            "offset_s": 2.002003,
+            "ratio": 3.821,
+            "peak": 0.234679,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 16.002,
+            "state": "searched",
+            "offset_s": 2.002004,
+            "ratio": 6.334,
+            "peak": 0.370286,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 18.002,
+            "state": "searched",
+            "offset_s": 2.002004,
+            "ratio": 5.956,
+            "peak": 0.3382,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 20.002,
+            "state": "searched",
+            "offset_s": 2.002004,
+            "ratio": 5.717,
+            "peak": 0.317999,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 22.002,
+            "state": "searched",
+            "offset_s": 2.002005,
+            "ratio": 2.849,
+            "peak": 0.3486,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 24.002,
+            "state": "searched",
+            "offset_s": 2.002004,
+            "ratio": 3.499,
+            "peak": 0.248149,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 26.002,
+            "state": "searched",
+            "offset_s": 2.002003,
+            "ratio": 2.712,
+            "peak": 0.341892,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 28.002,
+            "state": "searched",
+            "offset_s": 2.002007,
+            "ratio": 4.119,
+            "peak": 0.379068,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 30.002,
+            "state": "searched",
+            "offset_s": 2.002012,
+            "ratio": 4.094,
+            "peak": 0.316809,
+            "polarity": -1
+          },
+          {
+            "ref_start_s": 32.002,
+            "state": "searched",
+            "offset_s": 2.002021,
+            "ratio": 5.779,
+            "peak": 0.27088,
+            "polarity": -1
+          }
+        ],
+        "over_overlap_ms": 0.007
+      },
+      "overlap_s": 37.998,
+      "overlap_ref_s": [
+        2.002,
+        40.0
+      ],
+      "offset_s": 2.002004,
+      "offset_frames": 60,
+      "offset_frames_exact": 60.0001,
+      "rounding_error_ms": -0.0043,
+      "suggested_recording_origin": 60,
+      "confidence": {
+        "agreement": 0.818,
+        "median_ratio": 2.03,
+        "windows_agreeing": 9,
+        "windows_eligible": 11,
+        "confirmed": 1.0
+      }
+    }
+  ]
+}

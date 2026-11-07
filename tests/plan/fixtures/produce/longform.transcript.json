@@ -1,0 +1,285 @@
+{
+  "recording": "show-1",
+  "words": [
+    {
+      "text": "So",
+      "start_s": 1.2,
+      "end_s": 1.45
+    },
+    {
+      "text": "I",
+      "start_s": 1.52,
+      "end_s": 1.62
+    },
+    {
+      "text": "went",
+      "start_s": 1.7,
+      "end_s": 2.0
+    },
+    {
+      "text": "to",
+      "start_s": 2.06,
+      "end_s": 2.16
+    },
+    {
+      "text": "the",
+      "start_s": 2.22,
+      "end_s": 2.34
+    },
+    {
+      "text": "store",
+      "start_s": 2.4,
+      "end_s": 2.9
+    },
+    {
+      "text": "and",
+      "start_s": 4.4,
+      "end_s": 4.68
+    },
+    {
+      "text": "they",
+      "start_s": 4.75,
+      "end_s": 5.0
+    },
+    {
+      "text": "said",
+      "start_s": 5.06,
+      "end_s": 5.4
+    },
+    {
+      "text": "no",
+      "start_s": 5.46,
+      "end_s": 5.9
+    },
+    {
+      "text": "nothing",
+      "start_s": 6.3,
+      "end_s": 6.9
+    },
+    {
+      "text": "at",
+      "start_s": 6.96,
+      "end_s": 7.1
+    },
+    {
+      "text": "all",
+      "start_s": 7.16,
+      "end_s": 7.6
+    },
+    {
+      "text": "um",
+      "start_s": 8.0,
+      "end_s": 8.2
+    },
+    {
+      "text": "really",
+      "start_s": 8.8,
+      "end_s": 9.3
+    },
+    {
+      "text": "nothing",
+      "start_s": 9.36,
+      "end_s": 9.9
+    },
+    {
+      "text": "for",
+      "start_s": 9.96,
+      "end_s": 10.1
+    },
+    {
+      "text": "free",
+      "start_s": 10.16,
+      "end_s": 10.7
+    },
+    {
+      "text": "huh",
+      "start_s": 10.76,
+      "end_s": 11.1
+    },
+    {
+      "text": "funny",
+      "start_s": 11.6,
+      "end_s": 12.0
+    },
+    {
+      "text": "this",
+      "start_s": 14.3,
+      "end_s": 14.6
+    },
+    {
+      "text": "part",
+      "start_s": 14.66,
+      "end_s": 15.0
+    },
+    {
+      "text": "is",
+      "start_s": 15.06,
+      "end_s": 15.2
+    },
+    {
+      "text": "cut",
+      "start_s": 15.26,
+      "end_s": 15.7
+    },
+    {
+      "text": "out",
+      "start_s": 17.0,
+      "end_s": 17.4
+    },
+    {
+      "text": "later",
+      "start_s": 18.8,
+      "end_s": 19.3
+    },
+    {
+      "text": "and",
+      "start_s": 20.0,
+      "end_s": 20.3
+    },
+    {
+      "text": "then",
+      "start_s": 20.36,
+      "end_s": 20.7
+    },
+    {
+      "text": "I",
+      "start_s": 20.76,
+      "end_s": 20.86
+    },
+    {
+      "text": "told",
+      "start_s": 20.92,
+      "end_s": 21.3
+    },
+    {
+      "text": "her",
+      "start_s": 21.36,
+      "end_s": 21.6
+    },
+    {
+      "text": "about",
+      "start_s": 21.66,
+      "end_s": 22.1
+    },
+    {
+      "text": "it",
+      "start_s": 22.16,
+      "end_s": 22.4
+    },
+    {
+      "text": "she",
+      "start_s": 22.9,
+      "end_s": 23.2
+    },
+    {
+      "text": "laughed",
+      "start_s": 23.26,
+      "end_s": 23.8
+    },
+    {
+      "text": "first",
+      "start_s": 23.86,
+      "end_s": 24.3
+    },
+    {
+      "text": "then",
+      "start_s": 24.36,
+      "end_s": 24.5
+    },
+    {
+      "text": "cried",
+      "start_s": 25.6,
+      "end_s": 26.2
+    },
+    {
+      "text": "a",
+      "start_s": 26.26,
+      "end_s": 26.36
+    },
+    {
+      "text": "lot",
+      "start_s": 26.42,
+      "end_s": 26.8
+    },
+    {
+      "text": "because",
+      "start_s": 26.86,
+      "end_s": 27.4
+    },
+    {
+      "text": "of",
+      "start_s": 27.46,
+      "end_s": 27.6
+    },
+    {
+      "text": "me",
+      "start_s": 27.66,
+      "end_s": 28.0
+    },
+    {
+      "text": "anyway",
+      "start_s": 29.5,
+      "end_s": 30.1
+    },
+    {
+      "text": "we",
+      "start_s": 30.16,
+      "end_s": 30.3
+    },
+    {
+      "text": "got",
+      "start_s": 30.36,
+      "end_s": 30.6
+    },
+    {
+      "text": "married",
+      "start_s": 30.66,
+      "end_s": 31.2
+    },
+    {
+      "text": "next",
+      "start_s": 31.26,
+      "end_s": 31.6
+    },
+    {
+      "text": "week",
+      "start_s": 31.66,
+      "end_s": 32.1
+    },
+    {
+      "text": "and",
+      "start_s": 32.5,
+      "end_s": 32.7
+    },
+    {
+      "text": "that",
+      "start_s": 32.76,
+      "end_s": 33.0
+    },
+    {
+      "text": "was",
+      "start_s": 33.06,
+      "end_s": 33.2
+    },
+    {
+      "text": "that",
+      "start_s": 33.26,
+      "end_s": 34.8
+    },
+    {
+      "text": "and",
+      "start_s": 36.7,
+      "end_s": 36.9
+    },
+    {
+      "text": "another",
+      "start_s": 36.96,
+      "end_s": 37.4
+    },
+    {
+      "text": "thing",
+      "start_s": 37.46,
+      "end_s": 37.9
+    }
+  ]
+}

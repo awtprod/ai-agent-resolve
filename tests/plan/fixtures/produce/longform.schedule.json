@@ -1,0 +1,30 @@
+{
+  "recording": "show-1",
+  "spans": [
+    {
+      "start_s": 0.0,
+      "end_s": 8.0,
+      "camera": "A"
+    },
+    {
+      "start_s": 8.0,
+      "end_s": 25.0,
+      "camera": "B"
+    },
+    {
+      "start_s": 25.0,
+      "end_s": 31.0,
+      "camera": "A"
+    },
+    {
+      "start_s": 31.0,
+      "end_s": 31.5,
+      "camera": "B"
+    },
+    {
+      "start_s": 31.5,
+      "end_s": 40.0,
+      "camera": "A"
+    }
+  ]
+}

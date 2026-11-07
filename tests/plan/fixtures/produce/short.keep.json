@@ -1,0 +1,13 @@
+{
+  "recording": "set-1",
+  "ranges": [
+    {
+      "start_s": 1.0,
+      "end_s": 12.9
+    },
+    {
+      "start_s": 16.4,
+      "end_s": 25.6
+    }
+  ]
+}

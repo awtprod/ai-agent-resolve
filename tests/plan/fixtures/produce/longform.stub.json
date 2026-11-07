@@ -1,0 +1,85 @@
+{
+  "project": "Synthetic Show S01",
+  "timeline": "Synthetic Long v1",
+  "template": "CCN Long Template",
+  "kind": "longform",
+  "fps": {
+    "num": 30000,
+    "den": 1001
+  },
+  "resolution": {
+    "width": 1920,
+    "height": 1080
+  },
+  "profile": "ccn",
+  "sources": [
+    {
+      "id": "cam-a",
+      "media": "longform_a.wav",
+      "camera": "A",
+      "shot_size": "close",
+      "recording_id": "show-1",
+      "recording_origin": 0,
+      "duration": 1198
+    },
+    {
+      "id": "cam-b",
+      "media": "longform_b.wav",
+      "camera": "B",
+      "shot_size": "wide",
+      "recording_id": "show-1",
+      "recording_origin": 0,
+      "duration": 1198
+    },
+    {
+      "id": "outro",
+      "media": "ccn_outro.mov",
+      "shot_size": "wide",
+      "recording_id": "outro",
+      "duration": 302
+    }
+  ],
+  "segments": [],
+  "head": {
+    "video": "dissolve",
+    "video_frames": 15,
+    "audio_fade_frames": 15
+  },
+  "outro": {
+    "source": "outro",
+    "src_out": 302,
+    "audio_track": "A5",
+    "transition": {
+      "video": "cut"
+    }
+  },
+  "audio_tracks": [
+    {
+      "name": "A1",
+      "mute": true,
+      "bus": "A5"
+    },
+    {
+      "name": "A2",
+      "mute": true,
+      "bus": "A5"
+    },
+    {
+      "name": "A3",
+      "mute": true,
+      "bus": "A5"
+    },
+    {
+      "name": "A4",
+      "mute": true,
+      "bus": "A5"
+    },
+    {
+      "name": "A5"
+    },
+    {
+      "name": "A6"
+    }
+  ],
+  "end_fade_frames": 15
+}

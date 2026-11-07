@@ -1,0 +1,28 @@
+{
+  "project": "Synthetic Show S01",
+  "timeline": "Short 01 - Mom Calls",
+  "kind": "short",
+  "fps": "30000/1001",
+  "resolution": {
+    "width": 1080,
+    "height": 1920
+  },
+  "profile": "ccn",
+  "sources": [
+    {
+      "id": "master",
+      "media": "short_master.mov",
+      "camera": "A",
+      "shot_size": "medium",
+      "recording_id": "set-1",
+      "recording_origin": 0,
+      "duration": 899
+    }
+  ],
+  "segments": [],
+  "caption_style": {
+    "font": "Montserrat",
+    "active_word_color": "#FFE800"
+  },
+  "end_fade_frames": 1
+}
