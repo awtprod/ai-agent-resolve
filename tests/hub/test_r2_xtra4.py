@@ -129,6 +129,17 @@ def _records(hub: Any) -> list[dict[str, Any]]:
     return [json.loads(r[0]) for r in rows]
 
 
+def _record_bytes(hub: Any) -> list[int]:
+    """The STORED bytes of each worker_error record's payload, as the log holds them."""
+    con = sqlite3.connect(str(hub.root / "hub.db"))
+    rows = con.execute(
+        "SELECT length(CAST(payload AS BLOB)) FROM events WHERE type='hub.write' "
+        "AND json_extract(payload, '$.op') = 'recipe.worker_error'"
+    ).fetchall()
+    con.close()
+    return [r[0] for r in rows]
+
+
 def _event_count(hub: Any) -> int:
     con = sqlite3.connect(str(hub.root / "hub.db"))
     (n,) = con.execute("SELECT count(*) FROM events").fetchone()
@@ -182,7 +193,7 @@ def test_flood_probe_one_record_per_type_and_the_view_stays_bounded(
     assert count["i"] >= 200
     recs = _records(hub)
     assert len(recs) == 1, f"{len(recs)} worker_error records in 200 ticks"
-    assert _stored(recs[0]["error"]) <= 4 * 1024
+    assert max(_record_bytes(hub)) <= 4 * 1024  # the whole stored record, escaped JSON
     view = status_view(hub.log, rn)
     assert _view_bytes(view) <= MAX_VIEW_BYTES
     assert view["diagnostics"]["worker_error_count"] == 1
@@ -233,8 +244,7 @@ def test_view_entries_bounded_on_stored_bytes_with_huge_emoji_errors(
     rn = make_run(hub)
     recipe_start(hub.log, rn, AGENT, idempotency_key="s")
     _ticks(hub, monkeypatch, 60, lambda i: kinds[i % 30](f"{i} " + EMOJI * 4096))
-    recs = _records(hub)
-    assert len(recs) == 30 and max(_stored(r["error"]) for r in recs) <= 4 * 1024
+    assert len(_records(hub)) == 30 and max(_record_bytes(hub)) <= 4 * 1024
     view = status_view(hub.log, rn)
     diag = view["diagnostics"]
     assert diag["worker_error_count"] == 30 and len(diag["worker_errors"]) == 5

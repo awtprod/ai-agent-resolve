@@ -289,25 +289,25 @@ def record_worker_error(
 ) -> bool:
     """Leave one bounded ``hub.write`` record (op ``recipe.worker_error``) per
     (recipe node, exception type) for a swallowed per-recipe worker exception, so the status view
-    can surface it (R3-3) without flooding the log (R4-1). No new event type. The dedup key is the
-    exception TYPE (not the message), so a changing message records at most once; the stored
-    message is bounded to 4 KiB of escaped serialization (the round-4 stored-bytes rule)."""
-    base = f"aar.recipe.workererr/{recipe_node}/{exc_type[:64]}"
+    can surface it (R3-3) without flooding the log (R4-1). No new event type.
+
+    The dedup key is the exception TYPE, not the message: a message that changes every tick still
+    records at most once, and a repeat writes nothing. The whole stored record is bounded to
+    4 KiB of escaped JSON (the round-4 stored-bytes rule): the message gets what is left after the
+    other fields."""
+    exc_type = exc_type[:64]
+    base = f"aar.recipe.workererr/{recipe_node}/{exc_type}"
     if log.get_by_idempotency_key(base) is not None:
         return False
-    bounded = _bound_text(message, MAX_ERROR_BYTES)
+    fingerprint = request_sha256(OP_WORKER_ERROR, {"project_id": project_id, "recipe": recipe_node})
+    refs = {"recipe_node": recipe_node, "exc_type": exc_type}
+    envelope = {"op": OP_WORKER_ERROR, "request_sha256": fingerprint, **refs, "error": ""}
+    room = MAX_ERROR_BYTES - len(_canonical(envelope)) + _stored_len("")
+    bounded = _bound_text(message, room)
     try:
         with _in_transaction(log) as txn:
             _append_record(
-                txn,
-                base,
-                OP_WORKER_ERROR,
-                project_id,
-                RUNNER,
-                request_sha256(OP_WORKER_ERROR, {"project_id": project_id, "recipe": recipe_node}),
-                recipe_node=recipe_node,
-                exc_type=exc_type[:64],
-                error=bounded,
+                txn, base, OP_WORKER_ERROR, project_id, RUNNER, fingerprint, **refs, error=bounded
             )
     except Exception as exc:
         if _is_conflict(exc):
