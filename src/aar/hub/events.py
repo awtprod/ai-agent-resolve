@@ -30,7 +30,11 @@ from os import PathLike
 from pathlib import Path, PurePath
 from typing import Any
 
-ACTOR_KINDS = frozenset({"human", "agent", "node"})
+# "runner" is the recipe engine's own identity (aar.recipes.RUNNER). It is not a string any
+# tool surface may supply: the CLI/MCP actor parsers and the generic event-append paths refuse
+# it, so only aar.recipes can construct it. The scheduler trusts recipe.* events and op nodes
+# only when their actor is this kind (see aar.recipes.state).
+ACTOR_KINDS = frozenset({"human", "agent", "node", "runner"})
 
 # Crockford base32, used to render a 128-bit ULID as 26 sortable characters.
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
