@@ -547,6 +547,10 @@ def render_build(env: OpEnv, params: BuildParams) -> BuildResult:
         if params.adopt_render_job_id is not None:
             job_id = params.adopt_render_job_id
             info = _listed_once(project, job_id, "render_job_missing")
+            # A resumed build re-reads and verifies the adopted job's size exactly as the first
+            # attempt does, so a crash between AddRenderJob and the read-back can never leave a
+            # wrong, unverified size rendering. _verify_size only reads; it never re-applies.
+            size_verified = _verify_size(info, params)
         else:
             if params.prior_pre_ids is not None:
                 new = sorted(set(_job_ids(project)) - set(params.prior_pre_ids))

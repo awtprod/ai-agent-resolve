@@ -158,6 +158,7 @@ class RenderStep(Step):
                 return Fail(out.error)  # the build undid its own side effects; nothing to undo
             v = out.value_dict()
             cur["render_job_id"] = v["render_job_id"]
+            cur["size_verified"] = v.get("size_verified")
             if v.get("restore_error"):
                 cur["deliver_restore_error"] = v["restore_error"]
             cur["base"] = {
@@ -184,6 +185,9 @@ class RenderStep(Step):
             status = v["status"]
             if status in _DONE_OK:
                 cur["measured"] = {k: v.get(k) for k in _MEASURED_KEYS}
+                # size_verified is a build-time read-back (True/False/None), carried through to
+                # the job result so the hub can see whether the output size was confirmed.
+                cur["measured"]["size_verified"] = cur.get("size_verified")
                 if cur.get("deliver_restore_error"):
                     cur["measured"]["deliver_restore_error"] = cur["deliver_restore_error"]
                 if p.cleanup:
