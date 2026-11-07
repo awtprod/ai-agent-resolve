@@ -129,7 +129,7 @@ class RecipeDef:
         raise KeyError(step_id)
 
 
-def _check_step(step: StepDef, seen: set[str]) -> None:
+def _check_step(step: StepDef, seen: dict[str, int]) -> None:
     if not isinstance(step.id, str) or STEP_ID_RE.fullmatch(step.id) is None:
         raise RecipeDefError(f"step id {step.id!r} must match {STEP_ID_RE.pattern}")
     if step.id in seen:
@@ -162,7 +162,7 @@ def _check_step(step: StepDef, seen: set[str]) -> None:
     _check_kind_fields(step, seen)
 
 
-def _check_kind_fields(step: StepDef, seen: set[str]) -> None:
+def _check_kind_fields(step: StepDef, seen: dict[str, int]) -> None:
     if step.kind == "cold":
         if not step.callable_id:
             raise RecipeDefError(f"cold step {step.id!r} needs a callable_id")
@@ -183,11 +183,17 @@ def _check_kind_fields(step: StepDef, seen: set[str]) -> None:
             )
         if not step.on_reject:
             raise RecipeDefError(f"gate step {step.id!r} needs on_reject")
-        # on_reject must name an earlier step at or before the gate's subject: the round rolls
-        # back from on_reject, so it may not point at the gate itself or any later step.
+        # F13: on_reject must name the subject's producing step or an earlier one (never after the
+        # subject, or the round would re-review the unchanged subject). The round rolls back from
+        # on_reject, so it may not point at the gate itself or any later step.
         if step.on_reject not in seen:
             raise RecipeDefError(
                 f"gate step {step.id!r} on_reject {step.on_reject!r} must name an earlier step"
+            )
+        if seen[step.on_reject] > seen[step.subject]:
+            raise RecipeDefError(
+                f"gate step {step.id!r} on_reject {step.on_reject!r} is after its subject "
+                f"{step.subject!r}; it must be the subject or earlier"
             )
 
 
@@ -211,12 +217,12 @@ def validate_recipe(recipe: RecipeDef, *, known_callables: Sequence[str] = ()) -
         raise RecipeDefError(f"recipe {recipe.name!r} needs at least one step")
     if len(recipe.steps) > MAX_STEPS:
         raise RecipeDefError(f"recipe {recipe.name!r} has over {MAX_STEPS} steps")
-    seen: set[str] = set()
+    seen: dict[str, int] = {}
     known = set(known_callables)
-    for step in recipe.steps:
+    for index, step in enumerate(recipe.steps):
         _check_step(step, seen)
         if known_callables and step.kind == "cold" and step.callable_id not in known:
             raise RecipeDefError(
                 f"cold step {step.id!r} callable_id {step.callable_id!r} is not registered"
             )
-        seen.add(step.id)
+        seen[step.id] = index

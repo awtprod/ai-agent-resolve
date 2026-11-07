@@ -20,11 +20,12 @@ from typing import Any
 from aar.hub.common import Clock, utcnow
 from aar.hub.events import EventLog
 from aar.recipes.models import StepDef
+from aar.recipes.ports import HOT_STATES
 from aar.recipes.state import OpAttempt, RunState, load_state
 
 MAX_OUTPUTS_KEYS = 32
-MAX_STEP_OUTPUTS_BYTES = 1024
-MAX_STEP_ERROR_BYTES = 1024
+MAX_STEP_OUTPUTS_BYTES = 8 * 1024
+MAX_STEP_ERROR_BYTES = 4 * 1024
 MAX_VIEW_BYTES = 64 * 1024
 
 
@@ -111,9 +112,11 @@ def _summary(outputs: dict[str, Any] | None) -> tuple[dict[str, Any] | None, boo
         return None, False
     keys = sorted(outputs)[:MAX_OUTPUTS_KEYS]
     summary = {key: outputs[key] for key in keys}
-    if len(_canon(summary)) <= MAX_STEP_OUTPUTS_BYTES:
+    size = len(_canon(summary))
+    if size <= MAX_STEP_OUTPUTS_BYTES:
         return summary, False
-    return {"truncated": True, "keys": keys, "bytes": len(_canon(summary))}, True
+    # F6: the marker itself must stay small -- never echo the (possibly huge) keys, just counts.
+    return {"truncated": True, "key_count": len(outputs), "bytes": size}, True
 
 
 def _error(error: dict[str, Any] | None) -> tuple[dict[str, Any] | None, bool]:
@@ -201,11 +204,25 @@ def _hot_state(op: OpAttempt, step: StepDef, dispatcher: Any) -> tuple[str, dict
                 "who": "node",
                 "what": f"the node dispatcher failed to report on hot step {step.id!r}",
             }
-        if view.state in ("waiting_for_node", "node_offline"):
-            return f"waiting:{view.state}", {
+        if view is None:
+            # N7: a port that returns nothing is unknown, not a crash.
+            return "dispatcher_unknown", {
                 "who": "node",
-                "what": f"the node reports {view.state}",
+                "what": f"the node dispatcher returned no status for hot step {step.id!r}",
             }
-        if view.state == "running":
+        state_value = getattr(view, "state", None)
+        if not isinstance(state_value, str) or state_value not in HOT_STATES:
+            # N8: a garbage response gets a typed, bounded reason (not a raise, not silent).
+            return "waiting:dispatcher_bad_response", {
+                "who": "node",
+                "what": f"the node dispatcher returned an unusable status for hot step {step.id!r}",
+                "got": repr(state_value)[:200],
+            }
+        if state_value in ("waiting_for_node", "node_offline"):
+            return f"waiting:{state_value}", {
+                "who": "node",
+                "what": f"the node reports {state_value}",
+            }
+        if state_value == "running":
             return "running", None
     return "waiting:node", {"who": "node", "what": f"hot step {step.id!r} is on the node"}

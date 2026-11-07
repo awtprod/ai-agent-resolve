@@ -33,6 +33,7 @@ EVENT_RESULT = "recipe.result"
 EVENT_REVIEW_LINKED = "recipe.review_linked"
 EVENT_CANCELLED = "recipe.cancelled"
 EVENT_RUN_CANCELLED = "recipe.run_cancelled"
+EVENT_HOT_BAD_POLL = "recipe.hot_bad_poll"
 
 RECIPE_EVENT_TYPES = (
     EVENT_STARTED,
@@ -44,6 +45,7 @@ RECIPE_EVENT_TYPES = (
     EVENT_REVIEW_LINKED,
     EVENT_CANCELLED,
     EVENT_RUN_CANCELLED,
+    EVENT_HOT_BAD_POLL,
 )
 
 # hub.write ops (the record appended last by each runner write).
@@ -52,6 +54,7 @@ OP_CLAIM = "recipe.claim"
 OP_HEARTBEAT = "recipe.heartbeat"
 OP_HOT_INTENT = "recipe.hot_intent"
 OP_HOT_SUBMITTED = "recipe.hot_submitted"
+OP_HOT_BAD_POLL = "recipe.hot_bad_poll"
 OP_RESULT = "recipe.result"
 OP_REVIEW_OPEN = "recipe.review_open"
 OP_STEP_COMPLETE = "recipe.step_complete"

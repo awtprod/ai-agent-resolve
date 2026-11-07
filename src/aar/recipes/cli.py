@@ -134,19 +134,13 @@ def _print(value: Any) -> int:
 def _load_recipes(args: argparse.Namespace) -> None:
     from aar.recipes import registry
 
-    registry.load_modules(registry.modules_from_env(getattr(args, "recipes", [])))
+    registry.load_configured(getattr(args, "recipes", []))
 
 
 def _parse_actor(value: str) -> Any:
-    from aar.hub.events import Actor
+    from aar.hub.events import parse_actor_text
 
-    kind, sep, ident = value.partition(":")
-    if not sep:
-        raise ValueError(f"--actor must look like KIND:ID, got {value!r}")
-    if kind == "runner":
-        # 'runner' is the recipe engine's own identity; a caller may not impersonate it.
-        raise ValueError("actor kind 'runner' is reserved for the recipe engine")
-    return Actor(kind, ident)
+    return parse_actor_text(value)
 
 
 def _read_json(source: str) -> Any:

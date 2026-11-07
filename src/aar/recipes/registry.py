@@ -115,6 +115,14 @@ def modules_from_env(explicit: Sequence[str] | None = None) -> list[str]:
     return found
 
 
+def load_configured(explicit: Sequence[str] | None = None) -> None:
+    """Load every configured recipe module (``--recipes`` plus ``AAR_RECIPES``).
+
+    The one loader `aar hub serve`, `aar recipe` and `aar hub write recipe` all share, so the
+    registry a write sees is the registry the server sees (F12/N4)."""
+    load_modules(modules_from_env(explicit))
+
+
 def registry_params_validator(
     recipe: str, params: Mapping[str, object], brief: Brief
 ) -> Sequence[ParamProblem]:

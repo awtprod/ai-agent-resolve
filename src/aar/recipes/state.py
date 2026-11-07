@@ -30,6 +30,7 @@ from aar.recipes.events import (
     EVENT_CANCELLED,
     EVENT_CLAIMED,
     EVENT_HEARTBEAT,
+    EVENT_HOT_BAD_POLL,
     EVENT_HOT_INTENT,
     EVENT_HOT_SUBMITTED,
     EVENT_RESULT,
@@ -90,6 +91,7 @@ class OpAttempt:
     hot_job_ref: str | None = None
     hot_submitted: bool = False
     hot_intent: bool = False
+    bad_polls: int = 0
     # gate
     review_id: str | None = None
     review_round: int | None = None
@@ -270,12 +272,17 @@ def _op_from_node(node: Any) -> OpAttempt | None:
 
 
 def _fold_recipe_events(
-    ops: dict[str, OpAttempt], events: Iterable[Any], ignored: list[dict[str, Any]]
+    ops: dict[str, OpAttempt],
+    events: Iterable[Any],
+    ignored: list[dict[str, Any]],
+    recipe_node: str,
 ) -> tuple[bool, bool]:
     """Fold runner ``recipe.*`` events onto their ops; return (started, run_cancelled).
 
     Events whose actor is not RUNNER are ignored (and listed): no tool surface can produce the
-    runner identity, so this is what makes the evidence trustworthy.
+    runner identity, so this is what makes the evidence trustworthy. ``recipe.started`` and
+    ``recipe.run_cancelled`` count only for THIS recipe node (N1): the log read spans the whole
+    project, so a start/cancel of another recipe in the project must not touch this run.
     """
     started = run_cancelled = False
     claims: dict[str, list[_Claim]] = {}
@@ -296,10 +303,12 @@ def _fold_recipe_events(
         if not isinstance(payload, dict):
             continue
         if event.type == EVENT_STARTED:
-            started = True
+            if payload.get("recipe_node") == recipe_node:
+                started = True
             continue
         if event.type == EVENT_RUN_CANCELLED:
-            run_cancelled = True
+            if payload.get("recipe_node") == recipe_node:
+                run_cancelled = True
             continue
         op_id = payload.get("op_node")
         op = ops.get(op_id) if isinstance(op_id, str) else None
@@ -324,6 +333,8 @@ def _fold_recipe_events(
             op.hot_submitted = True
             op.hot_job_ref = _str(payload.get("job_ref")) or op.hot_job_ref
             op.hot_request_id = _str(payload.get("request_id")) or op.hot_request_id
+        elif event.type == EVENT_HOT_BAD_POLL:
+            op.bad_polls += 1
         elif event.type == EVENT_RESULT:
             op.result_outcome = payload.get("outcome")
             op.result_at = event.ts
@@ -431,7 +442,10 @@ def load_state(log: EventLog, recipe_node: str, *, project_id: str | None = None
         if op is not None:
             ops[op.op_id] = op
     started, run_cancelled = _fold_recipe_events(
-        ops, log.read(0, project_id=project_id, types=RECIPE_EVENT_TYPES, limit=-1), ignored
+        ops,
+        log.read(0, project_id=project_id, types=RECIPE_EVENT_TYPES, limit=-1),
+        ignored,
+        recipe_node,
     )
     reviews: dict[str, Review] = {}
     for op in ops.values():

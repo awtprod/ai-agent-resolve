@@ -29,8 +29,7 @@ from aar.hub.writes import (
 )
 from aar.recipes import registry
 from aar.recipes.engine import (
-    MAX_OUTPUT_BYTES,
-    _canonical,
+    _outputs_problem,
     _supersede_op,
     advance,
     create_attempt,
@@ -158,6 +157,17 @@ def recipe_start(
             node_id=recipe_node,
             status=state.recipe_status,
         )
+    # N5: the recipe node must still be open. If it has not started yet, its graph status must be
+    # pending; a creator that pre-moved it (active/done) can no longer start it here.
+    node = _graph.node(recipe_node)
+    if not state.started and node is not None and node.status != "pending":
+        raise WriteError(
+            "step_not_open",
+            f"recipe {recipe_node!r} node is {node.status!r}, not an open (pending) recipe",
+            "A recipe must be started from pending; recreate it if its node was moved.",
+            node_id=recipe_node,
+            status=node.status,
+        )
     record_started(log, project_id=project_id, recipe_node=recipe_node, caller=actor)
     advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
     return _result("recipe.start", log, recipe_node, dispatcher, clock)
@@ -194,6 +204,16 @@ def step_complete(
             "expects_unmet",
             "outputs must be a JSON object",
             "Send the step's outputs as an object.",
+        )
+    # N3: reject bad raw outputs (NaN/inf, non-string keys, nesting over 64) FIRST -- before the
+    # fingerprint canonicalises them -- so a deep structure can never crash with a RecursionError.
+    raw_problem = _outputs_problem(dict(outputs))
+    if raw_problem is not None:
+        raise WriteError(
+            raw_problem,
+            f"the agent step's outputs are {raw_problem.replace('_', ' ')}",
+            "Return finite, string-keyed JSON under 64 levels and 64 KiB.",
+            step_id=step_id,
         )
     project_id, _graph, state, definition = _resolve(log, recipe_node)
     fingerprint = request_sha256(
@@ -252,11 +272,12 @@ def step_complete(
             open_attempt=op.attempt,
         )
     validated = _validate_expects(log, store, state, recipe_node, step, dict(outputs))
-    if len(_canonical(validated)) > MAX_OUTPUT_BYTES:
+    problem = _outputs_problem(validated)
+    if problem is not None:
         raise WriteError(
-            "outputs_too_large",
-            f"the step's outputs exceed {MAX_OUTPUT_BYTES} bytes of canonical JSON",
-            "Store large data as an artifact and return its id, not inline outputs.",
+            problem,
+            f"the agent step's outputs are {problem.replace('_', ' ')}",
+            "Return finite, string-keyed JSON under 64 levels and 64 KiB.",
             step_id=step_id,
         )
     artifact_ids = tuple(a for a in validated.get("artifact_ids", []) if isinstance(a, str))
@@ -330,27 +351,39 @@ def _validate_plan(
             plan_node=plan_node_id,
         )
     parent = _plan_parent(graph, plan_node_id)
-    # F4: round 1 derives from the recipe node. A review parent is accepted only when it is a gate
-    # review of THIS recipe for the previous round (current-1): a plan deriving from another
-    # recipe's review, or from an earlier round's review, is refused.
+    # F4: the round is the run's current round from the event log, never a caller number.
+    #   round 1    -> the plan must derive from the recipe node.
+    #   round n>=2 -> the plan must derive from round n-1's REJECTED gate review (not the recipe
+    #                 node, and not any other round's or recipe's review).
     current = state.current_round()
-    allowed_reviews = {
-        op.review_id
-        for op in state.ops
-        if op.kind == "gate" and op.review_id is not None and op.round == current - 1
-    }
-    if parent == recipe_node or (_is_review(graph, parent) and parent in allowed_reviews):
-        pass
+    if current == 1:
+        if parent != recipe_node:
+            raise WriteError(
+                "expects_unmet",
+                f"plan {plan_node_id!r} must derive from the recipe node in round 1",
+                "Submit the plan with derives_from set to the recipe node.",
+                step_id=step.id,
+                derives_from=parent,
+            )
     else:
-        raise WriteError(
-            "expects_unmet",
-            f"plan {plan_node_id!r} must derive from the recipe node or this recipe's "
-            f"round-{current - 1} gate review",
-            "Submit the plan with derives_from set to the recipe node (or the current round's "
-            "review).",
-            step_id=step.id,
-            derives_from=parent,
-        )
+        prev_rejected = {
+            op.review_id
+            for op in state.ops
+            if op.kind == "gate"
+            and op.round == current - 1
+            and op.review_id is not None
+            and (rev := state.reviews.get(op.review_id)) is not None
+            and rev.decision is not None
+            and rev.decision.decision == "reject"
+        }
+        if not (_is_review(graph, parent) and parent in prev_rejected):
+            raise WriteError(
+                "expects_unmet",
+                f"plan {plan_node_id!r} must derive from round {current - 1}'s rejected review",
+                "In a later round, derive the new plan from the review that rejected the last one.",
+                step_id=step.id,
+                derives_from=parent,
+            )
     data = typed_plan(plan_node)
     if data is None:
         raise WriteError(
@@ -358,6 +391,21 @@ def _validate_plan(
             f"plan {plan_node_id!r} has no typed lint summary",
             "Submit the plan with plan_submit so it carries a lint summary.",
             step_id=step.id,
+        )
+    # F4: refuse a plan whose canonical bytes equal one a rejected review of this recipe covered.
+    rejected_shas = {
+        op.result_outputs.get("plan_sha256")
+        for op in state.ops
+        if op.step_id == step.id and op.round < current and isinstance(op.result_outputs, dict)
+    }
+    rejected_shas.discard(None)
+    if data.plan_sha256 in rejected_shas:
+        raise WriteError(
+            "plan_unchanged",
+            f"plan {plan_node_id!r} is byte-for-byte a plan a human already rejected",
+            "Change the plan in response to the rejection, then resubmit.",
+            step_id=step.id,
+            plan_sha256=data.plan_sha256,
         )
     gate = plan_gate(data, required_rules=expects.required_rules)
     if not gate.passed:
@@ -418,7 +466,28 @@ def _validate_artifact(
             step_id=step.id,
             media_kind=expects.media_kind,
         )
-    op = state.latest_in_round(step.id, state.current_round())
+    current = state.current_round()
+    # N6: in a later round, refuse the artifact (id or sha) a rejected review already covered.
+    rejected_artifacts = {
+        aid
+        for prior in state.ops
+        if prior.step_id == step.id
+        and prior.round < current
+        and isinstance(prior.result_outputs, dict)
+        for aid in (
+            prior.result_outputs.get("artifact_id"),
+            *(prior.result_outputs.get("artifact_ids") or []),
+        )
+        if isinstance(aid, str)
+    }
+    if artifact_id in rejected_artifacts:
+        raise WriteError(
+            "subject_unchanged",
+            f"artifact {artifact_id} is the one a human already rejected",
+            "Produce a new artifact in response to the rejection.",
+            step_id=step.id,
+        )
+    op = state.latest_in_round(step.id, current)
     subject = op.op_id if op is not None else None
     return {"artifact_id": artifact_id, "subject_node": subject, "artifact_ids": [artifact_id]}
 
@@ -471,6 +540,20 @@ def recipe_retry(
     project_id, graph, state, definition = _resolve(log, recipe_node)
     _require_owner(graph, recipe_node, actor, "retry")
     step = _step(definition, step_id)
+    # F9: a repeated retry with the same key replays the first result whatever has happened since.
+    # The key is checked BEFORE the "has a failed attempt" check (so a replay after the step moved
+    # on still replays, not step_not_open), and is fingerprinted on (recipe_node, step_id) so a
+    # different step under the same key is a conflict.
+    fingerprint = request_sha256(
+        OP_RETRY,
+        {"project_id": project_id, "recipe_node": recipe_node, "step_id": step_id},
+    )
+    if (
+        _find_record(log, caller_key, idempotency_key, OP_RETRY, project_id, actor, fingerprint)
+        is not None
+    ):
+        advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
+        return {**_result("recipe.retry", log, recipe_node, dispatcher, clock), "replayed": True}
     current = state.current_round()
     op = state.latest_in_round(step_id, current)
     if op is None or op.status != "failed":
@@ -489,21 +572,6 @@ def recipe_retry(
             step_id=step_id,
             max_review_rounds=state.max_review_rounds,
         )
-    fingerprint = request_sha256(
-        OP_RETRY,
-        {
-            "project_id": project_id,
-            "recipe_node": recipe_node,
-            "step_id": step_id,
-            "failed_op": op.op_id,
-        },
-    )
-    if (
-        _find_record(log, caller_key, idempotency_key, OP_RETRY, project_id, actor, fingerprint)
-        is not None
-    ):
-        advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
-        return {**_result("recipe.retry", log, recipe_node, dispatcher, clock), "replayed": True}
     failed = len([o for o in state.in_round(step_id, current) if o.status == "failed"])
     if failed >= step.max_attempts:
         raise WriteError(
@@ -560,6 +628,15 @@ def recipe_cancel(
     write_key(actor, idempotency_key)
     project_id, graph, state, _ = _resolve(log, recipe_node)
     _require_owner(graph, recipe_node, actor, "cancel")
+    # N5: cancelling a finished run is a no-op that reports already_finished (never flips a done
+    # run to cancelled).
+    if state.recipe_status in _FINISHED:
+        return {
+            "ok": True,
+            "op": "recipe.cancel",
+            "already_finished": True,
+            **status_view(log, recipe_node, clock=clock),
+        }
     for op in state.ops:
         if op.is_live:
             _supersede_op(log, project_id, op, actor, reason)

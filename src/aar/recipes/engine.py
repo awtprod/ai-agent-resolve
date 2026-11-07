@@ -40,6 +40,7 @@ from aar.recipes.events import (
     EVENT_CANCELLED,
     EVENT_CLAIMED,
     EVENT_HEARTBEAT,
+    EVENT_HOT_BAD_POLL,
     EVENT_HOT_INTENT,
     EVENT_HOT_SUBMITTED,
     EVENT_RESULT,
@@ -50,6 +51,7 @@ from aar.recipes.events import (
     OP_CANCEL,
     OP_CLAIM,
     OP_HEARTBEAT,
+    OP_HOT_BAD_POLL,
     OP_HOT_INTENT,
     OP_HOT_SUBMITTED,
     OP_RESULT,
@@ -61,7 +63,10 @@ from aar.recipes.events import (
     STEP_SCHEMA,
 )
 from aar.recipes.models import RecipeDef, StepDef
+from aar.recipes.ports import HOT_STATES
 from aar.recipes.state import OpAttempt, RunState, load_state, project_of_node
+
+MAX_BAD_POLLS = 5
 
 DEFAULT_LEASE_S = 60
 DEFAULT_HEARTBEAT_S = 15
@@ -75,22 +80,83 @@ def _caller_ref(actor: Actor) -> str:
     return f"{actor.kind}:{actor.id}"
 
 
+MAX_ERROR_BYTES = 4 * 1024
+_MAX_OUTPUT_DEPTH = 64
+
+
 def _canonical(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    """Canonical UTF-8 JSON. ``allow_nan=False`` so NaN/±inf raise rather than emit invalid JSON;
+    ``sort_keys`` raises ``TypeError`` on non-string keys."""
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
 
 
-def _outputs_too_large(outputs: dict[str, Any]) -> bool:
+def _within_depth(value: Any, limit: int) -> bool:
+    """Whether ``value`` nests no deeper than ``limit`` (iterative, so no RecursionError)."""
+    stack = [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > limit:
+            return False
+        if isinstance(node, dict):
+            stack.extend((v, depth + 1) for v in node.values())
+        elif isinstance(node, (list, tuple)):
+            stack.extend((v, depth + 1) for v in node)
+    return True
+
+
+def _outputs_problem(outputs: dict[str, Any]) -> str | None:
+    """``None`` if ``outputs`` is JSON-valid and within bounds, else a refusal code.
+
+    ``outputs_invalid``: NaN/±inf, non-string keys or nesting over 64. ``outputs_too_large``: over
+    64 KiB of canonical UTF-8 JSON. This runs on the boundary so no cold/hot result can crash the
+    worker or produce log-invalid JSON (N3)."""
+    if not _within_depth(outputs, _MAX_OUTPUT_DEPTH):
+        return "outputs_invalid"
     try:
-        return len(_canonical(outputs)) > MAX_OUTPUT_BYTES
+        blob = _canonical(outputs)
     except (TypeError, ValueError):
-        return True
+        return "outputs_invalid"
+    if len(blob) > MAX_OUTPUT_BYTES:
+        return "outputs_too_large"
+    return None
 
 
-_TOO_LARGE_ERROR = {
-    "code": "outputs_too_large",
-    "message": f"the step's outputs exceed {MAX_OUTPUT_BYTES} bytes of canonical JSON",
-    "fix_hint": "Store large data as an artifact and return its id, not inline outputs.",
+_OUTPUT_ERRORS = {
+    "outputs_too_large": {
+        "code": "outputs_too_large",
+        "message": f"the step's outputs exceed {MAX_OUTPUT_BYTES} bytes of canonical JSON",
+        "fix_hint": "Store large data as an artifact and return its id, not inline outputs.",
+    },
+    "outputs_invalid": {
+        "code": "outputs_invalid",
+        "message": "the step's outputs are not valid JSON (NaN/inf, non-string keys, or too deep)",
+        "fix_hint": "Return finite numbers, string keys and nesting under 64 levels.",
+    },
 }
+
+
+def _bound_text(value: Any, limit: int) -> Any:
+    """Truncate a string to ``limit`` UTF-8 bytes; pass non-strings through."""
+    if not isinstance(value, str):
+        return value
+    raw = value.encode("utf-8")
+    if len(raw) <= limit:
+        return value
+    return raw[:limit].decode("utf-8", "ignore")
+
+
+def _bound_error(error: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Keep only ``{code, message, fix_hint}`` and cap each text field to 4 KiB of UTF-8 (F6)."""
+    if not isinstance(error, dict):
+        return error
+    bounded = {
+        "code": _bound_text(error.get("code"), MAX_ERROR_BYTES),
+        "message": _bound_text(error.get("message"), MAX_ERROR_BYTES),
+        "fix_hint": _bound_text(error.get("fix_hint"), MAX_ERROR_BYTES),
+    }
+    return {k: v for k, v in bounded.items() if v is not None}
 
 
 # -- op creation --------------------------------------------------------------
@@ -285,15 +351,25 @@ def record_result(
     The write is attributed to RUNNER; ``actor`` is the real worker/caller, recorded as ``by`` in
     the payload and ``caller`` in the record. If the op is still active and has been claimed,
     only its latest claimant may record a result (``enforce_holder``); a stale worker's result is
-    refused quietly (``False``). Done outputs over :data:`MAX_OUTPUT_BYTES` are converted to a
-    ``failed`` result with code ``outputs_too_large``. Idempotent per op (``#result``).
+    refused quietly (``False``). Done outputs that are not JSON-valid, nest over 64, or exceed
+    64 KiB are converted to a ``failed`` result with ``outputs_invalid`` / ``outputs_too_large``
+    (N3/F6), so no result can crash the worker or write log-invalid JSON. The error dict is bounded
+    to ``{code, message, fix_hint}`` with each field capped at 4 KiB of UTF-8. Idempotent per op.
     """
     base = f"aar.recipe.result/{op_id}"
     if log.get_by_idempotency_key(base + "#result") is not None:
         return False
     out = dict(outputs or {})
-    if outcome == OUTCOME_DONE and _outputs_too_large(out):
-        outcome, out, artifact_ids, error = OUTCOME_FAILED, {}, (), dict(_TOO_LARGE_ERROR)
+    if outcome == OUTCOME_DONE:
+        problem = _outputs_problem(out)
+        if problem is not None:
+            outcome, out, artifact_ids, error = (
+                OUTCOME_FAILED,
+                {},
+                (),
+                dict(_OUTPUT_ERRORS[problem]),
+            )
+    error = _bound_error(error)
     new_status = "done" if outcome == OUTCOME_DONE else "failed"
     payload = {
         "op_node": op_id,
@@ -778,6 +854,26 @@ def _drive_one_hot(
         view = dispatcher.poll(op.hot_job_ref)
     else:
         return changed
+    state_value = getattr(view, "state", None)
+    if view is None or not isinstance(state_value, str) or state_value not in HOT_STATES:
+        # N8: a None or garbage poll response is not a crash and not a step failure (yet). Record
+        # it; after MAX_BAD_POLLS consecutive bad responses the step fails dispatcher_bad_response.
+        if _record_bad_poll(log, state.project_id, op, caller):
+            changed = True
+        if op.bad_polls + 1 >= MAX_BAD_POLLS and record_result(
+            log,
+            project_id=state.project_id,
+            op_id=op.op_id,
+            actor=caller,
+            outcome=OUTCOME_FAILED,
+            error={
+                "code": "dispatcher_bad_response",
+                "message": f"the node dispatcher returned {MAX_BAD_POLLS} unusable responses",
+                "fix_hint": "Check the node; retry the step once it reports properly.",
+            },
+        ):
+            changed = True
+        return changed
     if view.is_terminal:
         if view.state == "done":
             result = view.result
@@ -801,6 +897,32 @@ def _drive_one_hot(
         ):
             changed = True
     return changed
+
+
+def _record_bad_poll(log: EventLog, project_id: str, op: OpAttempt, caller: Actor) -> bool:
+    """Record one bad/None poll response for ``op`` (idempotent per count), for the N8 counter."""
+    base = f"aar.recipe.badpoll/{op.op_id}/{op.bad_polls}"
+    if log.get_by_idempotency_key(base + "#bad") is not None:
+        return False
+    with _in_transaction(log) as txn:
+        txn.append(
+            EVENT_HOT_BAD_POLL,
+            RUNNER,
+            {"op_node": op.op_id, "n": op.bad_polls},
+            project_id=project_id,
+            idempotency_key=base + "#bad",
+        )
+        _append_record(
+            txn,
+            base,
+            OP_HOT_BAD_POLL,
+            project_id,
+            RUNNER,
+            request_sha256(OP_HOT_BAD_POLL, {"project_id": project_id, "op_node": op.op_id}),
+            op_node=op.op_id,
+            caller=_caller_ref(caller),
+        )
+    return True
 
 
 def _record_hot_intent(log: EventLog, project_id: str, op: OpAttempt, caller: Actor) -> None:

@@ -296,40 +296,49 @@ def _tick(
     now = clock()
     recipes = active_recipes(log)
     for _project_id, recipe_node in recipes:
-        advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
+        # N3: one recipe's failure (a raising dispatcher, a bad advance) must never stop the loop.
+        try:
+            advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
+        except Exception:
+            continue
     for project_id, recipe_node in recipes:
-        state = load_state(log, recipe_node, project_id=project_id)
-        if state.recipe_def is None:
+        try:
+            state = load_state(log, recipe_node, project_id=project_id)
+            if state.recipe_def is None:
+                continue
+            found = _claimable(state, state.recipe_def, now)
+            if found is None:
+                continue
+            op, step = found
+            if not claim(
+                log,
+                project_id=project_id,
+                op=op,
+                worker=actor,
+                idempotent=step.idempotent,
+                clock=clock,
+                lease_s=lease_s,
+            ):
+                return True  # a race; another worker took it -- retry the loop
+            _run_step(
+                log,
+                store,
+                state,
+                state.recipe_def,
+                op,
+                step,
+                actor,
+                clock=clock,
+                stop=stop,
+                lease_s=lease_s,
+                heartbeat_s=heartbeat_s,
+            )
+            advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
+            return True
+        except Exception:
+            # The step result is recorded in _run_step; anything else (a per-recipe fault) is
+            # swallowed so the worker goes on to the next recipe (N3).
             continue
-        found = _claimable(state, state.recipe_def, now)
-        if found is None:
-            continue
-        op, step = found
-        if not claim(
-            log,
-            project_id=project_id,
-            op=op,
-            worker=actor,
-            idempotent=step.idempotent,
-            clock=clock,
-            lease_s=lease_s,
-        ):
-            return True  # a race; another worker took it -- retry the loop
-        _run_step(
-            log,
-            store,
-            state,
-            state.recipe_def,
-            op,
-            step,
-            actor,
-            clock=clock,
-            stop=stop,
-            lease_s=lease_s,
-            heartbeat_s=heartbeat_s,
-        )
-        advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
-        return True
     return False
 
 
