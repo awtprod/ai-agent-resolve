@@ -165,3 +165,51 @@ def test_hostile_title_track_17_exits_2_typed(
     path = _write(tmp_path, data)
     assert main(["plan", "apply", path]) == 2
     assert "Traceback" not in capsys.readouterr().err
+
+
+def test_w43_finish_submit_key_depends_on_the_assemble_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Two assemble results that differ (by job_id bytes) give different finish keys, so a re-run
+    # after an assemble redo is a new key, never a conflict (F2 at the CLI; kills W43).
+    import copy
+    import json as _json
+
+    base = _json.loads((FIXTURES / "ccn_longform_v2.assemble.json").read_text())
+    a1 = tmp_path / "asm1.json"
+    a1.write_text(_json.dumps(base))
+    other = copy.deepcopy(base)
+    other["job_id"] = "job_assemble_REDO"
+    a2 = tmp_path / "asm2.json"
+    a2.write_text(_json.dumps(other))
+
+    def key(asm: str) -> str:
+        assert (
+            main(
+                [
+                    "plan",
+                    "apply",
+                    LONGFORM,
+                    "--submit",
+                    "finish",
+                    "--json",
+                    "--prepare-result",
+                    PREPARE,
+                    "--assemble-result",
+                    asm,
+                ]
+            )
+            == 0
+        )
+        return _json.loads(capsys.readouterr().out)["idempotency_key"]
+
+    assert key(str(a1)) != key(str(a2))
+
+
+def test_submit_prints_warnings_before_submitting(capsys: pytest.CaptureFixture[str]) -> None:
+    # The mute warnings (and other notes) are surfaced on the submit path, not hidden (R4).
+    code = main(
+        ["plan", "apply", LONGFORM, "--submit", "assemble", "--json", "--prepare-result", PREPARE]
+    )
+    assert code == 0
+    assert "mute is template state" in capsys.readouterr().err

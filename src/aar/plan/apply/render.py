@@ -37,11 +37,13 @@ def _media_id(media: Any) -> str | None:
 # -- idempotency (F11) -------------------------------------------------------------------------
 
 
-def _present_items(describe: DescribeResult) -> dict[int, list[Any]]:
-    by_track: dict[int, list[Any]] = {}
+def _present_items(describe: DescribeResult) -> dict[tuple[str, int], list[Any]]:
+    # Key by (track_type, index): a linked audio item on A1 must not read as a video append on V1
+    # (R5).
+    by_track: dict[tuple[str, int], list[Any]] = {}
     for track in describe.tracks:
         for item in track.items:
-            by_track.setdefault(track.index, []).append(item)
+            by_track.setdefault((track.type, track.index), []).append(item)
     return by_track
 
 
@@ -67,13 +69,16 @@ def idempotency(
     missing_appends: list[str] = []
     present_appends = 0
     for rng in _appended(assemble):
-        items = by_track.get(rng["track"], [])
+        kind = "video" if rng["media_type"] in ("av", "video") else "audio"
+        items = by_track.get((kind, rng["track"]), [])
         if _item_present(
             items, rng["record_in"], rng["src_in"], rng["src_out"], _media_id(rng["media"])
         ):
             present_appends += 1
         else:
-            missing_appends.append(f"track {rng['track']} @ {rng['record_in']} ({rng['label']})")
+            missing_appends.append(
+                f"{kind[0].upper()}{rng['track']} @ {rng['record_in']} ({rng['label']})"
+            )
 
     t_track = title_track(plan)
     missing_titles: list[str] = []
@@ -82,7 +87,7 @@ def idempotency(
         if intent.kind not in ("title", "sting"):
             continue
         record_in = _title_record_in(intent)
-        if any(i.record_in == record_in for i in by_track.get(t_track, [])):
+        if any(i.record_in == record_in for i in by_track.get(("video", t_track), [])):
             present_titles += 1
         else:
             missing_titles.append(intent.target)
@@ -136,7 +141,7 @@ def render_text(
     )
     lines.append(
         f"profile {plan.profile}: {len(plan.segments)} segment(s), "
-        f"{plan.total_frames()} frame(s); batch size {_BATCH}"
+        f"{plan.total_frames()} frame(s); batch size {assemble.batch_size}"
     )
     lines.append("")
 
@@ -178,9 +183,6 @@ def render_text(
             for item in miss:
                 lines.append(f"    + {item}")
     return "\n".join(lines) + "\n"
-
-
-_BATCH = 10
 
 
 def _append_lines(assemble: Compilation) -> list[str]:

@@ -16,24 +16,30 @@ marker, never a guessed value. A dry-run prints it; a submission is refused if a
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import Any, get_args
 
-from pydantic import TypeAdapter, ValidationError
-
 from aar.node.ops import get_op
 from aar.node.ops.build import (
     AudioFormat,  # noqa: F401  (import registers build.py's ops before we read them)
-    EditPath,
     path_key,
 )
-from aar.node.ops.framework import MediaRef, TimelineRef
+from aar.node.ops.framework import TimelineRef
 from aar.node.ops.read import DescribeResult
 from aar.node.ops.write import MarkerColor
 from aar.plan.apply.errors import CompileError
-from aar.plan.apply.inputs import AssembleResult, PrepareResult
+from aar.plan.apply.inputs import (
+    AssembleResult,
+    PrepareResult,
+    check_media_classifiable,
+    classify_media,
+    import_bin,
+    plan_hash,
+    title_templates,
+    validate_assemble,
+    validate_prepare,
+)
 from aar.plan.apply.model import FinishIntent, Phase, SegmentPlacement, Step
 from aar.plan.apply.refs import find_unresolved, unresolved
 from aar.plan.model import Cdl, EditPlan, Source
@@ -48,9 +54,6 @@ TEMPLATE_MAX_ITEMS = 30
 MAX_STEPS = 500
 """``OpSequenceParams`` caps a job at 500 steps."""
 
-IMPORT_ROOT = "aar"
-
-_EDIT_PATH = TypeAdapter(EditPath)
 _VIDEO_TRANSITIONS = {
     "dissolve": "Cross Dissolve",
     "dip": "Dip To Color Dissolve",
@@ -70,17 +73,11 @@ class Compilation:
     warnings: list[str] = field(default_factory=list)
     placements: list[SegmentPlacement] = field(default_factory=list)
     intents: list[FinishIntent] = field(default_factory=list)
+    batch_size: int = DEFAULT_BATCH
 
     @property
     def unresolved(self) -> int:
         return sum(len(find_unresolved(step.params)) for step in self.steps)
-
-
-def plan_hash(plan: EditPlan) -> str:
-    canonical = json.dumps(
-        plan.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def template_item_count(describe: DescribeResult) -> int:
@@ -113,30 +110,6 @@ def _check_title_track(plan: EditPlan) -> None:
         )
 
 
-def _is_edit_path(media: str) -> bool:
-    try:
-        _EDIT_PATH.validate_python(media)
-    except ValidationError:
-        return False
-    return True
-
-
-def _import_bin(source: Source) -> tuple[str, ...]:
-    return (IMPORT_ROOT, source.camera or "sources")
-
-
-def _title_templates(plan: EditPlan) -> list[str]:
-    names: list[str] = []
-    for title in plan.titles:
-        if title.template is not None and title.template not in names:
-            names.append(title.template)
-    if plan.outro is not None and plan.outro.sting is not None:
-        sting = plan.outro.sting
-        if sting.template is not None and sting.template not in names:
-            names.append(sting.template)
-    return names
-
-
 def _audio_index(plan: EditPlan, name: str | None) -> int | None:
     for index, track in enumerate(plan.audio_tracks, start=1):
         if track.name == name:
@@ -154,6 +127,7 @@ def compile_prepare(plan: EditPlan, *, template: DescribeResult | None = None) -
             "the plan has no template to build from",
             "set the plan's 'template' (the timeline timeline.branch starts from)",
         )
+    check_media_classifiable(plan)
     notes: list[str] = []
     steps: list[Step] = []
 
@@ -195,7 +169,8 @@ def compile_prepare(plan: EditPlan, *, template: DescribeResult | None = None) -
         )
     )
     steps.extend(_import_steps(plan, notes))
-    for index, name in enumerate(_title_templates(plan)):
+    steps.extend(_find_source_steps(plan))
+    for index, name in enumerate(title_templates(plan)):
         steps.append(
             _step(
                 "prepare",
@@ -205,11 +180,33 @@ def compile_prepare(plan: EditPlan, *, template: DescribeResult | None = None) -
                 f"find title template {name!r}",
             )
         )
-    if not _title_templates(plan) and (plan.titles or _has_sting(plan)):
+    if not title_templates(plan) and (plan.titles or _has_sting(plan)):
         notes.append(
             "a title/sting has no template name; it cannot be placed (title.place needs one)"
         )
     return Compilation("prepare", steps, notes)
+
+
+def _find_source_steps(plan: EditPlan) -> list[Step]:
+    """A media.find for each pool-name source (e.g. a CCN multicam clip), in its camera bin, so
+    phase 1 resolves its real pool unique_id (R1)."""
+    steps: list[Step] = []
+    index = 0
+    for source in plan.sources:
+        if classify_media(source.media) != "pool":
+            continue
+        bin_path = import_bin(source)
+        steps.append(
+            _step(
+                "prepare",
+                "media.find",
+                f"find-source:{index}",
+                {"name": source.media, "bin_path": list(bin_path), "recursive": True, "limit": 200},
+                f"find pool source {source.media!r} for {source.id}",
+            )
+        )
+        index += 1
+    return steps
 
 
 def _has_sting(plan: EditPlan) -> bool:
@@ -218,19 +215,16 @@ def _has_sting(plan: EditPlan) -> bool:
 
 def _import_steps(plan: EditPlan, notes: list[str]) -> list[Step]:
     bins: dict[tuple[str, ...], list[str]] = {}
-    skipped = []
+    pool = []
     for source in plan.sources:
-        if not _is_edit_path(source.media):
-            skipped.append(source.id)
+        if classify_media(source.media) != "import":
+            pool.append(source.id)
             continue
-        paths = bins.setdefault(_import_bin(source), [])
+        paths = bins.setdefault(import_bin(source), [])
         if all(path_key(p) != path_key(source.media) for p in paths):
             paths.append(source.media)
-    if skipped:
-        notes.append(
-            f"sources not given as edit-PC paths are assumed already in the pool: "
-            f"{', '.join(skipped)}"
-        )
+    if pool:
+        notes.append(f"pool-name sources resolved by media.find in prepare: {', '.join(pool)}")
     steps: list[Step] = []
     for bin_path, paths in bins.items():
         for batch_index, batch in enumerate(_chunk(paths, 50)):
@@ -259,6 +253,9 @@ def compile_assemble(
 ) -> Compilation:
     _check_batch(batch_size)
     _check_title_track(plan)
+    check_media_classifiable(plan)
+    if prepare is not None:
+        validate_prepare(prepare, plan)
     notes: list[str] = []
     warnings: list[str] = []
     working = prepare.branch_ref() if prepare is not None else None
@@ -269,7 +266,9 @@ def compile_assemble(
     append_steps, placements = _append_steps(plan, tl, source_media, batch_size, notes)
     steps.extend(append_steps)
     _check_steps(steps)
-    return Compilation("assemble", steps, notes, warnings, placements=placements)
+    return Compilation(
+        "assemble", steps, notes, warnings, placements=placements, batch_size=batch_size
+    )
 
 
 def _track_step(plan: EditPlan, tl: Any, warnings: list[str]) -> Step:
@@ -295,15 +294,16 @@ def _track_step(plan: EditPlan, tl: Any, warnings: list[str]) -> Step:
 
 
 def _media_ref(plan: EditPlan, source: Source, source_media: dict[str, Any]) -> Any:
+    """The pool media ref for a source: ONLY from the prepare result. A source never passes its
+    own ``media`` string through as a pool id (R1); without a prepare result it is Unresolved,
+    which makes submit refuse."""
     imported = source_media.get(source.id)
     if imported is not None:
         return imported.media.model_dump(mode="json")
-    if source.id in source_media or not _is_edit_path(source.media):
-        # A pool-name source already in the pool: use it as given (its media is a pool id/name).
-        return MediaRef(unique_id=source.media, bin_path=None).model_dump(mode="json")
     return unresolved(
         "media",
-        f"pool unique_id for source {source.id!r} ({source.media}); run phase 'prepare'",
+        f"pool unique_id for source {source.id!r} ({source.media}); run phase 'prepare' and pass "
+        "--prepare-result",
     )
 
 
@@ -383,11 +383,15 @@ def _outro_append(
     )
     audio_index = _audio_index(plan, outro.audio_track)
     if audio_index is None:
-        notes.append(
-            f"outro.audio_track {outro.audio_track!r} is not in audio_tracks; the outro audio is "
-            "not placed (it must not fall back to A1)"
+        # Refuse rather than silently drop the outro's sound onto A1 (R4): the outro clip has
+        # audio, so it needs a named audio track to carry it.
+        raise CompileError(
+            "outro_audio_track_missing",
+            f"the outro has no audio_track in audio_tracks (audio_track={outro.audio_track!r})",
+            "set outro.audio_track to an audio_tracks entry (e.g. the A5 bus) so the outro's "
+            "sound has a track; it must not fall back to A1",
+            audio_track=outro.audio_track,
         )
-        return
     steps.append(
         _step(
             "assemble",
@@ -464,6 +468,7 @@ class _Resolver:
     video: dict[tuple[int, int], str]
     content_audio: dict[tuple[int, int], list[str]]
     audio_only: dict[tuple[int, int], list[str]]
+    meta: dict[tuple[int, int], tuple[int, int | None, int | None]]
     ambiguous: set[tuple[int, int]]
     timeline: TimelineRef
 
@@ -505,6 +510,7 @@ def _resolver(plan: EditPlan, assemble: AssembleResult) -> _Resolver:
     video: dict[tuple[int, int], str] = {}
     content_audio: dict[tuple[int, int], list[str]] = {}
     audio_only: dict[tuple[int, int], list[str]] = {}
+    meta: dict[tuple[int, int], tuple[int, int | None, int | None]] = {}
     ambiguous: set[tuple[int, int]] = set()
     branch_id = assemble.branch.unique_id
     timeline = assemble.branch_ref()
@@ -523,10 +529,15 @@ def _resolver(plan: EditPlan, assemble: AssembleResult) -> _Resolver:
                     ambiguous.add(key)
                 video[key] = appended.video.item_id
                 content_audio[key] = [p.item_id for p in appended.audio]
+                meta[key] = (
+                    appended.planned_record_out,
+                    appended.video.source_start,
+                    appended.video.source_end,
+                )
             elif appended.audio:
                 key = (appended.audio[0].track, appended.planned_record_in)
                 audio_only.setdefault(key, []).extend(p.item_id for p in appended.audio)
-    return _Resolver(video, content_audio, audio_only, ambiguous, timeline)
+    return _Resolver(video, content_audio, audio_only, meta, ambiguous, timeline)
 
 
 def compile_finish(
@@ -537,6 +548,20 @@ def compile_finish(
     batch_size: int = DEFAULT_BATCH,
 ) -> Compilation:
     _check_batch(batch_size)
+    _check_title_track(plan)
+    check_media_classifiable(plan)
+    if assemble is not None and prepare is None:
+        # Finish needs the prepare envelope too: title pool ids and the BRAW re-check come from
+        # it, and we must cross-check the shared branch (R2).
+        raise CompileError(
+            "missing_prepare_result",
+            "finish needs the prepare result as well as the assemble result",
+            "pass --prepare-result alongside --assemble-result",
+        )
+    if prepare is not None:
+        validate_prepare(prepare, plan)
+    if assemble is not None:
+        validate_assemble(assemble, plan)
     if (
         prepare is not None
         and assemble is not None
@@ -558,11 +583,31 @@ def compile_finish(
 
 
 def _check_all_segments_matched(plan: EditPlan, resolver: _Resolver) -> None:
-    """Every content segment must be matched exactly once in the assemble result, finishing op
-    or not (F8)."""
+    """Every content segment must be matched exactly once in the assemble result, finishing op or
+    not; and the matched append must be of this plan's range, not a stale one (F8, R2)."""
     ranges = plan.record_ranges()
     for index, seg in enumerate(plan.segments):
-        resolver.video_item(seg.track, ranges[index][0])  # raises unmatched / double_matched
+        record_in, record_out = ranges[index]
+        resolver.video_item(seg.track, record_in)  # raises unmatched / double_matched
+        planned_out, src_start, src_end = resolver.meta[(seg.track, record_in)]
+        if (
+            planned_out != record_out
+            or not _range_matches(src_start, seg.src_in)
+            or (not _range_matches(src_end, seg.src_out))
+        ):
+            raise CompileError(
+                "stale_phase_result",
+                f"segment {index} appended as record {record_in}..{planned_out} source "
+                f"{src_start}..{src_end}, not the plan's {record_in}..{record_out} source "
+                f"{seg.src_in}..{seg.src_out}",
+                "the assemble result is from an older plan; re-run phase 'assemble'",
+                segment=index,
+            )
+
+
+def _range_matches(reported: int | None, expected: int) -> bool:
+    # source frames carry a +/-1 read-back rounding trap; a stale clip differs by far more.
+    return reported is None or abs(reported - expected) <= 1
 
 
 class _Finish:
@@ -880,7 +925,8 @@ class _Finish:
             "no_handle_for_transition",
             f"{what}: no alignment fits a {frames}-frame transition (outgoing tail {tail}, "
             f"incoming head {head})",
-            "shorten the transition or give the source ranges more handle",
+            "shorten the transition, give the source ranges more handle, or set the source "
+            "'duration' (an unknown duration counts as no handle)",
             outgoing_tail=tail,
             incoming_head=head,
             frames=frames,
@@ -902,25 +948,33 @@ class _Finish:
         first = _first_content_segment(self.plan)
         if head is not None and first is not None and head.audio_fade_frames > 0:
             index, track, record_in = first
-            # Audio fade-in from silence: no audio-from-silence transition primitive exists
-            # (AddTransition audio needs an adjacent clip), so the clip fade handle is used.
+            # [I] inferred: the facts doc does not say an audio AddTransition needs a neighbour,
+            # so we do NOT claim 21.1 lacks an audio-from-silence transition. We use the clip fade
+            # handle (item.set_fades, which the op reads back) for the head audio fade-in.
             self.notes.append(
-                "head audio fade uses the clip fade handle (item.set_fades); 21.1 has no "
-                "audio transition from silence"
+                "[I] head audio fade uses the clip fade handle (item.set_fades), not an audio "
+                "transition from silence (inferred: the facts doc doesn't cover this)"
             )
             self._fades(
                 track, record_in, fade_in=head.audio_fade_frames, target=f"first segment {index}"
             )
         if self.plan.end_fade_frames and self.plan.end_fade_frames > 0:
             track, record_in, where = self._end_item()
-            if track is not None:
-                self._fades(
-                    track,
-                    record_in,
-                    fade_out=self.plan.end_fade_frames,
-                    target=where,
-                    audio_only=self.plan.outro is not None,
+            if track is None:
+                raise CompileError(
+                    "end_fade_without_audio",
+                    f"end_fade_frames is set ({self.plan.end_fade_frames}) but there is no audio "
+                    "track to fade at the end of the timeline",
+                    "give the outro an audio_track, or add a content segment with audio, or drop "
+                    "end_fade_frames",
                 )
+            self._fades(
+                track,
+                record_in,
+                fade_out=self.plan.end_fade_frames,
+                target=where,
+                audio_only=self.plan.outro is not None,
+            )
 
     def _end_item(self) -> tuple[int | None, int, str]:
         if self.plan.outro is not None:
@@ -1051,17 +1105,23 @@ class _Finish:
             self.notes.append(f"{label} has no template name; cannot place it")
             return
         if len(lines) > 4:
-            self.notes.append(f"{label} has {len(lines)} lines; title.place allows at most 4")
-            return
+            # Refuse, do not silently drop the lower third (R8).
+            raise CompileError(
+                "title_too_many_lines",
+                f"{label} has {len(lines)} lines; title.place allows at most 4",
+                "split the title into at most 4 lines",
+                lines=len(lines),
+            )
         media = self.titles.get(template)
         if media is not None:
             ref: Any = media.model_dump(mode="json")
-        elif self.prepare is not None:
-            self.notes.append(f"{label}: template {template!r} not in the prepare result; skipped")
-            return
         else:
+            # A template not (yet) in the prepare result is Unresolved, so submit refuses rather
+            # than dropping the title (R8, W29).
             ref = unresolved(
-                "title_template", f"pool id of title template {template!r}; run phase 'prepare'"
+                "title_template",
+                f"pool id of title template {template!r}; run phase 'prepare' and pass "
+                "--prepare-result",
             )
         self._emit(
             "title.place",
@@ -1189,7 +1249,9 @@ def _tl(working: TimelineRef | None, hint: str) -> Any:
 
 
 def _fits(available: int | None, need: int) -> bool:
-    return available is None or available >= need
+    # An unknown handle (no source duration / no neighbour) counts as NO handle: the conservative
+    # choice, so a transition that might not build is refused rather than silently emitted (R7).
+    return available is not None and available >= need
 
 
 def _is_braw(path: str) -> bool:

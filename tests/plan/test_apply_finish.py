@@ -239,8 +239,8 @@ def test_transform_keeps_pan_and_tilt_distinct() -> None:
     assert t["pan"] == 40.0 and t["tilt"] == -15.0 and t["zoom"] == 1.2
 
 
-def test_title_with_five_lines_is_skipped_with_a_note() -> None:
-    # title.place allows at most 4 lines; a 5-line title is not placed, and says so.
+def test_title_with_five_lines_is_refused() -> None:
+    # title.place allows at most 4 lines; a 5-line title is refused, not dropped (R8).
     p = plan(
         titles=[
             {
@@ -252,9 +252,8 @@ def test_title_with_five_lines_is_skipped_with_a_note() -> None:
             }
         ]
     )
-    comp, _ = _finish(p)
-    assert not _targets(comp, "title.place")
-    assert any("at most 4" in n for n in comp.notes)
+    prep = synth_prepare(p)
+    assert _code(p, prepare=prep, assemble=synth_assemble(p, prep)) == "title_too_many_lines"
 
 
 def test_idempotency_requires_full_source_range_identity() -> None:

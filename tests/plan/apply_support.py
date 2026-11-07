@@ -10,7 +10,7 @@ from aar.node.ops.framework import MediaRef, TimelineIdentity
 from aar.node.ops.read import DescribeResult, ItemInfo, MarkerInfo, TimelineInfo, TrackInfo
 from aar.node.ops.write import AppendedRange, AppendResult, PlacedItem
 from aar.plan.apply import PrepareResult, compile_assemble
-from aar.plan.apply.inputs import AssembleResult, FoundTitle, ImportedSource
+from aar.plan.apply.inputs import AssembleResult, FoundTitle, ImportedSource, plan_hash
 from aar.plan.model import EditPlan
 
 BRANCH_UID = "tl-branch-0001"
@@ -42,13 +42,17 @@ def synth_prepare(plan: EditPlan, *, unique_id: str = BRANCH_UID) -> PrepareResu
         for name in templates
     ]
     return PrepareResult(
+        plan_sha256=plan_hash(plan),
+        job_id="job_prepare_test",
         branch=TimelineIdentity(name=_branch_name(plan), unique_id=unique_id),
         sources=sources,
         titles=titles,
     )
 
 
-def _placed(track: int, rin: int, rout: int, item_id: str, ttype: str) -> PlacedItem:
+def _placed(
+    track: int, rin: int, rout: int, item_id: str, ttype: str, src_in: int, src_out: int
+) -> PlacedItem:
     return PlacedItem(
         item_id=item_id,
         track_type=ttype,
@@ -58,8 +62,8 @@ def _placed(track: int, rin: int, rout: int, item_id: str, ttype: str) -> Placed
         duration=rout - rin,
         record_in=rin,
         record_out=rout,
-        source_start=0,
-        source_end=rout - rin,
+        source_start=src_in,
+        source_end=src_out,
     )
 
 
@@ -75,12 +79,17 @@ def synth_assemble(
             continue
         for rng in step.params["ranges"]:
             track, rin = rng["track"], rng["record_in"]
-            frames = rng["src_out"] - rng["src_in"]
+            si, so = rng["src_in"], rng["src_out"]
+            frames = so - si
             rout = rin + frames
             mt = rng["media_type"]
-            video = _placed(track, rin, rout, f"V{track}:{rin}", "video") if mt != "audio" else None
+            video = (
+                _placed(track, rin, rout, f"V{track}:{rin}", "video", si, so)
+                if mt != "audio"
+                else None
+            )
             audio = (
-                [_placed(track, rin, rout, f"A{track}:{rin}", "audio")]
+                [_placed(track, rin, rout, f"A{track}:{rin}", "audio", si, so)]
                 if mt in ("av", "audio")
                 else []
             )
@@ -108,7 +117,12 @@ def synth_assemble(
         gaps=[],
         notes=[],
     )
-    return AssembleResult(branch=prepare.branch, appends=[result])
+    return AssembleResult(
+        plan_sha256=plan_hash(plan),
+        job_id="job_assemble_test",
+        branch=prepare.branch,
+        appends=[result],
+    )
 
 
 def template_describe(

@@ -1,4 +1,6 @@
 {
+  "plan_sha256": "a78a3d895889cf301d1f0cb8279af7a5c5610ee97cf75b25b76d6a1f25b0f7f1",
+  "job_id": "job_assemble_test",
   "branch": {
     "name": "CCN Short Template [agent:ccn-bot v1]",
     "unique_id": "tl-branch-0001"
@@ -65,8 +67,8 @@
             "duration": 120,
             "record_in": 120,
             "record_out": 240,
-            "source_start": 0,
-            "source_end": 120
+            "source_start": 120,
+            "source_end": 240
           },
           "audio": [
             {
@@ -78,8 +80,8 @@
               "duration": 120,
               "record_in": 120,
               "record_out": 240,
-              "source_start": 0,
-              "source_end": 120
+              "source_start": 120,
+              "source_end": 240
             }
           ],
           "notes": []

@@ -34,5 +34,5 @@ PHASE finish - finish (4 steps, 0 unresolved ref(s))
 WARNINGS (0)
 NOTES / GAPS (3)
   - template 'CCN Short Template' has 10 item(s) (<= 30)
-  - head audio fade uses the clip fade handle (item.set_fades); 21.1 has no audio transition from silence
+  - [I] head audio fade uses the clip fade handle (item.set_fades), not an audio transition from silence (inferred: the facts doc doesn't cover this)
   - 2 caption(s) are not applied by plan.apply (ffmpeg compose, S13e)

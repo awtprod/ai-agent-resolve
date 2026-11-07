@@ -269,7 +269,14 @@ def _do_submit(
     as_json: bool,
 ) -> int:
     phase = args.submit
-    steps = {"prepare": prepare, "assemble": assemble, "finish": finish}[phase].steps
+    comp = {"prepare": prepare, "assemble": assemble, "finish": finish}[phase]
+    # Surface every note and warning before submitting, so nothing is hidden on the submit path
+    # (R4): mute warnings, dropped-title notes, the head-fade [I] note, etc.
+    for warning in comp.warnings:
+        cli_io.warn(f"warning: {warning}")
+    for note in comp.notes:
+        cli_io.warn(f"note: {note}")
+    steps = comp.steps
     if not steps:
         cli_io.warn(f"phase {phase!r} compiled to no steps; nothing to submit")
         return EXIT_OK

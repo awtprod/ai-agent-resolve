@@ -65,4 +65,4 @@ WARNINGS (4)
   ! audio track 'A4' is marked mute in the plan; mute is template state in 21.1, so it is not applied -- verify it in the template
 NOTES / GAPS (2)
   - template 'CCN Longform Template' has 10 item(s) (<= 30)
-  - head audio fade uses the clip fade handle (item.set_fades); 21.1 has no audio transition from silence
+  - [I] head audio fade uses the clip fade handle (item.set_fades), not an audio transition from silence (inferred: the facts doc doesn't cover this)

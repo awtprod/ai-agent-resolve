@@ -1,4 +1,6 @@
 {
+  "plan_sha256": "4d9b216c831df0e927b5ea1a3fe4021670bc98417bf17c183b3bc13ff61a6f39",
+  "job_id": "job_prepare_test",
   "branch": {
     "name": "CCN Longform Template [agent:ccn-bot v1]",
     "unique_id": "tl-branch-0001"

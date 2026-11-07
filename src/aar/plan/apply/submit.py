@@ -14,8 +14,8 @@ from typing import Any
 
 from aar.node.jobs.kinds import OpSequenceParams
 from aar.node.ops import get_op
-from aar.plan.apply.compile import plan_hash
 from aar.plan.apply.errors import CompileError
+from aar.plan.apply.inputs import plan_hash
 from aar.plan.apply.model import Step
 from aar.plan.apply.refs import find_unresolved
 from aar.plan.model import EditPlan
@@ -76,7 +76,7 @@ def _validate(params: dict[str, Any]) -> None:
             op = get_op(spec.op)
         except KeyError as exc:
             raise CompileError(
-                "phase_result_mismatch",
+                "unknown_op",
                 f"step {index} names unknown op {spec.op!r}",
                 "every compiled step must name a registered op",
             ) from exc
