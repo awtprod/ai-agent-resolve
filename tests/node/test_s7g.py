@@ -40,6 +40,9 @@ TICK = 0.25
 """``aar node run``'s default ``--tick-seconds``: the rate the incident polled at."""
 INCIDENT_TICKS = 420
 """1 min 45 s of 0.25 s ticks: how long the node ran before Resolve crashed."""
+POLL = 2.0
+"""The default ``BrokerConfig.context_poll_seconds`` (pinned below): the budget tests use the
+production default, so they measure what ``aar node run`` does without the flag."""
 
 
 def _deliver_reads(fake: FakeResolve) -> int:
@@ -61,7 +64,6 @@ def _budget(elapsed: float, interval: float) -> int:
 def test_idle_broker_polls_position_only_and_at_most_once_per_interval() -> None:
     world = World()
     world.settle()
-    interval = world.broker.config.context_poll_seconds
     full_reads = []
     original = world.gw.get_context
     world.gw.get_context = lambda **kw: full_reads.append(kw) or original(**kw)  # type: ignore[method-assign]
@@ -74,8 +76,8 @@ def test_idle_broker_polls_position_only_and_at_most_once_per_interval() -> None
     assert _deliver_reads(world.fake) == 0
     assert full_reads == []
     polls = _position_reads(world.fake)
-    assert polls <= _budget(elapsed, interval)
-    assert polls >= elapsed // interval  # still polled: presence keeps being fed
+    assert polls <= _budget(elapsed, POLL)
+    assert polls >= elapsed // POLL  # still polled: presence keeps being fed
 
 
 def test_deferred_job_polls_position_only_at_the_interval(tmp_path: Path) -> None:
@@ -85,19 +87,18 @@ def test_deferred_job_polls_position_only_at_the_interval(tmp_path: Path) -> Non
     job_id = world.submit(
         "ops.sequence", {"steps": [{"op": "timeline.list", "params": {}}]}, world.locator()
     )
-    interval = world.broker.config.context_poll_seconds
     world.fake.reads.clear()
     start = world.clock()
     for _ in range(INCIDENT_TICKS):
         world.runner.pump()
         world.clock.advance(TICK)
     elapsed = world.clock() - TICK - start
+    assert _deliver_reads(world.fake) == 0
+    assert _position_reads(world.fake) <= _budget(elapsed, POLL)
     view = world.runner.get(job_id)
     assert view is not None and view.state == JobState.RUNNING.value
     assert len(world.broker.pending()) == 1  # deferred, never run: the human is present
     assert world.presence.may_switch(world.clock()).code == "human_input"
-    assert _deliver_reads(world.fake) == 0
-    assert _position_reads(world.fake) <= _budget(elapsed, interval)
 
 
 def test_one_borrowed_context_reads_deliver_state_twice() -> None:
@@ -109,12 +110,12 @@ def test_one_borrowed_context_reads_deliver_state_twice() -> None:
     world.broker.submit(HotOp(world.loc("B"), lambda gw: "done", Holder.agent("thread-1")))
     kinds = [outcome.kind for outcome in world.broker.run_until_idle()]
     assert kinds == [TickKind.RAN, TickKind.RESTORED, TickKind.IDLE]
+    assert world.fake.reads["GetCurrentRenderMode"] == 2
+    assert world.fake.reads["GetCurrentRenderFormatAndCodec"] == 2
     report = world.broker.last_restore
     assert report is not None and report.ok, report
     assert report.final.render_measured and report.final.render_format == "mov"
     assert world.broker.snapshot is None
-    assert world.fake.reads["GetCurrentRenderMode"] == 2
-    assert world.fake.reads["GetCurrentRenderFormatAndCodec"] == 2
 
 
 def test_render_job_polls_never_read_deliver_state(tmp_path: Path) -> None:
@@ -248,20 +249,24 @@ def test_get_position_still_reads_rendering() -> None:
 
 # == presence with cheap reads (decision 1) ======================================================
 
-FULL = ResolveContext(
-    project="A",
-    project_id="pa",
-    timeline="A main",
-    page="deliver",
-    playhead="01:00:00:00",
-    render_format="mov",
-    render_codec="ProRes422HQ",
-    render_mode=0,
-)
-CHEAP = ResolveContext(
-    project="A", project_id="pa", timeline="A main", page="deliver", playhead="01:00:00:00",
-    render_measured=False,
-)  # fmt: skip
+_POSITION = {
+    "project": "A",
+    "project_id": "pa",
+    "timeline": "A main",
+    "page": "deliver",
+    "playhead": "01:00:00:00",
+}
+_DELIVER = {"render_format": "mov", "render_codec": "ProRes422HQ", "render_mode": 0}
+
+
+def _full(**over: object) -> ResolveContext:
+    """What ``get_context`` returns: the position and the Deliver fields."""
+    return ResolveContext(**{**_POSITION, **_DELIVER, **over})  # type: ignore[arg-type]
+
+
+def _cheap(**over: object) -> ResolveContext:
+    """What ``get_position`` returns: the position only, Deliver unread."""
+    return ResolveContext(**{**_POSITION, **over}, render_measured=False)  # type: ignore[arg-type]
 
 
 def _guard() -> PresenceGuard:
@@ -269,45 +274,41 @@ def _guard() -> PresenceGuard:
 
 
 def test_diff_ignores_deliver_fields_a_side_did_not_read() -> None:
-    assert FULL.diff(CHEAP) == {} and CHEAP.diff(FULL) == {}
-    other = ResolveContext(**{**FULL.position(), "render_codec": "H264"})
-    assert FULL.diff(other) == {"render_codec": ("ProRes422HQ", "H264")}
-    moved = ResolveContext(**{**CHEAP.position(), "playhead": "01:00:05:00"}, render_measured=False)
-    assert FULL.diff(moved) == {"playhead": ("01:00:00:00", "01:00:05:00")}
+    assert _full().diff(_cheap()) == {} and _cheap().diff(_full()) == {}
+    assert _full().diff(_full(render_codec="H264")) == {"render_codec": ("ProRes422HQ", "H264")}
+    moved = _cheap(playhead="01:00:05:00")
+    assert _full().diff(moved) == {"playhead": ("01:00:00:00", "01:00:05:00")}
 
 
 def test_unknown_to_a_value_is_not_human_activity() -> None:
     g = _guard()
-    g.observe(CHEAP, 0.0)
-    assert g.observe(FULL, 2.0) is False
-    assert g.observe(CHEAP, 4.0) is False  # nor a value to unknown
+    g.observe(_cheap(), 0.0)
+    assert g.observe(_full(), 2.0) is False
+    assert g.observe(_cheap(), 4.0) is False  # nor a value to unknown
     assert g.last_human_change_at is None
 
 
 def test_a_deliver_change_between_two_full_reads_is_not_lost_to_cheap_polls() -> None:
     g = _guard()
-    g.observe(FULL, 0.0)
+    g.observe(_full(), 0.0)
     for t in (2.0, 4.0, 6.0):
-        assert g.observe(CHEAP, t) is False
-    changed = ResolveContext(**{**FULL.position(), "render_format": "mp4"})
-    assert g.observe(changed, 8.0) is True
+        assert g.observe(_cheap(), t) is False
+    assert g.observe(_full(render_format="mp4"), 8.0) is True
     assert g.last_human_change == {"render_format": ("mov", "mp4")}
 
 
 def test_a_position_change_is_seen_by_a_cheap_poll_after_a_full_read() -> None:
     g = _guard()
-    g.observe(FULL, 0.0)
-    moved = ResolveContext(**{**CHEAP.position(), "page": "edit"}, render_measured=False)
-    assert g.observe(moved, 2.0) is True
+    g.observe(_full(), 0.0)
+    assert g.observe(_cheap(page="edit"), 2.0) is True
     assert g.last_human_change == {"page": ("deliver", "edit")}
 
 
 def test_another_projects_deliver_fields_are_never_carried_over() -> None:
     g = _guard()
-    g.observe(FULL, 0.0)
-    other = ResolveContext(project="B", project_id="pb", page="deliver", render_measured=False)
-    assert g.observe(other, 2.0) is True  # the project changed: a human
-    b_full = ResolveContext(**{**other.position(), "render_format": "mp4", "render_codec": "H264"})
+    g.observe(_full(), 0.0)
+    assert g.observe(_cheap(project="B", project_id="pb"), 2.0) is True  # a human switched
+    b_full = _full(project="B", project_id="pb", render_format="mp4", render_codec="H264")
     assert g.observe(b_full, 70.0) is False  # B's Deliver was never read before: not a change
     assert g.last_human_change_at == 2.0
 
@@ -316,17 +317,16 @@ def test_the_brokers_cheap_note_forgets_the_deliver_fields() -> None:
     """The broker's own op may have changed Deliver state (render.build does), so a cheap note
     of its result must not keep the old values for a later full read to compare against."""
     g = _guard()
-    g.observe(FULL, 0.0)
-    g.note_broker_context(CHEAP, 1.0)
-    changed = ResolveContext(**{**FULL.position(), "render_codec": "H264"})
-    assert g.observe(changed, 2.0) is False
+    g.observe(_full(), 0.0)
+    g.note_broker_context(_cheap(), 1.0)
+    assert g.observe(_full(render_codec="H264"), 2.0) is False
 
 
 # == the poll interval (decision 2) ==============================================================
 
 
 def test_the_poll_interval_defaults_to_two_seconds() -> None:
-    assert BrokerConfig().context_poll_seconds == 2.0
+    assert BrokerConfig().context_poll_seconds == POLL == 2.0
     assert BrokerConfig(context_poll_seconds=0.5).context_poll_seconds == 0.5
 
 
