@@ -71,11 +71,21 @@ emitted once, not on every tick.
 The broker is a single-worker state machine driven by ``tick()``; it never sleeps. A runner
 (slice S7) calls ``tick()`` on a timer. ``submit``/``cancel``/``result`` may be called from
 other threads.
+
+How it reads Resolve (S7g, DESIGN R4 "never poll Deliver state"). Each tick starts with the
+presence poll, a position read (``ResolveGateway.get_position``) taken at most once per
+``BrokerConfig.context_poll_seconds``, however fast the runner ticks; between polls the tick
+works from the latest read, the poll's or the broker's own. The checks before and after each
+op are position reads too. Only two reads take the Deliver settings (``get_context``): the
+human's snapshot when the broker takes control, and the restore's final check. On Resolve 21.1
+``GetCurrentRenderMode`` raises a page signal on every call, and reading the full context on
+every 0.25 s worker tick crashed Resolve after about 270 reads (2026-11-07).
 """
 
 from __future__ import annotations
 
 import itertools
+import math
 import threading
 import time
 import traceback
@@ -105,6 +115,10 @@ OpFn = Callable[[ResolveGateway], object]
 """An op body. It receives the gateway (``ScriptApiGateway.resolve`` gives raw API access)."""
 
 _RUNNING_OP: ContextVar[str | None] = ContextVar("aar_running_hot_op", default=None)
+
+DEFAULT_CONTEXT_POLL_SECONDS = 2.0
+"""Seconds between presence polls (``aar node run --context-poll-seconds``)."""
+MIN_CONTEXT_POLL_SECONDS = 0.5
 
 
 def running_op_id() -> str | None:
@@ -174,7 +188,8 @@ class OpResult:
     error: OpError | None = None
     started_at: float | None = None
     context: ResolveContext | None = None
-    """The asserted context the op ran in (``None`` if it never ran)."""
+    """The asserted context the op ran in (``None`` if it never ran). A position read: its
+    Deliver fields are unread (``render_measured`` is False)."""
 
 
 @dataclass(frozen=True)
@@ -254,6 +269,10 @@ class BrokerConfig:
     project is located only from locators the broker verified itself; if it cannot be, the
     broker never switches away from it."""
     preset_prefix: str = "aar-restore-"
+    context_poll_seconds: float = DEFAULT_CONTEXT_POLL_SECONDS
+    """Seconds between presence polls (position reads), however fast ``tick()`` is called.
+    Finite and at least ``MIN_CONTEXT_POLL_SECONDS``; the broker also requires it to be
+    shorter than its presence guard's ``max_observation_age``."""
 
     def __post_init__(self) -> None:
         if self.batch_max_ops < 1:
@@ -262,6 +281,17 @@ class BrokerConfig:
             raise ValueError("batch_max_seconds, max_wait_seconds and lease_ttl must be positive")
         if self.restore_delay_seconds < 0:
             raise ValueError("restore_delay_seconds must not be negative")
+        poll = self.context_poll_seconds
+        if (
+            isinstance(poll, bool)
+            or not isinstance(poll, int | float)
+            or not math.isfinite(poll)
+            or poll < MIN_CONTEXT_POLL_SECONDS
+        ):
+            raise ValueError(
+                f"context_poll_seconds must be a finite number of seconds, at least "
+                f"{MIN_CONTEXT_POLL_SECONDS}: got {poll!r}"
+            )
 
 
 class Broker:
@@ -275,12 +305,20 @@ class Broker:
         sink: EventSink | None = None,
         config: BrokerConfig | None = None,
     ) -> None:
+        self.config = config or BrokerConfig()
+        if self.config.context_poll_seconds >= presence.max_observation_age:
+            # Between polls the guard sees no new observation: an interval this long would
+            # make it refuse on a stale observation however steadily the broker ticks.
+            raise ValueError(
+                f"context_poll_seconds ({self.config.context_poll_seconds}s) must be shorter "
+                f"than the presence guard's max_observation_age "
+                f"({presence.max_observation_age}s)"
+            )
         self._gw = gateway
         self._leases = leases
         self._presence = presence
         self._clock = clock
         self._sink = sink
-        self.config = config or BrokerConfig()
         self.holder = Holder.agent(self.config.broker_id)
         self._lock = threading.RLock()
         self._queues: dict[str, list[HotOp]] = {}
@@ -298,6 +336,9 @@ class Broker:
         self._known: dict[str, ProjectLocator] = {}
         self._touched_human_project = False
         self._last_target: ProjectLocator | None = None
+        self._context: ResolveContext | None = None
+        """The latest read of Resolve: the last poll, or the broker's own read after it."""
+        self._polled_at: float | None = None
 
     # -- public API ------------------------------------------------------------------------
 
@@ -372,22 +413,26 @@ class Broker:
     def tick(self) -> TickOutcome:
         """Make one scheduling decision: run a batch, defer, restore, or nothing."""
         now = self._clock()
-        ctx = self._gw.get_context()
-        self._presence.observe(ctx, now)
+        polled = self._poll_due(now)
+        ctx = self._observe(now) if polled else self._latest()
         self._check_takeover(now)
 
         self._sweep_prechecks()
         runnable = self._runnable(notify=True)
         if not runnable:
-            return self._idle_or_restore(ctx, now)
+            return self._idle_or_restore(ctx, now, polled)
         self._drained_since = None
         self._notices.pop("restore", None)
 
         project, why = self._select(runnable, self._current_key(runnable, ctx), now)
         target = runnable[project][0].project
         decision = self._gate(ctx, target, now)
+        if decision.allowed and not polled:
+            ctx = self._look_again(now)
+            decision = self._gate(ctx, target, now)
         if decision.allowed:
-            decision = self._take_control(ctx, now)
+            decision = self._take_control(now)
+            ctx = self._latest()  # taking control reads Resolve afresh
         if not decision.allowed:
             self._notice("defer", "deferred", decision, project=project)
             return TickOutcome(
@@ -413,6 +458,52 @@ class Broker:
             if outcome.kind in _NO_PROGRESS:
                 return outcomes
         raise RuntimeError(f"broker still busy after {max_ticks} ticks")
+
+    # -- reading Resolve -------------------------------------------------------------------
+
+    def _poll_due(self, now: float) -> bool:
+        """Is the presence poll due? At most once per ``context_poll_seconds``, however fast
+        the runner ticks.
+
+        Between polls a tick works from the latest read (``_latest``): the last poll, or the
+        broker's own read since, after a switch or an op. That read is never older than the
+        interval, which is shorter than the guard's ``max_observation_age``. Before the broker
+        acts on it, it looks again (``_look_again``), and every op asserts a fresh read."""
+        last = self._polled_at
+        return (
+            self._context is None
+            or last is None
+            or not 0 <= now - last < self.config.context_poll_seconds
+        )
+
+    def _latest(self) -> ResolveContext:
+        assert self._context is not None  # set by the first tick's poll
+        return self._context
+
+    def _look_again(self, now: float) -> ResolveContext:
+        """Before acting on a reused read (taking control, switching, running a batch or
+        restoring): read the position again, so a human who moved since the last poll is seen
+        (and takes over a borrowed context) before the broker acts. Only ticks that may act
+        pay for it; a tick the gate refuses, as while a human works, reads nothing more."""
+        ctx = self._observe(now)
+        self._check_takeover(now)
+        return ctx
+
+    def _observe(self, now: float) -> ResolveContext:
+        """Read the working position (never the Deliver settings) and show it to the guard."""
+        ctx = self._gw.get_position()
+        self._presence.observe(ctx, now)
+        self._context, self._polled_at = ctx, now
+        return ctx
+
+    def _note_broker_context(self, ctx: ResolveContext | None = None) -> ResolveContext:
+        """Record a context the broker produced (a fresh position read unless ``ctx`` is
+        given): the guard never takes it for a human, and the next tick starts from it."""
+        if ctx is None:
+            ctx = self._gw.get_position()
+        self._presence.note_broker_context(ctx, self._clock())
+        self._context = ctx
+        return ctx
 
     # -- events ----------------------------------------------------------------------------
 
@@ -644,10 +735,14 @@ class Broker:
         except LeaseNotHeld as exc:
             self._emit("lease_lost", lease_id=exc.lease_id, reason=exc.reason)
 
-    def _take_control(self, ctx: ResolveContext, now: float) -> Decision:
+    def _take_control(self, now: float) -> Decision:
         decision = self._hold_instance_lease()
         if not decision.allowed or self._snapshot is not None:
             return decision
+        # A full read, one of the two: the snapshot keeps the human's Deliver format, codec
+        # and mode, which the poll does not read.
+        ctx = self._gw.get_context()
+        self._context = ctx
         preset = None
         warnings: list[str] = []
         if self.config.snapshot_deliver_preset and ctx.project is not None:
@@ -662,7 +757,7 @@ class Broker:
             pm_path, human_project = self._snapshot_project_manager(ctx, warnings)
             ctx = replace(ctx, project_manager_path=pm_path)
             # The walk ends where it began; note it so it can never read as a human change.
-            self._presence.note_broker_context(self._gw.get_context(), now)
+            self._note_broker_context()
         elif ctx.project_id is not None:
             # Without Project Manager navigation only a locator the broker verified itself
             # can say where the human's project lives.
@@ -833,11 +928,6 @@ class Broker:
         self._emit("switch", source=ctx.project, target=key)
         return None
 
-    def _note_broker_context(self) -> ResolveContext:
-        ctx = self._gw.get_context()
-        self._presence.note_broker_context(ctx, self._clock())
-        return ctx
-
     # -- batches and ops -----------------------------------------------------------------------
 
     def _run_batch(self, project: str, why: str) -> TickOutcome:
@@ -856,8 +946,7 @@ class Broker:
                 if now - start >= cfg.batch_max_seconds:
                     exhausted, stop = True, "time"
                     break
-                ctx = self._gw.get_context()
-                self._presence.observe(ctx, now)
+                ctx = self._observe(now)  # did a human move while the last op ran?
                 if self._check_takeover(now):
                     stop = "human_took_over"
                     break
@@ -915,7 +1004,7 @@ class Broker:
             return None
         gw = self._gw
         want = op.project
-        ctx = gw.get_context()
+        ctx = gw.get_position()
         if not _is_open(want, ctx):
             self._emit("reselect", op_id=op.id, expected=want.key, actual=ctx.project)
             try:
@@ -1064,7 +1153,7 @@ class Broker:
 
     # -- restore -------------------------------------------------------------------------------
 
-    def _idle_or_restore(self, ctx: ResolveContext, now: float) -> TickOutcome:
+    def _idle_or_restore(self, ctx: ResolveContext, now: float, polled: bool) -> TickOutcome:
         snapshot = self._snapshot
         if snapshot is None:
             return TickOutcome(TickKind.IDLE)
@@ -1080,6 +1169,11 @@ class Broker:
             self._notice("restore", "restore_pending", decision)
             return TickOutcome(TickKind.RESTORE_PENDING, code=decision.code, reason=decision.reason)
         decision = self._gate(ctx, _human_target(snapshot), now)
+        if decision.allowed and not polled:
+            ctx = self._look_again(now)
+            if self._snapshot is None:  # a human took over since the last poll
+                return TickOutcome(TickKind.IDLE)
+            decision = self._gate(ctx, _human_target(snapshot), now)
         if not decision.allowed:
             self._notice("restore", "restore_deferred", decision)
             return TickOutcome(
@@ -1166,8 +1260,9 @@ class Broker:
                 # so the preset is redundant. Do not leave it behind.
                 step("deliver_preset_cleanup", lambda: gw.delete_render_preset(preset))
 
+        # A full read, the other one: it checks that the Deliver settings came back too.
         final = gw.get_context(with_pm_path=want.project_manager_path is not None)
-        self._presence.note_broker_context(final, self._clock())
+        self._note_broker_context(final)
         mismatches = want.diff(final)
         report = RestoreReport(
             not errors and not mismatches, snapshot, final, errors, mismatches, kept
@@ -1193,7 +1288,7 @@ class Broker:
         A load can fail after ``LoadProject`` has already opened something (an id mismatch
         is only seen afterwards). Then go back to the project the broker was working in.
         """
-        now = self._gw.get_context()
+        now = self._gw.get_position()
         if before.project_id is None or now.project_id == before.project_id:
             return
         back = self._last_target
