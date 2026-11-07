@@ -122,12 +122,16 @@ def _body_actor(ctx: _Ctx) -> Actor:
     raw = _required(ctx.body, "actor")
     if not isinstance(raw, dict):
         raise _ApiError(400, ERR_INVALID_REQUEST, "actor must be an object")
+    # Route through the one shared parser (N2): it refuses the runner identity and, with this
+    # allow-set, a human; a foreign node is refused just below.
+    from aar.hub.events import ActorNotAllowed, parse_actor
+
     try:
-        actor = Actor(raw.get("kind"), raw.get("id"))  # type: ignore[arg-type]
+        actor = parse_actor(raw.get("kind"), raw.get("id"), allow=frozenset({"agent", "node"}))
+    except ActorNotAllowed as exc:
+        raise _ApiError(403, ERR_ACTOR_NOT_ALLOWED, str(exc)) from exc
     except (ValueError, TypeError) as exc:
         raise _ApiError(400, ERR_INVALID_REQUEST, f"invalid actor: {exc}") from exc
-    if actor.kind == "human":
-        raise _ApiError(403, ERR_ACTOR_NOT_ALLOWED, "a human may not act through the node API")
     if actor.kind == "node" and actor.id != ctx.node_id:
         raise _ApiError(403, ERR_ACTOR_NOT_ALLOWED, "a node actor must be the authenticated node")
     return actor

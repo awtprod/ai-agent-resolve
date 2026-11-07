@@ -515,6 +515,7 @@ def register_write_tools(
         step_id: str,
         outputs: dict[str, Any],
         attempt: int | None = None,
+        round: int | None = None,
     ) -> CallToolResult:
         return run_dict(
             lambda: recipe_run.step_complete(
@@ -525,6 +526,7 @@ def register_write_tools(
                 attempt,
                 outputs,
                 _agent(agent_id),
+                round=round,
                 idempotency_key=idempotency_key,
             )
         )

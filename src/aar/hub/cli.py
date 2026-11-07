@@ -543,7 +543,7 @@ def _serve(args: argparse.Namespace) -> int:
     # against the registered recipe's model (invalid_params). Recipes register in code.
     from aar.recipes import registry as recipe_registry
 
-    recipe_registry.load_modules(recipe_registry.modules_from_env())
+    recipe_registry.load_configured()
     registry = Registry(log)
     server = build_server(
         log,
@@ -616,16 +616,11 @@ def _open_store(root: str, log: Any) -> Any:
 
 
 def _parse_actor(value: str) -> Any:
-    from aar.hub.events import Actor
+    # One shared parser (aar.hub.events.parse_actor_text) refuses the engine-only 'runner' identity
+    # for every external surface; see N2.
+    from aar.hub.events import parse_actor_text
 
-    kind, sep, ident = value.partition(":")
-    if not sep:
-        raise ValueError(f"--actor must look like KIND:ID, got {value!r}")
-    if kind == "runner":
-        # The 'runner' identity belongs to the recipe engine alone; no string surface may
-        # produce it, or an agent could forge runner-written evidence (see aar.recipes).
-        raise ValueError("actor kind 'runner' is reserved for the recipe engine")
-    return Actor(kind, ident)
+    return parse_actor_text(value)
 
 
 def _console(args: argparse.Namespace) -> int:
