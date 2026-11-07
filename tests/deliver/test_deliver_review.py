@@ -159,7 +159,7 @@ def test_facts_and_review_are_written(tmp_path: Path, sources: Path) -> None:
         transcoder=FakeTranscoder([10]),
     )
     facts = facts_view(hub.log, hub.project_id)
-    hash_fact = facts.get("render.hash.short-1")
+    hash_fact = facts.get("render.hash.review.short-1")
     assert hash_fact is not None
     assert hash_fact.current.value == {"sha256": result.artifact_id, "bytes": result.size}
     assert hash_fact.current.source == {"recipe_node": None, "artifact": result.artifact_id}
@@ -167,7 +167,7 @@ def test_facts_and_review_are_written(tmp_path: Path, sources: Path) -> None:
     assert size_fact is not None
     assert size_fact.current.value["unit"] == "MB"
     assert size_fact.current.value["value"] == pytest.approx(result.size / MB, abs=1e-6)
-    assert set(result.fact_keys) == {"render.hash.short-1", "qa.size.short-1"}
+    assert set(result.fact_keys) == {"render.hash.review.short-1", "qa.size.short-1"}
     review = get_review(hub.log, hub.project_id, result.review_id)
     assert review is not None
     assert review.renders == (result.artifact_id,)
@@ -200,7 +200,7 @@ def test_transcode_retries_once_at_a_lower_bitrate(tmp_path: Path, sources: Path
     assert result.video_kbps == 412
     # On the transcode path the review differs from the source, so the hash fact holds the
     # REVIEW file's sha256 (the stored artifact), not the source render's.
-    hash_fact = facts_view(hub.log, hub.project_id).get("render.hash.short-1")
+    hash_fact = facts_view(hub.log, hub.project_id).get("render.hash.review.short-1")
     assert hash_fact.current.value == {"sha256": result.artifact_id, "bytes": result.size}
 
 

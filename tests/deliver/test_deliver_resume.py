@@ -19,6 +19,7 @@ from deliver_support import (
     Hub,
     make_hub,
     make_profile,
+    make_source,
     qa_pass,
     render_output,
 )
@@ -142,7 +143,9 @@ def test_resume_after_transcode_reuses_the_review_file(tmp_path: Path, sources: 
     work = tmp_path / "work"
     ddir = _ddir(hub, work)
     shutil.copyfile(sources / "render_1080p.mp4", ddir / "source.mp4")
-    (ddir / "review.mp4").write_bytes(b"\x00" * int(0.3 * MB))  # the prior transcode output
+    # The prior transcode output: a real, decodable, under-cap review (the delivery decode-checks a
+    # reused review.mp4, so a zero-filled placeholder would be rebuilt instead of reused).
+    make_source(ddir / "review.mp4", width=1280, height=720, duration=1.0, video_kbps=200)
     transcoder = FakeTranscoder([int(0.3 * MB)])
     result = _review(
         hub, sources, work, source="render_1080p.mp4", cap_mb=0.5, transcoder=transcoder
@@ -195,12 +198,12 @@ def test_resume_after_facts_does_not_duplicate_facts(tmp_path: Path, sources: Pa
         producing_op="deliver.review",
     )
     size = source.stat().st_size
-    keys = _review_keys("short-1", "rj-1", artifact_id)
+    keys = _review_keys(hub.project_id, "short-1", "rj-1")
     src = {"artifact": artifact_id}
     record_fact(
         hub.log,
         hub.project_id,
-        "render.hash.short-1",
+        "render.hash.review.short-1",
         {"sha256": artifact_id, "bytes": size},
         AGENT,
         idempotency_key=keys["hash"],

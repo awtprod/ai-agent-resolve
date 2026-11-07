@@ -44,6 +44,7 @@ FAULTS = frozenset(
         "DuplicateTimeline:detached",  # returns a timeline that is not in the project
         "LoadRenderPreset:drops-codec",  # a preset round trip resets the codec to H264
         "SetRenderSettings:drops-size",  # the job ignores FormatWidth/FormatHeight (size not set)
+        "SetRenderSettings:fail-size",  # SetRenderSettings returns False for the output-size keys
         "OpenPage:keeps-jam",  # a page bounce does not clear the after-Color setter jam
         "CopyGrades:then-jam",  # CopyGrades works, then the setters jam (until a bounce)
         "CopyGrades:drops-label",  # the copy loses the first node's label
@@ -1416,6 +1417,10 @@ class FakeProject:
 
     def SetRenderSettings(self, settings: dict[str, Any]) -> bool:
         self._app.calls.append(("SetRenderSettings", dict(settings)))
+        # fault: Resolve rejects the output-size settings (returns False), so the op must raise
+        # render_settings_failed rather than silently continue with the wrong size.
+        if "SetRenderSettings:fail-size" in self._app.faults and "FormatWidth" in settings:
+            return False
         self.deliver.settings.update(settings)
         return True
 

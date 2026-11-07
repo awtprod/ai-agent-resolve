@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from deliver_support import AGENT, FakeEditHost, make_hub, make_profile, render_output
+from deliver_support import AGENT, FakeEditHost, make_hub, make_profile, make_source, render_output
 
 from aar.deliver.service import deliver_review
 from aar.deliver.transcode import FfmpegTranscoder
@@ -18,22 +18,27 @@ from aar.media import probe
 
 def test_review_end_to_end_with_real_ffmpeg(tmp_path: Path, sources: Path) -> None:
     hub = make_hub(tmp_path)
+    # A longform source at ~-22.7 LUFS (volume 0.9), so the REAL QA holds the review to the
+    # longform loudness target (-22 +/- a realistic 2 LU tolerance), not a hidden 60 LU one (F2).
+    edit_pc = tmp_path / "pc"
+    edit_pc.mkdir()
+    make_source(edit_pc / "render_1080p.mp4", width=1920, height=1080, duration=2.0, volume=0.9)
     transcoder = FfmpegTranscoder()
     result = deliver_review(
         project_id=hub.project_id,
         subject_id=hub.subject_id,
         deliverable="short-1",
         actor=AGENT,
-        profile=make_profile(review_mp4_max_mb=5.0),
+        profile=make_profile(review_mp4_max_mb=5.0, lufs_tolerance=2.0),
         title="Acme review",
         timeline="Main",
         fps=25.0,
         kind="longform",
         render_output=render_output(
-            sources / "render_1080p.mp4", duration=2.0, render_job_id="rj-e"
+            edit_pc / "render_1080p.mp4", duration=2.0, render_job_id="rj-e"
         ),
         workdir=str(tmp_path / "work"),
-        edit_host=FakeEditHost(sources),
+        edit_host=FakeEditHost(edit_pc),
         log=hub.log,
         store=hub.store,
         transcoder=transcoder,

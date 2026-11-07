@@ -150,3 +150,108 @@ def test_master_exit_1_on_qa_fail(
     monkeypatch.setattr(service, "_default_qa_check", qa_fail("longform"))
     argv = ["deliver", "master", *_common(hub, tmp_path, sources)]
     assert main(argv) == 1
+
+
+def _review_argv(hub, tmp_path: Path, sources: Path, **over: str) -> list[str]:
+    argv = [
+        "deliver",
+        "review",
+        *_common(hub, tmp_path, sources),
+        "--subject",
+        over.get("subject", hub.subject_id),
+        "--title",
+        "Acme",
+    ]
+    if "project" in over:
+        argv[argv.index("--project") + 1] = over["project"]
+    return argv
+
+
+def test_v48_missing_ffmpeg_exits_2(
+    tmp_path: Path, sources: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aar.media import MediaToolMissing
+
+    hub = make_hub(tmp_path)
+    _use_fake_host(monkeypatch, sources)
+
+    def boom(**_: object) -> None:
+        raise MediaToolMissing("ffmpeg not found")
+
+    monkeypatch.setattr(service, "deliver_review", boom)
+    assert main(_review_argv(hub, tmp_path, sources)) == 2
+
+
+def test_v49_other_host_error_exits_3(
+    tmp_path: Path, sources: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aar.host.errors import PathRefused
+
+    hub = make_hub(tmp_path)
+    monkeypatch.setattr(cli, "_edit_host", lambda: RaisingEditHost(PathRefused("x", "no")))
+    assert main(_review_argv(hub, tmp_path, sources)) == 3
+
+
+def test_v50_render_json_without_duration_exits_2(
+    tmp_path: Path, sources: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    hub = make_hub(tmp_path)
+    _use_fake_host(monkeypatch, sources)
+    monkeypatch.setattr(service, "_default_qa_check", qa_pass())
+    rj = tmp_path / "render.json"
+    rj.write_text(
+        json.dumps(
+            {
+                "output_path": str(sources / "render_720p.mp4"),
+                "frame_count": 50,
+                "frame_rate": 25.0,
+                "render_job_id": "rj-1",
+            }
+        )
+    )
+    argv = [
+        "deliver",
+        "review",
+        "--render-json",
+        str(rj),
+        "--deliverable",
+        "short-1",
+        "--project",
+        hub.project_id,
+        "--subject",
+        hub.subject_id,
+        "--title",
+        "Acme",
+        "--kind",
+        "short",
+        "--db",
+        str(tmp_path / "hub.db"),
+        "--artifacts",
+        str(tmp_path / "artifacts"),
+        "--workdir",
+        str(tmp_path / "work"),
+        "--actor",
+        "agent:recipe-1",
+        "--json",
+    ]
+    assert main(argv) == 2
+
+
+def test_unknown_subject_exits_2(
+    tmp_path: Path, sources: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hub = make_hub(tmp_path)
+    _use_fake_host(monkeypatch, sources)
+    monkeypatch.setattr(service, "_default_qa_check", qa_pass())
+    assert main(_review_argv(hub, tmp_path, sources, subject="no-such-node")) == 2
+
+
+def test_unregistered_project_exits_2(
+    tmp_path: Path, sources: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hub = make_hub(tmp_path)
+    _use_fake_host(monkeypatch, sources)
+    monkeypatch.setattr(service, "_default_qa_check", qa_pass())
+    assert main(_review_argv(hub, tmp_path, sources, project="proj-nope")) == 2

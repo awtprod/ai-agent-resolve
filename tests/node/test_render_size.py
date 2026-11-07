@@ -270,3 +270,118 @@ def test_verify_size_raises_on_mismatch() -> None:
     with pytest.raises(OpError) as exc:
         _verify_size({"FormatWidth": 1920, "FormatHeight": 1080}, params)
     assert exc.value.code == "render_size_ignored"
+
+
+# -- round 2: adopt re-verifies the size, size_verified reaches the job, extra read-back pins ---
+
+
+class _Crash(BaseException):
+    """A process death inside a Resolve call: no ``except Exception`` cleanup runs."""
+
+
+def test_resumed_adopt_reverifies_the_size(tmp_path: Path) -> None:
+    """F7: a crash between journal('added') and the read-back, with Resolve ignoring the size.
+    The resumed build adopts the journaled job and must re-verify its size (render_size_ignored),
+    never render 1920x1080 when 1280x720 was requested."""
+    world = JobWorld(tmp_path)
+    world.fake.faults.add("SetRenderSettings:drops-size")
+    world.project.render_complete_after = 2
+    job_id = world.submit(
+        "render",
+        _params(world, width=1280, height=720, cleanup=False),
+        world.locator(),
+        agent_id=AGENT_ID,
+    )
+    world.runner.pump()
+    real_list = world.project.GetRenderJobList
+    real_add = world.project.AddRenderJob
+    state = {"added": False}
+
+    def add() -> object:
+        state["added"] = True
+        return real_add()
+
+    def listing() -> object:
+        if state["added"]:
+            raise _Crash("power cut right after AddRenderJob, before the read-back")
+        return real_list()
+
+    world.project.AddRenderJob = add  # type: ignore[method-assign]
+    world.project.GetRenderJobList = listing  # type: ignore[method-assign]
+    with pytest.raises(_Crash):
+        world.broker.run_until_idle()
+    world.project.AddRenderJob = real_add  # type: ignore[method-assign]
+    world.project.GetRenderJobList = real_list  # type: ignore[method-assign]
+    assert world.store.get(job_id).cursor["journal"].get("render_job_id")
+    runner = world.restart()
+    runner.run_until_settled()
+    v = runner.get(job_id)
+    jobs = world.project.render_jobs
+    sizes = [(j.info.get("FormatWidth"), j.info.get("FormatHeight")) for j in jobs]
+    assert v.state == JobState.FAILED.value and v.error["code"] == "render_size_ignored", (
+        f"resumed job {v.state}: {sizes}"
+    )
+
+
+def test_size_verified_reaches_the_job_measured(tmp_path: Path) -> None:
+    """The build's size_verified must reach the render job's Done(measured) (what aar.deliver
+    sees), reported even when the queue echoes no size keys."""
+    world = JobWorld(tmp_path)
+    real_list = world.project.GetRenderJobList
+
+    def no_size_keys() -> object:
+        out = []
+        for info in real_list() or []:
+            d = dict(info)
+            d.pop("FormatWidth", None)
+            d.pop("FormatHeight", None)
+            out.append(d)
+        return out
+
+    world.project.GetRenderJobList = no_size_keys  # type: ignore[method-assign]
+    job_id = world.submit(
+        "render", _params(world, width=1280, height=720), world.locator(), agent_id=AGENT_ID
+    )
+    world.runner.run_until_settled()
+    v = world.runner.get(job_id)
+    assert v.state == JobState.SUCCEEDED.value, v.error
+    assert "size_verified" in (v.measured or {}), "size_verified is dropped by the render job"
+    assert v.measured["size_verified"] is False  # the queue reported no size keys
+
+
+def test_size_verified_true_reaches_the_job_measured(tmp_path: Path) -> None:
+    """On a clean build the queue echoes the size, so size_verified is True in the result."""
+    view = _run(JobWorld(tmp_path), width=1280, height=720)
+    assert view is not None and view.state == JobState.SUCCEEDED.value, view and view.error
+    assert view.measured["size_verified"] is True
+
+
+def test_partial_size_keys_is_a_mismatch_not_unverified(tmp_path: Path) -> None:
+    """One size key present (or a differing one) is a mismatch (render_size_ignored), not an
+    unverified read-back; string keys are accepted, float keys are a mismatch."""
+    params = _bp(width=1280, height=720)
+    with pytest.raises(OpError):  # only FormatWidth -> partial, a mismatch
+        _verify_size({"FormatWidth": 1280}, params)
+    with pytest.raises(OpError):  # width matches, height differs
+        _verify_size({"FormatWidth": 1280, "FormatHeight": 1080}, params)
+    assert _verify_size({"FormatWidth": "1280", "FormatHeight": "720"}, params) is True
+    with pytest.raises(OpError):
+        _verify_size({"FormatWidth": 1280.0, "FormatHeight": "720.0"}, params)
+
+
+def test_export_audio_false_is_applied(tmp_path: Path) -> None:
+    """export_audio=False must reach SetRenderSettings as ExportAudio False (not dropped)."""
+    world = JobWorld(tmp_path)
+    view = _run(world, width=1280, height=720, export_audio=False, cleanup=False)
+    assert view is not None and view.state == JobState.SUCCEEDED.value, view and view.error
+    size = [s for s in _set_render_settings(world) if "FormatWidth" in s]
+    assert size and size[0]["ExportAudio"] is False
+
+
+def test_set_render_settings_size_failure_is_raised(tmp_path: Path) -> None:
+    """A False from SetRenderSettings on the output-size keys must fail the build."""
+    world = JobWorld(tmp_path)
+    world.fake.faults.add("SetRenderSettings:fail-size")
+    view = _run(world, width=1280, height=720)
+    assert view is not None and view.state == JobState.FAILED.value
+    assert view.error["code"] == "render_settings_failed", view.error

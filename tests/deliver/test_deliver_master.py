@@ -72,13 +72,14 @@ def test_master_is_stored_and_hash_and_qa_facts_recorded(tmp_path: Path, sources
     assert meta.producing_op == "deliver.master"
 
     facts = facts_view(hub.log, hub.project_id)
-    assert facts.get("render.hash.longform-1").current.value == {
+    assert facts.get("render.hash.master.longform-1").current.value == {
         "sha256": result.artifact_id,
         "bytes": result.size,
     }
     assert facts.get("qa.lufs.longform-1").current.value == {"value": -22.3, "unit": "LUFS"}
     assert facts.get("qa.truepeak.longform-1").current.value == {"value": -1.5, "unit": "dBTP"}
-    assert facts.get("qa.duration.longform-1").current.value == {"value": 6.25, "unit": "s"}
+    # Duration is not written as a pass/fail fact without a plan (F10), even though QA measured it.
+    assert facts.get("qa.duration.longform-1") is None
     # No review was requested for a master.
     assert list(
         hub.log.iter_events(types=["graph.node_added"], project_id=hub.project_id)
@@ -97,7 +98,7 @@ def test_master_writes_only_measured_qa_facts(tmp_path: Path, sources: Path) -> 
     assert facts.get("qa.lufs.longform-1") is not None
     assert facts.get("qa.truepeak.longform-1") is None
     assert facts.get("qa.duration.longform-1") is None
-    assert set(result.fact_keys) == {"render.hash.longform-1", "qa.lufs.longform-1"}
+    assert set(result.fact_keys) == {"render.hash.master.longform-1", "qa.lufs.longform-1"}
 
 
 def test_master_qa_fail_still_writes_the_hash_and_stores(tmp_path: Path, sources: Path) -> None:
@@ -108,8 +109,8 @@ def test_master_qa_fail_still_writes_the_hash_and_stores(tmp_path: Path, sources
     assert result.qa_status == "fail"
     assert hub.store.has(result.artifact_id)
     facts = facts_view(hub.log, hub.project_id)
-    assert facts.get("render.hash.longform-1") is not None
-    assert result.fact_keys == ["render.hash.longform-1"]  # no QA facts (nothing measured)
+    assert facts.get("render.hash.master.longform-1") is not None
+    assert result.fact_keys == ["render.hash.master.longform-1"]  # no QA facts (nothing measured)
     assert result.review_id is None
     review_nodes = [
         e

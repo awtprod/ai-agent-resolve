@@ -172,7 +172,34 @@ class FakeTranscoder:
             }
         )
         size = self.sizes[min(len(self.calls) - 1, len(self.sizes) - 1)]
-        Path(out).write_bytes(b"\x00" * size)
+        # Write a REAL, decodable mp4 (moov first, so trailing padding is harmless), then pad to the
+        # requested size. The delivery decode-checks a reused review.mp4, so the fake output has to
+        # decode; the exact byte size still drives the cap/retry logic.
+        run_tool(
+            "ffmpeg",
+            [
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                f"testsrc2=size={max(width, 16)}x{max(height, 16)}:rate=5:duration=0.2",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-f",
+                "mp4",
+                str(out),
+            ],
+            timeout_s=60.0,
+        )
+        real = Path(out).stat().st_size
+        if size > real:
+            with open(out, "ab") as handle:
+                handle.write(b"\x00" * (size - real))
 
 
 @dataclass
@@ -207,11 +234,11 @@ def qa_fail(kind: str = "review") -> QaStub:
 def make_profile(
     *,
     review_mp4_max_mb: float = 5.0,
-    lufs_tolerance: float = 60.0,
+    lufs_tolerance: float = 1.0,
     true_peak_max_dbtp: float = 0.0,
 ) -> Profile:
-    """A permissive profile: the cap is set per test; loudness tolerance is wide for synthetic
-    sine audio."""
+    """A test profile with a realistic (tight) loudness tolerance. Tests that drive the real QA
+    generate audio at the kind's target loudness; tests that inject a QA stub ignore it."""
     return Profile(
         name="test",
         qa=QATargets(
