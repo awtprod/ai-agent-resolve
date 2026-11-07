@@ -11,10 +11,11 @@ from recipe_support import FixedClock
 from write_support import AGENT, Hub, brief_data, make_hub
 
 from aar.hub.events import Actor
-from aar.hub.writes import create_brief, create_recipe, set_own_status
+from aar.hub.writes import create_brief, create_recipe
 from aar.recipes import registry
 from aar.recipes.engine import DEFAULT_LEASE_S, advance, claim
 from aar.recipes.models import RecipeDef, StepDef
+from aar.recipes.run import recipe_start
 from aar.recipes.state import load_state
 
 W1 = Actor("agent", "w1")
@@ -76,8 +77,8 @@ def _started(hub: Hub, recipe_name: str, clock: FixedClock) -> str:
         idempotency_key="r",
         params_validator=registry.registry_params_validator,
     ).body["node"]["id"]
-    set_own_status(hub.log, hub.project_id, recipe_node, "active", AGENT, idempotency_key="act")
-    advance(hub.log, recipe_node, actor=AGENT, clock=clock)  # creates the pending cold op "c"
+    # Start via the runner evidence path (recipe.started), then advance creates the pending cold c.
+    recipe_start(hub.log, recipe_node, AGENT, idempotency_key="start", clock=clock)
     return recipe_node
 
 

@@ -64,6 +64,11 @@ def hub(tmp_path: Path) -> Iterator[Hub]:
 
 
 def _server(hub: Hub, **kw: Any) -> Any:
+    # S13g1 MCP tests predate the recipe registry; they use any-params recipes, so opt out of the
+    # new registry-validator default (F12) unless a test passes its own validator.
+    from aar.hub.writes import accept_any_params
+
+    kw.setdefault("params_validator", accept_any_params)
     return build_server(hub.log, Registry(hub.log), hub.store, **kw)
 
 

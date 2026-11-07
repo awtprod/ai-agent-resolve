@@ -11,7 +11,7 @@ import recipe_proc
 from write_support import AGENT, Hub, make_hub
 
 from aar.hub.graph import WorkGraph
-from aar.hub.writes import set_own_status
+from aar.recipes.engine import record_started
 from aar.recipes.state import load_state
 
 
@@ -36,8 +36,9 @@ def _op_nodes(hub: Hub, recipe_node: str) -> list[Any]:
 def test_two_concurrent_advance_callers_one_op_per_attempt(hub: Hub, tmp_path: Any) -> None:
     moddir, driver = recipe_proc.materialize(tmp_path)
     recipe_node = recipe_proc.make_cold_recipe(hub, "parallel")
-    # Activate WITHOUT advancing, so the two concurrent advance passes race to create the ops.
-    set_own_status(hub.log, hub.project_id, recipe_node, "active", AGENT, idempotency_key="act")
+    # Start (record the evidence) WITHOUT advancing, so the two concurrent advance passes race to
+    # create the ops.
+    record_started(hub.log, project_id=hub.project_id, recipe_node=recipe_node, caller=AGENT)
     hub.log.close()  # release this process's handle; the subprocesses open their own
 
     procs = [
@@ -68,7 +69,7 @@ def test_two_concurrent_advance_callers_one_op_per_attempt(hub: Hub, tmp_path: A
 def test_two_worker_processes_each_step_runs_once(hub: Hub, tmp_path: Any) -> None:
     moddir, driver = recipe_proc.materialize(tmp_path)
     recipe_node = recipe_proc.make_cold_recipe(hub, "parallel")
-    set_own_status(hub.log, hub.project_id, recipe_node, "active", AGENT, idempotency_key="act")
+    record_started(hub.log, project_id=hub.project_id, recipe_node=recipe_node, caller=AGENT)
     hub.log.close()
 
     sidefile = tmp_path / "ran.log"

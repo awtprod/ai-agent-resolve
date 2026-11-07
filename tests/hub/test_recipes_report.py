@@ -12,6 +12,7 @@ from aar.hub.events import Actor, EventLog
 from aar.hub.registry import Registry
 from aar.hub.writes import RecipeData
 from aar.recipes import registry
+from aar.recipes.events import RUNNER
 from aar.recipes.models import RecipeDef, StepDef
 from aar.recipes.report import build_report_text
 
@@ -80,6 +81,10 @@ def _build(log: EventLog) -> None:
     def ap(etype: str, payload: object, ts: str) -> None:
         log.append(etype, A, payload, project_id="prj_acme", ts=ts)
 
+    def rap(etype: str, payload: object, ts: str) -> None:
+        # Runner-authored evidence: op nodes and recipe.* events only count when written by RUNNER.
+        log.append(etype, RUNNER, payload, project_id="prj_acme", ts=ts)
+
     rec = RecipeData(recipe="gold", brief_id="nd_b", params={}, max_review_rounds=3).dump()
     sha_a, sha_b = "a" * 64, "b" * 64
     ap(
@@ -87,13 +92,18 @@ def _build(log: EventLog) -> None:
         {"node_id": "nd_rec", "kind": "recipe", "status": "pending", "title": "r", "data": rec},
         "2026-01-01T00:00:00+00:00",
     )
+    rap(
+        "recipe.started",
+        {"recipe_node": "nd_rec"},
+        "2026-01-01T00:00:00.500000+00:00",
+    )
     ap(
         "graph.node_status_changed",
         {"node_id": "nd_rec", "to": "active"},
         "2026-01-01T00:00:01+00:00",
     )
     _step(
-        ap,
+        rap,
         "nd_c",
         "c",
         "2026-01-01T00:00:02+00:00",
@@ -111,7 +121,7 @@ def _build(log: EventLog) -> None:
         "2026-01-01T00:00:03.600000+00:00",
     )
     _step(
-        ap,
+        rap,
         "nd_rp",
         "report",
         "2026-01-01T00:00:04+00:00",
@@ -175,18 +185,22 @@ def test_report_lists_failed_attempts(tmp_path: Path, gold_recipe: None) -> None
         def ap(etype: str, payload: object, ts: str) -> None:
             log.append(etype, A, payload, project_id="prj_acme", ts=ts)
 
+        def rap(etype: str, payload: object, ts: str) -> None:
+            log.append(etype, RUNNER, payload, project_id="prj_acme", ts=ts)
+
         rec = RecipeData(recipe="gold", brief_id="nd_b", params={}, max_review_rounds=3).dump()
         ap(
             "graph.node_added",
             {"node_id": "nd_rec", "kind": "recipe", "status": "pending", "title": "r", "data": rec},
             "2026-01-01T00:00:00+00:00",
         )
+        rap("recipe.started", {"recipe_node": "nd_rec"}, "2026-01-01T00:00:00.500000+00:00")
         ap(
             "graph.node_status_changed",
             {"node_id": "nd_rec", "to": "active"},
             "2026-01-01T00:00:01+00:00",
         )
-        ap(
+        rap(
             "graph.node_added",
             {
                 "node_id": "nd_c",
@@ -214,7 +228,7 @@ def test_report_lists_failed_attempts(tmp_path: Path, gold_recipe: None) -> None
             {"node_id": "nd_c", "to": "failed"},
             "2026-01-01T00:00:03+00:00",
         )
-        ap(
+        rap(
             "recipe.result",
             {
                 "op_node": "nd_c",

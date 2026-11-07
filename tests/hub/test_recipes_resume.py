@@ -20,7 +20,6 @@ from write_support import AGENT, HUMAN, Hub, make_hub
 from aar.hub.common import parse_ts, utcnow
 from aar.hub.events import Actor, EventLog
 from aar.hub.reviews import decide
-from aar.hub.writes import set_own_status
 from aar.recipes import registry
 from aar.recipes.engine import advance
 from aar.recipes.models import RecipeDef, StepDef
@@ -106,8 +105,9 @@ def test_hot_write_ahead_resends_same_request_id(hub: Hub, hot_recipe: None) -> 
     fake.set_behaviour("x", lambda params: HotJobView("done", result=HotResult(outputs={"x": 1})))
     crasher = _CrashOnce(fake)
 
-    with pytest.raises(RuntimeError, match="crash between"):
-        recipe_start(hub.log, recipe_node, AGENT, idempotency_key="start", dispatcher=crasher)
+    # F10: a dispatcher that raises no longer escapes advance; the crash is swallowed, the intent
+    # persists, and the next pass re-submits. So recipe_start returns normally here.
+    recipe_start(hub.log, recipe_node, AGENT, idempotency_key="start", dispatcher=crasher)
 
     # The intent is on the log; the submitted record is not.
     state = load_state(hub.log, recipe_node)
@@ -171,7 +171,8 @@ def _claimed_lease_until(log: EventLog, project_id: str) -> Any:
 def _kill_worker_mid_slow_step(hub: Hub, tmp_path: Any, recipe_name: str) -> tuple[Any, Any, str]:
     moddir, driver = recipe_proc.materialize(tmp_path)
     recipe_node = recipe_proc.make_cold_recipe(hub, recipe_name)
-    set_own_status(hub.log, hub.project_id, recipe_node, "active", AGENT, idempotency_key="act")
+    # Start via runner evidence so the subprocess worker sees an active run and claims the step.
+    recipe_start(hub.log, recipe_node, AGENT, idempotency_key="start")
     hub.log.close()
     db = tmp_path / "hub.db"
     proc = recipe_proc.spawn(
