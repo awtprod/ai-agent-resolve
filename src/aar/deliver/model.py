@@ -7,6 +7,7 @@ steps a resumed run skipped.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from aar.deliver.errors import DeliverError
@@ -73,11 +74,25 @@ class RenderOutput:
                 "output_path and render_job_id must be non-empty",
                 "Give a render that finished with a real output path and job id.",
             )
+        # NaN/Infinity slip past a plain ``<= 0`` test (NaN <= 0 is False), so check finiteness
+        # first, then positivity. A negative frame count is refused too.
+        if not math.isfinite(values["duration_seconds"]) or not math.isfinite(values["frame_rate"]):
+            raise DeliverError(
+                "invalid_render_output",
+                "frame_rate and duration_seconds must be finite numbers",
+                "Give a render with a finite frame rate and duration (no NaN or infinity).",
+            )
         if values["duration_seconds"] <= 0 or values["frame_rate"] <= 0:
             raise DeliverError(
                 "invalid_render_output",
                 "frame_rate and duration_seconds must be positive",
                 "Give a render with a positive frame rate and duration.",
+            )
+        if values["frame_count"] < 0:
+            raise DeliverError(
+                "invalid_render_output",
+                f"frame_count must not be negative: {values['frame_count']!r}",
+                "Give a render with a non-negative frame count.",
             )
         return cls(**values)
 

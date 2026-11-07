@@ -19,8 +19,10 @@ EXIT_QA_FAILED = 1  # QA failed (review refused, or a master whose QA failed)
 EXIT_INPUT = 2  # bad arguments, a missing tool, or unusable configuration
 EXIT_TRANSPORT = 3  # the verified transfer to or from the edit PC failed
 
-# DeliverError codes that mean "QA failed" (exit 1); every other code is bad input (exit 2).
+# DeliverError codes that mean "QA failed" (exit 1); delivery_in_progress is a transport-style
+# conflict (exit 3); every other code is bad input (exit 2).
 _QA_CODES = frozenset({"review_qa_failed"})
+_TRANSPORT_CODES = frozenset({"delivery_in_progress"})
 
 
 def register(subparsers: Any) -> None:
@@ -69,7 +71,12 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--deliverable", required=True, help="The deliverable name (a fact key).")
     parser.add_argument("--project", required=True, help="The hub project id.")
     parser.add_argument(
-        "--kind", required=True, choices=("short", "longform"), help="The source render kind."
+        "--content-kind",
+        "--kind",
+        dest="kind",
+        required=True,
+        choices=("short", "longform"),
+        help="The content kind (short or longform); sets the QA loudness and duration targets.",
     )
     parser.add_argument("--db", required=True, help="The hub event-log database path.")
     parser.add_argument("--artifacts", required=True, help="The hub artifact store directory.")
@@ -243,7 +250,12 @@ def _dispatch(args: argparse.Namespace, run: Any) -> int:
     try:
         return run()
     except DeliverError as exc:
-        code = EXIT_QA_FAILED if exc.code in _QA_CODES else EXIT_INPUT
+        if exc.code in _QA_CODES:
+            code = EXIT_QA_FAILED
+        elif exc.code in _TRANSPORT_CODES:
+            code = EXIT_TRANSPORT
+        else:
+            code = EXIT_INPUT
         return _error(exc.code, exc.message, exc.fix_hint, exc.detail, code, as_json)
     except MediaToolMissing as exc:
         return _error(

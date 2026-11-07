@@ -8,6 +8,9 @@ existing :class:`~aar.media.MediaToolMissing`.
 
 from __future__ import annotations
 
+import contextlib
+import glob
+import os
 from typing import Protocol, runtime_checkable
 
 from aar.deliver.errors import DeliverError
@@ -17,9 +20,21 @@ from aar.media.probe import PROBE_TIMEOUT_S
 AUDIO_KBPS = 128
 """The review's AAC bit rate in kbit/s (the size budget subtracts this from the video rate)."""
 
+# yuv420p + High profile so every browser player can play the review, even when the master is a
+# 10-bit 4:2:2 ProRes (the usual Resolve master would otherwise become unplayable High 4:2:2).
+_H264_PIX_FMT = "yuv420p"
+_H264_PROFILE = "high"
+
 
 def _scale(width: int, height: int) -> str:
     return f"scale={width}:{height}"
+
+
+def _remove_pass_logs(passlogfile: str) -> None:
+    """Delete the x264 two-pass logs (``<passlogfile>-N.log`` and ``.mbtree``)."""
+    for path in glob.glob(glob.escape(passlogfile) + "-*.log*"):
+        with contextlib.suppress(OSError):
+            os.unlink(path)
 
 
 def pass1_argv(
@@ -37,6 +52,10 @@ def pass1_argv(
         _scale(width, height),
         "-c:v",
         "libx264",
+        "-pix_fmt",
+        _H264_PIX_FMT,
+        "-profile:v",
+        _H264_PROFILE,
         "-b:v",
         f"{video_kbps}k",
         "-preset",
@@ -76,6 +95,10 @@ def pass2_argv(
         _scale(width, height),
         "-c:v",
         "libx264",
+        "-pix_fmt",
+        _H264_PIX_FMT,
+        "-profile:v",
+        _H264_PROFILE,
         "-b:v",
         f"{video_kbps}k",
         "-preset",
@@ -148,9 +171,14 @@ class FfmpegTranscoder:
             audio_kbps=audio_kbps,
             passlogfile=passlogfile,
         )
-        self._run(one, timeout_s)
-        self._run(two, timeout_s)
-        self._confirm_decodes(out, timeout_s)
+        try:
+            self._run(one, timeout_s)
+            self._run(two, timeout_s)
+            self._confirm_decodes(out, timeout_s)
+        finally:
+            # x264 writes <passlogfile>-N.log and <passlogfile>-N.log.mbtree; remove them whether
+            # the transcode succeeded or failed, so no two-pass log is ever left behind.
+            _remove_pass_logs(passlogfile)
 
     def _run(self, argv: list[str], timeout_s: float) -> None:
         self.argv_log.append(argv)

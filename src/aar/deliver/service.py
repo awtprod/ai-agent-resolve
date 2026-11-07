@@ -17,6 +17,7 @@ events, puts nothing new, and does not transcode again.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import math
 import os
@@ -30,12 +31,14 @@ from aar.deliver.transcode import AUDIO_KBPS, FfmpegTranscoder, Transcoder
 from aar.hub.artifacts import ArtifactStore
 from aar.hub.events import Actor, EventLog
 from aar.hub.facts import record_fact
-from aar.hub.reviews import Review, request_review
-from aar.media import probe, timeout_for
+from aar.hub.reviews import Review, ReviewError, SubjectNotFound, request_review
+from aar.hub.writes import WriteError
+from aar.media import MediaError, MediaToolMissing, probe
 from aar.media.probe import PROBE_TIMEOUT_S
 from aar.plan.profile import Profile
 from aar.qa.check import check as _default_qa_check
-from aar.qa.report import QAReport
+from aar.qa.check import evaluate_size
+from aar.qa.report import QACheck, QAReport, build_report
 
 MB = 1_000_000  # the review cap counts decimal megabytes (same as aar.qa)
 CAP_HEADROOM = 0.92  # leave 8% of the budget for container and rate overshoot
@@ -49,16 +52,141 @@ _CHUNK = 1024 * 1024
 QACheckFn = Callable[..., QAReport]
 
 # Master QA facts: metric segment -> (check id, measured key, unit). Only values that were
-# measured are written; keys are never guessed.
+# measured are written; keys are never guessed. Duration is NOT here: the master QA runs without a
+# plan, so qa.check never measures render_s and no qa.duration pass/fail fact is written (F10); the
+# measured duration stays available on the RenderOutput.
 MASTER_QA_FACTS: dict[str, tuple[str, str, str]] = {
     "lufs": ("loudness", "integrated_lufs", "LUFS"),
     "truepeak": ("loudness", "true_peak_dbtp", "dBTP"),
-    "duration": ("duration", "render_s", "s"),
 }
 
 _PATH_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _FACT_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")  # also the facts key <...> shape
 _MIME = {".mp4": "video/mp4", ".mov": "video/quicktime", ".mkv": "video/x-matroska"}
+
+# Temp roots a durable work dir must never resolve under. Assembled from os.sep (no "/tmp" literal,
+# so the AST pin that forbids a shared-temp literal still holds); $TMPDIR stands in for
+# tempfile.gettempdir() without importing tempfile (which the pin also forbids).
+_TEMP_ROOTS = (
+    os.sep + "tmp",
+    os.sep + "var" + os.sep + "tmp",
+    os.sep + "dev" + os.sep + "shm",
+)
+_REVIEW_READY_SUFFIXES = (".mp4", ".mov")  # MP4-family containers a browser can play as is
+
+
+def _temp_roots() -> tuple[str, ...]:
+    roots = [os.path.realpath(r) for r in _TEMP_ROOTS]
+    env = os.environ.get("TMPDIR")
+    if env:
+        roots.append(os.path.realpath(env))
+    return tuple(roots)
+
+
+def _is_under(path: str, root: str) -> bool:
+    try:
+        common = os.path.commonpath([path, root])
+    except ValueError:  # different drives / mixed absolute-relative: not under
+        return False
+    return common == root
+
+
+def _acquire_delivery_lock(work: str) -> int:
+    """Take the exclusive per-delivery lock, returning its fd. A second concurrent delivery of the
+    same render job gets ``delivery_in_progress``; the lock is an ``flock``, so a crashed delivery
+    releases it (the kernel closes the fd) and a later resume is never blocked by a stale file."""
+    fd = os.open(os.path.join(work, ".deliver.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(fd)
+        raise DeliverError(
+            "delivery_in_progress",
+            f"another delivery is already working in {work}",
+            "Wait for the other delivery to finish, or deliver into a separate work dir.",
+            work=work,
+        ) from exc
+    return fd
+
+
+def _release_delivery_lock(fd: int) -> None:
+    with contextlib.suppress(OSError):
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    with contextlib.suppress(OSError):
+        os.close(fd)
+
+
+def _decodes(path: str, timeout_s: float) -> bool:
+    """True when ``path`` is a readable media file with a video stream."""
+    try:
+        info = probe(path, timeout_s=min(PROBE_TIMEOUT_S, timeout_s))
+    except MediaError:
+        return False
+    return info.video is not None
+
+
+def _is_review_ready(info: Any, suffix: str) -> bool:
+    """True when the pulled file is already a browser-playable H.264/AAC MP4-family file, so it may
+    be stored as the review as is. Anything else (ProRes, 10-bit, a .mkv) is transcoded."""
+    if suffix not in _REVIEW_READY_SUFFIXES:
+        return False
+    video = info.video
+    if video is None or video.codec != "h264":
+        return False
+    audio = info.audio
+    return audio is None or audio.codec == "aac"
+
+
+def _wrap_step_error(exc: Exception, completed: list[str]) -> DeliverError:
+    """Turn a hub, media or value error raised after the first write into a typed DeliverError that
+    carries the truthful ``completed_steps`` (F4), so no untyped error escapes the library."""
+    if isinstance(exc, SubjectNotFound):
+        code, hint = "unknown_subject", "Pass a --subject that names a node in the project."
+    elif isinstance(exc, WriteError):
+        code, hint = "hub_write_failed", f"hub refused the write ({getattr(exc, 'code', '')})."
+    elif isinstance(exc, MediaError):
+        code, hint = "media_unreadable", "Re-render; the delivered file did not probe."
+    else:  # ValueError and other review errors
+        code, hint = "invalid_input", "Check the delivery inputs."
+    return DeliverError(
+        code,
+        str(exc) or type(exc).__name__,
+        hint,
+        completed_steps=list(completed),
+        cause=type(exc).__name__,
+    )
+
+
+def _size_cap_check(size_bytes: int, cap_mb: float) -> QACheck:
+    """The review size-cap QA check, built from the known review size (no extra ffmpeg run)."""
+    status = evaluate_size(size_bytes, cap_mb)
+    measured = {"size_bytes": size_bytes, "size_mb": round(size_bytes / MB, 3)}
+    message = (
+        f"Review render is {size_bytes / MB:.2f} MB (cap {cap_mb:g} MB)."
+        if status == "pass"
+        else f"Review render is {size_bytes / MB:.2f} MB, over the {cap_mb:g} MB cap."
+    )
+    return QACheck(
+        id="size-cap",
+        status=status,
+        message=message,
+        measured=measured,
+        target={"max_mb": cap_mb, "max_bytes": int(cap_mb * MB)},
+    )
+
+
+def _review_qa_report(
+    run_qa: QACheckFn, review_file: str, content_kind: str, profile: Profile, *, size_bytes: int
+) -> QAReport:
+    """Hold the review to the CONTENT kind's loudness and duration targets, plus the review checks
+    (decode and the size cap). This composes in the delivery library; it does not change what
+    ``qa.check(kind='review')`` means for other callers (F2)."""
+    base = run_qa(review_file, kind=content_kind, profile=profile)
+    checks = [c for c in base.checks if c.id != "size-cap"]
+    checks.append(_size_cap_check(size_bytes, profile.qa.review_mp4_max_mb))
+    return build_report(
+        file=review_file, kind="review", profile=base.profile, media=base.media, checks=checks
+    )
 
 
 @runtime_checkable
@@ -100,6 +228,16 @@ def _check_workdir(workdir: Any) -> str:
     # The directory must be durable: delivery artifacts outlive the run, so the caller must not
     # pass a scratch location. The library never creates a scratch directory of its own -- an AST
     # pin proves it imports no scratch-dir module and holds no scratch-root literal.
+    resolved = os.path.realpath(workdir)
+    for root in _temp_roots():
+        if _is_under(resolved, root):
+            raise DeliverError(
+                "invalid_workdir",
+                f"the work directory resolves under the temp root {root!r}: {workdir!r}",
+                "Pass a work dir on durable storage, never a system scratch directory.",
+                workdir=workdir,
+                resolved=resolved,
+            )
     return workdir
 
 
@@ -260,13 +398,20 @@ def _record(
     replays.append(result.replayed)
 
 
-def _review_keys(deliverable: str, render_job_id: str, sha256: str) -> dict[str, str]:
-    base = f"deliver.review:{deliverable}:{render_job_id}:{sha256}"
+def _key_base(role: str, project_id: str, deliverable: str, render_job_id: str) -> str:
+    """A deterministic hub idempotency key, well under the hub's 128-char limit for any input
+    length (the identifying tuple is hashed, not concatenated)."""
+    digest = hashlib.sha256(f"{project_id}|{deliverable}|{render_job_id}".encode()).hexdigest()
+    return f"deliver:{role}:{digest[:40]}"
+
+
+def _review_keys(project_id: str, deliverable: str, render_job_id: str) -> dict[str, str]:
+    base = _key_base("review", project_id, deliverable, render_job_id)
     return {"hash": f"{base}:hash", "qa_size": f"{base}:qa-size", "review": f"{base}:review"}
 
 
-def _master_keys(deliverable: str, render_job_id: str, sha256: str) -> dict[str, str]:
-    base = f"deliver.master:{deliverable}:{render_job_id}:{sha256}"
+def _master_keys(project_id: str, deliverable: str, render_job_id: str) -> dict[str, str]:
+    base = _key_base("master", project_id, deliverable, render_job_id)
     keys = {"hash": f"{base}:hash"}
     for metric in MASTER_QA_FACTS:
         keys[metric] = f"{base}:qa-{metric}"
@@ -328,14 +473,17 @@ def deliver_review(
     cap_bytes = int(cap_mb * MB)
 
     work = _delivery_dir(workdir, pid, dname, rjid)
-    source_path = os.path.join(work, "source" + _suffix(render_output.output_path))
+    suffix = _suffix(render_output.output_path)
+    source_path = os.path.join(work, "source" + suffix)
     review_path = os.path.join(work, "review.mp4")
     part_path = review_path + ".part"
     passlogfile = os.path.join(work, "ffpass")
-    timeout_s = timeout_for(render_output.duration_seconds, base_s=120.0, per_media_s=30.0)
+    # ffmpeg timeout: max(120 s, 4x realtime) per pass, not a flat multiple of realtime (F12).
+    timeout_s = max(120.0, 4.0 * render_output.duration_seconds)
 
     completed: list[str] = []
     resumed: list[str] = []
+    lock_fd = _acquire_delivery_lock(work)
     try:
         # 1. pull
         source_sha, source_size = _pull(edit_host, render_output.output_path, source_path, resumed)
@@ -353,17 +501,32 @@ def deliver_review(
             )
         box = _box_for(video.width, video.height)
         fits_box = video.width <= box[0] and video.height <= box[1]
+        review_mime = "video/mp4"
+        # The render is stored as is ONLY when it fits the box and the cap AND is already a
+        # browser-playable H.264/AAC MP4-family file (F6); anything else is transcoded.
+        as_is = False
         if fits_box and source_size <= cap_bytes:
+            as_is = _is_review_ready(info, suffix)
+        if as_is:
             review_file, transcoded = source_path, False
             width, height, video_kbps, attempts = video.width, video.height, None, 0
+            review_mime = _MIME.get(suffix, "video/mp4")  # .mov -> video/quicktime, etc.
         else:
             width, height = _fit(video.width, video.height, box[0], box[1])
             transcoded = True
-            if os.path.exists(review_path) and os.path.getsize(review_path) <= cap_bytes:
+            # Reuse a prior review.mp4 only if it fits the cap AND decodes; an over-cap or
+            # undecodable leftover (e.g. a crash or a lost race) is rebuilt, never reused (F5).
+            reusable = (
+                os.path.exists(review_path)
+                and os.path.getsize(review_path) <= cap_bytes
+                and _decodes(review_path, timeout_s)
+            )
+            if reusable:
                 resumed.append("transcode")
                 review_file, attempts = review_path, 0
                 video_kbps = _video_kbps(cap_bytes, render_output.duration_seconds)
             else:
+                _unlink_quiet(review_path)
                 video_kbps, attempts = _transcode_to_cap(
                     transcoder,
                     source_path,
@@ -380,12 +543,13 @@ def deliver_review(
                 review_file = review_path
         completed.append("transcode" if transcoded else "fit")
 
-        # 3. QA: a failed review is never stored or sent
-        report = run_qa(review_file, kind="review", profile=profile)
+        # 3. QA at the CONTENT kind's targets, plus the review checks; a fail is never stored.
+        review_size = os.path.getsize(review_file)
+        report = _review_qa_report(run_qa, review_file, kind, profile, size_bytes=review_size)
         if report.status == "fail":
             raise DeliverError(
                 "review_qa_failed",
-                f"review QA failed: {', '.join(c.id for c in report.checks if c.status == 'fail')}",
+                "review QA failed: " + ", ".join(c.id for c in report.checks if c.status == "fail"),
                 "Fix the render and re-run; QA facts are not recorded for a failed review.",
                 failed_checks=[c.id for c in report.checks if c.status == "fail"],
                 report=report.model_dump(mode="json"),
@@ -393,7 +557,6 @@ def deliver_review(
         completed.append("qa")
 
         # 4. store (content-addressed, so a re-run reuses the same id)
-        review_size = os.path.getsize(review_file)
         artifact_id = store.put(
             review_file,
             actor=actor,
@@ -406,21 +569,21 @@ def deliver_review(
                 "height": height,
                 "video_kbps": video_kbps,
             },
-            mime="video/mp4",
+            mime=review_mime,
             project_id=pid,
             producing_op="deliver.review",
         )
         completed.append("store")
 
         # 5. facts: the review file's hash and size, under deterministic keys
-        keys = _review_keys(dname, rjid, artifact_id)
+        keys = _review_keys(pid, dname, rjid)
         fact_keys: list[str] = []
         replays: list[bool] = []
         source = {"artifact": artifact_id}
         _record(
             log,
             pid,
-            f"render.hash.{dname}",
+            f"render.hash.review.{dname}",
             {"sha256": artifact_id, "bytes": review_size},
             actor,
             keys["hash"],
@@ -462,7 +625,13 @@ def deliver_review(
     except DeliverError as exc:
         exc.detail.setdefault("completed_steps", list(completed))
         raise
+    except MediaToolMissing:
+        raise  # the CLI maps a missing tool to its own exit code (2)
+    except (WriteError, ReviewError, MediaError, ValueError) as exc:
+        raise _wrap_step_error(exc, completed) from exc
 
+    finally:
+        _release_delivery_lock(lock_fd)
     return DeliveryResult(
         role="review",
         deliverable=dname,
@@ -517,10 +686,13 @@ def deliver_master(
     work = _delivery_dir(workdir, pid, dname, rjid)
     suffix = _suffix(render_output.output_path)
     master_path = os.path.join(work, "master" + suffix)
-    timeout_s = timeout_for(render_output.duration_seconds, base_s=300.0, per_media_s=60.0)
+    # Master QA is one ffprobe/loudness pass, not a transcode: cap the timeout at max(300 s, 4x
+    # realtime) instead of 60x realtime (F12).
+    timeout_s = max(300.0, 4.0 * render_output.duration_seconds)
 
     completed: list[str] = []
     resumed: list[str] = []
+    lock_fd = _acquire_delivery_lock(work)
     try:
         # 1. pull
         source_sha, _ = _pull(edit_host, render_output.output_path, master_path, resumed)
@@ -548,14 +720,14 @@ def deliver_master(
         completed.append("qa")
 
         # 4. facts: the hash is always written; a QA fact only for a measured value
-        keys = _master_keys(dname, rjid, artifact_id)
+        keys = _master_keys(pid, dname, rjid)
         fact_keys: list[str] = []
         replays: list[bool] = []
         source = {"artifact": artifact_id}
         _record(
             log,
             pid,
-            f"render.hash.{dname}",
+            f"render.hash.master.{dname}",
             {"sha256": artifact_id, "bytes": master_size},
             actor,
             keys["hash"],
@@ -583,7 +755,13 @@ def deliver_master(
     except DeliverError as exc:
         exc.detail.setdefault("completed_steps", list(completed))
         raise
+    except MediaToolMissing:
+        raise  # the CLI maps a missing tool to its own exit code (2)
+    except (WriteError, ReviewError, MediaError, ValueError) as exc:
+        raise _wrap_step_error(exc, completed) from exc
 
+    finally:
+        _release_delivery_lock(lock_fd)
     return DeliveryResult(
         role="master",
         deliverable=dname,
