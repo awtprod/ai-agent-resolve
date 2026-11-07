@@ -265,6 +265,73 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     job_release.add_argument("--idempotency-key", required=True)
     job_release.set_defaults(func=_job_release)
 
+    from aar.hub.registry import SOURCE_KINDS
+
+    project = hub_sub.add_parser(
+        "project", help="Register and inspect the Resolve projects the hub knows about."
+    )
+    project_sub = project.add_subparsers(dest="project_command", required=True)
+
+    def _source_args(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--source-kind",
+            required=True,
+            choices=sorted(SOURCE_KINDS),
+            help="Where the project lives.",
+        )
+        parser.add_argument(
+            "--locator",
+            required=True,
+            help='Source locator as a JSON object; local_db and cloud_library need {"project_id": '
+            'Resolve unique id, "name": ..., "folder_path": [...]}.',
+        )
+        parser.add_argument("--host", help="Host that holds the source (e.g. the node's name).")
+
+    project_add = project_sub.add_parser(
+        "add", help="Register a project (one Resolve unique id maps to one registry project)."
+    )
+    _add_db(project_add)
+    _add_actor(project_add)
+    project_add.add_argument("--name", required=True, help="Display name.")
+    _source_args(project_add)
+    project_add.add_argument("--alias", action="append", default=[], help="Repeatable.")
+    project_add.add_argument("--project-id", help="Explicit registry id (prj_...); else generated.")
+    project_add.add_argument("--idempotency-key", required=True)
+    project_add.set_defaults(func=_project_add)
+
+    project_list = project_sub.add_parser("list", help="List registered projects.")
+    _add_db(project_list)
+    project_list.set_defaults(func=_project_list)
+
+    project_show = project_sub.add_parser("show", help="Show one registered project.")
+    _add_db(project_show)
+    project_show.add_argument("project_id")
+    project_show.set_defaults(func=_project_show)
+
+    project_alias = project_sub.add_parser("alias", help="Add an alias to a project.")
+    _add_db(project_alias)
+    _add_actor(project_alias)
+    project_alias.add_argument("project_id")
+    project_alias.add_argument("alias")
+    project_alias.add_argument("--idempotency-key", required=True)
+    project_alias.set_defaults(func=_project_alias)
+
+    project_source = project_sub.add_parser("source", help="Add another source to a project.")
+    _add_db(project_source)
+    _add_actor(project_source)
+    project_source.add_argument("project_id")
+    _source_args(project_source)
+    project_source.add_argument("--idempotency-key", required=True)
+    project_source.set_defaults(func=_project_source)
+
+    project_rename = project_sub.add_parser("rename", help="Rename a project (its id stays).")
+    _add_db(project_rename)
+    _add_actor(project_rename)
+    project_rename.add_argument("project_id")
+    project_rename.add_argument("name")
+    project_rename.add_argument("--idempotency-key", required=True)
+    project_rename.set_defaults(func=_project_rename)
+
     from aar.hub import write_cli
 
     write_cli.register(hub_sub)
@@ -505,6 +572,119 @@ _job_list = _job_command(_job_list_action, read_only=True)
 _job_show = _job_command(_job_show_action, read_only=True)
 _job_cancel = _job_command(_job_cancel_action)
 _job_release = _job_command(_job_release_action)
+
+
+def _project_command(action: Any, *, read_only: bool = False) -> Any:
+    """CLI adapter for ``aar hub project``: one existing log, typed JSON errors on stderr."""
+
+    def run(args: argparse.Namespace) -> int:
+        from aar.hub.writes import WriteError
+
+        try:
+            actor = None if read_only else _parse_actor(args.actor)
+        except ValueError as exc:
+            return _fail("invalid_actor", str(exc))
+        try:
+            log = _open_existing(args.db, read_only=read_only)
+        except _DatabaseUnavailable as exc:
+            return _fail("database_unavailable", str(exc))
+        try:
+            try:
+                value = action(log, actor, args)
+            finally:
+                log.close()
+        except WriteError as exc:
+            cli_io.warn(json.dumps({"error": exc.to_dict()}, sort_keys=True))
+            return 1 if exc.code == "unknown_project" and read_only else 2
+        return _print(value)
+
+    return run
+
+
+def _locator_arg(raw: str) -> Any:
+    from aar.hub.writes import WriteError
+
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError):
+        raise WriteError(
+            "invalid_input", "--locator is not JSON", "Pass a JSON object.", field="locator"
+        ) from None
+
+
+def _project_add_action(log: Any, actor: Any, args: argparse.Namespace) -> dict[str, Any]:
+    from aar.hub import project_register
+
+    return project_register.register_project(
+        log,
+        actor,
+        name=args.name,
+        source_kind=args.source_kind,
+        locator=_locator_arg(args.locator),
+        host=args.host,
+        aliases=args.alias,
+        project_id=args.project_id,
+        idempotency_key=args.idempotency_key,
+    ).to_dict()
+
+
+def _project_list_action(log: Any, actor: Any, args: argparse.Namespace) -> dict[str, Any]:
+    from aar.hub.registry import Registry
+
+    return {"projects": [project.to_dict() for project in Registry(log).list()]}
+
+
+def _project_show_action(log: Any, actor: Any, args: argparse.Namespace) -> dict[str, Any]:
+    from aar.hub.registry import Registry
+    from aar.hub.writes import WriteError
+
+    project = Registry(log).get(args.project_id)
+    if project is None:
+        raise WriteError(
+            "unknown_project",
+            f"no project {args.project_id!r} in the hub registry",
+            "Use an id from `aar hub project list` (prj_...).",
+            project_id=args.project_id,
+        )
+    return {"project": project.to_dict()}
+
+
+def _project_alias_action(log: Any, actor: Any, args: argparse.Namespace) -> dict[str, Any]:
+    from aar.hub import project_register
+
+    return project_register.add_alias(
+        log, actor, args.project_id, args.alias, idempotency_key=args.idempotency_key
+    ).to_dict()
+
+
+def _project_source_action(log: Any, actor: Any, args: argparse.Namespace) -> dict[str, Any]:
+    from aar.hub import project_register
+
+    return project_register.add_source(
+        log,
+        actor,
+        args.project_id,
+        source_kind=args.source_kind,
+        locator=_locator_arg(args.locator),
+        host=args.host,
+        idempotency_key=args.idempotency_key,
+    ).to_dict()
+
+
+def _project_rename_action(log: Any, actor: Any, args: argparse.Namespace) -> dict[str, Any]:
+    from aar.hub import project_register
+
+    return project_register.rename(
+        log, actor, args.project_id, args.name, idempotency_key=args.idempotency_key
+    ).to_dict()
+
+
+_project_add = _project_command(_project_add_action)
+_project_list = _project_command(_project_list_action, read_only=True)
+_project_show = _project_command(_project_show_action, read_only=True)
+_project_alias = _project_command(_project_alias_action)
+_project_source = _project_command(_project_source_action)
+_project_rename = _project_command(_project_rename_action)
 
 
 def _serve(args: argparse.Namespace) -> int:

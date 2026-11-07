@@ -24,7 +24,7 @@ from mcp_types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import StrictInt
 
 from aar.hub import facts as facts_mod
-from aar.hub import jobs, writes
+from aar.hub import jobs, project_register, writes
 from aar.hub.artifacts import ArtifactStore
 from aar.hub.common import HumanRequired, InvalidInput, skipped_summary, utcnow
 from aar.hub.events import Actor, EventLog, IdempotencyConflict
@@ -53,6 +53,7 @@ WRITE_TOOL_NAMES = (
     "recipe_cancel",
     "job_submit",
     "job_cancel",
+    "project_register",
 )
 READ_TOOL_NAMES = ("facts_get", "brief_get", "plan_get")
 
@@ -263,6 +264,52 @@ def register_write_tools(
             return jobs.cancel(log, actor, job_id, reason, idempotency_key=idempotency_key)
 
         return run_job("job.cancel", cancel)
+
+    @server.tool(
+        name="project_register",
+        description=(
+            "Register a Resolve project in the hub so a node can run its jobs. `aar node run` "
+            "will not start until the registry holds a project whose source carries the Resolve "
+            "project's unique id. One Resolve unique id maps to one registry project: a second "
+            "registration is refused with project_exists, and details.existing_id names the "
+            "project to use (see projects_list). "
+            + _IDENTITY
+            + "name is the display name (1-500 characters). source_kind is cloud_library | "
+            "local_db | drp_file | drt_file. locator is an object; for cloud_library and "
+            "local_db it must be exactly {project_id: the Resolve unique id "
+            "(Project.GetUniqueId()), name: the Resolve project name, folder_path: [Project "
+            "Manager folder names from the root; [] is the root]}. host is optional text; "
+            "aliases is an optional list of text; project_id is an optional explicit registry "
+            "id (prj_...). A node cannot register. Example: name 'Show', source_kind "
+            "'local_db', locator {project_id: 'a1b2', name: 'Show', folder_path: ['Shows']}. "
+            "Returns {ok: true, op: 'project.register', replayed, project_id, project: {id, "
+            "name, sources, aliases, created}}. " + _ERRORS
+        ),
+        annotations=_WRITE,
+    )
+    def project_register_tool(
+        agent_id: str,
+        idempotency_key: str,
+        name: str,
+        source_kind: str,
+        locator: dict[str, Any],
+        host: str | None = None,
+        aliases: list[str] | None = None,
+        project_id: str | None = None,
+    ) -> CallToolResult:
+        return run(
+            lambda: project_register.register_project(
+                log,
+                _agent(agent_id),
+                name=name,
+                source_kind=source_kind,
+                locator=locator,
+                host=host,
+                aliases=aliases,
+                project_id=project_id,
+                idempotency_key=idempotency_key,
+            )
+        )
 
     @server.tool(
         name="brief_create",
