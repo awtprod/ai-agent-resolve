@@ -83,7 +83,7 @@ def test_namespaces_are_a_closed_set() -> None:
         "template.trap.<id>",
         "template.id.<name>",
         "path.map.<name>",
-        "render.hash.<deliverable>",
+        "render.hash.[review|master.]<deliverable>",
         "qa.<metric>.<deliverable>",
     ]
 
@@ -437,3 +437,13 @@ def test_a_record_in_log_order_wins_even_with_out_of_order_timestamps(hub: Hub) 
         ts="2020-01-01T00:00:00+00:00",
     )
     assert facts.facts_view(hub.log, pid).get("audio.gain.A1").current.value == {"db": -2.0}
+
+
+def test_render_hash_role_segment_is_restricted_to_review_or_master(hub: Hub) -> None:
+    """render.hash takes an optional review|master role segment; other words are refused (R2-7)."""
+    value = {"sha256": SHA, "bytes": 10}
+    for role in ("review", "master"):
+        _record(hub, f"render.hash.{role}.ep1", value, ikey=f"k-{role}")
+        assert facts.facts_view(hub.log, hub.project_id).get(f"render.hash.{role}.ep1") is not None
+    err = _refused("invalid_fact", lambda: _record(hub, "render.hash.draft.ep1", value, ikey="kd"))
+    assert err.details["field"] == "key"
