@@ -10,10 +10,9 @@ from pathlib import Path
 
 from aar.hub import jobs, nodes
 from aar.hub.events import EventLog
-from aar.node.jobs import JobStore
 
 from .fake_resolve import FakeResolve
-from .jobs_support import LAYOUT
+from .jobs_support import LAYOUT, open_store_when_released
 from .remote_support import write_token
 from .test_remote_worker import AGENT, HUMAN, NODE, PARAMS, _registered, _submit, _subprocess_hub
 
@@ -110,7 +109,9 @@ def test_subprocess_cli_crash_restart_keeps_claim_and_completed_step(tmp_path: P
                 process.kill()
                 process.wait(timeout=5)
                 assert process.returncode != 0
-            with contextlib.closing(JobStore(tmp_path / "jobs.db")) as store:
+            # On Windows the killed node's real process is a child of the venv redirector and
+            # releases the store lock a moment after process.wait(); poll, bounded.
+            with contextlib.closing(open_store_when_released(tmp_path / "jobs.db")) as store:
                 local = store.get(second.job_id)
                 assert local.current_step == 1 and len(local.results) == 1
                 assert sum(e.kind == "step_completed" for e in store.events(second.job_id)) == 1
@@ -129,7 +130,7 @@ def test_subprocess_cli_crash_restart_keeps_claim_and_completed_step(tmp_path: P
                     description="same local journal to resume",
                     node=restarted,
                 )
-            with contextlib.closing(JobStore(tmp_path / "jobs.db")) as store:
+            with contextlib.closing(open_store_when_released(tmp_path / "jobs.db")) as store:
                 local = store.get(second.job_id)
                 assert local.state.value == "succeeded" and local.current_step == 2
                 assert sum(e.kind == "step_completed" for e in store.events(second.job_id)) == 2

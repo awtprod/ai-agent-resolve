@@ -1,0 +1,22 @@
+[Unit]
+Description=AI-Agent-Resolve hub: agent MCP server (loopback, agent writes on)
+After=network.target
+
+[Service]
+ExecStart=@AAR_ROOT@/venv/bin/aar hub serve --db @AAR_ROOT@/data/hub.db --artifacts @AAR_ROOT@/data/artifacts --host 127.0.0.1 --port 8787 --agent-writes
+User=@AAR_USER@
+Group=@AAR_GROUP@
+WorkingDirectory=@AAR_ROOT@/data
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=@AAR_ROOT@/data
+UMask=0077
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
