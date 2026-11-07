@@ -148,7 +148,13 @@ def _check_step(step: StepDef, seen: set[str]) -> None:
         raise RecipeDefError(
             f"step {step.id!r} timeout_s must be finite and 0 < t <= {MAX_TIMEOUT_S}"
         )
+    if not isinstance(step.needs, tuple):
+        raise RecipeDefError(
+            f"step {step.id!r} needs must be a tuple of step ids, got {type(step.needs).__name__}"
+        )
     for need in step.needs:
+        if not isinstance(need, str):
+            raise RecipeDefError(f"step {step.id!r} needs must be step-id strings, got {need!r}")
         if need not in seen:
             raise RecipeDefError(
                 f"step {step.id!r} needs {need!r}, which is not an earlier step (DAG rule)"
@@ -177,6 +183,12 @@ def _check_kind_fields(step: StepDef, seen: set[str]) -> None:
             )
         if not step.on_reject:
             raise RecipeDefError(f"gate step {step.id!r} needs on_reject")
+        # on_reject must name an earlier step at or before the gate's subject: the round rolls
+        # back from on_reject, so it may not point at the gate itself or any later step.
+        if step.on_reject not in seen:
+            raise RecipeDefError(
+                f"gate step {step.id!r} on_reject {step.on_reject!r} must name an earlier step"
+            )
 
 
 def validate_recipe(recipe: RecipeDef, *, known_callables: Sequence[str] = ()) -> None:

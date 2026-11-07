@@ -40,13 +40,20 @@ from aar.recipes.state import OpAttempt, RunState, load_state
 
 
 def active_recipes(log: EventLog) -> list[tuple[str, str]]:
-    """Every ``(project_id, recipe_node)`` whose recipe node is active or blocked."""
+    """Every ``(project_id, recipe_node)`` whose run is active or blocked by evidence.
+
+    Liveness is read from the folded evidence status, never the recipe node's graph status (which
+    is only a mirror), so an agent cannot park or revive a run by moving the recipe node (F1).
+    """
     found: list[tuple[str, str]] = []
     registry_ = Registry(log)
     for project in registry_.list():
         graph = WorkGraph(log, project.id)
         for node in graph.nodes():
-            if node.kind == "recipe" and node.status in ("active", "blocked"):
+            if node.kind != "recipe":
+                continue
+            state = load_state(log, node.id, project_id=project.id)
+            if state.recipe_status in ("active", "blocked"):
                 found.append((project.id, node.id))
     return found
 
@@ -86,7 +93,22 @@ def _run_step(
     fn = registry.callable_for(step.callable_id or "")
     brief = _brief_of(log, state)
     profile = _profile_of(brief)
-    params = _params_of(state, recipe_def)
+    try:
+        params = _params_of(state, recipe_def)
+    except Exception as exc:  # F12: never hand a step the raw dict; fail with a typed error
+        record_result(
+            log,
+            project_id=state.project_id,
+            op_id=op.op_id,
+            actor=worker,
+            outcome=OUTCOME_FAILED,
+            error={
+                "code": "invalid_params",
+                "message": f"the stored recipe params do not validate: {exc}"[:500],
+                "fix_hint": "Recreate the recipe with params the registered model accepts.",
+            },
+        )
+        return
     needs = {need: dict(state.done_outputs(need)) for need in step.needs}
     deadline = clock() + timedelta(seconds=step.timeout_s)
     ctx = StepContext(
@@ -165,11 +187,10 @@ def _profile_of(brief: Any) -> Any:
 
 
 def _params_of(state: RunState, recipe_def: RecipeDef) -> Any:
+    """The parsed params model. Raises if the stored params do not validate (F12): the worker
+    never hands a step the raw dict."""
     raw = state.recipe_data.params if state.recipe_data is not None else {}
-    try:
-        return recipe_def.params_model.model_validate(dict(raw))
-    except Exception:
-        return raw
+    return recipe_def.params_model.model_validate(dict(raw))
 
 
 class _Heartbeat(threading.Thread):

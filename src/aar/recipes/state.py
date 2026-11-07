@@ -21,13 +21,12 @@ from datetime import datetime
 from typing import Any
 
 from aar.hub.common import parse_ts
-from aar.hub.events import Actor, EventLog
+from aar.hub.events import EventLog
 from aar.hub.graph import GRAPH_EVENT_TYPES, WorkGraph
 from aar.hub.reviews import Review, review_view
 from aar.hub.writes import RecipeData, typed_recipe
 from aar.recipes import registry
 from aar.recipes.events import (
-    RUNNER,
     EVENT_CANCELLED,
     EVENT_CLAIMED,
     EVENT_HEARTBEAT,
@@ -38,6 +37,7 @@ from aar.recipes.events import (
     EVENT_RUN_CANCELLED,
     EVENT_STARTED,
     RECIPE_EVENT_TYPES,
+    RUNNER,
     STEP_SCHEMA,
 )
 from aar.recipes.models import RecipeDef
@@ -220,6 +220,7 @@ class RunState:
                 return op.result_error.get("code") if op.result_error else "step_failed"
         return None
 
+    @property
     def recipe_status(self) -> str:
         """The run status from evidence: pending, active, blocked, done or cancelled."""
         if self.run_cancelled:
@@ -282,8 +283,14 @@ def _fold_recipe_events(
     for event in events:
         if event.actor != RUNNER:
             if len(ignored) < _MAX_IGNORED:
-                ignored.append({"kind": "event", "type": event.type, "id": event.id,
-                                "reason": f"not written by the runner ({event.actor.kind})"})
+                ignored.append(
+                    {
+                        "kind": "event",
+                        "type": event.type,
+                        "id": event.id,
+                        "reason": f"not written by the runner ({event.actor.kind})",
+                    }
+                )
             continue
         payload = event.payload
         if not isinstance(payload, dict):
@@ -302,8 +309,9 @@ def _fold_recipe_events(
             idx = payload.get("claim_index")
             idx = idx if isinstance(idx, int) and not isinstance(idx, bool) else op.claim_count
             claims.setdefault(op_id, []).append(
-                _Claim(event.seq, idx, _str(payload.get("worker")),
-                       _as_ts(payload.get("lease_until")))
+                _Claim(
+                    event.seq, idx, _str(payload.get("worker")), _as_ts(payload.get("lease_until"))
+                )
             )
         elif event.type == EVENT_HEARTBEAT:
             idx = payload.get("claim_index")
@@ -324,7 +332,8 @@ def _fold_recipe_events(
             op.result_outputs = outputs if isinstance(outputs, dict) else {}
             artifacts = payload.get("artifact_ids")
             op.result_artifacts = (
-                tuple(a for a in artifacts if isinstance(a, str)) if isinstance(artifacts, list)
+                tuple(a for a in artifacts if isinstance(a, str))
+                if isinstance(artifacts, list)
                 else ()
             )
             err = payload.get("error")
@@ -370,9 +379,14 @@ def _status_of(op: OpAttempt, review: Review | None) -> str:
     if op.result_outcome == "failed":
         return "failed"
     if op.kind == "gate":
-        if review is not None and review.decision is not None:
-            return "done" if review.decision.decision == "approve" else "active"
-        return "active" if op.review_id is not None else "pending"
+        # A gate op is open from creation: advance opens its review (needs status active), then it
+        # awaits a human decision. An approve is recorded as a done result; a reject leaves it
+        # active until the round rollback supersedes it.
+        return "active"
+    if op.kind == "agent":
+        # An agent op is open for step_complete from creation; there is no claim/submit step.
+        return "active"
+    # cold / hot: pending until a worker claims it or the hot step is submitted.
     if op.claim_count > 0 or op.hot_submitted:
         return "active"
     return "pending"
@@ -384,7 +398,10 @@ def load_state(log: EventLog, recipe_node: str, *, project_id: str | None = None
         project_id = project_of_node(log, recipe_node)
     if project_id is None:
         return RunState(
-            project_id="", recipe_node=recipe_node, recipe_data=None, recipe_def=None,
+            project_id="",
+            recipe_node=recipe_node,
+            recipe_data=None,
+            recipe_def=None,
             max_review_rounds=1,
         )
     graph = WorkGraph(log, project_id)
@@ -402,8 +419,13 @@ def load_state(log: EventLog, recipe_node: str, *, project_id: str | None = None
             continue
         if graph.creator(node.id) != RUNNER:
             if len(ignored) < _MAX_IGNORED:
-                ignored.append({"kind": "op_node", "id": node.id,
-                                "reason": "op node not created by the runner"})
+                ignored.append(
+                    {
+                        "kind": "op_node",
+                        "id": node.id,
+                        "reason": "op node not created by the runner",
+                    }
+                )
             continue
         op = _op_from_node(node)
         if op is not None:

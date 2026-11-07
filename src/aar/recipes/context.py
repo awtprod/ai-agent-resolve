@@ -115,6 +115,6 @@ class StepContext:
             dict(value),
             self.actor,
             idempotency_key=idem,
-            source={"recipe_node": self.recipe_node},
+            source={"recipe_node": self.recipe_node, "op_node": self.op_node},
         )
         return key

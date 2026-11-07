@@ -31,6 +31,17 @@ def _duration(op: OpAttempt) -> str:
     return f"{secs:.3f}s"
 
 
+def _report_status(state: RunState) -> str:
+    """The status to print. The report is the final step, so when it is the only step not yet
+    done the run is effectively complete: show ``done`` rather than the mid-run ``active`` (F18)."""
+    status = state.recipe_status
+    if status == "active" and state.recipe_def is not None:
+        others = [s for s in state.recipe_def.steps if s.callable_id != "recipe.report"]
+        if others and all(state.is_step_done(s.id) for s in others):
+            return "done"
+    return status
+
+
 def _step_order(state: RunState) -> list[str]:
     if state.recipe_def is not None:
         return [step.id for step in state.recipe_def.steps]
@@ -46,7 +57,7 @@ def build_report_text(log: EventLog, recipe_node: str) -> str:
     lines.append(f"# Recipe report: {recipe_name} v{version}")
     lines.append("")
     lines.append(f"- recipe_node: {recipe_node}")
-    lines.append(f"- status: {state.recipe_status}")
+    lines.append(f"- status: {_report_status(state)}")
     lines.append(f"- review rounds: used {state.current_round()} of {state.max_review_rounds}")
     lines.append("")
 

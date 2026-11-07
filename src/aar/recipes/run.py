@@ -13,20 +13,37 @@ from typing import Any
 from aar.hub.artifacts import ArtifactStore
 from aar.hub.common import Clock, utcnow
 from aar.hub.events import Actor, EventLog
-from aar.hub.graph import WorkGraph, allowed_transitions
+from aar.hub.graph import WorkGraph
 from aar.hub.reviews import get_review, withdraw
 from aar.hub.writes import (
     WriteError,
+    _append_record,
+    _find_record,
+    _in_transaction,
     check_actor,
     check_id,
-    set_own_status,
+    request_sha256,
     typed_plan,
     typed_recipe,
     write_key,
 )
 from aar.recipes import registry
-from aar.recipes.engine import advance, create_attempt, record_result
-from aar.recipes.events import OUTCOME_DONE
+from aar.recipes.engine import (
+    MAX_OUTPUT_BYTES,
+    _canonical,
+    _supersede_op,
+    advance,
+    create_attempt,
+    record_result,
+    record_run_cancelled,
+    record_started,
+)
+from aar.recipes.events import (
+    OP_RETRY,
+    OP_STEP_COMPLETE,
+    OUTCOME_DONE,
+    RUNNER,
+)
 from aar.recipes.gates import plan_gate
 from aar.recipes.models import ArtifactExpect, JsonExpect, PlanExpect, RecipeDef, StepDef
 from aar.recipes.state import RunState, load_state, project_of_node
@@ -83,6 +100,25 @@ def _resolve(log: EventLog, recipe_node: str) -> tuple[str, WorkGraph, RunState,
     return project_id, graph, state, definition
 
 
+def _revalidate_params(state: RunState, definition: RecipeDef) -> None:
+    """Re-validate the stored recipe params against the registered model (F12).
+
+    A recipe created through the generic graph API (or any surface that skipped the registry
+    validator) may hold params the model rejects; refuse to start it with ``invalid_params``.
+    """
+    from pydantic import ValidationError
+
+    raw = state.recipe_data.params if state.recipe_data is not None else {}
+    try:
+        definition.params_model.model_validate(dict(raw))
+    except ValidationError as exc:
+        raise WriteError(
+            "invalid_params",
+            f"recipe params do not validate ({exc.error_count()} problem(s))",
+            "Recreate the recipe with params the registered model accepts.",
+        ) from None
+
+
 def _require_owner(graph: WorkGraph, recipe_node: str, actor: Actor, action: str) -> None:
     if actor.kind == "human":
         return
@@ -104,25 +140,25 @@ def recipe_start(
     dispatcher: Any = None,
     clock: Clock = utcnow,
 ) -> dict[str, Any]:
-    """Start a recipe run: move the recipe node to ``active`` and advance it."""
+    """Start a recipe run: record the ``recipe.started`` evidence and advance it.
+
+    'Started' is the runner-written ``recipe.started`` event, not a graph status an agent could
+    forge; the recipe node's graph status is only a mirror the engine reconciles in ``advance``.
+    """
     actor = check_actor(actor)
     write_key(actor, idempotency_key)  # validate the key shape early
-    project_id, graph, _state, _ = _resolve(log, recipe_node)
-    _require_owner(graph, recipe_node, actor, "start")
-    node = graph.node(recipe_node)
-    assert node is not None
-    if node.status == "pending":
-        set_own_status(
-            log, project_id, recipe_node, "active", actor, idempotency_key=idempotency_key
-        )
-    elif node.status in _FINISHED:
+    project_id, _graph, state, definition = _resolve(log, recipe_node)
+    _require_owner(_graph, recipe_node, actor, "start")
+    _revalidate_params(state, definition)
+    if state.recipe_status in _FINISHED:
         raise WriteError(
             "step_not_open",
-            f"recipe {recipe_node!r} is {node.status!r} and cannot be started",
+            f"recipe {recipe_node!r} is {state.recipe_status!r} and cannot be started",
             "Start a fresh recipe run (recipe_create) instead.",
             node_id=recipe_node,
-            status=node.status,
+            status=state.recipe_status,
         )
+    record_started(log, project_id=project_id, recipe_node=recipe_node, caller=actor)
     advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
     return _result("recipe.start", log, recipe_node, dispatcher, clock)
 
@@ -136,17 +172,22 @@ def step_complete(
     outputs: Mapping[str, Any],
     actor: Actor,
     *,
+    round: int | None = None,
     idempotency_key: str,
     dispatcher: Any = None,
     clock: Clock = utcnow,
 ) -> dict[str, Any]:
     """Complete an agent step: validate ``outputs`` against its contract, then mark it done.
 
-    Any agent (or a human) may complete an agent step; attribution is the caller. If the outputs
-    fail the contract the call is refused and the step stays open.
+    Any agent (or a human) may complete an agent step; the write is made by the runner with the
+    caller recorded as ``by``. The caller's ``idempotency_key`` is honoured (F9): the same key and
+    request replays the first result (``replayed``); the same key with a different request is
+    ``idempotency_conflict``. ``round`` and ``attempt`` are optional guards that must name the live
+    attempt, which stops a replayed earlier-round call from completing a later round (F4). If the
+    outputs fail the contract the call is refused (``expects_unmet``) and the step stays open.
     """
     actor = check_actor(actor)
-    write_key(actor, idempotency_key)
+    caller_key = write_key(actor, idempotency_key)
     step_id = check_id(step_id, "step_id")
     if not isinstance(outputs, Mapping):
         raise WriteError(
@@ -155,6 +196,26 @@ def step_complete(
             "Send the step's outputs as an object.",
         )
     project_id, _graph, state, definition = _resolve(log, recipe_node)
+    fingerprint = request_sha256(
+        OP_STEP_COMPLETE,
+        {
+            "project_id": project_id,
+            "recipe_node": recipe_node,
+            "step_id": step_id,
+            "outputs": dict(outputs),
+        },
+    )
+    if (
+        _find_record(
+            log, caller_key, idempotency_key, OP_STEP_COMPLETE, project_id, actor, fingerprint
+        )
+        is not None
+    ):
+        advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
+        return {
+            **_result("recipe.step_complete", log, recipe_node, dispatcher, clock),
+            "replayed": True,
+        }
     step = _step(definition, step_id)
     if step.kind != "agent":
         raise WriteError(
@@ -165,6 +226,14 @@ def step_complete(
             kind=step.kind,
         )
     current = state.current_round()
+    if round is not None and round != current:
+        raise WriteError(
+            "step_not_open",
+            f"step {step_id!r} is open in round {current}, not {round}",
+            "Pass the round from recipe_status, or omit it.",
+            step_id=step_id,
+            round=current,
+        )
     op = state.latest_in_round(step_id, current)
     if op is None or op.status != "active":
         raise WriteError(
@@ -183,6 +252,14 @@ def step_complete(
             open_attempt=op.attempt,
         )
     validated = _validate_expects(log, store, state, recipe_node, step, dict(outputs))
+    if len(_canonical(validated)) > MAX_OUTPUT_BYTES:
+        raise WriteError(
+            "outputs_too_large",
+            f"the step's outputs exceed {MAX_OUTPUT_BYTES} bytes of canonical JSON",
+            "Store large data as an artifact and return its id, not inline outputs.",
+            step_id=step_id,
+        )
+    artifact_ids = tuple(a for a in validated.get("artifact_ids", []) if isinstance(a, str))
     record_result(
         log,
         project_id=project_id,
@@ -190,7 +267,20 @@ def step_complete(
         actor=actor,
         outcome=OUTCOME_DONE,
         outputs=validated,
+        artifact_ids=artifact_ids,
     )
+    with _in_transaction(log) as txn:
+        _append_record(
+            txn,
+            caller_key,
+            OP_STEP_COMPLETE,
+            project_id,
+            actor,
+            fingerprint,
+            recipe_node=recipe_node,
+            step_id=step_id,
+            op_node=op.op_id,
+        )
     advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
     return _result("recipe.step_complete", log, recipe_node, dispatcher, clock)
 
@@ -240,11 +330,24 @@ def _validate_plan(
             plan_node=plan_node_id,
         )
     parent = _plan_parent(graph, plan_node_id)
-    if parent != recipe_node and not _is_review(graph, parent):
+    # F4: round 1 derives from the recipe node. A review parent is accepted only when it is a gate
+    # review of THIS recipe for the previous round (current-1): a plan deriving from another
+    # recipe's review, or from an earlier round's review, is refused.
+    current = state.current_round()
+    allowed_reviews = {
+        op.review_id
+        for op in state.ops
+        if op.kind == "gate" and op.review_id is not None and op.round == current - 1
+    }
+    if parent == recipe_node or (_is_review(graph, parent) and parent in allowed_reviews):
+        pass
+    else:
         raise WriteError(
             "expects_unmet",
-            f"plan {plan_node_id!r} must derive from the recipe node or the round's review",
-            "Submit the plan with derives_from set to the recipe node (or the review).",
+            f"plan {plan_node_id!r} must derive from the recipe node or this recipe's "
+            f"round-{current - 1} gate review",
+            "Submit the plan with derives_from set to the recipe node (or the current round's "
+            "review).",
             step_id=step.id,
             derives_from=parent,
         )
@@ -298,9 +401,16 @@ def _validate_artifact(
             step_id=step.id,
         )
     meta = store.get_meta(artifact_id)
-    if expects.media_kind != "any" and (
-        meta is None or meta.meta.get("kind") != expects.media_kind
-    ):
+    # F5: the artifact must belong to this recipe's project.
+    if meta is None or meta.project_id != state.project_id:
+        raise WriteError(
+            "expects_unmet",
+            f"artifact {artifact_id} is not stored in this recipe's project",
+            "Produce the artifact in this project (ctx.put records the project).",
+            step_id=step.id,
+            project_id=state.project_id,
+        )
+    if expects.media_kind != "any" and meta.meta.get("kind") != expects.media_kind:
         raise WriteError(
             "expects_unmet",
             f"artifact {artifact_id} is not of media kind {expects.media_kind!r}",
@@ -346,9 +456,17 @@ def recipe_retry(
     dispatcher: Any = None,
     clock: Clock = utcnow,
 ) -> dict[str, Any]:
-    """Retry a failed step that still has attempts left: create its next attempt, then advance."""
+    """Retry a failed step that still has attempts left: create its next attempt, then advance.
+
+    A gate that failed ``review_rounds_exhausted`` is terminal: retry is refused with
+    ``rounds_exhausted`` (only ``recipe_cancel`` exits, F7). A gate whose review was withdrawn
+    (F8) may be retried by the
+    creator or a human to open a fresh review **in the same round** -- it does not use a round. The
+    caller's ``idempotency_key`` is honoured (F9): the same key and failed op replays; a different
+    request is ``idempotency_conflict``.
+    """
     actor = check_actor(actor)
-    write_key(actor, idempotency_key)
+    caller_key = write_key(actor, idempotency_key)
     step_id = check_id(step_id, "step_id")
     project_id, graph, state, definition = _resolve(log, recipe_node)
     _require_owner(graph, recipe_node, actor, "retry")
@@ -362,6 +480,30 @@ def recipe_retry(
             "Only a failed step can be retried.",
             step_id=step_id,
         )
+    code = op.result_error.get("code") if isinstance(op.result_error, dict) else None
+    if step.kind == "gate" and code == "review_rounds_exhausted":
+        raise WriteError(
+            "rounds_exhausted",
+            f"gate {step_id!r} used all {state.max_review_rounds} review round(s)",
+            "The review rounds are used up; only recipe_cancel can exit this recipe.",
+            step_id=step_id,
+            max_review_rounds=state.max_review_rounds,
+        )
+    fingerprint = request_sha256(
+        OP_RETRY,
+        {
+            "project_id": project_id,
+            "recipe_node": recipe_node,
+            "step_id": step_id,
+            "failed_op": op.op_id,
+        },
+    )
+    if (
+        _find_record(log, caller_key, idempotency_key, OP_RETRY, project_id, actor, fingerprint)
+        is not None
+    ):
+        advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
+        return {**_result("recipe.retry", log, recipe_node, dispatcher, clock), "replayed": True}
     failed = len([o for o in state.in_round(step_id, current) if o.status == "failed"])
     if failed >= step.max_attempts:
         raise WriteError(
@@ -371,7 +513,6 @@ def recipe_retry(
             step_id=step_id,
             max_attempts=step.max_attempts,
         )
-    runner = graph.creator(recipe_node) or actor
     status = "pending" if step.kind in ("cold", "hot") else "active"
     create_attempt(
         log,
@@ -380,9 +521,21 @@ def recipe_retry(
         step=step,
         round_=current,
         attempt=op.attempt + 1,
-        actor=runner,
+        caller=actor,
         status=status,
     )
+    with _in_transaction(log) as txn:
+        _append_record(
+            txn,
+            caller_key,
+            OP_RETRY,
+            project_id,
+            actor,
+            fingerprint,
+            recipe_node=recipe_node,
+            step_id=step_id,
+            failed_op=op.op_id,
+        )
     advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
     return _result("recipe.retry", log, recipe_node, dispatcher, clock)
 
@@ -396,13 +549,17 @@ def recipe_cancel(
     reason: str = "recipe cancelled",
     clock: Clock = utcnow,
 ) -> dict[str, Any]:
-    """Cancel a run: cancel live ops, withdraw open reviews, move the recipe to ``cancelled``."""
+    """Cancel a run: cancel live ops, withdraw open reviews, mark the run cancelled.
+
+    All writes are the runner's (with the caller recorded). The gate reviews are withdrawn as
+    RUNNER (their requester), so this works even though no agent may withdraw them; a cancel's own
+    withdrawals never count as human rejections (F8). The run is cancelled from the
+    ``recipe.run_cancelled`` evidence regardless, and ``advance`` reconciles the node mirror.
+    """
     actor = check_actor(actor)
     write_key(actor, idempotency_key)
     project_id, graph, state, _ = _resolve(log, recipe_node)
     _require_owner(graph, recipe_node, actor, "cancel")
-    from aar.recipes.engine import _supersede_op
-
     for op in state.ops:
         if op.is_live:
             _supersede_op(log, project_id, op, actor, reason)
@@ -411,17 +568,11 @@ def recipe_cancel(
             continue
         review = get_review(log, project_id, op.review_id)
         if review is not None and review.pending:
-            withdraw(log, project_id, op.review_id, reason, actor, idempotency_key=None)
-    node = graph.node(recipe_node)
-    if node is not None and "cancelled" in allowed_transitions(node.status):
-        set_own_status(
-            log,
-            project_id,
-            recipe_node,
-            "cancelled",
-            actor,
-            idempotency_key=f"{idempotency_key}:recipe-cancel",
-        )
+            withdraw(log, project_id, op.review_id, reason, RUNNER, idempotency_key=None)
+    record_run_cancelled(
+        log, project_id=project_id, recipe_node=recipe_node, caller=actor, reason=reason
+    )
+    advance(log, recipe_node, actor=actor, dispatcher=None, clock=clock)
     return _result("recipe.cancel", log, recipe_node, None, clock)
 
 

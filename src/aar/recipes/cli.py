@@ -143,6 +143,9 @@ def _parse_actor(value: str) -> Any:
     kind, sep, ident = value.partition(":")
     if not sep:
         raise ValueError(f"--actor must look like KIND:ID, got {value!r}")
+    if kind == "runner":
+        # 'runner' is the recipe engine's own identity; a caller may not impersonate it.
+        raise ValueError("actor kind 'runner' is reserved for the recipe engine")
     return Actor(kind, ident)
 
 
