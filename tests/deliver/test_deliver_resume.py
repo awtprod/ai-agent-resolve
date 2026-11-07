@@ -198,7 +198,7 @@ def test_resume_after_facts_does_not_duplicate_facts(tmp_path: Path, sources: Pa
         producing_op="deliver.review",
     )
     size = source.stat().st_size
-    keys = _review_keys(hub.project_id, "short-1", "rj-1")
+    keys = _review_keys(hub.project_id, "short-1", "rj-1", artifact_id)
     src = {"artifact": artifact_id}
     record_fact(
         hub.log,

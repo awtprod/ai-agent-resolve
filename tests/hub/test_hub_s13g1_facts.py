@@ -83,7 +83,7 @@ def test_namespaces_are_a_closed_set() -> None:
         "template.trap.<id>",
         "template.id.<name>",
         "path.map.<name>",
-        "render.hash.<deliverable>",
+        "render.hash.[review|master.]<deliverable>",
         "qa.<metric>.<deliverable>",
     ]
 

@@ -255,3 +255,17 @@ def test_unregistered_project_exits_2(
     _use_fake_host(monkeypatch, sources)
     monkeypatch.setattr(service, "_default_qa_check", qa_pass())
     assert main(_review_argv(hub, tmp_path, sources, project="proj-nope")) == 2
+
+
+def test_v71_delivery_in_progress_exits_3(
+    tmp_path: Path, sources: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hub = make_hub(tmp_path)
+    _use_fake_host(monkeypatch, sources)
+    monkeypatch.setattr(service, "_default_qa_check", qa_pass())
+    ddir = service._delivery_dir(str(tmp_path / "work"), hub.project_id, "short-1", "rj-1")
+    fd = service._acquire_delivery_lock(ddir)
+    try:
+        assert main(_review_argv(hub, tmp_path, sources)) == 3
+    finally:
+        service._release_delivery_lock(fd)

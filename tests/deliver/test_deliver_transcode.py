@@ -68,3 +68,39 @@ def test_v43_undecodable_output_raises_transcode_failed(
             timeout_s=60.0,
         )
     assert info.value.code == "transcode_failed"
+
+
+def test_v66_pass2_argv_pins_pix_fmt_and_profile(tmp_path: Path) -> None:
+    tc, _src, _pl, _out = _run(tmp_path)
+    _one, two = tc.argv_log
+    assert two[two.index("-pix_fmt") + 1] == "yuv420p"
+    assert two[two.index("-profile:v") + 1] == "high"
+
+
+def test_v65_pass_logs_removed_when_pass2_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aar.media import MediaError
+
+    real = transcode.run_tool
+
+    def flaky(tool, argv, **kw):
+        if "-pass" in argv and argv[argv.index("-pass") + 1] == "2":
+            raise MediaError("boom", tool="ffmpeg", exit_code=1)
+        return real(tool, argv, **kw)
+
+    monkeypatch.setattr(transcode, "run_tool", flaky)
+    src = make_source(tmp_path / "src.mp4", width=320, height=180, duration=1.0, fps=10)
+    pl = str(tmp_path / "ffpass")
+    with pytest.raises(DeliverError):
+        FfmpegTranscoder().transcode(
+            str(src),
+            str(tmp_path / "out.mp4.part"),
+            width=640,
+            height=360,
+            video_kbps=500,
+            audio_kbps=128,
+            passlogfile=pl,
+            timeout_s=120.0,
+        )
+    assert glob.glob(glob.escape(pl) + "-*.log*") == []

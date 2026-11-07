@@ -169,6 +169,7 @@ class FakeTranscoder:
                 "video_kbps": video_kbps,
                 "audio_kbps": audio_kbps,
                 "passlogfile": passlogfile,
+                "timeout_s": timeout_s,
             }
         )
         size = self.sizes[min(len(self.calls) - 1, len(self.sizes) - 1)]
