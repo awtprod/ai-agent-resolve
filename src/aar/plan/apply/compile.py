@@ -1,9 +1,9 @@
 """Compile a linted EditPlan v2 into Resolve build-op steps, in three phases that each compile
 only from the real results of the phases before them (round 2).
 
-* **prepare** -- ``timeline.branch`` (from the template's real unique_id), ``media.import`` for
-  every source, ``media.find`` for every title template the plan uses. Inputs: plan, template
-  describe.
+* **prepare** -- ``timeline.branch`` (from the template's real unique_id), ``media.import`` once
+  per edit-PC file, ``media.find`` over the whole pool for every pool-name source and title
+  template. Inputs: plan, template describe.
 * **assemble** -- ``track.ensure`` + ``timeline.append_ranges`` against the *real* branch
   timeline and *real* pool unique_ids from the prepare result. Inputs: plan, prepare result.
 * **finish** -- transitions, ``clip.set_input_color_space``, colour, transform, ``title.place``
@@ -11,7 +11,9 @@ only from the real results of the phases before them (round 2).
   assemble result by ``(track, record_in)``. Inputs: plan, prepare result, assemble result.
 
 A reference an earlier phase has not produced is a typed :mod:`~aar.plan.apply.refs` unresolved
-marker, never a guessed value. A dry-run prints it; a submission is refused if any survives.
+marker, never a guessed value. A dry-run prints it; a submission is refused if any survives. Every
+step has a stable name unique in its phase; a finished job's results are mapped by it when
+:func:`~aar.plan.apply.jobs.phase_result_from_job` turns them into the next phase's input.
 """
 
 from __future__ import annotations
@@ -30,11 +32,16 @@ from aar.node.ops.read import DescribeResult
 from aar.node.ops.write import MarkerColor
 from aar.plan.apply.errors import CompileError
 from aar.plan.apply.inputs import (
+    BRANCH_STEP,
     AssembleResult,
     PrepareResult,
     check_media_classifiable,
     classify_media,
+    find_source_step,
+    find_title_step,
     import_bin,
+    import_owners,
+    import_step,
     plan_hash,
     title_templates,
     validate_assemble,
@@ -163,20 +170,22 @@ def compile_prepare(plan: EditPlan, *, template: DescribeResult | None = None) -
         _step(
             "prepare",
             "timeline.branch",
-            "branch",
+            BRANCH_STEP,
             {"source": source, "if_exists": "reuse"},
             f"branch {plan.template!r} (reuse)",
         )
     )
     steps.extend(_import_steps(plan, notes))
     steps.extend(_find_source_steps(plan))
-    for index, name in enumerate(title_templates(plan)):
+    for name in title_templates(plan):
         steps.append(
             _step(
                 "prepare",
                 "media.find",
-                f"find-title:{index}",
-                {"name": name, "recursive": True, "limit": 200},
+                find_title_step(name),
+                # Recursive over the whole pool; the op matches the name exactly (case-sensitive)
+                # and the job builder re-checks the returned name (N1/N5).
+                {"name": name, "bin_path": [], "recursive": True, "limit": 200},
                 f"find title template {name!r}",
             )
         )
@@ -184,28 +193,28 @@ def compile_prepare(plan: EditPlan, *, template: DescribeResult | None = None) -
         notes.append(
             "a title/sting has no template name; it cannot be placed (title.place needs one)"
         )
+    _check_steps(steps)
     return Compilation("prepare", steps, notes)
 
 
 def _find_source_steps(plan: EditPlan) -> list[Step]:
-    """A media.find for each pool-name source (e.g. a CCN multicam clip), in its camera bin, so
-    phase 1 resolves its real pool unique_id (R1)."""
+    """A media.find for each pool-name source (e.g. a CCN multicam clip), recursively over the
+    WHOLE media pool, keyed to the source id so the result maps by name, never by position (N1,
+    N5). It requires exactly one exact, case-sensitive name match; the editor resolves ambiguity
+    in Resolve."""
     steps: list[Step] = []
-    index = 0
     for source in plan.sources:
         if classify_media(source.media) != "pool":
             continue
-        bin_path = import_bin(source)
         steps.append(
             _step(
                 "prepare",
                 "media.find",
-                f"find-source:{index}",
-                {"name": source.media, "bin_path": list(bin_path), "recursive": True, "limit": 200},
+                find_source_step(source.id),
+                {"name": source.media, "bin_path": [], "recursive": True, "limit": 200},
                 f"find pool source {source.media!r} for {source.id}",
             )
         )
-        index += 1
     return steps
 
 
@@ -214,17 +223,23 @@ def _has_sting(plan: EditPlan) -> bool:
 
 
 def _import_steps(plan: EditPlan, notes: list[str]) -> list[Step]:
+    """``media.import`` batches (<= 50 paths, the op's cap) per camera bin. Each distinct file (by
+    ``path_key``) is imported once, into the bin of the first source that uses it; a source that
+    shares the file maps to the same pool item (N7)."""
+    owners = import_owners(plan)
     bins: dict[tuple[str, ...], list[str]] = {}
-    pool = []
-    for source in plan.sources:
-        if classify_media(source.media) != "import":
-            pool.append(source.id)
-            continue
-        paths = bins.setdefault(import_bin(source), [])
-        if all(path_key(p) != path_key(source.media) for p in paths):
-            paths.append(source.media)
+    for owner in owners.values():
+        bins.setdefault(import_bin(owner), []).append(owner.media)
+    pool = [s.id for s in plan.sources if classify_media(s.media) != "import"]
     if pool:
         notes.append(f"pool-name sources resolved by media.find in prepare: {', '.join(pool)}")
+    shared = [
+        f"{s.id} (= {owners[path_key(s.media)].id})"
+        for s in plan.sources
+        if classify_media(s.media) == "import" and owners[path_key(s.media)] is not s
+    ]
+    if shared:
+        notes.append(f"sources sharing a file are imported once: {', '.join(shared)}")
     steps: list[Step] = []
     for bin_path, paths in bins.items():
         for batch_index, batch in enumerate(_chunk(paths, 50)):
@@ -232,7 +247,7 @@ def _import_steps(plan: EditPlan, notes: list[str]) -> list[Step]:
                 _step(
                     "prepare",
                     "media.import",
-                    f"import:{'/'.join(bin_path)}:{batch_index}",
+                    import_step(bin_path, batch_index),
                     {
                         "paths": batch,
                         "bin_path": list(bin_path),
@@ -468,7 +483,7 @@ class _Resolver:
     video: dict[tuple[int, int], str]
     content_audio: dict[tuple[int, int], list[str]]
     audio_only: dict[tuple[int, int], list[str]]
-    meta: dict[tuple[int, int], tuple[int, int | None, int | None]]
+    meta: dict[tuple[int, int], tuple[int | None, int | None]]
     ambiguous: set[tuple[int, int]]
     timeline: TimelineRef
 
@@ -510,18 +525,12 @@ def _resolver(plan: EditPlan, assemble: AssembleResult) -> _Resolver:
     video: dict[tuple[int, int], str] = {}
     content_audio: dict[tuple[int, int], list[str]] = {}
     audio_only: dict[tuple[int, int], list[str]] = {}
-    meta: dict[tuple[int, int], tuple[int, int | None, int | None]] = {}
+    meta: dict[tuple[int, int], tuple[int | None, int | None]] = {}
     ambiguous: set[tuple[int, int]] = set()
-    branch_id = assemble.branch.unique_id
     timeline = assemble.branch_ref()
+    # Every append is on the branch: validate_assemble has refused a mixed result before this
+    # runs (one copy of that check, so it cannot drift).
     for result in assemble.appends:
-        if result.timeline.unique_id != branch_id:
-            raise CompileError(
-                "phase_result_mismatch",
-                f"an append result is from timeline {result.timeline.unique_id!r}, not the "
-                f"assemble branch {branch_id!r}",
-                "every result must come from the same branch timeline",
-            )
         for appended in result.ranges:
             if appended.video is not None:
                 key = (appended.video.track, appended.planned_record_in)
@@ -529,11 +538,7 @@ def _resolver(plan: EditPlan, assemble: AssembleResult) -> _Resolver:
                     ambiguous.add(key)
                 video[key] = appended.video.item_id
                 content_audio[key] = [p.item_id for p in appended.audio]
-                meta[key] = (
-                    appended.planned_record_out,
-                    appended.video.source_start,
-                    appended.video.source_end,
-                )
+                meta[key] = (appended.video.source_start, appended.video.source_end)
             elif appended.audio:
                 key = (appended.audio[0].track, appended.planned_record_in)
                 audio_only.setdefault(key, []).extend(p.item_id for p in appended.audio)
@@ -582,32 +587,45 @@ def compile_finish(
     return Compilation("finish", steps, builder.notes, builder.warnings, intents=builder.intents)
 
 
+SOURCE_READBACK_TOLERANCE = 1
+"""Trap ``source-frame-readback-rounding`` (confirmed, aar/node/traps.py): GetSourceStartFrame /
+GetSourceEndFrame read back up to one frame off the in point used, and the append op itself
+accepts a start one frame off (write.py, note ``source_readback_off_by_one``). A tighter check
+would refuse honest results; a stale range differs by far more."""
+
+
 def _check_all_segments_matched(plan: EditPlan, resolver: _Resolver) -> None:
     """Every content segment must be matched exactly once in the assemble result, finishing op or
-    not; and the matched append must be of this plan's range, not a stale one (F8, R2)."""
+    not; and the matched append must be of this plan's range, not a stale one (F8, R2).
+
+    ``record_in`` is matched exactly (it is the resolver key, a timeline frame). The source in/out
+    are matched to the read-back tolerance above. ``record_out`` is NOT compared: the op
+    rate-converts it (write.py), so a mixed-rate source would read falsely stale (N8). A source
+    range that was not read back fails closed as ``unverified_phase_result`` (N6)."""
     ranges = plan.record_ranges()
     for index, seg in enumerate(plan.segments):
-        record_in, record_out = ranges[index]
+        record_in = ranges[index][0]
         resolver.video_item(seg.track, record_in)  # raises unmatched / double_matched
-        planned_out, src_start, src_end = resolver.meta[(seg.track, record_in)]
+        src_start, src_end = resolver.meta[(seg.track, record_in)]
+        if src_start is None or src_end is None:
+            raise CompileError(
+                "unverified_phase_result",
+                f"segment {index}: the appended item's source range was not read back, so it "
+                "cannot be checked against the plan",
+                "re-run phase 'assemble' against a Resolve that reports source frames",
+                segment=index,
+            )
         if (
-            planned_out != record_out
-            or not _range_matches(src_start, seg.src_in)
-            or (not _range_matches(src_end, seg.src_out))
+            abs(src_start - seg.src_in) > SOURCE_READBACK_TOLERANCE
+            or abs(src_end - seg.src_out) > SOURCE_READBACK_TOLERANCE
         ):
             raise CompileError(
                 "stale_phase_result",
-                f"segment {index} appended as record {record_in}..{planned_out} source "
-                f"{src_start}..{src_end}, not the plan's {record_in}..{record_out} source "
+                f"segment {index} appended source {src_start}..{src_end}, not the plan's "
                 f"{seg.src_in}..{seg.src_out}",
                 "the assemble result is from an older plan; re-run phase 'assemble'",
                 segment=index,
             )
-
-
-def _range_matches(reported: int | None, expected: int) -> bool:
-    # source frames carry a +/-1 read-back rounding trap; a stale clip differs by far more.
-    return reported is None or abs(reported - expected) <= 1
 
 
 class _Finish:

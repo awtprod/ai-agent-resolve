@@ -6,14 +6,25 @@ from __future__ import annotations
 
 from typing import Any
 
+from aar.node.ops.build import ImportedMedia, ImportResult, TrackResult, TrackState, path_key
+from aar.node.ops.collab import BranchResult
 from aar.node.ops.framework import MediaRef, TimelineIdentity
-from aar.node.ops.read import DescribeResult, ItemInfo, MarkerInfo, TimelineInfo, TrackInfo
+from aar.node.ops.read import (
+    DescribeResult,
+    ItemInfo,
+    MarkerInfo,
+    MediaFindResult,
+    MediaInfo,
+    TimelineInfo,
+    TrackInfo,
+)
 from aar.node.ops.write import AppendedRange, AppendResult, PlacedItem
-from aar.plan.apply import PrepareResult, compile_assemble
+from aar.plan.apply import PrepareResult, compile_assemble, compile_prepare
 from aar.plan.apply.inputs import AssembleResult, FoundTitle, ImportedSource, plan_hash
 from aar.plan.model import EditPlan
 
 BRANCH_UID = "tl-branch-0001"
+TEMPLATE_UID = "tl-template-0001"
 
 
 def _branch_name(plan: EditPlan) -> str:
@@ -270,3 +281,165 @@ def branch_describe(
 
 def as_dict(obj: Any) -> Any:
     return obj.model_dump(mode="json")
+
+
+# -- node-job builders (round 4): a well-formed job_result for phase_result_from_job -----------
+
+
+def media_info(name: str, media_id: str, *, bin_path=("pool",), file_path: str = "") -> MediaInfo:
+    return MediaInfo(
+        media_id=media_id,
+        name=name,
+        type="Multicam",
+        format="",
+        video_codec="",
+        file_name="",
+        file_path=file_path,
+        fps=24.0,
+        frames=1000,
+        is_braw=False,
+        is_still=False,
+        is_multicam=True,
+        has_video=True,
+        has_audio=True,
+        online_status="Online",
+        proxy="None",
+        input_color_space="",
+        bin_path=bin_path,
+    )
+
+
+def find_value(
+    items: list[MediaInfo], *, bin_path=(), recursive: bool = True, truncated: bool = False
+) -> dict:
+    """A ``media.find`` result over ``bin_path`` (default: the whole pool, recursive)."""
+    return MediaFindResult(
+        bin_path=bin_path,
+        recursive=recursive,
+        scanned=len(items),
+        truncated=truncated,
+        media=items,
+    ).model_dump(mode="json")
+
+
+def prepare_job(plan: EditPlan, template: DescribeResult, *, uid: str = BRANCH_UID) -> dict:
+    """A well-formed phase-1 job result: the compiled prepare steps, each with a synthesized op
+    result -- the branch of ``template``; per import step one imported item per requested file
+    (pool id ``pool-<owner source id>``); per find exactly one exact-name hit (``pool-<source id>``
+    for a pool source, ``title-<n>`` for the n-th title template)."""
+    owners = {path_key(s.media): s for s in reversed(plan.sources)}  # first source wins
+    titles = 0
+    steps = []
+    for step in compile_prepare(plan, template=template).steps:
+        value: dict
+        if step.op == "timeline.branch":
+            value = BranchResult(
+                source=TimelineIdentity(
+                    name=template.timeline.name, unique_id=template.timeline.unique_id
+                ),
+                timeline=TimelineIdentity(name=_branch_name(plan), unique_id=uid),
+                agent_id="a",
+                version=1,
+                created=True,
+                timeline_count=1,
+                notes=[],
+            ).model_dump(mode="json")
+        elif step.op == "media.import":
+            media = [
+                ImportedMedia(
+                    path=path,
+                    status="imported",
+                    media=MediaRef(unique_id=f"pool-{owners[path_key(path)].id}"),
+                    file_path=path,
+                )
+                for path in step.params["paths"]
+            ]
+            value = ImportResult(
+                bin_path=tuple(step.params["bin_path"]), bins_created=[], media=media, notes=[]
+            ).model_dump(mode="json")
+        elif step.name.startswith("find:source:"):
+            name = step.params["name"]
+            sid = step.name.removeprefix("find:source:")
+            value = find_value([media_info(name, f"pool-{sid}", bin_path=("Night 8", "CCN"))])
+        else:  # find:title:<template>
+            value = find_value([media_info(step.params["name"], f"title-{titles}")])
+            titles += 1
+        steps.append({"op": step.op, "name": step.name, "params": step.params, "value": value})
+    return {"job_id": "job_prepare_test", "steps": steps}
+
+
+def job_step(job: dict, name: str) -> dict:
+    """The step named ``name`` of a job result (mutable, for hostile-job tests)."""
+    return next(s for s in job["steps"] if s["name"] == name)
+
+
+def assemble_job(plan: EditPlan, prepare: PrepareResult, *, batch_size: int = 10) -> dict:
+    """A well-formed phase-2 job result: track.ensure plus the append steps, each append carrying
+    an AppendResult for its ranges (no branch step; the branch is in the prepare envelope)."""
+    steps = []
+    for step in compile_assemble(plan, prepare=prepare, batch_size=batch_size).steps:
+        if step.op == "track.ensure":
+            states = [
+                TrackState(
+                    type=t["type"],
+                    index=t["index"],
+                    created=False,
+                    name=t.get("name") or f"{t['type'][0].upper()}{t['index']}",
+                    enabled=True,
+                    locked=False,
+                    audio_format=None,
+                    changed=[],
+                )
+                for t in step.params["tracks"]
+            ]
+            value = TrackResult(timeline=prepare.branch, tracks=states, added=[])
+            steps.append(
+                {
+                    "op": step.op,
+                    "name": step.name,
+                    "params": step.params,
+                    "value": value.model_dump(mode="json"),
+                }
+            )
+            continue
+        ranges = []
+        for i, rng in enumerate(step.params["ranges"]):
+            track, rin = rng["track"], rng["record_in"]
+            si, so = rng["src_in"], rng["src_out"]
+            rout = rin + (so - si)
+            mt = rng["media_type"]
+            video = (
+                _placed(track, rin, rout, f"V{track}:{rin}", "video", si, so)
+                if mt != "audio"
+                else None
+            )
+            audio = (
+                [_placed(track, rin, rout, f"A{track}:{rin}", "audio", si, so)]
+                if mt in ("av", "audio")
+                else []
+            )
+            ranges.append(
+                AppendedRange(
+                    index=i,
+                    status="appended",
+                    planned_record_in=rin,
+                    planned_record_out=rout,
+                    planned_frames=so - si,
+                    end_frame_used=rout,
+                    video=video,
+                    audio=audio,
+                    notes=[],
+                )
+            )
+        value = AppendResult(
+            timeline=prepare.branch,
+            timeline_fps=24.0,
+            cursor=0,
+            next_cursor=None,
+            done=True,
+            ranges=ranges,
+            gaps=[],
+            notes=[],
+        ).model_dump(mode="json")
+        steps.append({"op": step.op, "name": step.name, "params": step.params, "value": value})
+    return {"job_id": "job_assemble_test", "steps": steps}

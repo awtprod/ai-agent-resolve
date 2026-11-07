@@ -94,7 +94,7 @@
       },
       {
         "op": "media.find",
-        "name": "find-title:0",
+        "name": "find:title:CCN Lower Third",
         "summary": "find title template 'CCN Lower Third'",
         "params": {
           "bin_path": [],
@@ -107,7 +107,7 @@
       },
       {
         "op": "media.find",
-        "name": "find-title:1",
+        "name": "find:title:CCN Sting",
         "summary": "find title template 'CCN Sting'",
         "params": {
           "bin_path": [],

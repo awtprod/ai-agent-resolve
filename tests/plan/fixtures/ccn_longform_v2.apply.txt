@@ -12,9 +12,9 @@ PHASE prepare - prepare (7 steps, 0 unresolved ref(s))
        import 1 file(s) into aar/A2
   5. media.import  [import:aar/X:0]
        import 1 file(s) into aar/X
-  6. media.find  [find-title:0]
+  6. media.find  [find:title:CCN Lower Third]
        find title template 'CCN Lower Third'
-  7. media.find  [find-title:1]
+  7. media.find  [find:title:CCN Sting]
        find title template 'CCN Sting'
 
 PHASE assemble - assemble (4 steps, 0 unresolved ref(s))

@@ -8,6 +8,7 @@ placeholder (:mod:`aar.plan.apply.refs`). Submission hands one phase to the hub 
 * :func:`~aar.plan.apply.compile.compile_prepare` -- branch, import, find title templates.
 * :func:`~aar.plan.apply.compile.compile_assemble` -- tracks and appends, from the prepare result.
 * :func:`~aar.plan.apply.compile.compile_finish` -- finishing ops, from prepare and assemble.
+* :func:`~aar.plan.apply.jobs.phase_result_from_job` -- a finished job's results -> an envelope.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from aar.plan.apply.compile import (
 )
 from aar.plan.apply.errors import CompileError
 from aar.plan.apply.inputs import AssembleResult, PrepareResult
+from aar.plan.apply.jobs import phase_result_from_job
 from aar.plan.apply.model import FinishIntent, SegmentPlacement, Step
 from aar.plan.apply.submit import Submission, build_submission
 
@@ -48,6 +50,7 @@ __all__ = [
     "compile_assemble",
     "compile_finish",
     "compile_prepare",
+    "phase_result_from_job",
     "plan_hash",
     "template_item_count",
     "title_track",

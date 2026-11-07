@@ -1,12 +1,13 @@
-"""The real phase-result envelopes the later phases compile from, plus the one place that builds
-them from a node job's op results and cross-checks them against the plan (round 3, R2).
+"""The real phase-result envelopes the later phases compile from, and the cross-checks that run
+on every envelope, hand-written or built from a node job (rounds 3-4).
 
 A phase is submittable only from the real results of the phases before it. Each result is an
 envelope stamped with the plan's sha256, the job id and the branch timeline id; the compiler
 refuses a stale envelope (`stale_phase_result`), a forged one (`forged_phase_result`: a pool id
-that is a path, a title id equal to a template name, a `file_path` that is not the plan's media),
-and duplicate or unknown source ids. ``phase_result_from_job`` is what the recipe runner (S13l)
-calls to turn the raw op results into a validated envelope.
+that contains a path character or equals a plan-supplied string, a `file_path` that is not the
+plan's media), and duplicate or unknown source ids. The builder that turns a node job's raw op
+results into an envelope is :func:`aar.plan.apply.jobs.phase_result_from_job` (also importable
+from here).
 """
 
 from __future__ import annotations
@@ -18,10 +19,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from aar.node.ops.build import EditPath, ImportResult, path_key
-from aar.node.ops.collab import BranchResult
+from aar.node.ops.build import EditPath, path_key
 from aar.node.ops.framework import MediaRef, TimelineIdentity, TimelineRef
-from aar.node.ops.read import MediaFindResult
 from aar.node.ops.write import AppendResult
 from aar.plan.apply.errors import CompileError
 from aar.plan.model import EditPlan, Source
@@ -75,6 +74,33 @@ def classify_media(media: str) -> Literal["import", "pool", "error"]:
 
 def import_bin(source: Source) -> tuple[str, ...]:
     return (IMPORT_ROOT, source.camera or "sources")
+
+
+def import_owners(plan: EditPlan) -> dict[str, Source]:
+    """Each distinct edit-PC file (by ``path_key``) -> the first source that uses it. That source's
+    bin gets the one ``media.import`` of the file; every source sharing it maps to the same pool
+    item (N7)."""
+    owners: dict[str, Source] = {}
+    for source in plan.sources:
+        if classify_media(source.media) == "import":
+            owners.setdefault(path_key(source.media), source)
+    return owners
+
+
+# Stable, unique step names: a job's results are mapped by these, never by position (N1).
+BRANCH_STEP = "branch"
+
+
+def find_source_step(source_id: str) -> str:
+    return f"find:source:{source_id}"
+
+
+def find_title_step(template: str) -> str:
+    return f"find:title:{template}"
+
+
+def import_step(bin_path: tuple[str, ...], batch: int) -> str:
+    return f"import:{'/'.join(bin_path)}:{batch}"
 
 
 def title_templates(plan: EditPlan) -> list[str]:
@@ -173,11 +199,23 @@ def _check_sha(result: Any, plan: EditPlan) -> None:
         )
 
 
-def _check_id_shape(unique_id: str, what: str, *, forbid: str | None = None) -> None:
-    if _looks_like_path(unique_id) or (forbid is not None and unique_id == forbid):
+_ID_FORBIDDEN = re.compile(r"[/\\:]")
+
+
+def _source_strings(source: Source) -> set[str]:
+    """Every plan-supplied string of one source; its pool id may equal none of them (N4)."""
+    return {s for s in (source.id, source.media, source.camera, source.recording_id) if s}
+
+
+def _check_id_shape(unique_id: str, what: str, *, forbid: set[str]) -> None:
+    """A real Resolve unique id never contains ``/``, ``\\`` or ``:`` and is never a string the
+    plan supplied (a media path or pool name, a source id, a template name) -- that would be a
+    name passed through as an id (R1/N4, the W01 shape)."""
+    if _ID_FORBIDDEN.search(unique_id) or unique_id in forbid:
         raise CompileError(
             "forged_phase_result",
-            f"{what} id {unique_id!r} is not a Resolve unique id (it is a path or a plan name)",
+            f"{what} id {unique_id!r} is not a Resolve unique id (it is path-shaped or a plan "
+            "string)",
             "a phase result must carry the real pool unique ids the ops returned",
             value=unique_id,
         )
@@ -186,6 +224,8 @@ def _check_id_shape(unique_id: str, what: str, *, forbid: str | None = None) -> 
 def validate_prepare(prepare: PrepareResult, plan: EditPlan) -> None:
     _check_sha(prepare, plan)
     by_id = {s.id: s for s in plan.sources}
+    templates = set(title_templates(plan))
+    plan_names = templates | ({plan.template} if plan.template else set())
     seen: set[str] = set()
     for src in prepare.sources:
         if src.source_id not in by_id:
@@ -203,8 +243,13 @@ def validate_prepare(prepare: PrepareResult, plan: EditPlan) -> None:
                 source=src.source_id,
             )
         seen.add(src.source_id)
-        _check_id_shape(src.media.unique_id, f"source {src.source_id!r} pool")
         plan_media = by_id[src.source_id].media
+        # A pool id never equals a plan string for that source, nor contains / \\ : (N4).
+        _check_id_shape(
+            src.media.unique_id,
+            f"source {src.source_id!r} pool",
+            forbid=_source_strings(by_id[src.source_id]) | plan_names,
+        )
         is_import = classify_media(plan_media) == "import"
         if is_import and path_key(src.file_path) != path_key(plan_media):
             raise CompileError(
@@ -214,7 +259,6 @@ def validate_prepare(prepare: PrepareResult, plan: EditPlan) -> None:
                 "the import result must be of the plan's media for that source",
                 source=src.source_id,
             )
-    templates = set(title_templates(plan))
     seen_t: set[str] = set()
     for title in prepare.titles:
         if title.template not in templates:
@@ -230,7 +274,7 @@ def validate_prepare(prepare: PrepareResult, plan: EditPlan) -> None:
                 "each title template resolves to exactly one pool item",
             )
         seen_t.add(title.template)
-        _check_id_shape(title.media.unique_id, f"title {title.template!r}", forbid=title.template)
+        _check_id_shape(title.media.unique_id, f"title {title.template!r}", forbid=plan_names)
 
 
 def validate_assemble(assemble: AssembleResult, plan: EditPlan) -> None:
@@ -245,125 +289,11 @@ def validate_assemble(assemble: AssembleResult, plan: EditPlan) -> None:
             )
 
 
-# -- build from a node job (R2) ----------------------------------------------------------------
+def __getattr__(name: str) -> Any:
+    # The job builder needs the compiler, which imports this module; serve it lazily (PEP 562)
+    # so ``from aar.plan.apply.inputs import phase_result_from_job`` keeps working.
+    if name == "phase_result_from_job":
+        from aar.plan.apply.jobs import phase_result_from_job
 
-
-def phase_result_from_job(
-    job_result: dict[str, Any], plan: EditPlan, phase: str
-) -> PrepareResult | AssembleResult:
-    """Wrap a node ops.sequence job's op results into a validated phase envelope.
-
-    ``job_result`` is ``{"job_id": str, "steps": [{"op": str, "name": str, "value": dict}, ...]}``
-    -- the recipe runner (S13l) passes the real op results. The envelope is stamped with the
-    plan's sha256 and the branch timeline id, then cross-checked against the plan.
-    """
-    steps = job_result.get("steps", [])
-    job_id = str(job_result.get("job_id", ""))
-    branch = _job_branch(steps)
-    sha = plan_hash(plan)
-    if phase == "prepare":
-        result: PrepareResult | AssembleResult = PrepareResult(
-            plan_sha256=sha,
-            job_id=job_id,
-            branch=branch,
-            sources=_job_sources(steps, plan),
-            titles=_job_titles(steps, plan),
-        )
-        validate_prepare(result, plan)
-    elif phase == "assemble":
-        appends = [
-            AppendResult.model_validate(s["value"])
-            for s in steps
-            if s["op"] == "timeline.append_ranges"
-        ]
-        result = AssembleResult(plan_sha256=sha, job_id=job_id, branch=branch, appends=appends)
-        validate_assemble(result, plan)
-    else:
-        raise ValueError(f"phase_result_from_job builds prepare/assemble, not {phase!r}")
-    return result
-
-
-def _job_branch(steps: list[dict[str, Any]]) -> TimelineIdentity:
-    for step in steps:
-        if step["op"] == "timeline.branch":
-            return BranchResult.model_validate(step["value"]).timeline
-    raise CompileError(
-        "phase_result_mismatch",
-        "the job result has no timeline.branch step",
-        "phase 1 must branch the template first",
-    )
-
-
-def _job_sources(steps: list[dict[str, Any]], plan: EditPlan) -> list[ImportedSource]:
-    by_pathkey = {path_key(s.media): s for s in plan.sources if classify_media(s.media) == "import"}
-    out: list[ImportedSource] = []
-    for step in steps:
-        if step["op"] == "media.import":
-            for im in ImportResult.model_validate(step["value"]).media:
-                src = by_pathkey.get(path_key(im.file_path)) or _by_requested(by_pathkey, im.path)
-                if src is not None:
-                    out.append(
-                        ImportedSource(source_id=src.id, media=im.media, file_path=im.file_path)
-                    )
-    pool_sources = [s for s in plan.sources if classify_media(s.media) == "pool"]
-    finds = {s["name"]: s for s in steps if step_is_find_source(s)}
-    for index, src in enumerate(pool_sources):
-        found = finds.get(f"find-source:{index}")
-        if found is None:
-            continue
-        media = MediaFindResult.model_validate(found["value"]).media
-        if len(media) != 1:
-            code = "source_not_found" if not media else "source_ambiguous"
-            raise CompileError(
-                code,
-                f"media.find for source {src.id!r} ({src.media!r}) returned {len(media)} items",
-                "a pool-name source must name exactly one media-pool item",
-                source=src.id,
-            )
-        info = media[0]
-        out.append(
-            ImportedSource(
-                source_id=src.id,
-                media=MediaRef(unique_id=info.media_id, bin_path=info.bin_path),
-                file_path=info.file_path or src.media,
-            )
-        )
-    return out
-
-
-def _by_requested(by_pathkey: dict[str, Source], path: str) -> Source | None:
-    return by_pathkey.get(path_key(path))
-
-
-def step_is_find_source(step: dict[str, Any]) -> bool:
-    return step["op"] == "media.find" and str(step.get("name", "")).startswith("find-source:")
-
-
-def _job_titles(steps: list[dict[str, Any]], plan: EditPlan) -> list[FoundTitle]:
-    templates = title_templates(plan)
-    finds = {
-        s["name"]: s
-        for s in steps
-        if s["op"] == "media.find" and str(s.get("name", "")).startswith("find-title:")
-    }
-    out: list[FoundTitle] = []
-    for index, name in enumerate(templates):
-        found = finds.get(f"find-title:{index}")
-        if found is None:
-            continue
-        media = MediaFindResult.model_validate(found["value"]).media
-        if len(media) != 1:
-            code = "title_template_missing" if not media else "title_template_ambiguous"
-            raise CompileError(
-                code,
-                f"media.find for title template {name!r} returned {len(media)} items",
-                "a title template must name exactly one media-pool item",
-                template=name,
-            )
-        info = media[0]
-        out.append(
-            FoundTitle(
-                template=name, media=MediaRef(unique_id=info.media_id, bin_path=info.bin_path)
-            )
-        )
-    return out
+        return phase_result_from_job
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

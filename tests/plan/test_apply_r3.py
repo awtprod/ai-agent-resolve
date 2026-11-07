@@ -1,6 +1,7 @@
 """Round-3 pins: media classification (R1), phase-result cross-checks (R2), the F1 gate
 (R3: W15/W35/W37/W38/W36/W43), refuse-not-drop (R4), the idempotency/batch fixes (R5), unknown op
-(R6), unknown-handle refusal (R7), titles (R8), and media.find arity (R9)."""
+(R6), unknown-handle refusal (R7) and titles (R8). The job builder (R9 arity, N1-N3, N5, N7) is
+pinned in test_apply_jobs.py; the round-4 compile-path checks (N4, N6, N8) in test_apply_r4.py."""
 
 from __future__ import annotations
 
@@ -8,11 +9,8 @@ import pytest
 from apply_builders import longform, longform_data, plan, seg, source
 from apply_support import synth_assemble, synth_prepare, template_describe
 
-from aar.node.ops.collab import BranchResult
-from aar.node.ops.framework import TimelineIdentity
 from aar.plan.apply import (
     CompileError,
-    PrepareResult,
     build_submission,
     compile_assemble,
     compile_finish,
@@ -20,7 +18,7 @@ from aar.plan.apply import (
     plan_hash,
     title_track,
 )
-from aar.plan.apply.inputs import classify_media, phase_result_from_job
+from aar.plan.apply.inputs import classify_media
 from aar.plan.apply.refs import find_unresolved
 from aar.plan.model import EditPlan
 
@@ -72,9 +70,12 @@ def test_pool_name_source_gets_a_find_step_in_prepare() -> None:
         segments=[seg(src="a", a=0, b=24), seg(src="b", a=24, b=48)],
     )
     comp = compile_prepare(p, template=template_describe(5, name=p.template))
-    finds = [s for s in comp.steps if s.op == "media.find" and s.name.startswith("find-source")]
+    finds = [s for s in comp.steps if s.name == "find:source:b"]
     assert len(finds) == 1
     assert finds[0].params["name"] == "B001 multicam"
+    # N5: recursive over the WHOLE pool, not scoped to a camera bin.
+    assert finds[0].params["bin_path"] == []
+    assert finds[0].params["recursive"] is True
 
 
 def test_w01_source_pool_id_only_from_prepare() -> None:
@@ -193,23 +194,6 @@ def test_finish_prepare_assemble_branch_mismatch() -> None:
     prep = synth_prepare(LF)
     asm = synth_assemble(LF, synth_prepare(LF, unique_id="tl-OTHER"))
     assert _finish_code(LF, prepare=prep, assemble=asm) == "phase_result_mismatch"
-
-
-def test_phase_result_from_job_builds_and_validates_prepare() -> None:
-    branch = BranchResult(
-        source=TimelineIdentity(name="CCN Longform Template", unique_id="tpl"),
-        timeline=TimelineIdentity(name="branch", unique_id="tl-b"),
-        agent_id="a",
-        version=1,
-        created=True,
-        timeline_count=1,
-        notes=[],
-    )
-    steps = [{"op": "timeline.branch", "name": "branch", "value": branch.model_dump(mode="json")}]
-    result = phase_result_from_job({"job_id": "j1", "steps": steps}, LF, "prepare")
-    assert isinstance(result, PrepareResult)
-    assert result.plan_sha256 == plan_hash(LF)
-    assert result.branch.unique_id == "tl-b"
 
 
 # -- R3: the F1 gate (W15, W35, W37, W38, W36, W43) --------------------------------------------
@@ -332,43 +316,6 @@ def test_w29_title_missing_from_prepare_is_unresolved() -> None:
     assert find_unresolved([s.params for s in comp.steps if s.op == "title.place"]), (
         "a title missing from prepare must be Unresolved, not dropped"
     )
-
-
-# -- R9: media.find arity ----------------------------------------------------------------------
-
-
-def _find_job(title_media: list) -> list:
-    from aar.node.ops.read import MediaFindResult
-
-    branch = BranchResult(
-        source=TimelineIdentity(name="CCN Longform Template", unique_id="tpl"),
-        timeline=TimelineIdentity(name="b", unique_id="tl-b"),
-        agent_id="a",
-        version=1,
-        created=True,
-        timeline_count=1,
-        notes=[],
-    )
-    find = MediaFindResult(
-        bin_path=(), recursive=True, scanned=len(title_media), truncated=False, media=title_media
-    )
-    return [
-        {"op": "timeline.branch", "name": "branch", "value": branch.model_dump(mode="json")},
-        {"op": "media.find", "name": "find-title:0", "value": find.model_dump(mode="json")},
-    ]
-
-
-def test_title_find_zero_is_missing() -> None:
-    p = plan(
-        sources=[source("a", media="E:/X/a.mov")],
-        segments=[seg(src="a", a=0, b=24)],
-        titles=[
-            {"kind": "title", "lines": ["x"], "record_in": 0, "record_out": 10, "template": "T"}
-        ],
-    )
-    with pytest.raises(CompileError) as ei:
-        phase_result_from_job({"job_id": "j", "steps": _find_job([])}, p, "prepare")
-    assert ei.value.code == "title_template_missing"
 
 
 # -- validator-mutant kills (W07, W20, W23, W28, W31, W39, W40) --------------------------------
@@ -515,3 +462,20 @@ def test_w40_idempotency_titles_use_the_right_track() -> None:
     describe = _describe_one(48, 0, 1, "m", index=title_track(LF))
     status = idempotency(LF, assemble, finish, describe)
     assert status["titles"]["present"] >= 1
+
+
+def test_x18_idempotency_keys_items_by_track_type() -> None:
+    # R5: an A1 audio item with segment 0's record_in and source range must not mark the V1
+    # append present (the mutant keys every track as video).
+    from aar.plan.apply.render import idempotency
+
+    p = plan(segments=[seg(src="a", a=0, b=24)])
+    prep = synth_prepare(p)
+    assemble = compile_assemble(p, prepare=prep)
+    finish = compile_finish(p, prepare=prep, assemble=synth_assemble(p, prep))
+    audio_only = _describe_one(0, 0, 24, "pool-a", track_type="audio", index=1)
+    status = idempotency(p, assemble, finish, audio_only)
+    assert status["appends"]["present"] == 0
+    assert status["appends"]["missing"] == ["V1 @ 0 (segment 0)"]
+    video = _describe_one(0, 0, 24, "pool-a", track_type="video", index=1)
+    assert idempotency(p, assemble, finish, video)["appends"]["present"] == 1
