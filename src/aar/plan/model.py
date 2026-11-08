@@ -291,9 +291,11 @@ class Source(_Model):
     )
     frame_size: FrameSize | None = Field(
         default=None,
-        description="Version 2. The media's picture size [width, height] in pixels (or any "
-        "size with its display aspect). Reframe x/y are shares of it; the FCPXML export needs "
-        "it to frame a clip whose aspect differs from the timeline's.",
+        description="Version 2. The media's DISPLAY size [width, height] in pixels: the size "
+        "after pixel aspect ratio and rotation, as the picture is shown, not the stored "
+        "(coded) pixel size (or any size with the same display aspect). Reframe x/y are "
+        "shares of it; the FCPXML export needs it to frame a clip whose aspect differs from "
+        "the timeline's.",
     )
 
 

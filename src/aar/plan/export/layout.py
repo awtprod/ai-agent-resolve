@@ -407,6 +407,28 @@ class _Builder:
         for source in self.plan.sources:
             if source.id in used and source.id not in self.layout.media:
                 self.layout.media[source.id] = media_ref(source, self.media_map)
+        self._check_shared_durations()
+
+    def _check_shared_durations(self) -> None:
+        """Sources that share one media file may not disagree about its length (one asset)."""
+        first: dict[str, tuple[str, int]] = {}
+        for source in self.plan.sources:
+            ref = self.layout.media.get(source.id)
+            if ref is None or source.duration is None:
+                continue
+            seen = first.setdefault(ref.src, (source.id, source.duration))
+            if seen[1] != source.duration:
+                raise ExportError(
+                    "conflicting_source_durations",
+                    f"sources {seen[0]!r} and {source.id!r} are the same media file "
+                    f"({ref.windows_path}) but give it different durations "
+                    f"({seen[1]} and {source.duration} frames)",
+                    "give both sources the same duration, or leave one unset, or merge them "
+                    "into one source",
+                    sources=[seen[0], source.id],
+                    media=ref.windows_path,
+                    durations=[seen[1], source.duration],
+                )
 
     def _track_gain(self, track: int) -> float:
         tracks = self.plan.audio_tracks

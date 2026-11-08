@@ -17,8 +17,10 @@ from aar.cli import main
 from aar.plan.apply import compile_finish
 from aar.plan.apply.errors import CompileError
 from aar.plan.export import ExportError, build_layout, media_map_from_mapping, verify_plan_fcpxml
+from aar.plan.export.fcpxml import format_name
 from aar.plan.export.media import media_ref
-from aar.plan.model import EditPlan, Source
+from aar.plan.export.timebase import SUPPORTED_RATES, Timebase
+from aar.plan.model import EditPlan, Fps, Source
 
 SIZE = [1920, 1080]
 
@@ -470,3 +472,117 @@ def test_a_media_map_root_is_a_directory_not_media(media: str) -> None:
         media_ref(Source(id="s", media="/srv/media/a.mov"), media_map).windows_path
         == "E:\\Media\\a.mov"
     )
+
+
+@pytest.mark.parametrize("host", ["nas:445", "nas:", "[::1]", "[fe80::1]", "[::1]:445", "::1"])
+def test_a_file_url_host_with_a_port_or_ipv6_literal_is_refused(host: str) -> None:
+    """N4: a UNC host is a plain name; `nas:445` and `[::1]` would become `\\\\nas:445\\...`."""
+    with pytest.raises(ExportError) as caught:
+        media_ref(Source(id="s", media=f"file://{host}/share/x.mov"))
+    assert caught.value.code == "media_not_on_edit_pc"
+    assert caught.value.details["reason"] == "host-not-unc"
+
+
+def test_a_plain_unc_host_is_still_accepted() -> None:
+    ref = media_ref(Source(id="s", media="file://nas/share/x.mov"))
+    assert ref.windows_path == "\\\\nas\\share\\x.mov"
+
+
+# -- N1: two sources on one media file must agree about its length -----------------------------
+
+
+def _shared_file_plan(first: int | None, second: int | None) -> EditPlan:
+    sources = []
+    for sid, duration in (("s1", first), ("s2", second)):
+        src = source(sid, media="E:/X/shared.mov", frame_size=SIZE)
+        src.pop("duration")
+        if duration is not None:
+            src["duration"] = duration
+        sources.append(src)
+    return _plan(sources=sources, segments=[seg(src="s1", a=0, b=48), seg(src="s2", a=100, b=148)])
+
+
+def test_sources_on_one_file_with_different_durations_are_refused_up_front() -> None:
+    error = _refused(_shared_file_plan(1000, 500), "conflicting_source_durations")
+    assert error.details["sources"] == ["s1", "s2"]
+    assert error.details["media"] == "E:/X/shared.mov"
+    assert error.details["durations"] == [1000, 500]
+    assert "s1" in error.message and "s2" in error.message and "shared.mov" in error.message
+    assert "exporter bug" not in error.as_dict()["fix_hint"]
+
+
+@pytest.mark.parametrize(
+    ("first", "second"), [(1000, 1000), (1000, None), (None, 500), (None, None)]
+)
+def test_sources_on_one_file_with_equal_or_unset_durations_export(
+    first: int | None, second: int | None
+) -> None:
+    assert export(_shared_file_plan(first, second)).report["self_check"]["ok"]
+
+
+# -- N2: the surviving mutants X10, X19, X22 ---------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["0", "2", "true", ""])
+def test_verify_rejects_a_has_video_value_the_writer_never_emits(value: str) -> None:
+    """X10: the allowlist for an asset's hasVideo is exactly {"1"}."""
+    problems = _problems(_tamper('hasVideo="1"', f'hasVideo="{value}"'))
+    assert any("hasVideo" in p for p in problems), problems
+
+
+_NAMED = {(1280, 720): "720p", (1920, 1080): "1080p", (3840, 2160): "2160p"}
+_NAMED_RATES = {"2398", "24", "25", "2997", "30", "50", "5994", "60"}
+
+
+@pytest.mark.parametrize("rate", sorted(SUPPORTED_RATES))
+@pytest.mark.parametrize("size", [*_NAMED, (1080, 1920), (1000, 1000)])
+def test_format_names_are_final_cut_pros_and_omitted_when_unknown(rate: Any, size: Any) -> None:
+    """X19 (F12): only the Final Cut Pro standard names; 47.95/48, vertical and odd sizes get
+    none."""
+    suffix = SUPPORTED_RATES[rate]
+    timebase = Timebase.of(Fps(num=rate.numerator, den=rate.denominator))
+    want = (
+        f"FFVideoFormat{_NAMED[size]}{suffix}"
+        if size in _NAMED and suffix in _NAMED_RATES
+        else None
+    )
+    assert format_name(timebase, *size) == want
+
+
+def test_format_names_pin_the_literal_values() -> None:
+    assert (
+        format_name(Timebase.of(Fps(num=24000, den=1001)), 1920, 1080) == "FFVideoFormat1080p2398"
+    )
+    assert format_name(Timebase.of(Fps(num=60, den=1)), 3840, 2160) == "FFVideoFormat2160p60"
+    assert format_name(Timebase.of(Fps(num=48000, den=1001)), 1920, 1080) is None
+    assert format_name(Timebase.of(Fps(num=48, den=1)), 1920, 1080) is None
+
+
+@pytest.mark.parametrize("fps", [{"num": 48, "den": 1}, {"num": 48000, "den": 1001}])
+def test_a_48_class_timeline_is_written_without_a_format_name(fps: dict[str, int]) -> None:
+    plan = _plan(
+        sources=[source("a", duration=1000, frame_size=SIZE)],
+        segments=[seg(a=0, b=48)],
+        fps=fps,
+    )
+    text = export(plan).fcpxml
+    format_tags = re.findall(r"<format [^>]*>", text)
+    assert format_tags and all(" name=" not in tag for tag in format_tags), format_tags
+
+
+def test_a_split_fade_longer_than_the_picture_but_inside_the_sound_is_allowed() -> None:
+    """X22: the 20-frame middle clip plays 6 + 20 + 6 frames of sound between two 12-frame
+    crossfades, so its 12 + 12 frames of fades fit the sound but not the picture."""
+    plan = _plan(
+        sources=[source("a", duration=1000, frame_size=SIZE)],
+        segments=[seg(a=100, b=148), seg(a=300, b=320), seg(a=500, b=548)],
+        transitions=[
+            {"after": 0, "audio": {"frames": 12}},
+            {"after": 1, "audio": {"frames": 12}},
+        ],
+    )
+    result = export(plan)
+    assert result.report["self_check"]["ok"]
+    middle = _spine(result.fcpxml)[1]
+    assert middle.find("adjust-volume/param/fadeIn").get("duration") == "12012/24000s"  # type: ignore[union-attr]
+    assert middle.find("adjust-volume/param/fadeOut").get("duration") == "12012/24000s"  # type: ignore[union-attr]

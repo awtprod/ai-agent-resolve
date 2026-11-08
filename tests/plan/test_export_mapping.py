@@ -58,6 +58,7 @@ def test_export_codes_are_stable() -> None:
             "zero_length_segment",
             "media_not_on_edit_pc",
             "source_size_required",
+            "conflicting_source_durations",
             "pool_source_not_exportable",
             "bad_media_map",
             "outro_audio_track_missing",

@@ -11,9 +11,10 @@ PC can open, or the export is refused.
 * A media-pool name (a multicam clip) cannot be referenced by FCPXML; it is refused as
   ``pool_source_not_exportable``.
 * Refused as ``media_not_on_edit_pc``, each with a ``reason`` in its details: a ``file:`` URL with
-  a drive letter in the host position (``file://E:/...``), with userinfo, or with an encoded
-  separator or any ``%`` in the host; a media path that is a map root (a directory, not a file);
-  a name ending in a space or a dot (Windows cannot open it); a relative name (a producer stub's
+  a drive letter in the host position (``file://E:/...``), with userinfo, with a port or an IPv6
+  literal in the host (``host-not-unc``), or with an encoded separator or any ``%`` in the host;
+  a media path that is a map root (a directory, not a file); a name ending in a space or a dot
+  (Windows cannot open it); a relative name (a producer stub's
   media must be absolute edit-PC paths, or hub paths with ``--media-map``).
 
 Nothing here touches the network or a file other than the media map itself.
@@ -236,6 +237,14 @@ def _from_file_url(source: Source, media_map: MediaMap | None) -> MediaRef:
             "is a file: URL with a drive letter in the host position (file://E:/...)",
             "write a drive path as file:///E:/... (three slashes)",
             reason="drive-in-host",
+        )
+    if "[" in host or "]" in host or ":" in host:
+        raise _not_on_edit_pc(
+            source,
+            "is a file: URL whose host has a port or is an IPv6 literal (a UNC host is a plain "
+            "name)",
+            "give a plain host name, file://host/share/...",
+            reason="host-not-unc",
         )
     if "%" in host:
         raise _not_on_edit_pc(
