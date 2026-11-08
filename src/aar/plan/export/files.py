@@ -24,12 +24,14 @@ failure, which nothing in the rollback can mask. An interrupt (``KeyboardInterru
 re-raised as itself, with the states as notes.
 
 aar exports to one destination are serialized: each holds an exclusive lock on
-``<fcpxml>.aar-lock`` beside it (the node job store's portable helper: ``fcntl.flock``, or
-``msvcrt.locking`` on Windows) for the whole write, temporary files, backups, both placements
-and any rollback. A second export to the same destination fails at once with ``output_locked``
-and touches nothing. The lock file stays after release (deleting it would reopen the race it
-closes). The limit: a process outside aar that replaces the files during an export is not
-serialized; the identity check above is the best effort against it, and no more.
+``<name>.aar-lock`` beside each of its destinations, the FCPXML's and the report's (``x.fcpxml``
+and ``x.xml`` share ``x.report.json``), taken in sorted order, with the node job store's portable
+helper (``fcntl.flock``, or ``msvcrt.locking`` on Windows), for the whole write: temporary files,
+backups, both placements and any rollback. A second export to the same destination fails at once
+with ``output_locked`` and touches nothing. The lock files stay after release (deleting one
+would reopen the race it closes). The limit: a process outside aar that replaces the files
+during an export is not serialized; the identity check above is the best effort against it, and
+no more.
 """
 
 from __future__ import annotations
@@ -44,7 +46,7 @@ from aar.drp.modify.write import _backup, _place, _temp
 from aar.plan.export.errors import ExportError
 
 MODE = 0o644
-#: The lock beside the first destination (the FCPXML) that serializes aar exports to it.
+#: The lock beside each destination that serializes aar exports to it.
 LOCK_SUFFIX = ".aar-lock"
 
 
@@ -112,26 +114,29 @@ def _refuse_existing(dests: list[Path], overwrite: bool) -> None:
 
 
 def write_pair(files: list[tuple[Path, bytes]], *, overwrite: bool) -> None:
-    """Write every ``(destination, bytes)`` or none of them, holding the first destination's
-    export lock throughout (see the module docstring)."""
+    """Write every ``(destination, bytes)`` or none of them, holding every destination's export
+    lock throughout (see the module docstring)."""
     api = _lock_api()
-    first = files[0][0]
-    lock = lock_path(first)
+    held: list[int] = []
     try:
-        fd = api.acquire_file_lock(str(lock))
-    except api.FileLockUnavailable:
-        raise ExportError(
-            "output_locked",
-            f"another aar export is writing {str(first)!r} (it holds {str(lock)!r}; or the "
-            "file system has no file locks)",
-            "wait for it to finish, or choose another --out",
-            path=str(first),
-            lock=str(lock),
-        ) from None
-    try:
+        # Every destination, in one fixed order: x.fcpxml and x.xml both write x.report.json,
+        # so two such exports meet on that lock (fix-check Q1), and never deadlock.
+        for lock in sorted({lock_path(dest) for dest, _ in files}):
+            try:
+                held.append(api.acquire_file_lock(str(lock)))
+            except api.FileLockUnavailable:
+                raise ExportError(
+                    "output_locked",
+                    f"another aar export holds the lock {str(lock)!r} (or the file system has no "
+                    "file locks)",
+                    "wait for the other export to finish, or choose another --out",
+                    path=str(lock.with_name(lock.name[: -len(LOCK_SUFFIX)])),
+                    lock=str(lock),
+                ) from None
         _write_pair_locked(files, overwrite)
     finally:
-        api.release_file_lock(fd)
+        for fd in reversed(held):
+            api.release_file_lock(fd)
 
 
 def _write_pair_locked(files: list[tuple[Path, bytes]], overwrite: bool) -> None:

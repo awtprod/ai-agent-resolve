@@ -1,5 +1,6 @@
-"""aar exports to one destination are serialized by an exclusive lock on ``<fcpxml>.aar-lock``
-(the node job store's portable helper), held for the whole pair write; a second export fails at
+"""aar exports to one destination are serialized by exclusive locks on ``<name>.aar-lock`` beside
+each destination, the FCPXML's and the report's, taken in sorted order (the node job store's
+portable helper), held for the whole pair write; a second export fails at
 once with ``output_locked`` and touches nothing. Prism (PR #13) found the third check-then-act
 race in the rollback; a lock, not more checks, closes it for aar writers."""
 
@@ -40,7 +41,13 @@ def _listing(folder: Path) -> dict[str, bytes]:
 class _Held:
     """An export (in a thread) held inside its first placement until released."""
 
-    def __init__(self, folder: Path, monkeypatch: pytest.MonkeyPatch, tag: str = "first") -> None:
+    def __init__(
+        self,
+        folder: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tag: str = "first",
+        pair: list[tuple[Path, bytes]] | None = None,
+    ) -> None:
         self.inside = threading.Event()
         self.go = threading.Event()
         self.error: BaseException | None = None
@@ -57,7 +64,7 @@ class _Held:
 
         def run() -> None:
             try:
-                write_pair(_pair(folder, tag), overwrite=True)
+                write_pair(pair or _pair(folder, tag), overwrite=True)
             except BaseException as exc:  # reported to the test
                 self.error = exc
 
@@ -87,7 +94,32 @@ def test_two_concurrent_exports_one_wins_the_other_is_locked_out(
     after = _listing(tmp_path)
     assert after.pop("cut.fcpxml") == b"<first fcpxml/>"  # the winner's pair, intact
     assert after.pop("cut.report.json") == b"{first}"
-    assert after == {"cut.fcpxml.aar-lock": b""}  # the lock stays; no temporary is left
+    # The locks stay; no temporary is left.
+    assert after == {"cut.fcpxml.aar-lock": b"", "cut.report.json.aar-lock": b""}
+
+
+def test_exports_sharing_only_the_report_name_are_serialized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fix-check Q1: x.fcpxml and x.xml both write x.report.json. The lock covers the report
+    too, so the second export is locked out and the winner's FCPXML keeps its own report."""
+    report = tmp_path / "x.report.json"
+    first = [(tmp_path / "x.fcpxml", b"<from fcpxml/>"), (report, b"{from fcpxml}")]
+    second = [(tmp_path / "x.xml", b"<from xml/>"), (report, b"{from xml}")]
+    held = _Held(tmp_path, monkeypatch, pair=first)
+    before = _listing(tmp_path)
+    with pytest.raises(ExportError) as caught:
+        write_pair(second, overwrite=True)
+    assert caught.value.code == "output_locked"
+    assert caught.value.details["lock"] == str(tmp_path / "x.report.json.aar-lock")
+    assert _listing(tmp_path) == before  # touched nothing (x.xml.aar-lock is free again)
+    held.finish()
+    assert (tmp_path / "x.fcpxml").read_bytes() == b"<from fcpxml/>"
+    assert report.read_bytes() == b"{from fcpxml}"
+    assert not (tmp_path / "x.xml").exists()
+    # Afterwards the other one runs normally.
+    write_pair(second, overwrite=True)
+    assert report.read_bytes() == b"{from xml}"
 
 
 def test_the_lock_is_released_after_success_and_after_failure(
@@ -161,7 +193,9 @@ def test_the_cli_exits_2_with_output_locked(
     try:
         argv = ["plan", "export", str(GOLDEN_PLANS["ccn_longform_v2"]), "--out", str(out)]
         assert main(argv) == 2
-        assert "another aar export is writing" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "another aar export holds the lock" in err
+        assert "or the file system has no file locks" in err
         assert sorted(p.name for p in tmp_path.iterdir()) == ["cut.fcpxml.aar-lock"]
     finally:
         file_lock.release_file_lock(fd)
@@ -215,6 +249,7 @@ def test_the_windows_backend_serializes_exports_too(
     assert (tmp_path / "cut.fcpxml").read_bytes() == b"<first fcpxml/>"
     # The Windows helper locks a real byte of the lock file, and unlocks it on release.
     assert (tmp_path / "cut.fcpxml.aar-lock").read_bytes() == b"\0"
-    assert calls == [(2, 1), (2, 1), (0, 1)]  # first takes it, second is refused, first frees
+    # The first takes both locks, the second is refused the first lock, the first frees both.
+    assert calls == [(2, 1), (2, 1), (2, 1), (0, 1), (0, 1)]
     write_pair(_pair(tmp_path, "third"), overwrite=True)  # free again
-    assert calls[-2:] == [(2, 1), (0, 1)]
+    assert calls[-4:] == [(2, 1), (2, 1), (0, 1), (0, 1)]

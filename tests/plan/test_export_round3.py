@@ -179,7 +179,7 @@ def _pair(folder: Path) -> list[tuple[Path, bytes]]:
 def _names(folder: Path) -> list[str]:
     """The folder's files but the export lock, which stays by design (deleting it would reopen
     the race it closes)."""
-    return sorted(p.name for p in folder.iterdir() if p.name != "cut.fcpxml.aar-lock")
+    return sorted(p.name for p in folder.iterdir() if not p.name.endswith(".aar-lock"))
 
 
 def _old(folder: Path) -> None:
