@@ -26,8 +26,9 @@ import statistics
 from collections.abc import Sequence
 
 from aar.plan.model import ReframeKey, Source
-from aar.plan.produce.timeline import Piece, is_cut, same_camera
+from aar.plan.produce.timeline import Piece, is_cut
 from aar.plan.profile import FramingPreset, SteadySettings
+from aar.plan.rules.cuts import same_camera
 
 
 def framing_levels(pieces: Sequence[Piece], sources: dict[str, Source], levels: int) -> list[int]:

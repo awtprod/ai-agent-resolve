@@ -502,9 +502,11 @@ def test_framing_steps_on_same_camera_cuts_and_resets_elsewhere() -> None:
         Piece("b", 150, 200, 0),  # another camera -> 0
         Piece("b", 250, 300, 1),  # cut -> 1
         Piece("a", 300, 350, 1),  # unbroken switch -> 0
+        Piece("a", 360, 400, 1),  # cut -> 1
+        Piece("b", 420, 460, 1),  # cut to another camera -> 0
     ]
-    assert framing_levels(pieces, sources, 3) == [0, 1, 2, 0, 1, 0]
-    assert framing_levels(pieces, sources, 2) == [0, 1, 0, 0, 1, 0]
+    assert framing_levels(pieces, sources, 3) == [0, 1, 2, 0, 1, 0, 1, 0]
+    assert framing_levels(pieces, sources, 2) == [0, 1, 0, 0, 1, 0, 1, 0]
 
 
 def test_gaussian_and_box_keep_a_constant() -> None:
@@ -539,6 +541,8 @@ def test_clamp_and_slew_limit() -> None:
     assert clamp_inside([0.0, 0.5, 1.0], 0.4) == [0.2, 0.5, 0.8]
     assert clamp_inside([0.1, 0.9], 1.2) == [0.5, 0.5]
     out = slew_limit([0.0, 1.0, 1.0, 0.0, 0.0], 0.1)
+    # forward first, so the path starts where the camera is and never moves before the face
+    assert out == pytest.approx([0.0, 0.1, 0.2, 0.1, 0.0])
     assert all(abs(b - a) <= 0.1 + 1e-12 for a, b in itertools.pairwise(out))
 
 
@@ -569,3 +573,19 @@ def test_keys_cover_the_segment_and_never_whip() -> None:
     for a, b in itertools.pairwise(keys):
         assert abs(b.x - a.x) / ((b.time - a.time) / 25) <= 0.3 * 0.9 + 1e-3
         assert 0.16 - 1e-4 <= a.x <= 0.84 + 1e-4
+
+
+def test_the_latest_laugh_in_the_final_keep_range_wins() -> None:
+    out, end, _ = ending([Piece("a", 150, 400, 1)], [(8.0, 9.0, 1.0), (10.0, 11.0, 1.0)])
+    assert out[-1].rec_out == 255 and end is not None and end.onset_s == 10.0
+
+
+@pytest.mark.parametrize(
+    ("at", "inside"),
+    [(1.005, False), (1.009, False), (1.011, True), (1.989, True), (1.991, False)],
+)
+def test_the_splice_test_allows_the_word_tolerance_at_each_edge(at: float, inside: bool) -> None:
+    from aar.plan.rules.speech import word_at
+
+    word = Word(text="w", start_s=1.0, end_s=2.0)
+    assert (word_at([word], at, 0.01) is not None) is inside

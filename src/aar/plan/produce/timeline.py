@@ -19,7 +19,7 @@ from dataclasses import dataclass, replace
 from fractions import Fraction
 
 from aar.plan.inputs import Word
-from aar.plan.model import EditPlan, Fps, Source
+from aar.plan.model import EditPlan, Fps
 from aar.plan.produce.errors import InvariantError, ProduceInputError
 from aar.plan.produce.inputs import CameraSchedule, KeepList
 from aar.plan.rules.speech import word_at
@@ -162,11 +162,6 @@ def keep_frames(
                 hint="lengthen it, join it to a neighbouring range, or drop it",
             )
     return out, snaps
-
-
-def same_camera(a: Source, b: Source) -> bool:
-    """The ``no-same-camera-jump`` test: one source, or one camera label."""
-    return a.id == b.id or (a.camera is not None and a.camera == b.camera)
 
 
 def resolve_camera(plan: EditPlan, name: str) -> str:

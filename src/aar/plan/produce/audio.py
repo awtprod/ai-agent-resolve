@@ -86,11 +86,12 @@ def quiet_spans(
     rate: int,
     chunk_s: float,
 ) -> list[tuple[float, float]]:
-    """Quiet runs of the source between file times ``start_s`` and ``end_s``, in file seconds."""
+    """Quiet runs of the source between file times ``start_s`` and ``end_s``, in file seconds,
+    chunk by chunk: a run that crosses a chunk boundary comes back as two touching runs, which
+    ``pause_runs`` joins."""
     runs: list[tuple[float, float]] = []
-    join = 2.0 / rate
     t = max(0.0, start_s)
-    while t < end_s - join:
+    while t < end_s - 2.0 / rate:
         length = min(chunk_s, end_s - t)
         try:
             pcm = read_pcm(
@@ -103,11 +104,8 @@ def quiet_spans(
             )
         except MediaError as exc:
             raise _media_failure(source_id, exc) from None
-        for run in quiet_runs(pcm, threshold_dbfs=threshold_db, window_s=window_s).runs:
-            if runs and run.start_s <= runs[-1][1] + join:
-                runs[-1] = (runs[-1][0], max(runs[-1][1], run.end_s))
-            else:
-                runs.append((run.start_s, run.end_s))
+        scan = quiet_runs(pcm, threshold_dbfs=threshold_db, window_s=window_s)
+        runs += [(run.start_s, run.end_s) for run in scan.runs]
         t += length
     return runs
 
@@ -124,7 +122,7 @@ def pause_runs(
     chunk_s: float,
 ) -> list[tuple[float, float]]:
     """Quiet runs over consecutive ``parts`` (each scanned in its own source's audio), in
-    recording seconds; runs that meet at a camera change are joined."""
+    recording seconds; runs that meet at a scan chunk's edge or a camera change are joined."""
     runs: list[tuple[float, float]] = []
     join = 2.0 / rate
     for part in parts:
