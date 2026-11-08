@@ -1,0 +1,52 @@
+{
+  "version": 2,
+  "project": "CCN",
+  "timeline": "Late Set 2997",
+  "template": "CCN Longform Template",
+  "kind": "longform",
+  "fps": "30000/1001",
+  "resolution": {"width": 1920, "height": 1080},
+  "profile": "ccn",
+  "sources": [
+    {"id": "camA", "media": "E:/Show/Late/A.mov", "camera": "A", "recording_id": "rec1",
+     "shot_size": "close", "duration": 5000, "frame_size": [1920, 1080]},
+    {"id": "camB", "media": "E:/Show/Late/B.mov", "camera": "B", "recording_id": "rec1",
+     "shot_size": "wide", "duration": 5000, "frame_size": [1920, 1080],
+     "color": {"input_color_space": "Rec.709 Gamma 2.4", "lut": "Show 709"}},
+    {"id": "broll", "media": "\\\\nas\\media\\late\\crowd.mov", "camera": "C", "duration": 600,
+     "frame_size": [3840, 2160]},
+    {"id": "outro", "media": "file:///E:/Show/Assets/Outro%202997.mov", "camera": "X",
+     "duration": 150}
+  ],
+  "segments": [
+    {"track": 1, "source": "camA", "src_in": 0, "src_out": 300},
+    {"track": 1, "source": "camB", "src_in": 300, "src_out": 600},
+    {"track": 1, "source": "camA", "src_in": 900, "src_out": 1200,
+     "transform": {"zoom": 1.25, "pan": -40, "tilt": 12.5, "rotation_deg": 1.5}},
+    {"track": 2, "source": "broll", "src_in": 100, "src_out": 250, "record_in": 400,
+     "gain_db": -3.0, "transform": {"zoom": 1.0, "flip_h": true}}
+  ],
+  "transitions": [
+    {"after": 1, "video": "cut", "video_frames": 0,
+     "audio": {"type": "Cross Fade 0 dB", "frames": 10}}
+  ],
+  "titles": [
+    {"kind": "lower-third", "lines": ["Sam Rivera", "Headliner", "Charlotte, NC"],
+     "record_in": 30, "record_out": 150, "template": "CCN Lower Third"}
+  ],
+  "markers": [
+    {"record": 0, "name": "Open", "color": "Green"},
+    {"record": 600, "name": "Time jump", "note": "cut close to wide", "duration": 30}
+  ],
+  "audio_tracks": [
+    {"name": "A1", "gain_db": 0.0},
+    {"name": "A2", "gain_db": -2.0}
+  ],
+  "head": {"video": "dissolve", "video_frames": 15, "audio_fade_frames": 12},
+  "outro": {
+    "source": "outro", "src_in": 0, "src_out": 150, "track": 1, "audio_track": "A2",
+    "transition": {"video": "dissolve", "video_frames": 20},
+    "sting": {"lines": ["Late Set"], "start": 10, "frames": 60, "template": "CCN Sting"}
+  },
+  "end_fade_frames": 3
+}

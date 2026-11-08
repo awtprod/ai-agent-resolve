@@ -81,6 +81,11 @@ name = "B"
 zoom = 1.22               # the house limit for a shorts punch-in
 y = 0.45
 
+# FCPXML timeline export (`aar plan export`): the timecode the exported timeline starts at,
+# non-drop HH:MM:SS:FF at the plan's nominal rate.
+[export]
+timeline_start = "01:00:00:00"
+
 # Segments from one recording play in source-time order: no reordering, no imported cold opens.
 [rules.chronological]
 tolerance_frames = 0      # how far a segment may start before the previous one ended

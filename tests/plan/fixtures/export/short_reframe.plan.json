@@ -1,0 +1,43 @@
+{
+  "version": 2,
+  "project": "CCN",
+  "timeline": "Ep1 Short 02 (reframe)",
+  "template": "CCN Short Template",
+  "kind": "short",
+  "fps": {"num": 24000, "den": 1001},
+  "resolution": {"width": 1080, "height": 1920},
+  "profile": "ccn",
+  "sources": [
+    {"id": "camA", "media": "E:/CCN/Ep1/A001.braw", "camera": "A", "recording_id": "rec1",
+     "recording_origin": 0, "shot_size": "medium", "duration": 2000,
+     "frame_size": [1920, 1080]},
+    {"id": "camB", "media": "E:\\CCN\\Ep1\\B 001 (wide).braw", "camera": "B",
+     "recording_id": "rec1", "recording_origin": 0, "shot_size": "wide", "duration": 2000,
+     "frame_size": [1920, 1080]}
+  ],
+  "segments": [
+    {"track": 1, "source": "camA", "src_in": 0, "src_out": 240,
+     "transform": {"zoom": 1.2},
+     "reframe": [
+       {"time": 0, "x": 0.5, "y": 0.5, "zoom": 1.0},
+       {"time": 120, "x": 0.55, "y": 0.5, "zoom": 1.05},
+       {"time": 239, "x": 0.6, "y": 0.45, "zoom": 1.1}
+     ],
+     "label": "open on Jane"},
+    {"track": 1, "source": "camB", "src_in": 240, "src_out": 480,
+     "reframe": [
+       {"time": 0, "x": 0.4, "y": 0.5, "zoom": 1.3},
+       {"time": 239, "x": 0.45, "y": 0.5, "zoom": 1.3}
+     ],
+     "notes": "wide reframed to the speaker"}
+  ],
+  "captions": [
+    {"lines": ["Hello there"], "record_in": 0, "record_out": 240},
+    {"lines": ["Good to see"], "record_in": 240, "record_out": 480}
+  ],
+  "caption_style": {"font": "Montserrat", "active_word_color": "#FFD400"},
+  "markers": [{"record": 0, "name": "Hook", "color": "Red"}],
+  "audio_tracks": [{"name": "A1"}, {"name": "A2"}],
+  "head": {"video": "cut", "video_frames": 0, "audio_fade_frames": 6},
+  "end_fade_frames": 1
+}

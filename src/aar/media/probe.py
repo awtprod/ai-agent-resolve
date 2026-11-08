@@ -1,10 +1,12 @@
-"""``probe(path)``: duration, size and streams of a media file, from ffprobe's JSON."""
+"""``probe(path)``: duration, size, streams and start timecode of a media file, from ffprobe's
+JSON; :func:`timecode_frames` counts a SMPTE timecode in frames."""
 
 from __future__ import annotations
 
 import json
 import math
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 from typing import Any
@@ -29,10 +31,26 @@ class Stream:
     channels: int | None = None
     attached_pic: bool = False
     pix_fmt: str | None = None
+    rotation: int = 0  # display rotation in degrees, 0-359 (video)
+    sample_aspect: Fraction | None = None  # pixel aspect; None when unknown or not video
+    timecode: str | None = None  # the stream's ``timecode`` tag (a video or tmcd stream)
+
+    @property
+    def display_size(self) -> tuple[int, int] | None:
+        """The picture as it is shown: the pixel aspect applied, then a 90/270 rotation."""
+        if not self.width or not self.height:
+            return None
+        return display_size(self.width, self.height, self.sample_aspect, self.rotation)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["fps"] = None if self.fps is None else f"{self.fps.numerator}/{self.fps.denominator}"
+        aspect = self.sample_aspect
+        data["sample_aspect"] = (
+            None if aspect is None else f"{aspect.numerator}/{aspect.denominator}"
+        )
+        size = self.display_size
+        data["display_size"] = None if size is None else list(size)
         return data
 
 
@@ -46,6 +64,7 @@ class MediaInfo:
     size_bytes: int
     bit_rate: int | None
     streams: tuple[Stream, ...] = field(default_factory=tuple)
+    format_timecode: str | None = None  # the container's ``timecode`` tag
 
     @property
     def video(self) -> Stream | None:
@@ -57,6 +76,16 @@ class MediaInfo:
         """The first audio stream: the one QA measures."""
         return next((s for s in self.streams if s.kind == "audio"), None)
 
+    @property
+    def timecode(self) -> str | None:
+        """The media's start timecode tag, as written: the video stream's, else the first other
+        stream's that has one (a QuickTime tmcd track), else the container's."""
+        video = self.video
+        if video is not None and video.timecode:
+            return video.timecode
+        tagged = next((s.timecode for s in self.streams if s.timecode), None)
+        return tagged or self.format_timecode
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "path": self.path,
@@ -65,6 +94,8 @@ class MediaInfo:
             "size_bytes": self.size_bytes,
             "bit_rate": self.bit_rate,
             "streams": [s.to_dict() for s in self.streams],
+            "format_timecode": self.format_timecode,
+            "timecode": self.timecode,
         }
 
 
@@ -97,6 +128,85 @@ def parse_rational(text: Any) -> Fraction | None:
     return Fraction(n, d)
 
 
+def sample_aspect(text: Any) -> Fraction | None:
+    """ffprobe's ``sample_aspect_ratio`` (``"4:3"``; ``"0:1"`` when unknown) as a Fraction."""
+    return parse_rational(text.replace(":", "/")) if isinstance(text, str) else None
+
+
+def stream_rotation(raw: dict[str, Any]) -> int:
+    """A stream's display rotation in degrees, 0-359: its Display Matrix side data, else the
+    older ``rotate`` tag."""
+    rotation = 0
+    for side in raw.get("side_data_list") or []:
+        if isinstance(side, dict) and _num(side.get("rotation")) is not None:
+            rotation = round(float(side["rotation"]))
+    tags = raw.get("tags")
+    if rotation == 0 and isinstance(tags, dict) and _num(tags.get("rotate")) is not None:
+        rotation = round(float(tags["rotate"]))
+    return rotation % 360
+
+
+def _timecode_tag(raw: Any) -> str | None:
+    """A stream's or the container's ``timecode`` tag, in any case: Matroska's is ``TIMECODE``
+    (on the container), QuickTime's and MXF's ``timecode``."""
+    tags = raw.get("tags") if isinstance(raw, dict) else None
+    if not isinstance(tags, dict):
+        return None
+    for key, value in tags.items():
+        named = isinstance(key, str) and key.lower() == "timecode"
+        if named and isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+_TIMECODE = re.compile(r"(\d{2}):(\d{2}):(\d{2})([:;.])(\d{2,3})")
+_DROP_FRAME_RATES = (Fraction(30000, 1001), Fraction(60000, 1001))
+
+
+def timecode_frames(text: str, fps: Fraction) -> int:
+    """A SMPTE timecode as the frame count it labels from 00:00:00:00 at ``fps``.
+
+    ``HH:MM:SS:FF`` is non-drop: frames count at the nominal rate (24 for 23.976, 30 for 29.97),
+    so 01:00:00:00 is 86400 at 24 and 108000 at 29.97. ``HH:MM:SS;FF`` (or ``.``) is
+    drop-frame, which exists only at 29.97 and 59.94: frame numbers 0-1 (0-3 at 59.94) are
+    skipped at the start of every minute except each tenth, so 01:00:00;00 is 107892 at 29.97.
+    Raises ``ValueError`` saying what is wrong."""
+    match = _TIMECODE.fullmatch(text.strip())
+    if match is None:
+        raise ValueError(f"{text!r} is not a HH:MM:SS:FF timecode")
+    hours, minutes, seconds, frame = (int(match.group(n)) for n in (1, 2, 3, 5))
+    nominal = round(fps)
+    for value, limit, unit in (
+        (hours, 24, "hour"),
+        (minutes, 60, "minute"),
+        (seconds, 60, "second"),
+        (frame, nominal, "frame"),
+    ):
+        if value >= limit:
+            raise ValueError(f"{text!r} has {unit} {value} (at {fps} fps the limit is {limit - 1})")
+    count = ((hours * 60 + minutes) * 60 + seconds) * nominal + frame
+    if match.group(4) == ":":
+        return count
+    if fps not in _DROP_FRAME_RATES:
+        raise ValueError(
+            f"{text!r} is drop-frame, which exists only at 29.97 and 59.94 fps, not {fps}"
+        )
+    skip = nominal // 15  # 2 frame numbers at 29.97, 4 at 59.94
+    if seconds == 0 and frame < skip and minutes % 10:
+        raise ValueError(f"{text!r} names a frame number drop-frame timecode skips (dropped)")
+    total_minutes = hours * 60 + minutes
+    return count - skip * (total_minutes - total_minutes // 10)
+
+
+def display_size(
+    width: int, height: int, aspect: Fraction | None, rotation: int
+) -> tuple[int, int]:
+    """Width and height as shown (and as ffmpeg emits them): the pixel aspect applied to the
+    width, then swapped by a 90 or 270 degree rotation."""
+    shown = max(1, round(width * aspect)) if aspect else width
+    return (height, shown) if rotation % 180 == 90 else (shown, height)
+
+
 def parse_probe_json(data: dict[str, Any], path: str, size_bytes: int) -> MediaInfo:
     """Build a MediaInfo from ffprobe ``-show_format -show_streams -of json`` output."""
     fmt = data.get("format") or {}
@@ -124,6 +234,11 @@ def parse_probe_json(data: dict[str, Any], path: str, size_bytes: int) -> MediaI
                 channels=_int(raw.get("channels")),
                 attached_pic=bool(disposition.get("attached_pic")),
                 pix_fmt=(str(raw["pix_fmt"]) if raw.get("pix_fmt") else None),
+                rotation=stream_rotation(raw) if kind == "video" else 0,
+                sample_aspect=(
+                    sample_aspect(raw.get("sample_aspect_ratio")) if kind == "video" else None
+                ),
+                timecode=_timecode_tag(raw),
             )
         )
     return MediaInfo(
@@ -133,6 +248,7 @@ def parse_probe_json(data: dict[str, Any], path: str, size_bytes: int) -> MediaI
         size_bytes=size_bytes,
         bit_rate=_int(fmt.get("bit_rate")),
         streams=tuple(streams),
+        format_timecode=_timecode_tag(fmt),
     )
 
 

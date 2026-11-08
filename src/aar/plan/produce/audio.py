@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 
 from aar.media import (
@@ -38,6 +39,9 @@ class SourceAudio:
     path: Path
     channels: int
     duration_s: float | None  # of the audio stream, else the container
+    frame_size: tuple[int, int] | None = None  # the video's display size; None without video
+    timecode: str | None = None  # the media's start timecode tag (S18 round 4)
+    fps: Fraction | None = None  # the video stream's rate; None without video
 
 
 def open_audio(
@@ -67,7 +71,12 @@ def open_audio(
                 "source-unreadable", f"source {source_id!r} has no audio stream"
             )
         duration = info.audio.duration_s or info.duration_s
-        out[source_id] = SourceAudio(path, info.audio.channels or 1, duration)
+        video = info.video
+        size = video.display_size if video is not None else None
+        fps = video.fps if video is not None else None
+        out[source_id] = SourceAudio(
+            path, info.audio.channels or 1, duration, size, info.timecode, fps
+        )
     return out
 
 

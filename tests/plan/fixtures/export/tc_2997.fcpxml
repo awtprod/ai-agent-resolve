@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.10">
+  <resources>
+    <format id="r1" name="FFVideoFormat1080p2997" frameDuration="1001/30000s" width="1920" height="1080" colorSpace="1-1-1 (Rec. 709)" />
+    <effect id="r2" name="Cross Dissolve" uid="FxPlug:4731E73A-8DAC-4113-9A30-AE85B1761265" />
+    <effect id="r3" name="Basic Title" uid=".../Titles.localized/Bumper:Opener.localized/Basic Title.localized/Basic Title.moti" />
+    <asset id="r4" name="A.mov" start="108108000/30000s" duration="5005000/30000s" hasVideo="1" hasAudio="1">
+      <media-rep kind="original-media" src="file:///E:/Show/Late/A.mov" />
+    </asset>
+    <asset id="r5" name="B.mov" start="108108000/30000s" duration="5005000/30000s" hasVideo="1" hasAudio="1">
+      <media-rep kind="original-media" src="file:///E:/Show/Late/B.mov" />
+    </asset>
+    <asset id="r6" name="crowd.mov" start="108108000/30000s" duration="600600/30000s" hasVideo="1" hasAudio="1">
+      <media-rep kind="original-media" src="file://nas/media/late/crowd.mov" />
+    </asset>
+    <asset id="r7" name="Outro 2997.mov" start="108108000/30000s" duration="150150/30000s" hasVideo="1" hasAudio="1">
+      <media-rep kind="original-media" src="file:///E:/Show/Assets/Outro%202997.mov" />
+    </asset>
+  </resources>
+  <library>
+    <event name="CCN">
+      <project name="Late Set 2997">
+        <sequence format="r1" duration="1051050/30000s" tcStart="108108000/30000s" tcFormat="NDF" audioLayout="stereo" audioRate="48k">
+          <note>aar export: not expressible in FCPXML (see the export report)
+outro.audio_track: outro sound is on the clip's own track (imported A1), not on A2 'A2' as planned; FCPXML cannot move a clip's sound to another track without doubling it in Resolve
+template: FCPXML builds a new timeline; it does not start from template 'CCN Longform Template', so its tracks, buses, Fusion titles and settings are not carried
+audio tracks after import:
+plan A1 (A1) -&gt; imported A1
+plan A2 (A2) -&gt; imported A2
+split crossfades (transitions[0]): the overlap goes on another audio track (observed: A1 holds the later clip's sound)</note>
+          <spine>
+            <transition name="Cross Dissolve" offset="108108000/30000s" duration="15015/30000s">
+              <filter-video ref="r2" name="Cross Dissolve" />
+            </transition>
+            <asset-clip ref="r4" offset="108108000/30000s" name="A.mov" start="108108000/30000s" duration="300300/30000s">
+              <adjust-volume>
+                <param name="amount">
+                  <fadeIn type="linear" duration="12012/30000s" />
+                </param>
+              </adjust-volume>
+              <title ref="r3" lane="2" offset="108138030/30000s" name="Sam Rivera / Headliner / Charlotte, NC" duration="120120/30000s">
+                <text><text-style ref="ts1">Sam Rivera
+Headliner
+Charlotte, NC</text-style></text>
+                <text-style-def id="ts1">
+                  <text-style font="Helvetica" fontSize="60" fontColor="1 1 1 1" alignment="center" />
+                </text-style-def>
+              </title>
+            </asset-clip>
+            <asset-clip ref="r5" offset="108408300/30000s" name="B.mov" start="108408300/30000s" duration="300300/30000s" audioStart="108408300/30000s" audioDuration="305305/30000s">
+              <adjust-volume>
+                <param name="amount">
+                  <fadeOut type="linear" duration="10010/30000s" />
+                </param>
+              </adjust-volume>
+              <asset-clip ref="r6" lane="1" offset="108508400/30000s" name="crowd.mov" start="108208100/30000s" duration="150150/30000s">
+                <adjust-conform type="fill" />
+                <adjust-transform position="0 0" scale="-1 1" rotation="0" />
+                <adjust-volume amount="-5dB" />
+              </asset-clip>
+            </asset-clip>
+            <asset-clip ref="r4" offset="108708600/30000s" name="A.mov" start="109008900/30000s" duration="300300/30000s" audioStart="109003895/30000s" audioDuration="305305/30000s">
+              <adjust-conform type="fill" />
+              <adjust-transform position="-3.7037037037037033 1.1574074074074074" scale="1.25 1.25" rotation="1.5" />
+              <adjust-volume>
+                <param name="amount">
+                  <fadeIn type="linear" duration="10010/30000s" />
+                </param>
+              </adjust-volume>
+            </asset-clip>
+            <transition name="Cross Dissolve" offset="109008900/30000s" duration="20020/30000s">
+              <filter-video ref="r2" name="Cross Dissolve" />
+            </transition>
+            <asset-clip ref="r7" offset="109008900/30000s" name="Outro 2997.mov" start="108108000/30000s" duration="150150/30000s">
+              <adjust-volume amount="-2dB">
+                <param name="amount">
+                  <fadeOut type="linear" duration="3003/30000s" />
+                </param>
+              </adjust-volume>
+              <title ref="r3" lane="2" offset="108118010/30000s" name="Late Set" duration="60060/30000s">
+                <text><text-style ref="ts2">Late Set</text-style></text>
+                <text-style-def id="ts2">
+                  <text-style font="Helvetica" fontSize="60" fontColor="1 1 1 1" alignment="center" />
+                </text-style-def>
+              </title>
+            </asset-clip>
+          </spine>
+        </sequence>
+      </project>
+    </event>
+  </library>
+</fcpxml>

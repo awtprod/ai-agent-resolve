@@ -20,7 +20,11 @@
       "shot_size": "medium",
       "recording_id": "set-1",
       "recording_origin": 0,
-      "duration": 899
+      "duration": 899,
+      "frame_size": [
+        160,
+        90
+      ]
     }
   ],
   "segments": [

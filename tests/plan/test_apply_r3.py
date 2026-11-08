@@ -332,9 +332,11 @@ def test_w07_sting_only_plan_ensures_the_title_track() -> None:
 
 
 def test_w20_centre_rounds_down() -> None:
-    # 15-frame dissolve with exactly 7 frames of handle each side -> centre (7 = 15 // 2).
+    # 15-frame dissolve: 7 frames before the cut (15 // 2) on the incoming head, 8 after it on
+    # the outgoing tail. Since S18 F7 the compiler and the FCPXML exporter share one rule, which
+    # needs all 15 frames of media: 8 + 7 handles centre it.
     p = plan(
-        sources=[source("a", media="E:/X/a.mov", duration=31)],
+        sources=[source("a", media="E:/X/a.mov", duration=32)],
         segments=[seg(src="a", a=0, b=24), seg(src="a", a=7, b=31)],
         transitions=[{"after": 0, "video": "dissolve", "video_frames": 15}],
     )
@@ -343,6 +345,20 @@ def test_w20_centre_rounds_down() -> None:
     tx = next(s for s in comp.steps if s.op == "transition.add")
     simple = next(t for t in tx.params["targets"] if t["category"] == "simple")
     assert simple["alignment"] == "center"
+
+
+def test_w20_centre_needs_every_frame_of_media() -> None:
+    # 7 + 7 handles hold 14 frames, not 15: no alignment has the media, so it is refused (the
+    # rule before S18 F7 centred it and Resolve would have had to read past the source).
+    p = plan(
+        sources=[source("a", media="E:/X/a.mov", duration=31)],
+        segments=[seg(src="a", a=0, b=24), seg(src="a", a=7, b=31)],
+        transitions=[{"after": 0, "video": "dissolve", "video_frames": 15}],
+    )
+    prep = synth_prepare(p)
+    with pytest.raises(CompileError) as caught:
+        compile_finish(p, prepare=prep, assemble=synth_assemble(p, prep))
+    assert caught.value.code == "no_handle_for_transition"
 
 
 def test_w23_outro_incoming_head_is_used() -> None:

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 from pathlib import Path
@@ -19,11 +19,12 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from aar.media.probe import parse_rational
+from aar.media import MediaError, probe
+from aar.media.probe import parse_rational, timecode_frames
 from aar.plan.inputs import LaughMap, Transcript
 from aar.plan.lint import LintReport, all_rules, lint, validate_profile
 from aar.plan.model import EditPlan, Fps, Source
-from aar.plan.produce.audio import JoinJudge, ScanStats, open_audio, pause_runs
+from aar.plan.produce.audio import JoinJudge, ScanStats, SourceAudio, open_audio, pause_runs
 from aar.plan.produce.camera import crop_width, face_x, framing_levels, reframe_keys
 from aar.plan.produce.ending import Ending, end_on_laugh
 from aar.plan.produce.errors import InvariantError, LintGateError, ProduceError, ProduceInputError
@@ -231,6 +232,184 @@ def _applies(name: str | None, sources: Sequence[Source]) -> bool:
     return name is None or all(name in (s.recording_id, s.id) for s in sources)
 
 
+Size = tuple[int, int]
+
+
+def _aspect_differs(a: Size, b: Size) -> bool:
+    """Two picture sizes disagree when their aspects differ by more than 1 %: a face track keeps
+    the display aspect but rounds its sampled size to even pixels."""
+    return abs(a[0] * b[1] - b[0] * a[1]) > 0.01 * b[0] * a[1]
+
+
+def source_frame_sizes(
+    stub: EditPlan, probed: Mapping[str, Size | None], faces: Mapping[str, FaceTrack]
+) -> tuple[dict[str, Size], list[PlannerWarning]]:
+    """Each source's ``frame_size`` (S18): the stub's own, else the media probe's display size,
+    else the face track's sampled size. An audio-only source (no probed video, no face track)
+    gets none. When the sources of a size disagree on the aspect, a warning names them; the
+    stub's explicit size still wins, and the probe wins over the face track."""
+    sizes: dict[str, Size] = {}
+    warnings: list[PlannerWarning] = []
+    for source in stub.sources:
+        found: list[tuple[str, Size]] = []
+        if source.frame_size is not None:
+            found.append(("stub", (source.frame_size[0], source.frame_size[1])))
+        probe_size = probed.get(source.id)
+        if probe_size is not None:
+            found.append(("media probe", probe_size))
+        track = faces.get(source.id)
+        if track is not None:
+            found.append(("face track", (track.header.frame_size[0], track.header.frame_size[1])))
+        if not found:
+            continue
+        (origin, chosen), others = found[0], found[1:]
+        sizes[source.id] = chosen
+        for name, size in others:
+            if _aspect_differs(chosen, size):
+                warnings.append(
+                    PlannerWarning(
+                        code="frame-size-mismatch",
+                        message=(
+                            f"source {source.id!r}: the {origin} gives a {chosen[0]}x{chosen[1]} "
+                            f"picture, the {name} {size[0]}x{size[1]} (another aspect); the "
+                            f"{origin}'s size is used"
+                        ),
+                        source=source.id,
+                        hint="check the media, the stub's frame_size and the face track",
+                    )
+                )
+    return sizes, warnings
+
+
+@dataclass(frozen=True)
+class Probed:
+    """What the media probe says about one source's file: its display size, its start timecode
+    tag as written, and its video rate (None without video)."""
+
+    frame_size: Size | None
+    timecode: str | None = None
+    fps: Fraction | None = None
+
+
+def probe_frame_sizes(
+    stub: EditPlan, audio: Mapping[str, SourceAudio], media_root: Path | None
+) -> tuple[dict[str, Size | None], list[PlannerWarning]]:
+    """The display size of every source the producer can read (see :func:`probe_sources`)."""
+    probed, warnings = probe_sources(stub, audio, media_root)
+    return {key: value.frame_size for key, value in probed.items()}, warnings
+
+
+def probe_sources(
+    stub: EditPlan, audio: Mapping[str, SourceAudio], media_root: Path | None
+) -> tuple[dict[str, Probed], list[PlannerWarning]]:
+    """The probe of every source the producer can read: the cut's sources from the probe
+    ``open_audio`` already made, the rest (an outro clip, say) probed when their media is a local
+    file. A file that cannot be probed is a warning, not a failure: the cut does not use it."""
+    found: dict[str, Probed] = {
+        key: Probed(value.frame_size, value.timecode, value.fps) for key, value in audio.items()
+    }
+    warnings: list[PlannerWarning] = []
+    for source in stub.sources:
+        if source.id in found:
+            continue
+        path = resolve_media(source.media, media_root)
+        if path is None or not path.is_file():
+            continue
+        try:
+            info = probe(path)
+        except MediaError as exc:
+            warnings.append(
+                PlannerWarning(
+                    code="frame-size-unread",
+                    message=f"source {source.id!r}: its picture size could not be read "
+                    f"({exc.summary()})",
+                    source=source.id,
+                    hint="set the source's frame_size and start_timecode in the stub",
+                )
+            )
+            continue
+        video = info.video
+        found[source.id] = Probed(
+            video.display_size if video is not None else None,
+            info.timecode,
+            video.fps if video is not None else None,
+        )
+    return found, warnings
+
+
+@dataclass(frozen=True)
+class StartTimecode:
+    """A source's start timecode: ``frames`` from 00:00:00:00 counted at ``rate`` (the media's
+    own frame rate; None when unknown, meaning the plan's)."""
+
+    frames: int
+    rate: Fraction | None = None
+
+
+def source_start_timecodes(
+    stub: EditPlan, probed: Mapping[str, Probed]
+) -> tuple[dict[str, StartTimecode], list[PlannerWarning]]:
+    """Each source's ``start_timecode`` and ``start_timecode_rate`` (S18 round 4), as
+    ``frame_size``: the stub's own win, else the media's timecode tag counted at the video
+    stream's rate (the plan's for a file with no video), drop-frame handled, with that rate. A tag
+    that cannot be read and a stub value the probe disagrees with are warnings; a source with
+    neither gets none (the export then refuses or reports it).
+
+    A stub that gives ``start_timecode`` without its rate, for media the probe shows at another
+    rate than the plan's, is refused (``start-timecode-rate-required``): the frame count is
+    ambiguous, and the export would place the asset at the wrong time."""
+    plan_fps = Fraction(stub.fps.num, stub.fps.den)
+    timecodes: dict[str, StartTimecode] = {}
+    warnings: list[PlannerWarning] = []
+    for source in stub.sources:
+        seen = probed.get(source.id)
+        media_rate = seen.fps if seen is not None else None
+        given = source.start_timecode_rate
+        stub_rate = Fraction(given.num, given.den) if given is not None else None
+        read: int | None = None
+        if seen is not None and seen.timecode is not None:
+            try:
+                read = timecode_frames(seen.timecode, media_rate or stub_rate or plan_fps)
+            except ValueError as exc:
+                warnings.append(
+                    PlannerWarning(
+                        code="start-timecode-unread",
+                        message=f"source {source.id!r}: its media's start timecode tag cannot "
+                        f"be used ({exc})",
+                        source=source.id,
+                        hint="set the source's start_timecode in the stub",
+                    )
+                )
+        if source.start_timecode is not None:
+            if stub_rate is None and media_rate is not None and media_rate != plan_fps:
+                raise ProduceInputError(
+                    "start-timecode-rate-required",
+                    f"source {source.id!r}: the stub gives start_timecode "
+                    f"{source.start_timecode} without start_timecode_rate, and its media runs "
+                    f"at {float(media_rate):g} fps, not the plan's {float(plan_fps):g}",
+                    hint="give start_timecode_rate (the media's rate) with start_timecode, or "
+                    "leave both unset to read them from the media",
+                )
+            chosen = StartTimecode(source.start_timecode, stub_rate)
+            timecodes[source.id] = chosen
+            if read is not None and seen is not None:
+                read_s = Fraction(read) / (media_rate or stub_rate or plan_fps)
+                if read_s != Fraction(chosen.frames) / (chosen.rate or plan_fps):
+                    warnings.append(
+                        PlannerWarning(
+                            code="start-timecode-mismatch",
+                            message=f"source {source.id!r}: the stub gives start timecode "
+                            f"frame {source.start_timecode}, the media's tag {seen.timecode} "
+                            f"(frame {read}); the stub's is used",
+                            source=source.id,
+                            hint="check the media and the stub's start_timecode",
+                        )
+                    )
+        elif read is not None:
+            timecodes[source.id] = StartTimecode(read, media_rate or stub_rate)
+    return timecodes, warnings
+
+
 @dataclass
 class ProduceResult:
     plan: EditPlan
@@ -302,8 +481,16 @@ def assemble(
     faces: dict[str, FaceTrack],
     profile: Profile,
     rules: RuleView,
+    *,
+    frame_sizes: Mapping[str, tuple[int, int]] | None = None,
+    start_timecodes: Mapping[str, StartTimecode] | None = None,
 ) -> tuple[EditPlan, list[PlannerWarning]]:
-    """Transform 5 and the plan: framing, the camera path, segments and transitions."""
+    """Transform 5 and the plan: framing, the camera path, segments and transitions.
+
+    ``frame_sizes`` sets each source's ``frame_size`` (from :func:`source_frame_sizes`); without
+    it the stub's own sizes and the face tracks' are used. ``start_timecodes`` sets each
+    source's ``start_timecode`` and ``start_timecode_rate`` (from
+    :func:`source_start_timecodes`); without it the stub's own stay."""
     s = profile.produce
     fps = stub.fps
     sources = stub.source_map()
@@ -369,6 +556,19 @@ def assemble(
         if is_cut(pieces[index - 1], pieces[index])
     ]
     data = stub.model_dump(mode="json")
+    if frame_sizes is None:
+        frame_sizes, _ = source_frame_sizes(stub, {}, faces)
+    for item in data["sources"]:
+        if item["id"] in frame_sizes:
+            item["frame_size"] = list(frame_sizes[item["id"]])
+        if start_timecodes is not None and item["id"] in start_timecodes:
+            timecode = start_timecodes[item["id"]]
+            item["start_timecode"] = timecode.frames
+            if timecode.rate is not None:
+                item["start_timecode_rate"] = {
+                    "num": timecode.rate.numerator,
+                    "den": timecode.rate.denominator,
+                }
     data.update(version=2, segments=segments, transitions=transitions)
     try:
         return EditPlan.model_validate(data), warnings
@@ -584,7 +784,22 @@ def produce(
                     hint="check the source's audio and the --venue",
                 )
             )
-    plan, framing_warnings = assemble(stub, done.pieces, keeps, coverage, tracks, profile, rules)
+    probed, probe_warnings = probe_sources(stub, audio, media_root)
+    sizes = {key: value.frame_size for key, value in probed.items()}
+    frame_sizes, mismatches = source_frame_sizes(stub, sizes, tracks)
+    start_timecodes, timecode_warnings = source_start_timecodes(stub, probed)
+    warnings += probe_warnings + mismatches + timecode_warnings
+    plan, framing_warnings = assemble(
+        stub,
+        done.pieces,
+        keeps,
+        coverage,
+        tracks,
+        profile,
+        rules,
+        frame_sizes=frame_sizes,
+        start_timecodes=start_timecodes,
+    )
     warnings += framing_warnings
     report = lint(plan, profile, transcript=transcript, laughs=laughs)
     if not report.ok:

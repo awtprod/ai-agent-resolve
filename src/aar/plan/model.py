@@ -13,7 +13,9 @@ Two clocks appear in a plan:
 
 Versions: a plan says which format it uses in ``version``. Version 2 (the default for a plan
 that does not say) adds the build-from-template fields: ``template``, ``head``, ``outro``,
-``audio_tracks``, ``end_fade_frames``, ``Source.color`` and ``Segment.transform``. Everything
+``audio_tracks``, ``end_fade_frames``, ``Source.color``, ``Source.frame_size``,
+``Source.start_timecode``, ``Source.start_timecode_rate`` and ``Segment.transform``.
+Everything
 else is the same in both, so every valid version 1 plan is also valid as version 2. A plan that
 says ``"version": 1`` may not use a version 2 field: giving one a value is a validation error
 naming the field. Null (or an empty ``audio_tracks``) is not a use, so a full dump of a version
@@ -39,6 +41,7 @@ from pydantic import (
     ConfigDict,
     Field,
     GetJsonSchemaHandler,
+    StrictInt,
     ValidationError,
     field_validator,
     model_validator,
@@ -69,7 +72,7 @@ PlanVersion = Annotated[Literal[1, 2], BeforeValidator(_whole_number_version)]
 
 #: Fields only a version 2 plan may use, per model.
 V2_PLAN_FIELDS = ("template", "head", "outro", "audio_tracks", "end_fade_frames")
-V2_SOURCE_FIELDS = ("color",)
+V2_SOURCE_FIELDS = ("color", "frame_size", "start_timecode", "start_timecode_rate")
 V2_SEGMENT_FIELDS = ("transform",)
 
 ShotSize = Literal["close", "medium", "wide", "unknown"]
@@ -104,7 +107,11 @@ def _not_blank(value: str) -> str:
 
 #: A name that must say something: empty and whitespace-only strings are rejected.
 Name = Annotated[str, AfterValidator(_not_blank)]
+#: A picture size, [width, height]: two whole numbers above zero (not booleans or decimals).
+FrameSize = Annotated[list[Annotated[StrictInt, Field(gt=0)]], Field(min_length=2, max_length=2)]
 Finite = Annotated[float, Field(allow_inf_nan=False)]
+#: A frame count from 00:00:00:00: a whole number, zero or more (not a boolean or a decimal).
+FrameCount = Annotated[StrictInt, Field(ge=0)]
 
 #: JSON Schema dialect the plan schema is written in (what pydantic emits).
 JSON_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
@@ -285,15 +292,45 @@ class Source(_Model):
         default=None,
         description="Version 2. Colour settings for every clip placed from this source.",
     )
+    frame_size: FrameSize | None = Field(
+        default=None,
+        description="Version 2. The media's DISPLAY size [width, height] in pixels: the size "
+        "after pixel aspect ratio and rotation, as the picture is shown, not the stored "
+        "(coded) pixel size (or any size with the same display aspect). Reframe x/y are "
+        "shares of it; the FCPXML export needs it to frame a clip whose aspect differs from "
+        "the timeline's.",
+    )
+    start_timecode: FrameCount | None = Field(
+        default=None,
+        description="Version 2. The media's embedded start timecode as a frame count from "
+        "00:00:00:00 at the source's frame rate (drop-frame timecode counted as the frames it "
+        "labels): 01:00:00:00 is 86400 at 24 fps and 108000 at 29.97 non-drop. Source positions "
+        "(src_in, src_out) still count from the file's first frame; the FCPXML export writes "
+        "the asset's start at this timecode, which Resolve needs to link a clip to its file.",
+    )
+    start_timecode_rate: Fps | None = Field(
+        default=None,
+        description="Version 2. The frame rate start_timecode is counted at: the media's own "
+        "rate (25 for a 25 fps file at 01:00:00:00 = 90000). Unset means the plan's fps. The "
+        "FCPXML export converts the timecode to time with it.",
+    )
 
 
 class ReframeKey(_Model):
-    """One reframe keyframe. Values are linearly interpolated between keyframes."""
+    """One reframe keyframe: the crop window over the source picture. Values are linearly
+    interpolated between keyframes.
+
+    ``x`` and ``y`` are the crop centre as shares of the source width and height; ``zoom`` 1.0 is
+    the tallest crop the timeline's aspect allows (the picture filling the frame), and 2.0 a crop
+    half that size.
+    """
 
     time: int = Field(ge=0, description="Frames from the segment's start.")
-    x: float = Field(default=0.5, ge=0, le=1, description="Frame centre x, 0-1 of frame width.")
-    y: float = Field(default=0.5, ge=0, le=1, description="Frame centre y, 0-1 of frame height.")
-    zoom: float = Field(default=1.0, gt=0, description="Zoom factor, 1.0 = full frame.")
+    x: float = Field(default=0.5, ge=0, le=1, description="Crop centre x, 0-1 of source width.")
+    y: float = Field(default=0.5, ge=0, le=1, description="Crop centre y, 0-1 of source height.")
+    zoom: float = Field(
+        default=1.0, gt=0, description="Zoom factor; 1.0 = the source filling the frame."
+    )
 
 
 class Transform(_Model):

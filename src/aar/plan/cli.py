@@ -1,4 +1,5 @@
-"""``aar plan`` commands: print the EditPlan JSON Schema, lint a plan and produce one."""
+"""``aar plan`` commands: print the EditPlan JSON Schema, lint, compile (apply), produce and
+export plans."""
 
 from __future__ import annotations
 
@@ -21,6 +22,14 @@ from aar.plan.apply import (
     compile_prepare,
 )
 from aar.plan.apply.render import dumps_json, render_json, render_text
+from aar.plan.export import (
+    ExportError,
+    export_fcpxml,
+    load_media_map,
+    verify_plan_fcpxml,
+)
+from aar.plan.export.files import write_pair
+from aar.plan.export.reader import MAX_BYTES as FCPXML_MAX_BYTES
 from aar.plan.inputs import LaughMap, Transcript, load_laughs, load_transcript
 from aar.plan.lint import Finding, LintReport, Ref, lint
 from aar.plan.model import EditPlan
@@ -99,6 +108,42 @@ def register(subparsers: Any) -> None:
         "reference is unresolved; thin, for manual use with 'aar hub job submit').",
     )
     apply.set_defaults(func=_cmd_apply)
+
+    export = sub.add_parser(
+        "export",
+        help="Export a linted EditPlan v2 as an FCPXML 1.10 timeline (no Resolve needed).",
+        description="Lints first (refuses a plan with lint errors), writes FCPXML 1.10 for "
+        "File > Import > Timeline in Resolve, reads it back and checks it reproduces the plan, "
+        "and writes the export report beside it (<name>.report.json). --verify FILE reads an "
+        "FCPXML file back and compares it with the plan. Exit: 0 ok, 1 --verify found a "
+        "mismatch, 2 refused or unreadable input.",
+    )
+    export.add_argument("plan", type=Path, help="EditPlan JSON file.")
+    export.add_argument("--profile", help="Profile name or .toml path (default: the plan's).")
+    export.add_argument("--format", choices=["fcpxml"], default="fcpxml", help="Output format.")
+    target = export.add_mutually_exclusive_group(required=True)
+    target.add_argument("--out", type=Path, help="FCPXML file to write (never overwritten).")
+    target.add_argument(
+        "--verify", type=Path, metavar="FILE", help="Read FILE back and compare it with the plan."
+    )
+    export.add_argument(
+        "--media-map",
+        type=Path,
+        help="JSON object of linux_root -> windows_root, for sources with hub (Linux) paths.",
+    )
+    export.add_argument("--transcript", type=Path, help="Transcript JSON, for the lint.")
+    export.add_argument("--laughs", type=Path, help="Laugh map JSON, for the lint.")
+    export.add_argument(
+        "--overwrite", action="store_true", help="Replace an existing FCPXML and report."
+    )
+    export.add_argument(
+        "--allow-unknown-timecode",
+        action="store_true",
+        help="Export sources with no start_timecode anyway, their assets at 0s (Resolve links "
+        "their clips only if the file's timecode starts at 00:00:00:00).",
+    )
+    export.add_argument("--json", action="store_true", help="Print the report as JSON.")
+    export.set_defaults(func=_cmd_export)
 
 
 def _cmd_schema(args: argparse.Namespace) -> int:
@@ -310,3 +355,150 @@ def _format_report(report: LintReport, segments: int) -> str:
         f"{counts['warn']} warn, {counts['info']} info"
     )
     return "\n".join([head, *(_format_finding(f) for f in report.findings)])
+
+
+# -- export (S18) ------------------------------------------------------------------------------
+
+
+def report_path(out: Path) -> Path:
+    """Where the export report goes: beside the FCPXML, ``<name>.report.json``."""
+    return out.with_name(f"{out.stem}.report.json")
+
+
+def _write_export(out: Path, report: Path, fcpxml: str, body: str, overwrite: bool) -> None:
+    """The FCPXML and its report land together or not at all (round 3, item 9)."""
+    write_pair([(out, fcpxml.encode("utf-8")), (report, body.encode("utf-8"))], overwrite=overwrite)
+
+
+def _render_export(report: dict[str, Any], out: Path, report_file: Path) -> str:
+    timeline = report["timeline"]
+    counts = report["exported"]
+    lines = [
+        f"exported FCPXML {report['fcpxml_version']}: {out} "
+        f"(sha256 {report['fcpxml_sha256'][:12]})",
+        f"timeline {report['plan']['timeline']!r}: {timeline['fps']} fps, starts "
+        f"{timeline['start']}, {timeline['total_frames']} frames, {timeline['resolution']}",
+        f"exported: {counts['segments']} segment(s), outro {'yes' if counts['outro'] else 'no'}, "
+        f"{counts['transitions']} transition(s), {counts['titles']} title(s), "
+        f"{counts['assets']} asset(s)",
+        "import into Resolve:",
+        *(f"  - {step}" for step in report["import"]),
+        "media:",
+        *(f"  {m['source']}: {m['src']} ({m['rule']})" for m in report["media"]),
+        "lanes (after import):",
+        *(
+            f"  lane {row['lane']}: {row['carries']} -> {row['imported_video']}"
+            + (f", sound {row['imported_audio']}" if row["imported_audio"] else "")
+            for row in report["lanes"]
+        ),
+        "titles (after import):",
+        *(
+            f"  {t['location']} {t['name']!r} at {t['timecode']} -> {t['imported_video']}"
+            for t in report["titles"]
+        ),
+        "audio tracks (plan -> after import):",
+        *(
+            f"  {row['track']} {row['name']!r} -> {', '.join(row['imported'])}"
+            for row in report["audio_tracks"]
+        ),
+        *(
+            f"  split crossfade {row['location']} at {row['timecode']}: {row['overlap']}"
+            for row in report["split_crossfade_audio"]
+        ),
+        f"{report['not_imported']['heading']} ({len(report['not_imported']['markers'])}):",
+        *(f"  marker {m['name']!r} at {m['timecode']}" for m in report["not_imported"]["markers"]),
+        f"not expressible in FCPXML ({len(report['not_expressible'])}):",
+        *(
+            f"  {item['location']}: {item['detail']} -> {item['action']}"
+            for item in report["not_expressible"]
+        ),
+        f"notes ({len(report['notes'])}):",
+        *(f"  {item['location']}: {item['detail']}" for item in report["notes"]),
+        f"self-check: {'ok' if report['self_check']['ok'] else 'FAILED'} "
+        + ", ".join(f"{v} {k}" for k, v in report["self_check"]["checked"].items()),
+        f"report: {report_file}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _export_refusal(exc: ExportError, as_json: bool) -> int:
+    code = _compile_refusal(exc, as_json)
+    if not as_json:
+        for error in exc.details.get("errors", []):
+            cli_io.warn(f"  {error['rule']}: {error['message']}")
+        for problem in exc.details.get("problems", []):
+            cli_io.warn(f"  {problem}")
+    return code
+
+
+def _cmd_export(args: argparse.Namespace) -> int:
+    as_json: bool = args.json
+    try:
+        plan = EditPlan.model_validate_json(args.plan.read_text(encoding="utf-8"))
+        transcript: Transcript | None = (
+            load_transcript(args.transcript) if args.transcript else None
+        )
+        laughs: LaughMap | None = load_laughs(args.laughs) if args.laughs else None
+        profile = load_profile(args.profile or plan.profile)
+        media_map = load_media_map(args.media_map) if args.media_map else None
+    except ValidationError as exc:
+        return _input_error(
+            "invalid-input", "input failed validation", _validation_details(exc), as_json
+        )
+    except ExportError as exc:
+        return _export_refusal(exc, as_json)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ProfileError) as exc:
+        return _input_error(type(exc).__name__, str(exc), [], as_json)
+
+    if args.verify is not None:
+        return _do_verify(args.verify, plan, profile, media_map, as_json)
+    try:
+        result = export_fcpxml(
+            plan,
+            profile,
+            media_map=media_map,
+            transcript=transcript,
+            laughs=laughs,
+            allow_unknown_timecode=args.allow_unknown_timecode,
+        )
+    except ExportError as exc:
+        return _export_refusal(exc, as_json)
+    for finding in result.warnings:  # warnings are printed, not fatal
+        cli_io.warn(f"warning {finding.rule}: {finding.message}")
+    out: Path = args.out
+    report_file = report_path(out)
+    report = {**result.report, "file": out.name}
+    body = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+    try:
+        _write_export(out, report_file, result.fcpxml, body, args.overwrite)
+    except ExportError as exc:
+        return _export_refusal(exc, as_json)
+    except OSError as exc:
+        return _input_error(type(exc).__name__, str(exc), [], as_json)
+    text = body if as_json else _render_export(report, out, report_file)
+    return cli_io.emit(_PROG, text)
+
+
+def _do_verify(path: Path, plan: EditPlan, profile: Any, media_map: Any, as_json: bool) -> int:
+    try:
+        if path.stat().st_size > FCPXML_MAX_BYTES:
+            return _input_error(
+                "too-large", f"{path} is over {FCPXML_MAX_BYTES} bytes", [], as_json
+            )
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return _input_error(type(exc).__name__, str(exc), [], as_json)
+    try:
+        result = verify_plan_fcpxml(text, plan, profile, media_map=media_map)
+    except ExportError as exc:
+        return _export_refusal(exc, as_json)
+    if as_json:
+        out = json.dumps({**result.as_dict(), "file": str(path)}, indent=2) + "\n"
+    else:
+        counts = ", ".join(f"{v} {k}" for k, v in result.checked.items())
+        head = f"verify {path}: {'ok' if result.ok else 'MISMATCH'} ({counts})"
+        out = "\n".join([head, *(f"  {p}" for p in result.problems)]) + "\n"
+    written = cli_io.emit(_PROG, out)
+    if written != EXIT_OK:
+        return written
+    return EXIT_OK if result.ok else EXIT_ERRORS

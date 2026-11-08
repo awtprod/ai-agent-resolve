@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.10">
+  <resources>
+    <format id="r1" frameDuration="1001/24000s" width="1080" height="1920" colorSpace="1-1-1 (Rec. 709)" />
+    <asset id="r2" name="A001.braw" start="0s" duration="2002000/24000s" hasVideo="1" hasAudio="1">
+      <media-rep kind="original-media" src="file:///E:/CCN/Ep1/A001.braw" />
+    </asset>
+    <asset id="r3" name="B 001 (wide).braw" start="0s" duration="2002000/24000s" hasVideo="1" hasAudio="1">
+      <media-rep kind="original-media" src="file:///E:/CCN/Ep1/B%20001%20%28wide%29.braw" />
+    </asset>
+  </resources>
+  <library>
+    <event name="CCN">
+      <project name="Ep1 Short 02 (reframe)">
+        <sequence format="r1" duration="480480/24000s" tcStart="86486400/24000s" tcFormat="NDF" audioLayout="stereo" audioRate="48k">
+          <note>aar export: not expressible in FCPXML (see the export report)
+template: FCPXML builds a new timeline; it does not start from template 'CCN Short Template', so its tracks, buses, Fusion titles and settings are not carried
+audio tracks after import:
+plan A1 (A1) -&gt; imported A1</note>
+          <spine>
+            <asset-clip ref="r2" offset="86486400/24000s" name="open on Jane" start="0s" duration="240240/24000s">
+              <adjust-conform type="fill" />
+              <adjust-transform position="0 0" scale="1.2 1.2" rotation="0">
+                <param name="position">
+                  <keyframeAnimation>
+                    <keyframe time="0s" value="0 0" interp="linear" curve="linear" />
+                    <keyframe time="120120/24000s" value="-11.200000000000008 0" interp="linear" curve="linear" />
+                    <keyframe time="239239/24000s" value="-23.46666666666666 -6.599999999999999" interp="linear" curve="linear" />
+                  </keyframeAnimation>
+                </param>
+                <param name="scale">
+                  <keyframeAnimation>
+                    <keyframe time="0s" value="1.2 1.2" interp="linear" curve="linear" />
+                    <keyframe time="120120/24000s" value="1.26 1.26" interp="linear" curve="linear" />
+                    <keyframe time="239239/24000s" value="1.32 1.32" interp="linear" curve="linear" />
+                  </keyframeAnimation>
+                </param>
+              </adjust-transform>
+              <adjust-volume>
+                <param name="amount">
+                  <fadeIn type="linear" duration="6006/24000s" />
+                </param>
+              </adjust-volume>
+            </asset-clip>
+            <asset-clip ref="r3" offset="86726640/24000s" name="B 001 (wide).braw" start="240240/24000s" duration="240240/24000s">
+              <note>wide reframed to the speaker</note>
+              <adjust-conform type="fill" />
+              <adjust-transform position="23.111111111111107 0" scale="1.3 1.3" rotation="0">
+                <param name="position">
+                  <keyframeAnimation>
+                    <keyframe time="240240/24000s" value="23.111111111111107 0" interp="linear" curve="linear" />
+                    <keyframe time="479479/24000s" value="11.555555555555554 0" interp="linear" curve="linear" />
+                  </keyframeAnimation>
+                </param>
+                <param name="scale">
+                  <keyframeAnimation>
+                    <keyframe time="240240/24000s" value="1.3 1.3" interp="linear" curve="linear" />
+                    <keyframe time="479479/24000s" value="1.3 1.3" interp="linear" curve="linear" />
+                  </keyframeAnimation>
+                </param>
+              </adjust-transform>
+              <adjust-volume>
+                <param name="amount">
+                  <fadeOut type="linear" duration="1001/24000s" />
+                </param>
+              </adjust-volume>
+            </asset-clip>
+          </spine>
+        </sequence>
+      </project>
+    </event>
+  </library>
+</fcpxml>
