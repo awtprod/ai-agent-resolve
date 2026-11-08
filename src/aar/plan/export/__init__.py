@@ -109,15 +109,34 @@ def _lanes(layout: Layout) -> list[dict[str, Any]]:
             "imported_video": f"V{lane + 1}",
             "imported_audio": f"A{layout.imported_audio_track(lane)}",
         }
-    if layout.titles:
-        lane = layout.title_lane
+    for lane in sorted({t.lane for t in layout.titles}):
         rows[lane] = {
             "lane": lane,
-            "carries": "titles and sting",
+            "carries": "titles: " + ", ".join(t.location for t in layout.titles if t.lane == lane),
             "imported_video": f"V{lane + 1}",
             "imported_audio": None,
         }
     return [rows[lane] for lane in sorted(rows, reverse=True)]
+
+
+def _titles(layout: Layout) -> list[dict[str, Any]]:
+    """Each title and the sting with the lane it sits on: one lane while none overlap in time,
+    the first free lane above for one that overlaps another (Resolve trims overlaps on a
+    track)."""
+    fps = layout.plan.fps
+    return [
+        {
+            "location": t.location,
+            "kind": t.kind,
+            "name": t.name,
+            "record_in": t.record_in,
+            "record_out": t.record_out,
+            "timecode": fps.timecode(layout.tc_start + t.record_in),
+            "lane": t.lane,
+            "imported_video": f"V{t.lane + 1}",
+        }
+        for t in layout.titles
+    ]
 
 
 def build_report(
@@ -150,6 +169,7 @@ def build_report(
         },
         "media": [ref.as_dict() for ref in layout.media.values()],
         "lanes": _lanes(layout),
+        "titles": _titles(layout),
         "audio_tracks": _audio_tracks(layout),
         "transitions": [
             {

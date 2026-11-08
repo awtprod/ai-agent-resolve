@@ -23,6 +23,7 @@ give (the compiler's rule). A wrong window or overlap leaves a mismatch.
 
 from __future__ import annotations
 
+import itertools
 import math
 from dataclasses import dataclass, field
 from typing import Any
@@ -464,6 +465,22 @@ class _Check:
             for t in self.layout.titles
         )
         self.want(got_titles == want_titles, f"titles {got_titles} != {want_titles}")
+        # Resolve trims items that overlap on one track, so titles sharing a lane never overlap,
+        # and every title lane sits above the content lanes.
+        top = max((v.lane for v in self.views), default=0)
+        spans: dict[int, list[tuple[int, int]]] = {}
+        for title in self.dec.titles:
+            spans.setdefault(title.lane, []).append(
+                (title.record_in, title.record_in + title.frames)
+            )
+        for lane, on_lane in sorted(spans.items()):
+            self.want(lane > top, f"a title on lane {lane} is not above the content lanes ({top})")
+            on_lane.sort()
+            for (a_in, a_out), (b_in, b_out) in itertools.pairwise(on_lane):
+                self.want(
+                    b_in >= a_out,
+                    f"titles overlap on lane {lane}: {a_in}..{a_out} and {b_in}..{b_out}",
+                )
         got_markers = sorted(
             (m.record, m.duration, m.value, m.note or "") for m in self.dec.markers
         )

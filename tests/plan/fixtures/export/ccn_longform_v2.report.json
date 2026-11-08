@@ -60,7 +60,7 @@
   "lanes": [
     {
       "lane": 1,
-      "carries": "titles and sting",
+      "carries": "titles: titles[0], outro.sting",
       "imported_video": "V2",
       "imported_audio": null
     },
@@ -69,6 +69,28 @@
       "carries": "V1, the primary storyline, with its clips' sound",
       "imported_video": "V1",
       "imported_audio": "A1"
+    }
+  ],
+  "titles": [
+    {
+      "location": "titles[0]",
+      "kind": "lower-third",
+      "name": "Jane Doe / Head Judge",
+      "record_in": 48,
+      "record_out": 120,
+      "timecode": "01:00:02:00",
+      "lane": 1,
+      "imported_video": "V2"
+    },
+    {
+      "location": "outro.sting",
+      "kind": "sting",
+      "name": "Baking Resistance",
+      "record_in": 312,
+      "record_out": 360,
+      "timecode": "01:00:13:00",
+      "lane": 1,
+      "imported_video": "V2"
     }
   ],
   "audio_tracks": [

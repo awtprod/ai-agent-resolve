@@ -385,6 +385,11 @@ def _render_export(report: dict[str, Any], out: Path, report_file: Path) -> str:
             + (f", sound {row['imported_audio']}" if row["imported_audio"] else "")
             for row in report["lanes"]
         ),
+        "titles (after import):",
+        *(
+            f"  {t['location']} {t['name']!r} at {t['timecode']} -> {t['imported_video']}"
+            for t in report["titles"]
+        ),
         "audio tracks (plan -> after import):",
         *(
             f"  {row['track']} {row['name']!r} -> {', '.join(row['imported'])}"

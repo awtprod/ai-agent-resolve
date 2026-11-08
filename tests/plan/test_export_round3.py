@@ -12,12 +12,13 @@ from typing import Any
 import pytest
 from apply_builders import plan_data, seg, source
 from dtd_support import load_dtd, validate
-from export_support import GOLDEN_PLANS, export
+from export_support import GOLDEN_PLANS, ccn, export, load_plan
 
 import aar.plan.export.files as files
 from aar.cli import main
-from aar.plan.export import ExportError
+from aar.plan.export import ExportError, verify_plan_fcpxml
 from aar.plan.export.files import write_pair
+from aar.plan.export.layout import stack_lanes
 from aar.plan.model import EditPlan
 
 SIZE = [1920, 1080]
@@ -48,7 +49,86 @@ def test_lanes_are_dense_so_v3_without_v2_imports_as_v2() -> None:
     ]
     lanes = {row["carries"]: (row["lane"], row["imported_video"]) for row in result.report["lanes"]}
     assert lanes["plan V3 (connected clips) with their sound"] == (1, "V2")
-    assert lanes["titles and sting"] == (2, "V3")
+    assert lanes["titles: titles[0]"] == (2, "V3")
+
+
+# -- fix-check R1: overlapping titles stack on free lanes ------------------------------------
+
+
+def test_stack_lanes_uses_the_first_free_lane() -> None:
+    assert stack_lanes([(0, 10), (20, 30)], 3) == [3, 3]  # no overlap: one lane
+    assert stack_lanes([(0, 10), (10, 20)], 3) == [3, 3]  # abutting spans share it
+    assert stack_lanes([(0, 30), (10, 20), (15, 40), (31, 50)], 1) == [1, 2, 3, 1]
+    assert stack_lanes([(40, 60), (0, 50)], 1) == [2, 1]  # in record order, not plan order
+    assert stack_lanes([], 1) == []
+
+
+def _ccn_with_overlap() -> EditPlan:
+    """The CCN golden (lower third 48-120, sting 312-360) plus a lower third at 300-340 that
+    overlaps the sting."""
+    data = load_plan(GOLDEN_PLANS["ccn_longform_v2"]).model_dump(mode="json")
+    data["titles"].append(
+        {
+            "kind": "lower-third",
+            "lines": ["Sam Roe", "Judge"],
+            "record_in": 300,
+            "record_out": 340,
+            "template": "CCN Lower Third",
+        }
+    )
+    return EditPlan.model_validate(data)
+
+
+def test_a_lower_third_overlapping_the_sting_gets_the_lane_above() -> None:
+    """Resolve trims items that overlap on one track: the sting moves to the first free lane
+    above, the two lower thirds (which never overlap) share the first title lane, and the
+    report says where each lands."""
+    result = export(_ccn_with_overlap(), ccn())
+    lanes = {t.location: t.lane for t in result.layout.titles}
+    assert lanes == {"titles[0]": 1, "titles[1]": 1, "outro.sting": 2}
+    root = ET.fromstring(result.fcpxml)
+    written = sorted((t.get("name"), t.get("lane")) for t in root.iter("title"))
+    assert written == [
+        ("Baking Resistance", "2"),
+        ("Jane Doe / Head Judge", "1"),
+        ("Sam Roe / Judge", "1"),
+    ]
+    report = result.report
+    assert [(t["location"], t["lane"], t["imported_video"]) for t in report["titles"]] == [
+        ("titles[0]", 1, "V2"),
+        ("titles[1]", 1, "V2"),
+        ("outro.sting", 2, "V3"),
+    ]
+    assert [(row["lane"], row["carries"]) for row in report["lanes"]] == [
+        (2, "titles: outro.sting"),
+        (1, "titles: titles[0], titles[1]"),
+        (0, "V1, the primary storyline, with its clips' sound"),
+    ]
+    assert verify_plan_fcpxml(result.fcpxml, _ccn_with_overlap(), ccn()).ok
+
+
+def test_the_golden_titles_keep_one_lane() -> None:
+    """No overlap (lower third 48-120, sting 312-360): both on the one title lane."""
+    result = export(load_plan(GOLDEN_PLANS["ccn_longform_v2"]), ccn())
+    assert {t.location: t.lane for t in result.layout.titles} == {
+        "titles[0]": 1,
+        "outro.sting": 1,
+    }
+
+
+def test_verify_rejects_titles_overlapping_on_one_lane() -> None:
+    """The self-check holds the rule independently of the layout: titles sharing a lane never
+    overlap, and title lanes sit above the content lanes."""
+    plan = _ccn_with_overlap()
+    text = export(plan, ccn()).fcpxml
+    root = ET.fromstring(text)
+    sting = next(t for t in root.iter("title") if t.get("lane") == "2")
+    sting.set("lane", "1")
+    problems = verify_plan_fcpxml(ET.tostring(root, encoding="unicode"), plan, ccn()).problems
+    assert any("titles overlap on lane 1: 300..340 and 312..360" in p for p in problems)
+    sting.set("lane", "-1")  # (lane 0 is refused by the reader already)
+    problems = verify_plan_fcpxml(ET.tostring(root, encoding="unicode"), plan, ccn()).problems
+    assert any("a title on lane -1 is not above the content lanes" in p for p in problems)
 
 
 # -- item 9: the export pair, both or neither --------------------------------------------------

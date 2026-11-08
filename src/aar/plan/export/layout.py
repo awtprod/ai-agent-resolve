@@ -13,7 +13,9 @@ Conventions (see docs/DESIGN.md, "FCPXML export"):
 
 * V1 is the primary spine; the other used video tracks get dense lanes in plan order (V3 with no
   V2 is lane 1), because Resolve creates no empty track for a missing lane (import test,
-  2026-11-08). Titles sit on the lane above.
+  2026-11-08). Titles sit on the lanes above: all on the first while none overlap in time, and
+  a title that overlaps another (a lower third under the sting) on the first free lane above,
+  since Resolve trims overlapping items on one track.
 * Every clip carries its own linked sound; nothing relies on ``srcEnable`` (Resolve ignores it).
   By the compiler's positional convention V``N`` content sound is plan audio track A``N``; the
   outro's sound rides with its clip, and a different planned track is reported ("move it by
@@ -199,7 +201,8 @@ class Layout:
 
     @property
     def title_lane(self) -> int:
-        """The lane above the top content lane (titles and the sting)."""
+        """The first title lane: the lane above the top content lane. Titles that overlap in
+        time stack on the lanes above it (:func:`stack_lanes`)."""
         return max(self.lanes.values(), default=0) + 1
 
     def imported_audio_track(self, lane: int) -> int:
@@ -275,6 +278,24 @@ class Layout:
             imported = f"A{self.imported_audio_track(clip.lane)}"
             rows[clip.audio_track] = (f"A{clip.audio_track}", name, imported)
         return [rows[k] for k in sorted(rows)]
+
+
+def stack_lanes(spans: list[tuple[int, int]], first: int) -> list[int]:
+    """A lane for each ``(record_in, record_out)`` span, from ``first`` up: the first lane free
+    over the whole span (spans are half-open, so one ending where the next starts shares its
+    lane). Taken in record order, this uses as few lanes as the most spans overlapping at one
+    frame."""
+    lanes = [0] * len(spans)
+    ends: list[int] = []  # per lane above ``first``: where its last span ends
+    for index in sorted(range(len(spans)), key=lambda i: (spans[i][0], i)):
+        record_in, record_out = spans[index]
+        free = next((n for n, end in enumerate(ends) if end <= record_in), len(ends))
+        if free == len(ends):
+            ends.append(record_out)
+        else:
+            ends[free] = record_out
+        lanes[index] = first + free
+    return lanes
 
 
 # -- transforms --------------------------------------------------------------------------------
@@ -881,27 +902,25 @@ class _Builder:
             )
 
     def _titles(self) -> None:
-        lane = self.layout.title_lane
-        for index, title in enumerate(self.plan.titles):
-            location = f"titles[{index}]"
-            self._inside(location, title.record_in, title.record_out)
-            self._add_title(
-                location,
-                title.kind,
-                title.record_in,
-                title.record_out,
-                title.lines,
-                title.template,
-                lane,
-            )
+        entries: list[tuple[str, str, int, int, list[str], str | None]] = [
+            (f"titles[{i}]", t.kind, t.record_in, t.record_out, t.lines, t.template)
+            for i, t in enumerate(self.plan.titles)
+        ]
         outro = self.plan.outro
         if outro is not None and outro.sting is not None:
             start = self.plan.content_frames() + outro.sting.start
-            end = start + outro.sting.frames
-            self._inside("outro.sting", start, end)
-            self._add_title(
-                "outro.sting", "sting", start, end, outro.sting.lines, outro.sting.template, lane
+            sting = outro.sting
+            entries.append(
+                ("outro.sting", "sting", start, start + sting.frames, sting.lines, sting.template)
             )
+        for location, _, record_in, record_out, _, _ in entries:
+            self._inside(location, record_in, record_out)
+        # Resolve trims items that overlap on one track: overlapping titles get their own lanes.
+        lanes = stack_lanes([(e[2], e[3]) for e in entries], self.layout.title_lane)
+        for (location, kind, record_in, record_out, lines, template), lane in zip(
+            entries, lanes, strict=True
+        ):
+            self._add_title(location, kind, record_in, record_out, lines, template, lane)
 
     def _add_title(
         self,

@@ -60,7 +60,7 @@
   "lanes": [
     {
       "lane": 2,
-      "carries": "titles and sting",
+      "carries": "titles: titles[0], outro.sting",
       "imported_video": "V3",
       "imported_audio": null
     },
@@ -75,6 +75,28 @@
       "carries": "V1, the primary storyline, with its clips' sound",
       "imported_video": "V1",
       "imported_audio": "A1"
+    }
+  ],
+  "titles": [
+    {
+      "location": "titles[0]",
+      "kind": "lower-third",
+      "name": "Sam Rivera / Headliner / Charlotte, NC",
+      "record_in": 30,
+      "record_out": 150,
+      "timecode": "01:00:01:00",
+      "lane": 2,
+      "imported_video": "V3"
+    },
+    {
+      "location": "outro.sting",
+      "kind": "sting",
+      "name": "Late Set",
+      "record_in": 910,
+      "record_out": 970,
+      "timecode": "01:00:30:10",
+      "lane": 2,
+      "imported_video": "V3"
     }
   ],
   "audio_tracks": [
