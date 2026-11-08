@@ -345,6 +345,54 @@ def test_the_key_never_leaks_from_a_hostile_success(tmp_path, clip, paid, capsys
     assert_no_key_anywhere(tmp_path, json.dumps(report), err)
 
 
+def _carries_key(request: dict[str, Any]) -> bool:
+    """The key, or the header the client sends it in, anywhere in a request the stub saw."""
+    headers = request["headers"]
+    body = request["body"] if isinstance(request["body"], bytes) else b""
+    return (
+        "x-goog-api-key" in headers
+        or any(KEY in str(value) for value in headers.values())
+        or KEY in request["path"] + request["query"]
+        or KEY.encode() in body
+    )
+
+
+def _is_bare_probe(request: dict[str, Any]) -> bool:
+    """A request nobody under test made. On the awtprod host the Command Center server probes
+    every new localhost listener with a bare ``GET /`` (user-agent node, b3 and traceparent
+    headers), so a stub can see one at any moment; ``elsewhere.requests == []`` failed 4 runs in
+    5 on dev b1a9096 (aar-evidence/s18a-val). A probe is a GET of ``/`` with no query, no body
+    and no key; the client's own requests are POSTs to the Gemini paths with the key header."""
+    return (
+        request["method"] == "GET"
+        and request["path"] == "/"
+        and not request["query"]
+        and not request["body"]
+        and not _carries_key(request)
+    )
+
+
+def test_only_a_bare_keyless_get_of_the_root_counts_as_a_host_probe() -> None:
+    def request(method="GET", path="/", query="", headers=None, body=b""):
+        return {"method": method, "path": path, "query": query, "headers": headers or {},
+                "body": body}  # fmt: skip
+
+    probe = {"host": "localhost:1", "user-agent": "node", "b3": "x-y-1-z", "traceparent": "00-x"}
+    assert _is_bare_probe(request(headers=probe))
+    assert not _is_bare_probe(request(path="/steal"))  # a followed redirect
+    assert not _is_bare_probe(request(method="POST"))
+    assert not _is_bare_probe(request(query="a=1"))
+    assert not _is_bare_probe(request(body=b"{}"))
+    for leak in (
+        request(headers={**probe, "x-goog-api-key": "anything"}),
+        request(headers={**probe, "authorization": f"Bearer {KEY}"}),
+        request(query=f"key={KEY}"),
+        request(body=KEY.encode()),
+    ):
+        assert _carries_key(leak) and not _is_bare_probe(leak)
+    assert not _carries_key(request(headers=probe))
+
+
 @needs_ffmpeg
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
 def test_redirects_are_refused_and_the_key_goes_nowhere_else(tmp_path, clip, paid, capsys, status):
@@ -358,7 +406,10 @@ def test_redirects_are_refused_and_the_key_goes_nowhere_else(tmp_path, clip, pai
         code, body, _ = cli(capsys, *base_args(tmp_path, clip), "--allow-paid")
         assert code == 1 and body["error"]["type"] == "gemini-redirect"
         assert str(status) in body["error"]["message"]
-        assert elsewhere.requests == []
+        # The redirect was not followed: nothing reached the other server but host probes,
+        # and nothing that reached it carries the key (header, query or body).
+        assert not [r for r in elsewhere.requests if _carries_key(r)]
+        assert [r for r in elsewhere.requests if not _is_bare_probe(r)] == []
         assert paid.calls()[-1] == f"DELETE /v1beta/{FILE}"  # still deleted
     finally:
         elsewhere.close()
