@@ -179,13 +179,14 @@ def test_a_timecoded_master_gives_the_plan_its_start_timecode(
     assert not [
         w for w in result.warnings if w.code in ("start-timecode-unread", "start-timecode-mismatch")
     ]
-    # S18a: the log says what supplied it. ffprobe's tag gives the frame, and the tmcd track
-    # (the same frame) its rate, which for this file is the video stream's own.
+    # S18a: the log says what supplied it: ffprobe's tag the frame (the tmcd track agrees, so no
+    # warning) and the video stream's rate, snapped to a standard rate (here it already is one).
+    assert not [w for w in result.warnings if w.code.startswith("start-timecode")]
     source_id = result.plan.sources[0].id
     entry = result.log()["start_timecodes"][source_id]
     assert (entry["from"], entry["rate_from"], entry["timecode"]) == (
         "media probe",
-        "tmcd reader",
+        "media probe",
         "01:00:00:00",
     )
     assert entry["frames"] == result.plan.sources[0].start_timecode
