@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 from pathlib import Path
@@ -19,11 +19,12 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from aar.media import MediaError, probe
 from aar.media.probe import parse_rational
 from aar.plan.inputs import LaughMap, Transcript
 from aar.plan.lint import LintReport, all_rules, lint, validate_profile
 from aar.plan.model import EditPlan, Fps, Source
-from aar.plan.produce.audio import JoinJudge, ScanStats, open_audio, pause_runs
+from aar.plan.produce.audio import JoinJudge, ScanStats, SourceAudio, open_audio, pause_runs
 from aar.plan.produce.camera import crop_width, face_x, framing_levels, reframe_keys
 from aar.plan.produce.ending import Ending, end_on_laugh
 from aar.plan.produce.errors import InvariantError, LintGateError, ProduceError, ProduceInputError
@@ -231,6 +232,86 @@ def _applies(name: str | None, sources: Sequence[Source]) -> bool:
     return name is None or all(name in (s.recording_id, s.id) for s in sources)
 
 
+Size = tuple[int, int]
+
+
+def _aspect_differs(a: Size, b: Size) -> bool:
+    """Two picture sizes disagree when their aspects differ by more than 1 %: a face track keeps
+    the display aspect but rounds its sampled size to even pixels."""
+    return abs(a[0] * b[1] - b[0] * a[1]) > 0.01 * b[0] * a[1]
+
+
+def source_frame_sizes(
+    stub: EditPlan, probed: Mapping[str, Size | None], faces: Mapping[str, FaceTrack]
+) -> tuple[dict[str, Size], list[PlannerWarning]]:
+    """Each source's ``frame_size`` (S18): the stub's own, else the media probe's display size,
+    else the face track's sampled size. An audio-only source (no probed video, no face track)
+    gets none. When the sources of a size disagree on the aspect, a warning names them; the
+    stub's explicit size still wins, and the probe wins over the face track."""
+    sizes: dict[str, Size] = {}
+    warnings: list[PlannerWarning] = []
+    for source in stub.sources:
+        found: list[tuple[str, Size]] = []
+        if source.frame_size is not None:
+            found.append(("stub", (source.frame_size[0], source.frame_size[1])))
+        probe_size = probed.get(source.id)
+        if probe_size is not None:
+            found.append(("media probe", probe_size))
+        track = faces.get(source.id)
+        if track is not None:
+            found.append(("face track", (track.header.frame_size[0], track.header.frame_size[1])))
+        if not found:
+            continue
+        (origin, chosen), others = found[0], found[1:]
+        sizes[source.id] = chosen
+        for name, size in others:
+            if _aspect_differs(chosen, size):
+                warnings.append(
+                    PlannerWarning(
+                        code="frame-size-mismatch",
+                        message=(
+                            f"source {source.id!r}: the {origin} gives a {chosen[0]}x{chosen[1]} "
+                            f"picture, the {name} {size[0]}x{size[1]} (another aspect); the "
+                            f"{origin}'s size is used"
+                        ),
+                        source=source.id,
+                        hint="check the media, the stub's frame_size and the face track",
+                    )
+                )
+    return sizes, warnings
+
+
+def probe_frame_sizes(
+    stub: EditPlan, audio: Mapping[str, SourceAudio], media_root: Path | None
+) -> tuple[dict[str, Size | None], list[PlannerWarning]]:
+    """The display size of every source the producer can read: the cut's sources from the probe
+    ``open_audio`` already made, the rest (an outro clip, say) probed when their media is a local
+    file. A file that cannot be probed is a warning, not a failure: the cut does not use it."""
+    sizes: dict[str, Size | None] = {key: value.frame_size for key, value in audio.items()}
+    warnings: list[PlannerWarning] = []
+    for source in stub.sources:
+        if source.id in sizes:
+            continue
+        path = resolve_media(source.media, media_root)
+        if path is None or not path.is_file():
+            continue
+        try:
+            video = probe(path).video
+        except MediaError as exc:
+            warnings.append(
+                PlannerWarning(
+                    code="frame-size-unread",
+                    message=f"source {source.id!r}: its picture size could not be read "
+                    f"({exc.summary()})",
+                    source=source.id,
+                    hint="set the source's frame_size in the stub",
+                )
+            )
+            continue
+        sizes[source.id] = video.display_size if video is not None else None
+    return sizes, warnings
+
+
 @dataclass
 class ProduceResult:
     plan: EditPlan
@@ -302,8 +383,13 @@ def assemble(
     faces: dict[str, FaceTrack],
     profile: Profile,
     rules: RuleView,
+    *,
+    frame_sizes: Mapping[str, tuple[int, int]] | None = None,
 ) -> tuple[EditPlan, list[PlannerWarning]]:
-    """Transform 5 and the plan: framing, the camera path, segments and transitions."""
+    """Transform 5 and the plan: framing, the camera path, segments and transitions.
+
+    ``frame_sizes`` sets each source's ``frame_size`` (from :func:`source_frame_sizes`); without
+    it the stub's own sizes and the face tracks' are used."""
     s = profile.produce
     fps = stub.fps
     sources = stub.source_map()
@@ -369,12 +455,11 @@ def assemble(
         if is_cut(pieces[index - 1], pieces[index])
     ]
     data = stub.model_dump(mode="json")
+    if frame_sizes is None:
+        frame_sizes, _ = source_frame_sizes(stub, {}, faces)
     for item in data["sources"]:
-        # The face track measured this source's picture: its size (the sampled frames keep the
-        # display aspect) frames the reframe in the FCPXML export (S18 F1). A stub's own size wins.
-        track = faces.get(item["id"])
-        if track is not None and item.get("frame_size") is None:
-            item["frame_size"] = list(track.header.frame_size)
+        if item["id"] in frame_sizes:
+            item["frame_size"] = list(frame_sizes[item["id"]])
     data.update(version=2, segments=segments, transitions=transitions)
     try:
         return EditPlan.model_validate(data), warnings
@@ -590,7 +675,12 @@ def produce(
                     hint="check the source's audio and the --venue",
                 )
             )
-    plan, framing_warnings = assemble(stub, done.pieces, keeps, coverage, tracks, profile, rules)
+    probed, size_warnings = probe_frame_sizes(stub, audio, media_root)
+    frame_sizes, mismatches = source_frame_sizes(stub, probed, tracks)
+    warnings += size_warnings + mismatches
+    plan, framing_warnings = assemble(
+        stub, done.pieces, keeps, coverage, tracks, profile, rules, frame_sizes=frame_sizes
+    )
     warnings += framing_warnings
     report = lint(plan, profile, transcript=transcript, laughs=laughs)
     if not report.ok:

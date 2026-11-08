@@ -38,6 +38,7 @@ class SourceAudio:
     path: Path
     channels: int
     duration_s: float | None  # of the audio stream, else the container
+    frame_size: tuple[int, int] | None = None  # the video's display size; None without video
 
 
 def open_audio(
@@ -67,7 +68,9 @@ def open_audio(
                 "source-unreadable", f"source {source_id!r} has no audio stream"
             )
         duration = info.audio.duration_s or info.duration_s
-        out[source_id] = SourceAudio(path, info.audio.channels or 1, duration)
+        video = info.video
+        size = video.display_size if video is not None else None
+        out[source_id] = SourceAudio(path, info.audio.channels or 1, duration, size)
     return out
 
 

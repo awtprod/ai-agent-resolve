@@ -138,14 +138,15 @@ def test_the_short_matches_its_golden_plan(short: dict[str, Path]) -> None:
     assert result.lint.duration_s < 37
 
 
-def test_the_short_takes_its_source_size_from_the_face_track(
+def test_sources_get_their_frame_size_from_the_media(
     short: dict[str, Path], longform: dict[str, Path]
 ) -> None:
-    # S18 F1: the FCPXML export frames a reframed short from Source.frame_size.
-    faces = json.loads(short["faces"].read_text(encoding="utf-8"))
-    plan = produce_short(short).plan
-    assert plan.sources[0].frame_size == faces["header"]["frame_size"] == [640, 360]
-    # No face track, no size: the long-form's sources keep none.
+    # S18: the short's master is a 160x90 video; the probe of the file the producer already reads
+    # wins over the face track's 640x360 sample (same aspect: no warning).
+    result = produce_short(short)
+    assert result.plan.sources[0].frame_size == [160, 90]
+    assert not [w for w in result.warnings if w.code.startswith("frame-size")]
+    # The long-form's cameras are WAV files: audio only, so no frame size.
     assert all(s.frame_size is None for s in produce_longform(longform).plan.sources)
 
 
