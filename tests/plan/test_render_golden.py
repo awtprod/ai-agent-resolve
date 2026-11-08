@@ -304,6 +304,8 @@ def test_short_crops_are_s18s_windows(short: Rendered) -> None:
     width, height = short.size
     picks = sorted({*range(0, 480, 3), 119, 120, 121, 239, 240, 479})
     worst = 0.0
+    bias = [0.0, 0.0]  # signed error, summed: horizontal edges, vertical edges
+    edges = 0
     for n, frame in iter_frames(short.result.out, short.size, picks):
         index = 0 if n < 240 else 1
         seg = plan.segments[index]
@@ -323,7 +325,16 @@ def test_short_crops_are_s18s_windows(short: Rendered) -> None:
         for axis, (got, expect) in enumerate(zip(reading.ring, want, strict=True)):
             per_px = width / w if axis % 2 == 0 else height / h
             worst = max(worst, abs(got - expect) / per_px)
+            bias[axis % 2] += (got - expect) / per_px
+        edges += 2
     assert worst < 1.0, f"a crop edge is {worst:.3f} source px from S18's window"
+    # Measured here: under 0.1 px at worst. The edges' mean signed error is also near zero: a
+    # slip of the half-pixel correction (perspective maps pixel indices, the window is in pixel
+    # areas) would shift every edge on that axis by about 0.15 px.
+    print(
+        "crop edge bias (source px)", [round(b / edges, 4) for b in bias], "worst", round(worst, 4)
+    )
+    assert all(abs(b / edges) < 0.06 for b in bias), bias
 
 
 def test_short_loudness_is_gain_and_limiter(short: Rendered) -> None:
