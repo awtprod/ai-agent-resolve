@@ -35,7 +35,7 @@ from aar.plan.export.fcpxml import (
     format_name,
 )
 from aar.plan.export.layout import ClipSpec, Layout, TransformSpec, TransitionSpec
-from aar.plan.export.reader import Decoded, RawClip, read_fcpxml
+from aar.plan.export.reader import Decoded, RawClip, SpineEntry, read_fcpxml
 from aar.plan.export.timebase import frame_duration_text
 from aar.plan.model import Transform
 
@@ -207,6 +207,8 @@ class _Check:
         self.decoded_transitions: list[tuple[int, int, bool, bool]] = []
         self.views: list[ClipView] = []
         self.windows = 0
+        self.expected_spine = {t.cut: t for t in layout.transitions if t.form == "transition"}
+        self.handles: dict[int, list[int]] = {}  # spine clip index -> [before its in, past its out]
 
     def want(self, ok: bool, message: str) -> None:
         if not ok:
@@ -242,73 +244,32 @@ class _Check:
         self.want(dec.event == plan.project, f"event is {dec.event!r}, not {plan.project!r}")
 
     def spine(self) -> None:
-        """Contiguity, transition overlaps and effects, and the decode of each primary clip."""
+        """Spine clips abut exactly and never overlap (Resolve trims overlaps, import test
+        2026-11-08); each transition sits at the edit between two elements with its window over
+        the cut (its frames before the cut are the cut minus its offset) and the writer's
+        effects; the decode of each clip."""
         entries = self.dec.spine
-        expected = {t.window_start: t for t in self.layout.transitions if t.form == "transition"}
-        matched: dict[int, TransitionSpec] = {}
-        for k, entry in enumerate(entries):
-            if entry.kind != "transition":
-                continue
-            raw = self.dec.transitions[entry.index]
-            spec = expected.get(raw.offset)
-            if spec is None or spec.frames != raw.frames:
-                self.problems.append(
-                    f"transition at record {raw.offset} ({raw.frames} frames) is not in the plan"
-                )
-                continue
-            matched[k] = spec
-            nxt = entries[k + 1] if k + 1 < len(entries) else None
-            prev = entries[k - 1] if k > 0 else None
-            self.want(
-                nxt is not None and nxt.kind == "clip" and nxt.raw_in == raw.offset,
-                f"transition at record {raw.offset}: the next clip does not start under it",
-            )
-            if prev is None:
-                self.want(
-                    spec.kind == "head" and raw.offset == 0,
-                    f"transition at record {raw.offset} opens the spine but is not a head at 0",
-                )
-            else:
-                self.want(
-                    prev.kind != "transition" and prev.raw_out == raw.offset + raw.frames,
-                    f"transition at record {raw.offset}: the element before it does not end "
-                    f"at {raw.offset + raw.frames} (FCPXML overlap)",
-                )
-            want_effect = (
-                CROSS_DISSOLVE if spec.video else None,
-                AUDIO_CROSSFADE if spec.audio else None,
-            )
-            self.want(
-                (raw.video_effect, raw.audio_effect) == want_effect,
-                f"transition at record {raw.offset}: effects {raw.video_effect}/"
-                f"{raw.audio_effect}, not {want_effect} (name, uid)",
-            )
-            self.decoded_transitions.append(
-                (raw.offset + spec.head_part, raw.frames, raw.video, raw.audio)
-            )
         end = 0
-        for k, entry in enumerate(entries):
+        prev = None  # the last clip or gap
+        pending = None  # a transition waiting for the element after it
+        for entry in entries:
             if entry.kind == "transition":
+                self.want(pending is None, f"two transitions in a row at record {entry.raw_in}")
+                pending = entry
                 continue
-            if k == 0 or entries[k - 1].kind != "transition":
-                self.want(
-                    entry.raw_in == end,
-                    f"spine {entry.kind} at record {entry.raw_in} does not follow the previous "
-                    f"element's end {end}",
-                )
-            end = entry.raw_out
-            if entry.kind != "clip":
-                continue
-            into = matched.get(k - 1)
-            out = matched.get(k + 1)
-            raw_clip = self.dec.clips[entry.index]
-            self.views.append(
-                _decoded_view(
-                    raw_clip,
-                    into.head_part if into is not None else 0,
-                    out.tail_part if out is not None else 0,
-                )
+            self.want(
+                entry.raw_in == end,
+                f"spine {entry.kind} at record {entry.raw_in} does not follow the previous "
+                f"element's end {end} (spine clips must abut, never overlap)",
             )
+            if pending is not None:
+                self._transition(pending, entry, prev)
+                pending = None
+            end = entry.raw_out
+            prev = entry
+            if entry.kind == "clip":
+                self.views.append(_decoded_view(self.dec.clips[entry.index], 0, 0))
+        self.want(pending is None, "a transition ends the spine, with no element after it")
         self.want(
             end == self.layout.total_frames,
             f"the spine ends at record {end}, not {self.layout.total_frames}",
@@ -316,6 +277,36 @@ class _Check:
         for raw_clip in self.dec.clips:
             if raw_clip.lane != 0:
                 self.views.append(_decoded_view(raw_clip, 0, 0))
+
+    def _transition(self, entry: SpineEntry, nxt: SpineEntry, prev: SpineEntry | None) -> None:
+        raw = self.dec.transitions[entry.index]
+        cut = nxt.raw_in
+        before = cut - raw.offset
+        spec = self.expected_spine.get(cut)
+        if spec is None or spec.frames != raw.frames or spec.head_part != before:
+            self.problems.append(
+                f"transition at record {raw.offset} ({raw.frames} frames) over the edit at {cut} "
+                "is not in the plan"
+            )
+            return
+        self.want(nxt.kind == "clip", f"transition at {cut}: no clip after it")
+        if prev is None or prev.kind == "gap":
+            self.want(spec.kind == "head", f"transition at {cut} follows no clip but is no head")
+        want_effect = (
+            CROSS_DISSOLVE if spec.video else None,
+            AUDIO_CROSSFADE if spec.audio else None,
+        )
+        self.want(
+            (raw.video_effect, raw.audio_effect) == want_effect,
+            f"transition at record {raw.offset}: effects {raw.video_effect}/"
+            f"{raw.audio_effect}, not {want_effect} (name, uid)",
+        )
+        self.decoded_transitions.append((cut, raw.frames, raw.video, raw.audio))
+        # The transition plays from the handles: the outgoing clip's media past its out, the
+        # incoming clip's before its in (checked against the media in media_bounds).
+        if prev is not None and prev.kind == "clip":
+            self.handles.setdefault(prev.index, [0, 0])[1] = raw.frames - before
+        self.handles.setdefault(nxt.index, [0, 0])[0] = before
 
     def split_crossfades(self) -> None:
         """Read each split-edit crossfade back from the two clips: the outgoing sound runs on by
@@ -381,9 +372,10 @@ class _Check:
             if ref is not None and source.duration is not None:
                 durations.setdefault(ref.src, []).append(source.duration)
         assets = {asset.src: asset for asset in self.dec.assets.values()}
-        for raw in self.dec.clips:
+        for index, raw in enumerate(self.dec.clips):
             length = raw.raw_out - raw.raw_in
-            reads = [(raw.start, raw.start + length)]
+            before, after = self.handles.get(index, [0, 0])
+            reads = [(raw.start - before, raw.start + length + after)]
             if raw.sound is not None and raw.enable != "video":
                 reads.append(raw.sound)
             first = min(a for a, _ in reads)
@@ -475,9 +467,8 @@ class _Check:
         got_markers = sorted(
             (m.record, m.duration, m.value, m.note or "") for m in self.dec.markers
         )
-        want_markers = sorted(
-            (m.record, m.duration, m.value, m.note or "") for m in self.layout.markers
-        )
+        # Resolve imports no FCPXML marker, so the writer writes none (the report lists them).
+        want_markers: list[tuple[int, int, str, str]] = []
         self.want(got_markers == want_markers, f"markers {got_markers} != {want_markers}")
 
     def against_plan(self) -> None:
@@ -488,7 +479,8 @@ class _Check:
         for index, seg in enumerate(plan.segments):
             record_in, record_out = ranges[index]
             src = self.layout.media[seg.source].src
-            row = (seg.track - 1, record_in, record_out, seg.src_in, seg.src_out, src)
+            lane = self.layout.lanes[seg.track]
+            row = (lane, record_in, record_out, seg.src_in, seg.src_out, src)
             self.want(row in have, f"segment {index} {row} is not in the file")
         if plan.outro is not None:
             rng = plan.outro_range()
@@ -496,7 +488,8 @@ class _Check:
             source = plan.source_map()[plan.outro.source]
             end = plan.outro.src_out if plan.outro.src_out is not None else source.duration
             src = self.layout.media[source.id].src
-            row = (plan.outro.track - 1, rng[0], rng[1], plan.outro.src_in, end, src)
+            lane = self.layout.lanes[plan.outro.track]
+            row = (lane, rng[0], rng[1], plan.outro.src_in, end, src)
             self.want(row in have, f"outro {row} is not in the file")
         decoded = {(cut, frames) for cut, frames, _, _ in self.decoded_transitions}
         for spec in self.layout.transitions:

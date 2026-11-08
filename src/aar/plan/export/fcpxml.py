@@ -5,19 +5,25 @@ project > sequence > spine``. Geometry follows Apple's FCPXML reference (URLs in
 aar-evidence/s18/PROGRESS.md):
 
 * Spine offsets count from the sequence's ``tcStart`` (01:00:00:00 by default), in exact rational
-  seconds. Holes on V1 are ``gap`` elements; the spine runs from 0 to the plan's total length.
-* A ``transition`` overlaps the end of the element before it and the start of the one after: the
-  outgoing clip is lengthened into its tail by the part after the cut, and the incoming clip
-  starts earlier (offset and ``start``) by the part before it. A transition from black is the
-  first spine element, or follows a gap that it overlaps.
-* V2 and up, titles and audio-only clips are anchored to the spine element under their start,
-  at a non-zero lane, with ``offset`` in that element's local time (``start`` + frames into it).
-  Markers sit in the same element the same way.
-* A clip whose sound must stop at a cut its picture runs past (the dissolve into the outro), or
-  run past a cut its picture stops at (a split-edit audio crossfade, a J/L cut), carries
-  ``audioStart``/``audioDuration``; the DTD: "Use 'audioStart' and 'audioDuration' to define J/L
-  cuts (i.e., split edits) on composite A/V clips". A split crossfade's fades are ``fadeIn`` and
-  ``fadeOut`` inside ``adjust-volume``'s ``amount`` param.
+  seconds. Spine clips keep their plan record ranges and abut exactly; holes on V1 are ``gap``
+  elements; the spine runs from 0 to the plan's total length. Resolve 21.1 "trims" overlapping
+  spine clips and duplicated the outro when they overlapped (import test, 2026-11-08).
+* A ``transition`` sits at the edit between two spine elements and plays over the media beyond
+  the outgoing clip's out and the incoming clip's in (handles); neither clip is lengthened. Its
+  ``offset`` is the cut minus its frames before the cut: the cut for one that starts on it (a
+  transition from black, an outro dissolve with no head handle), the cut minus ``d // 2`` when
+  centred, the cut minus ``d`` when it ends on it. Apple: the spine "contains elements ordered
+  sequentially in time" and "only one story element is active at a given time, except when a
+  transition is present"; the transition's "offset and duration attributes define the position
+  and extent of the transition effect".
+* Connected clips (V2 and up, dense lanes) and titles are anchored to the spine element under
+  their start, at a non-zero lane, with ``offset`` in that element's local time (``start`` +
+  frames into it). Every clip keeps its own linked sound: no ``srcEnable`` (Resolve ignores it).
+  No ``marker`` is written: Resolve imports none from FCPXML; the report lists them.
+* A clip whose sound runs past a cut its picture stops at (a split-edit audio crossfade, a J/L
+  cut) carries ``audioStart``/``audioDuration``; the DTD: "Use 'audioStart' and 'audioDuration'
+  to define J/L cuts (i.e., split edits) on composite A/V clips". A split crossfade's fades are
+  ``fadeIn`` and ``fadeOut`` inside ``adjust-volume``'s ``amount`` param.
 * A clip framed for another aspect, or moved, carries ``adjust-conform type="fill"`` before its
   ``adjust-transform`` (the DTD: "The absence 'adjust-conform' element implies 'fit'").
 
@@ -209,19 +215,13 @@ class _Writer:
         cursor = 0
         primary = sorted((c for c in self.layout.clips if c.lane == 0), key=lambda c: c.record_in)
         for clip in primary:
-            into = self.by_cut.get(clip.record_in)
-            raw_in, raw_out = self.layout.raw_range(clip)
-            if into is not None and into.kind == "head":
-                if raw_in > cursor:
-                    # The gap before a transition from black runs under it (FCPXML overlap).
-                    items.append(self._gap(spine, cursor, raw_in + into.frames))
+            if clip.record_in > cursor:
+                items.append(self._gap(spine, cursor, clip.record_in))
+            if clip.record_in in self.by_cut:
                 self._transition(spine, clip.record_in)
-            elif into is not None:
-                self._transition(spine, clip.record_in)
-            elif raw_in > cursor:
-                items.append(self._gap(spine, cursor, raw_in))
-            items.append(self._clip(spine, clip, raw_in, raw_out, self.seq(raw_in)))
-            cursor = raw_out
+            offset = self.seq(clip.record_in)
+            items.append(self._clip(spine, clip, clip.record_in, clip.record_out, offset))
+            cursor = clip.record_out
         if cursor < self.layout.total_frames:
             items.append(self._gap(spine, cursor, self.layout.total_frames))
         return items
@@ -232,7 +232,7 @@ class _Writer:
         self, parent: ET.Element, clip: ClipSpec, raw_in: int, raw_out: int, offset: str
     ) -> _SpineItem:
         """An asset-clip; ``offset`` is a sequence time on the spine, else parent-local."""
-        start = clip.src_in - (clip.record_in - raw_in)
+        start = clip.src_in
         attrs = {"ref": self.asset_ids[clip.src]}
         if clip.lane != 0:
             attrs["lane"] = str(clip.lane)
@@ -240,13 +240,11 @@ class _Writer:
         attrs["name"] = clip.name
         attrs["start"] = self.t(start)
         attrs["duration"] = self.t(raw_out - raw_in)
-        if clip.enable != "all":
-            attrs["srcEnable"] = clip.enable
-        if clip.enable != "video":
-            sound_in, sound_out = self.layout.sound_range(clip)
-            if (sound_in, sound_out) != (raw_in, raw_out):
-                attrs["audioStart"] = self.t(start + sound_in - raw_in)
-                attrs["audioDuration"] = self.t(sound_out - sound_in)
+        # Never srcEnable: Resolve 21.1 ignores it and imports the clip's sound anyway.
+        sound_in, sound_out = self.layout.sound_range(clip)
+        if (sound_in, sound_out) != (raw_in, raw_out):
+            attrs["audioStart"] = self.t(start + sound_in - raw_in)
+            attrs["audioDuration"] = self.t(sound_out - sound_in)
         element = ET.SubElement(parent, "asset-clip", attrs)
         if clip.note:
             ET.SubElement(element, "note").text = clip.note
@@ -255,7 +253,7 @@ class _Writer:
         if clip.transform is not None:
             self._transform(element, clip, clip.transform)
         fade_in, fade_out = self.layout.fades(clip)
-        if clip.enable != "video" and (clip.volume_db != 0.0 or fade_in or fade_out):
+        if clip.volume_db != 0.0 or fade_in or fade_out:
             self._volume(element, clip, fade_in, fade_out)
         return _SpineItem(raw_in, raw_out, start, element, clip)
 
@@ -293,7 +291,7 @@ class _Writer:
             if fade_out:
                 ET.SubElement(param, "fadeOut", type="linear", duration=self.t(fade_out))
 
-    # -- anchored items and markers ------------------------------------------------------------
+    # -- anchored items ------------------------------------------------------------------------
 
     def _parent(self, items: list[_SpineItem], record: int) -> _SpineItem:
         """The spine element an item starting at ``record`` is anchored to: the last one that
@@ -321,17 +319,6 @@ class _Writer:
                 self._clip(parent.element, obj, obj.record_in, obj.record_out, offset)
             else:
                 self._title(parent, obj)
-        for marker in sorted(self.layout.markers, key=lambda m: m.record):
-            parent = self._parent(items, marker.record)
-            element = ET.SubElement(
-                parent.element,
-                "marker",
-                start=self._local(parent, marker.record),
-                duration=self.t(marker.duration),
-                value=marker.value,
-            )
-            if marker.note:
-                element.set("note", marker.note)
 
     def _title(self, parent: _SpineItem, title: TitleSpec) -> None:
         self.styles += 1
@@ -372,7 +359,7 @@ def _indent(element: ET.Element, level: int = 0) -> None:
 
 
 def _reorder(root: ET.Element) -> None:
-    """Put each clip's children in the DTD's order: note, adjustments, anchored items, markers."""
+    """Put each clip's children in the DTD's order: note, adjustments, anchored items."""
     rank = {
         "note": 0,
         "adjust-conform": 1,
@@ -380,7 +367,6 @@ def _reorder(root: ET.Element) -> None:
         "adjust-volume": 3,
         "asset-clip": 4,
         "title": 4,
-        "marker": 5,
     }
     for element in root.iter():
         if element.tag in ("asset-clip", "gap"):

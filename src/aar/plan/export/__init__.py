@@ -22,7 +22,7 @@ from typing import Any
 from aar.plan.apply.inputs import plan_hash
 from aar.plan.export.errors import EXPORT_CODES, ExportError
 from aar.plan.export.fcpxml import FCPXML_VERSION, write_fcpxml
-from aar.plan.export.layout import AUDIO_CROSSFADE_FORMS, AudioCrossfade, Layout, build_layout
+from aar.plan.export.layout import Layout, build_layout
 from aar.plan.export.media import MediaMap, load_media_map, media_map_from_mapping
 from aar.plan.export.timebase import frame_duration_text
 from aar.plan.export.verify import VerifyResult, verify_fcpxml
@@ -32,7 +32,6 @@ from aar.plan.model import EditPlan
 from aar.plan.profile import Profile
 
 __all__ = [
-    "AUDIO_CROSSFADE_FORMS",
     "EXPORT_CODES",
     "ExportError",
     "ExportResult",
@@ -56,34 +55,36 @@ class ExportResult:
     layout: Layout
 
 
-def layout_for(
-    plan: EditPlan,
-    profile: Profile,
-    *,
-    media_map: MediaMap | None = None,
-    audio_crossfade: AudioCrossfade = "split",
-) -> Layout:
+def layout_for(plan: EditPlan, profile: Profile, *, media_map: MediaMap | None = None) -> Layout:
     """The export layout for ``plan`` with the profile's timeline start."""
-    return build_layout(
-        plan,
-        media_map=media_map,
-        timeline_start=profile.export.timeline_start,
-        audio_crossfade=audio_crossfade,
-    )
+    return build_layout(plan, media_map=media_map, timeline_start=profile.export.timeline_start)
+
+
+#: How to bring the file into Resolve (import test, 2026-11-08).
+IMPORT_STEPS = [
+    "In Resolve use File > Import > Timeline and pick the .fcpxml.",
+    "For a non-16:9 or custom timeline size (a 9:16 short), tick 'Use sizing information' and "
+    "'Automatically set project settings': the scripted import ignores the FCPXML format size, "
+    "so a 9:16 short came in at 1920x1080.",
+    "'Import source clips' can be left on in the dialog (the scripted import cancels with it on; "
+    "import the media first there).",
+]
 
 
 def _audio_tracks(layout: Layout) -> list[dict[str, Any]]:
-    """The plan audio tracks clips sit on, by name, with their lanes (F9)."""
+    """The plan audio tracks clips' sound is planned on, by name, with where it lands after
+    import (dense, F9 and round 3)."""
     rows: list[dict[str, Any]] = []
     for number, track in enumerate(layout.plan.audio_tracks, start=1):
-        clips = [c for c in layout.clips if c.audio_track == number and c.enable != "video"]
+        clips = [c for c in layout.clips if c.audio_track == number]
         if not clips:
             continue
+        imported = sorted({layout.imported_audio_track(c.lane) for c in clips})
         rows.append(
             {
                 "track": f"A{number}",
                 "name": track.name,
-                "lanes": sorted({c.lane for c in clips}, reverse=True),
+                "imported": [f"A{n}" for n in imported],
                 "clips": len(clips),
                 "gain_db": track.gain_db,
                 "mute": track.mute,
@@ -94,27 +95,36 @@ def _audio_tracks(layout: Layout) -> list[dict[str, Any]]:
 
 
 def _lanes(layout: Layout) -> list[dict[str, Any]]:
-    rows: dict[int, str] = {}
-    for clip in layout.clips:
-        if clip.enable == "audio":
-            rows[clip.lane] = f"A{clip.audio_track} (audio-only clips)"
-        elif clip.lane == 0:
-            rows[0] = "V1, the primary storyline, with its clips' sound (A1)"
+    """Each lane in the file, the plan track it carries and the track it is expected on after
+    import (lanes are dense, so plan V3 with no V2 imports as V2)."""
+    rows: dict[int, dict[str, Any]] = {}
+    for track, lane in sorted(layout.lanes.items()):
+        if lane == 0:
+            what = "V1, the primary storyline, with its clips' sound"
         else:
-            rows.setdefault(
-                clip.lane,
-                f"V{clip.lane + 1} (connected clips) with their sound "
-                f"(A{clip.lane + 1} by position)",
-            )
+            what = f"plan V{track} (connected clips) with their sound"
+        rows[lane] = {
+            "lane": lane,
+            "carries": what,
+            "imported_video": f"V{lane + 1}",
+            "imported_audio": f"A{layout.imported_audio_track(lane)}",
+        }
     if layout.titles:
-        rows[layout.title_lane] = f"titles and sting (V{layout.title_lane + 1})"
-    return [{"lane": lane, "carries": rows[lane]} for lane in sorted(rows, reverse=True)]
+        lane = layout.title_lane
+        rows[lane] = {
+            "lane": lane,
+            "carries": "titles and sting",
+            "imported_video": f"V{lane + 1}",
+            "imported_audio": None,
+        }
+    return [rows[lane] for lane in sorted(rows, reverse=True)]
 
 
 def build_report(
     layout: Layout, text: str, warnings: list[Finding], check: VerifyResult
 ) -> dict[str, Any]:
-    """The export report: what was exported and every plan feature FCPXML cannot carry."""
+    """The export report: what was exported, how to import it, and every plan feature FCPXML
+    (or Resolve's import) cannot carry."""
     plan = layout.plan
     res = plan.resolution
     return {
@@ -130,19 +140,17 @@ def build_report(
             "total_frames": layout.total_frames,
             "resolution": f"{res.width}x{res.height}",
         },
+        "import": IMPORT_STEPS,
         "exported": {
             "segments": sum(c.location.startswith("segments[") for c in layout.clips),
             "outro": any(c.location == "outro" for c in layout.clips),
-            "audio_only_clips": sum(c.enable == "audio" for c in layout.clips),
             "transitions": len(layout.transitions),
             "titles": len(layout.titles),
-            "markers": len(layout.markers),
             "assets": len(layout.assets),
         },
         "media": [ref.as_dict() for ref in layout.media.values()],
         "lanes": _lanes(layout),
         "audio_tracks": _audio_tracks(layout),
-        "audio_crossfade": layout.audio_crossfade,
         "transitions": [
             {
                 "location": t.location,
@@ -155,6 +163,21 @@ def build_report(
             }
             for t in layout.transitions
         ],
+        "not_imported": {
+            "heading": "not imported: add by hand",
+            "markers": [
+                {
+                    "location": m.location,
+                    "timecode": plan.fps.timecode(layout.tc_start + m.record),
+                    "record_frame": m.record,
+                    "duration": m.duration,
+                    "name": m.value,
+                    "color": plan.markers[i].color,
+                    "note": m.note,
+                }
+                for i, m in enumerate(layout.markers)
+            ],
+        },
         "not_expressible": [item.as_dict() for item in layout.not_expressible],
         "notes": [item.as_dict() for item in layout.notes],
         "lint_warnings": [{"rule": f.rule, "message": f.message} for f in warnings],
@@ -169,7 +192,6 @@ def export_fcpxml(
     media_map: MediaMap | None = None,
     transcript: Transcript | None = None,
     laughs: LaughMap | None = None,
-    audio_crossfade: AudioCrossfade = "split",
 ) -> ExportResult:
     """Lint, build, write and self-check one plan; a typed :class:`ExportError` on refusal."""
     report = lint(plan, profile, transcript=transcript, laughs=laughs)
@@ -182,11 +204,10 @@ def export_fcpxml(
             errors=[{"rule": f.rule, "message": f.message} for f in errors],
         )
     warnings = [f for f in report.findings if f.severity == "warn"]
-    layout = layout_for(plan, profile, media_map=media_map, audio_crossfade=audio_crossfade)
+    layout = layout_for(plan, profile, media_map=media_map)
     text = write_fcpxml(layout)
     # The self-check compares the file with a layout built afresh from the plan.
-    fresh = layout_for(plan, profile, media_map=media_map, audio_crossfade=audio_crossfade)
-    check = verify_fcpxml(text, fresh)
+    check = verify_fcpxml(text, layout_for(plan, profile, media_map=media_map))
     if not check.ok:
         raise ExportError(
             "self_check_failed",
@@ -203,8 +224,6 @@ def verify_plan_fcpxml(
     profile: Profile,
     *,
     media_map: MediaMap | None = None,
-    audio_crossfade: AudioCrossfade = "split",
 ) -> VerifyResult:
     """Read an FCPXML file back and compare it with ``plan`` (``aar plan export --verify``)."""
-    layout = layout_for(plan, profile, media_map=media_map, audio_crossfade=audio_crossfade)
-    return verify_fcpxml(text, layout)
+    return verify_fcpxml(text, layout_for(plan, profile, media_map=media_map))

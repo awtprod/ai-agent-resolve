@@ -11,18 +11,22 @@ handle is no handle" rule. Nothing here talks to Resolve or the network.
 
 Conventions (see docs/DESIGN.md, "FCPXML export"):
 
-* Plan video track ``N`` is lane ``N - 1``: V1 is the primary spine, V2 and up are connected clips.
-* A content segment carries its own sound, which by the compiler's positional convention sits on
-  audio track ``A{N}``; plan audio track ``A{k}`` for ``k >= 2`` maps to lane ``-(k - 1)`` for an
-  audio-only clip (the outro's sound on its named track). FCPXML has no tracks, so a track's gain
-  is folded into each clip's volume and its mute and bus are reported.
-* A transition's alignment comes from the compiler's own rule
+* V1 is the primary spine; the other used video tracks get dense lanes in plan order (V3 with no
+  V2 is lane 1), because Resolve creates no empty track for a missing lane (import test,
+  2026-11-08). Titles sit on the lane above.
+* Every clip carries its own linked sound; nothing relies on ``srcEnable`` (Resolve ignores it).
+  By the compiler's positional convention V``N`` content sound is plan audio track A``N``; the
+  outro's sound rides with its clip, and a different planned track is reported ("move it by
+  hand"). FCPXML has no tracks, so a track's gain is folded into each clip's volume and its mute
+  and bus are reported.
+* Spine clips keep their plan record ranges and abut. A ``transition`` element sits at the edit,
+  over the media beyond each clip's in and out (handles): its offset is the cut minus its frames
+  before the cut. The alignment comes from the compiler's own rule
   (:func:`aar.plan.apply.compile.transition_alignment`): centred when the handles hold all its
   media (``d // 2`` frames before the cut), else it starts on the cut (``right``) or ends on it
-  (``left``). FCPXML overlaps the clips under a transition element, so the media must exist.
-* An audio-only crossfade is, by default, a split edit (``split``): the picture cuts at the
-  plan's cut and each clip's sound runs on under the other's with fades; ``transition`` writes it
-  as a spine transition holding only ``filter-audio``.
+  (``left``).
+* An audio-only crossfade is a split edit (J/L cut): the picture cuts at the plan's cut and each
+  clip's sound runs on under the other's with fades.
 * Framing: ``Source.frame_size`` gives the source picture's aspect. A clip whose aspect differs
   from the timeline's, or that has a reframe or transform, gets ``adjust-conform type="fill"``
   and an ``adjust-transform`` computed in FCPXML's units from the source size; such a clip needs
@@ -42,7 +46,6 @@ from aar.plan.apply.compile import (
     _last_content_segment,
     incoming_head,
     outgoing_tail,
-    title_track,
     transition_alignment,
 )
 from aar.plan.export.errors import ExportError
@@ -59,9 +62,8 @@ DEFAULT_AUDIO_TRANSITION = "Cross Fade 0 dB"
 Enable = Literal["all", "video", "audio"]
 TransitionKind = Literal["head", "join", "outro"]
 Alignment = Literal["right", "center", "left"]
-#: How an audio-only crossfade is written: a J/L split edit, or a spine transition.
-AudioCrossfade = Literal["split", "transition"]
-AUDIO_CROSSFADE_FORMS: tuple[AudioCrossfade, ...] = ("split", "transition")
+#: How a transition is written: a spine ``transition`` element, or (audio-only) a split edit.
+TransitionForm = Literal["transition", "split"]
 
 
 @dataclass(frozen=True)
@@ -120,7 +122,7 @@ class TransitionSpec:
     alignment: Alignment
     video: bool
     audio: bool
-    form: AudioCrossfade = "transition"
+    form: TransitionForm = "transition"
 
     @property
     def window_start(self) -> int:
@@ -184,7 +186,6 @@ class Layout:
     tc_start: int
     timeline_start: str
     total_frames: int
-    audio_crossfade: AudioCrossfade = "split"
     clips: list[ClipSpec] = field(default_factory=list)
     transitions: list[TransitionSpec] = field(default_factory=list)
     titles: list[TitleSpec] = field(default_factory=list)
@@ -193,10 +194,18 @@ class Layout:
     assets: list[AssetSpec] = field(default_factory=list)
     not_expressible: list[ReportItem] = field(default_factory=list)
     notes: list[ReportItem] = field(default_factory=list)
+    #: Plan video track -> lane: V1 is 0, the other used tracks dense from 1 in plan order.
+    lanes: dict[int, int] = field(default_factory=dict)
 
     @property
     def title_lane(self) -> int:
-        return title_track(self.plan) - 1
+        """The lane above the top content lane (titles and the sting)."""
+        return max(self.lanes.values(), default=0) + 1
+
+    def imported_audio_track(self, lane: int) -> int:
+        """The audio track a clip's sound is expected on after import: Resolve gives the spine's
+        sound A1 and each used lane the next track (dense; no empty tracks)."""
+        return lane + 1
 
     def transition_at(self, cut: int) -> TransitionSpec | None:
         """The transition at record frame ``cut`` of video track 1, in either form (cuts are
@@ -211,34 +220,23 @@ class Layout:
         spec = self.transition_at(cut)
         return spec if spec is not None and spec.form == "transition" else None
 
-    def raw_range(self, clip: ClipSpec) -> tuple[int, int]:
-        """The record frames a clip covers in the file: its plan range, widened under the
-        transition elements on its ends (FCPXML overlaps both neighbours under one)."""
-        if clip.lane != 0:
-            return clip.record_in, clip.record_out
-        into = self.spine_transition_at(clip.record_in)
-        out = self.spine_transition_at(clip.record_out)
-        return (
-            clip.record_in - (into.head_part if into is not None else 0),
-            clip.record_out + (out.tail_part if out is not None else 0),
-        )
-
     def sound_range(self, clip: ClipSpec) -> tuple[int, int]:
-        """The record frames a clip's sound plays: its plan range, widened only under an audio
-        crossfade (in a transition element, or a split edit)."""
+        """The record frames a clip's own sound plays: its plan range, widened only by a split
+        edit (an audio-only crossfade's J/L cut). A transition element's crossfade plays from the
+        handles and leaves the clip's range alone."""
         if clip.lane != 0:
             return clip.record_in, clip.record_out
         into, out = self.transition_at(clip.record_in), self.transition_at(clip.record_out)
         return (
-            clip.record_in - (into.head_part if into is not None and into.audio else 0),
-            clip.record_out + (out.tail_part if out is not None and out.audio else 0),
+            clip.record_in - (into.head_part if into is not None and into.form == "split" else 0),
+            clip.record_out + (out.tail_part if out is not None and out.form == "split" else 0),
         )
 
     def fades(self, clip: ClipSpec) -> tuple[int, int]:
         """The clip's sound fade-in and fade-out: the head and end fades, plus the fades of a
         split-edit crossfade on its ends (they never fall on the same end)."""
         fade_in, fade_out = clip.fade_in, clip.fade_out
-        if clip.lane == 0 and clip.enable != "video":
+        if clip.lane == 0:
             into, out = self.transition_at(clip.record_in), self.transition_at(clip.record_out)
             if into is not None and into.form == "split":
                 fade_in += into.frames
@@ -246,20 +244,37 @@ class Layout:
                 fade_out += out.frames
         return fade_in, fade_out
 
-    def audio_lane(self, track: int) -> int:
-        """The lane of an audio-only clip on plan audio track ``A{track}`` (``track >= 2``)."""
-        return -(track - 1)
-
     def sequence_note(self) -> str | None:
-        """The sequence-level note: what the file cannot say about the audio topology."""
+        """The sequence-level note: the audio track mapping, and what the file cannot say about
+        the audio topology."""
         lines = [
             f"{item.location}: {item.detail}"
             for item in self.not_expressible
-            if item.feature in ("audio_mute", "audio_bus", "template")
+            if item.feature in ("audio_mute", "audio_bus", "template", "outro_sound_track")
         ]
-        if not lines:
+        mapping = [
+            f"plan {plan} ({name}) -> imported {imported}"
+            for plan, name, imported in self.audio_mapping()
+        ]
+        if not lines and not mapping:
             return None
-        return "aar export: not expressible in FCPXML (see the export report)\n" + "\n".join(lines)
+        parts = ["aar export: not expressible in FCPXML (see the export report)", *lines]
+        if mapping:
+            parts += ["audio tracks after import:", *mapping]
+        return "\n".join(parts)
+
+    def audio_mapping(self) -> list[tuple[str, str, str]]:
+        """(plan track, its name, imported track) for every plan audio track a clip's sound is
+        planned on, in plan track order: where that sound lands after import (dense)."""
+        rows: dict[int, tuple[str, str, str]] = {}
+        tracks = self.plan.audio_tracks
+        for clip in self.clips:
+            if clip.audio_track is None or clip.audio_track in rows:
+                continue
+            name = tracks[clip.audio_track - 1].name if clip.audio_track <= len(tracks) else "-"
+            imported = f"A{self.imported_audio_track(clip.lane)}"
+            rows[clip.audio_track] = (f"A{clip.audio_track}", name, imported)
+        return [rows[k] for k in sorted(rows)]
 
 
 # -- transforms --------------------------------------------------------------------------------
@@ -317,10 +332,7 @@ class _Builder:
         plan: EditPlan,
         media_map: MediaMap | None,
         timeline_start: str,
-        audio_crossfade: AudioCrossfade,
     ) -> None:
-        if audio_crossfade not in AUDIO_CROSSFADE_FORMS:
-            raise ValueError(f"audio_crossfade must be one of {AUDIO_CROSSFADE_FORMS}")
         self.plan = plan
         self.media_map = media_map
         self.timebase = Timebase.of(plan.fps)
@@ -341,7 +353,12 @@ class _Builder:
                 "add segments to the plan",
             )
         self.ranges = plan.record_ranges()
-        self.layout = Layout(plan, self.timebase, tc_start, timeline_start, total, audio_crossfade)
+        self.layout = Layout(plan, self.timebase, tc_start, timeline_start, total)
+        used = {seg.track for seg in plan.segments}
+        if plan.outro is not None:
+            used.add(plan.outro.track)
+        others = sorted(t for t in used if t != 1)
+        self.layout.lanes = {1: 0, **{track: lane for lane, track in enumerate(others, start=1)}}
 
     # -- report helpers ------------------------------------------------------------------------
 
@@ -471,7 +488,7 @@ class _Builder:
             self.layout.clips.append(
                 ClipSpec(
                     location=f"segments[{index}]",
-                    lane=seg.track - 1,
+                    lane=self.layout.lanes[seg.track],
                     record_in=record_in,
                     record_out=record_out,
                     src_in=seg.src_in,
@@ -573,37 +590,11 @@ class _Builder:
                 audio_track=outro.audio_track,
             )
         record_in, record_out = rng
-        lane = outro.track - 1
+        lane = self.layout.lanes[outro.track]
         frame_size, conform = self._framing("outro", source, False)
-        framing = {"frame_size": frame_size, "conform": conform}
-        if audio == outro.track or audio == 1:
-            if audio != outro.track:
-                self.unexpressible(
-                    "outro_audio_track",
-                    "outro.audio_track",
-                    f"the outro's sound is on A1 but its picture on V{outro.track}; an audio-only "
-                    "clip cannot sit in the primary storyline, so the sound rides with the picture",
-                    "move the outro's sound to A1 in Resolve after import",
-                )
-            self.layout.clips.append(
-                ClipSpec(
-                    "outro",
-                    lane,
-                    record_in,
-                    record_out,
-                    outro.src_in,
-                    src_out,
-                    ref.src,
-                    "all",
-                    # The sound plays on A{audio}: its own track, or A1 riding with a V2+
-                    # picture; that track's gain applies (F2).
-                    audio,
-                    volume_db=self._track_gain(audio),
-                    name=ref.name,
-                    **framing,  # type: ignore[arg-type]
-                )
-            )
-            return
+        # One clip with its own linked sound (Resolve ignores srcEnable, so a picture-only clip
+        # plus a sound-only companion doubled the sound in the import test). Its volume is the
+        # gain of the track the plan puts the sound on (F2).
         self.layout.clips.append(
             ClipSpec(
                 "outro",
@@ -613,27 +604,27 @@ class _Builder:
                 outro.src_in,
                 src_out,
                 ref.src,
-                "video",
-                None,
-                name=ref.name,
-                **framing,  # type: ignore[arg-type]
-            )
-        )
-        self.layout.clips.append(
-            ClipSpec(
-                "outro.audio_track",
-                self.layout.audio_lane(audio),
-                record_in,
-                record_out,
-                outro.src_in,
-                src_out,
-                ref.src,
-                "audio",
+                "all",
                 audio,
                 volume_db=self._track_gain(audio),
                 name=ref.name,
+                frame_size=frame_size,
+                conform=conform,
             )
         )
+        if audio != outro.track:
+            name = self.plan.audio_tracks[audio - 1].name
+            is_bus = any(t.bus == name for t in self.plan.audio_tracks)
+            target = f"the {name} bus" if is_bus else name
+            imported = self.layout.imported_audio_track(lane)
+            self.unexpressible(
+                "outro_sound_track",
+                "outro.audio_track",
+                f"outro sound is on the clip's own track (imported A{imported}), not on "
+                f"A{audio} {name!r} as planned; FCPXML cannot move a clip's sound to another "
+                "track without doubling it in Resolve",
+                f"outro sound is on the clip's own track; move it to {target} by hand",
+            )
 
     def _clip(self, location: str) -> int:
         for index, clip in enumerate(self.layout.clips):
@@ -651,11 +642,7 @@ class _Builder:
         end = self.plan.end_fade_frames or 0
         if end > 0:
             if self.plan.outro is not None:
-                carrier = next(
-                    i
-                    for i, c in enumerate(clips)
-                    if c.location.startswith("outro") and c.enable != "video"
-                )
+                carrier = self._clip("outro")
             else:
                 last = _last_content_segment(self.plan)
                 assert last is not None, "a non-empty timeline without an outro has segments"
@@ -665,8 +652,6 @@ class _Builder:
     def _check_fades(self) -> None:
         """A clip's fades (head, end and split-edit crossfades) fit in the sound it plays."""
         for clip in self.layout.clips:
-            if clip.enable == "video":
-                continue
             fade_in, fade_out = self.layout.fades(clip)
             sound_in, sound_out = self.layout.sound_range(clip)
             if fade_in + fade_out > sound_out - sound_in:
@@ -792,7 +777,7 @@ class _Builder:
                 continue
             frames = tx.video_frames if video else audio_frames
             alignment, before = self._alignment(tx.after, frames, location)
-            form: AudioCrossfade = "transition" if video else self.layout.audio_crossfade
+            form: TransitionForm = "transition" if video else "split"
             self.layout.transitions.append(
                 TransitionSpec(
                     location, "join", 1, cut, frames, before, alignment, video, True, form
@@ -958,13 +943,21 @@ class _Builder:
             self.layout.markers.append(
                 MarkerSpec(location, marker.record, marker.duration, marker.name, marker.note)
             )
-            if marker.color is not None:
-                self.unexpressible(
-                    "marker_color",
-                    f"{location}.color",
-                    f"FCPXML markers have no colour ({marker.color})",
-                    f"set the marker colour to {marker.color} in Resolve",
-                )
+            # Resolve 21.1 imports no FCPXML marker (import test, 2026-11-08): none is written,
+            # and each is listed to add by hand.
+            timecode = self.plan.fps.timecode(self.layout.tc_start + marker.record)
+            extra = "".join(
+                f", {part}"
+                for part in (marker.color, marker.note and f"note {marker.note!r}")
+                if part
+            )
+            self.unexpressible(
+                "marker",
+                location,
+                f"marker {marker.name!r} at {timecode} ({marker.duration} frame(s){extra}) is not "
+                "imported by Resolve from FCPXML",
+                f"add it by hand at {timecode}",
+            )
 
     # -- assets --------------------------------------------------------------------------------
 
@@ -1107,18 +1100,8 @@ class _Builder:
                 "end_fade_frames",
                 f"{plan.end_fade_frames}-frame fade-out on the last clip's volume",
             )
-        if any(t.kind == "outro" for t in self.layout.transitions):
-            self.note(
-                "outro_sound",
-                "outro.transition",
-                "the dissolve overlaps the last segment's picture into its tail; its sound still "
-                "ends at the outro (audioStart/audioDuration)",
-                "check it in Resolve",
-            )
         for clip in self.layout.clips:
-            if clip.enable == "video" or self.layout.sound_range(clip) == self.layout.raw_range(
-                clip
-            ):
+            if self.layout.sound_range(clip) == (clip.record_in, clip.record_out):
                 continue
             ends = (
                 self.layout.spine_transition_at(clip.record_in),
@@ -1129,8 +1112,8 @@ class _Builder:
                     self.unexpressible(
                         "split_audio_crossfade",
                         spec.location,
-                        f"{clip.location} needs split audio timing (audioStart/audioDuration) for "
-                        "a video-only transition on its other end; Final Cut Pro ignores an "
+                        f"{clip.location} has split audio timing (audioStart/audioDuration) for a "
+                        "J/L crossfade on its other end; Final Cut Pro ignores a transition's "
                         "audio crossfade on such a clip (Resolve's import is unconfirmed)",
                         "check this audio crossfade after import and re-add it if missing",
                     )
@@ -1141,7 +1124,7 @@ class _Builder:
                 "audio-only crossfades are split edits: the picture cuts at the plan's cut, each "
                 "clip's sound runs on under the other's (audioStart/audioDuration) and fades out "
                 "or in over the crossfade (adjust-volume fadeIn/fadeOut)",
-                "check them after import; --audio-crossfade transition writes spine transitions",
+                "check them after import (Resolve puts the overlapping sound on another track)",
             )
         for source in plan.sources:
             if source.id in self.layout.media and source.frame_size is None:
@@ -1171,7 +1154,6 @@ def build_layout(
     *,
     media_map: MediaMap | None = None,
     timeline_start: str = DEFAULT_TIMELINE_START,
-    audio_crossfade: AudioCrossfade = "split",
 ) -> Layout:
     """Every export decision for ``plan``, or a typed :class:`ExportError`."""
-    return _Builder(plan, media_map, timeline_start, audio_crossfade).build()
+    return _Builder(plan, media_map, timeline_start).build()

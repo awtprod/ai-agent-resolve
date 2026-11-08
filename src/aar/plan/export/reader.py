@@ -14,8 +14,9 @@ Problems are collected, not raised, so one run reports them all:
 * a duplicate id, or a ``ref``/``format`` that does not resolve to a resource of the right kind;
 * a time that is not an exact rational on a frame boundary of the sequence's rate;
 * anything the writer never emits (:func:`check_writer_subset`): an element, an attribute, or a
-  value of a fixed attribute (``enabled``, ``anchor``, a proxy ``media-rep``, ``tcFormat="DF"``
-  ...). A hand-edited or foreign file cannot pass, however DTD-valid it is.
+  value of a fixed attribute (``enabled``, ``anchor``, ``srcEnable``, a ``marker``, a proxy
+  ``media-rep``, ``tcFormat="DF"`` ...). A hand-edited or foreign file cannot pass, however
+  DTD-valid it is.
 """
 
 from __future__ import annotations
@@ -236,7 +237,6 @@ WRITER_ATTRS: dict[str, _W] = {
         "name": _ANY,
         "start": _ANY,
         "duration": _ANY,
-        "srcEnable": frozenset({"video", "audio"}),
         "audioStart": _ANY,
         "audioDuration": _ANY,
     },
@@ -253,7 +253,6 @@ WRITER_ATTRS: dict[str, _W] = {
     },
     "fadeIn": {"type": frozenset({"linear"}), "duration": _ANY},
     "fadeOut": {"type": frozenset({"linear"}), "duration": _ANY},
-    "marker": {"start": _ANY, "duration": _ANY, "value": _ANY, "note": _ANY},
     "title": {"ref": _ANY, "lane": _ANY, "offset": _ANY, "name": _ANY, "duration": _ANY},
     "text": {},
     "text-style-def": {"id": _ANY},
@@ -288,7 +287,6 @@ WRITER_REQUIRED: dict[str, frozenset[str]] = {
     "keyframe": frozenset({"time", "value", "interp", "curve"}),
     "fadeIn": frozenset({"type", "duration"}),
     "fadeOut": frozenset({"type", "duration"}),
-    "marker": frozenset({"start", "duration", "value"}),
     "title": frozenset({"ref", "lane", "offset", "name", "duration"}),
     "text-style-def": frozenset({"id"}),
 }

@@ -28,6 +28,7 @@ from aar.plan.export import (
     load_media_map,
     verify_plan_fcpxml,
 )
+from aar.plan.export.files import write_pair
 from aar.plan.export.reader import MAX_BYTES as FCPXML_MAX_BYTES
 from aar.plan.inputs import LaughMap, Transcript, load_laughs, load_transcript
 from aar.plan.lint import Finding, LintReport, Ref, lint
@@ -129,14 +130,6 @@ def register(subparsers: Any) -> None:
         "--media-map",
         type=Path,
         help="JSON object of linux_root -> windows_root, for sources with hub (Linux) paths.",
-    )
-    export.add_argument(
-        "--audio-crossfade",
-        choices=["split", "transition"],
-        default="split",
-        help="How an audio-only crossfade is written: 'split' (default) keeps the picture cut "
-        "and overlaps the sound as a J/L split edit with fades; 'transition' writes a spine "
-        "transition holding only an audio crossfade. --verify needs the same choice.",
     )
     export.add_argument("--transcript", type=Path, help="Transcript JSON, for the lint.")
     export.add_argument("--laughs", type=Path, help="Laugh map JSON, for the lint.")
@@ -366,39 +359,9 @@ def report_path(out: Path) -> Path:
     return out.with_name(f"{out.stem}.report.json")
 
 
-def _place_new(data: bytes, dest: Path, overwrite: bool) -> None:
-    from aar.drp.modify.write import _place, _temp
-
-    tmp = _temp(dest.parent, dest.name, data, mode=0o644)
-    try:
-        _place(tmp, dest, overwrite)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-
-
 def _write_export(out: Path, report: Path, fcpxml: str, body: str, overwrite: bool) -> None:
-    for dest in (out, report):
-        if dest.is_dir():
-            raise ExportError(
-                "output_exists", f"{str(dest)!r} is a directory", "give a file path for --out"
-            )
-        if not overwrite and (dest.exists() or dest.is_symlink()):
-            raise ExportError(
-                "output_exists",
-                f"{str(dest)!r} already exists",
-                "choose another --out, or pass --overwrite",
-                path=str(dest),
-            )
-    try:
-        _place_new(fcpxml.encode("utf-8"), out, overwrite)
-        _place_new(body.encode("utf-8"), report, overwrite)
-    except FileExistsError as exc:
-        raise ExportError(
-            "output_exists",
-            f"{exc.filename!r} appeared while writing",
-            "choose another --out, or pass --overwrite",
-        ) from None
+    """The FCPXML and its report land together or not at all (round 3, item 9)."""
+    write_pair([(out, fcpxml.encode("utf-8")), (report, body.encode("utf-8"))], overwrite=overwrite)
 
 
 def _render_export(report: dict[str, Any], out: Path, report_file: Path) -> str:
@@ -410,13 +373,25 @@ def _render_export(report: dict[str, Any], out: Path, report_file: Path) -> str:
         f"timeline {report['plan']['timeline']!r}: {timeline['fps']} fps, starts "
         f"{timeline['start']}, {timeline['total_frames']} frames, {timeline['resolution']}",
         f"exported: {counts['segments']} segment(s), outro {'yes' if counts['outro'] else 'no'}, "
-        f"{counts['audio_only_clips']} audio-only clip(s), {counts['transitions']} "
-        f"transition(s), {counts['titles']} title(s), {counts['markers']} marker(s), "
+        f"{counts['transitions']} transition(s), {counts['titles']} title(s), "
         f"{counts['assets']} asset(s)",
+        "import into Resolve:",
+        *(f"  - {step}" for step in report["import"]),
         "media:",
         *(f"  {m['source']}: {m['src']} ({m['rule']})" for m in report["media"]),
-        "lanes:",
-        *(f"  lane {row['lane']}: {row['carries']}" for row in report["lanes"]),
+        "lanes (after import):",
+        *(
+            f"  lane {row['lane']}: {row['carries']} -> {row['imported_video']}"
+            + (f", sound {row['imported_audio']}" if row["imported_audio"] else "")
+            for row in report["lanes"]
+        ),
+        "audio tracks (plan -> after import):",
+        *(
+            f"  {row['track']} {row['name']!r} -> {', '.join(row['imported'])}"
+            for row in report["audio_tracks"]
+        ),
+        f"{report['not_imported']['heading']} ({len(report['not_imported']['markers'])}):",
+        *(f"  marker {m['name']!r} at {m['timecode']}" for m in report["not_imported"]["markers"]),
         f"not expressible in FCPXML ({len(report['not_expressible'])}):",
         *(
             f"  {item['location']}: {item['detail']} -> {item['action']}"
@@ -461,7 +436,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
         return _input_error(type(exc).__name__, str(exc), [], as_json)
 
     if args.verify is not None:
-        return _do_verify(args.verify, plan, profile, media_map, args.audio_crossfade, as_json)
+        return _do_verify(args.verify, plan, profile, media_map, as_json)
     try:
         result = export_fcpxml(
             plan,
@@ -469,7 +444,6 @@ def _cmd_export(args: argparse.Namespace) -> int:
             media_map=media_map,
             transcript=transcript,
             laughs=laughs,
-            audio_crossfade=args.audio_crossfade,
         )
     except ExportError as exc:
         return _export_refusal(exc, as_json)
@@ -489,9 +463,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
     return cli_io.emit(_PROG, text)
 
 
-def _do_verify(
-    path: Path, plan: EditPlan, profile: Any, media_map: Any, crossfade: Any, as_json: bool
-) -> int:
+def _do_verify(path: Path, plan: EditPlan, profile: Any, media_map: Any, as_json: bool) -> int:
     try:
         if path.stat().st_size > FCPXML_MAX_BYTES:
             return _input_error(
@@ -501,9 +473,7 @@ def _do_verify(
     except (OSError, UnicodeDecodeError) as exc:
         return _input_error(type(exc).__name__, str(exc), [], as_json)
     try:
-        result = verify_plan_fcpxml(
-            text, plan, profile, media_map=media_map, audio_crossfade=crossfade
-        )
+        result = verify_plan_fcpxml(text, plan, profile, media_map=media_map)
     except ExportError as exc:
         return _export_refusal(exc, as_json)
     if as_json:
