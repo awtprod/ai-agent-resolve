@@ -7,7 +7,7 @@ and the CLI prints them. A refusal is never a guess or a silent drop.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 #: Every code the compiler may refuse with. Kept here so a test can assert the set is stable.
 CODES = frozenset(
@@ -52,11 +52,14 @@ CODES = frozenset(
 
 
 class CompileError(Exception):
-    """A typed compile refusal. ``code`` is one of :data:`CODES`."""
+    """A typed compile refusal. ``code`` is one of :data:`CODES` (a subclass may name its own
+    set in ``codes``, as the FCPXML exporter's ``ExportError`` does)."""
+
+    codes: ClassVar[frozenset[str]] = CODES
 
     def __init__(self, code: str, message: str, fix_hint: str, **details: Any) -> None:
-        if code not in CODES:
-            raise ValueError(f"unknown compile error code {code!r}")
+        if code not in self.codes:
+            raise ValueError(f"unknown {type(self).__name__} code {code!r}")
         super().__init__(message)
         self.code = code
         self.message = message

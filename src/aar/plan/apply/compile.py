@@ -923,15 +923,8 @@ class _Finish:
         """Choose an alignment from the handles the plan's source ranges actually have, and
         refuse when none fits (F7). Outgoing tail = source.duration - src_out; incoming head =
         the next same-track segment's src_in (0 for the outro, which starts at source frame 0)."""
-        sources = self.plan.source_map()
-        out_seg = self.plan.segments[outgoing_index]
-        out_src = sources.get(out_seg.source)
-        tail = (
-            None
-            if out_src is None or out_src.duration is None
-            else out_src.duration - out_seg.src_out
-        )
-        head = self._incoming_head(outgoing_index)
+        tail = outgoing_tail(self.plan, outgoing_index)
+        head = incoming_head(self.plan, outgoing_index)
         half = frames // 2
         if _fits(tail, half) and _fits(head, half):
             return "center"
@@ -949,15 +942,6 @@ class _Finish:
             incoming_head=head,
             frames=frames,
         )
-
-    def _incoming_head(self, outgoing_index: int) -> int | None:
-        track = self.plan.segments[outgoing_index].track
-        for index in range(outgoing_index + 1, len(self.plan.segments)):
-            if self.plan.segments[index].track == track:
-                return self.plan.segments[index].src_in
-        if self.plan.outro is not None and self.plan.outro.track == track:
-            return self.plan.outro.src_in
-        return None
 
     # -- head / end fades ----------------------------------------------------------------------
 
@@ -1264,6 +1248,29 @@ def _tl(working: TimelineRef | None, hint: str) -> Any:
     if working is not None:
         return working.model_dump(mode="json")
     return unresolved("timeline", hint)
+
+
+def outgoing_tail(plan: EditPlan, outgoing_index: int) -> int | None:
+    """Source frames left after the outgoing segment's ``src_out``: ``source.duration - src_out``.
+    ``None`` when the source or its duration is unknown (counts as no handle, see :func:`_fits`).
+    Shared with the FCPXML exporter (S18)."""
+    out_seg = plan.segments[outgoing_index]
+    out_src = plan.source_map().get(out_seg.source)
+    if out_src is None or out_src.duration is None:
+        return None
+    return out_src.duration - out_seg.src_out
+
+
+def incoming_head(plan: EditPlan, outgoing_index: int) -> int | None:
+    """Source frames before the incoming side's ``src_in``: the next same-track segment's
+    ``src_in``, else the outro's when it is on that track; ``None`` with no incoming side."""
+    track = plan.segments[outgoing_index].track
+    for index in range(outgoing_index + 1, len(plan.segments)):
+        if plan.segments[index].track == track:
+            return plan.segments[index].src_in
+    if plan.outro is not None and plan.outro.track == track:
+        return plan.outro.src_in
+    return None
 
 
 def _fits(available: int | None, need: int) -> bool:
