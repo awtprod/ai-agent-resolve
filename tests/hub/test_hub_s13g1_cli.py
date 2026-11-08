@@ -9,10 +9,36 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import BaseModel, ConfigDict
 from write_support import Hub, brief_data, make_hub, plan_fixture
 
 from aar.cli import main
 from aar.hub.graph import WorkGraph
+from aar.recipes import registry
+from aar.recipes.models import RecipeDef, StepDef
+
+
+class _CcnShortParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+@pytest.fixture
+def ccn_short_recipe() -> Any:
+    # `aar hub write recipe` now validates params against the registered recipe (F12), so the
+    # recipe name brief_data uses must be registered in this process for the write to succeed.
+    registry.clear()
+    registry.register(
+        RecipeDef(
+            name="ccn-short",
+            version=1,
+            params_model=_CcnShortParams,
+            steps=(
+                StepDef(id="report", kind="cold", callable_id="recipe.report", idempotent=True),
+            ),
+        )
+    )
+    yield
+    registry.clear()
 
 
 @pytest.fixture
@@ -113,7 +139,9 @@ def test_write_reads_stdin_by_default(
     assert code == 0 and json.loads(capsys.readouterr().out)["replayed"] is True
 
 
-def test_every_write_command(hub: Hub, capsys: pytest.CaptureFixture[str]) -> None:
+def test_every_write_command(
+    hub: Hub, capsys: pytest.CaptureFixture[str], ccn_short_recipe: Any
+) -> None:
     pid = hub.project_id
     brief_id = _brief(hub, capsys)
     code, recipe, _ = _write(

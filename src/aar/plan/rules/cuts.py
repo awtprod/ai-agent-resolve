@@ -9,7 +9,7 @@ from fractions import Fraction
 from typing import Any, Literal
 
 from aar.plan.lint import Finding, LintContext, Ref, check_flag, check_number, rule
-from aar.plan.model import Segment, Transition, VideoTransitionType
+from aar.plan.model import Segment, Source, Transition, VideoTransitionType
 
 _SIZE_RANK = {"close": 0, "medium": 1, "wide": 2}
 
@@ -26,6 +26,12 @@ def _zoom_out(seg: Segment) -> float:
 def _zoom_in(seg: Segment) -> float:
     """Effective zoom at the segment's first frame: the static transform times the reframe."""
     return (seg.reframe[0].zoom if seg.reframe else 1.0) * _static_zoom(seg)
+
+
+def same_camera(first: Source, second: Source) -> bool:
+    """The jump-cut test's "same camera": one source, or one camera label. The plan producers
+    use it too, so a produced punch-in lands exactly where this rule looks for one."""
+    return first.id == second.id or (first.camera is not None and first.camera == second.camera)
 
 
 def _join_refs(ctx: LintContext, outgoing: int, incoming: int) -> list[Ref]:
@@ -47,10 +53,7 @@ def no_same_camera_jump(ctx: LintContext) -> list[Finding]:
             continue
         first, second = ctx.source(outgoing), ctx.source(incoming)
         assert first is not None and second is not None
-        same_camera = first.id == second.id or (
-            first.camera is not None and first.camera == second.camera
-        )
-        if not same_camera or not ctx.time_jump(outgoing, incoming, tolerance):
+        if not same_camera(first, second) or not ctx.time_jump(outgoing, incoming, tolerance):
             continue
         z_out = _zoom_out(ctx.plan.segments[outgoing])
         z_in = _zoom_in(ctx.plan.segments[incoming])

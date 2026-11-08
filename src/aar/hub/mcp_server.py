@@ -36,7 +36,7 @@ from aar.hub.events import Event, EventLog
 from aar.hub.graph import WorkGraph
 from aar.hub.leaseboard import lease_board as project_lease_board
 from aar.hub.registry import Registry
-from aar.hub.writes import ParamsValidator, accept_any_params
+from aar.hub.writes import ParamsValidator
 
 SERVER_INSTRUCTIONS = (
     "Shared memory for humans and AI agents working on DaVinci Resolve projects. "
@@ -139,14 +139,20 @@ def build_server(
     name: str = "aar-hub",
     clock: Clock = utcnow,
     agent_writes: bool = False,
-    params_validator: ParamsValidator = accept_any_params,
+    params_validator: ParamsValidator | None = None,
 ) -> MCPServer:
     """Build the hub MCP server over the given hub components.
 
     ``clock`` decides what has expired (leases, presence, approval tokens). With
     ``agent_writes`` the agent write tools are registered too (the log must be
-    writable); ``params_validator`` checks recipe params for ``recipe_create``.
+    writable); ``params_validator`` checks recipe params for ``recipe_create``. It defaults to the
+    recipe registry validator (so an unregistered recipe or bad params are refused, F12); pass
+    :func:`~aar.hub.writes.accept_any_params` to opt out.
     """
+    if params_validator is None:
+        from aar.recipes.registry import registry_params_validator
+
+        params_validator = registry_params_validator
     instructions = WRITE_INSTRUCTIONS if agent_writes else SERVER_INSTRUCTIONS
     server: MCPServer = MCPServer(name=name, instructions=instructions)
 
@@ -413,6 +419,25 @@ def build_server(
             if include_inactive or token.state(now) == "active"
         ]
         return {"approvals": listed, "skipped": skipped_summary(view.skipped)}
+
+    @server.tool(
+        name="recipe_status",
+        description=(
+            "Get a recipe run's status view: per step its state (waiting_on_needs, ready, running, "
+            "needs_agent, needs_human, waiting:<reason>, done, failed, cancelled), attempt, round, "
+            "op node id, an outputs summary and its error; plus next_actions saying who acts "
+            "(agent, human, worker or node) and, for agents, the tool and argument template to "
+            "call. Returns {found: true, recipe_node, status, round, steps, next_actions} or "
+            "{found: false}. It is always listed (even without --agent-writes) because agents "
+            "need it to drive a run. Read-only: a hot step shows waiting:no_node_dispatcher while "
+            "the Resolve node is unreachable from the hub."
+        ),
+        annotations=_READ_ONLY,
+    )
+    def recipe_status(recipe_node: str) -> dict[str, Any]:
+        from aar.recipes.run import recipe_status as _status
+
+        return _bounded(_status(log, recipe_node, clock=clock))
 
     @server.tool(
         name="jobs_list",

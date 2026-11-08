@@ -30,7 +30,11 @@ from os import PathLike
 from pathlib import Path, PurePath
 from typing import Any
 
-ACTOR_KINDS = frozenset({"human", "agent", "node"})
+# "runner" is the recipe engine's own identity (aar.recipes.RUNNER). It is not a string any
+# tool surface may supply: the CLI/MCP actor parsers and the generic event-append paths refuse
+# it, so only aar.recipes can construct it. The scheduler trusts recipe.* events and op nodes
+# only when their actor is this kind (see aar.recipes.state).
+ACTOR_KINDS = frozenset({"human", "agent", "node", "runner"})
 
 # Crockford base32, used to render a 128-bit ULID as 26 sortable characters.
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -104,6 +108,9 @@ def _canonical(value: Any) -> str:
     # allow_nan=False: NaN/Infinity cannot round-trip through JSON, so an event that
     # carried one could never compare equal to its own reload. Reject it at the point
     # of serialization (append) rather than store a value that breaks idempotency.
+    # ensure_ascii=True (the released form): changing it would change the stored bytes and the
+    # request/plan fingerprints, breaking idempotent retries of every non-ASCII event the released
+    # hub wrote (R3-1). Recipe output/error/summary bounds are measured on THIS stored form instead.
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
@@ -230,6 +237,43 @@ class Actor:
             raise ValueError(f"actor kind must be one of {sorted(ACTOR_KINDS)}, got {self.kind!r}")
         if not self.id:
             raise ValueError("actor id must be non-empty")
+
+
+# The runner identity is the recipe engine's own (aar.recipes.RUNNER). No external surface may
+# build it; only aar.recipes constructs it directly.
+RUNNER_KIND = "runner"
+_INPUT_ACTOR_KINDS = frozenset({"human", "agent", "node"})
+
+
+class ActorNotAllowed(ValueError):
+    """An actor an external surface may not produce (the runner identity, or a forbidden kind)."""
+
+
+def parse_actor(kind: Any, actor_id: Any, *, allow: frozenset[str] = _INPUT_ACTOR_KINDS) -> Actor:
+    """Build an :class:`Actor` from external input, refusing the engine-only ``runner`` identity.
+
+    This is the ONE shared parser every external surface (CLIs, MCP, the node API, media) routes
+    through, so "no string surface may produce the runner identity" holds in one place. ``allow``
+    restricts the kinds a given surface accepts (e.g. the node API forbids ``human``). The engine
+    builds ``RUNNER`` directly inside ``aar.recipes`` and never through here.
+    """
+    if kind == RUNNER_KIND:
+        raise ActorNotAllowed("the 'runner' identity is reserved for the recipe engine")
+    if kind not in allow:
+        raise ActorNotAllowed(
+            f"actor kind {kind!r} is not allowed here (expected one of {sorted(allow)})"
+        )
+    return Actor(kind, actor_id)
+
+
+def parse_actor_text(value: str, *, allow: frozenset[str] = _INPUT_ACTOR_KINDS) -> Actor:
+    """Parse a ``KIND:ID`` string into an :class:`Actor` through :func:`parse_actor`."""
+    if not isinstance(value, str):
+        raise ActorNotAllowed(f"actor must be a KIND:ID string, got {type(value).__name__}")
+    kind, separator, actor_id = value.partition(":")
+    if not separator:
+        raise ActorNotAllowed(f"actor must look like KIND:ID, got {value!r}")
+    return parse_actor(kind, actor_id, allow=allow)
 
 
 @dataclass(frozen=True, slots=True)

@@ -33,6 +33,9 @@ READ_TOOLS = {
     "agent_branches",
     "jobs_list",
     "approvals_list",
+    # S13g2: recipe_status is the 13th always-listed read tool. It is listed even without
+    # --agent-writes because agents need it to drive a recipe run (see DESIGN "Recipe runner").
+    "recipe_status",
 }
 WRITE_TOOLS = {
     "brief_create",
@@ -41,6 +44,11 @@ WRITE_TOOLS = {
     "node_set_status",
     "facts_record",
     "facts_retract",
+    # S13g2 recipe write tools (listed only with --agent-writes).
+    "recipe_start",
+    "step_complete",
+    "recipe_retry",
+    "recipe_cancel",
     "job_submit",
     "job_cancel",
     "project_register",
@@ -57,6 +65,11 @@ def hub(tmp_path: Path) -> Iterator[Hub]:
 
 
 def _server(hub: Hub, **kw: Any) -> Any:
+    # S13g1 MCP tests predate the recipe registry; they use any-params recipes, so opt out of the
+    # new registry-validator default (F12) unless a test passes its own validator.
+    from aar.hub.writes import accept_any_params
+
+    kw.setdefault("params_validator", accept_any_params)
     return build_server(hub.log, Registry(hub.log), hub.store, **kw)
 
 

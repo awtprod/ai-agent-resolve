@@ -13,6 +13,7 @@ from aar.hub import cli as hub_cli
 from aar.node import cli as node_cli
 from aar.plan import cli as plan_cli
 from aar.qa import cli as qa_cli
+from aar.recipes import cli as recipe_cli
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     qa_cli.register(groups)
     host_cli.register(groups)
     analyze_cli.register(groups)
+    recipe_cli.register(groups)
     deliver_cli.register(groups)
     # Keep the source-media store out of import-only/library paths; its CLI is needed
     # only while constructing the command inventory.

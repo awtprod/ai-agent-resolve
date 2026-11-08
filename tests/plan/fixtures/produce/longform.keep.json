@@ -1,0 +1,15 @@
+{
+  "recording": "show-1",
+  "ranges": [
+    {
+      "start_s": 1.0,
+      "end_s": 14.0,
+      "label": "store"
+    },
+    {
+      "start_s": 19.4,
+      "end_s": 38.0,
+      "label": "married"
+    }
+  ]
+}

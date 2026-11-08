@@ -25,6 +25,7 @@ from aar.media import (
     MediaInputError,
     MediaTimeout,
     QuietRun,
+    QuietScan,
     count_clipped,
     decode_check,
     measure_audio,
@@ -628,6 +629,47 @@ def judge_join_quiet(
     return JoinQuiet("fail", at_cut, min(long_enough, key=distance, default=None))
 
 
+def join_quiet_window(src_in_s: float, search_s: float, end_s: float | None) -> tuple[float, float]:
+    """The stretch of source audio the join-quiet test reads: ``src_in_s`` ± ``search_s``,
+    clipped to the start and (when known) the end of the source."""
+    lo = max(0.0, src_in_s - search_s)
+    hi = src_in_s + search_s
+    if end_s is not None:
+        hi = min(hi, end_s)
+    return lo, hi
+
+
+@dataclass(frozen=True)
+class JoinScan:
+    """One cut's join-quiet measurement: the quiet runs read around src_in and the verdict."""
+
+    scan: QuietScan
+    judged: JoinQuiet
+
+
+def scan_join_quiet(
+    path: Path,
+    *,
+    channels: int,
+    src_in_s: float,
+    window: tuple[float, float],
+    qa: QATargets,
+    timeout_s: float,
+) -> JoinScan:
+    """Decode ``window`` of the source's first audio stream and judge ``src_in_s`` against it.
+
+    This is the join-quiet check of ``aar qa check``; the plan producers call it too, so a cut
+    the planner placed in quiet passes QA. Raises ``MediaError`` when the audio cannot be read.
+    """
+    lo, hi = window
+    pcm = read_pcm(path, start_s=lo, duration_s=hi - lo, channels=channels, timeout_s=timeout_s)
+    scan = quiet_runs(pcm, threshold_dbfs=qa.join_quiet_db, window_s=qa.join_quiet_window_ms / 1000)
+    judged = judge_join_quiet(
+        scan.runs, src_in_s, min_ms=qa.join_quiet_min_ms, slack_ms=qa.join_quiet_slack_ms
+    )
+    return JoinScan(scan, judged)
+
+
 def suggest_src_in(run: QuietRun, fps: Fps) -> int:
     """The source frame (at the plan fps) nearest the middle of ``run``."""
     return fps.frames((run.start_s + run.end_s) / 2)
@@ -669,11 +711,8 @@ def _join_quiet(ctx: _Ctx) -> QACheck:
             entry.update(status="unchecked", reason=why)
             details.append(entry)
             continue
-        lo = max(0.0, cut.src_in_s - qa.join_quiet_search_s)
-        hi = cut.src_in_s + qa.join_quiet_search_s
         end = src_info.audio.duration_s or src_info.duration_s
-        if end is not None:
-            hi = min(hi, end)
+        lo, hi = join_quiet_window(cut.src_in_s, qa.join_quiet_search_s, end)
         entry["window_s"] = [round(lo, 4), round(hi, 4)]
         if hi <= lo:
             reason = "src_in is at or past the end of the source audio"
@@ -681,11 +720,12 @@ def _join_quiet(ctx: _Ctx) -> QACheck:
             details.append(entry)
             continue
         try:
-            pcm = read_pcm(
+            measured = scan_join_quiet(
                 path,
-                start_s=lo,
-                duration_s=hi - lo,
                 channels=src_info.audio.channels or 1,
+                src_in_s=cut.src_in_s,
+                window=(lo, hi),
+                qa=qa,
                 timeout_s=ctx.timeout(1.0, duration_s=0.0),
             )
         except MediaTimeout as exc:
@@ -703,15 +743,7 @@ def _join_quiet(ctx: _Ctx) -> QACheck:
             entry.update(status="fail", reason=reason, hint=f"join {cut.number}: {reason}")
             details.append(entry)
             continue
-        scan = quiet_runs(
-            pcm, threshold_dbfs=qa.join_quiet_db, window_s=qa.join_quiet_window_ms / 1000
-        )
-        judged = judge_join_quiet(
-            scan.runs,
-            cut.src_in_s,
-            min_ms=qa.join_quiet_min_ms,
-            slack_ms=qa.join_quiet_slack_ms,
-        )
+        scan, judged = measured.scan, measured.judged
         at_cut = judged.at_cut
         longest = scan.longest
         entry.update(

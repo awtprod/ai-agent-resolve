@@ -31,6 +31,56 @@ join_window_edge_s = 0.25 # compared region = the windows' overlap less this at 
 join_agreement_min = 0.8  # difflib ratio every window pair and window vs plan must reach
 word_straddle_s = 0.03    # a word may cross a cut or region edge by this much
 
+# Plan producers (`aar plan produce`): planner parameters, not lint rules. Times in seconds
+# unless the name says _ms. A cut's in point must also start in source-audio quiet: that test
+# is the [qa] join_quiet_* values above, so the planner and QA cannot drift apart.
+[produce]
+default_camera = "A"      # camera (Source.camera, else a source id) when no schedule is given
+min_pause_s = 0.9         # a pause at least this long ...
+beat_s = 0.45             # ... is trimmed to this beat
+beat_lead_s = 0.25        # of the beat, this much stays after the outgoing speech
+silence_db = -42.0        # pause = 10 ms RMS (loudest channel) below this; see [produce.venues]
+min_word_ms = 40          # a transcribed word occupies at least this long, so even a 0 ms word splits a pause
+no_pause_warn_s = 60      # warn when this much of a source's audio holds no pause at all
+scan_window_ms = 10       # RMS window of the pause scan
+scan_rate_hz = 16000      # the pause scan decodes the source audio at this rate ...
+scan_chunk_s = 30         # ... this many seconds at a time
+out_quiet_preroll_ms = 20 # a human cut's out point needs quiet this long before it (the in side uses [qa] join_quiet_min_ms)
+join_nudge_ms = 150       # a cut's in point may move this far to find source-audio quiet
+min_shot_s = 1.0          # a shorter content segment folds into a neighbour
+end_after_ms = 200        # with a laugh map, the content ends this long after the final laugh's onset
+crossfade_frames = 2      # audio crossfade on every cut (type from rules.audio-crossfade)
+punch_in_zoom = 1.25      # long-form: same-camera jump cuts toggle the static zoom 1.0 <-> this
+
+[produce.venues.loud]     # rooms where laughs sit at -36 to -40 dB on the mic (LKN)
+silence_db = -36.0
+
+# Shorts: the steady "camera operator" path over the face track (supoclip steady()).
+[produce.steady]
+pre_smooth_s = 0.17       # box filter on the face centre before the dead zone
+start_median_s = 0.5      # the path starts at the median face position over this long
+dead_zone = 0.25          # the face may sway this share of the crop width without a move
+glide_sigma_s = 0.7       # Gaussian glide of the held path
+safety_margin = 0.057     # keep the face this far inside the crop edge (share of source width)
+safety_window_s = 0.6     # ... easing over early, within this long either side
+safety_sigma_s = 0.3      # ... with a Gaussian ramp this wide
+safety_passes = 4
+warn_margin = 0.047       # a planner warning when the face comes closer to the crop edge
+key_step_s = 0.5          # reframe keyframe spacing
+speed_headroom = 0.9      # pan speed is clamped to this share of rules.no-whip-pan (at most 0.95)
+
+# Shorts crop presets, alternated on every same-camera jump cut (zooms differ by at least
+# rules.no-same-camera-jump min_zoom_delta).
+[[produce.framing]]
+name = "A"
+zoom = 1.0
+y = 0.5
+
+[[produce.framing]]
+name = "B"
+zoom = 1.22               # the house limit for a shorts punch-in
+y = 0.45
+
 # FCPXML timeline export (`aar plan export`): the timecode the exported timeline starts at,
 # non-drop HH:MM:SS:FF at the plan's nominal rate.
 [export]
