@@ -55,3 +55,29 @@ def test_without_stop_the_same_tick_claims_and_runs(hub: Any, registered_recipe:
     recipe_start(hub.log, rn, AGENT, idempotency_key="s")
     assert _tick(hub, threading.Event()) is True
     assert _claimed(hub) == 1
+
+
+class _BadStr(Exception):
+    def __str__(self) -> str:
+        raise RuntimeError("no text for you")
+
+
+def test_callable_whose_str_raises_still_gets_a_failed_result(
+    hub: Any, registered_recipe: Any
+) -> None:
+    """A broken ``__str__`` must not skip ``record_result`` (the op would hold its lease)."""
+    from aar.recipes import registry
+
+    def boom(ctx: Any) -> Any:
+        raise _BadStr()
+
+    registry.register_callable("rectest.cold", boom)
+    rn = make_run(hub)
+    recipe_start(hub.log, rn, AGENT, idempotency_key="s")
+    assert _tick(hub, threading.Event()) is True
+    results = hub.log.read(0, project_id=hub.project_id, types=["recipe.result"], limit=-1)
+    assert len(results) == 1
+    payload = results[0].payload
+    assert payload["outcome"] == "failed"
+    assert payload["error"]["code"] == "error"
+    assert payload["error"]["message"].startswith("_BadStr:")

@@ -94,6 +94,11 @@ class FakeHotDispatcher:
     crash. ``submits`` records every ``request_id`` actually dispatched (once each); ``calls``
     records every ``submit`` invocation (including idempotent repeats), so a test can prove the
     same ``request_id`` was re-sent after a crash and that it ran only once.
+
+    Contract: a ``request_id`` is reserved only once its job exists. If the behaviour raises,
+    nothing is recorded (not in ``submits``, no ``job_ref``), so a retry with the same
+    ``request_id`` dispatches afresh instead of returning a ref that ``poll`` cannot find. A real
+    adapter must keep the same "no reservation without a job" contract.
     """
 
     def __init__(self, behaviours: Mapping[str, FakeBehaviour] | None = None) -> None:
@@ -121,12 +126,13 @@ class FakeHotDispatcher:
         if existing is not None:
             # Idempotent: already dispatched this request_id; do not re-run the behaviour.
             return existing
+        behaviour = self._behaviours.get(kind, _done())
+        view = behaviour(dict(params))  # may raise: then nothing is reserved (retry runs afresh)
         self._next += 1
         job_ref = f"job-{self._next}"
+        self._views[job_ref] = view
         self._by_request[request_id] = job_ref
         self.submits.append(request_id)
-        behaviour = self._behaviours.get(kind, _done())
-        self._views[job_ref] = behaviour(dict(params))
         return job_ref
 
     def poll(self, job_ref: str) -> HotJobView:

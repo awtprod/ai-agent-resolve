@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from aar import cli_io
+from aar.recipes.textutil import safe_str
 
 _PROG = "aar recipe"
 EXIT_OK = 0
@@ -176,14 +177,14 @@ def _with_db(args: argparse.Namespace, func: Any, *, read_only: bool = False) ->
     try:
         log = _open_existing(args.db, read_only=read_only)
     except _DatabaseUnavailable as exc:
-        return _error("database_unavailable", str(exc), "Pass --db an existing hub database.")
+        return _error("database_unavailable", safe_str(exc), "Pass --db an existing hub database.")
     try:
         try:
             return func(log)
         except WriteError as exc:
             return _error(exc.code, exc.message, exc.fix_hint, exc.details)
         except ValueError as exc:
-            return _error("invalid_input", str(exc), "Check the arguments.")
+            return _error("invalid_input", safe_str(exc), "Check the arguments.")
     finally:
         log.close()
 
@@ -216,7 +217,9 @@ def _complete(args: argparse.Namespace) -> int:
     try:
         outputs = _read_json(args.outputs)
     except (OSError, ValueError) as exc:
-        return _error("invalid_input", str(exc), "Pass a JSON object (a file, or - for stdin).")
+        return _error(
+            "invalid_input", safe_str(exc), "Pass a JSON object (a file, or - for stdin)."
+        )
     if not isinstance(outputs, dict):
         return _error("invalid_input", "outputs must be a JSON object", "Send an object.")
 
@@ -277,16 +280,18 @@ def _worker(args: argparse.Namespace) -> int:
     try:
         actor = _parse_actor(args.actor)
     except ValueError as exc:
-        return _error("invalid_input", str(exc), "Use --actor KIND:ID.")
+        return _error("invalid_input", safe_str(exc), "Use --actor KIND:ID.")
     try:
         log = _open_existing(args.db)
     except _DatabaseUnavailable as exc:
-        return _error("database_unavailable", str(exc), "Pass --db an existing hub database.")
+        return _error("database_unavailable", safe_str(exc), "Pass --db an existing hub database.")
     try:
         store = _open_store(args.artifacts, log)
     except _StoreUnavailable as exc:
         log.close()
-        return _error("artifact_store_unavailable", str(exc), "Pass --artifacts an existing store.")
+        return _error(
+            "artifact_store_unavailable", safe_str(exc), "Pass --artifacts an existing store."
+        )
     try:
         ran = run_worker(
             log, store, actor, once=args.once, poll_s=args.poll_s, install_signals=True

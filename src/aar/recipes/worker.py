@@ -41,6 +41,7 @@ from aar.recipes.engine import (
 from aar.recipes.events import OUTCOME_DONE, OUTCOME_FAILED
 from aar.recipes.models import RecipeDef, StepDef
 from aar.recipes.state import OpAttempt, RunState, load_state
+from aar.recipes.textutil import safe_str
 
 _LOG = logging.getLogger("aar.recipes.worker")
 
@@ -110,7 +111,7 @@ def _run_step(
             outcome=OUTCOME_FAILED,
             error={
                 "code": "invalid_params",
-                "message": f"the stored recipe params do not validate: {exc}"[:500],
+                "message": f"the stored recipe params do not validate: {safe_str(exc)}"[:500],
                 "fix_hint": "Recreate the recipe with params the registered model accepts.",
             },
         )
@@ -142,7 +143,7 @@ def _run_step(
     except Exception as exc:  # a callable that raised: fail the step, never crash the worker
         outcome = OUTCOME_FAILED
         outputs, artifacts = {}, ()
-        error = {"code": "error", "message": f"{type(exc).__name__}: {exc}"[:500], "fix_hint": ""}
+        error = {"code": "error", "message": _describe(exc)[1][:500], "fix_hint": ""}
     finally:
         beat.stop()
     record_result(
@@ -369,10 +370,7 @@ def _describe(exc: BaseException) -> tuple[str, str]:
     """``(type name, "Type: message")`` for a swallowed exception, never raising (a broken
     ``__str__`` must not take the worker loop down) and cut to 4096 characters."""
     exc_type = type(exc).__name__
-    try:
-        text = str(exc)
-    except Exception:
-        text = "<unprintable exception>"
+    text = safe_str(exc)
     return exc_type, f"{exc_type}: {text[:_LOG_TEXT_CHARS]}"[:_LOG_TEXT_CHARS]
 
 
