@@ -138,6 +138,17 @@ def test_the_short_matches_its_golden_plan(short: dict[str, Path]) -> None:
     assert result.lint.duration_s < 37
 
 
+def test_the_short_takes_its_source_size_from_the_face_track(
+    short: dict[str, Path], longform: dict[str, Path]
+) -> None:
+    # S18 F1: the FCPXML export frames a reframed short from Source.frame_size.
+    faces = json.loads(short["faces"].read_text(encoding="utf-8"))
+    plan = produce_short(short).plan
+    assert plan.sources[0].frame_size == faces["header"]["frame_size"] == [640, 360]
+    # No face track, no size: the long-form's sources keep none.
+    assert all(s.frame_size is None for s in produce_longform(longform).plan.sources)
+
+
 @pytest.mark.parametrize("show", ["longform", "short"])
 def test_the_golden_plans_lint_clean_under_ccn(
     show: str, capsys: pytest.CaptureFixture[str]

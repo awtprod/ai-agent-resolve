@@ -369,6 +369,12 @@ def assemble(
         if is_cut(pieces[index - 1], pieces[index])
     ]
     data = stub.model_dump(mode="json")
+    for item in data["sources"]:
+        # The face track measured this source's picture: its size (the sampled frames keep the
+        # display aspect) frames the reframe in the FCPXML export (S18 F1). A stub's own size wins.
+        track = faces.get(item["id"])
+        if track is not None and item.get("frame_size") is None:
+            item["frame_size"] = list(track.header.frame_size)
     data.update(version=2, segments=segments, transitions=transitions)
     try:
         return EditPlan.model_validate(data), warnings
