@@ -500,6 +500,26 @@ def test_an_id_that_is_not_an_xml_name_is_rejected(value: str) -> None:
     assert _ids(f'<item id="{value}"/>') == [f"<item id={value!r}> is not an XML Name"]
 
 
+@pytest.mark.parametrize(
+    ("body", "ok"),
+    [
+        ("<e/>", True),
+        ("<e></e>", True),
+        ("<e> </e>", False),
+        ("<e>\n  </e>", False),
+        ("<e>x</e>", False),
+    ],
+)
+def test_an_empty_element_holds_no_content_not_even_white_space(body: str, ok: bool) -> None:
+    """Prism (PR #13): for an element declared EMPTY any content is a violation, white space
+    included; white space between children stays allowed in element-only content."""
+    dtd = load_dtd("<!ELEMENT root (e*)>\n<!ELEMENT e EMPTY>")
+    problems = validate(dtd, f"<root>\n  {body}\n</root>")
+    assert (problems == []) is ok, problems
+    if not ok:
+        assert problems == [f"<e> is declared EMPTY but holds {ET.fromstring(body).text!r}"]
+
+
 def test_idref_and_idrefs_tokens_must_be_xml_names() -> None:
     problems = _ids('<item id="r1"/>', '<link ref="1x" refs="r1 2x"/>')
     assert problems == [

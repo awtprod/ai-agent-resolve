@@ -44,6 +44,7 @@ class Attribute:
 class Dtd:
     models: dict[str, str] = field(default_factory=dict)  # element -> regex over child tags
     mixed: set[str] = field(default_factory=set)  # elements that may hold text
+    empty: set[str] = field(default_factory=set)  # declared EMPTY: no content, not even spaces
     attributes: dict[str, dict[str, Attribute]] = field(default_factory=dict)
 
 
@@ -93,6 +94,8 @@ def load_dtd(text: str) -> Dtd:
         dtd.models[name] = regex
         if mixed:
             dtd.mixed.add(name)
+        if model.strip() == "EMPTY":
+            dtd.empty.add(name)
     for element, body in _ATTLIST.findall(text):
         attrs = dtd.attributes.setdefault(element, {})
         for name, kind, default in _ATTR.findall(body):
@@ -122,9 +125,14 @@ def validate(dtd: Dtd, document: str) -> list[str]:
         children = "".join(f"{child.tag} " for child in element)
         if not re.fullmatch(dtd.models[tag], children):
             problems.append(f"<{tag}> children {children.strip()!r} break its content model")
-        has_text = (element.text or "").strip() or any((c.tail or "").strip() for c in element)
-        if has_text and tag not in dtd.mixed:
-            problems.append(f"<{tag}> holds text its model does not allow")
+        if tag in dtd.empty:
+            # EMPTY means no content at all, white space included (XML 1.0, VC Element Valid).
+            if element.text:
+                problems.append(f"<{tag}> is declared EMPTY but holds {element.text!r}")
+        else:
+            has_text = (element.text or "").strip() or any((c.tail or "").strip() for c in element)
+            if has_text and tag not in dtd.mixed:
+                problems.append(f"<{tag}> holds text its model does not allow")
         declared = dtd.attributes.get(tag, {})
         for name, value in element.attrib.items():
             attr = declared.get(name)
