@@ -1,0 +1,15 @@
+[0:a:0]aresample=48000,pan=stereo|c0=c0|c1=c0,asplit=2[a0_0][a0_1];
+[1:a:0]aresample=48000,pan=stereo|c0=c0|c1=c0[a1_0];
+[2:a:0]aresample=48000,pan=stereo|c0=c0|c1=c0[a2_0];
+[3:a:0]aresample=48000,pan=stereo|c0=c0|c1=c0[a3_0];
+[a0_0]atrim=start_sample=0:end_sample=144144,asetpts=PTS-STARTPTS,afade=t=in:start_sample=0:nb_samples=48048:curve=tri,apad=whole_len=144144,atrim=end_sample=144144[s0];
+[a1_0]atrim=start_sample=144144:end_sample=288288,asetpts=PTS-STARTPTS,apad=whole_len=144144,atrim=end_sample=144144[s1];
+[a0_1]atrim=start_sample=288288:end_sample=444444,asetpts=PTS-STARTPTS,volume=volume=-2.000000dB,afade=t=out:start_sample=132132:nb_samples=24024:curve=tri,apad=whole_len=156156,atrim=end_sample=156156[s2];
+[a2_0]atrim=start_sample=48048:end_sample=240240,asetpts=PTS-STARTPTS,afade=t=in:start_sample=0:nb_samples=24024:curve=tri,apad=whole_len=192192,atrim=end_sample=192192[s3];
+[a3_0]atrim=start_sample=0:end_sample=240240,asetpts=PTS-STARTPTS,volume=volume=-1.000000dB,afade=t=out:start_sample=236236:nb_samples=4004:curve=tri,apad=whole_len=240240,atrim=end_sample=240240[s4];
+anullsrc=r=48000:cl=stereo,atrim=end_sample=168168[z0];
+[s0][s1][s2][z0][s4]concat=n=5:v=0:a=1[l0];
+anullsrc=r=48000:cl=stereo,atrim=end_sample=420420[z1];
+anullsrc=r=48000:cl=stereo,atrim=end_sample=240240[z2];
+[z1][s3][z2]concat=n=3:v=0:a=1[l1];
+[l0][l1]amix=inputs=2:normalize=0:duration=longest[mix]

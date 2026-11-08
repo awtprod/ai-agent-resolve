@@ -1,0 +1,6 @@
+[0:a:0]aresample=48000,pan=stereo|c0=c0|c1=c0[a0_0];
+[1:a:0]aresample=48000,pan=stereo|c0=c0|c1=c0[a1_0];
+[a0_0]atrim=start_sample=0:end_sample=480480,asetpts=PTS-STARTPTS,afade=t=in:start_sample=0:nb_samples=12012:curve=tri,apad=whole_len=480480,atrim=end_sample=480480[s0];
+[a1_0]atrim=start_sample=480480:end_sample=960960,asetpts=PTS-STARTPTS,afade=t=out:start_sample=478478:nb_samples=2002:curve=tri,apad=whole_len=480480,atrim=end_sample=480480[s1];
+[s0][s1]concat=n=2:v=0:a=1[l0];
+[l0]anull[mix]

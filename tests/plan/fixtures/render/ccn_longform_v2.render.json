@@ -1,0 +1,327 @@
+{
+ "loudness_method": "loudnorm-2pass",
+ "not_rendered": [
+  {
+   "action": "for the template's look, import the FCPXML export into a branch of it",
+   "detail": "the render builds the plan's own timeline; template 'CCN Longform Template' (its look, Fusion titles and buses) is not applied",
+   "feature": "template",
+   "location": "template"
+  },
+  {
+   "action": "apply it on the Color page",
+   "detail": "the CDL of 'camA' is not applied",
+   "feature": "cdl",
+   "location": "sources[0].color.cdl"
+  },
+  {
+   "action": "give the LUT's hub path (.cube, .3dl) to render it with lut3d",
+   "detail": "LUT 'CCN Show LUT' of 'camA' is not a LUT file on the hub, so it is not applied",
+   "feature": "lut",
+   "location": "sources[0].color.lut"
+  },
+  {
+   "action": "none",
+   "detail": "A1 'A1' is muted but feeds bus 'A5': rendered audible (the CCN topology), as the FCPXML export does",
+   "feature": "audio_mute",
+   "location": "audio_tracks[0].mute"
+  },
+  {
+   "action": "route 'A1' to 'A5' in Fairlight",
+   "detail": "bus routing is not rendered: A1 'A1' plays at each segment's gain plus its own track's gain",
+   "feature": "audio_bus",
+   "location": "audio_tracks[0].bus"
+  },
+  {
+   "action": "none",
+   "detail": "bus 'A5''s gain -1 dB is not applied to A1 'A1''s clips (as the export)",
+   "feature": "bus_gain",
+   "location": "audio_tracks[0].bus"
+  },
+  {
+   "action": "none",
+   "detail": "A2 'A2' is muted but feeds bus 'A5': rendered audible (the CCN topology), as the FCPXML export does",
+   "feature": "audio_mute",
+   "location": "audio_tracks[1].mute"
+  },
+  {
+   "action": "route 'A2' to 'A5' in Fairlight",
+   "detail": "bus routing is not rendered: A2 'A2' plays at each segment's gain plus its own track's gain",
+   "feature": "audio_bus",
+   "location": "audio_tracks[1].bus"
+  },
+  {
+   "action": "none",
+   "detail": "bus 'A5''s gain -1 dB is not applied to A2 'A2''s clips (as the export)",
+   "feature": "bus_gain",
+   "location": "audio_tracks[1].bus"
+  },
+  {
+   "action": "none",
+   "detail": "A3 'A3' is muted but feeds bus 'A5': rendered audible (the CCN topology), as the FCPXML export does",
+   "feature": "audio_mute",
+   "location": "audio_tracks[2].mute"
+  },
+  {
+   "action": "route 'A3' to 'A5' in Fairlight",
+   "detail": "bus routing is not rendered: A3 'A3' plays at each segment's gain plus its own track's gain",
+   "feature": "audio_bus",
+   "location": "audio_tracks[2].bus"
+  },
+  {
+   "action": "none",
+   "detail": "bus 'A5''s gain -1 dB is not applied to A3 'A3''s clips (as the export)",
+   "feature": "bus_gain",
+   "location": "audio_tracks[2].bus"
+  },
+  {
+   "action": "none",
+   "detail": "A4 'A4' is muted but feeds bus 'A5': rendered audible (the CCN topology), as the FCPXML export does",
+   "feature": "audio_mute",
+   "location": "audio_tracks[3].mute"
+  },
+  {
+   "action": "route 'A4' to 'A5' in Fairlight",
+   "detail": "bus routing is not rendered: A4 'A4' plays at each segment's gain plus its own track's gain",
+   "feature": "audio_bus",
+   "location": "audio_tracks[3].bus"
+  },
+  {
+   "action": "none",
+   "detail": "bus 'A5''s gain -1 dB is not applied to A4 'A4''s clips (as the export)",
+   "feature": "bus_gain",
+   "location": "audio_tracks[3].bus"
+  },
+  {
+   "action": "see the FCPXML export report for the marker list",
+   "detail": "marker 'Act 1' at frame 0: an MP4 carries no markers",
+   "feature": "marker",
+   "location": "markers[0]"
+  },
+  {
+   "action": "see the FCPXML export report for the marker list",
+   "detail": "marker 'Act 2' at frame 144: an MP4 carries no markers",
+   "feature": "marker",
+   "location": "markers[1]"
+  },
+  {
+   "action": "replace it in Resolve for the final look",
+   "detail": "drawn as plain DejaVu Sans text on its frames; the Resolve title ('CCN Lower Third' template) is not applied",
+   "feature": "title_template",
+   "location": "titles[0]"
+  },
+  {
+   "action": "replace it in Resolve for the final look",
+   "detail": "drawn as plain DejaVu Sans text on its frames; the Resolve title ('CCN Sting' template) is not applied",
+   "feature": "title_template",
+   "location": "outro.sting"
+  }
+ ],
+ "notes": [
+  {
+   "action": "none",
+   "detail": "no Montserrat font file in AAR_FONTS_DIR or the font folders; using DejaVu Sans (DejaVuSans-Bold.ttf)",
+   "feature": "font",
+   "location": "titles"
+  }
+ ],
+ "rendered": {
+  "dissolves": [
+   {
+    "cut": 306,
+    "frames": 15,
+    "location": "outro.transition",
+    "window": [
+     306,
+     321
+    ]
+   }
+  ],
+  "luts": {},
+  "pictures": [
+   {
+    "fade_from_black_frames": 15,
+    "framing": "window",
+    "lane": 0,
+    "location": "segments[0]",
+    "record": [
+     0,
+     72
+    ],
+    "source": "camA",
+    "source_frames": [
+     0,
+     72
+    ],
+    "window": {
+     "box": [
+      12,
+      6,
+      296,
+      168
+     ],
+     "first": [
+      160.0,
+      90.0,
+      290.909,
+      163.636
+     ],
+     "last": [
+      160.0,
+      90.0,
+      290.909,
+      163.636
+     ],
+     "moving": false,
+     "pad": 0,
+     "units": "hub source pixels: centre x, centre y, width, height"
+    }
+   },
+   {
+    "framing": "scale",
+    "lane": 0,
+    "location": "segments[1]",
+    "record": [
+     72,
+     144
+    ],
+    "source": "camB",
+    "source_frames": [
+     72,
+     144
+    ]
+   },
+   {
+    "framing": "scale",
+    "lane": 0,
+    "location": "segments[2]",
+    "record": [
+     144,
+     216
+    ],
+    "source": "camA",
+    "source_frames": [
+     144,
+     216
+    ]
+   },
+   {
+    "framing": "scale",
+    "lane": 0,
+    "location": "segments[3]",
+    "record": [
+     216,
+     321
+    ],
+    "source": "camA2",
+    "source_frames": [
+     30,
+     135
+    ]
+   },
+   {
+    "framing": "scale",
+    "lane": 0,
+    "location": "outro",
+    "record": [
+     306,
+     426
+    ],
+    "source": "outroclip",
+    "source_frames": [
+     0,
+     120
+    ]
+   }
+  ],
+  "sounds": [
+   {
+    "fade_in_frames": 24,
+    "fade_out_frames": 0,
+    "gain_db": 0.0,
+    "location": "segments[0]",
+    "record": [
+     0,
+     72
+    ],
+    "source": "camA"
+   },
+   {
+    "fade_in_frames": 0,
+    "fade_out_frames": 0,
+    "gain_db": 0.0,
+    "location": "segments[1]",
+    "record": [
+     72,
+     144
+    ],
+    "source": "camB"
+   },
+   {
+    "fade_in_frames": 0,
+    "fade_out_frames": 12,
+    "gain_db": -2.0,
+    "location": "segments[2]",
+    "record": [
+     144,
+     222
+    ],
+    "source": "camA"
+   },
+   {
+    "fade_in_frames": 12,
+    "fade_out_frames": 0,
+    "gain_db": 0.0,
+    "location": "segments[3]",
+    "record": [
+     210,
+     306
+    ],
+    "source": "camA2"
+   },
+   {
+    "fade_in_frames": 0,
+    "fade_out_frames": 2,
+    "gain_db": -1.0,
+    "location": "outro",
+    "record": [
+     306,
+     426
+    ],
+    "source": "outroclip"
+   }
+  ],
+  "titles": [
+   {
+    "lines": [
+     "Jane Doe",
+     "Head Judge"
+    ],
+    "location": "titles[0]",
+    "record": [
+     48,
+     120
+    ],
+    "timecode": "00:00:02:00"
+   },
+   {
+    "lines": [
+     "Baking Resistance"
+    ],
+    "location": "outro.sting",
+    "record": [
+     312,
+     360
+    ],
+    "timecode": "00:00:13:00"
+   }
+  ]
+ },
+ "timeline": {
+  "audio_samples": 852852,
+  "duration_s": 17.76775,
+  "fps": "24000/1001",
+  "resolution": "1920x1080",
+  "sample_rate": 48000,
+  "total_frames": 426
+ }
+}
