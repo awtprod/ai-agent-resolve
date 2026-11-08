@@ -93,7 +93,9 @@ def golden(show: str) -> str:
 def test_the_longform_matches_its_golden_plan(longform: dict[str, Path]) -> None:
     result = produce_longform(longform)
     assert dumped(result.plan) == golden("longform")
-    assert result.warnings == []
+    # the tag after the final laugh ("and another thing") is dropped, and said so
+    assert [(w.code, w.at_s) for w in result.warnings] == [("end-dropped-speech", 35.202)]
+    assert "3 transcribed word(s)" in result.warnings[0].message
     assert result.lint.ok and result.lint.counts["error"] == 0
     log = result.log()
     assert len(log["trims"]) == 3
@@ -101,10 +103,16 @@ def test_the_longform_matches_its_golden_plan(longform: dict[str, Path]) -> None
     assert log["trims"][1]["pause_s"][0] < 25.0 < log["trims"][1]["pause_s"][1]
     # the mumble at 8.0 s splits its 1.2 s quiet run, so that pause is not trimmed
     assert not any(7.5 < t["pause_s"][0] < 8.9 for t in log["trims"])
-    # the keep edge at 19.95 s sits in "and", which sounds from 19.92 s: one frame earlier
-    assert [(n["join"], n["from_frame"], n["to_frame"]) for n in log["nudges"]] == [(2, 598, 597)]
+    # keep 2 starts at 19.40 s inside the real tail of "later" (Whisper ended it at 19.30, the
+    # sound runs to 19.45): the in point moves later, inward only, until the run holds the
+    # crossfade's handle too. Never earlier, into material the human excluded.
+    assert [(n["join"], n["side"], n["from_frame"], n["to_frame"]) for n in log["nudges"]] == [
+        (2, "in", 581, 584)
+    ]
     # camera B's half-second flash at 31.0 s folds into the A shot before it
-    assert [(f["source"], f["into"]) for f in log["folds"]] == [("cam-b", "previous")]
+    assert [(f["source"], f["into"], f["retrimmed"]) for f in log["folds"]] == [
+        ("cam-b", "previous", False)
+    ]
     # the content ends 200 ms after the final laugh's onset and drops the tag after it
     assert log["ending"]["onset_s"] == 35.0 and log["ending"]["out_s"] == 35.202
     # the sync report put camera B at its measured origin
@@ -121,7 +129,8 @@ def test_the_short_matches_its_golden_plan(short: dict[str, Path]) -> None:
     assert result.lint.ok
     plan = result.plan
     # the jump cuts alternate the A and B presets, so no same-camera jump cut
-    assert [seg.reframe[0].zoom for seg in plan.segments] == [1.0, 1.25, 1.0]
+    assert [seg.reframe[0].zoom for seg in plan.segments] == [1.0, 1.22, 1.0]
+    assert [(w.code, w.at_s) for w in result.warnings] == [("end-dropped-speech", 23.49)]
     # the face sways inside the dead zone for the first shot: the camera does not move
     assert len({key.x for key in plan.segments[0].reframe}) == 1
     # then it follows the walk and the lunge
@@ -186,7 +195,8 @@ def test_the_cli_writes_the_golden_and_a_json_report(
     assert code == 0
     assert out.read_text(encoding="utf-8") == golden("longform")
     assert report["ok"] is True and report["segments"] == 6 and report["cuts"] == 4
-    assert report["warnings"] == [] and report["lint"]["counts"]["error"] == 0
+    assert [w["code"] for w in report["warnings"]] == ["end-dropped-speech"]
+    assert report["lint"]["counts"]["error"] == 0
     assert {f["severity"] for f in report["lint"]["findings"]} <= {"warn", "info"}
 
 
@@ -237,7 +247,8 @@ def test_without_room_to_nudge_the_join_is_named_and_qa_agrees(
     path = _profile(tmp_path, lambda d: d["produce"].update(join_nudge_ms=0))
     result = produce_longform(longform, profile=load_profile(path))
     assert [(w.code, w.source, w.at_s) for w in result.warnings] == [
-        ("join-not-quiet", "cam-b", 19.953)
+        ("end-dropped-speech", None, 35.202),
+        ("join-not-quiet", "cam-b", 19.386),
     ]
     assert result.lint.ok  # lint cannot hear the audio: the warning is the planner's job
     qa = load_profile("ccn").qa
@@ -351,3 +362,163 @@ def test_real_sync_output_drives_the_origins(longform: dict[str, Path]) -> None:
     assert pair["status"] == "ok" and pair["suggested_recording_origin"] == 60
     committed = load_sync(longform["sync"])
     assert committed.pairs[0].suggested_recording_origin == pair["suggested_recording_origin"]
+
+
+# ---------------------------------------------------------------- round 2: small rendered shows
+
+FPS2997 = "30000/1001"
+
+
+def _mini(
+    tmp_path: Path,
+    bursts: list[tuple[float, float]],
+    words: list[tuple[str, float, float]],
+    keeps: list[tuple[float, float]],
+    *,
+    seconds: float,
+    silent: bool = False,
+) -> Any:
+    """One camera; ``bursts`` are where the voice really sounds, ``words`` what Whisper says."""
+    from produce_support import VOICES, amp, ffmpeg
+
+    if silent:
+        source = f"anullsrc=r=16000:cl=mono:d={seconds}"
+    else:
+        gate = "+".join(f"between(t\\,{a}\\,{b})" for a, b in bursts) or "0"
+        expr = f"{amp(-60)}*sin(2*PI*120*t)+({gate})*{amp(-20)}*{VOICES[0]}"
+        source = f"aevalsrc={expr}:s=16000:d={seconds}"
+    ffmpeg("-f", "lavfi", "-i", source, "-c:a", "pcm_s16le", str(tmp_path / "mini.wav"))
+    frames = int(seconds * 30000 / 1001) - 1
+    stub = EditPlan.model_validate(
+        {
+            "project": "p",
+            "timeline": "t",
+            "kind": "longform",
+            "fps": FPS2997,
+            "resolution": {"width": 1920, "height": 1080},
+            "profile": "ccn",
+            "sources": [
+                {"id": "cam", "media": "mini.wav", "camera": "A", "shot_size": "close",
+                 "recording_id": "r", "duration": frames}
+            ],
+            "segments": [],
+        }
+    )  # fmt: skip
+    from aar.plan.inputs import Transcript
+    from aar.plan.produce import KeepList
+
+    return produce(
+        stub,
+        transcript=Transcript.model_validate(
+            {"recording": "r",
+             "words": [{"text": t, "start_s": a, "end_s": b} for t, a, b in words]}
+        ),
+        keep=KeepList.model_validate(
+            {"ranges": [{"start_s": a, "end_s": b} for a, b in keeps]}
+        ),
+        profile=load_profile("ccn"),
+        media_root=tmp_path,
+    )  # fmt: skip
+
+
+def test_the_next_removed_words_onset_never_leaks_into_the_out_handle(tmp_path: Path) -> None:
+    """F4 (the 10k run's out-handle leaks): the human's out at 2.24 s is quiet before, but the
+    removed "next" sounds from 2.25 s, inside the crossfade's outgoing frame. The out point
+    moves earlier (inward) until quiet covers 60 ms before it and the handle after it."""
+    result = _mini(
+        tmp_path,
+        bursts=[(1.0, 2.0), (2.25, 2.7), (4.0, 5.0)],
+        words=[("kept", 1.0, 2.0), ("next", 2.3, 2.7), ("after", 4.0, 5.0)],
+        keeps=[(0.5, 2.24), (3.8, 5.5)],
+        seconds=6.0,
+    )
+    out = [n for n in result.nudges if n.side == "out"]
+    assert len(out) == 1 and out[0].to_frame < out[0].from_frame  # earlier only
+    assert not [w for w in result.warnings if w.code == "join-out-not-quiet"]
+    first = result.plan.segments[0]
+    assert first.src_out * 1001 / 30000 + 1001 / 30000 <= 2.25  # the handle ends before "next"
+
+
+def test_a_real_word_tail_past_whispers_end_is_named(tmp_path: Path) -> None:
+    """F4 (the 10k run's audio splices): Whisper ends "kept" at 2.05 s but it sounds to 2.20 s,
+    and the human's out at 2.10 s cuts that tail. Moving earlier would cut more of the word,
+    and later is the human's cut, so the producer warns, naming the join."""
+    result = _mini(
+        tmp_path,
+        bursts=[(1.0, 2.2), (4.0, 5.0)],
+        words=[("kept", 1.0, 2.05), ("after", 4.0, 5.0)],
+        keeps=[(0.5, 2.1), (3.8, 5.5)],
+        seconds=6.0,
+    )
+    warned = [w for w in result.warnings if w.code == "join-out-not-quiet"]
+    assert len(warned) == 1 and "join 1" in warned[0].message
+    assert result.plan.segments[0].src_out == round(2.1 * 30000 / 1001)  # never moved outward
+
+
+@pytest.mark.parametrize("silent", [True, False])
+def test_a_long_source_with_no_pause_at_all_is_a_warning(tmp_path: Path, silent: bool) -> None:
+    """F10: 61 s of silence, or of unbroken sound, gives no pause to trim: suspicious."""
+    result = _mini(
+        tmp_path,
+        bursts=[] if silent else [(0.0, 61.0)],
+        words=[("drone", 1.0, 60.0)],
+        keeps=[(0.5, 60.8)],
+        seconds=61.0,
+        silent=silent,
+    )
+    assert [(w.code, w.source) for w in result.warnings] == [("no-pauses", "cam")]
+
+
+def test_a_long_form_with_a_face_track_warns_that_it_is_ignored(
+    longform: dict[str, Path],
+) -> None:
+    """V31."""
+    from aar.plan.produce import FaceTrack
+
+    track = FaceTrack.model_validate(
+        {
+            "schema": "aar.faces/1",
+            "header": {
+                "frame_size": [640, 360],
+                "input": {"path": str(longform["dir"] / "longform_a.wav")},
+            },
+            "frames": [{"file_s": 0.0, "faces": [{"box": [0.4, 0.2, 0.1, 0.2]}]}],
+        }
+    )
+    result = produce_longform(longform, faces=[track])
+    assert "faces-ignored" in [w.code for w in result.warnings]
+
+
+def test_the_pause_scan_reads_the_last_chunk_of_a_part(tmp_path: Path) -> None:
+    """V34: with 0.7 s chunks the last one starts at 3.5 s, within a second of the end."""
+    from produce_support import amp, ffmpeg
+
+    expr = f"if(between(t\\,3.2\\,3.9)\\,0\\,{amp(-20)}*sin(2*PI*220*t))"
+    path = tmp_path / "tail.wav"
+    ffmpeg("-f", "lavfi", "-i", f"aevalsrc={expr}:s=16000:d=4", "-c:a", "pcm_s16le", str(path))
+    fps = load_stub(FIXTURES / "short.stub.json").fps
+    [(start, end)] = pause_runs(
+        [Piece("a", 0, fps.frames(4.0), 0)],
+        {"a": SourceAudio(path, 1, 4.0)},
+        {"a": 0},
+        fps,
+        threshold_db=-42.0,
+        window_s=0.01,
+        rate=16000,
+        chunk_s=0.7,
+    )
+    assert start == pytest.approx(3.2, abs=0.002) and end == pytest.approx(3.9, abs=0.002)
+
+
+def test_no_join_is_quiet_at_or_past_the_end_of_the_audio(longform: dict[str, Path]) -> None:
+    """V35: the source audio ends at 40 s; a cut there has no audio to start in."""
+    from aar.plan.produce.audio import JoinJudge
+
+    stub = load_stub(FIXTURES / "longform.stub.json")
+    path = longform["dir"] / "longform_a.wav"
+    judge = JoinJudge({"a": SourceAudio(path, 1, 40.0)}, load_profile("ccn").qa, stub.fps)
+    end = stub.fps.frames(40.0)
+    assert judge.in_quiet("a", stub.fps.frames(39.9), handle=0)  # room tone before the end
+    # QA's window is clipped at the end, so 0.17 s past it there is nothing left to read
+    assert not judge.in_quiet("a", end + 5, handle=0)
+    assert not judge.out_quiet("a", end, handle=1)

@@ -1,11 +1,13 @@
 """Property tests of the producer's pure core, over seeded random shows (no media).
 
-Each case invents a transcript, quiet runs that only roughly match its gaps (the audio and
-Whisper disagree by up to 0.15 s, and some runs pass over a mumbled word), a keep list whose
-edges may fall inside words, a two-camera schedule with sliver flashes, a QA-like join judge and
-sometimes a laugh map. ``cut`` and ``assemble`` must then give a plan that is chronological,
-splits no word, has no shot under ``min_shot_s``, starts every cut in quiet or names it, keeps
-every reframe move under the no-whip-pan limits, and lints with no error under ``ccn``.
+Each case invents a transcript (with zero-length and sub-50 ms words among the rest), quiet
+runs that only roughly match its gaps (the audio and Whisper disagree by up to 0.15 s, and some
+runs pass over a mumbled word), a keep list whose edges may fall inside words, a two-camera
+schedule with sliver flashes, a QA-like judge of both sides of a cut and sometimes a laugh map.
+``cut`` and ``assemble`` must then give a plan that is chronological, splits no word, removes no
+word at all, plays nothing outside the keep ranges, has no shot under ``min_shot_s``, starts
+every cut in quiet (and ends every human cut in quiet) or names it, keeps every reframe move
+under the no-whip-pan limits, and lints with no error under ``ccn``.
 """
 
 from __future__ import annotations
@@ -42,7 +44,11 @@ def _words(rng: random.Random, until: float) -> list[Word]:
     out: list[Word] = []
     t = 0.4
     while t < until:
-        dur = rng.uniform(0.05, 0.6)
+        dur = (
+            rng.choice([0.0, rng.uniform(0.0, 0.05)])
+            if rng.random() < 0.1
+            else rng.uniform(0.05, 0.6)
+        )
         gap = rng.uniform(0.02, 0.15) if rng.random() < 0.7 else rng.uniform(0.2, 2.6)
         out.append(Word(text=f"w{len(out)}", start_s=round(t, 3), end_s=round(t + dur, 3)))
         t += dur + gap
@@ -67,10 +73,10 @@ def _keep(rng: random.Random, start: float, end: float) -> KeepList:
     points = sorted(rng.uniform(start, end) for _ in range(2 * rng.randint(1, 4)))
     ranges = []
     for a, b in zip(points[::2], points[1::2], strict=True):
-        if b - a >= 1.2 and (not ranges or a >= ranges[-1]["end_s"]):
+        if b - a >= 2.5 and (not ranges or a >= ranges[-1]["end_s"]):
             ranges.append({"start_s": round(a, 3), "end_s": round(b, 3)})
     if not ranges:
-        ranges = [{"start_s": start, "end_s": start + 3.0}]
+        ranges = [{"start_s": start, "end_s": start + 3.0}]  # never inside a word: t starts at 0.4
     return KeepList.model_validate({"ranges": ranges})
 
 
@@ -139,14 +145,24 @@ def _faces(rng: random.Random, until: float) -> FaceTrack:
     )
 
 
-def _judge(runs: list[tuple[float, float]], fps: Fps, origins: dict[str, int]) -> Any:
-    """QA's verdict on the synthetic audio: src_in inside a run of at least 60 ms (10 ms slack)."""
+class _Judge:
+    """QA's verdict on the synthetic audio: src_in inside a run of at least 60 ms (10 ms slack)
+    holding ``handle`` frames before it; src_out in a run from 60 ms before to ``handle`` after."""
 
-    def judge(source: str, src_in: int) -> bool:
-        at = fps.seconds(src_in + origins[source])
-        return any(b - a >= 0.06 and a - 0.01 <= at <= b + 0.01 for a, b in runs)
+    def __init__(self, runs: list[tuple[float, float]], fps: Fps, origins: dict[str, int]) -> None:
+        self.runs, self.fps, self.origins = runs, fps, origins
 
-    return judge
+    def in_quiet(self, source: str, src_in: int, *, handle: int) -> bool:
+        at = self.fps.seconds(src_in + self.origins[source])
+        pre = self.fps.seconds(handle)
+        return any(
+            b - a >= 0.06 and a - 0.01 <= at <= b + 0.01 and a <= at - pre for a, b in self.runs
+        )
+
+    def out_quiet(self, source: str, src_out: int, *, handle: int) -> bool:
+        at = self.fps.seconds(src_out + self.origins[source])
+        post = self.fps.seconds(handle)
+        return any(a <= at - 0.06 and b >= at + post for a, b in self.runs)
 
 
 def _case(seed: int, kind: str) -> dict[str, Any]:
@@ -159,6 +175,8 @@ def _case(seed: int, kind: str) -> dict[str, Any]:
     if rng.random() < 0.7:
         last = keep.ranges[-1]
         onset = round(rng.uniform(last.start_s, last.end_s), 3)
+        if rng.random() < 0.25:  # the human started the range on the laugh (finding 1)
+            onset = round(last.start_s + 0.001, 6)
         laughs = LaughMap(laughs=[Laugh(start_s=onset, end_s=onset + 1.0, strength=1.0)])
     return {
         "rng": rng,
@@ -179,12 +197,12 @@ def _run(case: dict[str, Any], kind: str) -> tuple[list[Piece], Any, Any, EditPl
     settings = PROFILE.produce
     coverage = {s.id: Coverage(s.recording_origin, s.duration) for s in stub.sources}
     origins = {k: v.origin for k, v in coverage.items()}
-    words = Words(case["words"], rules.word_tolerance_s, fps)
-    keeps, _ = keep_frames(case["keep"], words, fps, min_shot_s=settings.min_shot_s)
+    words = Words(case["words"], rules.word_tolerance_s, fps, settings.min_word_ms / 1000)
+    keeps, _, _ = keep_frames(case["keep"], words, fps, min_shot_s=settings.min_shot_s)
     sched = schedule_frames(stub, case["schedule"], settings.default_camera)
     parts = [split(k.start, k.end, i, sched, coverage, fps) for i, k in enumerate(keeps)]
     runs = case["runs"]
-    judge = _judge(runs, fps, origins)
+    judge = _Judge(runs, fps, origins)
     done = cut(
         keeps,
         parts,
@@ -205,11 +223,15 @@ def _run(case: dict[str, Any], kind: str) -> tuple[list[Piece], Any, Any, EditPl
 
 @pytest.mark.parametrize("kind", ["longform", "short"])
 def test_random_shows_give_plans_that_keep_every_house_rule(kind: str) -> None:
-    seen = {"trims": 0, "nudges": 0, "folds": 0, "endings": 0, "warned": 0}
+    seen = dict.fromkeys(
+        ("trims", "nudges", "out_nudges", "folds", "regrown", "endings", "warned"), 0
+    )
+    handle = check_profile(PROFILE, kind).handle_frames
     for seed in range(CASES):
         case = _case(seed, kind)
         pieces, done, (keeps, judge), plan, words = _run(case, kind)
         fps = case["fps"]
+        sec = fps.seconds
         need = min_frames(PROFILE.produce.min_shot_s, fps)
         where = f"seed {seed}"
         # chronological, and every shot at least min_shot_s
@@ -219,25 +241,37 @@ def test_random_shows_give_plans_that_keep_every_house_rule(kind: str) -> None:
         # no edit point inside a word, judged exactly as no-dialogue-splice judges it
         for _, _, frame in cut_points(pieces):
             assert words.inside(frame) is None, where
-        # no pause trim swallowed a word: within a keep range, gaps hold no speech
-        for a, b in itertools.pairwise(pieces):
-            if a.keep == b.keep and is_cut(a, b):
-                lo, hi = fps.seconds(a.rec_out), fps.seconds(b.rec_in)
-                assert words.speech_between(lo, hi) is None, where
-        # every cut starts in quiet, or a planner warning names it
-        warned = {w.at_s for w in done.warnings if w.code == "join-not-quiet"}
-        for a, b in itertools.pairwise(pieces):
-            if is_cut(a, b):
-                origin = plan.source_map()[b.source].recording_origin
-                ok = judge(b.source, b.rec_in - origin)
-                assert ok or round(fps.seconds(b.rec_in), 3) in warned, where
-        # nothing outside the keep list but a join nudge (an in point moved up to
-        # join_nudge_ms earlier, into word-free audio) and the ending (up to the laugh window)
-        nudge = fps.frames(PROFILE.produce.join_nudge_ms / 1000)
+        # nothing plays outside the keep ranges: no edge, nudge, fold or ending reaches past them
         for piece in pieces:
             keep = keeps[piece.keep]
-            assert keep.start - nudge <= piece.rec_in < piece.rec_out, where
-            assert piece.rec_out <= keep.end + fps.frames(0.4), where
+            assert keep.start <= piece.rec_in < piece.rec_out <= keep.end, where
+        # no word is removed, however short: every word whose occupied span lies in a keep range
+        # (and before the final out, which the ending may move) is wholly in the plan
+        final = sec(pieces[-1].rec_out)
+        kept = [(sec(p.rec_in), sec(p.rec_out)) for p in pieces]
+        merged: list[list[float]] = []
+        for a, b in kept:
+            if merged and a <= merged[-1][1] + 1e-9:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        for lo, hi in words.spans(0.0, float("inf")):
+            if hi > final or not any(sec(k.start) <= lo and hi <= sec(k.end) for k in keeps):
+                continue
+            assert any(a - 1e-9 <= lo and hi <= b + 1e-9 for a, b in merged), (where, lo, hi)
+        # every cut starts in quiet, every human cut also ends in quiet, or a warning names it
+        warned_in = {w.at_s for w in done.warnings if w.code == "join-not-quiet"}
+        warned_out = {w.at_s for w in done.warnings if w.code == "join-out-not-quiet"}
+        origins = {s.id: s.recording_origin for s in plan.sources}
+        for a, b in itertools.pairwise(pieces):
+            if not is_cut(a, b):
+                continue
+            human = a.keep != b.keep
+            ok_in = judge.in_quiet(b.source, b.rec_in - origins[b.source], handle=handle * human)
+            assert ok_in or round(sec(b.rec_in), 3) in warned_in, where
+            if human:
+                ok_out = judge.out_quiet(a.source, a.rec_out - origins[a.source], handle=handle)
+                assert ok_out or round(sec(a.rec_out), 3) in warned_out, where
         # the plan lints clean under ccn, reframe speeds included
         transcript = Transcript(words=case["words"])
         report = lint(plan, PROFILE, transcript=transcript, laughs=case["laughs"])
@@ -248,9 +282,11 @@ def test_random_shows_give_plans_that_keep_every_house_rule(kind: str) -> None:
                 speed = abs(k1.x - k0.x) / fps.seconds(k1.time - k0.time)
                 assert speed < 0.3 and k1.zoom == k0.zoom, where
         seen["trims"] += len(done.trims)
-        seen["nudges"] += len(done.nudges)
+        seen["nudges"] += sum(n.side == "in" for n in done.nudges)
+        seen["out_nudges"] += sum(n.side == "out" for n in done.nudges)
         seen["folds"] += len(done.folds)
+        seen["regrown"] += sum(f.retrimmed for f in done.folds)
         seen["endings"] += done.ending is not None
-        seen["warned"] += len(warned)
+        seen["warned"] += len(warned_in) + len(warned_out)
     # the generator really exercises every transform
     assert all(count > 0 for count in seen.values()), seen

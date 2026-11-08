@@ -527,7 +527,8 @@ def test_committed_ccn_produce_values() -> None:
         assert getattr(s, name) == getattr(d, name), name
     assert {k: v.silence_db for k, v in s.venues.items()} == {"loud": -36.0}
     assert [p.name for p in s.framing] == ["A", "B"]
-    assert [p.zoom for p in s.framing] == [1.0, 1.25]
+    assert [p.zoom for p in s.framing] == [1.0, 1.22]
+    assert s.min_word_ms == 40 and s.no_pause_warn_s == 60
 
 
 # ---------------------------------------------------------------- produce(): before any audio
@@ -636,3 +637,73 @@ def test_produce_stub_with_segments(tmp_path: Path) -> None:
     with pytest.raises(ProduceInputError) as info:
         run(tmp_path, stub_with(segment))
     check_code(info, "stub-has-segments")
+
+
+# ---------------------------------------------------------------- round 2
+
+
+def test_preset_b_at_1_22_still_clears_the_jump_cut_rule_despite_float_rounding() -> None:
+    """F8: 1.22 - 1.0 is 0.21999999999999997 in floats, still at least min_zoom_delta 0.2; the
+    linter itself agrees on a two-segment jump cut with those zooms (1.2 would not)."""
+    from aar.plan.lint import lint
+
+    profile = load_profile("ccn")
+    check_profile(profile, "short")
+    assert abs(1.22 - 1.0) >= 0.2 > abs(1.2 - 1.0)
+
+    def jump(zoom_b: float) -> list[str]:
+        plan = EditPlan.model_validate(
+            {
+                "project": "p",
+                "timeline": "t",
+                "kind": "short",
+                "fps": 25,
+                "resolution": {"width": 1080, "height": 1920},
+                "profile": "ccn",
+                "sources": [{"id": "m", "media": "m.mov", "camera": "A", "duration": 1000}],
+                "segments": [
+                    {"source": "m", "src_in": 10, "src_out": 60,
+                     "reframe": [{"time": 0, "zoom": 1.0}]},
+                    {"source": "m", "src_in": 100, "src_out": 150,
+                     "reframe": [{"time": 0, "zoom": zoom_b, "y": 0.45}]},
+                ],
+                "transitions": [{"after": 0, "audio": {"frames": 2}}],
+            }
+        )  # fmt: skip
+        report = lint(plan, profile)
+        return [f.rule for f in report.findings if f.rule == "no-same-camera-jump"]
+
+    assert jump(1.22) == [] and jump(1.2) == ["no-same-camera-jump"]
+    with pytest.raises(ProfileError, match="framing"):
+        check_profile(ccn_with(lambda d: d["produce"]["framing"][1].update(zoom=1.2)), "short")
+
+
+@pytest.mark.parametrize(("headroom", "ok"), [(0.95, True), (0.951, False), (1.0, False)])
+def test_speed_headroom_is_capped_at_load(headroom: float, ok: bool) -> None:
+    """F9: at 1.0 the 4-decimal keyframe rounding can cross no-whip-pan's limit."""
+    edit = lambda d: d["produce"]["steady"].update(speed_headroom=headroom)  # noqa: E731
+    if ok:
+        assert ccn_with(edit).produce.steady.speed_headroom == headroom
+        return
+    with pytest.raises(ProfileError, match="speed_headroom"):
+        ccn_with(edit)
+
+
+def test_a_transcript_that_names_no_recording_is_refused(tmp_path: Path) -> None:
+    """F10: an unnamed transcript cannot be checked against the sources' clock."""
+    data = load("longform", "transcript")
+    data.pop("recording")
+    with pytest.raises(ProduceInputError) as info:
+        run(tmp_path, transcript=Transcript.model_validate(data))
+    check_code(info, "transcript-unnamed")
+
+
+def test_faces_are_sorted_largest_first_at_the_boundary() -> None:
+    """F12: the camera follows faces[0], so the order in the file is not trusted."""
+    data = faces_data()
+    small = {"box": [0.8, 0.1, 0.05, 0.05]}
+    big = {"box": [0.3, 0.2, 0.2, 0.3]}
+    data["frames"] = [{"file_s": 0.0, "faces": [small, big]}]
+    track = FaceTrack.model_validate(data)
+    assert [f.box for f in track.frames[0].faces] == [big["box"], small["box"]]
+    assert track.samples() == [(0.0, pytest.approx(0.4))]

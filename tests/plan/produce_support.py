@@ -2,11 +2,13 @@
 
 The JSON inputs (stub, transcript, keep list, schedule, laughs, sync report, face track) are
 committed under ``fixtures/produce``. The audio is generated from the committed transcript and
-laugh map, so the two can never disagree: every word is a burst of a three-partial "voice" at
--20 dBFS peak, every laugh a two-partial burst at -22 dBFS, over a 120 Hz room tone at -60 dBFS
+laugh map, so the two can never disagree: every word is a burst of one of three three-partial
+"voices" at -20 dBFS peak, every laugh a two-partial burst at -22 dBFS, over a 120 Hz room tone
+at -60 dBFS
 (camera B: 6 dB quieter voice, room at -50 dBFS). ``AUDIO`` lists the deliberate differences
 between what the transcript says and what is on the audio: a mumble too quiet to break a pause,
-and a word whose sound starts 80 ms before Whisper's time (the R6 join trap).
+a word whose sound outlasts Whisper's end and one that starts before Whisper's start (the R6
+join traps).
 
 Nothing here uses aar.media, so a bug there cannot hide in the fixtures.
 """
@@ -38,7 +40,13 @@ needs_ffmpeg = pytest.mark.skipif(
     reason="ffmpeg/ffprobe not found on PATH or via AAR_FFMPEG/AAR_FFPROBE",
 )
 
-VOICE = "(0.5*sin(2*PI*220*t)+0.3*sin(2*PI*337*t)+0.2*sin(2*PI*513*t))"
+#: Three voices, word i speaking with VOICES[i % 3], so the bursts do not repeat one period and
+#: ``aar analyze sync`` finds a single clear correlation peak between the cameras.
+VOICES = (
+    "(0.5*sin(2*PI*220*t)+0.3*sin(2*PI*337*t)+0.2*sin(2*PI*513*t))",
+    "(0.5*sin(2*PI*181*t)+0.3*sin(2*PI*419*t)+0.2*sin(2*PI*647*t))",
+    "(0.5*sin(2*PI*263*t)+0.3*sin(2*PI*389*t)+0.2*sin(2*PI*571*t))",
+)
 LAUGH = "(0.5*sin(2*PI*600*t)+0.5*sin(2*PI*910*t))"
 
 #: (show, word text, transcript start) -> what the audio does instead.
@@ -46,8 +54,10 @@ AUDIO: dict[tuple[str, str, float], dict[str, float]] = {
     # A mumble below the silence threshold: the quiet run goes on through it, but it is a
     # transcribed word, so no trim may swallow it.
     ("longform", "um", 8.0): {"peak_db": -46.0},
-    # Whisper put "and" 80 ms late: the sound starts at 19.92 s, inside the keep range's
-    # in point (19.95 s), so the join must move earlier to start in quiet.
+    # Whisper ended "later" 150 ms early: its sound runs on to 19.45 s, past the second keep
+    # range's in point (19.40 s), so that in point must move later (inward) into quiet.
+    ("longform", "later", 18.8): {"end_s": 19.45},
+    # Whisper put "and" 80 ms late: its sound starts at 19.92 s.
     ("longform", "and", 20.0): {"start_s": 19.92},
 }
 
@@ -94,10 +104,11 @@ def load(show: str, part: str) -> Any:
 def events(show: str) -> list[tuple[float, float, float, str]]:
     """(start, end, peak dBFS, timbre) in recording seconds, from the committed inputs."""
     out = []
-    for word in load(show, "transcript")["words"]:
+    for index, word in enumerate(load(show, "transcript")["words"]):
         change = AUDIO.get((show, word["text"], word["start_s"]), {})
         start = change.get("start_s", word["start_s"])
-        out.append((start, word["end_s"], change.get("peak_db", -20.0), VOICE))
+        end = change.get("end_s", word["end_s"])
+        out.append((start, end, change.get("peak_db", -20.0), VOICES[index % 3]))
     for laugh in load(show, "laughs")["laughs"]:
         out.append((laugh["start_s"], laugh["end_s"], -22.0, LAUGH))
     return sorted(out)
@@ -105,7 +116,7 @@ def events(show: str) -> list[tuple[float, float, float, str]]:
 
 def _expr(show: str, origin_s: float, gain_db: float, room_db: float) -> str:
     """Room tone plus each timbre times the sum of its bursts' gated amplitudes."""
-    gates: dict[str, list[str]] = {VOICE: [], LAUGH: []}
+    gates: dict[str, list[str]] = {voice: [] for voice in (*VOICES, LAUGH)}
     for start, end, peak, timbre in events(show):
         a, b = start - origin_s, end - origin_s
         if b > 0:

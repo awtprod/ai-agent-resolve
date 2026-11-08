@@ -84,57 +84,90 @@ def test_min_frames_rounds_up_like_the_min_shot_rule() -> None:
 
 
 def test_keep_edges_become_frames() -> None:
-    keeps, snaps = keep_frames(
+    keeps, snaps, warnings = keep_frames(
         KeepList.model_validate({"ranges": [{"start_s": 1.0, "end_s": 3.0, "label": "x"}]}),
         NO_WORDS,
         FPS,
         min_shot_s=1.0,
     )
     assert [(k.start, k.end, k.label) for k in keeps] == [(25, 75, "x")]
-    assert snaps == []
+    assert snaps == [] and warnings == []
 
 
-def test_a_keep_edge_inside_a_word_moves_out_and_keeps_the_word() -> None:
+def test_a_keep_edge_inside_a_word_moves_inward_and_leaves_the_partial_word_out() -> None:
     w = words(("hello", 0.9, 1.3), ("world", 2.8, 3.2))
-    keeps, snaps = keep_frames(
+    keeps, snaps, _ = keep_frames(
         KeepList.model_validate({"ranges": [{"start_s": 1.0, "end_s": 3.0}]}),
         w,
         FPS,
         min_shot_s=1.0,
     )
-    # in 1.00 s is inside "hello" (0.91-1.29 core): back to frame 22 (0.88 s); out 3.00 s is inside
-    # "world": forward to frame 80 (3.20 s, not strictly inside 2.81-3.19).
-    assert [(k.start, k.end) for k in keeps] == [(22, 80)]
+    # in 1.00 s is inside "hello" (core 0.91-1.29): forward to frame 33 (1.32 s); out 3.00 s is
+    # inside "world" (2.81-3.19): back to frame 70 (2.80 s). The range only ever shrinks.
+    assert [(k.start, k.end) for k in keeps] == [(33, 70)]
     assert [(s.edge, s.word, s.from_frame, s.to_frame) for s in snaps] == [
-        ("in", "hello", 25, 22),
-        ("out", "world", 75, 80),
+        ("in", "hello", 25, 33),
+        ("out", "world", 75, 70),
     ]
-    assert all(w.inside(f) is None for f in (22, 80))
+    assert all(w.inside(f) is None for f in (33, 70))
 
 
-def test_snapped_ranges_that_now_overlap_merge() -> None:
-    w = words(("long", 2.9, 3.6))
-    keeps, _ = keep_frames(
+def test_a_long_word_at_an_edge_never_pulls_in_excluded_material() -> None:
+    w = words(("noise", 2.5, 10.5))  # an 8 s "word" across the out edge
+    keeps, _, _ = keep_frames(
+        KeepList.model_validate({"ranges": [{"start_s": 0.4, "end_s": 3.0}]}),
+        w,
+        FPS,
+        min_shot_s=1.0,
+    )
+    assert [(k.start, k.end) for k in keeps] == [(10, 62)]  # 2.48 s, outside the 2.51 core
+
+
+def test_touching_keep_ranges_merge_and_keep_a_word_across_the_seam() -> None:
+    w = words(("seam", 2.9, 3.1))
+    keeps, snaps, _ = keep_frames(
         KeepList.model_validate(
-            {"ranges": [{"start_s": 1.0, "end_s": 3.0}, {"start_s": 3.5, "end_s": 5.0}]}
+            {"ranges": [{"start_s": 1.0, "end_s": 3.0}, {"start_s": 3.0, "end_s": 5.0}]}
         ),
         w,
         FPS,
         min_shot_s=1.0,
     )
-    assert [(k.start, k.end) for k in keeps] == [(25, 125)]
+    assert [(k.start, k.end) for k in keeps] == [(25, 125)] and snaps == []
 
 
-def test_touching_keep_ranges_stay_two_ranges() -> None:
-    keeps, _ = keep_frames(
+def test_a_range_inside_one_word_is_dropped_with_a_warning() -> None:
+    w = words(("long", 0.9, 1.6))
+    keeps, _, warnings = keep_frames(
         KeepList.model_validate(
-            {"ranges": [{"start_s": 1.0, "end_s": 3.0}, {"start_s": 3.0, "end_s": 5.0}]}
+            {"ranges": [{"start_s": 1.0, "end_s": 1.5}, {"start_s": 2.0, "end_s": 4.0}]}
         ),
-        NO_WORDS,
+        w,
         FPS,
-        min_shot_s=1.0,
+        min_shot_s=0.4,
     )
-    assert [(k.start, k.end) for k in keeps] == [(25, 75), (75, 125)]
+    assert [(k.start, k.end) for k in keeps] == [(50, 100)]
+    assert [x.code for x in warnings] == ["keep-dropped"] and warnings[0].at_s == 1.0
+    with pytest.raises(ProduceInputError) as exc:
+        keep_frames(
+            KeepList.model_validate({"ranges": [{"start_s": 1.0, "end_s": 1.5}]}),
+            w,
+            FPS,
+            min_shot_s=0.4,
+        )
+    assert exc.value.code == "keep-empty"
+
+
+def test_a_range_that_shrinks_under_min_shot_is_refused() -> None:
+    w = words(("word", 0.9, 1.5))
+    with pytest.raises(ProduceInputError) as exc:
+        keep_frames(
+            KeepList.model_validate({"ranges": [{"start_s": 1.0, "end_s": 2.2}]}),
+            w,
+            FPS,
+            min_shot_s=1.0,
+        )
+    assert exc.value.code == "keep-too-short" and "partial word" in exc.value.message
 
 
 @pytest.mark.parametrize(("end_s", "ok"), [(1.96, False), (2.0, True)])
@@ -293,82 +326,147 @@ def test_trims_never_cut_into_any_word() -> None:
 # ---------------------------------------------------------------- joins in quiet
 
 
-def judge_quiet_at(*frames: int):
-    calls: list[tuple[str, int]] = []
+class FakeJudge:
+    """Quiet exactly at the listed source frames; records every question."""
 
-    def judge(source: str, src_in: int) -> bool:
-        calls.append((source, src_in))
-        return src_in in frames
+    def __init__(self, ins: tuple[int, ...] = (), outs: tuple[int, ...] = ()) -> None:
+        self.ins, self.outs = set(ins), set(outs)
+        self.calls: list[tuple[str, str, int, int]] = []
 
-    judge.calls = calls  # type: ignore[attr-defined]
-    return judge
+    def in_quiet(self, source: str, src_in: int, *, handle: int) -> bool:
+        self.calls.append(("in", source, src_in, handle))
+        return src_in in self.ins
+
+    def out_quiet(self, source: str, src_out: int, *, handle: int) -> bool:
+        self.calls.append(("out", source, src_out, handle))
+        return src_out in self.outs
 
 
-def joins(pieces, judge, w=NO_WORDS, cover=WIDE):
-    return place_joins(pieces, judge, w, cover, FPS, nudge_frames=3, need=25)
+ONE_KEEP = [KeepFrames(0, 1000, None)]
+TWO_KEEPS = [KeepFrames(0, 50, None), KeepFrames(100, 1000, None)]
+
+
+def joins(pieces, judge, w=NO_WORDS, cover=WIDE, keeps=ONE_KEEP):
+    return place_joins(pieces, judge, w, cover, keeps, FPS, nudge_frames=3, need=25, handle=1)
 
 
 def test_a_cut_already_in_quiet_stays() -> None:
-    pieces = [Piece("a", 0, 50, 0), Piece("a", 100, 200, 1)]
-    out, nudges, warnings = joins(pieces, judge_quiet_at(100))
+    pieces = [Piece("a", 0, 50, 0), Piece("a", 100, 200, 0)]
+    out, nudges, warnings = joins(pieces, FakeJudge(ins=(100,)))
     assert out == pieces and nudges == [] and warnings == []
 
 
-def test_a_cut_moves_to_the_nearest_quiet_frame_later_first_on_a_tie() -> None:
-    pieces = [Piece("a", 0, 50, 0), Piece("a", 100, 200, 1)]
-    out, nudges, _ = joins(pieces, judge_quiet_at(98, 102))
+def test_inside_a_keep_range_the_in_point_moves_either_way_later_first() -> None:
+    pieces = [Piece("a", 0, 50, 0), Piece("a", 100, 200, 0)]
+    out, nudges, _ = joins(pieces, FakeJudge(ins=(98, 102)))
     assert out[1].rec_in == 102
-    assert [(n.join, n.from_frame, n.to_frame) for n in nudges] == [(1, 100, 102)]
-    out, _, _ = joins(pieces, judge_quiet_at(98, 103))
-    assert out[1].rec_in == 98
+    assert [(n.join, n.side, n.from_frame, n.to_frame) for n in nudges] == [(1, "in", 100, 102)]
+    out, _, _ = joins(pieces, FakeJudge(ins=(98, 103)))
+    assert out[1].rec_in == 98  # a trimmed pause may come back a little
+
+
+def test_at_a_human_cut_the_in_point_only_moves_inward_with_its_handle() -> None:
+    pieces = [Piece("a", 0, 50, 0), Piece("a", 100, 200, 1)]
+    judge = FakeJudge(ins=(98, 102), outs=(50,))
+    out, _, warnings = joins(pieces, judge, keeps=TWO_KEEPS)
+    assert out[1].rec_in == 102 and warnings == []
+    assert ("in", "a", 100, 1) in judge.calls  # the incoming handle must be quiet too
+    out, _, warnings = joins(pieces, FakeJudge(ins=(98,), outs=(50,)), keeps=TWO_KEEPS)
+    assert out[1].rec_in == 100  # 98 would play material the human excluded
+    assert [x.code for x in warnings] == ["join-not-quiet"] and "human cut" in warnings[0].message
+
+
+def test_a_trim_cut_judges_no_handle_and_no_out_side() -> None:
+    judge = FakeJudge(ins=(100,))
+    joins([Piece("a", 0, 50, 0), Piece("a", 100, 200, 0)], judge)
+    assert judge.calls == [("in", "a", 100, 0)]
+
+
+def test_the_out_side_of_a_human_cut_moves_earlier_into_quiet() -> None:
+    pieces = [Piece("a", 0, 50, 0), Piece("a", 100, 200, 1)]
+    out, nudges, warnings = joins(pieces, FakeJudge(ins=(100,), outs=(48, 52)), keeps=TWO_KEEPS)
+    assert out[0].rec_out == 48 and warnings == []
+    assert [(n.side, n.from_frame, n.to_frame) for n in nudges] == [("out", 50, 48)]
+    out, _, warnings = joins(pieces, FakeJudge(ins=(100,), outs=(52,)), keeps=TWO_KEEPS)
+    assert out[0].rec_out == 50  # never later, into the human's cut
+    assert [x.code for x in warnings] == ["join-out-not-quiet"] and "join 1" in warnings[0].message
+
+
+def test_an_out_side_nudge_never_drops_a_word() -> None:
+    pieces = [Piece("a", 0, 50, 0), Piece("a", 100, 200, 1)]
+    w = words(("tail", 1.9, 1.95))  # frames 47.5-48.75 occupy 1.905-1.945 s (40 ms at least)
+    out, _, warnings = joins(pieces, FakeJudge(ins=(100,), outs=(47,)), w, keeps=TWO_KEEPS)
+    assert out[0].rec_out == 50 and [x.code for x in warnings] == ["join-out-not-quiet"]
 
 
 def test_the_judge_gets_source_frames_not_recording_frames() -> None:
-    judge = judge_quiet_at(70)
+    judge = FakeJudge()
     joins(
-        [Piece("a", 0, 50, 0), Piece("b", 100, 200, 1)],
+        [Piece("a", 0, 50, 0), Piece("b", 100, 200, 0)],
         judge,
         cover={**WIDE, "b": Coverage(30, None)},
     )
-    assert judge.calls == [("b", 70)]  # type: ignore[attr-defined]
+    assert judge.calls[0] == ("in", "b", 70, 0)
 
 
 def test_a_nudge_never_adds_or_drops_a_word() -> None:
-    pieces = [Piece("a", 0, 50, 0), Piece("a", 100, 200, 1)]
+    pieces = [Piece("a", 0, 50, 0), Piece("a", 100, 200, 0)]
     # "x" sits in 3.93-3.99 s (frames 98.25-99.75): moving the in point to 98 would add it.
     w = words(("x", 3.92, 4.0), ("y", 4.04, 4.2))
-    out, nudges, warnings = joins(pieces, judge_quiet_at(98, 102), w)
+    out, nudges, warnings = joins(pieces, FakeJudge(ins=(98, 102)), w)
     assert out[1].rec_in == 100 and nudges == []
     assert [x.code for x in warnings] == ["join-not-quiet"]
 
 
 def test_a_nudge_keeps_the_cut_a_cut() -> None:
-    pieces = [Piece("a", 0, 99, 0), Piece("a", 100, 200, 1)]
-    out, _, warnings = joins(pieces, judge_quiet_at(99, 98))
+    pieces = [Piece("a", 0, 99, 0), Piece("a", 100, 200, 0)]
+    out, _, warnings = joins(pieces, FakeJudge(ins=(99, 98)))
     assert out[1].rec_in == 100 and warnings  # 99 would be unbroken playback, 98 overlaps
 
 
 def test_a_nudge_may_not_strand_an_unfoldable_sliver() -> None:
+    keeps = [KeepFrames(0, 50, None), KeepFrames(100, 126, None)]
     pieces = [Piece("a", 0, 50, 0), Piece("a", 100, 126, 1)]
-    out, _, warnings = joins(pieces, judge_quiet_at(102))
+    out, _, warnings = joins(pieces, FakeJudge(ins=(102,), outs=(50,)), keeps=keeps)
     assert out[1].rec_in == 100 and warnings  # 102-126 is 24 frames, keep range 1 has no other
-    pieces = [Piece("a", 0, 50, 1), Piece("a", 100, 126, 1)]
-    out, _, _ = joins(pieces, judge_quiet_at(102))
+    pieces = [Piece("a", 0, 50, 0), Piece("a", 100, 126, 0)]
+    out, _, _ = joins(pieces, FakeJudge(ins=(102,)))
     assert out[1].rec_in == 102  # same keep range: a later fold can absorb it
 
 
 def test_a_camera_switch_in_unbroken_playback_is_not_judged() -> None:
-    judge = judge_quiet_at()
-    _out, _, warnings = joins([Piece("a", 0, 50, 0), Piece("b", 50, 100, 0)], judge)
-    assert judge.calls == [] and warnings == []  # type: ignore[attr-defined]
+    judge = FakeJudge()
+    _, _, warnings = joins([Piece("a", 0, 50, 0), Piece("b", 50, 100, 0)], judge)
+    assert judge.calls == [] and warnings == []
 
 
 def test_no_quiet_frame_leaves_the_cut_and_names_the_join() -> None:
+    keeps = [KeepFrames(0, 120, None), KeepFrames(200, 300, None)]
     pieces = [Piece("a", 0, 50, 0), Piece("a", 60, 120, 0), Piece("b", 200, 300, 1)]
-    out, _, warnings = joins(pieces, judge_quiet_at(60))
+    out, _, warnings = joins(pieces, FakeJudge(ins=(60,), outs=(120,)), keeps=keeps)
     assert out == pieces
     assert len(warnings) == 1 and "join 2" in warnings[0].message
     assert warnings[0].source == "b" and warnings[0].at_s == 8.0
+
+
+def test_no_incoming_handle_shifts_the_in_point_one_frame_or_fails() -> None:
+    cover = {"a": Coverage(0, None), "b": Coverage(100, None)}  # b's media starts at the cut
+    pieces = [Piece("a", 0, 50, 0), Piece("b", 100, 200, 1)]
+    out, nudges, _ = joins(pieces, FakeJudge(ins=(1,), outs=(50,)), cover=cover, keeps=TWO_KEEPS)
+    assert out[1].rec_in == 101 and [(n.side, n.to_frame) for n in nudges] == [("in", 101)]
+    with pytest.raises(ProduceError) as exc:
+        joins(pieces, FakeJudge(ins=(0, 2), outs=(50,)), cover=cover, keeps=TWO_KEEPS)
+    assert exc.value.code == "no-handle" and "cut 1" in exc.value.message
+
+
+def test_no_outgoing_handle_shifts_the_out_point_one_frame_or_fails() -> None:
+    cover = {"a": Coverage(0, 50), "b": Coverage(0, None)}  # a's media ends at the cut
+    pieces = [Piece("a", 0, 50, 0), Piece("b", 100, 200, 1)]
+    out, _, _ = joins(pieces, FakeJudge(ins=(100,), outs=(49,)), cover=cover, keeps=TWO_KEEPS)
+    assert out[0].rec_out == 49
+    with pytest.raises(ProduceError) as exc:
+        joins(pieces, FakeJudge(ins=(100,), outs=(50,)), cover=cover, keeps=TWO_KEEPS)
+    assert exc.value.code == "no-handle" and "after its out" in exc.value.message
 
 
 # ---------------------------------------------------------------- sliver fold
@@ -447,12 +545,49 @@ def test_the_content_ends_end_after_past_the_final_laughs_onset() -> None:
     assert warnings == []
 
 
-def test_the_ending_may_grow_into_a_trimmed_pause_or_past_the_keep_out() -> None:
+def test_the_ending_may_grow_into_a_trimmed_pause_but_never_past_the_keep_out() -> None:
     pieces = [Piece("a", 150, 300, 1), Piece("a", 320, 400, 1)]
     out, _, _ = ending(pieces, [(12.3, 13.0, 1.0)])
     assert out[-1] == Piece("a", 150, 312, 1)  # 12.5 s = frame 312.5 -> 312, in the trimmed 300-320
-    out, _, _ = ending(pieces, [(15.95, 17.0, 1.0)])
-    assert out[-1] == Piece("a", 320, 404, 1)  # 16.15 s: 4 frames past the keep out
+    out, end, _ = ending(pieces, [(15.95, 17.0, 1.0)])
+    assert out[-1] == Piece("a", 320, 400, 1)  # 16.15 s is past the keep out: 16.0 s is nearest
+    assert end is not None and end.to_frame == 400
+
+
+def test_a_laugh_at_the_final_ranges_start_never_replays_the_human_cut() -> None:
+    """The validator's repro (finding 1): keeps [0, 300) and [900, 1200) with a laugh 1 ms
+    after frame 900. The only frame that fits stretched [0, 300) across the cut to 900."""
+    fps = Fps(num=30000, den=1001)
+    keeps = [KeepFrames(0, 300, None), KeepFrames(900, 1200, None)]
+    pieces = [Piece("a", 0, 300, 0), Piece("a", 900, 1200, 1)]
+    laughs = LaughMap.model_validate(
+        {"laughs": [{"start_s": fps.seconds(900) + 0.001, "end_s": fps.seconds(940)}]}
+    )
+    out, end, warnings = end_on_laugh(
+        pieces,
+        laughs,
+        keeps,
+        Words([], 0.01, fps),
+        {"a": Coverage(0, None)},
+        fps,
+        end_after_s=0.2,
+        window_s=(0.0, 0.4),
+        min_strength=0.0,
+        need=30,
+    )
+    assert out == pieces and end is None
+    assert [w.code for w in warnings] == ["end-not-on-laugh"]
+
+
+def test_dropping_kept_speech_after_the_laugh_is_a_warning() -> None:
+    pieces = [Piece("a", 150, 400, 1)]
+    talk = words(("and", 11.0, 11.3), ("more", 12.0, 12.4))
+    out, end, warnings = ending(pieces, [(10.0, 10.6, 1.0)], talk)
+    assert out[-1].rec_out == 255 and end is not None
+    assert [w.code for w in warnings] == ["end-dropped-speech"]
+    assert "5.800 s" in warnings[0].message and "2 transcribed word(s)" in warnings[0].message
+    _, _, quiet = ending(pieces, [(15.0, 15.5, 1.0)], talk)
+    assert quiet == []  # nothing spoken after 15.2 s
 
 
 def test_only_a_laugh_in_the_final_keep_range_counts() -> None:
@@ -589,3 +724,118 @@ def test_the_splice_test_allows_the_word_tolerance_at_each_edge(at: float, insid
 
     word = Word(text="w", start_s=1.0, end_s=2.0)
     assert (word_at([word], at, 0.01) is not None) is inside
+
+
+# ---------------------------------------------------------------- round 2 pins
+
+
+def test_a_sliver_grows_into_a_trimmed_pause_that_stays_trimmed() -> None:
+    """F7: folding re-runs the trim instead of bringing the whole pause back."""
+    out, folds = fold_slivers([Piece("a", 0, 18, 0), Piece("a", 60, 150, 0)], WIDE, FPS, need=25)
+    assert out == [Piece("a", 0, 25, 0), Piece("a", 60, 150, 0)]
+    assert [(f.into, f.readded_frames, f.retrimmed) for f in folds] == [("next", 7, True)]
+    out, folds = fold_slivers([Piece("a", 0, 100, 0), Piece("a", 140, 150, 0)], WIDE, FPS, need=25)
+    assert out == [Piece("a", 0, 100, 0), Piece("a", 125, 150, 0)]
+    assert folds[0].retrimmed and folds[0].into == "previous"
+
+
+def test_a_pause_too_short_to_regrow_comes_back_whole() -> None:
+    out, folds = fold_slivers([Piece("a", 0, 18, 0), Piece("a", 22, 150, 0)], WIDE, FPS, need=25)
+    assert out == [Piece("a", 0, 150, 0)]
+    assert [(f.into, f.readded_frames, f.retrimmed) for f in folds] == [("next", 4, False)]
+
+
+def test_both_regrowths_tie_toward_the_previous_side() -> None:
+    pieces = [Piece("a", 0, 50, 0), Piece("a", 100, 110, 0), Piece("a", 160, 250, 0)]
+    out, folds = fold_slivers(pieces, WIDE, FPS, need=25)
+    assert out[1] == Piece("a", 85, 110, 0) and folds[0].into == "previous"
+
+
+def test_the_nudge_reach_rounds_down() -> None:
+    """V07: 150 ms is 4.5 frames at 29.97 fps, so a nudge reaches 4 frames, not 5."""
+    from aar.plan.produce.joins import reach_frames
+
+    assert reach_frames(150, Fps(num=30000, den=1001)) == 4
+    assert reach_frames(150, FPS) == 3 and reach_frames(160, FPS) == 4 and reach_frames(0, FPS) == 0
+
+
+def test_a_nudge_never_starts_before_the_media() -> None:
+    """V06: with no crossfade handle to keep, the media's first frame still bounds a nudge."""
+    cover = {"a": Coverage(0, None), "b": Coverage(100, None)}
+    pieces = [Piece("a", 0, 50, 0), Piece("b", 101, 200, 0)]
+    out, _, warnings = place_joins(
+        pieces, FakeJudge(ins=(-1, 0)), NO_WORDS, cover, ONE_KEEP, FPS,
+        nudge_frames=3, need=25, handle=0,
+    )  # fmt: skip
+    assert out[1].rec_in == 100  # source frame 0, never -1
+    out, _, warnings = place_joins(
+        pieces, FakeJudge(ins=(-1,)), NO_WORDS, cover, ONE_KEEP, FPS,
+        nudge_frames=3, need=25, handle=0,
+    )  # fmt: skip
+    assert out[1].rec_in == 101 and [w.code for w in warnings] == ["join-not-quiet"]
+
+
+def test_a_laugh_exactly_at_the_final_keep_start_counts() -> None:
+    """V11: the onset may equal the range's first frame (then no clean frame is long enough)."""
+    _, end, warnings = ending([Piece("a", 150, 400, 1)], [(6.0, 7.0, 1.0)])
+    assert end is None and [w.code for w in warnings] == ["end-not-on-laugh"]
+
+
+def test_the_ending_never_runs_past_the_media() -> None:
+    """V13: target 255 (10.2 s) is past the media's last frame 253, so 253 it is."""
+    out, end, _ = ending(
+        [Piece("a", 150, 250, 1)], [(10.0, 11.0, 1.0)], cover={"a": Coverage(0, 253)}
+    )
+    assert end is not None and out[-1].rec_out == 253
+
+
+def test_the_face_margin_is_the_distance_to_the_crop_edge() -> None:
+    """V22: a face pinned at 0.95 under a 0.32-wide crop that clamps at 0.84 sits 0.05 inside."""
+    preset = FramingPreset(name="A", zoom=1.0)
+    _, margin = reframe_keys([0.95] * 60, preset, 0.32, 25.0, SteadySettings(), max_pan_speed=0.3)
+    assert margin == pytest.approx(0.05)
+
+
+def test_a_one_frame_schedule_gap_is_refused() -> None:
+    """V28: 2.00-2.04 s is one frame (50 -> 51) with no camera."""
+    plan = stub(("a", "A"), ("b", "B"))
+    sched = schedule_frames(
+        plan,
+        CameraSchedule.model_validate(
+            {"spans": [{"start_s": 0, "end_s": 2.0, "camera": "A"},
+                       {"start_s": 2.04, "end_s": 9, "camera": "B"}]}
+        ),
+        "A",
+    )  # fmt: skip
+    with pytest.raises(ProduceInputError) as exc:
+        split(25, 100, 0, sched, WIDE, FPS)
+    assert exc.value.code == "schedule-gap"
+
+
+def test_zero_length_and_15_ms_words_split_a_pause() -> None:
+    """The validator's repro (finding 2): 'uh' (0 ms) and 'mm' (15 ms) in a 3 s quiet run were
+    removed; with min_word_ms 40 every word splits the pause and stays."""
+    fps = Fps(num=30000, den=1001)
+    for text, a, b in (("uh", 11.5, 11.5), ("mm", 11.5, 11.515), ("um", 11.5, 11.7)):
+        w = Words(
+            [Word(text="so", start_s=9.0, end_s=10.0), Word(text=text, start_s=a, end_s=b),
+             Word(text="then", start_s=13.0, end_s=13.5)],
+            0.010, fps, 0.040,
+        )  # fmt: skip
+        trims = find_trims(
+            0, fps.frames(8.0), fps.frames(15.0), [(10.0, 13.0)], w, fps,
+            min_pause_s=0.9, beat_s=0.45, beat_lead_s=0.25,
+        )  # fmt: skip
+        assert len(trims) == 2, text
+        assert not any(
+            fps.seconds(t.out_frame) <= a and b <= fps.seconds(t.in_frame) for t in trims
+        )
+
+
+def test_a_word_occupies_at_least_min_word_around_its_middle() -> None:
+    w = Words([Word(text="uh", start_s=1.0, end_s=1.0)], 0.01, FPS, 0.04)
+    assert w.spans(0.0, 2.0) == [pytest.approx((0.98, 1.02))]
+    assert w.speech_between(1.019, 2.0) is not None and w.speech_between(1.021, 2.0) is None
+    assert Words([Word(text="uh", start_s=1.0, end_s=1.0)], 0.01, FPS).spans(0.0, 2.0) == []
+    long = Words([Word(text="long", start_s=1.0, end_s=2.0)], 0.01, FPS, 0.04)
+    assert long.spans(0.0, 3.0) == [pytest.approx((1.01, 1.99))]  # the core, as before

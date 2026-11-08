@@ -44,275 +44,275 @@
       "non_finite_samples": 0,
       "status": "ok",
       "level_dbfs": {
-        "reference": -30.3,
-        "other": -36.4
+        "reference": -30.4,
+        "other": -36.5
       },
       "coarse": {
         "windows": [
           {
             "ref_start_s": 0.0,
             "state": "searched",
-            "offset_s": -23.598004,
-            "ratio": 1.652,
-            "peak": 0.118545,
+            "offset_s": -25.598,
+            "ratio": 1.363,
+            "peak": 0.101448,
             "polarity": -1
           },
           {
             "ref_start_s": 2.7273,
             "state": "searched",
-            "offset_s": 2.002007,
-            "ratio": 1.421,
-            "peak": 0.137108,
+            "offset_s": 2.002006,
+            "ratio": 1.329,
+            "peak": 0.138374,
             "polarity": -1
           },
           {
             "ref_start_s": 5.4545,
             "state": "searched",
-            "offset_s": 2.002014,
-            "ratio": 1.32,
-            "peak": 0.147781,
+            "offset_s": 2.002009,
+            "ratio": 1.084,
+            "peak": 0.125244,
             "polarity": -1
           },
           {
             "ref_start_s": 8.1819,
             "state": "searched",
-            "offset_s": -20.298,
-            "ratio": 1.093,
-            "peak": 0.157045,
+            "offset_s": -20.29801,
+            "ratio": 1.262,
+            "peak": 0.151989,
             "polarity": -1
           },
           {
             "ref_start_s": 10.9091,
             "state": "searched",
-            "offset_s": -14.597997,
-            "ratio": 1.099,
-            "peak": 0.119005,
+            "offset_s": 2.002009,
+            "ratio": 1.958,
+            "peak": 0.116446,
             "polarity": -1
           },
           {
             "ref_start_s": 13.6364,
             "state": "searched",
-            "offset_s": 2.002006,
-            "ratio": 1.979,
-            "peak": 0.210712,
+            "offset_s": 2.001998,
+            "ratio": 2.283,
+            "peak": 0.203807,
             "polarity": -1
           },
           {
             "ref_start_s": 16.3636,
             "state": "searched",
-            "offset_s": 2.002004,
-            "ratio": 2.03,
-            "peak": 0.229808,
+            "offset_s": 2.001998,
+            "ratio": 3.364,
+            "peak": 0.228784,
             "polarity": -1
           },
           {
             "ref_start_s": 19.0909,
             "state": "searched",
-            "offset_s": 2.002004,
-            "ratio": 1.919,
-            "peak": 0.239705,
+            "offset_s": 2.001997,
+            "ratio": 2.819,
+            "peak": 0.228471,
             "polarity": -1
           },
           {
             "ref_start_s": 21.8181,
             "state": "searched",
-            "offset_s": 2.002006,
-            "ratio": 3.231,
-            "peak": 0.241811,
+            "offset_s": 2.002001,
+            "ratio": 2.3,
+            "peak": 0.181876,
             "polarity": -1
           },
           {
             "ref_start_s": 24.5455,
             "state": "searched",
-            "offset_s": 2.002006,
-            "ratio": 2.801,
-            "peak": 0.260689,
+            "offset_s": 2.001998,
+            "ratio": 1.825,
+            "peak": 0.148899,
             "polarity": -1
           },
           {
             "ref_start_s": 27.2727,
             "state": "searched",
-            "offset_s": 2.002018,
-            "ratio": 3.493,
-            "peak": 0.304898,
+            "offset_s": 2.002005,
+            "ratio": 3.199,
+            "peak": 0.261739,
             "polarity": -1
           },
           {
             "ref_start_s": 30.0,
             "state": "searched",
-            "offset_s": 2.002017,
-            "ratio": 3.602,
-            "peak": 0.272346,
+            "offset_s": 2.002012,
+            "ratio": 1.802,
+            "peak": 0.213113,
             "polarity": -1
           }
         ],
         "silent": 0,
         "at_edge": 0,
-        "offset_s": 2.002006,
-        "windows_agreeing": 9,
+        "offset_s": 2.002003,
+        "windows_agreeing": 10,
         "windows_eligible": 11,
-        "agreement": 0.818,
-        "median_ratio": 2.03
+        "agreement": 0.909,
+        "median_ratio": 2.121
       },
       "drift": {
         "windows": 16,
         "silent": 0,
         "unsearchable": 0,
-        "low_confidence": 0,
+        "low_confidence": 2,
         "measured": true,
-        "ppm": 0.176,
-        "residual_rms_ms": 0.0098,
-        "used": 16,
+        "ppm": -0.14,
+        "residual_rms_ms": 0.0113,
+        "used": 14,
         "outliers": 0,
-        "confirmed": 1.0,
+        "confirmed": 0.875,
         "detail": [
           {
             "ref_start_s": 2.002,
             "state": "searched",
             "offset_s": 2.002,
-            "ratio": 11.717,
-            "peak": 0.281797,
+            "ratio": 6.991,
+            "peak": 0.289954,
             "polarity": -1
           },
           {
             "ref_start_s": 4.002,
             "state": "searched",
-            "offset_s": 2.002002,
-            "ratio": 4.473,
-            "peak": 0.327425,
+            "offset_s": 2.001993,
+            "ratio": 9.528,
+            "peak": 0.35453,
             "polarity": -1
           },
           {
             "ref_start_s": 6.002,
             "state": "searched",
-            "offset_s": 2.002001,
-            "ratio": 4.782,
-            "peak": 0.372342,
+            "offset_s": 2.001996,
+            "ratio": 6.402,
+            "peak": 0.309777,
             "polarity": -1
           },
           {
             "ref_start_s": 8.002,
             "state": "searched",
-            "offset_s": 2.002024,
-            "ratio": 6.459,
-            "peak": 0.19666,
+            "offset_s": 2.002025,
+            "ratio": 4.855,
+            "peak": 0.206648,
             "polarity": -1
           },
           {
             "ref_start_s": 10.002,
             "state": "searched",
-            "offset_s": 2.002017,
-            "ratio": 3.776,
-            "peak": 0.247425,
+            "offset_s": 2.002015,
+            "ratio": 3.083,
+            "peak": 0.209913,
             "polarity": -1
           },
           {
             "ref_start_s": 12.002,
             "state": "searched",
-            "offset_s": 2.002028,
-            "ratio": 3.421,
-            "peak": 0.261112,
+            "offset_s": 2.002022,
+            "ratio": 3.874,
+            "peak": 0.191135,
             "polarity": -1
           },
           {
             "ref_start_s": 14.002,
             "state": "searched",
-            "offset_s": 2.002003,
-            "ratio": 3.821,
-            "peak": 0.234679,
+            "offset_s": 2.001999,
+            "ratio": 5.049,
+            "peak": 0.232895,
             "polarity": -1
           },
           {
             "ref_start_s": 16.002,
             "state": "searched",
-            "offset_s": 2.002004,
-            "ratio": 6.334,
-            "peak": 0.370286,
+            "offset_s": 2.001997,
+            "ratio": 12.443,
+            "peak": 0.380128,
             "polarity": -1
           },
           {
             "ref_start_s": 18.002,
             "state": "searched",
-            "offset_s": 2.002004,
-            "ratio": 5.956,
-            "peak": 0.3382,
+            "offset_s": 2.001997,
+            "ratio": 8.178,
+            "peak": 0.351441,
             "polarity": -1
           },
           {
             "ref_start_s": 20.002,
             "state": "searched",
-            "offset_s": 2.002004,
-            "ratio": 5.717,
-            "peak": 0.317999,
+            "offset_s": 2.001998,
+            "ratio": 6.828,
+            "peak": 0.31161,
             "polarity": -1
           },
           {
             "ref_start_s": 22.002,
             "state": "searched",
-            "offset_s": 2.002005,
-            "ratio": 2.849,
-            "peak": 0.3486,
+            "offset_s": 2.001997,
+            "ratio": 6.487,
+            "peak": 0.323551,
             "polarity": -1
           },
           {
             "ref_start_s": 24.002,
             "state": "searched",
-            "offset_s": 2.002004,
-            "ratio": 3.499,
-            "peak": 0.248149,
+            "offset_s": 2.001994,
+            "ratio": 4.856,
+            "peak": 0.228515,
             "polarity": -1
           },
           {
             "ref_start_s": 26.002,
             "state": "searched",
-            "offset_s": 2.002003,
-            "ratio": 2.712,
-            "peak": 0.341892,
+            "offset_s": 2.001996,
+            "ratio": 3.926,
+            "peak": 0.243959,
             "polarity": -1
           },
           {
             "ref_start_s": 28.002,
             "state": "searched",
-            "offset_s": 2.002007,
-            "ratio": 4.119,
-            "peak": 0.379068,
+            "offset_s": 2.001998,
+            "ratio": 1.788,
+            "peak": 0.248063,
             "polarity": -1
           },
           {
             "ref_start_s": 30.002,
             "state": "searched",
-            "offset_s": 2.002012,
-            "ratio": 4.094,
-            "peak": 0.316809,
+            "offset_s": 2.002003,
+            "ratio": 1.959,
+            "peak": 0.237644,
             "polarity": -1
           },
           {
             "ref_start_s": 32.002,
             "state": "searched",
-            "offset_s": 2.002021,
-            "ratio": 5.779,
-            "peak": 0.27088,
+            "offset_s": 2.002011,
+            "ratio": 3.255,
+            "peak": 0.239213,
             "polarity": -1
           }
         ],
-        "over_overlap_ms": 0.007
+        "over_overlap_ms": 0.005
       },
       "overlap_s": 37.998,
       "overlap_ref_s": [
         2.002,
         40.0
       ],
-      "offset_s": 2.002004,
+      "offset_s": 2.001998,
       "offset_frames": 60,
-      "offset_frames_exact": 60.0001,
-      "rounding_error_ms": -0.0043,
+      "offset_frames_exact": 59.9999,
+      "rounding_error_ms": 0.0022,
       "suggested_recording_origin": 60,
       "confidence": {
-        "agreement": 0.818,
-        "median_ratio": 2.03,
-        "windows_agreeing": 9,
+        "agreement": 0.909,
+        "median_ratio": 2.121,
+        "windows_agreeing": 10,
         "windows_eligible": 11,
-        "confirmed": 1.0
+        "confirmed": 0.875
       }
     }
   ]

@@ -80,7 +80,7 @@
     {
       "track": 1,
       "source": "cam-b",
-      "src_in": 537,
+      "src_in": 524,
       "src_out": 682,
       "reframe": [],
       "transform": {
