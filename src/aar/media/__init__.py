@@ -1,4 +1,5 @@
-"""A small ffmpeg/ffprobe layer: probing, measuring and decoding local media files.
+"""A small ffmpeg/ffprobe layer: probing, measuring and decoding local media files, and a
+seek-based QuickTime reader for the start timecode of files ffprobe may not open (BRAW).
 
 Binaries come from ``AAR_FFMPEG`` / ``AAR_FFPROBE`` or ``PATH``. Calls use argument lists
 (never a shell), a timeout each, bounded stderr capture and typed errors (``MediaError`` with
@@ -24,7 +25,8 @@ from aar.media.parse import (
     parse_silencedetect,
 )
 from aar.media.pcm import Pcm, QuietRun, QuietScan, quiet_runs
-from aar.media.probe import MediaInfo, Stream, parse_rational, probe
+from aar.media.probe import MediaInfo, Stream, frames_timecode, parse_rational, probe
+from aar.media.quicktime import QuickTimeTimecode, TimecodeUnreadable, read_timecode
 from aar.media.tools import (
     MediaError,
     MediaInputError,
@@ -52,13 +54,16 @@ __all__ = [
     "OutputTooLarge",
     "ParseError",
     "Pcm",
+    "QuickTimeTimecode",
     "QuietRun",
     "QuietScan",
     "RunResult",
     "Silence",
     "Stream",
+    "TimecodeUnreadable",
     "count_clipped",
     "decode_check",
+    "frames_timecode",
     "input_url",
     "measure_audio",
     "parse_astats",
@@ -68,6 +73,7 @@ __all__ = [
     "probe",
     "quiet_runs",
     "read_pcm",
+    "read_timecode",
     "resolve_tool",
     "run_tool",
     "timeout_for",
