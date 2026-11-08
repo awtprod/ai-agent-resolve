@@ -155,6 +155,39 @@ def test_unknown_elements_and_text_are_caught() -> None:
     assert any("text content" in p for p in problems), problems
 
 
+RUN = '<text-style ref="ts1">Jane Doe\nHead Judge</text-style>'
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expect"),
+    [
+        # a second run would show "FAKE" in the title
+        (RUN, RUN + '<text-style ref="ts1">FAKE</text-style>', "exactly one text-style run"),
+        # text outside the run, before or after it
+        ("<text>" + RUN, "<text>FAKE " + RUN, "no text outside it"),
+        (RUN + "</text>", RUN + " FAKE</text>", "no text outside it"),
+        # a second text element
+        (
+            RUN + "</text>",
+            RUN + '</text><text><text-style ref="ts1">FAKE</text-style></text>',
+            "exactly one text",
+        ),
+        # an element inside the run
+        (
+            RUN,
+            '<text-style ref="ts1">Jane Doe\nHead Judge<param name="x" /></text-style>',
+            "holds elements",
+        ),
+    ],
+)
+def test_a_title_holds_one_text_run_only(old: str, new: str, expect: str) -> None:
+    """The writer emits one text-style run per title; anything more could change a visible
+    title and still decode the same first run."""
+    assert GOLDEN.count(old) >= 1, old
+    problems = _problems(GOLDEN.replace(old, new, 1))
+    assert any(expect in p for p in problems), problems
+
+
 @pytest.mark.parametrize(
     "text",
     [

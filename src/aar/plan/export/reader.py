@@ -460,6 +460,24 @@ def check_writer_subset(root: ET.Element) -> list[str]:
             problems.append(f"<{tag}> lacks attribute {name!r}, which aar's writer always emits")
         if tag == "asset" and len(element.findall("media-rep")) != 1:
             problems.append(f"<asset id={element.get('id')!r}> must hold exactly one media-rep")
+        if tag == "title":
+            kids = [child.tag for child in element]
+            if kids.count("text") != 1 or kids.count("text-style-def") != 1:
+                problems.append("a <title> must hold exactly one text and one text-style-def")
+        if tag == "text":
+            # The writer emits one text-style run and nothing else: a second run, or text outside
+            # it, would change the visible title.
+            runs = list(element)
+            outside = (element.text or "") + "".join(run.tail or "" for run in runs)
+            if len(runs) != 1 or runs[0].tag != "text-style" or outside:
+                problems.append(
+                    "a title <text> must hold exactly one text-style run, no text outside it"
+                )
+        if tag == "text-style" and len(element):
+            problems.append("a <text-style> holds elements aar's writer never emits")
+        in_def = parent is not None and parent.tag == "text-style-def"
+        if tag == "text-style" and in_def and element.text:
+            problems.append("a style <text-style> holds text aar's writer never emits")
         if tag == "asset-clip" and parent is not None:
             on_spine = parent.tag == "spine"
             if on_spine and "lane" in element.attrib:
