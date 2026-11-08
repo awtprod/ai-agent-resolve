@@ -7,10 +7,13 @@ placed is put back (its backup restored, or the new file removed when there was 
 temporary file and backup is removed. A previous pair is left byte-identical; a fresh export
 leaves nothing. The temporary, placement and backup helpers are the DRP writer's.
 
-The rollback touches a destination only while it is still the file this call placed: the same
-device, inode, size and ``mtime_ns`` as right after the rename. If another writer replaced or
-changed it meanwhile, it is left alone, the backup (if any) is kept beside it as
-``.aar-backup-<name>.<token>``, and the failure is raised as ``output_conflict`` naming both.
+Each destination is recorded before it is placed, with the identity of its temporary file
+(device, inode, size, ``mtime_ns``: a rename or hard link keeps all four), so a failure inside the
+placement itself (the temporary's unlink, a signal) still rolls it back. The rollback touches a
+destination only while it is still that file. If another writer replaced or changed it after our
+placement, it is left alone, the backup (if any) is kept beside it as
+``.aar-backup-<name>.<token>``, and the failure is raised as ``output_conflict`` naming both; a
+backup that cannot be restored is kept and named the same way.
 """
 
 from __future__ import annotations
@@ -80,7 +83,7 @@ def write_pair(files: list[tuple[Path, bytes]], *, overwrite: bool) -> None:
     _refuse_existing([dest for dest, _ in files], overwrite)
     temps: list[Path] = []
     backups: dict[Path, Path] = {}
-    placed: list[tuple[Path, Identity | None]] = []
+    placed: list[tuple[Path, Path, Identity]] = []  # (destination, its temp, the temp's identity)
     try:
         for dest, data in files:
             temps.append(_write_temp(dest, data))
@@ -90,11 +93,9 @@ def write_pair(files: list[tuple[Path, bytes]], *, overwrite: bool) -> None:
                 if backup is not None:
                     backups[dest] = backup
         for (dest, _), tmp in zip(files, temps, strict=True):
-            ours = _identity(tmp)[:2]
+            # Recorded before placing, so a failure inside the placement still rolls it back.
+            placed.append((dest, tmp, _identity(tmp)))
             _place_one(tmp, dest, overwrite)
-            after = _identity(dest)
-            # Our file is the one at dest only if the rename's inode is there; else never touch it.
-            placed.append((dest, after if after[:2] == ours else None))
     except FileExistsError as exc:
         conflicts = _roll_back(placed, backups)
         error = ExportError(
@@ -115,47 +116,61 @@ def write_pair(files: list[tuple[Path, bytes]], *, overwrite: bool) -> None:
             backup.unlink(missing_ok=True)
 
 
-def _conflict(cause: BaseException, conflicts: list[tuple[Path, Path | None]]) -> BaseException:
-    """The failure, as ``output_conflict`` when the rollback found a destination another writer
-    had replaced (left in place, our backup kept beside it); else the failure itself."""
+def _conflict(
+    cause: BaseException, conflicts: list[tuple[Path, Path | None, str]]
+) -> BaseException:
+    """The failure, as ``output_conflict`` when the rollback could not put a destination back
+    (another writer replaced it, or the restore failed); else the failure itself."""
     if not conflicts:
         return cause
     lines = [
-        f"{str(dest)!r} was replaced by another writer and left in place"
+        f"{str(dest)!r} {why}"
         + (f"; the previous file is kept as {str(kept)!r}" if kept is not None else "")
-        for dest, kept in conflicts
+        for dest, kept, why in conflicts
     ]
     return ExportError(
         "output_conflict",
         f"writing the export failed ({cause}), and {'; '.join(lines)}",
         "compare the files, keep the right one and remove the other",
         conflicts=[
-            {"path": str(dest), "kept_backup": None if kept is None else str(kept)}
-            for dest, kept in conflicts
+            {"path": str(dest), "kept_backup": None if kept is None else str(kept), "reason": why}
+            for dest, kept, why in conflicts
         ],
     )
 
 
 def _roll_back(
-    placed: list[tuple[Path, Identity | None]], backups: dict[Path, Path]
-) -> list[tuple[Path, Path | None]]:
-    """Put back every destination already placed: its backup, or nothing when it was new, but
-    only while it is still the file this call placed (device, inode, size, mtime_ns). A
-    destination another writer replaced is left alone and returned, with its backup kept beside
-    it under a clear name."""
-    conflicts: list[tuple[Path, Path | None]] = []
-    for dest, identity in reversed(placed):
+    placed: list[tuple[Path, Path, Identity]], backups: dict[Path, Path]
+) -> list[tuple[Path, Path | None, str]]:
+    """Put back every destination this call placed: its backup, or nothing when it was new, but
+    only while it is still the file placed (device, inode, size, mtime_ns). A destination whose
+    temporary file was never consumed was never placed and is left alone. One another writer
+    replaced after our placement is left in place and returned, with its backup kept beside it
+    under a clear name; so is one whose backup cannot be restored."""
+    conflicts: list[tuple[Path, Path | None, str]] = []
+    for dest, tmp, identity in reversed(placed):
         backup = backups.pop(dest, None)
         try:
-            ours = identity is not None and _identity(dest) == identity
+            ours = _identity(dest) == identity
         except FileNotFoundError:
             ours = False
-        if ours:
-            if backup is not None:
-                os.replace(backup, dest)
-            else:
-                dest.unlink()
+        if not ours:
+            if tmp.exists():
+                if backup is not None:
+                    backups[dest] = backup  # never placed: dest is untouched; drop the backup
+                continue
+            if backup is not None or dest.exists() or dest.is_symlink():
+                kept = _keep_backup(backup, dest) if backup is not None else None
+                conflicts.append((dest, kept, "was replaced by another writer and left in place"))
             continue
-        if backup is not None or dest.exists() or dest.is_symlink():
-            conflicts.append((dest, _keep_backup(backup, dest) if backup is not None else None))
+        if backup is None:
+            dest.unlink()
+            continue
+        try:
+            os.replace(backup, dest)
+        except OSError as exc:
+            kept = _keep_backup(backup, dest)
+            conflicts.append(
+                (dest, kept, f"could not be restored ({exc}); the new file is in place")
+            )
     return conflicts

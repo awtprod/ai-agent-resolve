@@ -163,7 +163,11 @@ def test_rollback_leaves_another_writers_file_and_keeps_the_backup(
     kept = [p for p in tmp_path.iterdir() if p.name.startswith(".aar-backup-cut.fcpxml.")]
     assert len(kept) == 1 and kept[0].read_bytes() == b"<old fcpxml/>"
     assert caught.value.details["conflicts"] == [
-        {"path": str(tmp_path / "cut.fcpxml"), "kept_backup": str(kept[0])}
+        {
+            "path": str(tmp_path / "cut.fcpxml"),
+            "kept_backup": str(kept[0]),
+            "reason": "was replaced by another writer and left in place",
+        }
     ]
     names = sorted(p.name for p in tmp_path.iterdir())
     assert names == sorted(["cut.fcpxml", "cut.report.json", kept[0].name])  # no temp left
@@ -178,7 +182,11 @@ def test_rollback_never_deletes_another_writers_file(
         write_pair(_pair(tmp_path), overwrite=False)
     assert caught.value.code == "output_conflict"
     assert caught.value.details["conflicts"] == [
-        {"path": str(tmp_path / "cut.fcpxml"), "kept_backup": None}
+        {
+            "path": str(tmp_path / "cut.fcpxml"),
+            "kept_backup": None,
+            "reason": "was replaced by another writer and left in place",
+        }
     ]
     assert sorted(p.name for p in tmp_path.iterdir()) == ["cut.fcpxml"]
     assert (tmp_path / "cut.fcpxml").read_bytes() == b"<their fcpxml/>"
@@ -203,6 +211,98 @@ def test_an_in_place_change_is_not_ours_either(
         write_pair(_pair(tmp_path), overwrite=True)
     assert caught.value.code == "output_conflict"
     assert (tmp_path / "cut.fcpxml").read_bytes() == b"<new fcpxml/><!-- edited -->"
+
+
+def _fail_after_placing(name: str, exc: BaseException, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The placement of ``name`` lands, then fails before returning (an interrupt, or a failure
+    after the rename): the window between the file appearing and write_pair hearing of it."""
+    real = files._place_one
+
+    def landed_then_failed(tmp: Path, dest: Path, overwrite: bool) -> None:
+        real(tmp, dest, overwrite)
+        if dest.name == name:
+            raise exc
+
+    monkeypatch.setattr(files, "_place_one", landed_then_failed)
+
+
+FAILURES = [OSError(5, "Input/output error"), KeyboardInterrupt()]
+
+
+@pytest.mark.parametrize("exc", FAILURES, ids=["oserror", "interrupt"])
+@pytest.mark.parametrize("name", ["cut.fcpxml", "cut.report.json"])
+@pytest.mark.parametrize("overwrite", [False, True], ids=["fresh", "overwrite"])
+def test_a_failure_inside_the_placement_still_rolls_back(
+    overwrite: bool,
+    name: str,
+    exc: BaseException,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fix-check R3: each destination is recorded before its placement, so one that landed
+    just before the failure is put back too: a fresh export leaves nothing, an overwrite
+    leaves the previous pair byte-identical; no temporary file or backup remains."""
+    if overwrite:
+        _old(tmp_path)
+    _fail_after_placing(name, exc, monkeypatch)
+    with pytest.raises(type(exc)):
+        write_pair(_pair(tmp_path), overwrite=overwrite)
+    if overwrite:
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["cut.fcpxml", "cut.report.json"]
+        assert (tmp_path / "cut.fcpxml").read_bytes() == b"<old fcpxml/>"
+        assert (tmp_path / "cut.report.json").read_bytes() == b"{old}"
+    else:
+        assert sorted(p.name for p in tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("name", ["cut.fcpxml", "cut.report.json"])
+def test_a_failed_temp_unlink_after_the_link_rolls_back(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The no-clobber placement links the temporary to the destination, then unlinks the
+    temporary. If that unlink fails, the destination (still the temporary's inode) is ours and
+    is removed again, with the temporary."""
+    real = files._place_one
+
+    def link_then_fail(tmp: Path, dest: Path, overwrite: bool) -> None:
+        if dest.name != name:
+            real(tmp, dest, overwrite)
+            return
+        os.link(tmp, dest)
+        raise PermissionError(13, "Permission denied", str(tmp))
+
+    monkeypatch.setattr(files, "_place_one", link_then_fail)
+    with pytest.raises(PermissionError):
+        write_pair(_pair(tmp_path), overwrite=False)
+    assert sorted(p.name for p in tmp_path.iterdir()) == []
+
+
+def test_a_failed_restore_keeps_the_backup_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If putting the previous file back fails, the backup is kept under a clear name and the
+    failure is output_conflict naming it, not a lost previous file."""
+    _old(tmp_path)
+    _fail_on("_place_one", 2, monkeypatch, OSError(28, "No space left on device"))
+    real_replace = os.replace
+    onto_fcpxml = {"n": 0}
+
+    def failing_restore(src: Any, dst: Any) -> None:
+        if Path(dst).name == "cut.fcpxml":
+            onto_fcpxml["n"] += 1
+            if onto_fcpxml["n"] == 2:  # the first is the placement, the second the restore
+                raise OSError(30, "Read-only file system")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(files.os, "replace", failing_restore)
+    with pytest.raises(ExportError) as caught:
+        write_pair(_pair(tmp_path), overwrite=True)
+    assert caught.value.code == "output_conflict"
+    kept = [p for p in tmp_path.iterdir() if p.name.startswith(".aar-backup-cut.fcpxml.")]
+    assert len(kept) == 1 and kept[0].read_bytes() == b"<old fcpxml/>"
+    [conflict] = caught.value.details["conflicts"]
+    assert conflict["kept_backup"] == str(kept[0])
+    assert conflict["reason"].startswith("could not be restored")
 
 
 def test_the_cli_keeps_the_previous_pair_when_the_report_fails(
