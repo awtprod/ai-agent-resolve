@@ -309,6 +309,8 @@ def _tick(
             _note_worker_error(log, _project_id, recipe_node, exc)
             continue
     for project_id, recipe_node in recipes:
+        if stop.is_set():  # drain: load no further recipe once a stop is requested
+            return False
         try:
             state = load_state(log, recipe_node, project_id=project_id)
             if state.recipe_def is None:
@@ -317,6 +319,8 @@ def _tick(
             if found is None:
                 continue
             op, step = found
+            if stop.is_set():  # drain: never start a new step (callables cannot be interrupted)
+                return False
             if not claim(
                 log,
                 project_id=project_id,
