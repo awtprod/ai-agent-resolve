@@ -187,6 +187,30 @@ def timecoded(tmp_path: Path) -> Path:
     return out
 
 
+@pytest.mark.parametrize("key", ["timecode", "TIMECODE", "TimeCode"])
+def test_the_tag_name_is_read_in_any_case(key: str) -> None:
+    """Fix-check Q2: ffprobe reports Matroska's tag as TIMECODE, on the container."""
+    data = {
+        "streams": [{"index": 0, "codec_type": "video"}],
+        "format": {"tags": {key: "01:00:00:00"}},
+    }
+    assert parse_probe_json(data, "x.mkv", 1).timecode == "01:00:00:00"
+
+
+@needs_ffmpeg
+def test_a_matroska_file_gives_its_start_timecode(tmp_path: Path) -> None:
+    out = tmp_path / "tc.mkv"
+    ffmpeg(
+        "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24", "-f", "lavfi", "-i", "sine=d=1",
+        "-t", "1", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-timecode", "01:00:00:00", str(out),
+    )  # fmt: skip
+    stub = _stub(_source(media=str(out)))
+    probed, warnings = probe_sources(stub, {}, None)
+    assert warnings == [] and probed["cam"].timecode == "01:00:00:00"
+    assert source_start_timecodes(stub, probed)[0] == {"cam": 86400}
+
+
 @needs_ffmpeg
 def test_a_timecoded_file_gives_its_start_timecode(timecoded: Path) -> None:
     stub = _stub(_source(media=str(timecoded)))

@@ -147,9 +147,16 @@ def stream_rotation(raw: dict[str, Any]) -> int:
 
 
 def _timecode_tag(raw: Any) -> str | None:
+    """A stream's or the container's ``timecode`` tag, in any case: Matroska's is ``TIMECODE``
+    (on the container), QuickTime's and MXF's ``timecode``."""
     tags = raw.get("tags") if isinstance(raw, dict) else None
-    value = tags.get("timecode") if isinstance(tags, dict) else None
-    return value.strip() if isinstance(value, str) and value.strip() else None
+    if not isinstance(tags, dict):
+        return None
+    for key, value in tags.items():
+        named = isinstance(key, str) and key.lower() == "timecode"
+        if named and isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 _TIMECODE = re.compile(r"(\d{2}):(\d{2}):(\d{2})([:;.])(\d{2,3})")
