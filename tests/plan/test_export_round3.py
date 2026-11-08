@@ -252,3 +252,27 @@ def test_an_idref_holds_exactly_one_name() -> None:
 def test_idrefs_may_hold_a_list() -> None:
     assert _check('<link ref="r1" refs="r1 r2"/>') == []
     assert _check('<link ref="r1" refs="r1 r9"/>') == ["<link> IDREF 'r9' resolves to no ID"]
+
+
+def _ids(item: str, link: str = "") -> list[str]:
+    return validate(load_dtd(MINI_DTD), f"<root>{item}{link}</root>")
+
+
+@pytest.mark.parametrize(
+    "value", ["r1", "_x", ":x", "a-1.b", "x\u00b7y", "\u00e9t\u00e9", "\u4e2d1"]
+)
+def test_ids_that_are_xml_names_pass(value: str) -> None:
+    assert _ids(f'<item id="{value}"/>', f'<link ref="{value}" refs="{value}"/>') == []
+
+
+@pytest.mark.parametrize("value", ["1bad", "-x", ".x", "\u00b7x", "9"])
+def test_an_id_that_is_not_an_xml_name_is_rejected(value: str) -> None:
+    assert _ids(f'<item id="{value}"/>') == [f"<item id={value!r}> is not an XML Name"]
+
+
+def test_idref_and_idrefs_tokens_must_be_xml_names() -> None:
+    problems = _ids('<item id="r1"/>', '<link ref="1x" refs="r1 2x"/>')
+    assert problems == [
+        "<link ref='1x'> is not an XML Name",
+        "<link refs> token '2x' is not an XML Name",
+    ]

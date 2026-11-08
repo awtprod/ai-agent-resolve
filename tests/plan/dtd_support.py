@@ -17,6 +17,14 @@ _COMMENT = re.compile(r"<!--.*?-->", re.S)
 _ENTITY = re.compile(r'<!ENTITY\s+%\s+([\w.-]+)\s+"([^"]*)"\s*>', re.S)
 _ELEMENT = re.compile(r"<!ELEMENT\s+([\w.:-]+)\s+(.*?)\s*>", re.S)
 _ATTLIST = re.compile(r"<!ATTLIST\s+([\w.:-]+)\s*(.*?)\s*>", re.S)
+# XML 1.0 (Fifth Edition) Name: NameStartChar NameChar* (productions [4], [4a], [5]).
+_NAME_START = (
+    ":A-Z_a-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u02ff\u0370-\u037d\u037f-\u1fff"
+    "\u200c-\u200d\u2070-\u218f\u2c00-\u2fef\u3001-\ud7ff\uf900-\ufdcf\ufdf0-\ufffd"
+    "\U00010000-\U000effff"
+)
+_NAME_CHAR = _NAME_START + "\\-.0-9\u00b7\u0300-\u036f\u203f-\u2040"
+XML_NAME = re.compile(f"[{_NAME_START}][{_NAME_CHAR}]*")
 _ATTR = re.compile(
     r"([\w.:-]+)\s+(CDATA|ID|IDREFS?|NMTOKENS?|\([^)]*\))\s+"
     r"(#REQUIRED|#IMPLIED|#FIXED\s+(?:\"[^\"]*\"|'[^']*')|\"[^\"]*\"|'[^']*')",
@@ -128,6 +136,8 @@ def validate(dtd: Dtd, document: str) -> list[str]:
             if attr.fixed is not None and value != attr.fixed:
                 problems.append(f"<{tag} {name}={value!r}> is fixed at {attr.fixed!r}")
             if attr.kind == "ID":
+                if not XML_NAME.fullmatch(value):
+                    problems.append(f"<{tag} {name}={value!r}> is not an XML Name")
                 if value in ids:
                     problems.append(f"duplicate ID {value!r}")
                 ids.add(value)
@@ -135,10 +145,16 @@ def validate(dtd: Dtd, document: str) -> list[str]:
                 # An IDREF holds exactly one name; only IDREFS may be a whitespace list.
                 if not value or value != value.strip() or len(value.split()) != 1:
                     problems.append(f"<{tag} {name}={value!r}> is not a single IDREF name")
+                elif not XML_NAME.fullmatch(value):
+                    problems.append(f"<{tag} {name}={value!r}> is not an XML Name")
                 else:
                     refs.append((tag, value))
             elif attr.kind == "IDREFS":
-                refs.extend((tag, v) for v in value.split())
+                for token in value.split():
+                    if XML_NAME.fullmatch(token):
+                        refs.append((tag, token))
+                    else:
+                        problems.append(f"<{tag} {name}> token {token!r} is not an XML Name")
         for name, attr in declared.items():
             if attr.required and name not in element.attrib:
                 problems.append(f"<{tag}> lacks required attribute {name!r}")
