@@ -40,6 +40,7 @@ EXPORT_CODES = frozenset(
         "output_exists",
         "output_conflict",
         "rollback_failed",
+        "output_locked",
     }
 )
 

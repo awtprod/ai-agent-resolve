@@ -176,6 +176,12 @@ def _pair(folder: Path) -> list[tuple[Path, bytes]]:
     return [(folder / "cut.fcpxml", b"<new fcpxml/>"), (folder / "cut.report.json", b"{new}")]
 
 
+def _names(folder: Path) -> list[str]:
+    """The folder's files but the export lock, which stays by design (deleting it would reopen
+    the race it closes)."""
+    return sorted(p.name for p in folder.iterdir() if p.name != "cut.fcpxml.aar-lock")
+
+
 def _old(folder: Path) -> None:
     (folder / "cut.fcpxml").write_bytes(b"<old fcpxml/>")
     (folder / "cut.report.json").write_bytes(b"{old}")
@@ -203,7 +209,7 @@ def test_a_failed_fresh_export_leaves_nothing(
     _fail_on(name, call, monkeypatch, OSError(28, "No space left on device"))
     with pytest.raises(OSError, match="No space left"):
         write_pair(_pair(tmp_path), overwrite=False)
-    assert sorted(p.name for p in tmp_path.iterdir()) == []
+    assert _names(tmp_path) == []
 
 
 @pytest.mark.parametrize(("name", "call"), [("_write_temp", 2), ("_place_one", 2)])
@@ -216,7 +222,7 @@ def test_a_failed_overwrite_keeps_the_previous_pair(
     _fail_on(name, call, monkeypatch, PermissionError(13, "Permission denied"))
     with pytest.raises(PermissionError):
         write_pair(_pair(tmp_path), overwrite=True)
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["cut.fcpxml", "cut.report.json"]
+    assert _names(tmp_path) == ["cut.fcpxml", "cut.report.json"]
     assert (tmp_path / "cut.fcpxml").read_bytes() == b"<old fcpxml/>"
     assert (tmp_path / "cut.report.json").read_bytes() == b"{old}"
 
@@ -224,7 +230,7 @@ def test_a_failed_overwrite_keeps_the_previous_pair(
 def test_an_overwrite_replaces_both_and_cleans_up(tmp_path: Path) -> None:
     _old(tmp_path)
     write_pair(_pair(tmp_path), overwrite=True)
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["cut.fcpxml", "cut.report.json"]
+    assert _names(tmp_path) == ["cut.fcpxml", "cut.report.json"]
     assert (tmp_path / "cut.fcpxml").read_bytes() == b"<new fcpxml/>"
     assert (tmp_path / "cut.report.json").read_bytes() == b"{new}"
 
@@ -245,7 +251,7 @@ def test_a_report_appearing_mid_write_rolls_back(
     with pytest.raises(ExportError) as caught:
         write_pair(_pair(tmp_path), overwrite=False)
     assert caught.value.code == "output_exists"
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["cut.report.json"]
+    assert _names(tmp_path) == ["cut.report.json"]
     assert (tmp_path / "cut.report.json").read_bytes() == b"{theirs}"
 
 
@@ -296,7 +302,7 @@ def test_rollback_leaves_another_writers_file_and_keeps_the_backup(
     ]
     assert caught.value.details["left_behind"] == []
     assert isinstance(caught.value.__cause__, OSError)  # chained to the placement failure
-    names = sorted(p.name for p in tmp_path.iterdir())
+    names = _names(tmp_path)
     assert names == sorted(["cut.fcpxml", "cut.report.json", kept[0].name])  # no temp left
 
 
@@ -311,7 +317,7 @@ def test_rollback_never_deletes_another_writers_file(
     [fcpxml, report] = caught.value.details["destinations"]
     assert (fcpxml["state"], fcpxml["kept_backup"]) == ("other_writer", None)
     assert report["state"] == "untouched"
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["cut.fcpxml"]
+    assert _names(tmp_path) == ["cut.fcpxml"]
     assert (tmp_path / "cut.fcpxml").read_bytes() == b"<their fcpxml/>"
 
 
@@ -371,11 +377,11 @@ def test_a_failure_inside_the_placement_still_rolls_back(
     with pytest.raises(type(exc)):
         write_pair(_pair(tmp_path), overwrite=overwrite)
     if overwrite:
-        assert sorted(p.name for p in tmp_path.iterdir()) == ["cut.fcpxml", "cut.report.json"]
+        assert _names(tmp_path) == ["cut.fcpxml", "cut.report.json"]
         assert (tmp_path / "cut.fcpxml").read_bytes() == b"<old fcpxml/>"
         assert (tmp_path / "cut.report.json").read_bytes() == b"{old}"
     else:
-        assert sorted(p.name for p in tmp_path.iterdir()) == []
+        assert _names(tmp_path) == []
 
 
 @pytest.mark.parametrize("name", ["cut.fcpxml", "cut.report.json"])
@@ -397,7 +403,7 @@ def test_a_failed_temp_unlink_after_the_link_rolls_back(
     monkeypatch.setattr(files, "_place_one", link_then_fail)
     with pytest.raises(PermissionError):
         write_pair(_pair(tmp_path), overwrite=False)
-    assert sorted(p.name for p in tmp_path.iterdir()) == []
+    assert _names(tmp_path) == []
 
 
 def test_a_failed_restore_keeps_the_backup_and_says_so(
@@ -488,9 +494,7 @@ def test_a_failed_rollback_step_does_not_stop_the_others(
     kept = Path(failed["kept_backup"])
     assert kept.parent == tmp_path and kept.read_bytes() == old[name]
     # Nothing else is left: no temporary file, no other backup.
-    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
-        ["cut.fcpxml", "cut.report.json", kept.name]
-    )
+    assert _names(tmp_path) == sorted(["cut.fcpxml", "cut.report.json", kept.name])
     assert error.details["left_behind"] == []
 
 
@@ -582,7 +586,7 @@ def test_the_cli_keeps_the_previous_pair_when_the_report_fails(
     assert "No space left" in capsys.readouterr().err
     assert out.read_bytes() == b"<old fcpxml/>"
     assert (tmp_path / "cut.report.json").read_bytes() == b"{old}"
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["cut.fcpxml", "cut.report.json"]
+    assert _names(tmp_path) == ["cut.fcpxml", "cut.report.json"]
     # And without the failure the pair is replaced together.
     monkeypatch.undo()
     assert main([*argv, "--overwrite"]) == 0

@@ -75,6 +75,7 @@ def test_export_codes_are_stable() -> None:
             "output_exists",
             "output_conflict",
             "rollback_failed",
+            "output_locked",
         ]
     )
 

@@ -22,6 +22,14 @@ every temporary file is still removed. Then one error lists every destination's 
 ``output_conflict`` when only another writer got in the way. It is chained to the original
 failure, which nothing in the rollback can mask. An interrupt (``KeyboardInterrupt``) is
 re-raised as itself, with the states as notes.
+
+aar exports to one destination are serialized: each holds an exclusive lock on
+``<fcpxml>.aar-lock`` beside it (the node job store's portable helper: ``fcntl.flock``, or
+``msvcrt.locking`` on Windows) for the whole write, temporary files, backups, both placements
+and any rollback. A second export to the same destination fails at once with ``output_locked``
+and touches nothing. The lock file stays after release (deleting it would reopen the race it
+closes). The limit: a process outside aar that replaces the files during an export is not
+serialized; the identity check above is the best effort against it, and no more.
 """
 
 from __future__ import annotations
@@ -36,6 +44,21 @@ from aar.drp.modify.write import _backup, _place, _temp
 from aar.plan.export.errors import ExportError
 
 MODE = 0o644
+#: The lock beside the first destination (the FCPXML) that serializes aar exports to it.
+LOCK_SUFFIX = ".aar-lock"
+
+
+def lock_path(dest: Path) -> Path:
+    """The lock file that serializes aar exports to ``dest``: ``<dest>.aar-lock`` beside it."""
+    return dest.with_name(dest.name + LOCK_SUFFIX)
+
+
+def _lock_api() -> Any:
+    """The node job store's portable exclusive lock (fcntl, or msvcrt on Windows), imported only
+    when an export writes."""
+    from aar.node.jobs import file_lock
+
+    return file_lock
 
 
 def _write_temp(dest: Path, data: bytes) -> Path:
@@ -89,7 +112,29 @@ def _refuse_existing(dests: list[Path], overwrite: bool) -> None:
 
 
 def write_pair(files: list[tuple[Path, bytes]], *, overwrite: bool) -> None:
-    """Write every ``(destination, bytes)`` or none of them (see the module docstring)."""
+    """Write every ``(destination, bytes)`` or none of them, holding the first destination's
+    export lock throughout (see the module docstring)."""
+    api = _lock_api()
+    first = files[0][0]
+    lock = lock_path(first)
+    try:
+        fd = api.acquire_file_lock(str(lock))
+    except api.FileLockUnavailable:
+        raise ExportError(
+            "output_locked",
+            f"another aar export is writing {str(first)!r} (it holds {str(lock)!r}; or the "
+            "file system has no file locks)",
+            "wait for it to finish, or choose another --out",
+            path=str(first),
+            lock=str(lock),
+        ) from None
+    try:
+        _write_pair_locked(files, overwrite)
+    finally:
+        api.release_file_lock(fd)
+
+
+def _write_pair_locked(files: list[tuple[Path, bytes]], overwrite: bool) -> None:
     _refuse_existing([dest for dest, _ in files], overwrite)
     temps: list[Path] = []
     backups: dict[Path, Path] = {}
