@@ -5,7 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from apply_builders import plan_data, source
+from export_support import permissive
 
+from aar.plan.apply.errors import CompileError
+from aar.plan.export import export_fcpxml
 from aar.plan.export.errors import EXPORT_CODES, ExportError
 from aar.plan.export.media import (
     MEDIA_MAP_MAX_BYTES,
@@ -13,7 +17,7 @@ from aar.plan.export.media import (
     media_map_from_mapping,
     media_ref,
 )
-from aar.plan.model import Source
+from aar.plan.model import EditPlan, Source
 
 MAP = {"/srv/media": "E:\\Media"}
 
@@ -179,3 +183,46 @@ def test_load_media_map_too_big(tmp_path: Path) -> None:
         load_media_map(f)
     assert info.value.code == "bad_media_map"
     assert "limit" in str(info.value)
+
+
+# -- malformed URLs: only a typed refusal escapes (Prism, PR #13) ------------------------------
+
+MEDIA_FUZZ = [
+    # urlsplit raises ValueError on an unmatched bracket: refused as malformed-url
+    ("file://[/share/clip.mov", "malformed-url"),
+    ("file://[::1/x.mov", "malformed-url"),
+    ("file://]/x.mov", "malformed-url"),
+    # a bad port parses (only .port would raise, which is never read): a host that is no UNC name
+    ("file://host:notaport/x.mov", "host-not-unc"),
+    ("file://host:99999/x.mov", "host-not-unc"),
+    ("file://[::1]:notaport/x.mov", "host-not-unc"),
+    ("file://[v1.x]/x.mov", "host-not-unc"),
+    ("file://", None),
+    ("file:", None),
+    ("file:///", None),
+    ("file:////", None),
+    ("file://%/x.mov", None),
+    ("file://h/%zz.mov", None),
+]
+
+
+@pytest.mark.parametrize(("media", "reason"), MEDIA_FUZZ, ids=[m for m, _ in MEDIA_FUZZ])
+def test_a_malformed_file_url_is_a_typed_refusal(media: str, reason: str | None) -> None:
+    """Only a CompileError (here media_not_on_edit_pc) escapes; never a raw ValueError."""
+    try:
+        media_ref(Source(id="s", media=media))
+    except CompileError as exc:
+        assert exc.code == "media_not_on_edit_pc"
+        if reason is not None:
+            assert exc.details["reason"] == reason
+    else:
+        pytest.fail(f"{media!r} was accepted")
+
+
+@pytest.mark.parametrize("media", ["file://[/share/clip.mov", "file://[::1/x.mov"])
+def test_the_export_refuses_a_malformed_url_with_a_typed_error(media: str) -> None:
+    data = plan_data(sources=[source(media=media, frame_size=[1920, 1080])])
+    with pytest.raises(CompileError) as caught:
+        export_fcpxml(EditPlan.model_validate(data), permissive())
+    assert caught.value.code == "media_not_on_edit_pc"
+    assert caught.value.details["reason"] == "malformed-url"

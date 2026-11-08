@@ -13,6 +13,8 @@ PC can open, or the export is refused.
 * Refused as ``media_not_on_edit_pc``, each with a ``reason`` in its details: a ``file:`` URL with
   a drive letter in the host position (``file://E:/...``), with userinfo, with a port or an IPv6
   literal in the host (``host-not-unc``), or with an encoded separator or any ``%`` in the host;
+  one ``urlsplit`` cannot parse (an unmatched ``[`` or ``]``: ``malformed-url``); the host is
+  read from ``netloc`` only, never ``.hostname`` or ``.port`` (which raise on a bad port);
   a media path that is a map root (a directory, not a file); a name ending in a space or a dot
   (Windows cannot open it); a relative name (a producer stub's
   media must be absolute edit-PC paths, or hub paths with ``--media-map``).
@@ -215,7 +217,15 @@ def _from_file_url(source: Source, media_map: MediaMap | None) -> MediaRef:
         raise _not_on_edit_pc(
             source, bad, "give the edit-PC path instead (E:\\...); the exporter encodes it"
         )
-    parts = urlsplit(text)
+    try:
+        parts = urlsplit(text)  # an unmatched [ or ] in the host raises (Invalid IPv6 URL)
+    except ValueError as exc:
+        raise _not_on_edit_pc(
+            source,
+            f"is a malformed file: URL ({exc})",
+            "give the edit-PC path instead (E:\\...), or file://host/share/...",
+            reason="malformed-url",
+        ) from None
     if not text.lower().startswith("file://") or parts.query or parts.fragment:
         raise _not_on_edit_pc(
             source,
