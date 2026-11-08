@@ -920,28 +920,22 @@ class _Finish:
         )
 
     def _alignment(self, outgoing_index: int, frames: int, what: str) -> str:
-        """Choose an alignment from the handles the plan's source ranges actually have, and
-        refuse when none fits (F7). Outgoing tail = source.duration - src_out; incoming head =
-        the next same-track segment's src_in (0 for the outro, which starts at source frame 0)."""
-        tail = outgoing_tail(self.plan, outgoing_index)
-        head = incoming_head(self.plan, outgoing_index)
-        half = frames // 2
-        if _fits(tail, half) and _fits(head, half):
-            return "center"
-        if _fits(tail, frames):
-            return "right"
-        if _fits(head, frames):
-            return "left"
-        raise CompileError(
-            "no_handle_for_transition",
-            f"{what}: no alignment fits a {frames}-frame transition (outgoing tail {tail}, "
-            f"incoming head {head})",
-            "shorten the transition, give the source ranges more handle, or set the source "
-            "'duration' (an unknown duration counts as no handle)",
-            outgoing_tail=tail,
-            incoming_head=head,
-            frames=frames,
-        )
+        """The alignment :func:`transition_alignment` gives, or a refusal when none fits (F7)."""
+        chosen = transition_alignment(self.plan, outgoing_index, frames)
+        if chosen is None:
+            tail = outgoing_tail(self.plan, outgoing_index)
+            head = incoming_head(self.plan, outgoing_index)
+            raise CompileError(
+                "no_handle_for_transition",
+                f"{what}: no alignment fits a {frames}-frame transition (outgoing tail {tail}, "
+                f"incoming head {head})",
+                "shorten the transition, give the source ranges more handle, or set the source "
+                "'duration' (an unknown duration counts as no handle)",
+                outgoing_tail=tail,
+                incoming_head=head,
+                frames=frames,
+            )
+        return chosen[0]
 
     # -- head / end fades ----------------------------------------------------------------------
 
@@ -1270,6 +1264,30 @@ def incoming_head(plan: EditPlan, outgoing_index: int) -> int | None:
             return plan.segments[index].src_in
     if plan.outro is not None and plan.outro.track == track:
         return plan.outro.src_in
+    return None
+
+
+def transition_alignment(
+    plan: EditPlan, outgoing_index: int, frames: int
+) -> tuple[str, int] | None:
+    """The alignment of a ``frames``-long transition after segment ``outgoing_index``, and how
+    many of its frames lie before the cut; ``None`` when the handles fit none (F7).
+
+    Centred when both sides have the media (``frames // 2`` before the cut on the incoming head,
+    the rest after it on the outgoing tail, so an odd length's extra frame is on the tail), else
+    ``right`` (it starts on the cut, all on the tail), else ``left`` (it ends on the cut, all on
+    the head). An unknown handle counts as none. The one rule for the compiler and the FCPXML
+    exporter (S18), so the two always agree.
+    """
+    tail = outgoing_tail(plan, outgoing_index)
+    head = incoming_head(plan, outgoing_index)
+    before = frames // 2
+    if _fits(tail, frames - before) and _fits(head, before):
+        return "center", before
+    if _fits(tail, frames):
+        return "right", 0
+    if _fits(head, frames):
+        return "left", frames
     return None
 
 
