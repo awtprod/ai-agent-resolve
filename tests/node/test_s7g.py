@@ -457,7 +457,7 @@ def test_a_quiet_tick_between_polls_acts_on_the_brokers_latest_read() -> None:
     assert world.fake.reads["GetCurrentRenderMode"] == 2  # the restore's two checks only
 
 
-# == a human's Deliver edit is never overwritten (round 2, F1) ===================================
+# == a human's Deliver edit is kept (round 2, F1) ===================================
 
 HUMAN_DELIVER = ("mxf", "DNxHR", 1)
 
@@ -640,6 +640,117 @@ def test_a_failed_render_build_restore_is_the_brokers_change_not_a_humans(
         original.mode,
     )
     assert proj.deliver.settings == original.settings
+
+
+def test_a_reporting_op_in_the_human_project_costs_one_more_full_read() -> None:
+    """An op in A that reports its own Deliver change (``set_render_mode`` does, through the
+    gateway) makes the broker read what it left, once: four full reads, not three. The restore
+    then puts the snapshot's mode back over the op's, which is not a human's edit."""
+    world = World()
+    world.settle()
+    snapshot_deliver = _deliver(world)
+
+    def sets_mode(gw) -> str:
+        gw.set_render_mode(1 - snapshot_deliver[2])
+        return "done"
+
+    world.fake.reads.clear()
+    world.broker.submit(HotOp(world.loc("A"), sets_mode, Holder.agent("thread-1")))
+    kinds = [outcome.kind for outcome in world.broker.run_until_idle()]
+    assert kinds == [TickKind.RAN, TickKind.RESTORED, TickKind.IDLE]
+    report = world.broker.last_restore
+    assert report is not None and report.ok and report.deliver_restore_skipped is None, report
+    assert _deliver(world) == snapshot_deliver
+    assert world.fake.reads["GetCurrentRenderMode"] == 4  # snapshot, the op's, check, final
+    assert world.fake.reads["GetCurrentRenderFormatAndCodec"] == 4
+
+
+def test_after_an_op_reports_its_deliver_change_a_later_human_edit_is_kept() -> None:
+    """The claim the docs make: once an op in A has reported its own Deliver change, the broker
+    compares against what the op left, so a human edit made after that is kept (and the
+    snapshot preset is named, because an op ran in A)."""
+    world = World()
+    world.settle()
+
+    def sets_mode(gw) -> str:
+        gw.set_render_mode(1)
+        return "done"
+
+    world.broker.submit(HotOp(world.loc("A"), sets_mode, Holder.agent("thread-1")))
+    assert world.broker.tick().kind is TickKind.RAN
+    _edit_deliver(world)
+    assert _restore_after(world, int(3 / TICK)) is TickKind.RESTORED
+    assert _deliver(world) == HUMAN_DELIVER
+    report = world.broker.last_restore
+    assert report is not None and report.deliver_restore_skipped is not None
+    assert report.kept_preset is not None and report.kept_preset in world.fake.presets
+
+
+def test_a_human_edit_before_a_reporting_op_in_the_same_project_is_overwritten() -> None:
+    """The documented limit of "kept": a human edit made before an op in the same project
+    reports its own change is absorbed into what the broker left, so the restore overwrites it."""
+    world = World()
+    world.settle()
+    snapshot_deliver = _deliver(world)
+    world.broker.submit(HotOp(world.loc("A"), lambda gw: "done", Holder.agent("thread-1")))
+    assert world.broker.tick().kind is TickKind.RAN
+    _edit_deliver(world)
+
+    def sets_mode(gw) -> str:
+        gw.set_render_mode(snapshot_deliver[2])
+        return "done"
+
+    world.broker.submit(HotOp(world.loc("A"), sets_mode, Holder.agent("thread-1")))
+    world.broker.run_until_idle()
+    report = world.broker.last_restore
+    assert report is not None and report.deliver_restore_skipped is None, report
+    assert _deliver(world) == snapshot_deliver
+
+
+def test_a_crashed_render_builds_recovered_snapshot_is_not_a_reported_change(
+    tmp_path: Path,
+) -> None:
+    """Crash after render.build's job settings went in and before its own restore: the next run
+    recovers the snapshot preset (``snapshot_recovered``). That recovery must not report a
+    Deliver change, or the broker would take the job's leftovers as its own and the recovery
+    would not hold; the pre-job settings come back."""
+    from .jobs_support import AGENT_ID
+    from .test_jobs_render import _render_params
+
+    class Crash(BaseException):
+        pass
+
+    world = JobWorld(tmp_path)
+    original = world.project.deliver.copy()
+    job_id = world.runner.submit(
+        "render", _render_params(world), world.locator(), agent_id=AGENT_ID
+    )
+    world.runner.pump()
+    load = world.project.LoadRenderPreset
+
+    def die(name: str) -> bool:
+        if name.startswith("aar-job-"):
+            raise Crash("power cut before the build's Deliver restore")
+        return load(name)
+
+    world.project.LoadRenderPreset = die  # type: ignore[method-assign]
+    with pytest.raises(Crash):
+        world.broker.run_until_idle()
+    world.project.LoadRenderPreset = load  # type: ignore[method-assign]
+    assert (world.project.deliver.format, world.project.deliver.codec) != (
+        original.format,
+        original.codec,
+    )  # the crashed attempt left the job's settings in place
+    runner = world.restart()
+    runner.run_until_settled()
+    world.clock.advance(16)
+    runner.pump()
+    assert runner.get(job_id) is not None
+    assert (world.project.deliver.format, world.project.deliver.codec) == (
+        original.format,
+        original.codec,
+    )
+    assert world.project.deliver.settings == original.settings
 
 
 # == the CLI flag (decision 2) ===================================================================

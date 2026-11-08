@@ -84,12 +84,14 @@ setters report themselves, and ``render.build`` reports a failed restore). On Re
 ``GetCurrentRenderMode`` raises a page signal on every call, and reading the full context on
 every 0.25 s worker tick crashed Resolve after about 270 reads (2026-11-07).
 
-A human's Deliver edit is never overwritten. The poll cannot see one, so before the restore
+A human's Deliver edit is kept, unless an op in the same project then reports its own
+Deliver change. The poll cannot see one, so before the restore
 reapplies the snapshot's Deliver settings it reads them once and compares them with what the
 broker itself last left there: the snapshot's, unless an op reported changing them. If they
 differ, a human changed them while the broker held the context: the broker leaves Deliver
 alone (``RestoreReport.deliver_restore_skipped``, the ``restored`` event and a node-log
-warning) and restores only the position.
+warning) and restores only the position. The only op that reports its own change today is
+``render.build`` when its own restore fails, and its snapshot preset keeps the human's edit.
 """
 
 from __future__ import annotations
