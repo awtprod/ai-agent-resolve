@@ -210,6 +210,69 @@ class ExportSettings(_Model):
     )
 
 
+X264Preset = Literal[
+    "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"
+]
+
+
+class RenderSettings(_Settings):
+    """Settings for ``aar plan render`` (an EditPlan to MP4 with ffmpeg on the hub, S18b).
+
+    Optional, with defaults in code, so an older profile still loads. The loudness targets are
+    the ``[qa]`` ones; these are how the render reaches them. See docs/DESIGN.md "Hub render".
+    """
+
+    font: str = Field(
+        default="Montserrat",
+        min_length=1,
+        description="Title font family, looked up as a font file (AAR_FONTS_DIR, then the system "
+        "font folders); DejaVu Sans is the documented fallback.",
+    )
+    master_codec: Literal["h264", "prores"] = Field(
+        default="h264", description="The master's video codec; prores writes a .mov (HQ, PCM)."
+    )
+    review_crf: int = Field(default=20, ge=0, le=51)
+    review_x264_preset: X264Preset = "medium"
+    review_audio_kbps: int = Field(default=192, ge=64, le=512)
+    master_crf: int = Field(default=14, ge=0, le=51)
+    master_x264_preset: X264Preset = "slow"
+    master_audio_kbps: int = Field(default=320, ge=64, le=512)
+    longform_lra: float = Field(
+        default=20.0,
+        ge=1,
+        le=50,
+        description="loudnorm's LRA target for long-forms: high, so the linear (one gain) mode "
+        "holds and the laugh range is kept.",
+    )
+    true_peak_margin_db: float = Field(
+        default=0.5,
+        ge=0,
+        le=3,
+        description="Headroom below [qa] true_peak_max_dbtp the audio is processed to, so the AAC "
+        "encode stays under the maximum.",
+    )
+    limiter_attack_ms: float = Field(default=5.0, ge=0.1, le=80)
+    limiter_release_ms: float = Field(default=50.0, ge=1, le=8000)
+    short_gain_tolerance_lu: float = Field(
+        default=0.1,
+        gt=0,
+        le=1,
+        description="A short's gain is measured again after the limiter and corrected once when "
+        "it lands further than this from the target.",
+    )
+    fps_tolerance: float = Field(
+        default=0.001,
+        ge=0,
+        lt=0.05,
+        description="How far (as a share) a source's frame rate may sit from the plan's. Frames "
+        "are taken by index and retimed to the plan's rate.",
+    )
+    timeout_base_s: float = Field(default=120.0, gt=0)
+    timeout_per_media_s: float = Field(
+        default=8.0, gt=0, description="Seconds of ffmpeg time allowed per second of timeline."
+    )
+
+
 class Profile(_Model):
     name: str
     description: str = ""
@@ -217,6 +280,7 @@ class Profile(_Model):
     produce: ProduceSettings = Field(default_factory=ProduceSettings)
     rules: dict[str, RuleConfig]
     export: ExportSettings = Field(default_factory=ExportSettings)
+    render: RenderSettings = Field(default_factory=RenderSettings)
 
 
 def parse_profile(data: dict[str, Any], *, origin: str = "profile") -> Profile:

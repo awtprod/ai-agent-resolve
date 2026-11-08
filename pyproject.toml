@@ -43,4 +43,5 @@ select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
 testpaths = ["tests"]
 markers = [
     "live: needs a running DaVinci Resolve (set AAR_LIVE=1)",
+    "slow: renders real media with ffmpeg (a few seconds); deselect with -m 'not slow'",
 ]

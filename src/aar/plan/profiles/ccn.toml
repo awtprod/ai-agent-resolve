@@ -86,6 +86,26 @@ y = 0.45
 [export]
 timeline_start = "01:00:00:00"
 
+# Hub render (`aar plan render`): an EditPlan to MP4 with ffmpeg, no Resolve. Loudness targets are
+# the [qa] ones above: long-forms get two-pass loudnorm, shorts gain plus a limiter (R6).
+[render]
+font = "Montserrat"       # title font; DejaVu Sans when no Montserrat file is found (AAR_FONTS_DIR)
+master_codec = "h264"     # or "prores" (a .mov master, ProRes 422 HQ with PCM sound)
+review_crf = 20
+review_x264_preset = "medium"
+review_audio_kbps = 192
+master_crf = 14
+master_x264_preset = "slow"
+master_audio_kbps = 320
+longform_lra = 20.0       # loudnorm LRA target: high, so loudnorm stays linear (one gain)
+true_peak_margin_db = 0.5 # process to true_peak_max_dbtp minus this, so the AAC stays under it
+limiter_attack_ms = 5.0   # shorts limiter (alimiter, 4x oversampled)
+limiter_release_ms = 50.0
+short_gain_tolerance_lu = 0.1  # re-measure after the limiter; correct the gain once past this
+fps_tolerance = 0.001     # source frame rate versus the plan's, as a share
+timeout_base_s = 120.0    # every ffmpeg call: base + per-second x timeline length
+timeout_per_media_s = 8.0
+
 # Segments from one recording play in source-time order: no reordering, no imported cold opens.
 [rules.chronological]
 tolerance_frames = 0      # how far a segment may start before the previous one ended
