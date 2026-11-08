@@ -199,12 +199,9 @@ def _write(args: argparse.Namespace) -> int:
 
 
 def _parse_actor(value: str) -> Any:
-    from aar.hub.events import Actor
+    from aar.hub.events import parse_actor_text
 
-    kind, sep, ident = value.partition(":")
-    if not sep:
-        raise ValueError(f"--actor must look like KIND:ID, got {value!r}")
-    return Actor(kind, ident)
+    return parse_actor_text(value)
 
 
 def _dispatch(
@@ -212,13 +209,23 @@ def _dispatch(
 ) -> dict[str, Any]:
     from aar.hub import facts, writes
     from aar.hub.cli import _open_store
+    from aar.recipes import registry as recipe_registry
 
     key = args.idempotency_key
     if command == "brief":
         result = writes.create_brief(log, request["brief"], actor, idempotency_key=key)
     elif command == "recipe":
+        # F12/N4: load the configured recipe modules exactly as `aar hub serve` does, then validate
+        # params against the registered model, so the CLI can create a registered recipe (and
+        # refuse bad params) instead of refusing every recipe as unknown.
+        recipe_registry.load_configured()
         result = writes.create_recipe(
-            log, request["project_id"], request["recipe"], actor, idempotency_key=key
+            log,
+            request["project_id"],
+            request["recipe"],
+            actor,
+            idempotency_key=key,
+            params_validator=recipe_registry.registry_params_validator,
         )
     elif command == "plan":
         result = writes.submit_plan(

@@ -282,3 +282,21 @@ def test_r3_1_bad_db_exits_2(
     common[common.index("--db") + 1] = str(tmp_path / "missing_dir" / "hub.db")
     argv = ["deliver", "review", *common, "--subject", hub.subject_id, "--title", "Acme"]
     assert main(argv) == 2
+
+
+@pytest.mark.parametrize("verb", ["review", "master"])
+def test_runner_actor_is_refused_exit_2_and_writes_nothing(
+    tmp_path: Path, sources: Path, monkeypatch: pytest.MonkeyPatch, verb: str
+) -> None:
+    """R5-1: ``--actor runner:recipes`` goes through the shared parser like every string surface."""
+    hub = make_hub(tmp_path)
+    _use_fake_host(monkeypatch, sources)
+    monkeypatch.setattr(service, "_default_qa_check", qa_pass())
+    before = hub.log.latest_seq()
+    argv = ["deliver", verb, *_common(hub, tmp_path, sources), "--subject", hub.subject_id]
+    argv[argv.index("agent:recipe-1")] = "runner:recipes"
+    if verb == "review":
+        argv += ["--title", "Acme"]
+    assert main(argv) == 2
+    assert hub.log.latest_seq() == before
+    assert not any(p.is_file() for p in (tmp_path / "artifacts").rglob("*"))

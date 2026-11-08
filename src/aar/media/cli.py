@@ -80,11 +80,11 @@ def _positive_bytes(raw: str) -> int:
 
 
 def _actor(raw: str) -> Actor:
-    kind, separator, actor_id = raw.partition(":")
-    if not separator:
-        raise InvalidMediaInput(f"--actor must look like KIND:ID, got {raw!r}")
+    # Route through the one shared parser so this surface cannot produce the runner identity (N2).
+    from aar.hub.events import parse_actor_text
+
     try:
-        return Actor(kind, actor_id)
+        return parse_actor_text(raw)
     except ValueError as exc:
         raise InvalidMediaInput(str(exc)) from exc
 

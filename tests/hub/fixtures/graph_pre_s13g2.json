@@ -1,0 +1,403 @@
+{
+ "events": [
+  {
+   "actor": [
+    "agent",
+    "ed"
+   ],
+   "payload": {
+    "data": {},
+    "kind": "brief",
+    "node_id": "nd_brief",
+    "status": "pending",
+    "title": "b"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-01-01T00:00:00+00:00",
+   "type": "graph.node_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "ed"
+   ],
+   "payload": {
+    "data": {
+     "schema": "aar.recipe/1"
+    },
+    "kind": "recipe",
+    "node_id": "nd_recipe",
+    "status": "pending",
+    "title": "r"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-01-01T00:00:00+00:00",
+   "type": "graph.node_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "ed"
+   ],
+   "payload": {
+    "data": {},
+    "dst": "nd_brief",
+    "edge_id": "edg_1",
+    "src": "nd_recipe",
+    "type": "derives_from"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-01-01T00:00:00+00:00",
+   "type": "graph.edge_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "ed"
+   ],
+   "payload": {
+    "data": {},
+    "kind": "op",
+    "node_id": "nd_op",
+    "status": "pending",
+    "title": "op"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-01-01T00:00:00+00:00",
+   "type": "graph.node_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "ed"
+   ],
+   "payload": {
+    "node_id": "nd_op",
+    "to": "active"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-01-01T00:00:00+00:00",
+   "type": "graph.node_status_changed"
+  },
+  {
+   "actor": [
+    "agent",
+    "ed"
+   ],
+   "payload": {
+    "data": {},
+    "kind": "artifact",
+    "node_id": "nd_art",
+    "status": "done",
+    "title": "a"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-01-01T00:00:00+00:00",
+   "type": "graph.node_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "ed"
+   ],
+   "payload": {
+    "data": {},
+    "dst": "nd_art",
+    "edge_id": "edg_2",
+    "src": "nd_op",
+    "type": "produces"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-01-01T00:00:00+00:00",
+   "type": "graph.edge_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "ed"
+   ],
+   "payload": {
+    "node_id": "nd_op",
+    "to": "done"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-01-01T00:00:00+00:00",
+   "type": "graph.node_status_changed"
+  },
+  {
+   "actor": [
+    "agent",
+    "ed"
+   ],
+   "payload": {
+    "data": {
+     "subject": "nd_op"
+    },
+    "kind": "review",
+    "node_id": "nd_review",
+    "status": "active",
+    "title": "rev"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-01-01T00:00:00+00:00",
+   "type": "graph.node_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "ed"
+   ],
+   "payload": {
+    "data": {},
+    "dst": "nd_op",
+    "edge_id": "edg_3",
+    "src": "nd_review",
+    "type": "reviews"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-01-01T00:00:00+00:00",
+   "type": "graph.edge_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "ed"
+   ],
+   "payload": {
+    "data": {},
+    "dst": "nd_brief",
+    "edge_id": "edg_4",
+    "src": "nd_review",
+    "type": "blocks"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-01-01T00:00:00+00:00",
+   "type": "graph.edge_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "x"
+   ],
+   "payload": {
+    "data": {},
+    "kind": "nope",
+    "node_id": "nd_bogus",
+    "status": "pending",
+    "title": "t"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-01-01T00:00:00+00:00",
+   "type": "graph.node_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "x"
+   ],
+   "payload": {
+    "data": {},
+    "kind": "brief",
+    "node_id": "nd_brief",
+    "status": "pending",
+    "title": "dup"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-01-01T00:00:00+00:00",
+   "type": "graph.node_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "x"
+   ],
+   "payload": {
+    "node_id": "nd_op",
+    "to": "active"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-01-01T00:00:00+00:00",
+   "type": "graph.node_status_changed"
+  },
+  {
+   "actor": [
+    "agent",
+    "x"
+   ],
+   "payload": {
+    "data": {},
+    "dst": "nd_art",
+    "edge_id": "edg_5",
+    "src": "nd_brief",
+    "type": "produces"
+   },
+   "project_id": "prj_acme",
+   "ts": "2026-01-01T00:00:00+00:00",
+   "type": "graph.edge_added"
+  },
+  {
+   "actor": [
+    "agent",
+    "x"
+   ],
+   "payload": [
+    "not",
+    "an",
+    "object"
+   ],
+   "project_id": "prj_acme",
+   "ts": "2026-01-01T00:00:00+00:00",
+   "type": "graph.node_added"
+  }
+ ],
+ "expected": {
+  "creators": {
+   "nd_art": [
+    "agent",
+    "ed"
+   ],
+   "nd_brief": [
+    "agent",
+    "ed"
+   ],
+   "nd_op": [
+    "agent",
+    "ed"
+   ],
+   "nd_recipe": [
+    "agent",
+    "ed"
+   ],
+   "nd_review": [
+    "agent",
+    "ed"
+   ]
+  },
+  "edges": [
+   {
+    "created": "2026-01-01T00:00:00+00:00",
+    "dst": "nd_brief",
+    "id": "edg_1",
+    "payload": {},
+    "src": "nd_recipe",
+    "type": "derives_from"
+   },
+   {
+    "created": "2026-01-01T00:00:00+00:00",
+    "dst": "nd_art",
+    "id": "edg_2",
+    "payload": {},
+    "src": "nd_op",
+    "type": "produces"
+   },
+   {
+    "created": "2026-01-01T00:00:00+00:00",
+    "dst": "nd_op",
+    "id": "edg_3",
+    "payload": {},
+    "src": "nd_review",
+    "type": "reviews"
+   },
+   {
+    "created": "2026-01-01T00:00:00+00:00",
+    "dst": "nd_brief",
+    "id": "edg_4",
+    "payload": {},
+    "src": "nd_review",
+    "type": "blocks"
+   }
+  ],
+  "last_change": {
+   "nd_op": [
+    8,
+    "agent",
+    "ed",
+    "done"
+   ]
+  },
+  "nodes": [
+   {
+    "created": "2026-01-01T00:00:00+00:00",
+    "id": "nd_brief",
+    "kind": "brief",
+    "payload": {},
+    "status": "pending",
+    "title": "b",
+    "updated": "2026-01-01T00:00:00+00:00"
+   },
+   {
+    "created": "2026-01-01T00:00:00+00:00",
+    "id": "nd_recipe",
+    "kind": "recipe",
+    "payload": {
+     "schema": "aar.recipe/1"
+    },
+    "status": "pending",
+    "title": "r",
+    "updated": "2026-01-01T00:00:00+00:00"
+   },
+   {
+    "created": "2026-01-01T00:00:00+00:00",
+    "id": "nd_op",
+    "kind": "op",
+    "payload": {},
+    "status": "done",
+    "title": "op",
+    "updated": "2026-01-01T00:00:00+00:00"
+   },
+   {
+    "created": "2026-01-01T00:00:00+00:00",
+    "id": "nd_art",
+    "kind": "artifact",
+    "payload": {},
+    "status": "done",
+    "title": "a",
+    "updated": "2026-01-01T00:00:00+00:00"
+   },
+   {
+    "created": "2026-01-01T00:00:00+00:00",
+    "id": "nd_review",
+    "kind": "review",
+    "payload": {
+     "subject": "nd_op"
+    },
+    "status": "active",
+    "title": "rev",
+    "updated": "2026-01-01T00:00:00+00:00"
+   }
+  ],
+  "skipped": [
+   {
+    "event_id": "01M5BPW87QWCH9BH9MX9W3CJBW",
+    "reason": "kind is not a node kind",
+    "seq": 12,
+    "type": "graph.node_added"
+   },
+   {
+    "event_id": "01M5BPW88E66QV6ZRZEVDFVA66",
+    "reason": "node nd_brief already exists",
+    "seq": 13,
+    "type": "graph.node_added"
+   },
+   {
+    "event_id": "01M5BPW8936NDRZX0XSQ9P1YSN",
+    "reason": "illegal transition from 'done' to 'active'",
+    "seq": 14,
+    "type": "graph.node_status_changed"
+   },
+   {
+    "event_id": "01M5BPW89Y1SB5VKR9ZN2PM9GC",
+    "reason": "produces edge cannot start at a brief node",
+    "seq": 15,
+    "type": "graph.edge_added"
+   },
+   {
+    "event_id": "01M5BPW8AEWNYV6R9JV7Y2V1XF",
+    "reason": "payload is not an object",
+    "seq": 16,
+    "type": "graph.node_added"
+   }
+  ]
+ },
+ "project_id": "prj_acme"
+}

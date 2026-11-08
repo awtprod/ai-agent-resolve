@@ -283,9 +283,13 @@ def _stopped(error: dict[str, Any], message: str) -> Stopped:
 
 
 def _actor(data: Any) -> Actor:
+    # Route the node's read-side actor through the one shared parser (R3-5): it refuses the
+    # engine-only `runner` identity like every other external-input surface.
+    from aar.hub.events import parse_actor
+
     if not isinstance(data, dict):
         raise TypeError("actor must be an object")
-    return Actor(data["kind"], data["id"])
+    return parse_actor(data["kind"], data["id"])
 
 
 def _approval_from_dict(data: dict[str, Any]) -> Approval:

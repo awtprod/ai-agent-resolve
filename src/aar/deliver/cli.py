@@ -96,12 +96,9 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _parse_actor(value: str) -> Any:
-    from aar.hub.events import Actor
+    from aar.hub.events import parse_actor_text
 
-    kind, sep, ident = value.partition(":")
-    if not sep:
-        raise ValueError(f"--actor must look like KIND:ID, got {value!r}")
-    return Actor(kind, ident)
+    return parse_actor_text(value)
 
 
 def _render_output(args: argparse.Namespace) -> Any:

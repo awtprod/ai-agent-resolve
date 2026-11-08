@@ -718,8 +718,20 @@ def _serve(args: argparse.Namespace) -> int:
         log.close()  # release the DB handle we just opened before bailing out
         cli_io.warn(f"aar hub serve: {exc}")
         return 2
+    # The live server plugs the recipe registry into S13g1's params-validator hook, so
+    # recipe_create refuses unregistered recipe names (unknown_recipe) and validates params
+    # against the registered recipe's model (invalid_params). Recipes register in code.
+    from aar.recipes import registry as recipe_registry
+
+    recipe_registry.load_configured()
     registry = Registry(log)
-    server = build_server(log, registry, artifacts, agent_writes=args.agent_writes)
+    server = build_server(
+        log,
+        registry,
+        artifacts,
+        agent_writes=args.agent_writes,
+        params_validator=recipe_registry.registry_params_validator,
+    )
     if args.agent_writes:
         cli_io.warn(
             "aar hub serve: agent write tools are ON; agent ids are self-declared "
@@ -784,12 +796,11 @@ def _open_store(root: str, log: Any) -> Any:
 
 
 def _parse_actor(value: str) -> Any:
-    from aar.hub.events import Actor
+    # One shared parser (aar.hub.events.parse_actor_text) refuses the engine-only 'runner' identity
+    # for every external surface; see N2.
+    from aar.hub.events import parse_actor_text
 
-    kind, sep, ident = value.partition(":")
-    if not sep:
-        raise ValueError(f"--actor must look like KIND:ID, got {value!r}")
-    return Actor(kind, ident)
+    return parse_actor_text(value)
 
 
 def _console(args: argparse.Namespace) -> int:

@@ -34,6 +34,8 @@ TOOL_NAMES = {
     "agent_branches",
     "jobs_list",
     "approvals_list",
+    # S13g2: recipe_status is the 13th read tool, always listed so agents can drive a run.
+    "recipe_status",
 }
 
 
