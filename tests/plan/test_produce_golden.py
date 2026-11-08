@@ -171,6 +171,11 @@ def test_a_timecoded_master_gives_the_plan_its_start_timecode(
     track.write_text(json.dumps(faces), encoding="utf-8")
     result = produce_short({**short, "dir": folder, "faces": track})
     assert result.plan.sources[0].start_timecode == timecode_frames("01:00:00:00", info.video.fps)
+    rate = result.plan.sources[0].start_timecode_rate  # the media's own rate (fix-check Q3)
+    assert rate is not None and (rate.num, rate.den) == (
+        info.video.fps.numerator,
+        info.video.fps.denominator,
+    )
     assert not [
         w for w in result.warnings if w.code in ("start-timecode-unread", "start-timecode-mismatch")
     ]

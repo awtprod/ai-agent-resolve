@@ -14,7 +14,8 @@ Two clocks appear in a plan:
 Versions: a plan says which format it uses in ``version``. Version 2 (the default for a plan
 that does not say) adds the build-from-template fields: ``template``, ``head``, ``outro``,
 ``audio_tracks``, ``end_fade_frames``, ``Source.color``, ``Source.frame_size``,
-``Source.start_timecode`` and ``Segment.transform``. Everything
+``Source.start_timecode``, ``Source.start_timecode_rate`` and ``Segment.transform``.
+Everything
 else is the same in both, so every valid version 1 plan is also valid as version 2. A plan that
 says ``"version": 1`` may not use a version 2 field: giving one a value is a validation error
 naming the field. Null (or an empty ``audio_tracks``) is not a use, so a full dump of a version
@@ -71,7 +72,7 @@ PlanVersion = Annotated[Literal[1, 2], BeforeValidator(_whole_number_version)]
 
 #: Fields only a version 2 plan may use, per model.
 V2_PLAN_FIELDS = ("template", "head", "outro", "audio_tracks", "end_fade_frames")
-V2_SOURCE_FIELDS = ("color", "frame_size", "start_timecode")
+V2_SOURCE_FIELDS = ("color", "frame_size", "start_timecode", "start_timecode_rate")
 V2_SEGMENT_FIELDS = ("transform",)
 
 ShotSize = Literal["close", "medium", "wide", "unknown"]
@@ -306,6 +307,12 @@ class Source(_Model):
         "labels): 01:00:00:00 is 86400 at 24 fps and 108000 at 29.97 non-drop. Source positions "
         "(src_in, src_out) still count from the file's first frame; the FCPXML export writes "
         "the asset's start at this timecode, which Resolve needs to link a clip to its file.",
+    )
+    start_timecode_rate: Fps | None = Field(
+        default=None,
+        description="Version 2. The frame rate start_timecode is counted at: the media's own "
+        "rate (25 for a 25 fps file at 01:00:00:00 = 90000). Unset means the plan's fps. The "
+        "FCPXML export converts the timecode to time with it.",
     )
 
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import dataclass, field, replace
+from fractions import Fraction
 from typing import Any
 
 from aar.plan.export.fcpxml import (
@@ -535,16 +536,18 @@ class _Check:
         timecode-based time, so a wrong one lands elsewhere)."""
         plan = self.layout.plan
         sources = plan.source_map()
-        want: dict[str, set[int]] = {}
+        want: dict[str, set[Fraction]] = {}
+        frame = Fraction(plan.fps.den, plan.fps.num)
         for source_id, ref in self.layout.media.items():
-            timecode = sources[source_id].start_timecode
+            source = sources[source_id]
             want.setdefault(ref.src, set())
-            if timecode is not None:
-                want[ref.src].add(timecode)
+            if source.start_timecode is not None:
+                rate = source.start_timecode_rate or plan.fps  # the media's own rate (Q3)
+                want[ref.src].add(Fraction(source.start_timecode) * rate.den / rate.num / frame)
         for asset in self.dec.assets.values():
             if asset.src not in want:
                 continue
-            start = next(iter(want[asset.src]), 0)
+            start = next(iter(want[asset.src]), Fraction(0))
             self.want(
                 asset.start == start,
                 f"the asset for {asset.src} starts at frame {asset.start}, not its media's start "

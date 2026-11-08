@@ -5,16 +5,19 @@ the asset's start equals the file's start timecode (import test rerun, 2026-11-0
 
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
 from fractions import Fraction
 from pathlib import Path
 
 import pytest
+from export_support import GOLDEN_PLANS, ccn, export, load_plan
 from produce_support import ffmpeg, needs_ffmpeg
 
 from aar.media.probe import parse_probe_json, timecode_frames
 from aar.plan.model import EditPlan
 from aar.plan.produce.audio import open_audio
-from aar.plan.produce.build import Probed, probe_sources, source_start_timecodes
+from aar.plan.produce.build import Probed, StartTimecode, probe_sources, source_start_timecodes
+from aar.plan.produce.errors import ProduceInputError
 
 FILM = Fraction(24000, 1001)
 NTSC = Fraction(30000, 1001)
@@ -125,21 +128,24 @@ def test_the_probe_reads_the_timecode_tag(
 HOUR = Probed(None, "01:00:00:00", Fraction(24))
 
 
+TC24 = Fraction(24)
+
+
 @pytest.mark.parametrize(
     ("stub_tc", "probed", "want", "warns"),
     [
-        (None, HOUR, 86400, []),  # the probe's tag
-        (86400, HOUR, 86400, []),  # agree: no warning
-        (0, HOUR, 0, ["start-timecode-mismatch"]),  # the stub wins, and says so
-        (90000, None, 90000, []),  # the stub alone
-        (None, Probed(None, None, Fraction(24)), None, []),  # no tag: unset
+        (None, HOUR, StartTimecode(86400, TC24), []),  # the probe's tag, at the media's rate
+        (86400, HOUR, StartTimecode(86400), []),  # agree: no warning (the stub gave no rate)
+        (0, HOUR, StartTimecode(0), ["start-timecode-mismatch"]),  # the stub wins, and says so
+        (90000, None, StartTimecode(90000), []),  # the stub alone
+        (None, Probed(None, None, TC24), None, []),  # no tag: unset
         (None, None, None, []),  # nothing probed (a pool clip, say): unset
-        (None, Probed(None, "junk", Fraction(24)), None, ["start-timecode-unread"]),
-        (3, Probed(None, "junk", Fraction(24)), 3, ["start-timecode-unread"]),
+        (None, Probed(None, "junk", TC24), None, ["start-timecode-unread"]),
+        (3, Probed(None, "junk", TC24), StartTimecode(3), ["start-timecode-unread"]),
     ],
 )
 def test_start_timecode_precedence(
-    stub_tc: int | None, probed: Probed | None, want: int | None, warns: list[str]
+    stub_tc: int | None, probed: Probed | None, want: StartTimecode | None, warns: list[str]
 ) -> None:
     stub = _stub(_source(**({"start_timecode": stub_tc} if stub_tc is not None else {})))
     timecodes, warnings = source_start_timecodes(stub, {"cam": probed} if probed else {})
@@ -151,25 +157,40 @@ def test_start_timecode_precedence(
 def test_a_drop_frame_tag_is_counted_at_the_stream_rate() -> None:
     stub = _stub(_source(), fps="30000/1001")
     timecodes, warnings = source_start_timecodes(stub, {"cam": Probed(None, "01:00:00;00", NTSC)})
-    assert timecodes == {"cam": 107892} and warnings == []
+    assert timecodes == {"cam": StartTimecode(107892, NTSC)} and warnings == []
 
 
 def test_an_audio_only_tag_is_counted_at_the_plan_rate() -> None:
     stub = _stub(_source(media="cam.wav"), fps="30000/1001")
     timecodes, warnings = source_start_timecodes(stub, {"cam": Probed(None, "01:00:00:00", None)})
-    assert timecodes == {"cam": 108000} and warnings == []
+    assert timecodes == {"cam": StartTimecode(108000)} and warnings == []  # the plan's rate
 
 
-def test_another_stream_rate_is_a_warning() -> None:
-    """Counted at the media's own rate (25 fps here), as the field says; the export writes the
-    plan's rate, so the producer warns."""
+def test_another_stream_rate_comes_with_its_rate() -> None:
+    """Fix-check Q3: counted at the media's own rate (25 fps here), and that rate is set, so the
+    export converts with it."""
     stub = _stub(_source())
     timecodes, warnings = source_start_timecodes(
         stub, {"cam": Probed(None, "01:00:00:00", Fraction(25))}
     )
-    assert timecodes == {"cam": 90000}
-    assert [w.code for w in warnings] == ["start-timecode-rate"]
-    assert "25" in warnings[0].message and "24" in warnings[0].message
+    assert timecodes == {"cam": StartTimecode(90000, Fraction(25))} and warnings == []
+
+
+def test_a_stub_timecode_without_its_rate_on_other_rate_media_is_refused() -> None:
+    stub = _stub(_source(start_timecode=90000))
+    with pytest.raises(ProduceInputError) as caught:
+        source_start_timecodes(stub, {"cam": Probed(None, None, Fraction(25))})
+    assert caught.value.code == "start-timecode-rate-required"
+    assert caught.value.exit_code == 2
+    # With its rate it is fine, and so is media at the plan's rate.
+    given = _stub(_source(start_timecode=90000, start_timecode_rate={"num": 25}))
+    assert source_start_timecodes(given, {"cam": Probed(None, None, Fraction(25))}) == (
+        {"cam": StartTimecode(90000, Fraction(25))},
+        [],
+    )
+    assert source_start_timecodes(stub, {"cam": Probed(None, None, TC24)})[0] == {
+        "cam": StartTimecode(90000)
+    }
 
 
 # -- a real file -------------------------------------------------------------------------------
@@ -208,7 +229,7 @@ def test_a_matroska_file_gives_its_start_timecode(tmp_path: Path) -> None:
     stub = _stub(_source(media=str(out)))
     probed, warnings = probe_sources(stub, {}, None)
     assert warnings == [] and probed["cam"].timecode == "01:00:00:00"
-    assert source_start_timecodes(stub, probed)[0] == {"cam": 86400}
+    assert source_start_timecodes(stub, probed)[0] == {"cam": StartTimecode(86400, TC24)}
 
 
 @needs_ffmpeg
@@ -220,4 +241,27 @@ def test_a_timecoded_file_gives_its_start_timecode(timecoded: Path) -> None:
     for given in (audio, {}):
         probed, warnings = probe_sources(stub, given, None)
         assert warnings == []
-        assert source_start_timecodes(stub, probed) == ({"cam": 86400}, [])
+        assert source_start_timecodes(stub, probed) == ({"cam": StartTimecode(86400, TC24)}, [])
+
+
+@needs_ffmpeg
+def test_a_25_fps_file_at_01_00_00_00_exports_at_3600s_in_a_24_fps_plan(tmp_path: Path) -> None:
+    """Fix-check Q3 end to end: the probe reads 90000 at 25 fps and the producer sets the rate,
+    so the export of a 24 fps plan starts the asset exactly at 3600 s."""
+    out = tmp_path / "pal.mov"
+    ffmpeg(
+        "-f", "lavfi", "-i", "testsrc=size=160x90:rate=25", "-f", "lavfi", "-i", "sine=d=1",
+        "-t", "1", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-timecode", "01:00:00:00", str(out),
+    )  # fmt: skip
+    stub = _stub(_source(media=str(out)))  # a 24 fps plan
+    probed, _ = probe_sources(stub, {}, None)
+    timecodes, warnings = source_start_timecodes(stub, probed)
+    assert timecodes == {"cam": StartTimecode(90000, Fraction(25))} and warnings == []
+    data = load_plan(GOLDEN_PLANS["tc_24"]).model_dump(mode="json")
+    for source in data["sources"]:
+        source["start_timecode"] = timecodes["cam"].frames
+        source["start_timecode_rate"] = {"num": 25, "den": 1}
+    result = export(EditPlan.model_validate(data), ccn())
+    starts = {a.get("start") for a in ET.fromstring(result.fcpxml).iter("asset")}
+    assert starts == {"3600s"}

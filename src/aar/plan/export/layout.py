@@ -43,6 +43,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
+from fractions import Fraction
 from typing import Literal
 
 from aar.plan.apply.compile import (
@@ -300,6 +301,15 @@ class Layout:
         return [rows[k] for k in sorted(rows)]
 
 
+def timecode_seconds(source: Source, plan: EditPlan) -> Fraction | None:
+    """A source's start timecode as time: its frame count over ``start_timecode_rate`` (the
+    media's own rate), or over the plan's fps when that is unset (fix-check Q3)."""
+    if source.start_timecode is None:
+        return None
+    rate = source.start_timecode_rate or plan.fps
+    return Fraction(source.start_timecode) * rate.den / rate.num
+
+
 def stack_lanes(spans: list[tuple[int, int]], first: int) -> list[int]:
     """A lane for each ``(record_in, record_out)`` span, from ``first`` up: the first lane free
     over the whole span (spans are half-open, so one ending where the next starts shares its
@@ -491,14 +501,16 @@ class _Builder:
 
     def _check_shared_start_timecodes(self) -> None:
         """Sources that share one media file may not disagree about its start timecode (one
-        asset, one timecode); one that leaves it unset takes the other's."""
-        first: dict[str, tuple[str, int]] = {}
+        asset, one timecode, compared as time, each at its own rate); one that leaves it unset
+        takes the other's."""
+        first: dict[str, tuple[str, int, Fraction]] = {}
         for source in self.plan.sources:
             ref = self.layout.media.get(source.id)
-            if ref is None or source.start_timecode is None:
+            seconds = timecode_seconds(source, self.plan)
+            if ref is None or seconds is None or source.start_timecode is None:
                 continue
-            seen = first.setdefault(ref.src, (source.id, source.start_timecode))
-            if seen[1] != source.start_timecode:
+            seen = first.setdefault(ref.src, (source.id, source.start_timecode, seconds))
+            if seen[2] != seconds:
                 raise ExportError(
                     "conflicting_source_start_timecodes",
                     f"sources {seen[0]!r} and {source.id!r} are the same media file "
@@ -1048,9 +1060,21 @@ class _Builder:
                     "furthest frame used)",
                     "set the source's duration in the plan",
                 )
-            timecodes = {s.start_timecode for s in users if s.start_timecode is not None}
-            start = next(iter(timecodes), 0)  # one value at most (checked above)
-            if not timecodes:
+            timecodes = {t for s in users if (t := timecode_seconds(s, self.plan)) is not None}
+            start = 0
+            if timecodes:  # one value at most (checked above), converted at its own rate
+                exact = next(iter(timecodes)) / self.timebase.frame_duration
+                if exact.denominator != 1:
+                    raise ExportError(
+                        "start_timecode_off_grid",
+                        f"the start timecode of {src} ({float(next(iter(timecodes))):g} s) is "
+                        f"not on a frame of the plan's {self.timebase.rate_text} fps, so no "
+                        "asset start can match it",
+                        "conform the media to the plan's rate, or export it at its own rate",
+                        media=src,
+                    )
+                start = exact.numerator
+            else:
                 self.note(
                     "media_start_timecode",
                     ", ".join(f"sources[{self.plan.sources.index(s)}]" for s in users),

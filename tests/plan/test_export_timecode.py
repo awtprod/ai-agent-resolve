@@ -236,3 +236,53 @@ def test_a_clip_reading_before_the_asset_start_is_refused() -> None:
         ET.tostring(root, encoding="unicode"), load_plan(GOLDEN_PLANS["tc_24"]), ccn()
     ).problems
     assert any("reads before its media's first frame (-1)" in p for p in problems), problems
+
+
+# -- fix-check Q3: the timecode's own rate -----------------------------------------------------
+
+
+def _at_rate(timecode: int, rate: Any, name: str = "tc_24") -> EditPlan:
+    data = load_plan(GOLDEN_PLANS[name]).model_dump(mode="json")
+    for source in data["sources"]:
+        source["start_timecode"] = timecode
+        source["start_timecode_rate"] = rate
+    return EditPlan.model_validate(data)
+
+
+def test_a_25_fps_file_at_01_00_00_00_in_a_24_fps_plan_starts_at_3600s() -> None:
+    """90000 frames at 25 fps is 3600 s: the asset starts exactly there (it was 3750 s when the
+    export counted the timecode at the plan's 24 fps)."""
+    plan = _at_rate(90000, {"num": 25})
+    result = export(plan, ccn())
+    root = ET.fromstring(result.fcpxml)
+    assert {a.get("start") for a in root.iter("asset")} == {"3600s"}
+    assert _spine_clips(root)[1].get("start") == TB24.time(HOUR_24 + 72)  # plan frames after it
+    assert verify_plan_fcpxml(result.fcpxml, plan, ccn()).ok
+    # Unset, the rate falls back to the plan's: 90000 frames at 24 fps.
+    fallback = export(_at_rate(90000, None), ccn())
+    assert {a.get("start") for a in ET.fromstring(fallback.fcpxml).iter("asset")} == {"3750s"}
+
+
+def test_the_self_check_converts_with_the_rate_too() -> None:
+    plan = _at_rate(90000, {"num": 25})
+    text = export(plan, ccn()).fcpxml
+    # The file is right for rate 25; checked against a plan without the rate it is not.
+    problems = verify_plan_fcpxml(text, _at_rate(90000, None), ccn()).problems
+    assert any("not its media's start timecode 90000" in p for p in problems), problems
+
+
+def test_a_timecode_off_the_plans_frame_grid_is_refused() -> None:
+    """01:00:00;00 drop-frame at 29.97 is 3599.9964 s, between two frames of a 24 fps plan."""
+    with pytest.raises(ExportError) as caught:
+        export(_at_rate(107892, "30000/1001"), ccn())
+    assert caught.value.code == "start_timecode_off_grid"
+
+
+def test_sources_sharing_a_file_agree_by_time_not_frame_count() -> None:
+    data = load_plan(GOLDEN_PLANS["tc_24"]).model_dump(mode="json")
+    cam_a, cam_a2 = data["sources"][0], data["sources"][2]
+    cam_a2["media"], cam_a2["duration"] = cam_a["media"], cam_a["duration"]
+    cam_a["start_timecode"], cam_a["start_timecode_rate"] = 90000, {"num": 25}
+    cam_a2["start_timecode"] = HOUR_24  # the same instant at the plan's 24 fps
+    result = export(EditPlan.model_validate(data), ccn())
+    assert {a.get("start") for a in ET.fromstring(result.fcpxml).iter("asset")} == {"3600s"}

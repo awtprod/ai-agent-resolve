@@ -65,3 +65,41 @@ def test_a_version_1_plan_may_not_use_it() -> None:
         data.pop(key, None)
     with pytest.raises(ValidationError, match=r"sources\[0\]\.start_timecode"):
         EditPlan.model_validate(data)
+
+
+# -- Source.start_timecode_rate (fix-check Q3) -------------------------------------------------
+
+
+def _rate(value: Any) -> dict[str, Any]:
+    data = _with(90000)
+    data["sources"][0]["start_timecode_rate"] = value
+    return data
+
+
+@pytest.mark.parametrize(
+    ("value", "want"),
+    [
+        ({"num": 25}, (25, 1)),
+        ({"num": 30000, "den": 1001}, (30000, 1001)),
+        ("25", (25, 1)),
+        (24, (24, 1)),
+    ],
+)
+def test_the_rate_takes_the_fps_forms(value: Any, want: tuple[int, int]) -> None:
+    rate = EditPlan.model_validate(_rate(value)).sources[0].start_timecode_rate
+    assert rate is not None and (rate.num, rate.den) == want
+
+
+@pytest.mark.parametrize("value", [0, -25, {"num": 0}, {"num": 25, "den": 0}, "x", True])
+def test_a_bad_rate_is_refused(value: Any) -> None:
+    with pytest.raises(ValidationError):
+        EditPlan.model_validate(_rate(value))
+
+
+def test_plan_hash_leaves_the_rate_out_while_unset() -> None:
+    assert plan_hash(EditPlan.model_validate(_with(90000))) == plan_hash(
+        EditPlan.model_validate(_rate(None))
+    )
+    assert plan_hash(EditPlan.model_validate(_rate(25))) != plan_hash(
+        EditPlan.model_validate(_with(90000))
+    )

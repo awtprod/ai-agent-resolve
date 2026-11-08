@@ -25,6 +25,7 @@ EXPORT_CODES = frozenset(
         "source_size_required",
         "conflicting_source_durations",
         "conflicting_source_start_timecodes",
+        "start_timecode_off_grid",
         "pool_source_not_exportable",
         "bad_media_map",
         "outro_audio_track_missing",

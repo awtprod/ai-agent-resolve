@@ -337,24 +337,39 @@ def probe_sources(
     return found, warnings
 
 
+@dataclass(frozen=True)
+class StartTimecode:
+    """A source's start timecode: ``frames`` from 00:00:00:00 counted at ``rate`` (the media's
+    own frame rate; None when unknown, meaning the plan's)."""
+
+    frames: int
+    rate: Fraction | None = None
+
+
 def source_start_timecodes(
     stub: EditPlan, probed: Mapping[str, Probed]
-) -> tuple[dict[str, int], list[PlannerWarning]]:
-    """Each source's ``start_timecode`` (S18 round 4), as ``frame_size``: the stub's own wins,
-    else the media's timecode tag counted at the video stream's rate (the plan's for a file with
-    no video), drop-frame handled. A tag that cannot be read, a stub value the probe disagrees
-    with, and a stream rate other than the plan's are warnings; a source with neither gets none
-    (the export then reports it)."""
+) -> tuple[dict[str, StartTimecode], list[PlannerWarning]]:
+    """Each source's ``start_timecode`` and ``start_timecode_rate`` (S18 round 4), as
+    ``frame_size``: the stub's own win, else the media's timecode tag counted at the video
+    stream's rate (the plan's for a file with no video), drop-frame handled, with that rate. A tag
+    that cannot be read and a stub value the probe disagrees with are warnings; a source with
+    neither gets none (the export then refuses or reports it).
+
+    A stub that gives ``start_timecode`` without its rate, for media the probe shows at another
+    rate than the plan's, is refused (``start-timecode-rate-required``): the frame count is
+    ambiguous, and the export would place the asset at the wrong time."""
     plan_fps = Fraction(stub.fps.num, stub.fps.den)
-    timecodes: dict[str, int] = {}
+    timecodes: dict[str, StartTimecode] = {}
     warnings: list[PlannerWarning] = []
     for source in stub.sources:
         seen = probed.get(source.id)
+        media_rate = seen.fps if seen is not None else None
+        given = source.start_timecode_rate
+        stub_rate = Fraction(given.num, given.den) if given is not None else None
         read: int | None = None
         if seen is not None and seen.timecode is not None:
-            rate = seen.fps or plan_fps
             try:
-                read = timecode_frames(seen.timecode, rate)
+                read = timecode_frames(seen.timecode, media_rate or stub_rate or plan_fps)
             except ValueError as exc:
                 warnings.append(
                     PlannerWarning(
@@ -365,36 +380,33 @@ def source_start_timecodes(
                         hint="set the source's start_timecode in the stub",
                     )
                 )
-            else:
-                if rate != plan_fps:
+        if source.start_timecode is not None:
+            if stub_rate is None and media_rate is not None and media_rate != plan_fps:
+                raise ProduceInputError(
+                    "start-timecode-rate-required",
+                    f"source {source.id!r}: the stub gives start_timecode "
+                    f"{source.start_timecode} without start_timecode_rate, and its media runs "
+                    f"at {float(media_rate):g} fps, not the plan's {float(plan_fps):g}",
+                    hint="give start_timecode_rate (the media's rate) with start_timecode, or "
+                    "leave both unset to read them from the media",
+                )
+            chosen = StartTimecode(source.start_timecode, stub_rate)
+            timecodes[source.id] = chosen
+            if read is not None and seen is not None:
+                read_s = Fraction(read) / (media_rate or stub_rate or plan_fps)
+                if read_s != Fraction(chosen.frames) / (chosen.rate or plan_fps):
                     warnings.append(
                         PlannerWarning(
-                            code="start-timecode-rate",
-                            message=f"source {source.id!r}: its start timecode "
-                            f"{seen.timecode} is counted at the media's {float(rate):g} fps; the "
-                            f"plan runs at {float(plan_fps):g} fps, and the FCPXML export writes "
-                            "it at the plan's rate",
+                            code="start-timecode-mismatch",
+                            message=f"source {source.id!r}: the stub gives start timecode "
+                            f"frame {source.start_timecode}, the media's tag {seen.timecode} "
+                            f"(frame {read}); the stub's is used",
                             source=source.id,
-                            hint="conform the media to the plan's rate, or check the clip's "
-                            "link in Resolve",
+                            hint="check the media and the stub's start_timecode",
                         )
                     )
-        if source.start_timecode is not None:
-            timecodes[source.id] = source.start_timecode
-            if read is not None and read != source.start_timecode:
-                assert seen is not None
-                warnings.append(
-                    PlannerWarning(
-                        code="start-timecode-mismatch",
-                        message=f"source {source.id!r}: the stub gives start timecode frame "
-                        f"{source.start_timecode}, the media's tag {seen.timecode} (frame {read});"
-                        " the stub's is used",
-                        source=source.id,
-                        hint="check the media and the stub's start_timecode",
-                    )
-                )
         elif read is not None:
-            timecodes[source.id] = read
+            timecodes[source.id] = StartTimecode(read, media_rate or stub_rate)
     return timecodes, warnings
 
 
@@ -471,14 +483,14 @@ def assemble(
     rules: RuleView,
     *,
     frame_sizes: Mapping[str, tuple[int, int]] | None = None,
-    start_timecodes: Mapping[str, int] | None = None,
+    start_timecodes: Mapping[str, StartTimecode] | None = None,
 ) -> tuple[EditPlan, list[PlannerWarning]]:
     """Transform 5 and the plan: framing, the camera path, segments and transitions.
 
     ``frame_sizes`` sets each source's ``frame_size`` (from :func:`source_frame_sizes`); without
     it the stub's own sizes and the face tracks' are used. ``start_timecodes`` sets each
-    source's ``start_timecode`` (from :func:`source_start_timecodes`); without it the stub's
-    own stay."""
+    source's ``start_timecode`` and ``start_timecode_rate`` (from
+    :func:`source_start_timecodes`); without it the stub's own stay."""
     s = profile.produce
     fps = stub.fps
     sources = stub.source_map()
@@ -550,7 +562,13 @@ def assemble(
         if item["id"] in frame_sizes:
             item["frame_size"] = list(frame_sizes[item["id"]])
         if start_timecodes is not None and item["id"] in start_timecodes:
-            item["start_timecode"] = start_timecodes[item["id"]]
+            timecode = start_timecodes[item["id"]]
+            item["start_timecode"] = timecode.frames
+            if timecode.rate is not None:
+                item["start_timecode_rate"] = {
+                    "num": timecode.rate.numerator,
+                    "den": timecode.rate.denominator,
+                }
     data.update(version=2, segments=segments, transitions=transitions)
     try:
         return EditPlan.model_validate(data), warnings
