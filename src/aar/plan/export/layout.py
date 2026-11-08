@@ -16,9 +16,17 @@ Conventions (see docs/DESIGN.md, "FCPXML export"):
   audio track ``A{N}``; plan audio track ``A{k}`` for ``k >= 2`` maps to lane ``-(k - 1)`` for an
   audio-only clip (the outro's sound on its named track). FCPXML has no tracks, so a track's gain
   is folded into each clip's volume and its mute and bus are reported.
-* A transition of ``d`` frames at cut ``c`` is centred when the handles allow it (``d // 2``
-  frames before the cut), else it starts on the cut (``right``) or ends on it (``left``), like
-  the compiler. FCPXML overlaps the clips under it, so the handles are checked exactly.
+* A transition's alignment comes from the compiler's own rule
+  (:func:`aar.plan.apply.compile.transition_alignment`): centred when the handles hold all its
+  media (``d // 2`` frames before the cut), else it starts on the cut (``right``) or ends on it
+  (``left``). FCPXML overlaps the clips under a transition element, so the media must exist.
+* An audio-only crossfade is, by default, a split edit (``split``): the picture cuts at the
+  plan's cut and each clip's sound runs on under the other's with fades; ``transition`` writes it
+  as a spine transition holding only ``filter-audio``.
+* Framing: ``Source.frame_size`` gives the source picture's aspect. A clip whose aspect differs
+  from the timeline's, or that has a reframe or transform, gets ``adjust-conform type="fill"``
+  and an ``adjust-transform`` computed in FCPXML's units from the source size; such a clip needs
+  the size (``source_size_required``).
 """
 
 from __future__ import annotations
@@ -28,20 +36,19 @@ import re
 from dataclasses import dataclass, field
 from typing import Literal
 
-from aar.host.pathmap import HostPathMap
 from aar.plan.apply.compile import (
     _audio_index,
     _first_content_segment,
-    _fits,
     _last_content_segment,
     incoming_head,
     outgoing_tail,
     title_track,
+    transition_alignment,
 )
 from aar.plan.export.errors import ExportError
-from aar.plan.export.media import MediaRef, media_ref
+from aar.plan.export.media import MediaMap, MediaRef, media_ref
 from aar.plan.export.timebase import Timebase
-from aar.plan.model import EditPlan, ReframeKey, Segment, Transform
+from aar.plan.model import EditPlan, ReframeKey, Segment, Source, Transform
 
 DEFAULT_TIMELINE_START = "01:00:00:00"
 # Characters XML 1.0 cannot carry, plus CR, which a parser turns into LF (so it would not
@@ -52,6 +59,9 @@ DEFAULT_AUDIO_TRANSITION = "Cross Fade 0 dB"
 Enable = Literal["all", "video", "audio"]
 TransitionKind = Literal["head", "join", "outro"]
 Alignment = Literal["right", "center", "left"]
+#: How an audio-only crossfade is written: a J/L split edit, or a spine transition.
+AudioCrossfade = Literal["split", "transition"]
+AUDIO_CROSSFADE_FORMS: tuple[AudioCrossfade, ...] = ("split", "transition")
 
 
 @dataclass(frozen=True)
@@ -93,6 +103,8 @@ class ClipSpec:
     transform: TransformSpec | None = None
     name: str = ""
     note: str | None = None
+    frame_size: tuple[int, int] | None = None
+    conform: bool = False
 
 
 @dataclass(frozen=True)
@@ -108,6 +120,7 @@ class TransitionSpec:
     alignment: Alignment
     video: bool
     audio: bool
+    form: AudioCrossfade = "transition"
 
     @property
     def window_start(self) -> int:
@@ -171,6 +184,7 @@ class Layout:
     tc_start: int
     timeline_start: str
     total_frames: int
+    audio_crossfade: AudioCrossfade = "split"
     clips: list[ClipSpec] = field(default_factory=list)
     transitions: list[TransitionSpec] = field(default_factory=list)
     titles: list[TitleSpec] = field(default_factory=list)
@@ -185,26 +199,33 @@ class Layout:
         return title_track(self.plan) - 1
 
     def transition_at(self, cut: int) -> TransitionSpec | None:
-        """The spine transition at record frame ``cut`` (cuts are unique on track 1)."""
+        """The transition at record frame ``cut`` of video track 1, in either form (cuts are
+        unique there)."""
         for spec in self.transitions:
             if spec.cut == cut:
                 return spec
         return None
 
+    def spine_transition_at(self, cut: int) -> TransitionSpec | None:
+        """The transition at ``cut`` when it is written as a spine ``transition`` element."""
+        spec = self.transition_at(cut)
+        return spec if spec is not None and spec.form == "transition" else None
+
     def raw_range(self, clip: ClipSpec) -> tuple[int, int]:
         """The record frames a clip covers in the file: its plan range, widened under the
-        transitions on its ends (FCPXML overlaps both neighbours under a transition)."""
+        transition elements on its ends (FCPXML overlaps both neighbours under one)."""
         if clip.lane != 0:
             return clip.record_in, clip.record_out
-        into, out = self.transition_at(clip.record_in), self.transition_at(clip.record_out)
+        into = self.spine_transition_at(clip.record_in)
+        out = self.spine_transition_at(clip.record_out)
         return (
             clip.record_in - (into.head_part if into is not None else 0),
             clip.record_out + (out.tail_part if out is not None else 0),
         )
 
     def sound_range(self, clip: ClipSpec) -> tuple[int, int]:
-        """The record frames a clip's sound plays: its plan range, widened only under a
-        transition that carries an audio crossfade."""
+        """The record frames a clip's sound plays: its plan range, widened only under an audio
+        crossfade (in a transition element, or a split edit)."""
         if clip.lane != 0:
             return clip.record_in, clip.record_out
         into, out = self.transition_at(clip.record_in), self.transition_at(clip.record_out)
@@ -212,6 +233,18 @@ class Layout:
             clip.record_in - (into.head_part if into is not None and into.audio else 0),
             clip.record_out + (out.tail_part if out is not None and out.audio else 0),
         )
+
+    def fades(self, clip: ClipSpec) -> tuple[int, int]:
+        """The clip's sound fade-in and fade-out: the head and end fades, plus the fades of a
+        split-edit crossfade on its ends (they never fall on the same end)."""
+        fade_in, fade_out = clip.fade_in, clip.fade_out
+        if clip.lane == 0 and clip.enable != "video":
+            into, out = self.transition_at(clip.record_in), self.transition_at(clip.record_out)
+            if into is not None and into.form == "split":
+                fade_in += into.frames
+            if out is not None and out.form == "split":
+                fade_out += out.frames
+        return fade_in, fade_out
 
     def audio_lane(self, track: int) -> int:
         """The lane of an audio-only clip on plan audio track ``A{track}`` (``track >= 2``)."""
@@ -232,25 +265,42 @@ class Layout:
 # -- transforms --------------------------------------------------------------------------------
 
 
-def transform_spec(seg: Segment, width: int, height: int) -> TransformSpec:
-    """A segment's static transform and reframe keyframes as one FCPXML adjust-transform.
+def conformed_size(frame_size: tuple[int, int], width: int, height: int) -> tuple[float, float]:
+    """The source picture's size in timeline pixels under ``adjust-conform type="fill"``: scaled
+    uniformly until it covers the whole frame."""
+    fill = max(width / frame_size[0], height / frame_size[1])
+    return frame_size[0] * fill, frame_size[1] * fill
 
-    The reframe moves within the transformed picture (DESIGN, EditPlan v2): ``(x, y)`` is the
-    point of the transformed picture shown at the frame centre and ``zoom`` scales about it. With
-    ``w = ((x - 0.5) * width, (0.5 - y) * height)`` in pixels from the centre, y up, a picture
-    point ``p`` lands at ``kz * (T(p) - w)``, so the position is ``kz * ((pan, tilt) - w)`` and the
-    scale ``kz * zoom`` (negated per axis for a flip). Positions are percent of the frame height.
+
+def transform_spec(
+    seg: Segment, frame_size: tuple[int, int], width: int, height: int
+) -> TransformSpec:
+    """A segment's static transform and reframe keyframes as one FCPXML adjust-transform, for a
+    clip conformed with ``fill`` (DESIGN "FCPXML export"; never the timeline width for a source
+    value).
+
+    The reframe picks a crop window of the source: its centre ``(x, y)`` as shares of the source
+    width and height, ``zoom`` 1.0 the fill window (the tallest crop the timeline's aspect allows).
+    The static transform multiplies the zoom, rotates and flips about the frame centre, and pans
+    and tilts in timeline pixels. In timeline pixels from the frame centre, y up, with the source
+    filled to ``(cw, ch)``, a source point ``p`` lands at ``R(rot) * s * F * (p - c) + (pan,
+    tilt)``, where ``c = ((x - 0.5) * cw, (0.5 - y) * ch)`` and ``s = zoom * reframe zoom``. So the
+    FCPXML scale is ``s * F`` and the position ``(pan, tilt) - R(rot) * s * F * c``, in percent of
+    the frame height.
     """
     tf = seg.transform or Transform()
     flip = (-1.0 if tf.flip_h else 1.0, -1.0 if tf.flip_v else 1.0)
+    cw, ch = conformed_size(frame_size, width, height)
+    angle = math.radians(tf.rotation_deg)
+    cos, sin = math.cos(angle), math.sin(angle)
 
     def at(key: ReframeKey) -> tuple[tuple[float, float], tuple[float, float]]:
-        kz = key.zoom
-        wx = (key.x - 0.5) * width
-        wy = (0.5 - key.y) * height
-        position = (kz * (tf.pan - wx) / height * 100.0, kz * (tf.tilt - wy) / height * 100.0)
-        scale = (kz * tf.zoom * flip[0], kz * tf.zoom * flip[1])
-        return position, scale
+        zoom = key.zoom * tf.zoom
+        ax = zoom * flip[0] * (key.x - 0.5) * cw
+        ay = zoom * flip[1] * (0.5 - key.y) * ch
+        qx, qy = cos * ax - sin * ay, sin * ax + cos * ay
+        position = ((tf.pan - qx) / height * 100.0, (tf.tilt - qy) / height * 100.0)
+        return position, (zoom * flip[0], zoom * flip[1])
 
     keys = list(seg.reframe) or [ReframeKey(time=0)]
     position, scale = at(keys[0])
@@ -265,9 +315,12 @@ class _Builder:
     def __init__(
         self,
         plan: EditPlan,
-        media_map: HostPathMap | None,
+        media_map: MediaMap | None,
         timeline_start: str,
+        audio_crossfade: AudioCrossfade,
     ) -> None:
+        if audio_crossfade not in AUDIO_CROSSFADE_FORMS:
+            raise ValueError(f"audio_crossfade must be one of {AUDIO_CROSSFADE_FORMS}")
         self.plan = plan
         self.media_map = media_map
         self.timebase = Timebase.of(plan.fps)
@@ -288,7 +341,7 @@ class _Builder:
                 "add segments to the plan",
             )
         self.ranges = plan.record_ranges()
-        self.layout = Layout(plan, self.timebase, tc_start, timeline_start, total)
+        self.layout = Layout(plan, self.timebase, tc_start, timeline_start, total, audio_crossfade)
 
     # -- report helpers ------------------------------------------------------------------------
 
@@ -307,6 +360,7 @@ class _Builder:
         self._fades()
         self._transitions()
         self._check_overlaps()
+        self._check_fades()
         self._titles()
         self._markers()
         self._assets()
@@ -386,9 +440,12 @@ class _Builder:
                     "give gain_db as a finite number of dB",
                     segment=index,
                 )
+            moved = seg.transform is not None or bool(seg.reframe)
+            frame_size, conform = self._framing(f"segments[{index}]", source, moved)
             transform = None
-            if seg.transform is not None or seg.reframe:
-                transform = self._transform(index, seg)
+            if moved:
+                assert frame_size is not None
+                transform = self._transform(index, seg, frame_size)
             self.layout.clips.append(
                 ClipSpec(
                     location=f"segments[{index}]",
@@ -404,11 +461,37 @@ class _Builder:
                     transform=transform,
                     name=seg.label or ref.name,
                     note=seg.notes,
+                    frame_size=frame_size,
+                    conform=conform,
                 )
             )
         self._outro_clips()
 
-    def _transform(self, index: int, seg: Segment) -> TransformSpec:
+    def _framing(
+        self, location: str, source: Source, moved: bool
+    ) -> tuple[tuple[int, int] | None, bool]:
+        """The clip's source size and whether it is conformed with ``fill``: when its aspect
+        differs from the timeline's, or it is moved (reframe or transform), which then needs the
+        size (F1)."""
+        res = self.plan.resolution
+        if source.frame_size is None:
+            if moved:
+                index = self.plan.sources.index(source)
+                raise ExportError(
+                    "source_size_required",
+                    f"{location} has a reframe or transform, so the export needs source "
+                    f"{source.id!r}'s picture size to frame it, and the plan gives none",
+                    f"set sources[{index}].frame_size to the media's [width, height] (aar plan "
+                    "produce sets it from the face track)",
+                    location=location,
+                    source=source.id,
+                )
+            return None, False
+        size = (source.frame_size[0], source.frame_size[1])
+        differs = size[0] * res.height != size[1] * res.width
+        return size, differs or moved
+
+    def _transform(self, index: int, seg: Segment, frame_size: tuple[int, int]) -> TransformSpec:
         times = [key.time for key in seg.reframe]
         if len(set(times)) != len(times):
             raise ExportError(
@@ -426,7 +509,7 @@ class _Builder:
                 segment=index,
             )
         res = self.plan.resolution
-        spec = transform_spec(seg, res.width, res.height)
+        spec = transform_spec(seg, frame_size, res.width, res.height)
         for k, (a, b) in enumerate(zip(seg.reframe, seg.reframe[1:], strict=False)):
             if a.zoom != b.zoom and (a.x != b.x or a.y != b.y):
                 self.unexpressible(
@@ -469,6 +552,8 @@ class _Builder:
             )
         record_in, record_out = rng
         lane = outro.track - 1
+        frame_size, conform = self._framing("outro", source, False)
+        framing = {"frame_size": frame_size, "conform": conform}
         if audio == outro.track or audio == 1:
             if audio != outro.track:
                 self.unexpressible(
@@ -488,9 +573,12 @@ class _Builder:
                     src_out,
                     ref.src,
                     "all",
-                    outro.track,
-                    volume_db=self._track_gain(outro.track),
+                    # The sound plays on A{audio}: its own track, or A1 riding with a V2+
+                    # picture; that track's gain applies (F2).
+                    audio,
+                    volume_db=self._track_gain(audio),
                     name=ref.name,
+                    **framing,  # type: ignore[arg-type]
                 )
             )
             return
@@ -506,6 +594,7 @@ class _Builder:
                 "video",
                 None,
                 name=ref.name,
+                **framing,  # type: ignore[arg-type]
             )
         )
         self.layout.clips.append(
@@ -550,12 +639,19 @@ class _Builder:
                 assert last is not None, "a non-empty timeline without an outro has segments"
                 carrier = self._clip(f"segments[{last[0]}]")
             clips[carrier] = _replace(clips[carrier], fade_out=end)
-        for clip in clips:
-            if clip.fade_in + clip.fade_out > clip.record_out - clip.record_in:
+
+    def _check_fades(self) -> None:
+        """A clip's fades (head, end and split-edit crossfades) fit in the sound it plays."""
+        for clip in self.layout.clips:
+            if clip.enable == "video":
+                continue
+            fade_in, fade_out = self.layout.fades(clip)
+            sound_in, sound_out = self.layout.sound_range(clip)
+            if fade_in + fade_out > sound_out - sound_in:
                 raise ExportError(
                     "fade_too_long",
-                    f"{clip.location}: fade-in {clip.fade_in} + fade-out {clip.fade_out} frames "
-                    f"exceed the clip's {clip.record_out - clip.record_in} frames",
+                    f"{clip.location}: fade-in {fade_in} + fade-out {fade_out} frames exceed "
+                    f"the {sound_out - sound_in} frames of sound it plays",
                     "shorten head.audio_fade_frames or end_fade_frames",
                     location=clip.location,
                 )
@@ -563,28 +659,25 @@ class _Builder:
     # -- transitions ---------------------------------------------------------------------------
 
     def _alignment(self, outgoing: int, frames: int, location: str) -> tuple[Alignment, int]:
-        """The compiler's alignment order (centre, right, left) with FCPXML's exact handles: a
-        centred transition puts ``frames // 2`` before the cut and the rest after it."""
-        tail = outgoing_tail(self.plan, outgoing)
-        head = incoming_head(self.plan, outgoing)
-        before = frames // 2
-        if _fits(tail, frames - before) and _fits(head, before):
-            return "center", before
-        if _fits(tail, frames):
-            return "right", 0
-        if _fits(head, frames):
-            return "left", frames
-        raise ExportError(
-            "no_handle_for_transition",
-            f"{location}: no alignment fits a {frames}-frame transition (outgoing tail {tail}, "
-            f"incoming head {head}); FCPXML overlaps the clips, so the media must exist",
-            "shorten the transition, give the source ranges more handle, or set the source "
-            "'duration' (an unknown duration counts as no handle)",
-            location=location,
-            outgoing_tail=tail,
-            incoming_head=head,
-            frames=frames,
-        )
+        """The compiler's own alignment rule (F7), or a refusal when no alignment has the media
+        (FCPXML overlaps the clips, or a split edit plays the sound, from the handles)."""
+        chosen = transition_alignment(self.plan, outgoing, frames)
+        if chosen is None:
+            tail = outgoing_tail(self.plan, outgoing)
+            head = incoming_head(self.plan, outgoing)
+            raise ExportError(
+                "no_handle_for_transition",
+                f"{location}: no alignment fits a {frames}-frame transition (outgoing tail "
+                f"{tail}, incoming head {head}); the media under it must exist",
+                "shorten the transition, give the source ranges more handle, or set the source "
+                "'duration' (an unknown duration counts as no handle)",
+                location=location,
+                outgoing_tail=tail,
+                incoming_head=head,
+                frames=frames,
+            )
+        alignment, before = chosen
+        return alignment, before  # type: ignore[return-value]
 
     def _placeholder(self, location: str, video: str) -> None:
         if video != "dissolve":
@@ -677,8 +770,11 @@ class _Builder:
                 continue
             frames = tx.video_frames if video else audio_frames
             alignment, before = self._alignment(tx.after, frames, location)
+            form: AudioCrossfade = "transition" if video else self.layout.audio_crossfade
             self.layout.transitions.append(
-                TransitionSpec(location, "join", 1, cut, frames, before, alignment, video, True)
+                TransitionSpec(
+                    location, "join", 1, cut, frames, before, alignment, video, True, form
+                )
             )
             if video:
                 self._placeholder(f"{location}.video", tx.video)
@@ -909,6 +1005,16 @@ class _Builder:
                     "Fairlight routing",
                     f"route {track.name!r} to {track.bus!r} in Fairlight",
                 )
+                target = next((t for t in plan.audio_tracks if t.name == track.bus), None)
+                if target is not None and target.gain_db != 0.0:
+                    self.unexpressible(
+                        "bus_gain",
+                        f"{location}.bus",
+                        f"bus {track.bus!r}'s gain {target.gain_db:+g} dB is applied only to "
+                        f"clips placed on {track.bus!r}, not to A{number} {track.name!r}'s clips "
+                        "that feed it (FCPXML has no buses)",
+                        f"set the gain on {track.bus!r} in Fairlight once the routing is in place",
+                    )
             if track.gain_db != 0.0:
                 self.note(
                     "audio_track_gain",
@@ -923,7 +1029,7 @@ class _Builder:
                     location,
                     f"no clip sits on A{number} {track.name!r}; FCPXML cannot declare an empty "
                     "track",
-                    "the template provides it",
+                    "add the track in Resolve after import if it is needed",
                 )
         for index, source in enumerate(plan.sources):
             color = source.color
@@ -993,8 +1099,8 @@ class _Builder:
             ):
                 continue
             ends = (
-                self.layout.transition_at(clip.record_in),
-                self.layout.transition_at(clip.record_out),
+                self.layout.spine_transition_at(clip.record_in),
+                self.layout.spine_transition_at(clip.record_out),
             )
             for spec in ends:
                 if spec is not None and spec.audio:
@@ -1006,6 +1112,24 @@ class _Builder:
                         "audio crossfade on such a clip (Resolve's import is unconfirmed)",
                         "check this audio crossfade after import and re-add it if missing",
                     )
+        if any(t.form == "split" for t in self.layout.transitions):
+            self.note(
+                "audio_crossfade",
+                "transitions",
+                "audio-only crossfades are split edits: the picture cuts at the plan's cut, each "
+                "clip's sound runs on under the other's (audioStart/audioDuration) and fades out "
+                "or in over the crossfade (adjust-volume fadeIn/fadeOut)",
+                "check them after import; --audio-crossfade transition writes spine transitions",
+            )
+        for source in plan.sources:
+            if source.id in self.layout.media and source.frame_size is None:
+                self.note(
+                    "frame_size",
+                    f"sources[{plan.sources.index(source)}].frame_size",
+                    f"source {source.id!r} has no frame_size, so its clips get Resolve's default "
+                    "framing (fit: letterboxed if its aspect differs from the timeline's)",
+                    "set frame_size to frame it with fill",
+                )
         self.note(
             "source_timecode",
             "sources",
@@ -1023,8 +1147,9 @@ def _replace(clip: ClipSpec, **changes: object) -> ClipSpec:
 def build_layout(
     plan: EditPlan,
     *,
-    media_map: HostPathMap | None = None,
+    media_map: MediaMap | None = None,
     timeline_start: str = DEFAULT_TIMELINE_START,
+    audio_crossfade: AudioCrossfade = "split",
 ) -> Layout:
     """Every export decision for ``plan``, or a typed :class:`ExportError`."""
-    return _Builder(plan, media_map, timeline_start).build()
+    return _Builder(plan, media_map, timeline_start, audio_crossfade).build()

@@ -13,8 +13,13 @@ aar-evidence/s18/PROGRESS.md):
 * V2 and up, titles and audio-only clips are anchored to the spine element under their start,
   at a non-zero lane, with ``offset`` in that element's local time (``start`` + frames into it).
   Markers sit in the same element the same way.
-* A clip whose sound must stop at a cut its picture runs past (the dissolve into the outro)
-  carries ``audioStart``/``audioDuration``.
+* A clip whose sound must stop at a cut its picture runs past (the dissolve into the outro), or
+  run past a cut its picture stops at (a split-edit audio crossfade, a J/L cut), carries
+  ``audioStart``/``audioDuration``; the DTD: "Use 'audioStart' and 'audioDuration' to define J/L
+  cuts (i.e., split edits) on composite A/V clips". A split crossfade's fades are ``fadeIn`` and
+  ``fadeOut`` inside ``adjust-volume``'s ``amount`` param.
+* A clip framed for another aspect, or moved, carries ``adjust-conform type="fill"`` before its
+  ``adjust-transform`` (the DTD: "The absence 'adjust-conform' element implies 'fit'").
 
 The output is deterministic: the same plan and inputs give the same bytes.
 """
@@ -39,7 +44,19 @@ BASIC_TITLE = (
     ".../Titles.localized/Bumper:Opener.localized/Basic Title.localized/Basic Title.moti",
 )
 _STANDARD_SIZES = {(1280, 720): "720p", (1920, 1080): "1080p", (3840, 2160): "2160p"}
+#: Rates with a standard Final Cut Pro format name (FFVideoFormat1080p2398 etc.); 47.95 and 48
+#: have none, so those formats, like vertical and other sizes, carry no name (it is optional).
+_STANDARD_RATES = frozenset({"2398", "24", "25", "2997", "30", "50", "5994", "60"})
 _MIXED_CONTENT = frozenset({"text", "text-style", "note"})
+
+
+def format_name(timebase: Timebase, width: int, height: int) -> str | None:
+    """Final Cut Pro's standard format name (``FFVideoFormat1080p2398``) where one exists for
+    this size and rate, else ``None`` (the ``name`` attribute is optional; F12)."""
+    size = _STANDARD_SIZES.get((width, height))
+    if size is None or timebase.suffix not in _STANDARD_RATES:
+        return None
+    return f"FFVideoFormat{size}{timebase.suffix}"
 
 
 def number(value: float) -> str:
@@ -74,7 +91,8 @@ class _Writer:
     def __init__(self, layout: Layout) -> None:
         self.layout = layout
         self.tb: Timebase = layout.timebase
-        self.by_cut = {t.cut: t for t in layout.transitions}  # cuts are unique on track 1
+        # Transitions written as spine elements, by cut (cuts are unique on video track 1).
+        self.by_cut = {t.cut: t for t in layout.transitions if t.form == "transition"}
         self.ids: dict[str, str] = {}
         self.asset_ids: dict[str, str] = {}
         self.styles = 0
@@ -119,18 +137,18 @@ class _Writer:
         res = layout.plan.resolution
         self.ids["format"] = "r1"
         fmt = ET.SubElement(resources, "format", id="r1")
-        size = _STANDARD_SIZES.get((res.width, res.height))
-        if size is not None:
-            fmt.set("name", f"FFVideoFormat{size}{self.tb.suffix}")
+        name = format_name(self.tb, res.width, res.height)
+        if name is not None:
+            fmt.set("name", name)
         fmt.set("frameDuration", frame_duration_text(self.tb))
         fmt.set("width", str(res.width))
         fmt.set("height", str(res.height))
         fmt.set("colorSpace", "1-1-1 (Rec. 709)")
         number_ = 2
         effects = []
-        if any(t.video for t in layout.transitions):
+        if any(t.video for t in self.by_cut.values()):
             effects.append(("dissolve", CROSS_DISSOLVE))
-        if any(t.audio for t in layout.transitions):
+        if any(t.audio for t in self.by_cut.values()):
             effects.append(("crossfade", AUDIO_CROSSFADE))
         if layout.titles:
             effects.append(("title", BASIC_TITLE))
@@ -232,10 +250,13 @@ class _Writer:
         element = ET.SubElement(parent, "asset-clip", attrs)
         if clip.note:
             ET.SubElement(element, "note").text = clip.note
+        if clip.conform:
+            ET.SubElement(element, "adjust-conform", type="fill")
         if clip.transform is not None:
             self._transform(element, clip, clip.transform)
-        if clip.enable != "video" and (clip.volume_db != 0.0 or clip.fade_in or clip.fade_out):
-            self._volume(element, clip)
+        fade_in, fade_out = self.layout.fades(clip)
+        if clip.enable != "video" and (clip.volume_db != 0.0 or fade_in or fade_out):
+            self._volume(element, clip, fade_in, fade_out)
         return _SpineItem(raw_in, raw_out, start, element, clip)
 
     def _transform(self, element: ET.Element, clip: ClipSpec, spec: TransformSpec) -> None:
@@ -261,16 +282,16 @@ class _Writer:
                     curve="linear",
                 )
 
-    def _volume(self, element: ET.Element, clip: ClipSpec) -> None:
+    def _volume(self, element: ET.Element, clip: ClipSpec, fade_in: int, fade_out: int) -> None:
         adjust = ET.SubElement(element, "adjust-volume")
         if clip.volume_db != 0.0:
             adjust.set("amount", db(clip.volume_db))
-        if clip.fade_in or clip.fade_out:
+        if fade_in or fade_out:
             param = ET.SubElement(adjust, "param", name="amount")
-            if clip.fade_in:
-                ET.SubElement(param, "fadeIn", type="linear", duration=self.t(clip.fade_in))
-            if clip.fade_out:
-                ET.SubElement(param, "fadeOut", type="linear", duration=self.t(clip.fade_out))
+            if fade_in:
+                ET.SubElement(param, "fadeIn", type="linear", duration=self.t(fade_in))
+            if fade_out:
+                ET.SubElement(param, "fadeOut", type="linear", duration=self.t(fade_out))
 
     # -- anchored items and markers ------------------------------------------------------------
 
@@ -354,11 +375,12 @@ def _reorder(root: ET.Element) -> None:
     """Put each clip's children in the DTD's order: note, adjustments, anchored items, markers."""
     rank = {
         "note": 0,
-        "adjust-transform": 1,
-        "adjust-volume": 2,
-        "asset-clip": 3,
-        "title": 3,
-        "marker": 4,
+        "adjust-conform": 1,
+        "adjust-transform": 2,
+        "adjust-volume": 3,
+        "asset-clip": 4,
+        "title": 4,
+        "marker": 5,
     }
     for element in root.iter():
         if element.tag in ("asset-clip", "gap"):

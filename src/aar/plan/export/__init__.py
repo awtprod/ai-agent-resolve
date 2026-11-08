@@ -19,12 +19,11 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any
 
-from aar.host.pathmap import HostPathMap
 from aar.plan.apply.inputs import plan_hash
 from aar.plan.export.errors import EXPORT_CODES, ExportError
 from aar.plan.export.fcpxml import FCPXML_VERSION, write_fcpxml
-from aar.plan.export.layout import Layout, build_layout
-from aar.plan.export.media import load_media_map, media_map_from_mapping
+from aar.plan.export.layout import AUDIO_CROSSFADE_FORMS, AudioCrossfade, Layout, build_layout
+from aar.plan.export.media import MediaMap, load_media_map, media_map_from_mapping
 from aar.plan.export.timebase import frame_duration_text
 from aar.plan.export.verify import VerifyResult, verify_fcpxml
 from aar.plan.inputs import LaughMap, Transcript
@@ -33,6 +32,7 @@ from aar.plan.model import EditPlan
 from aar.plan.profile import Profile
 
 __all__ = [
+    "AUDIO_CROSSFADE_FORMS",
     "EXPORT_CODES",
     "ExportError",
     "ExportResult",
@@ -56,9 +56,41 @@ class ExportResult:
     layout: Layout
 
 
-def layout_for(plan: EditPlan, profile: Profile, *, media_map: HostPathMap | None = None) -> Layout:
+def layout_for(
+    plan: EditPlan,
+    profile: Profile,
+    *,
+    media_map: MediaMap | None = None,
+    audio_crossfade: AudioCrossfade = "split",
+) -> Layout:
     """The export layout for ``plan`` with the profile's timeline start."""
-    return build_layout(plan, media_map=media_map, timeline_start=profile.export.timeline_start)
+    return build_layout(
+        plan,
+        media_map=media_map,
+        timeline_start=profile.export.timeline_start,
+        audio_crossfade=audio_crossfade,
+    )
+
+
+def _audio_tracks(layout: Layout) -> list[dict[str, Any]]:
+    """The plan audio tracks clips sit on, by name, with their lanes (F9)."""
+    rows: list[dict[str, Any]] = []
+    for number, track in enumerate(layout.plan.audio_tracks, start=1):
+        clips = [c for c in layout.clips if c.audio_track == number and c.enable != "video"]
+        if not clips:
+            continue
+        rows.append(
+            {
+                "track": f"A{number}",
+                "name": track.name,
+                "lanes": sorted({c.lane for c in clips}, reverse=True),
+                "clips": len(clips),
+                "gain_db": track.gain_db,
+                "mute": track.mute,
+                "bus": track.bus,
+            }
+        )
+    return rows
 
 
 def _lanes(layout: Layout) -> list[dict[str, Any]]:
@@ -109,6 +141,8 @@ def build_report(
         },
         "media": [ref.as_dict() for ref in layout.media.values()],
         "lanes": _lanes(layout),
+        "audio_tracks": _audio_tracks(layout),
+        "audio_crossfade": layout.audio_crossfade,
         "transitions": [
             {
                 "location": t.location,
@@ -117,6 +151,7 @@ def build_report(
                 "alignment": t.alignment,
                 "video": t.video,
                 "audio": t.audio,
+                "form": t.form,
             }
             for t in layout.transitions
         ],
@@ -131,9 +166,10 @@ def export_fcpxml(
     plan: EditPlan,
     profile: Profile,
     *,
-    media_map: HostPathMap | None = None,
+    media_map: MediaMap | None = None,
     transcript: Transcript | None = None,
     laughs: LaughMap | None = None,
+    audio_crossfade: AudioCrossfade = "split",
 ) -> ExportResult:
     """Lint, build, write and self-check one plan; a typed :class:`ExportError` on refusal."""
     report = lint(plan, profile, transcript=transcript, laughs=laughs)
@@ -146,10 +182,11 @@ def export_fcpxml(
             errors=[{"rule": f.rule, "message": f.message} for f in errors],
         )
     warnings = [f for f in report.findings if f.severity == "warn"]
-    layout = layout_for(plan, profile, media_map=media_map)
+    layout = layout_for(plan, profile, media_map=media_map, audio_crossfade=audio_crossfade)
     text = write_fcpxml(layout)
     # The self-check compares the file with a layout built afresh from the plan.
-    check = verify_fcpxml(text, layout_for(plan, profile, media_map=media_map))
+    fresh = layout_for(plan, profile, media_map=media_map, audio_crossfade=audio_crossfade)
+    check = verify_fcpxml(text, fresh)
     if not check.ok:
         raise ExportError(
             "self_check_failed",
@@ -161,7 +198,13 @@ def export_fcpxml(
 
 
 def verify_plan_fcpxml(
-    text: str, plan: EditPlan, profile: Profile, *, media_map: HostPathMap | None = None
+    text: str,
+    plan: EditPlan,
+    profile: Profile,
+    *,
+    media_map: MediaMap | None = None,
+    audio_crossfade: AudioCrossfade = "split",
 ) -> VerifyResult:
     """Read an FCPXML file back and compare it with ``plan`` (``aar plan export --verify``)."""
-    return verify_fcpxml(text, layout_for(plan, profile, media_map=media_map))
+    layout = layout_for(plan, profile, media_map=media_map, audio_crossfade=audio_crossfade)
+    return verify_fcpxml(text, layout)

@@ -130,6 +130,14 @@ def register(subparsers: Any) -> None:
         type=Path,
         help="JSON object of linux_root -> windows_root, for sources with hub (Linux) paths.",
     )
+    export.add_argument(
+        "--audio-crossfade",
+        choices=["split", "transition"],
+        default="split",
+        help="How an audio-only crossfade is written: 'split' (default) keeps the picture cut "
+        "and overlaps the sound as a J/L split edit with fades; 'transition' writes a spine "
+        "transition holding only an audio crossfade. --verify needs the same choice.",
+    )
     export.add_argument("--transcript", type=Path, help="Transcript JSON, for the lint.")
     export.add_argument("--laughs", type=Path, help="Laugh map JSON, for the lint.")
     export.add_argument(
@@ -453,10 +461,15 @@ def _cmd_export(args: argparse.Namespace) -> int:
         return _input_error(type(exc).__name__, str(exc), [], as_json)
 
     if args.verify is not None:
-        return _do_verify(args.verify, plan, profile, media_map, as_json)
+        return _do_verify(args.verify, plan, profile, media_map, args.audio_crossfade, as_json)
     try:
         result = export_fcpxml(
-            plan, profile, media_map=media_map, transcript=transcript, laughs=laughs
+            plan,
+            profile,
+            media_map=media_map,
+            transcript=transcript,
+            laughs=laughs,
+            audio_crossfade=args.audio_crossfade,
         )
     except ExportError as exc:
         return _export_refusal(exc, as_json)
@@ -476,7 +489,9 @@ def _cmd_export(args: argparse.Namespace) -> int:
     return cli_io.emit(_PROG, text)
 
 
-def _do_verify(path: Path, plan: EditPlan, profile: Any, media_map: Any, as_json: bool) -> int:
+def _do_verify(
+    path: Path, plan: EditPlan, profile: Any, media_map: Any, crossfade: Any, as_json: bool
+) -> int:
     try:
         if path.stat().st_size > FCPXML_MAX_BYTES:
             return _input_error(
@@ -486,7 +501,9 @@ def _do_verify(path: Path, plan: EditPlan, profile: Any, media_map: Any, as_json
     except (OSError, UnicodeDecodeError) as exc:
         return _input_error(type(exc).__name__, str(exc), [], as_json)
     try:
-        result = verify_plan_fcpxml(text, plan, profile, media_map=media_map)
+        result = verify_plan_fcpxml(
+            text, plan, profile, media_map=media_map, audio_crossfade=crossfade
+        )
     except ExportError as exc:
         return _export_refusal(exc, as_json)
     if as_json:

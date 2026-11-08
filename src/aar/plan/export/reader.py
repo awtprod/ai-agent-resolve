@@ -12,7 +12,10 @@ Problems are collected, not raised, so one run reports them all:
 * an element, attribute or child order outside FCPXML 1.10 for the elements aar writes (the
   content models below are transcribed from Apple's DTD, see aar-evidence/s18/apple-docs);
 * a duplicate id, or a ``ref``/``format`` that does not resolve to a resource of the right kind;
-* a time that is not an exact rational on a frame boundary of the sequence's rate.
+* a time that is not an exact rational on a frame boundary of the sequence's rate;
+* anything the writer never emits (:func:`check_writer_subset`): an element, an attribute, or a
+  value of a fixed attribute (``enabled``, ``anchor``, a proxy ``media-rep``, ``tcFormat="DF"``
+  ...). A hand-edited or foreign file cannot pass, however DTD-valid it is.
 """
 
 from __future__ import annotations
@@ -64,6 +67,7 @@ CONTENT: dict[str, str] = {
     "transition": rf"(?:filter-video )?(?:filter-audio )?{_MARKERS}(?:metadata )?(?:reserved )?",
     "filter-video": r"(?:data )*(?:param )*",
     "filter-audio": r"(?:data )?(?:param )*",
+    "adjust-conform": "",
     "adjust-transform": r"(?:param )*",
     "adjust-volume": r"(?:param )*",
     "param": r"(?:fadeIn )?(?:fadeOut )?(?:keyframeAnimation )?(?:param )*",
@@ -137,6 +141,7 @@ _attrs("title", "ref lane offset name start duration enabled role", "ref duratio
 _attrs("transition", "name offset duration", "duration")
 _attrs("filter-video", "ref name enabled", "ref", enabled=_BOOL)
 _attrs("filter-audio", "ref name enabled presetID", "ref", enabled=_BOOL)
+_attrs("adjust-conform", "type", type=frozenset({"fit", "fill", "none"}))
 _attrs("adjust-transform", "enabled position scale rotation anchor tracking", enabled=_BOOL)
 _attrs("adjust-volume", "amount")
 _attrs("param", "name key value enabled", "name", enabled=_BOOL)
@@ -178,6 +183,116 @@ _REFS: dict[tuple[str, str], frozenset[str]] = {
 }
 _ENTITY = re.compile(r"<!ENTITY|<!DOCTYPE[^>]*\[")
 
+# -- what the writer emits (F3): element -> attribute -> allowed values (None: any; checked by the
+# decode and the comparison with the plan). A file holding anything else fails verify.
+_ANY = None
+_W = dict[str, frozenset[str] | None]
+WRITER_ATTRS: dict[str, _W] = {
+    "fcpxml": {"version": frozenset({"1.10"})},
+    "resources": {},
+    "format": {
+        "id": _ANY,
+        "name": _ANY,
+        "frameDuration": _ANY,
+        "width": _ANY,
+        "height": _ANY,
+        "colorSpace": frozenset({"1-1-1 (Rec. 709)"}),
+    },
+    "effect": {"id": _ANY, "name": _ANY, "uid": _ANY},
+    "asset": {
+        "id": _ANY,
+        "name": _ANY,
+        "start": frozenset({"0s"}),
+        "duration": _ANY,
+        "hasVideo": frozenset({"1"}),
+        "hasAudio": frozenset({"1"}),
+    },
+    "media-rep": {"kind": frozenset({"original-media"}), "src": _ANY},
+    "library": {},
+    "event": {"name": _ANY},
+    "project": {"name": _ANY},
+    "sequence": {
+        "format": _ANY,
+        "duration": _ANY,
+        "tcStart": _ANY,
+        "tcFormat": frozenset({"NDF"}),
+        "audioLayout": frozenset({"stereo"}),
+        "audioRate": frozenset({"48k"}),
+    },
+    "note": {},
+    "spine": {},
+    "gap": {"name": frozenset({"Gap"}), "offset": _ANY, "start": _ANY, "duration": _ANY},
+    "transition": {
+        "name": frozenset({"Cross Dissolve", "Audio Crossfade"}),
+        "offset": _ANY,
+        "duration": _ANY,
+    },
+    "filter-video": {"ref": _ANY, "name": frozenset({"Cross Dissolve"})},
+    "filter-audio": {"ref": _ANY, "name": frozenset({"Audio Crossfade"})},
+    "asset-clip": {
+        "ref": _ANY,
+        "lane": _ANY,
+        "offset": _ANY,
+        "name": _ANY,
+        "start": _ANY,
+        "duration": _ANY,
+        "srcEnable": frozenset({"video", "audio"}),
+        "audioStart": _ANY,
+        "audioDuration": _ANY,
+    },
+    "adjust-conform": {"type": frozenset({"fill"})},
+    "adjust-transform": {"position": _ANY, "scale": _ANY, "rotation": _ANY},
+    "adjust-volume": {"amount": _ANY},
+    "param": {"name": frozenset({"position", "scale", "amount"})},
+    "keyframeAnimation": {},
+    "keyframe": {
+        "time": _ANY,
+        "value": _ANY,
+        "interp": frozenset({"linear"}),
+        "curve": frozenset({"linear"}),
+    },
+    "fadeIn": {"type": frozenset({"linear"}), "duration": _ANY},
+    "fadeOut": {"type": frozenset({"linear"}), "duration": _ANY},
+    "marker": {"start": _ANY, "duration": _ANY, "value": _ANY, "note": _ANY},
+    "title": {"ref": _ANY, "lane": _ANY, "offset": _ANY, "name": _ANY, "duration": _ANY},
+    "text": {},
+    "text-style-def": {"id": _ANY},
+}
+#: ``text-style`` differs by parent: a reference in ``text``, the style in ``text-style-def``.
+_TEXT_STYLE: dict[str, _W] = {
+    "text": {"ref": _ANY},
+    "text-style-def": {
+        "font": frozenset({"Helvetica"}),
+        "fontSize": frozenset({"60"}),
+        "fontColor": frozenset({"1 1 1 1"}),
+        "alignment": frozenset({"center"}),
+    },
+}
+#: Attributes the writer always emits, whose absence would change what plays.
+WRITER_REQUIRED: dict[str, frozenset[str]] = {
+    "format": frozenset({"id", "frameDuration", "width", "height", "colorSpace"}),
+    "effect": frozenset({"id", "name", "uid"}),
+    "asset": frozenset({"id", "name", "start", "duration", "hasVideo", "hasAudio"}),
+    "media-rep": frozenset({"kind", "src"}),
+    "sequence": frozenset(
+        {"format", "duration", "tcStart", "tcFormat", "audioLayout", "audioRate"}
+    ),
+    "gap": frozenset({"name", "offset", "start", "duration"}),
+    "transition": frozenset({"name", "offset", "duration"}),
+    "filter-video": frozenset({"ref", "name"}),
+    "filter-audio": frozenset({"ref", "name"}),
+    "asset-clip": frozenset({"ref", "offset", "name", "start", "duration"}),
+    "adjust-conform": frozenset({"type"}),
+    "adjust-transform": frozenset({"position", "scale", "rotation"}),
+    "param": frozenset({"name"}),
+    "keyframe": frozenset({"time", "value", "interp", "curve"}),
+    "fadeIn": frozenset({"type", "duration"}),
+    "fadeOut": frozenset({"type", "duration"}),
+    "marker": frozenset({"start", "duration", "value"}),
+    "title": frozenset({"ref", "lane", "offset", "name", "duration"}),
+    "text-style-def": frozenset({"id"}),
+}
+
 
 # -- decoded timeline --------------------------------------------------------------------------
 
@@ -199,6 +314,7 @@ class RawClip:
     fade_in: int
     fade_out: int
     transform: TransformSpec | None  # keyframe times are clip-local source frames here
+    conform: str | None = None  # adjust-conform type, when present
 
 
 @dataclass
@@ -207,8 +323,8 @@ class RawTransition:
     frames: int
     video: bool
     audio: bool
-    video_effect: str | None
-    audio_effect: str | None
+    video_effect: tuple[str, str] | None  # (name, uid) of the effect resource
+    audio_effect: tuple[str, str] | None
 
 
 @dataclass
@@ -218,7 +334,7 @@ class RawTitle:
     frames: int
     lines: tuple[str, ...]
     name: str
-    effect: str | None
+    effect: tuple[str, str] | None  # (name, uid)
 
 
 @dataclass
@@ -241,6 +357,13 @@ class SpineEntry:
 
 
 @dataclass
+class RawAsset:
+    src: str
+    start: int | None
+    duration: int | None
+
+
+@dataclass
 class Decoded:
     problems: list[str] = field(default_factory=list)
     version: str | None = None
@@ -252,8 +375,9 @@ class Decoded:
     duration: int | None = None
     event: str | None = None
     project: str | None = None
-    assets: dict[str, str] = field(default_factory=dict)  # asset id -> media-rep src
-    effects: dict[str, str] = field(default_factory=dict)  # effect id -> name
+    format_name: str | None = None
+    assets: dict[str, RawAsset] = field(default_factory=dict)  # asset id -> asset
+    effects: dict[str, tuple[str, str]] = field(default_factory=dict)  # id -> (name, uid)
     spine: list[SpineEntry] = field(default_factory=list)
     clips: list[RawClip] = field(default_factory=list)
     transitions: list[RawTransition] = field(default_factory=list)
@@ -309,6 +433,44 @@ def check_structure(root: ET.Element) -> list[str]:
     return problems
 
 
+def check_writer_subset(root: ET.Element) -> list[str]:
+    """Everything in the file the writer never emits (F3): elements, attributes, values of fixed
+    attributes, a second media-rep, a lane on a spine clip or none on an anchored one."""
+    problems: list[str] = []
+    parents = {child: parent for parent in root.iter() for child in parent}
+    for element in root.iter():
+        tag = element.tag
+        parent = parents.get(element)
+        if tag == "text-style":
+            allowed = _TEXT_STYLE.get(parent.tag if parent is not None else "", {})
+            required = frozenset(allowed)
+        elif tag in WRITER_ATTRS:
+            allowed = WRITER_ATTRS[tag]
+            required = WRITER_REQUIRED.get(tag, frozenset())
+        else:
+            problems.append(f"<{tag}> is not something aar's writer emits")
+            continue
+        for name, value in element.attrib.items():
+            if name not in allowed:
+                problems.append(f"<{tag}> has attribute {name!r}, which aar's writer never emits")
+            elif allowed[name] is not None and value not in allowed[name]:  # type: ignore[operator]
+                problems.append(
+                    f"<{tag} {name}={value!r}>: aar's writer only writes "
+                    f"{' or '.join(sorted(allowed[name]))}"  # type: ignore[arg-type]
+                )
+        for name in sorted(required - set(element.attrib)):
+            problems.append(f"<{tag}> lacks attribute {name!r}, which aar's writer always emits")
+        if tag == "asset" and len(element.findall("media-rep")) != 1:
+            problems.append(f"<asset id={element.get('id')!r}> must hold exactly one media-rep")
+        if tag == "asset-clip" and parent is not None:
+            on_spine = parent.tag == "spine"
+            if on_spine and "lane" in element.attrib:
+                problems.append("a spine <asset-clip> has a lane; aar's writer gives it none")
+            if not on_spine and "lane" not in element.attrib:
+                problems.append("an anchored <asset-clip> has no lane")
+    return problems
+
+
 # -- decode ------------------------------------------------------------------------------------
 
 
@@ -355,16 +517,16 @@ class _Decoder:
         out.version = root.get("version")
         resources = root.find("resources")
         formats: dict[str, ET.Element] = {}
+        assets: list[ET.Element] = []
         if resources is not None:
             for child in resources:
                 identifier = child.get("id", "")
                 if child.tag == "format":
                     formats[identifier] = child
                 elif child.tag == "effect":
-                    out.effects[identifier] = child.get("name", "")
+                    out.effects[identifier] = (child.get("name", ""), child.get("uid", ""))
                 elif child.tag == "asset":
-                    rep = child.find("media-rep")
-                    out.assets[identifier] = rep.get("src", "") if rep is not None else ""
+                    assets.append(child)
         projects = root.findall("library/event/project")
         if len(projects) != 1:
             raise _Bad(f"expected one project, found {len(projects)}")
@@ -388,8 +550,19 @@ class _Decoder:
         if Fraction(rate) not in SUPPORTED_RATES:
             raise _Bad(f"frameDuration {out.frame_duration!r} is not a supported rate")
         self.tb = out.timebase = Timebase(Fraction(rate))
-        out.width = int(fmt.get("width", "0") or 0)
-        out.height = int(fmt.get("height", "0") or 0)
+        out.format_name = fmt.get("name")
+        try:
+            out.width = int(fmt.get("width", "0") or 0)
+            out.height = int(fmt.get("height", "0") or 0)
+        except ValueError:
+            raise _Bad("the format's width and height are not whole numbers") from None
+        for asset in assets:
+            rep = asset.find("media-rep")
+            out.assets[asset.get("id", "")] = RawAsset(
+                rep.get("src", "") if rep is not None else "",
+                self.frames(asset, "start") if "start" in asset.attrib else None,
+                self.frames(asset, "duration") if "duration" in asset.attrib else None,
+            )
         self.tc = out.tc_start = self.frames(sequence, "tcStart", "0s")
         out.duration = self.frames(sequence, "duration")
         spine = sequence.find("spine")
@@ -455,7 +628,7 @@ class _Decoder:
             raw_in=raw_in,
             raw_out=raw_in + duration,
             start=start,
-            src=self.out.assets.get(element.get("ref", "")),
+            src=self._src(element.get("ref", "")),
             enable=element.get("srcEnable", "all"),
             sound=sound,
             name=element.get("name", ""),
@@ -464,7 +637,16 @@ class _Decoder:
             fade_in=fade_in,
             fade_out=fade_out,
             transform=self.transform(element.find("adjust-transform")),
+            conform=(
+                conform.get("type")
+                if (conform := element.find("adjust-conform")) is not None
+                else None
+            ),
         )
+
+    def _src(self, ref: str) -> str | None:
+        asset = self.out.assets.get(ref)
+        return asset.src if asset is not None else None
 
     def transform(self, adjust: ET.Element | None) -> TransformSpec | None:
         if adjust is None:
@@ -557,6 +739,7 @@ def read_fcpxml(text: str) -> Decoded:
         out.problems.append(f"the root element is <{root.tag}>, not <fcpxml>")
         return out
     out.problems.extend(check_structure(root))
+    out.problems.extend(check_writer_subset(root))
     try:
         _Decoder(root, out).run()
     except (_Bad, ValueError) as exc:
