@@ -454,7 +454,9 @@ class _Check:
                     f"from the plan's {tuple(round(v, 3) for v in want)}",
                 )
 
-    def titles_and_markers(self) -> None:
+    def titles(self) -> None:
+        # No marker check here: the writer writes none (Resolve imports none; the report lists
+        # them), and the allowlist (check_writer_subset) already rejects any <marker>.
         # Title text is compared joined: FCPXML holds one text, the lines joined by LF.
         got_titles = sorted(
             (t.lane, t.record_in, t.record_in + t.frames, "\n".join(t.lines), t.name, t.effect)
@@ -481,12 +483,6 @@ class _Check:
                     b_in >= a_out,
                     f"titles overlap on lane {lane}: {a_in}..{a_out} and {b_in}..{b_out}",
                 )
-        got_markers = sorted(
-            (m.record, m.duration, m.value, m.note or "") for m in self.dec.markers
-        )
-        # Resolve imports no FCPXML marker, so the writer writes none (the report lists them).
-        want_markers: list[tuple[int, int, str, str]] = []
-        self.want(got_markers == want_markers, f"markers {got_markers} != {want_markers}")
 
     def against_plan(self) -> None:
         """The brief's check, straight from the plan: segments and exported transitions."""
@@ -555,6 +551,6 @@ def verify_fcpxml(text: str, layout: Layout) -> VerifyResult:
     check.media_bounds()
     check.assets()
     check.crop_windows()
-    check.titles_and_markers()
+    check.titles()
     check.against_plan()
     return check.result()
