@@ -300,7 +300,8 @@ def record_worker_error(
     if log.get_by_idempotency_key(base) is not None:
         return False
     fingerprint = request_sha256(OP_WORKER_ERROR, {"project_id": project_id, "recipe": recipe_node})
-    refs = {"recipe_node": recipe_node, "exc_type": exc_type}
+    # R5-3: the first time this (recipe, type) failed; later occurrences write nothing (dedup).
+    refs = {"recipe_node": recipe_node, "exc_type": exc_type, "first_seen": iso(utcnow())}
     envelope = {"op": OP_WORKER_ERROR, "request_sha256": fingerprint, **refs, "error": ""}
     room = MAX_ERROR_BYTES - len(_canonical(envelope)) + _stored_len("")
     bounded = _bound_text(message, room)

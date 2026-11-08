@@ -27,6 +27,7 @@ MAX_OUTPUTS_KEYS = 32
 MAX_STEP_OUTPUTS_BYTES = 8 * 1024
 MAX_STEP_ERROR_BYTES = 4 * 1024
 MAX_VIEW_BYTES = 64 * 1024
+MAX_ACTION_WHAT_BYTES = 256
 
 
 def status_view(
@@ -120,8 +121,13 @@ def _worker_errors(
         total += 1
         if len(entries) < MAX_WORKER_ERRORS_LISTED:
             exc_type, error = payload.get("exc_type"), payload.get("error")
+            first_seen = payload.get("first_seen")
             entries.append(
                 {
+                    # R5-3: when it first failed; later occurrences are only in the WARNING log.
+                    "first_seen": _bound_text(first_seen, _MAX_EXC_TYPE_BYTES)
+                    if isinstance(first_seen, str)
+                    else None,
                     "exc_type": _bound_text(exc_type, _MAX_EXC_TYPE_BYTES)
                     if isinstance(exc_type, str)
                     else None,
@@ -144,6 +150,15 @@ def _enforce_total_bound(view: dict[str, Any]) -> dict[str, Any]:
     view["truncated"] = True
     if len(_canon(view)) > MAX_VIEW_BYTES:
         view["diagnostics"]["worker_errors"] = []
+    if len(_canon(view)) > MAX_VIEW_BYTES:
+        from aar.recipes.engine import _bound_text
+
+        # Last resort (R5-2): a registered instruction is capped per step, but 64 of them can
+        # still exceed the whole bound; cut each action's text, keeping the tool and its args.
+        for action in view["next_actions"]:
+            what = action.get("what")
+            if isinstance(what, str) and len(what.encode("utf-8")) > MAX_ACTION_WHAT_BYTES:
+                action["what"] = _bound_text(what, MAX_ACTION_WHAT_BYTES)
     return view
 
 

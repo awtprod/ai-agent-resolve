@@ -28,6 +28,7 @@ STEP_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _NAME_RE = re.compile(NAME_RE)
 
 MAX_STEPS = 64
+MAX_INSTRUCTION_BYTES = 2 * 1024
 MIN_ATTEMPTS = 1
 MAX_ATTEMPTS = 5
 DEFAULT_ATTEMPTS = 3
@@ -172,6 +173,13 @@ def _check_kind_fields(step: StepDef, seen: dict[str, int]) -> None:
     elif step.kind == "agent":
         if not step.instruction:
             raise RecipeDefError(f"agent step {step.id!r} needs an instruction")
+        if not isinstance(step.instruction, str):
+            raise RecipeDefError(f"agent step {step.id!r} instruction must be a string")
+        if len(step.instruction.encode("utf-8")) > MAX_INSTRUCTION_BYTES:
+            raise RecipeDefError(
+                f"agent step {step.id!r} instruction is over {MAX_INSTRUCTION_BYTES} bytes "
+                f"of UTF-8; shorten it"
+            )
         if step.expects is None:
             raise RecipeDefError(f"agent step {step.id!r} needs an expects contract")
         if not isinstance(step.expects, (PlanExpect, ArtifactExpect, JsonExpect)):
