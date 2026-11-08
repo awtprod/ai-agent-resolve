@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from aar.plan.export.fcpxml import (
@@ -99,6 +99,19 @@ def _expected_view(clip: ClipSpec, layout: Layout) -> ClipView:
         clip.name,
         clip.note,
     )
+
+
+def _rebased(raw: RawClip, base: int) -> RawClip:
+    """A clip's times counted from its media's first frame, as the plan counts: in the file they
+    count from the asset's start, the media's start timecode (round 4)."""
+    if not base:
+        return raw
+    sound = None if raw.sound is None else (raw.sound[0] - base, raw.sound[1] - base)
+    transform = raw.transform
+    if transform is not None and transform.keyframes:
+        keys = tuple(replace(k, time=k.time - base) for k in transform.keyframes)
+        transform = replace(transform, keyframes=keys)
+    return replace(raw, start=raw.start - base, sound=sound, transform=transform)
 
 
 def _decoded_view(raw: RawClip, head_in: int, tail_out: int) -> ClipView:
@@ -202,6 +215,8 @@ def window_from_plan(
 
 class _Check:
     def __init__(self, decoded: Decoded, layout: Layout) -> None:
+        bases = {asset.src: asset.start or 0 for asset in decoded.assets.values()}
+        decoded.clips = [_rebased(clip, bases.get(clip.src or "", 0)) for clip in decoded.clips]
         self.dec = decoded
         self.layout = layout
         self.problems: list[str] = list(decoded.problems)
@@ -397,7 +412,7 @@ class _Check:
 
     def assets(self) -> None:
         got_assets = sorted((a.src, a.start, a.duration) for a in self.dec.assets.values())
-        want_assets = sorted((a.src, 0, a.duration) for a in self.layout.assets)
+        want_assets = sorted((a.src, a.start, a.duration) for a in self.layout.assets)
         self.want(got_assets == want_assets, f"assets {got_assets} != {want_assets}")
 
     def crop_windows(self) -> None:
@@ -504,12 +519,49 @@ class _Check:
             lane = self.layout.lanes[plan.outro.track]
             row = (lane, rng[0], rng[1], plan.outro.src_in, end, src)
             self.want(row in have, f"outro {row} is not in the file")
+        self._starts_and_titles_against_plan()
         decoded = {(cut, frames) for cut, frames, _, _ in self.decoded_transitions}
         for spec in self.layout.transitions:
             cut, frames = _plan_transition(plan, spec)
             self.want(
                 (cut, frames) in decoded,
                 f"{spec.location}: the plan's cut {cut} ({frames} frames) is not in the file",
+            )
+
+    def _starts_and_titles_against_plan(self) -> None:
+        """Straight from the plan too: each asset starts at its media's start timecode (Resolve
+        links a clip only then), and each title and the sting sit at their plan frames once
+        resolved through their parent clip (an anchored item's offset counts in the parent's
+        timecode-based time, so a wrong one lands elsewhere)."""
+        plan = self.layout.plan
+        sources = plan.source_map()
+        want: dict[str, set[int]] = {}
+        for source_id, ref in self.layout.media.items():
+            timecode = sources[source_id].start_timecode
+            want.setdefault(ref.src, set())
+            if timecode is not None:
+                want[ref.src].add(timecode)
+        for asset in self.dec.assets.values():
+            if asset.src not in want:
+                continue
+            start = next(iter(want[asset.src]), 0)
+            self.want(
+                asset.start == start,
+                f"the asset for {asset.src} starts at frame {asset.start}, not its media's start "
+                f"timecode {start} (Source.start_timecode)",
+            )
+        got = {(t.record_in, t.record_in + t.frames, "\n".join(t.lines)) for t in self.dec.titles}
+        wanted = [
+            (f"titles[{i}]", t.record_in, t.record_out, t.lines) for i, t in enumerate(plan.titles)
+        ]
+        if plan.outro is not None and plan.outro.sting is not None:
+            sting = plan.outro.sting
+            start = plan.content_frames() + sting.start
+            wanted.append(("outro.sting", start, start + sting.frames, sting.lines))
+        for location, record_in, record_out, lines in wanted:
+            self.want(
+                (record_in, record_out, "\n".join(lines)) in got,
+                f"{location} is not at its plan frames {record_in}..{record_out} in the file",
             )
 
     def result(self) -> VerifyResult:

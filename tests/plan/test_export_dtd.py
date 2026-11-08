@@ -38,7 +38,13 @@ def _problems(document: str) -> list[str]:
 
 
 def test_every_golden_is_present() -> None:
-    assert len(GOLDEN_FILES) == 3
+    assert [p.stem for p in GOLDEN_FILES] == [
+        "ccn_2997",
+        "ccn_longform_v2",
+        "short_reframe",
+        "tc_24",  # round 4: assets at the media's start timecode
+        "tc_2997",
+    ]
 
 
 @pytest.mark.parametrize("path", GOLDEN_FILES, ids=[p.name for p in GOLDEN_FILES])

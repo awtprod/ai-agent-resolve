@@ -333,6 +333,30 @@
   ],
   "notes": [
     {
+      "feature": "media_start_timecode",
+      "location": "sources[0]",
+      "detail": "media start timecode unknown; Resolve links clips only if the file's timecode starts at 00:00:00:00",
+      "action": "set Source.start_timecode (aar plan produce reads it from the media)"
+    },
+    {
+      "feature": "media_start_timecode",
+      "location": "sources[1]",
+      "detail": "media start timecode unknown; Resolve links clips only if the file's timecode starts at 00:00:00:00",
+      "action": "set Source.start_timecode (aar plan produce reads it from the media)"
+    },
+    {
+      "feature": "media_start_timecode",
+      "location": "sources[2]",
+      "detail": "media start timecode unknown; Resolve links clips only if the file's timecode starts at 00:00:00:00",
+      "action": "set Source.start_timecode (aar plan produce reads it from the media)"
+    },
+    {
+      "feature": "media_start_timecode",
+      "location": "sources[3]",
+      "detail": "media start timecode unknown; Resolve links clips only if the file's timecode starts at 00:00:00:00",
+      "action": "set Source.start_timecode (aar plan produce reads it from the media)"
+    },
+    {
       "feature": "audio_track_gain",
       "location": "audio_tracks[4].gain_db",
       "detail": "A5 gain -1 dB is folded into each clip's volume on that track (FCPXML has no track gain)",
@@ -355,12 +379,6 @@
       "location": "transitions",
       "detail": "audio-only crossfades are split edits: the picture cuts at the plan's cut, each clip's sound runs on under the other's (audioStart/audioDuration) and fades out or in over the crossfade (adjust-volume fadeIn/fadeOut)",
       "action": "check them after import (Resolve puts the overlapping sound on another track)"
-    },
-    {
-      "feature": "source_timecode",
-      "location": "sources",
-      "detail": "each asset starts at 0s, so source frames count from each file's first frame",
-      "action": "check that clips land on the planned frames after import"
     }
   ],
   "lint_warnings": [],

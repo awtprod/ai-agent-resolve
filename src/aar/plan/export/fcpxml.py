@@ -16,10 +16,16 @@ aar-evidence/s18/PROGRESS.md):
   sequentially in time" and "only one story element is active at a given time, except when a
   transition is present"; the transition's "offset and duration attributes define the position
   and extent of the transition effect".
+* Each ``asset`` starts at its media's start timecode (``Source.start_timecode``, ``0s`` when
+  unknown), and a clip's times count from there: its ``start`` and ``audioStart`` (the asset's
+  start + the source position) and its keyframe times. Resolve links a clip to its file only
+  when the asset's start is the file's timecode (import test rerun, 2026-11-08).
 * Connected clips (V2 and up, dense lanes) and titles are anchored to the spine element under
   their start, at a non-zero lane, with ``offset`` in that element's local time (``start`` +
-  frames into it). Every clip keeps its own linked sound: no ``srcEnable`` (Resolve ignores it).
-  No ``marker`` is written: Resolve imports none from FCPXML; the report lists them.
+  frames into it), so in the parent's timecode-based time: a title left at the un-shifted value
+  imported an hour before the timeline start. Every clip keeps its own linked sound: no
+  ``srcEnable`` (Resolve ignores it). No ``marker`` is written: Resolve imports none from
+  FCPXML; the report lists them.
 * A clip whose sound runs past a cut its picture stops at (a split-edit audio crossfade, a J/L
   cut) carries ``audioStart``/``audioDuration``; the DTD: "Use 'audioStart' and 'audioDuration'
   to define J/L cuts (i.e., split edits) on composite A/V clips". A split crossfade's fades are
@@ -172,7 +178,7 @@ class _Writer:
                 "asset",
                 id=rid,
                 name=asset.name,
-                start="0s",
+                start=self.t(asset.start),
                 duration=self.t(asset.duration),
                 hasVideo="1",
                 hasAudio="1",
@@ -231,8 +237,12 @@ class _Writer:
     def _clip(
         self, parent: ET.Element, clip: ClipSpec, raw_in: int, raw_out: int, offset: str
     ) -> _SpineItem:
-        """An asset-clip; ``offset`` is a sequence time on the spine, else parent-local."""
-        start = clip.src_in
+        """An asset-clip; ``offset`` is a sequence time on the spine, else parent-local.
+
+        Its times count from its asset's start, the media's start timecode (round 4): ``start``
+        and ``audioStart`` here, the keyframe times inside it, and the ``offset`` of every item
+        anchored to it (``_local``). Resolve links the clip to its file only then."""
+        start = self.layout.asset_start(clip.src) + clip.src_in
         attrs = {"ref": self.asset_ids[clip.src]}
         if clip.lane != 0:
             attrs["lane"] = str(clip.lane)
@@ -251,13 +261,14 @@ class _Writer:
         if clip.conform:
             ET.SubElement(element, "adjust-conform", type="fill")
         if clip.transform is not None:
-            self._transform(element, clip, clip.transform)
+            self._transform(element, start, clip.transform)
         fade_in, fade_out = self.layout.fades(clip)
         if clip.volume_db != 0.0 or fade_in or fade_out:
             self._volume(element, clip, fade_in, fade_out)
         return _SpineItem(raw_in, raw_out, start, element, clip)
 
-    def _transform(self, element: ET.Element, clip: ClipSpec, spec: TransformSpec) -> None:
+    def _transform(self, element: ET.Element, start: int, spec: TransformSpec) -> None:
+        """``start`` is the clip's local start (keyframe times are clip-local)."""
         adjust = ET.SubElement(
             element,
             "adjust-transform",
@@ -274,7 +285,7 @@ class _Writer:
                 ET.SubElement(
                     animation,
                     "keyframe",
-                    time=self.t(clip.src_in + key.time),
+                    time=self.t(start + key.time),
                     value=_pair(key.position if name == "position" else key.scale),
                     interp="linear",
                     curve="linear",

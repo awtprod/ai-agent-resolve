@@ -109,7 +109,10 @@ def test_the_validators_cli_case_now_fails(
     out = capsys.readouterr().out
     assert code == 1 and "MISMATCH" in out
     assert "attribute 'enabled', which aar's writer never emits" in out
-    assert "<asset start='3600s'>: aar's writer only writes 0s" in out
+    # Round 4: an asset may start at its media's timecode now, so the allowlist no longer pins
+    # 0s; 3600 s is still refused, as no frame boundary at 23.976 (and the self-check compares
+    # every asset's start with the plan's Source.start_timecode).
+    assert "<asset start>: time '3600s' is not a whole number of frames at 24000/1001 fps" in out
 
 
 @pytest.mark.parametrize(

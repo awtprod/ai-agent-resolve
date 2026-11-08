@@ -127,6 +127,18 @@
   ],
   "notes": [
     {
+      "feature": "media_start_timecode",
+      "location": "sources[0]",
+      "detail": "media start timecode unknown; Resolve links clips only if the file's timecode starts at 00:00:00:00",
+      "action": "set Source.start_timecode (aar plan produce reads it from the media)"
+    },
+    {
+      "feature": "media_start_timecode",
+      "location": "sources[1]",
+      "detail": "media start timecode unknown; Resolve links clips only if the file's timecode starts at 00:00:00:00",
+      "action": "set Source.start_timecode (aar plan produce reads it from the media)"
+    },
+    {
       "feature": "audio_fade",
       "location": "head.audio_fade_frames",
       "detail": "6-frame fade-in on the first segment's volume",
@@ -137,12 +149,6 @@
       "location": "end_fade_frames",
       "detail": "1-frame fade-out on the last clip's volume",
       "action": "none"
-    },
-    {
-      "feature": "source_timecode",
-      "location": "sources",
-      "detail": "each asset starts at 0s, so source frames count from each file's first frame",
-      "action": "check that clips land on the planned frames after import"
     }
   ],
   "lint_warnings": [],

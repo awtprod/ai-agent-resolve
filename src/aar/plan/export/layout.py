@@ -29,6 +29,9 @@ Conventions (see docs/DESIGN.md, "FCPXML export"):
   (``left``).
 * An audio-only crossfade is a split edit (J/L cut): the picture cuts at the plan's cut and each
   clip's sound runs on under the other's with fades.
+* Each asset starts at its media's start timecode (``Source.start_timecode``; 0 when unknown,
+  reported), and every time inside a clip counts from there: Resolve links a clip to its file
+  only then (import test rerun, 2026-11-08).
 * Framing: ``Source.frame_size`` gives the source picture's aspect. A clip whose aspect differs
   from the timeline's, or that has a reframe or transform, gets ``adjust-conform type="fill"``
   and an ``adjust-transform`` computed in FCPXML's units from the source size; such a clip needs
@@ -161,6 +164,9 @@ class AssetSpec:
     src: str
     name: str
     duration: int
+    #: The media's start timecode in frames (``Source.start_timecode``; 0 when unknown). The
+    #: asset starts there, and every time inside its clips counts from it (round 4).
+    start: int = 0
 
 
 @dataclass(frozen=True)
@@ -204,6 +210,10 @@ class Layout:
         """The first title lane: the lane above the top content lane. Titles that overlap in
         time stack on the lanes above it (:func:`stack_lanes`)."""
         return max(self.lanes.values(), default=0) + 1
+
+    def asset_start(self, src: str) -> int:
+        """The start of the asset for media ``src``: its start timecode in frames (0 unknown)."""
+        return next((asset.start for asset in self.assets if asset.src == src), 0)
 
     def imported_audio_track(self, lane: int) -> int:
         """The audio track a clip's sound is expected on after import: Resolve gives the spine's
@@ -462,6 +472,7 @@ class _Builder:
             if source.id in used and source.id not in self.layout.media:
                 self.layout.media[source.id] = media_ref(source, self.media_map)
         self._check_shared_durations()
+        self._check_shared_start_timecodes()
 
     def _check_shared_durations(self) -> None:
         """Sources that share one media file may not disagree about its length (one asset)."""
@@ -482,6 +493,27 @@ class _Builder:
                     sources=[seen[0], source.id],
                     media=ref.windows_path,
                     durations=[seen[1], source.duration],
+                )
+
+    def _check_shared_start_timecodes(self) -> None:
+        """Sources that share one media file may not disagree about its start timecode (one
+        asset, one timecode); one that leaves it unset takes the other's."""
+        first: dict[str, tuple[str, int]] = {}
+        for source in self.plan.sources:
+            ref = self.layout.media.get(source.id)
+            if ref is None or source.start_timecode is None:
+                continue
+            seen = first.setdefault(ref.src, (source.id, source.start_timecode))
+            if seen[1] != source.start_timecode:
+                raise ExportError(
+                    "conflicting_source_start_timecodes",
+                    f"sources {seen[0]!r} and {source.id!r} are the same media file "
+                    f"({ref.windows_path}) but give it different start timecodes "
+                    f"(frames {seen[1]} and {source.start_timecode})",
+                    "give both sources the media's start timecode, or leave one unset",
+                    sources=[seen[0], source.id],
+                    media=ref.windows_path,
+                    start_timecodes=[seen[1], source.start_timecode],
                 )
 
     def _track_gain(self, track: int) -> float:
@@ -1022,7 +1054,18 @@ class _Builder:
                     "furthest frame used)",
                     "set the source's duration in the plan",
                 )
-            self.layout.assets.append(AssetSpec(src, self.layout.media[users[0].id].name, duration))
+            timecodes = {s.start_timecode for s in users if s.start_timecode is not None}
+            start = next(iter(timecodes), 0)  # one value at most (checked above)
+            if not timecodes:
+                self.note(
+                    "media_start_timecode",
+                    ", ".join(f"sources[{self.plan.sources.index(s)}]" for s in users),
+                    "media start timecode unknown; Resolve links clips only if the file's "
+                    "timecode starts at 00:00:00:00",
+                    "set Source.start_timecode (aar plan produce reads it from the media)",
+                )
+            name = self.layout.media[users[0].id].name
+            self.layout.assets.append(AssetSpec(src, name, duration, start))
 
     # -- report --------------------------------------------------------------------------------
 
@@ -1170,12 +1213,6 @@ class _Builder:
                     "framing (fit: letterboxed if its aspect differs from the timeline's)",
                     "set frame_size to frame it with fill",
                 )
-        self.note(
-            "source_timecode",
-            "sources",
-            "each asset starts at 0s, so source frames count from each file's first frame",
-            "check that clips land on the planned frames after import",
-        )
 
 
 def _replace(clip: ClipSpec, **changes: object) -> ClipSpec:

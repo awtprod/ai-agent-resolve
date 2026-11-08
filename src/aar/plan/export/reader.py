@@ -203,7 +203,7 @@ WRITER_ATTRS: dict[str, _W] = {
     "asset": {
         "id": _ANY,
         "name": _ANY,
-        "start": frozenset({"0s"}),
+        "start": _ANY,  # the media's start timecode (round 4); the self-check compares it
         "duration": _ANY,
         "hasVideo": frozenset({"1"}),
         "hasAudio": frozenset({"1"}),

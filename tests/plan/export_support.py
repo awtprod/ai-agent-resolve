@@ -24,6 +24,10 @@ GOLDEN_PLANS: dict[str, Path] = {
     "ccn_longform_v2": EXPORT_FIXTURES / "ccn_longform_v2.plan.json",
     "short_reframe": EXPORT_FIXTURES / "short_reframe.plan.json",
     "ccn_2997": EXPORT_FIXTURES / "ccn_2997.plan.json",
+    # Round 4: every source with an embedded start timecode of 01:00:00:00 (24 fps: 86400;
+    # 29.97 non-drop: 108000), titles included, to pin timecode-based clip and anchor times.
+    "tc_24": EXPORT_FIXTURES / "tc_24.plan.json",
+    "tc_2997": EXPORT_FIXTURES / "tc_2997.plan.json",
 }
 MEDIA_MAP = {"/srv/media": "E:\\Media", "/srv/media/ccn": "\\\\nas\\ccn"}
 _QA = {"longform_lufs": -22.0, "short_lufs": -14.5, "lufs_tolerance": 0.5, "review_mp4_max_mb": 20}

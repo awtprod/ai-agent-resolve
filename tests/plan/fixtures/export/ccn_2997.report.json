@@ -250,6 +250,30 @@
       "action": "check the flip in Resolve's Inspector after import"
     },
     {
+      "feature": "media_start_timecode",
+      "location": "sources[0]",
+      "detail": "media start timecode unknown; Resolve links clips only if the file's timecode starts at 00:00:00:00",
+      "action": "set Source.start_timecode (aar plan produce reads it from the media)"
+    },
+    {
+      "feature": "media_start_timecode",
+      "location": "sources[1]",
+      "detail": "media start timecode unknown; Resolve links clips only if the file's timecode starts at 00:00:00:00",
+      "action": "set Source.start_timecode (aar plan produce reads it from the media)"
+    },
+    {
+      "feature": "media_start_timecode",
+      "location": "sources[2]",
+      "detail": "media start timecode unknown; Resolve links clips only if the file's timecode starts at 00:00:00:00",
+      "action": "set Source.start_timecode (aar plan produce reads it from the media)"
+    },
+    {
+      "feature": "media_start_timecode",
+      "location": "sources[3]",
+      "detail": "media start timecode unknown; Resolve links clips only if the file's timecode starts at 00:00:00:00",
+      "action": "set Source.start_timecode (aar plan produce reads it from the media)"
+    },
+    {
       "feature": "audio_track_gain",
       "location": "audio_tracks[1].gain_db",
       "detail": "A2 gain -2 dB is folded into each clip's volume on that track (FCPXML has no track gain)",
@@ -278,12 +302,6 @@
       "location": "sources[3].frame_size",
       "detail": "source 'outro' has no frame_size, so its clips get Resolve's default framing (fit: letterboxed if its aspect differs from the timeline's)",
       "action": "set frame_size to frame it with fill"
-    },
-    {
-      "feature": "source_timecode",
-      "location": "sources",
-      "detail": "each asset starts at 0s, so source frames count from each file's first frame",
-      "action": "check that clips land on the planned frames after import"
     }
   ],
   "lint_warnings": [

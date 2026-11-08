@@ -108,6 +108,23 @@ def test_golden_self_check_counts() -> None:
             "assets": 4,
             "crop_windows": 2,
         },
+        # Round 4: the same plans with a start timecode check the same things.
+        "tc_24": {
+            "clips": 5,
+            "transitions": 3,
+            "titles": 2,
+            "markers": 0,
+            "assets": 4,
+            "crop_windows": 1,
+        },
+        "tc_2997": {
+            "clips": 5,
+            "transitions": 3,
+            "titles": 2,
+            "markers": 0,
+            "assets": 4,
+            "crop_windows": 2,
+        },
     }
 
 
