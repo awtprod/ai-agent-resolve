@@ -1,5 +1,6 @@
 """``probe(path)``: duration, size, streams and start timecode of a media file, from ffprobe's
-JSON; :func:`timecode_frames` counts a SMPTE timecode in frames."""
+JSON; :func:`timecode_frames` counts a SMPTE timecode in frames and :func:`frames_timecode`
+labels a frame count."""
 
 from __future__ import annotations
 
@@ -160,7 +161,8 @@ def _timecode_tag(raw: Any) -> str | None:
 
 
 _TIMECODE = re.compile(r"(\d{2}):(\d{2}):(\d{2})([:;.])(\d{2,3})")
-_DROP_FRAME_RATES = (Fraction(30000, 1001), Fraction(60000, 1001))
+#: The only rates drop-frame timecode exists at: 29.97 and 59.94.
+DROP_FRAME_RATES = (Fraction(30000, 1001), Fraction(60000, 1001))
 
 
 def timecode_frames(text: str, fps: Fraction) -> int:
@@ -187,7 +189,7 @@ def timecode_frames(text: str, fps: Fraction) -> int:
     count = ((hours * 60 + minutes) * 60 + seconds) * nominal + frame
     if match.group(4) == ":":
         return count
-    if fps not in _DROP_FRAME_RATES:
+    if fps not in DROP_FRAME_RATES:
         raise ValueError(
             f"{text!r} is drop-frame, which exists only at 29.97 and 59.94 fps, not {fps}"
         )
@@ -196,6 +198,37 @@ def timecode_frames(text: str, fps: Fraction) -> int:
         raise ValueError(f"{text!r} names a frame number drop-frame timecode skips (dropped)")
     total_minutes = hours * 60 + minutes
     return count - skip * (total_minutes - total_minutes // 10)
+
+
+def is_drop_frame(text: str) -> bool:
+    """Whether a ``HH:MM:SS;FF`` label is drop-frame: ``;`` or ``.`` before the frames."""
+    match = _TIMECODE.fullmatch(text.strip())
+    return match is not None and match.group(4) != ":"
+
+
+def frames_timecode(frames: int, fps: Fraction, *, drop_frame: bool = False) -> str:
+    """The SMPTE label of frame ``frames`` (counted from 00:00:00:00) at ``fps``, the inverse of
+    :func:`timecode_frames`: ``HH:MM:SS:FF`` at the nominal rate, or ``HH:MM:SS;FF`` for
+    drop-frame (29.97 and 59.94 only), which skips frame numbers 0-1 (0-3 at 59.94) at the start
+    of every minute except each tenth. Hours are not wrapped. Raises ``ValueError`` for a negative
+    count, a rate under 0.5 fps or drop-frame at another rate."""
+    if frames < 0:
+        raise ValueError(f"frame {frames} is before 00:00:00:00")
+    nominal = round(fps)
+    if nominal < 1:
+        raise ValueError(f"{fps} fps rounds to no frames a second")
+    separator = ":"
+    if drop_frame:
+        if fps not in DROP_FRAME_RATES:
+            raise ValueError(f"drop-frame exists only at 29.97 and 59.94 fps, not {fps}")
+        skip = nominal // 15  # 2 frame numbers at 29.97, 4 at 59.94
+        tens, rest = divmod(frames, 600 * nominal - 9 * skip)  # ten-minute blocks
+        frames += 9 * skip * tens
+        if rest > skip:
+            frames += skip * ((rest - skip) // (60 * nominal - skip))
+        separator = ";"
+    seconds, ff = divmod(frames, nominal)
+    return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}{separator}{ff:02d}"
 
 
 def display_size(
