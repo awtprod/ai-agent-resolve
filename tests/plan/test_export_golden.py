@@ -47,14 +47,15 @@ def _t(frames: int, den: int = 24000, step: int = 1001) -> str:
 @pytest.mark.parametrize("name", NAMES)
 def test_cli_export_matches_the_golden_bytes(name: str, tmp_path: Path) -> None:
     out = tmp_path / f"{name}.fcpxml"
-    assert main(["plan", "export", str(GOLDEN_PLANS[name]), "--out", str(out)]) == 0
+    argv = ["plan", "export", str(GOLDEN_PLANS[name]), "--out", str(out)]
+    assert main([*argv, "--allow-unknown-timecode"]) == 0
     assert out.read_bytes() == _golden(name, ".fcpxml")
     assert (tmp_path / f"{name}.report.json").read_bytes() == _golden(name, ".report.json")
 
 
 @pytest.mark.parametrize("name", NAMES)
 def test_library_export_matches_the_golden(name: str) -> None:
-    result = export_fcpxml(load_plan(GOLDEN_PLANS[name]), ccn())
+    result = export_fcpxml(load_plan(GOLDEN_PLANS[name]), ccn(), allow_unknown_timecode=True)
     assert result.fcpxml.encode("utf-8") == _golden(name, ".fcpxml")
     assert {**result.report, "file": f"{name}.fcpxml"} == _report(name)
 

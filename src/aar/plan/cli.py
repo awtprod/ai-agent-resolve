@@ -136,6 +136,12 @@ def register(subparsers: Any) -> None:
     export.add_argument(
         "--overwrite", action="store_true", help="Replace an existing FCPXML and report."
     )
+    export.add_argument(
+        "--allow-unknown-timecode",
+        action="store_true",
+        help="Export sources with no start_timecode anyway, their assets at 0s (Resolve links "
+        "their clips only if the file's timecode starts at 00:00:00:00).",
+    )
     export.add_argument("--json", action="store_true", help="Print the report as JSON.")
     export.set_defaults(func=_cmd_export)
 
@@ -453,6 +459,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
             media_map=media_map,
             transcript=transcript,
             laughs=laughs,
+            allow_unknown_timecode=args.allow_unknown_timecode,
         )
     except ExportError as exc:
         return _export_refusal(exc, as_json)

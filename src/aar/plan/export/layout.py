@@ -383,9 +383,11 @@ class _Builder:
         plan: EditPlan,
         media_map: MediaMap | None,
         timeline_start: str,
+        allow_unknown_timecode: bool = False,
     ) -> None:
         self.plan = plan
         self.media_map = media_map
+        self.allow_unknown_timecode = allow_unknown_timecode
         self.timebase = Timebase.of(plan.fps)
         try:
             tc_start = self.timebase.timecode_frames(timeline_start)
@@ -1040,6 +1042,7 @@ class _Builder:
         sources = self.plan.source_map()
         by_cut = {t.cut: t for t in self.layout.transitions}
         reach: dict[str, int] = {}
+        unknown: list[Source] = []
         for clip in self.layout.clips:
             out = by_cut.get(clip.record_out) if clip.lane == 0 else None
             end = clip.src_out + (out.tail_part if out is not None else 0)
@@ -1075,6 +1078,7 @@ class _Builder:
                     )
                 start = exact.numerator
             else:
+                unknown += users
                 self.note(
                     "media_start_timecode",
                     ", ".join(f"sources[{self.plan.sources.index(s)}]" for s in users),
@@ -1084,6 +1088,20 @@ class _Builder:
                 )
             name = self.layout.media[users[0].id].name
             self.layout.assets.append(AssetSpec(src, name, duration, start))
+        if unknown and not self.allow_unknown_timecode:
+            # Fix-check Q4: Resolve shows such clips Media Offline unless the file's timecode
+            # happens to start at 00:00:00:00, and ffprobe cannot read BRAW's at all.
+            names = ", ".join(f"{s.id!r} ({s.media})" for s in unknown)
+            raise ExportError(
+                "start_timecode_unknown",
+                f"{len(unknown)} source(s) have no start_timecode, so Resolve would not link "
+                f"their clips unless the file's timecode starts at 00:00:00:00: {names}",
+                "set Source.start_timecode (and start_timecode_rate) from the clip's 'Start TC' "
+                "in Resolve or the camera metadata (aar plan produce reads it from media "
+                "ffprobe can open, not BRAW); or pass --allow-unknown-timecode to export with "
+                "the asset at 0s",
+                sources=[s.id for s in unknown],
+            )
 
     # -- report --------------------------------------------------------------------------------
 
@@ -1244,6 +1262,9 @@ def build_layout(
     *,
     media_map: MediaMap | None = None,
     timeline_start: str = DEFAULT_TIMELINE_START,
+    allow_unknown_timecode: bool = False,
 ) -> Layout:
-    """Every export decision for ``plan``, or a typed :class:`ExportError`."""
-    return _Builder(plan, media_map, timeline_start).build()
+    """Every export decision for ``plan``, or a typed :class:`ExportError`. A used source with no
+    ``start_timecode`` is refused (``start_timecode_unknown``) unless ``allow_unknown_timecode``,
+    which writes its asset at 0s with a report note."""
+    return _Builder(plan, media_map, timeline_start, allow_unknown_timecode).build()

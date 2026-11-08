@@ -21,7 +21,9 @@ OFFSET_NEW = 'offset="86559473/24000s"'
 
 
 def run(capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, str, str]:
-    code = main(["plan", "export", *argv])
+    # The fixtures name no start timecode: allow it (the default refusal has its own tests).
+    extra = ["--allow-unknown-timecode"] if "--out" in argv else []
+    code = main(["plan", "export", *argv, *extra])
     captured = capsys.readouterr()
     return code, captured.out, captured.err
 

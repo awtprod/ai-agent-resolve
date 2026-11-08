@@ -55,9 +55,20 @@ class ExportResult:
     layout: Layout
 
 
-def layout_for(plan: EditPlan, profile: Profile, *, media_map: MediaMap | None = None) -> Layout:
+def layout_for(
+    plan: EditPlan,
+    profile: Profile,
+    *,
+    media_map: MediaMap | None = None,
+    allow_unknown_timecode: bool = False,
+) -> Layout:
     """The export layout for ``plan`` with the profile's timeline start."""
-    return build_layout(plan, media_map=media_map, timeline_start=profile.export.timeline_start)
+    return build_layout(
+        plan,
+        media_map=media_map,
+        timeline_start=profile.export.timeline_start,
+        allow_unknown_timecode=allow_unknown_timecode,
+    )
 
 
 #: How to bring the file into Resolve (import test, 2026-11-08).
@@ -247,8 +258,12 @@ def export_fcpxml(
     media_map: MediaMap | None = None,
     transcript: Transcript | None = None,
     laughs: LaughMap | None = None,
+    allow_unknown_timecode: bool = False,
 ) -> ExportResult:
-    """Lint, build, write and self-check one plan; a typed :class:`ExportError` on refusal."""
+    """Lint, build, write and self-check one plan; a typed :class:`ExportError` on refusal.
+
+    A used source with no ``start_timecode`` is refused (``start_timecode_unknown``) unless
+    ``allow_unknown_timecode``: its asset then starts at 0s, with a report note."""
     report = lint(plan, profile, transcript=transcript, laughs=laughs)
     if not report.ok:
         errors = [f for f in report.findings if f.severity == "error"]
@@ -259,10 +274,17 @@ def export_fcpxml(
             errors=[{"rule": f.rule, "message": f.message} for f in errors],
         )
     warnings = [f for f in report.findings if f.severity == "warn"]
-    layout = layout_for(plan, profile, media_map=media_map)
+    layout = layout_for(
+        plan, profile, media_map=media_map, allow_unknown_timecode=allow_unknown_timecode
+    )
     text = write_fcpxml(layout)
     # The self-check compares the file with a layout built afresh from the plan.
-    check = verify_fcpxml(text, layout_for(plan, profile, media_map=media_map))
+    check = verify_fcpxml(
+        text,
+        layout_for(
+            plan, profile, media_map=media_map, allow_unknown_timecode=allow_unknown_timecode
+        ),
+    )
     if not check.ok:
         raise ExportError(
             "self_check_failed",
@@ -281,4 +303,8 @@ def verify_plan_fcpxml(
     media_map: MediaMap | None = None,
 ) -> VerifyResult:
     """Read an FCPXML file back and compare it with ``plan`` (``aar plan export --verify``)."""
-    return verify_fcpxml(text, layout_for(plan, profile, media_map=media_map))
+    return (
+        verify_fcpxml(  # any file: an asset at 0s for an unknown timecode is compared, not refused
+            text, layout_for(plan, profile, media_map=media_map, allow_unknown_timecode=True)
+        )
+    )

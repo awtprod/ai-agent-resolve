@@ -25,6 +25,7 @@ def _export(seed: int):
         plan,
         permissive(start),
         media_map=media_map_from_mapping(MEDIA_MAP),
+        allow_unknown_timecode=True,  # the generator names no start timecodes
     )
 
 

@@ -61,6 +61,7 @@ def test_export_codes_are_stable() -> None:
             "conflicting_source_durations",
             "conflicting_source_start_timecodes",
             "start_timecode_off_grid",
+            "start_timecode_unknown",
             "pool_source_not_exportable",
             "bad_media_map",
             "outro_audio_track_missing",

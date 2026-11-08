@@ -191,7 +191,8 @@ def test_the_cli_exits_2_with_output_locked(
     out = tmp_path / "cut.fcpxml"
     fd = file_lock.acquire_file_lock(str(lock_path(out)))
     try:
-        argv = ["plan", "export", str(GOLDEN_PLANS["ccn_longform_v2"]), "--out", str(out)]
+        plan = str(GOLDEN_PLANS["ccn_longform_v2"])
+        argv = ["plan", "export", plan, "--out", str(out), "--allow-unknown-timecode"]
         assert main(argv) == 2
         err = capsys.readouterr().err
         assert "another aar export holds the lock" in err

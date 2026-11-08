@@ -581,7 +581,8 @@ def test_the_cli_keeps_the_previous_pair_when_the_report_fails(
     out = tmp_path / "cut.fcpxml"
     _old(tmp_path)
     _fail_on("_place_one", 2, monkeypatch, OSError(28, "No space left on device"))
-    argv = ["plan", "export", str(GOLDEN_PLANS["ccn_longform_v2"]), "--out", str(out)]
+    plan = str(GOLDEN_PLANS["ccn_longform_v2"])
+    argv = ["plan", "export", plan, "--out", str(out), "--allow-unknown-timecode"]
     assert main([*argv, "--overwrite"]) == 2
     assert "No space left" in capsys.readouterr().err
     assert out.read_bytes() == b"<old fcpxml/>"

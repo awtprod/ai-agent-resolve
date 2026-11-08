@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 from fractions import Fraction
+from pathlib import Path
 from typing import Any
 
 import pytest
 from export_support import EXPORT_FIXTURES, GOLDEN_PLANS, ccn, export, load_plan, permissive
 
-from aar.plan.export import ExportError, verify_plan_fcpxml
+from aar.cli import main
+from aar.plan.export import ExportError, export_fcpxml, verify_plan_fcpxml
 from aar.plan.export.reader import read_fcpxml
 from aar.plan.export.timebase import Timebase
 from aar.plan.model import EditPlan
@@ -286,3 +288,58 @@ def test_sources_sharing_a_file_agree_by_time_not_frame_count() -> None:
     cam_a2["start_timecode"] = HOUR_24  # the same instant at the plan's 24 fps
     result = export(EditPlan.model_validate(data), ccn())
     assert {a.get("start") for a in ET.fromstring(result.fcpxml).iter("asset")} == {"3600s"}
+
+
+# -- fix-check Q4: an unknown start timecode is refused by default -----------------------------
+
+
+def test_an_unknown_start_timecode_is_refused_by_default() -> None:
+    """BRAW, the CCN camera format, cannot be probed: without a start_timecode every such clip
+    would import Media Offline, so the export refuses and names the sources."""
+    with pytest.raises(ExportError) as caught:
+        export_fcpxml(load_plan(GOLDEN_PLANS["ccn_longform_v2"]), ccn())
+    error = caught.value
+    assert error.code == "start_timecode_unknown"
+    assert error.details["sources"] == ["camA", "camB", "camA2", "outroclip"]
+    assert "'camA' (E:/CCN/Ep1/A001.braw)" in error.message
+    assert "'Start TC' in Resolve or the camera metadata" in error.fix_hint
+    assert "--allow-unknown-timecode" in error.fix_hint
+
+
+def test_only_the_sources_without_one_are_named() -> None:
+    data = load_plan(GOLDEN_PLANS["ccn_longform_v2"]).model_dump(mode="json")
+    for source in data["sources"][:3]:
+        source["start_timecode"] = HOUR_24
+    with pytest.raises(ExportError) as caught:
+        export_fcpxml(EditPlan.model_validate(data), ccn())
+    assert caught.value.details["sources"] == ["outroclip"]
+
+
+def test_the_flag_exports_anyway_with_the_asset_at_0s_and_the_note() -> None:
+    result = export_fcpxml(
+        load_plan(GOLDEN_PLANS["ccn_longform_v2"]), ccn(), allow_unknown_timecode=True
+    )
+    assert {a.get("start") for a in ET.fromstring(result.fcpxml).iter("asset")} == {"0s"}
+    assert any(n["feature"] == "media_start_timecode" for n in result.report["notes"])
+    assert result.fcpxml == _golden("ccn_longform_v2")
+
+
+def test_set_explicitly_needs_no_flag() -> None:
+    result = export_fcpxml(load_plan(GOLDEN_PLANS["tc_24"]), ccn())
+    assert result.fcpxml == _golden("tc_24")
+
+
+def test_the_cli_refuses_with_exit_2_and_the_flag_lets_it_through(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "cut.fcpxml"
+    argv = ["plan", "export", str(GOLDEN_PLANS["ccn_longform_v2"]), "--out", str(out)]
+    assert main(argv) == 2
+    err = capsys.readouterr().err
+    assert "start_timecode_unknown" in err and "--allow-unknown-timecode" in err
+    assert sorted(p.name for p in tmp_path.iterdir()) == []  # refused before writing anything
+    assert main([*argv, "--allow-unknown-timecode"]) == 0
+    assert out.read_text(encoding="utf-8") == _golden("ccn_longform_v2")
+    # Verifying a file never refuses for it: the asset at 0s is compared.
+    capsys.readouterr()
+    assert main(["plan", "export", str(GOLDEN_PLANS["ccn_longform_v2"]), "--verify", str(out)]) == 0

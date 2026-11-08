@@ -54,6 +54,10 @@ def permissive(timeline_start: str = "01:00:00:00") -> Profile:
 
 
 def export(plan: EditPlan, profile: Profile | None = None, **kwargs: Any) -> ExportResult:
+    """Export with the permissive profile by default. Most fixtures name no start timecode, so
+    unknown ones are allowed here (asset at 0s, reported); the default refusal
+    (``start_timecode_unknown``) has its own tests."""
+    kwargs.setdefault("allow_unknown_timecode", True)
     return export_fcpxml(plan, profile or permissive(), **kwargs)
 
 
@@ -66,6 +70,7 @@ def reverify(result: ExportResult) -> VerifyResult:
         layout.plan,
         media_map=media_map_from_mapping(MEDIA_MAP),
         timeline_start=layout.timeline_start,
+        allow_unknown_timecode=True,
     )
     return verify_fcpxml(result.fcpxml, fresh)
 

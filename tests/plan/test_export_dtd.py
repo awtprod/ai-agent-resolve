@@ -62,6 +62,7 @@ def test_random_export_is_valid_against_apples_dtd(seed: int) -> None:
         plan,
         permissive(start),
         media_map=media_map_from_mapping(MEDIA_MAP),
+        allow_unknown_timecode=True,
     )
     assert _problems(result.fcpxml) == []
 

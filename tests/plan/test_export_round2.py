@@ -331,7 +331,8 @@ def test_exporter_and_compiler_choose_the_same_alignment(frames: int) -> None:
         plan = _join_plan(frames, tail, head)
         compiled = _compiler_alignment(plan)
         try:
-            exported = next(t.alignment for t in build_layout(plan).transitions if t.kind == "join")
+            layout = build_layout(plan, allow_unknown_timecode=True)
+            exported = next(t.alignment for t in layout.transitions if t.kind == "join")
         except ExportError as exc:
             assert exc.code == "no_handle_for_transition"
             exported = None
@@ -342,7 +343,7 @@ def test_odd_centre_needs_the_extra_frame_on_the_tail() -> None:
     """W05: d=3 with a 1-frame tail and a long head is left-aligned, never centred (a centred
     window would read one frame past the outgoing source)."""
     plan = _join_plan(3, 1, 50)
-    layout = build_layout(plan)
+    layout = build_layout(plan, allow_unknown_timecode=True)
     (join,) = layout.transitions
     assert (join.alignment, join.head_part) == ("left", 3)
     result = export(plan)
