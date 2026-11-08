@@ -62,7 +62,7 @@ from aar.analyze.common import (
 )
 from aar.analyze.errors import AnalyzeError, from_media_error, need_cv2, need_numpy
 from aar.media import MediaError, timeout_for
-from aar.media.probe import parse_rational
+from aar.media.probe import display_size, parse_rational, sample_aspect, stream_rotation
 from aar.media.tools import input_url, require_regular_file, run_tool
 
 SCHEMA = "aar.faces/1"
@@ -185,11 +185,7 @@ class VideoInfo:
     @property
     def display_size(self) -> tuple[int, int]:
         """Width and height as ffmpeg emits them: the aspect ratio applied, then rotated."""
-        width = max(1, round(self.width * self.sample_aspect))
-        height = self.height
-        if self.rotation % 180 == 90:
-            width, height = height, width
-        return width, height
+        return display_size(self.width, self.height, self.sample_aspect, self.rotation)
 
     def to_dict(self) -> dict[str, Any]:
         width, height = self.display_size
@@ -239,23 +235,15 @@ def probe_video(path: Path, timeout_s: float = 30.0) -> VideoInfo:
     width, height = stream.get("width"), stream.get("height")
     if not (isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0):
         raise AnalyzeError("no-video", f"{path}: the video stream has no size")
-    rotation = 0
-    for side in stream.get("side_data_list") or []:
-        if isinstance(side, dict) and _number(side.get("rotation")) is not None:
-            rotation = round(float(side["rotation"]))
-    tags = stream.get("tags")
-    if rotation == 0 and isinstance(tags, dict) and _number(tags.get("rotate")) is not None:
-        rotation = round(float(tags["rotate"]))
-    sar = parse_rational(stream.get("sample_aspect_ratio"))  # "0:1" (unknown) gives None
-    if sar is None and isinstance(stream.get("sample_aspect_ratio"), str):
-        sar = parse_rational(stream["sample_aspect_ratio"].replace(":", "/"))
+    rotation = stream_rotation(stream)
+    sar = sample_aspect(stream.get("sample_aspect_ratio"))  # "0:1" (unknown) gives None
     fps = parse_rational(stream.get("avg_frame_rate")) or parse_rational(stream.get("r_frame_rate"))
     fmt = data.get("format") if isinstance(data.get("format"), dict) else {}
     duration = _number(stream.get("duration")) or _number(fmt.get("duration"))
     return VideoInfo(
         width=width,
         height=height,
-        rotation=rotation % 360,
+        rotation=rotation,
         sample_aspect=sar or Fraction(1),
         fps=fps,
         duration_s=duration,

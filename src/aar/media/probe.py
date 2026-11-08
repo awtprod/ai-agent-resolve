@@ -29,10 +29,25 @@ class Stream:
     channels: int | None = None
     attached_pic: bool = False
     pix_fmt: str | None = None
+    rotation: int = 0  # display rotation in degrees, 0-359 (video)
+    sample_aspect: Fraction | None = None  # pixel aspect; None when unknown or not video
+
+    @property
+    def display_size(self) -> tuple[int, int] | None:
+        """The picture as it is shown: the pixel aspect applied, then a 90/270 rotation."""
+        if not self.width or not self.height:
+            return None
+        return display_size(self.width, self.height, self.sample_aspect, self.rotation)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["fps"] = None if self.fps is None else f"{self.fps.numerator}/{self.fps.denominator}"
+        aspect = self.sample_aspect
+        data["sample_aspect"] = (
+            None if aspect is None else f"{aspect.numerator}/{aspect.denominator}"
+        )
+        size = self.display_size
+        data["display_size"] = None if size is None else list(size)
         return data
 
 
@@ -97,6 +112,33 @@ def parse_rational(text: Any) -> Fraction | None:
     return Fraction(n, d)
 
 
+def sample_aspect(text: Any) -> Fraction | None:
+    """ffprobe's ``sample_aspect_ratio`` (``"4:3"``; ``"0:1"`` when unknown) as a Fraction."""
+    return parse_rational(text.replace(":", "/")) if isinstance(text, str) else None
+
+
+def stream_rotation(raw: dict[str, Any]) -> int:
+    """A stream's display rotation in degrees, 0-359: its Display Matrix side data, else the
+    older ``rotate`` tag."""
+    rotation = 0
+    for side in raw.get("side_data_list") or []:
+        if isinstance(side, dict) and _num(side.get("rotation")) is not None:
+            rotation = round(float(side["rotation"]))
+    tags = raw.get("tags")
+    if rotation == 0 and isinstance(tags, dict) and _num(tags.get("rotate")) is not None:
+        rotation = round(float(tags["rotate"]))
+    return rotation % 360
+
+
+def display_size(
+    width: int, height: int, aspect: Fraction | None, rotation: int
+) -> tuple[int, int]:
+    """Width and height as shown (and as ffmpeg emits them): the pixel aspect applied to the
+    width, then swapped by a 90 or 270 degree rotation."""
+    shown = max(1, round(width * aspect)) if aspect else width
+    return (height, shown) if rotation % 180 == 90 else (shown, height)
+
+
 def parse_probe_json(data: dict[str, Any], path: str, size_bytes: int) -> MediaInfo:
     """Build a MediaInfo from ffprobe ``-show_format -show_streams -of json`` output."""
     fmt = data.get("format") or {}
@@ -124,6 +166,10 @@ def parse_probe_json(data: dict[str, Any], path: str, size_bytes: int) -> MediaI
                 channels=_int(raw.get("channels")),
                 attached_pic=bool(disposition.get("attached_pic")),
                 pix_fmt=(str(raw["pix_fmt"]) if raw.get("pix_fmt") else None),
+                rotation=stream_rotation(raw) if kind == "video" else 0,
+                sample_aspect=(
+                    sample_aspect(raw.get("sample_aspect_ratio")) if kind == "video" else None
+                ),
             )
         )
     return MediaInfo(
