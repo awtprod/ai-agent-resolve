@@ -1,0 +1,237 @@
+{
+  "format": "fcpxml",
+  "fcpxml_version": "1.10",
+  "fcpxml_sha256": "815f8186fc7f6d47ca118d5e206643a1344ef54aa84939bacee2013e9df244bb",
+  "plan": {
+    "project": "CCN",
+    "timeline": "Late Set 2997",
+    "sha256": "115d06c8ad6a490c7cdd1e4a049020e34f5380c56c2dc42f56893e3d3931d590"
+  },
+  "timeline": {
+    "fps": "30000/1001",
+    "frame_duration": "1001/30000s",
+    "start": "01:00:00:00",
+    "tc_start_frames": 108000,
+    "total_frames": 1050,
+    "resolution": "1920x1080"
+  },
+  "exported": {
+    "segments": 4,
+    "outro": true,
+    "audio_only_clips": 1,
+    "transitions": 3,
+    "titles": 2,
+    "markers": 2,
+    "assets": 4
+  },
+  "media": [
+    {
+      "source": "camA",
+      "plan_media": "E:/Show/Late/A.mov",
+      "src": "file:///E:/Show/Late/A.mov",
+      "rule": "windows-path",
+      "windows_path": "E:/Show/Late/A.mov"
+    },
+    {
+      "source": "camB",
+      "plan_media": "E:/Show/Late/B.mov",
+      "src": "file:///E:/Show/Late/B.mov",
+      "rule": "windows-path",
+      "windows_path": "E:/Show/Late/B.mov"
+    },
+    {
+      "source": "broll",
+      "plan_media": "\\\\nas\\media\\late\\crowd.mov",
+      "src": "file://nas/media/late/crowd.mov",
+      "rule": "windows-path",
+      "windows_path": "\\\\nas\\media\\late\\crowd.mov"
+    },
+    {
+      "source": "outro",
+      "plan_media": "file:///E:/Show/Assets/Outro%202997.mov",
+      "src": "file:///E:/Show/Assets/Outro%202997.mov",
+      "rule": "file-url",
+      "windows_path": "E:/Show/Assets/Outro 2997.mov"
+    }
+  ],
+  "lanes": [
+    {
+      "lane": 2,
+      "carries": "titles and sting (V3)"
+    },
+    {
+      "lane": 1,
+      "carries": "V2 (connected clips) with their sound (A2 by position)"
+    },
+    {
+      "lane": 0,
+      "carries": "V1, the primary storyline, with its clips' sound (A1)"
+    },
+    {
+      "lane": -1,
+      "carries": "A2 (audio-only clips)"
+    }
+  ],
+  "audio_tracks": [
+    {
+      "track": "A1",
+      "name": "A1",
+      "lanes": [
+        0
+      ],
+      "clips": 3,
+      "gain_db": 0.0,
+      "mute": false,
+      "bus": null
+    },
+    {
+      "track": "A2",
+      "name": "A2",
+      "lanes": [
+        1,
+        -1
+      ],
+      "clips": 2,
+      "gain_db": -2.0,
+      "mute": false,
+      "bus": null
+    }
+  ],
+  "audio_crossfade": "transition",
+  "transitions": [
+    {
+      "location": "head",
+      "cut": 0,
+      "frames": 15,
+      "alignment": "right",
+      "video": true,
+      "audio": false,
+      "form": "transition"
+    },
+    {
+      "location": "transitions[0]",
+      "cut": 600,
+      "frames": 10,
+      "alignment": "center",
+      "video": false,
+      "audio": true,
+      "form": "transition"
+    },
+    {
+      "location": "outro.transition",
+      "cut": 900,
+      "frames": 20,
+      "alignment": "right",
+      "video": true,
+      "audio": false,
+      "form": "transition"
+    }
+  ],
+  "not_expressible": [
+    {
+      "feature": "title_template",
+      "location": "titles[0]",
+      "detail": "exported as a Basic Title with its text; Resolve does not map it to a Fusion template (lower-third)",
+      "action": "replace it with template 'CCN Lower Third'"
+    },
+    {
+      "feature": "title_template",
+      "location": "outro.sting",
+      "detail": "exported as a Basic Title with its text; Resolve does not map it to a Fusion template (sting)",
+      "action": "replace it with template 'CCN Sting'"
+    },
+    {
+      "feature": "marker_color",
+      "location": "markers[0].color",
+      "detail": "FCPXML markers have no colour (Green)",
+      "action": "set the marker colour to Green in Resolve"
+    },
+    {
+      "feature": "template",
+      "location": "template",
+      "detail": "FCPXML builds a new timeline; it does not start from template 'CCN Longform Template', so its tracks, buses, Fusion titles and settings are not carried",
+      "action": "import the timeline, then bring its clips into a branch of the template"
+    },
+    {
+      "feature": "input_color_space",
+      "location": "sources[1].color.input_color_space",
+      "detail": "input colour space 'Rec.709 Gamma 2.4' of source 'camB'",
+      "action": "set it in Resolve (never on BRAW media)"
+    },
+    {
+      "feature": "lut",
+      "location": "sources[1].color.lut",
+      "detail": "LUT 'Show 709' of source 'camB'",
+      "action": "apply it on the Color page"
+    },
+    {
+      "feature": "split_audio_crossfade",
+      "location": "transitions[0]",
+      "detail": "segments[2] needs split audio timing (audioStart/audioDuration) for a video-only transition on its other end; Final Cut Pro ignores an audio crossfade on such a clip (Resolve's import is unconfirmed)",
+      "action": "check this audio crossfade after import and re-add it if missing"
+    }
+  ],
+  "notes": [
+    {
+      "feature": "flip",
+      "location": "segments[3].transform",
+      "detail": "flips are written as a negative scale on that axis",
+      "action": "check the flip in Resolve's Inspector after import"
+    },
+    {
+      "feature": "audio_track_gain",
+      "location": "audio_tracks[1].gain_db",
+      "detail": "A2 gain -2 dB is folded into each clip's volume on that track (FCPXML has no track gain)",
+      "action": "none, or move it to the track fader in Resolve"
+    },
+    {
+      "feature": "audio_fade",
+      "location": "head.audio_fade_frames",
+      "detail": "12-frame fade-in on the first segment's volume",
+      "action": "none"
+    },
+    {
+      "feature": "audio_fade",
+      "location": "end_fade_frames",
+      "detail": "3-frame fade-out on the last clip's volume",
+      "action": "none"
+    },
+    {
+      "feature": "outro_sound",
+      "location": "outro.transition",
+      "detail": "the dissolve overlaps the last segment's picture into its tail; its sound still ends at the outro (audioStart/audioDuration)",
+      "action": "check it in Resolve"
+    },
+    {
+      "feature": "frame_size",
+      "location": "sources[3].frame_size",
+      "detail": "source 'outro' has no frame_size, so its clips get Resolve's default framing (fit: letterboxed if its aspect differs from the timeline's)",
+      "action": "set frame_size to frame it with fill"
+    },
+    {
+      "feature": "source_timecode",
+      "location": "sources",
+      "detail": "each asset starts at 0s, so source frames count from each file's first frame",
+      "action": "check that clips land on the planned frames after import"
+    }
+  ],
+  "lint_warnings": [
+    {
+      "rule": "timejump-close-to-wide",
+      "message": "Time jump between segments 1 and 2 goes wide to close; it should go to a wider shot."
+    }
+  ],
+  "self_check": {
+    "ok": true,
+    "problems": [],
+    "checked": {
+      "clips": 6,
+      "transitions": 3,
+      "titles": 2,
+      "markers": 2,
+      "assets": 4,
+      "crop_windows": 2
+    }
+  },
+  "file": "ccn_2997.transition.fcpxml"
+}

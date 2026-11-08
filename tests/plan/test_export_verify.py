@@ -9,12 +9,14 @@ from export_support import EXPORT_FIXTURES, GOLDEN_PLANS, ccn, load_plan
 from aar.plan.export import verify_plan_fcpxml
 from aar.plan.export.reader import MAX_BYTES, check_structure, read_fcpxml
 
-GOLDEN = (EXPORT_FIXTURES / "ccn_longform_v2.fcpxml").read_text(encoding="utf-8")
+# The transition-form golden: its audio-only crossfade is a spine transition element.
+GOLDEN = (EXPORT_FIXTURES / "ccn_longform_v2.transition.fcpxml").read_text(encoding="utf-8")
 PLAN = load_plan(GOLDEN_PLANS["ccn_longform_v2"])
+FORM = "transition"
 
 
 def _problems(text: str) -> list[str]:
-    result = verify_plan_fcpxml(text, PLAN, ccn())
+    result = verify_plan_fcpxml(text, PLAN, ccn(), audio_crossfade=FORM)
     assert not result.ok
     assert result.problems
     return result.problems
@@ -26,7 +28,7 @@ def _tamper(old: str, new: str) -> str:
 
 
 def test_the_golden_is_clean() -> None:
-    assert verify_plan_fcpxml(GOLDEN, PLAN, ccn()).problems == []
+    assert verify_plan_fcpxml(GOLDEN, PLAN, ccn(), audio_crossfade=FORM).problems == []
 
 
 @pytest.mark.parametrize(
@@ -175,6 +177,6 @@ def test_check_structure_on_the_golden_is_clean() -> None:
 
 def test_verify_against_another_plan_fails() -> None:
     other = load_plan(GOLDEN_PLANS["short_reframe"])
-    result = verify_plan_fcpxml(GOLDEN, other, ccn())
+    result = verify_plan_fcpxml(GOLDEN, other, ccn(), audio_crossfade=FORM)
     assert not result.ok
     assert any("segment 0" in p for p in result.problems)

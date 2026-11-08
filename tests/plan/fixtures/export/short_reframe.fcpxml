@@ -18,12 +18,13 @@
 template: FCPXML builds a new timeline; it does not start from template 'CCN Short Template', so its tracks, buses, Fusion titles and settings are not carried</note>
           <spine>
             <asset-clip ref="r2" offset="86486400/24000s" name="open on Jane" start="0s" duration="240240/24000s">
+              <adjust-conform type="fill" />
               <adjust-transform position="0 0" scale="1.2 1.2" rotation="0">
                 <param name="position">
                   <keyframeAnimation>
                     <keyframe time="0s" value="0 0" interp="linear" curve="linear" />
-                    <keyframe time="120120/24000s" value="-2.9531250000000027 0" interp="linear" curve="linear" />
-                    <keyframe time="239239/24000s" value="-6.187499999999999 -5.499999999999998" interp="linear" curve="linear" />
+                    <keyframe time="120120/24000s" value="-11.200000000000008 0" interp="linear" curve="linear" />
+                    <keyframe time="239239/24000s" value="-23.46666666666666 -6.599999999999999" interp="linear" curve="linear" />
                   </keyframeAnimation>
                 </param>
                 <param name="scale">
@@ -43,11 +44,12 @@ template: FCPXML builds a new timeline; it does not start from template 'CCN Sho
             </asset-clip>
             <asset-clip ref="r3" offset="86726640/24000s" name="B 001 (wide).braw" start="240240/24000s" duration="240240/24000s">
               <note>wide reframed to the speaker</note>
-              <adjust-transform position="7.312499999999998 0" scale="1.3 1.3" rotation="0">
+              <adjust-conform type="fill" />
+              <adjust-transform position="23.111111111111107 0" scale="1.3 1.3" rotation="0">
                 <param name="position">
                   <keyframeAnimation>
-                    <keyframe time="240240/24000s" value="7.312499999999998 0" interp="linear" curve="linear" />
-                    <keyframe time="479479/24000s" value="3.656249999999999 0" interp="linear" curve="linear" />
+                    <keyframe time="240240/24000s" value="23.111111111111107 0" interp="linear" curve="linear" />
+                    <keyframe time="479479/24000s" value="11.555555555555554 0" interp="linear" curve="linear" />
                   </keyframeAnimation>
                 </param>
                 <param name="scale">

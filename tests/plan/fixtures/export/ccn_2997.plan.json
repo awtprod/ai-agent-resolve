@@ -9,11 +9,12 @@
   "profile": "ccn",
   "sources": [
     {"id": "camA", "media": "E:/Show/Late/A.mov", "camera": "A", "recording_id": "rec1",
-     "shot_size": "close", "duration": 5000},
+     "shot_size": "close", "duration": 5000, "frame_size": [1920, 1080]},
     {"id": "camB", "media": "E:/Show/Late/B.mov", "camera": "B", "recording_id": "rec1",
-     "shot_size": "wide", "duration": 5000,
+     "shot_size": "wide", "duration": 5000, "frame_size": [1920, 1080],
      "color": {"input_color_space": "Rec.709 Gamma 2.4", "lut": "Show 709"}},
-    {"id": "broll", "media": "\\\\nas\\media\\late\\crowd.mov", "camera": "C", "duration": 600},
+    {"id": "broll", "media": "\\\\nas\\media\\late\\crowd.mov", "camera": "C", "duration": 600,
+     "frame_size": [3840, 2160]},
     {"id": "outro", "media": "file:///E:/Show/Assets/Outro%202997.mov", "camera": "X",
      "duration": 150}
   ],

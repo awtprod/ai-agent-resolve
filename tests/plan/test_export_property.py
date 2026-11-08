@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 import pytest
-from export_support import MEDIA_MAP, permissive, random_plan, reverify, structure_problems
+from export_support import (
+    MEDIA_MAP,
+    crossfade_form,
+    permissive,
+    random_plan,
+    reverify,
+    structure_problems,
+)
 
 from aar.plan.export import ExportError, export_fcpxml, media_map_from_mapping
 from aar.plan.export.reader import read_fcpxml
@@ -15,7 +22,12 @@ SEEDS = range(300)
 def _export(seed: int):
     data, start = random_plan(seed)
     plan = EditPlan.model_validate(data)
-    return plan, export_fcpxml(plan, permissive(start), media_map=media_map_from_mapping(MEDIA_MAP))
+    return plan, export_fcpxml(
+        plan,
+        permissive(start),
+        media_map=media_map_from_mapping(MEDIA_MAP),
+        audio_crossfade=crossfade_form(seed),  # type: ignore[arg-type]
+    )
 
 
 @pytest.mark.parametrize("seed", SEEDS)
@@ -86,6 +98,9 @@ def test_the_generator_reaches_every_feature() -> None:
         seen |= {f"rule:{m.rule}" for m in layout.media.values()}
         seen |= {"gap" for e in read_fcpxml(result.fcpxml).spine if e.kind == "gap"}
         seen |= {"split-audio" for c in layout.clips if "audioStart" in result.fcpxml}
+        seen |= {f"form:{t.form}" for t in layout.transitions if not t.video}
+        seen |= {"conform" for c in layout.clips if c.conform}
+        seen |= {"conform-unmoved" for c in layout.clips if c.conform and c.transform is None}
     want = {
         "align:center",
         "align:right",
@@ -105,5 +120,9 @@ def test_the_generator_reaches_every_feature() -> None:
         "rule:media-map",
         "gap",
         "split-audio",
+        "form:split",
+        "form:transition",
+        "conform",
+        "conform-unmoved",
     }
     assert want <= seen, want - seen

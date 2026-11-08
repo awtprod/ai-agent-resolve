@@ -1,0 +1,215 @@
+{
+ "version": 2,
+ "project": "CCN",
+ "timeline": "Baking Resistance Ep1",
+ "template": "CCN Longform Template",
+ "kind": "longform",
+ "fps": {
+  "num": 24000,
+  "den": 1001
+ },
+ "resolution": {
+  "width": 1920,
+  "height": 1080
+ },
+ "profile": "ccn",
+ "sources": [
+  {
+   "id": "camA",
+   "media": "E:/CCN/Ep1/A001.braw",
+   "camera": "A",
+   "recording_id": "rec1",
+   "recording_origin": 0,
+   "shot_size": "medium",
+   "color": {
+    "cdl": {
+     "slope": [
+      1.05,
+      1.0,
+      0.95
+     ],
+     "offset": [
+      0.0,
+      0.0,
+      0.01
+     ],
+     "power": [
+      1.0,
+      1.0,
+      1.0
+     ],
+     "saturation": 1.1
+    },
+    "lut": "CCN Show LUT"
+   },
+   "duration": 1000,
+   "frame_size": [
+    3840,
+    2160
+   ]
+  },
+  {
+   "id": "camB",
+   "media": "E:/CCN/Ep1/B001.braw",
+   "camera": "B",
+   "recording_id": "rec1",
+   "recording_origin": 0,
+   "shot_size": "wide",
+   "duration": 1000,
+   "frame_size": [
+    3840,
+    2160
+   ]
+  },
+  {
+   "id": "camA2",
+   "media": "E:/CCN/Ep1/A002.mov",
+   "camera": "A2",
+   "recording_id": "rec2",
+   "recording_origin": 0,
+   "shot_size": "close",
+   "duration": 1000,
+   "frame_size": [
+    3840,
+    2160
+   ]
+  },
+  {
+   "id": "outroclip",
+   "media": "E:/CCN/Assets/Outro.mov",
+   "camera": "X",
+   "duration": 120,
+   "frame_size": [
+    1920,
+    1080
+   ]
+  }
+ ],
+ "segments": [
+  {
+   "track": 1,
+   "source": "camA",
+   "src_in": 0,
+   "src_out": 72,
+   "transform": {
+    "zoom": 1.1,
+    "pan": 0.0
+   }
+  },
+  {
+   "track": 1,
+   "source": "camB",
+   "src_in": 72,
+   "src_out": 144
+  },
+  {
+   "track": 1,
+   "source": "camA",
+   "src_in": 144,
+   "src_out": 216,
+   "gain_db": -2.0
+  },
+  {
+   "track": 1,
+   "source": "camA2",
+   "src_in": 30,
+   "src_out": 120
+  }
+ ],
+ "transitions": [
+  {
+   "after": 2,
+   "video": "cut",
+   "video_frames": 0,
+   "audio": {
+    "type": "Cross Fade 0 dB",
+    "frames": 12
+   }
+  }
+ ],
+ "titles": [
+  {
+   "kind": "lower-third",
+   "lines": [
+    "Jane Doe",
+    "Head Judge"
+   ],
+   "record_in": 48,
+   "record_out": 120,
+   "template": "CCN Lower Third"
+  }
+ ],
+ "markers": [
+  {
+   "record": 0,
+   "name": "Act 1",
+   "color": "Green"
+  },
+  {
+   "record": 144,
+   "name": "Act 2",
+   "color": "Blue"
+  }
+ ],
+ "audio_tracks": [
+  {
+   "name": "A1",
+   "gain_db": 0.0,
+   "mute": true,
+   "bus": "A5"
+  },
+  {
+   "name": "A2",
+   "gain_db": 0.0,
+   "mute": true,
+   "bus": "A5"
+  },
+  {
+   "name": "A3",
+   "gain_db": 0.0,
+   "mute": true,
+   "bus": "A5"
+  },
+  {
+   "name": "A4",
+   "gain_db": 0.0,
+   "mute": true,
+   "bus": "A5"
+  },
+  {
+   "name": "A5",
+   "gain_db": -1.0,
+   "mute": false
+  },
+  {
+   "name": "A6",
+   "gain_db": 0.0,
+   "mute": false
+  }
+ ],
+ "head": {
+  "video": "dissolve",
+  "video_frames": 15,
+  "audio_fade_frames": 24
+ },
+ "outro": {
+  "source": "outroclip",
+  "src_in": 0,
+  "src_out": 120,
+  "track": 1,
+  "audio_track": "A5",
+  "transition": {
+   "video": "dissolve",
+   "video_frames": 15
+  },
+  "sting": {
+   "lines": [
+    "Baking Resistance"
+   ],
+   "start": 6,
+   "frames": 48,
+   "template": "CCN Sting"
+  }
+ },
+ "end_fade_frames": 2
+}

@@ -1,0 +1,317 @@
+{
+  "format": "fcpxml",
+  "fcpxml_version": "1.10",
+  "fcpxml_sha256": "5ac0bddd5aa7b41f93caacf2fec84954595b7964e98c6e54ec96ad4e48a0e5d7",
+  "plan": {
+    "project": "CCN",
+    "timeline": "Baking Resistance Ep1",
+    "sha256": "b76261081795a5a048082e774d187142fad1e7b6f52c39972de718bdf939d8a0"
+  },
+  "timeline": {
+    "fps": "24000/1001",
+    "frame_duration": "1001/24000s",
+    "start": "01:00:00:00",
+    "tc_start_frames": 86400,
+    "total_frames": 426,
+    "resolution": "1920x1080"
+  },
+  "exported": {
+    "segments": 4,
+    "outro": true,
+    "audio_only_clips": 1,
+    "transitions": 3,
+    "titles": 2,
+    "markers": 2,
+    "assets": 4
+  },
+  "media": [
+    {
+      "source": "camA",
+      "plan_media": "E:/CCN/Ep1/A001.braw",
+      "src": "file:///E:/CCN/Ep1/A001.braw",
+      "rule": "windows-path",
+      "windows_path": "E:/CCN/Ep1/A001.braw"
+    },
+    {
+      "source": "camB",
+      "plan_media": "E:/CCN/Ep1/B001.braw",
+      "src": "file:///E:/CCN/Ep1/B001.braw",
+      "rule": "windows-path",
+      "windows_path": "E:/CCN/Ep1/B001.braw"
+    },
+    {
+      "source": "camA2",
+      "plan_media": "E:/CCN/Ep1/A002.mov",
+      "src": "file:///E:/CCN/Ep1/A002.mov",
+      "rule": "windows-path",
+      "windows_path": "E:/CCN/Ep1/A002.mov"
+    },
+    {
+      "source": "outroclip",
+      "plan_media": "E:/CCN/Assets/Outro.mov",
+      "src": "file:///E:/CCN/Assets/Outro.mov",
+      "rule": "windows-path",
+      "windows_path": "E:/CCN/Assets/Outro.mov"
+    }
+  ],
+  "lanes": [
+    {
+      "lane": 1,
+      "carries": "titles and sting (V2)"
+    },
+    {
+      "lane": 0,
+      "carries": "V1, the primary storyline, with its clips' sound (A1)"
+    },
+    {
+      "lane": -4,
+      "carries": "A5 (audio-only clips)"
+    }
+  ],
+  "audio_tracks": [
+    {
+      "track": "A1",
+      "name": "A1",
+      "lanes": [
+        0
+      ],
+      "clips": 4,
+      "gain_db": 0.0,
+      "mute": true,
+      "bus": "A5"
+    },
+    {
+      "track": "A5",
+      "name": "A5",
+      "lanes": [
+        -4
+      ],
+      "clips": 1,
+      "gain_db": -1.0,
+      "mute": false,
+      "bus": null
+    }
+  ],
+  "audio_crossfade": "transition",
+  "transitions": [
+    {
+      "location": "head",
+      "cut": 0,
+      "frames": 15,
+      "alignment": "right",
+      "video": true,
+      "audio": false,
+      "form": "transition"
+    },
+    {
+      "location": "transitions[0]",
+      "cut": 216,
+      "frames": 12,
+      "alignment": "center",
+      "video": false,
+      "audio": true,
+      "form": "transition"
+    },
+    {
+      "location": "outro.transition",
+      "cut": 306,
+      "frames": 15,
+      "alignment": "right",
+      "video": true,
+      "audio": false,
+      "form": "transition"
+    }
+  ],
+  "not_expressible": [
+    {
+      "feature": "title_template",
+      "location": "titles[0]",
+      "detail": "exported as a Basic Title with its text; Resolve does not map it to a Fusion template (lower-third)",
+      "action": "replace it with template 'CCN Lower Third'"
+    },
+    {
+      "feature": "title_template",
+      "location": "outro.sting",
+      "detail": "exported as a Basic Title with its text; Resolve does not map it to a Fusion template (sting)",
+      "action": "replace it with template 'CCN Sting'"
+    },
+    {
+      "feature": "marker_color",
+      "location": "markers[0].color",
+      "detail": "FCPXML markers have no colour (Green)",
+      "action": "set the marker colour to Green in Resolve"
+    },
+    {
+      "feature": "marker_color",
+      "location": "markers[1].color",
+      "detail": "FCPXML markers have no colour (Blue)",
+      "action": "set the marker colour to Blue in Resolve"
+    },
+    {
+      "feature": "template",
+      "location": "template",
+      "detail": "FCPXML builds a new timeline; it does not start from template 'CCN Longform Template', so its tracks, buses, Fusion titles and settings are not carried",
+      "action": "import the timeline, then bring its clips into a branch of the template"
+    },
+    {
+      "feature": "audio_mute",
+      "location": "audio_tracks[0].mute",
+      "detail": "A1 'A1' is muted in the plan; exported audible (the CCN topology feeds the bus from muted tracks, so sound is never dropped)",
+      "action": "mute 'A1' in Resolve's Fairlight page if it must be silent"
+    },
+    {
+      "feature": "audio_bus",
+      "location": "audio_tracks[0].bus",
+      "detail": "A1 'A1' feeds bus 'A5'; FCPXML has no buses or Fairlight routing",
+      "action": "route 'A1' to 'A5' in Fairlight"
+    },
+    {
+      "feature": "bus_gain",
+      "location": "audio_tracks[0].bus",
+      "detail": "bus 'A5''s gain -1 dB is applied only to clips placed on 'A5', not to A1 'A1''s clips that feed it (FCPXML has no buses)",
+      "action": "set the gain on 'A5' in Fairlight once the routing is in place"
+    },
+    {
+      "feature": "audio_mute",
+      "location": "audio_tracks[1].mute",
+      "detail": "A2 'A2' is muted in the plan; exported audible (the CCN topology feeds the bus from muted tracks, so sound is never dropped)",
+      "action": "mute 'A2' in Resolve's Fairlight page if it must be silent"
+    },
+    {
+      "feature": "audio_bus",
+      "location": "audio_tracks[1].bus",
+      "detail": "A2 'A2' feeds bus 'A5'; FCPXML has no buses or Fairlight routing",
+      "action": "route 'A2' to 'A5' in Fairlight"
+    },
+    {
+      "feature": "bus_gain",
+      "location": "audio_tracks[1].bus",
+      "detail": "bus 'A5''s gain -1 dB is applied only to clips placed on 'A5', not to A2 'A2''s clips that feed it (FCPXML has no buses)",
+      "action": "set the gain on 'A5' in Fairlight once the routing is in place"
+    },
+    {
+      "feature": "audio_track_empty",
+      "location": "audio_tracks[1]",
+      "detail": "no clip sits on A2 'A2'; FCPXML cannot declare an empty track",
+      "action": "add the track in Resolve after import if it is needed"
+    },
+    {
+      "feature": "audio_mute",
+      "location": "audio_tracks[2].mute",
+      "detail": "A3 'A3' is muted in the plan; exported audible (the CCN topology feeds the bus from muted tracks, so sound is never dropped)",
+      "action": "mute 'A3' in Resolve's Fairlight page if it must be silent"
+    },
+    {
+      "feature": "audio_bus",
+      "location": "audio_tracks[2].bus",
+      "detail": "A3 'A3' feeds bus 'A5'; FCPXML has no buses or Fairlight routing",
+      "action": "route 'A3' to 'A5' in Fairlight"
+    },
+    {
+      "feature": "bus_gain",
+      "location": "audio_tracks[2].bus",
+      "detail": "bus 'A5''s gain -1 dB is applied only to clips placed on 'A5', not to A3 'A3''s clips that feed it (FCPXML has no buses)",
+      "action": "set the gain on 'A5' in Fairlight once the routing is in place"
+    },
+    {
+      "feature": "audio_track_empty",
+      "location": "audio_tracks[2]",
+      "detail": "no clip sits on A3 'A3'; FCPXML cannot declare an empty track",
+      "action": "add the track in Resolve after import if it is needed"
+    },
+    {
+      "feature": "audio_mute",
+      "location": "audio_tracks[3].mute",
+      "detail": "A4 'A4' is muted in the plan; exported audible (the CCN topology feeds the bus from muted tracks, so sound is never dropped)",
+      "action": "mute 'A4' in Resolve's Fairlight page if it must be silent"
+    },
+    {
+      "feature": "audio_bus",
+      "location": "audio_tracks[3].bus",
+      "detail": "A4 'A4' feeds bus 'A5'; FCPXML has no buses or Fairlight routing",
+      "action": "route 'A4' to 'A5' in Fairlight"
+    },
+    {
+      "feature": "bus_gain",
+      "location": "audio_tracks[3].bus",
+      "detail": "bus 'A5''s gain -1 dB is applied only to clips placed on 'A5', not to A4 'A4''s clips that feed it (FCPXML has no buses)",
+      "action": "set the gain on 'A5' in Fairlight once the routing is in place"
+    },
+    {
+      "feature": "audio_track_empty",
+      "location": "audio_tracks[3]",
+      "detail": "no clip sits on A4 'A4'; FCPXML cannot declare an empty track",
+      "action": "add the track in Resolve after import if it is needed"
+    },
+    {
+      "feature": "audio_track_empty",
+      "location": "audio_tracks[5]",
+      "detail": "no clip sits on A6 'A6'; FCPXML cannot declare an empty track",
+      "action": "add the track in Resolve after import if it is needed"
+    },
+    {
+      "feature": "cdl",
+      "location": "sources[0].color.cdl",
+      "detail": "CDL of source 'camA': slope [1.05, 1.0, 0.95], offset [0.0, 0.0, 0.01], power [1.0, 1.0, 1.0], saturation 1.1",
+      "action": "apply it on the Color page"
+    },
+    {
+      "feature": "lut",
+      "location": "sources[0].color.lut",
+      "detail": "LUT 'CCN Show LUT' of source 'camA'",
+      "action": "apply it on the Color page"
+    },
+    {
+      "feature": "split_audio_crossfade",
+      "location": "transitions[0]",
+      "detail": "segments[3] needs split audio timing (audioStart/audioDuration) for a video-only transition on its other end; Final Cut Pro ignores an audio crossfade on such a clip (Resolve's import is unconfirmed)",
+      "action": "check this audio crossfade after import and re-add it if missing"
+    }
+  ],
+  "notes": [
+    {
+      "feature": "audio_track_gain",
+      "location": "audio_tracks[4].gain_db",
+      "detail": "A5 gain -1 dB is folded into each clip's volume on that track (FCPXML has no track gain)",
+      "action": "none, or move it to the track fader in Resolve"
+    },
+    {
+      "feature": "audio_fade",
+      "location": "head.audio_fade_frames",
+      "detail": "24-frame fade-in on the first segment's volume",
+      "action": "none"
+    },
+    {
+      "feature": "audio_fade",
+      "location": "end_fade_frames",
+      "detail": "2-frame fade-out on the last clip's volume",
+      "action": "none"
+    },
+    {
+      "feature": "outro_sound",
+      "location": "outro.transition",
+      "detail": "the dissolve overlaps the last segment's picture into its tail; its sound still ends at the outro (audioStart/audioDuration)",
+      "action": "check it in Resolve"
+    },
+    {
+      "feature": "source_timecode",
+      "location": "sources",
+      "detail": "each asset starts at 0s, so source frames count from each file's first frame",
+      "action": "check that clips land on the planned frames after import"
+    }
+  ],
+  "lint_warnings": [],
+  "self_check": {
+    "ok": true,
+    "problems": [],
+    "checked": {
+      "clips": 6,
+      "transitions": 3,
+      "titles": 2,
+      "markers": 2,
+      "assets": 4,
+      "crop_windows": 1
+    }
+  },
+  "file": "ccn_longform_v2.transition.fcpxml"
+}

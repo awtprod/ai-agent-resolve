@@ -4,18 +4,17 @@
   <resources>
     <format id="r1" name="FFVideoFormat1080p2398" frameDuration="1001/24000s" width="1920" height="1080" colorSpace="1-1-1 (Rec. 709)" />
     <effect id="r2" name="Cross Dissolve" uid="FxPlug:4731E73A-8DAC-4113-9A30-AE85B1761265" />
-    <effect id="r3" name="Audio Crossfade" uid="FFAudioTransition" />
-    <effect id="r4" name="Basic Title" uid=".../Titles.localized/Bumper:Opener.localized/Basic Title.localized/Basic Title.moti" />
-    <asset id="r5" name="A001.braw" start="0s" duration="1001000/24000s" hasVideo="1" hasAudio="1">
+    <effect id="r3" name="Basic Title" uid=".../Titles.localized/Bumper:Opener.localized/Basic Title.localized/Basic Title.moti" />
+    <asset id="r4" name="A001.braw" start="0s" duration="1001000/24000s" hasVideo="1" hasAudio="1">
       <media-rep kind="original-media" src="file:///E:/CCN/Ep1/A001.braw" />
     </asset>
-    <asset id="r6" name="B001.braw" start="0s" duration="1001000/24000s" hasVideo="1" hasAudio="1">
+    <asset id="r5" name="B001.braw" start="0s" duration="1001000/24000s" hasVideo="1" hasAudio="1">
       <media-rep kind="original-media" src="file:///E:/CCN/Ep1/B001.braw" />
     </asset>
-    <asset id="r7" name="A002.mov" start="0s" duration="1001000/24000s" hasVideo="1" hasAudio="1">
+    <asset id="r6" name="A002.mov" start="0s" duration="1001000/24000s" hasVideo="1" hasAudio="1">
       <media-rep kind="original-media" src="file:///E:/CCN/Ep1/A002.mov" />
     </asset>
-    <asset id="r8" name="Outro.mov" start="0s" duration="120120/24000s" hasVideo="1" hasAudio="1">
+    <asset id="r7" name="Outro.mov" start="0s" duration="120120/24000s" hasVideo="1" hasAudio="1">
       <media-rep kind="original-media" src="file:///E:/CCN/Assets/Outro.mov" />
     </asset>
   </resources>
@@ -37,14 +36,15 @@ audio_tracks[3].bus: A4 'A4' feeds bus 'A5'; FCPXML has no buses or Fairlight ro
             <transition name="Cross Dissolve" offset="86486400/24000s" duration="15015/24000s">
               <filter-video ref="r2" name="Cross Dissolve" />
             </transition>
-            <asset-clip ref="r5" offset="86486400/24000s" name="A001.braw" start="0s" duration="72072/24000s">
+            <asset-clip ref="r4" offset="86486400/24000s" name="A001.braw" start="0s" duration="72072/24000s">
+              <adjust-conform type="fill" />
               <adjust-transform position="0 0" scale="1.1 1.1" rotation="0" />
               <adjust-volume>
                 <param name="amount">
                   <fadeIn type="linear" duration="24024/24000s" />
                 </param>
               </adjust-volume>
-              <title ref="r4" lane="1" offset="48048/24000s" name="Jane Doe / Head Judge" duration="72072/24000s">
+              <title ref="r3" lane="1" offset="48048/24000s" name="Jane Doe / Head Judge" duration="72072/24000s">
                 <text><text-style ref="ts1">Jane Doe
 Head Judge</text-style></text>
                 <text-style-def id="ts1">
@@ -53,27 +53,34 @@ Head Judge</text-style></text>
               </title>
               <marker start="0s" duration="1001/24000s" value="Act 1" />
             </asset-clip>
-            <asset-clip ref="r6" offset="86558472/24000s" name="B001.braw" start="72072/24000s" duration="72072/24000s" />
-            <asset-clip ref="r5" offset="86630544/24000s" name="A001.braw" start="144144/24000s" duration="78078/24000s">
-              <adjust-volume amount="-2dB" />
+            <asset-clip ref="r5" offset="86558472/24000s" name="B001.braw" start="72072/24000s" duration="72072/24000s" />
+            <asset-clip ref="r4" offset="86630544/24000s" name="A001.braw" start="144144/24000s" duration="72072/24000s" audioStart="144144/24000s" audioDuration="78078/24000s">
+              <adjust-volume amount="-2dB">
+                <param name="amount">
+                  <fadeOut type="linear" duration="12012/24000s" />
+                </param>
+              </adjust-volume>
               <marker start="144144/24000s" duration="1001/24000s" value="Act 2" />
             </asset-clip>
-            <transition name="Audio Crossfade" offset="86696610/24000s" duration="12012/24000s">
-              <filter-audio ref="r3" name="Audio Crossfade" />
-            </transition>
-            <asset-clip ref="r7" offset="86696610/24000s" name="A002.mov" start="24024/24000s" duration="111111/24000s" audioStart="24024/24000s" audioDuration="96096/24000s" />
+            <asset-clip ref="r6" offset="86702616/24000s" name="A002.mov" start="30030/24000s" duration="105105/24000s" audioStart="24024/24000s" audioDuration="96096/24000s">
+              <adjust-volume>
+                <param name="amount">
+                  <fadeIn type="linear" duration="12012/24000s" />
+                </param>
+              </adjust-volume>
+            </asset-clip>
             <transition name="Cross Dissolve" offset="86792706/24000s" duration="15015/24000s">
               <filter-video ref="r2" name="Cross Dissolve" />
             </transition>
-            <asset-clip ref="r8" offset="86792706/24000s" name="Outro.mov" start="0s" duration="120120/24000s" srcEnable="video">
-              <asset-clip ref="r8" lane="-4" offset="0s" name="Outro.mov" start="0s" duration="120120/24000s" srcEnable="audio">
+            <asset-clip ref="r7" offset="86792706/24000s" name="Outro.mov" start="0s" duration="120120/24000s" srcEnable="video">
+              <asset-clip ref="r7" lane="-4" offset="0s" name="Outro.mov" start="0s" duration="120120/24000s" srcEnable="audio">
                 <adjust-volume amount="-1dB">
                   <param name="amount">
                     <fadeOut type="linear" duration="2002/24000s" />
                   </param>
                 </adjust-volume>
               </asset-clip>
-              <title ref="r4" lane="1" offset="6006/24000s" name="Baking Resistance" duration="48048/24000s">
+              <title ref="r3" lane="1" offset="6006/24000s" name="Baking Resistance" duration="48048/24000s">
                 <text><text-style ref="ts2">Baking Resistance</text-style></text>
                 <text-style-def id="ts2">
                   <text-style font="Helvetica" fontSize="60" fontColor="1 1 1 1" alignment="center" />

@@ -1,11 +1,11 @@
 {
   "format": "fcpxml",
   "fcpxml_version": "1.10",
-  "fcpxml_sha256": "5992e383ba4399ec86dea9c45e0537bd54b294f57f3c369bd499e2c596ec2da6",
+  "fcpxml_sha256": "684309b26eb65ca4038db3e53a3f15e4fa413d3f05db674024d897e09d532ed2",
   "plan": {
     "project": "CCN",
     "timeline": "Ep1 Short 02 (reframe)",
-    "sha256": "65897b0cdb7814f80ed8ba5e1d576cf5ff18d206f1f397f8876528dc45dbcc7f"
+    "sha256": "3dee382431ded943aa27f37767a42b63fa2999d1e8174b5df1fd2d8a5e822755"
   },
   "timeline": {
     "fps": "24000/1001",
@@ -46,6 +46,20 @@
       "carries": "V1, the primary storyline, with its clips' sound (A1)"
     }
   ],
+  "audio_tracks": [
+    {
+      "track": "A1",
+      "name": "A1",
+      "lanes": [
+        0
+      ],
+      "clips": 2,
+      "gain_db": 0.0,
+      "mute": false,
+      "bus": null
+    }
+  ],
+  "audio_crossfade": "split",
   "transitions": [],
   "not_expressible": [
     {
@@ -76,7 +90,7 @@
       "feature": "audio_track_empty",
       "location": "audio_tracks[1]",
       "detail": "no clip sits on A2 'A2'; FCPXML cannot declare an empty track",
-      "action": "the template provides it"
+      "action": "add the track in Resolve after import if it is needed"
     },
     {
       "feature": "captions",
@@ -120,7 +134,8 @@
       "transitions": 0,
       "titles": 0,
       "markers": 1,
-      "assets": 2
+      "assets": 2,
+      "crop_windows": 5
     }
   },
   "file": "short_reframe.fcpxml"

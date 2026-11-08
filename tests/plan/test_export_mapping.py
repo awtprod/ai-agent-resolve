@@ -19,6 +19,8 @@ from aar.plan.profile import ProfileError, parse_profile
 
 
 def _plan(**kwargs: Any) -> EditPlan:
+    # The default source has a size, so its clips may move (reframe/transform need one).
+    kwargs.setdefault("sources", [source(frame_size=[1920, 1080])])
     return EditPlan.model_validate(plan_data(**kwargs))
 
 
@@ -55,6 +57,7 @@ def test_export_codes_are_stable() -> None:
             "unknown_source",
             "zero_length_segment",
             "media_not_on_edit_pc",
+            "source_size_required",
             "pool_source_not_exportable",
             "bad_media_map",
             "outro_audio_track_missing",
@@ -279,7 +282,7 @@ def test_non_dissolve_video_is_a_dissolve_placeholder() -> None:
 
 
 def test_audio_only_crossfade_has_no_video_filter() -> None:
-    spine = _spine(_xml(_join(1000, 100, 8, video=False)))
+    spine = _spine(_xml(_join(1000, 100, 8, video=False), audio_crossfade="transition"))
     assert spine[1].get("name") == "Audio Crossfade"
     assert [c.tag for c in spine[1]] == ["filter-audio"]
 
@@ -341,7 +344,10 @@ def _segment(**kwargs: Any) -> Segment:
 
 def test_static_transform_units() -> None:
     spec = transform_spec(
-        _segment(transform={"zoom": 2.0, "pan": 108, "tilt": -54, "flip_v": True}), 1920, 1080
+        _segment(transform={"zoom": 2.0, "pan": 108, "tilt": -54, "flip_v": True}),
+        (1920, 1080),
+        1920,
+        1080,
     )
     assert spec.position == (10.0, -5.0)  # percent of the 1080 frame height, y up
     assert spec.scale == (2.0, -2.0)
@@ -350,14 +356,39 @@ def test_static_transform_units() -> None:
 
 def test_reframe_window_maths() -> None:
     keys = [{"time": 0, "x": 0.25, "y": 0.5, "zoom": 2.0}, {"time": 24, "x": 0.5, "zoom": 2.0}]
-    spec = transform_spec(_segment(reframe=keys, transform={"zoom": 1.5}), 1920, 1080)
+    spec = transform_spec(_segment(reframe=keys, transform={"zoom": 1.5}), (1920, 1080), 1920, 1080)
     first, second = spec.keyframes
-    # x 0.25 puts the frame centre 480 px left of the picture centre; zoom 2 doubles it.
-    assert math.isclose(first.position[0], 2 * 480 / 1080 * 100)
+    # Same aspect, so fill is 1:1. x 0.25 is 480 px left of centre; the total zoom 2 * 1.5 = 3
+    # scales that offset, and moving the window left moves the picture right.
+    assert math.isclose(first.position[0], 3 * 480 / 1080 * 100)
     assert first.position[1] == 0.0
     assert first.scale == second.scale == (3.0, 3.0)
     assert second.position == (0.0, 0.0)
     assert (first.time, second.time) == (0, 24)
+
+
+@pytest.mark.parametrize(
+    ("frame_size", "timeline", "key", "position"),
+    [
+        # A 16:9 source on a 9:16 short fills to 3413.33 x 1920; x 0.25 is 853.33 px left.
+        ((1920, 1080), (1080, 1920), {"x": 0.25}, (0.25 * 1920 * (1920 / 1080) / 1920 * 100, 0.0)),
+        # A face track's sampled size has the same aspect, so the same crop.
+        ((640, 360), (1080, 1920), {"x": 0.25}, (0.25 * 1920 * (1920 / 1080) / 1920 * 100, 0.0)),
+        # A 9:16 source on a 16:9 timeline fills to 1920 x 3413.33; y 0.25 is 853.33 px up.
+        ((1080, 1920), (1920, 1080), {"y": 0.25}, (0.0, -0.25 * 1920 * (1920 / 1080) / 1080 * 100)),
+        # A 4:3 source on 16:9 fills to 1920 x 1440 (the height is cropped), x 1.0 = 960 px right.
+        ((1440, 1080), (1920, 1080), {"x": 1.0}, (-960 / 1080 * 100, 0.0)),
+    ],
+)
+def test_reframe_is_in_source_units_after_fill(
+    frame_size: tuple[int, int],
+    timeline: tuple[int, int],
+    key: dict[str, float],
+    position: tuple[float, float],
+) -> None:
+    spec = transform_spec(_segment(reframe=[{"time": 0, **key}]), frame_size, *timeline)
+    assert spec.position == pytest.approx(position, abs=1e-9)
+    assert spec.scale == (1.0, 1.0)
 
 
 def test_keyframes_are_clip_local_and_a_single_key_is_static() -> None:

@@ -1,11 +1,11 @@
 {
   "format": "fcpxml",
   "fcpxml_version": "1.10",
-  "fcpxml_sha256": "481d2f6ec0d1d976d5127203606b9a0c96cb0bffda9ce13b7d8e7a7cce1daad4",
+  "fcpxml_sha256": "6a90d49fcefa81f1e2113f624b17d2d2522dd4e46389deec5a7ce75b31f5eabb",
   "plan": {
     "project": "CCN",
     "timeline": "Baking Resistance Ep1",
-    "sha256": "4d9b216c831df0e927b5ea1a3fe4021670bc98417bf17c183b3bc13ff61a6f39"
+    "sha256": "b76261081795a5a048082e774d187142fad1e7b6f52c39972de718bdf939d8a0"
   },
   "timeline": {
     "fps": "24000/1001",
@@ -68,6 +68,31 @@
       "carries": "A5 (audio-only clips)"
     }
   ],
+  "audio_tracks": [
+    {
+      "track": "A1",
+      "name": "A1",
+      "lanes": [
+        0
+      ],
+      "clips": 4,
+      "gain_db": 0.0,
+      "mute": true,
+      "bus": "A5"
+    },
+    {
+      "track": "A5",
+      "name": "A5",
+      "lanes": [
+        -4
+      ],
+      "clips": 1,
+      "gain_db": -1.0,
+      "mute": false,
+      "bus": null
+    }
+  ],
+  "audio_crossfade": "split",
   "transitions": [
     {
       "location": "head",
@@ -75,7 +100,8 @@
       "frames": 15,
       "alignment": "right",
       "video": true,
-      "audio": false
+      "audio": false,
+      "form": "transition"
     },
     {
       "location": "transitions[0]",
@@ -83,7 +109,8 @@
       "frames": 12,
       "alignment": "center",
       "video": false,
-      "audio": true
+      "audio": true,
+      "form": "split"
     },
     {
       "location": "outro.transition",
@@ -91,7 +118,8 @@
       "frames": 15,
       "alignment": "right",
       "video": true,
-      "audio": false
+      "audio": false,
+      "form": "transition"
     }
   ],
   "not_expressible": [
@@ -138,6 +166,12 @@
       "action": "route 'A1' to 'A5' in Fairlight"
     },
     {
+      "feature": "bus_gain",
+      "location": "audio_tracks[0].bus",
+      "detail": "bus 'A5''s gain -1 dB is applied only to clips placed on 'A5', not to A1 'A1''s clips that feed it (FCPXML has no buses)",
+      "action": "set the gain on 'A5' in Fairlight once the routing is in place"
+    },
+    {
       "feature": "audio_mute",
       "location": "audio_tracks[1].mute",
       "detail": "A2 'A2' is muted in the plan; exported audible (the CCN topology feeds the bus from muted tracks, so sound is never dropped)",
@@ -150,10 +184,16 @@
       "action": "route 'A2' to 'A5' in Fairlight"
     },
     {
+      "feature": "bus_gain",
+      "location": "audio_tracks[1].bus",
+      "detail": "bus 'A5''s gain -1 dB is applied only to clips placed on 'A5', not to A2 'A2''s clips that feed it (FCPXML has no buses)",
+      "action": "set the gain on 'A5' in Fairlight once the routing is in place"
+    },
+    {
       "feature": "audio_track_empty",
       "location": "audio_tracks[1]",
       "detail": "no clip sits on A2 'A2'; FCPXML cannot declare an empty track",
-      "action": "the template provides it"
+      "action": "add the track in Resolve after import if it is needed"
     },
     {
       "feature": "audio_mute",
@@ -168,10 +208,16 @@
       "action": "route 'A3' to 'A5' in Fairlight"
     },
     {
+      "feature": "bus_gain",
+      "location": "audio_tracks[2].bus",
+      "detail": "bus 'A5''s gain -1 dB is applied only to clips placed on 'A5', not to A3 'A3''s clips that feed it (FCPXML has no buses)",
+      "action": "set the gain on 'A5' in Fairlight once the routing is in place"
+    },
+    {
       "feature": "audio_track_empty",
       "location": "audio_tracks[2]",
       "detail": "no clip sits on A3 'A3'; FCPXML cannot declare an empty track",
-      "action": "the template provides it"
+      "action": "add the track in Resolve after import if it is needed"
     },
     {
       "feature": "audio_mute",
@@ -186,16 +232,22 @@
       "action": "route 'A4' to 'A5' in Fairlight"
     },
     {
+      "feature": "bus_gain",
+      "location": "audio_tracks[3].bus",
+      "detail": "bus 'A5''s gain -1 dB is applied only to clips placed on 'A5', not to A4 'A4''s clips that feed it (FCPXML has no buses)",
+      "action": "set the gain on 'A5' in Fairlight once the routing is in place"
+    },
+    {
       "feature": "audio_track_empty",
       "location": "audio_tracks[3]",
       "detail": "no clip sits on A4 'A4'; FCPXML cannot declare an empty track",
-      "action": "the template provides it"
+      "action": "add the track in Resolve after import if it is needed"
     },
     {
       "feature": "audio_track_empty",
       "location": "audio_tracks[5]",
       "detail": "no clip sits on A6 'A6'; FCPXML cannot declare an empty track",
-      "action": "the template provides it"
+      "action": "add the track in Resolve after import if it is needed"
     },
     {
       "feature": "cdl",
@@ -208,12 +260,6 @@
       "location": "sources[0].color.lut",
       "detail": "LUT 'CCN Show LUT' of source 'camA'",
       "action": "apply it on the Color page"
-    },
-    {
-      "feature": "split_audio_crossfade",
-      "location": "transitions[0]",
-      "detail": "segments[3] needs split audio timing (audioStart/audioDuration) for a video-only transition on its other end; Final Cut Pro ignores an audio crossfade on such a clip (Resolve's import is unconfirmed)",
-      "action": "check this audio crossfade after import and re-add it if missing"
     }
   ],
   "notes": [
@@ -242,6 +288,12 @@
       "action": "check it in Resolve"
     },
     {
+      "feature": "audio_crossfade",
+      "location": "transitions",
+      "detail": "audio-only crossfades are split edits: the picture cuts at the plan's cut, each clip's sound runs on under the other's (audioStart/audioDuration) and fades out or in over the crossfade (adjust-volume fadeIn/fadeOut)",
+      "action": "check them after import; --audio-crossfade transition writes spine transitions"
+    },
+    {
       "feature": "source_timecode",
       "location": "sources",
       "detail": "each asset starts at 0s, so source frames count from each file's first frame",
@@ -257,7 +309,8 @@
       "transitions": 3,
       "titles": 2,
       "markers": 2,
-      "assets": 4
+      "assets": 4,
+      "crop_windows": 1
     }
   },
   "file": "ccn_longform_v2.fcpxml"

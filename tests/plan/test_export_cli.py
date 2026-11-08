@@ -57,7 +57,7 @@ def test_export_writes_fcpxml_and_report(
 
 def test_export_not_expressible_count(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _, stdout, _ = run(capsys, str(LONGFORM), "--out", str(tmp_path / "cut.fcpxml"))
-    assert any(line.startswith("not expressible in FCPXML (20):") for line in stdout.splitlines())
+    assert any(line.startswith("not expressible in FCPXML (23):") for line in stdout.splitlines())
 
 
 def test_export_json_matches_report_file(

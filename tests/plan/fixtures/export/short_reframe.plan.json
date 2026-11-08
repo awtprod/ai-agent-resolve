@@ -9,9 +9,11 @@
   "profile": "ccn",
   "sources": [
     {"id": "camA", "media": "E:/CCN/Ep1/A001.braw", "camera": "A", "recording_id": "rec1",
-     "recording_origin": 0, "shot_size": "medium", "duration": 2000},
+     "recording_origin": 0, "shot_size": "medium", "duration": 2000,
+     "frame_size": [1920, 1080]},
     {"id": "camB", "media": "E:\\CCN\\Ep1\\B 001 (wide).braw", "camera": "B",
-     "recording_id": "rec1", "recording_origin": 0, "shot_size": "wide", "duration": 2000}
+     "recording_id": "rec1", "recording_origin": 0, "shot_size": "wide", "duration": 2000,
+     "frame_size": [1920, 1080]}
   ],
   "segments": [
     {"track": 1, "source": "camA", "src_in": 0, "src_out": 240,

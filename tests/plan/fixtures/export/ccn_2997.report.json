@@ -1,11 +1,11 @@
 {
   "format": "fcpxml",
   "fcpxml_version": "1.10",
-  "fcpxml_sha256": "dc4ec983d43ae418d71ca043a7ecf42a530246f1d0298caa24589b2db06661bc",
+  "fcpxml_sha256": "57ea5fa753e285a5d7c59868b2a89f846234467cc7fd21ed29f44bb17b8d37c8",
   "plan": {
     "project": "CCN",
     "timeline": "Late Set 2997",
-    "sha256": "ee7891d33e7e17f35e43a43d7d393a259d8fa1c783d4ebfa45bc9833d7c21495"
+    "sha256": "115d06c8ad6a490c7cdd1e4a049020e34f5380c56c2dc42f56893e3d3931d590"
   },
   "timeline": {
     "fps": "30000/1001",
@@ -72,6 +72,32 @@
       "carries": "A2 (audio-only clips)"
     }
   ],
+  "audio_tracks": [
+    {
+      "track": "A1",
+      "name": "A1",
+      "lanes": [
+        0
+      ],
+      "clips": 3,
+      "gain_db": 0.0,
+      "mute": false,
+      "bus": null
+    },
+    {
+      "track": "A2",
+      "name": "A2",
+      "lanes": [
+        1,
+        -1
+      ],
+      "clips": 2,
+      "gain_db": -2.0,
+      "mute": false,
+      "bus": null
+    }
+  ],
+  "audio_crossfade": "split",
   "transitions": [
     {
       "location": "head",
@@ -79,7 +105,8 @@
       "frames": 15,
       "alignment": "right",
       "video": true,
-      "audio": false
+      "audio": false,
+      "form": "transition"
     },
     {
       "location": "transitions[0]",
@@ -87,7 +114,8 @@
       "frames": 10,
       "alignment": "center",
       "video": false,
-      "audio": true
+      "audio": true,
+      "form": "split"
     },
     {
       "location": "outro.transition",
@@ -95,7 +123,8 @@
       "frames": 20,
       "alignment": "right",
       "video": true,
-      "audio": false
+      "audio": false,
+      "form": "transition"
     }
   ],
   "not_expressible": [
@@ -134,12 +163,6 @@
       "location": "sources[1].color.lut",
       "detail": "LUT 'Show 709' of source 'camB'",
       "action": "apply it on the Color page"
-    },
-    {
-      "feature": "split_audio_crossfade",
-      "location": "transitions[0]",
-      "detail": "segments[2] needs split audio timing (audioStart/audioDuration) for a video-only transition on its other end; Final Cut Pro ignores an audio crossfade on such a clip (Resolve's import is unconfirmed)",
-      "action": "check this audio crossfade after import and re-add it if missing"
     }
   ],
   "notes": [
@@ -174,6 +197,18 @@
       "action": "check it in Resolve"
     },
     {
+      "feature": "audio_crossfade",
+      "location": "transitions",
+      "detail": "audio-only crossfades are split edits: the picture cuts at the plan's cut, each clip's sound runs on under the other's (audioStart/audioDuration) and fades out or in over the crossfade (adjust-volume fadeIn/fadeOut)",
+      "action": "check them after import; --audio-crossfade transition writes spine transitions"
+    },
+    {
+      "feature": "frame_size",
+      "location": "sources[3].frame_size",
+      "detail": "source 'outro' has no frame_size, so its clips get Resolve's default framing (fit: letterboxed if its aspect differs from the timeline's)",
+      "action": "set frame_size to frame it with fill"
+    },
+    {
       "feature": "source_timecode",
       "location": "sources",
       "detail": "each asset starts at 0s, so source frames count from each file's first frame",
@@ -194,7 +229,8 @@
       "transitions": 3,
       "titles": 2,
       "markers": 2,
-      "assets": 4
+      "assets": 4,
+      "crop_windows": 2
     }
   },
   "file": "ccn_2997.fcpxml"

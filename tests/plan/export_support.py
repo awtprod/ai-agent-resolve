@@ -20,10 +20,13 @@ from aar.plan.profile import Profile, load_profile, parse_profile
 EXPORT_FIXTURES = FIXTURES / "export"
 #: name -> plan file of every golden export fixture.
 GOLDEN_PLANS: dict[str, Path] = {
-    "ccn_longform_v2": FIXTURES / "ccn_longform_v2.plan.json",
+    # The S13h2 fixture with frame sizes (that file is pinned by the compiler's phase results).
+    "ccn_longform_v2": EXPORT_FIXTURES / "ccn_longform_v2.plan.json",
     "short_reframe": EXPORT_FIXTURES / "short_reframe.plan.json",
     "ccn_2997": EXPORT_FIXTURES / "ccn_2997.plan.json",
 }
+#: Golden plans that also get a ``<name>.transition`` golden (audio-only crossfades).
+TRANSITION_GOLDENS = ("ccn_longform_v2", "ccn_2997")
 MEDIA_MAP = {"/srv/media": "E:\\Media", "/srv/media/ccn": "\\\\nas\\ccn"}
 _QA = {"longform_lufs": -22.0, "short_lufs": -14.5, "lufs_tolerance": 0.5, "review_mp4_max_mb": 20}
 
@@ -61,6 +64,7 @@ def reverify(result: ExportResult) -> VerifyResult:
         layout.plan,
         media_map=media_map_from_mapping(MEDIA_MAP),
         timeline_start=layout.timeline_start,
+        audio_crossfade=layout.audio_crossfade,
     )
     return verify_fcpxml(result.fcpxml, fresh)
 
@@ -73,6 +77,24 @@ def structure_problems(text: str) -> list[str]:
 
 _RATES = sorted(SUPPORTED_RATES)
 _SIZES = [(1920, 1080), (1080, 1920), (3840, 2160), (1280, 720), (2048, 858)]
+#: Source picture sizes: the timeline sizes, other aspects, and a face track's sampled size.
+_FRAME_SIZES = [
+    (1920, 1080),
+    (3840, 2160),
+    (1080, 1920),
+    (1440, 1080),
+    (1080, 1080),
+    (640, 360),
+    (4096, 1716),
+    (720, 1280),
+]
+
+
+def crossfade_form(seed: int) -> str:
+    """The audio-crossfade form a random plan is exported with: both, by seed parity."""
+    return "split" if seed % 2 == 0 else "transition"
+
+
 _TEXT = ["Jane & Joe", "<b>Loud</b>", 'say "hi"', "it's", "Café ✨", "tab\there", "a\nb"]
 
 
@@ -100,6 +122,8 @@ def random_plan(seed: int) -> tuple[dict[str, Any], str]:
         source: dict[str, Any] = {"id": f"s{index}", "media": _media(rng, index)}
         if rng.random() < 0.85:
             source["duration"] = rng.randint(3000, 6000)
+        if rng.random() < 0.85:
+            source["frame_size"] = list(rng.choice(_FRAME_SIZES))
         sources.append(source)
     known = [s for s in sources if "duration" in s]
 
@@ -151,6 +175,10 @@ def random_plan(seed: int) -> tuple[dict[str, Any], str]:
             segments.append(seg)
             start += length + rng.randint(0, 30)
     sources_by_id = {s["id"]: s for s in sources}
+    for seg in segments:  # a moved clip needs its source's size (source_size_required)
+        if "frame_size" not in sources_by_id[seg["source"]]:
+            seg.pop("transform", None)
+            seg.pop("reframe", None)
     for a, b in itertools.pairwise(v1):
         out_seg, in_seg = segments[a], segments[b]
         if out_seg["record_in"] + out_seg["src_out"] - out_seg["src_in"] != in_seg["record_in"]:
