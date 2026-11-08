@@ -71,11 +71,34 @@ emitted once, not on every tick.
 The broker is a single-worker state machine driven by ``tick()``; it never sleeps. A runner
 (slice S7) calls ``tick()`` on a timer. ``submit``/``cancel``/``result`` may be called from
 other threads.
+
+How it reads Resolve (S7g, DESIGN R4 "never poll Deliver state"). Each tick starts with the
+presence poll, a position read (``ResolveGateway.get_position``) taken at most once per
+``BrokerConfig.context_poll_seconds``, however fast the runner ticks; between polls the tick
+works from the latest read, the poll's or the broker's own. The checks before and after each
+op are position reads too. Only these reads take the Deliver settings (``get_context``): the
+human's snapshot when the broker takes control, one check before the restore puts Deliver
+settings back, the restore's final check, and one read after an op in the human's project that
+reported changing Deliver settings (``gateway.note_deliver_changed``: the gateway's Deliver
+setters report themselves, and ``render.build`` reports a failed restore). On Resolve 21.1
+``GetCurrentRenderMode`` raises a page signal on every call, and reading the full context on
+every 0.25 s worker tick crashed Resolve after about 270 reads (2026-11-07).
+
+A human's Deliver edit is kept, unless an op in the same project then reports its own
+Deliver change. The poll cannot see one, so before the restore
+reapplies the snapshot's Deliver settings it reads them once and compares them with what the
+broker itself last left there: the snapshot's, unless an op reported changing them. If they
+differ, a human changed them while the broker held the context: the broker leaves Deliver
+alone (``RestoreReport.deliver_restore_skipped``, the ``restored`` event and a node-log
+warning) and restores only the position. The only op that reports its own change today is
+``render.build`` when its own restore fails, and its snapshot preset keeps the human's edit.
 """
 
 from __future__ import annotations
 
 import itertools
+import logging
+import math
 import threading
 import time
 import traceback
@@ -85,7 +108,13 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 
-from aar.node.gateway import VALID_PAGES, GatewayError, ResolveContext, ResolveGateway
+from aar.node.gateway import (
+    VALID_PAGES,
+    GatewayError,
+    ResolveContext,
+    ResolveGateway,
+    deliver_changes,
+)
 from aar.node.leases import (
     Clock,
     Holder,
@@ -105,6 +134,11 @@ OpFn = Callable[[ResolveGateway], object]
 """An op body. It receives the gateway (``ScriptApiGateway.resolve`` gives raw API access)."""
 
 _RUNNING_OP: ContextVar[str | None] = ContextVar("aar_running_hot_op", default=None)
+_log = logging.getLogger(__name__)
+
+DEFAULT_CONTEXT_POLL_SECONDS = 2.0
+"""Seconds between presence polls (``aar node run --context-poll-seconds``)."""
+MIN_CONTEXT_POLL_SECONDS = 0.5
 
 
 def running_op_id() -> str | None:
@@ -174,7 +208,8 @@ class OpResult:
     error: OpError | None = None
     started_at: float | None = None
     context: ResolveContext | None = None
-    """The asserted context the op ran in (``None`` if it never ran)."""
+    """The asserted context the op ran in (``None`` if it never ran). A position read: its
+    Deliver fields are unread (``render_measured`` is False)."""
 
 
 @dataclass(frozen=True)
@@ -208,7 +243,12 @@ class RestoreReport:
     kept_preset: str | None = None
     """A temporary Deliver preset left in place because it may be the only copy of the
     human's Deliver settings (an op ran in the human's project, and the project could not be
-    restored). ``None`` when there was none or it was deleted."""
+    restored or its Deliver restore was skipped). ``None`` when there was none or it was
+    deleted."""
+    deliver_restore_skipped: Mapping[str, object] | None = None
+    """``{"reason": "human_change", "fields": {field: [broker_left, found]}}`` when the Deliver
+    settings were not put back because a human changed them while the broker held the
+    context; ``None`` when they were restored (or there was nothing to restore)."""
 
 
 class TickKind(StrEnum):
@@ -254,6 +294,10 @@ class BrokerConfig:
     project is located only from locators the broker verified itself; if it cannot be, the
     broker never switches away from it."""
     preset_prefix: str = "aar-restore-"
+    context_poll_seconds: float = DEFAULT_CONTEXT_POLL_SECONDS
+    """Seconds between presence polls (position reads), however fast ``tick()`` is called.
+    Finite and at least ``MIN_CONTEXT_POLL_SECONDS``; the broker also requires it to be
+    shorter than its presence guard's ``max_observation_age``."""
 
     def __post_init__(self) -> None:
         if self.batch_max_ops < 1:
@@ -262,6 +306,17 @@ class BrokerConfig:
             raise ValueError("batch_max_seconds, max_wait_seconds and lease_ttl must be positive")
         if self.restore_delay_seconds < 0:
             raise ValueError("restore_delay_seconds must not be negative")
+        poll = self.context_poll_seconds
+        if (
+            isinstance(poll, bool)
+            or not isinstance(poll, int | float)
+            or not math.isfinite(poll)
+            or poll < MIN_CONTEXT_POLL_SECONDS
+        ):
+            raise ValueError(
+                f"context_poll_seconds must be a finite number of seconds, at least "
+                f"{MIN_CONTEXT_POLL_SECONDS}: got {poll!r}"
+            )
 
 
 class Broker:
@@ -275,12 +330,20 @@ class Broker:
         sink: EventSink | None = None,
         config: BrokerConfig | None = None,
     ) -> None:
+        self.config = config or BrokerConfig()
+        if self.config.context_poll_seconds >= presence.max_observation_age:
+            # Between polls the guard sees no new observation: an interval this long would
+            # make it refuse on a stale observation however steadily the broker ticks.
+            raise ValueError(
+                f"context_poll_seconds ({self.config.context_poll_seconds}s) must be shorter "
+                f"than the presence guard's max_observation_age "
+                f"({presence.max_observation_age}s)"
+            )
         self._gw = gateway
         self._leases = leases
         self._presence = presence
         self._clock = clock
         self._sink = sink
-        self.config = config or BrokerConfig()
         self.holder = Holder.agent(self.config.broker_id)
         self._lock = threading.RLock()
         self._queues: dict[str, list[HotOp]] = {}
@@ -298,6 +361,13 @@ class Broker:
         self._known: dict[str, ProjectLocator] = {}
         self._touched_human_project = False
         self._last_target: ProjectLocator | None = None
+        self._context: ResolveContext | None = None
+        """The latest read of Resolve: the last poll, or the broker's own read after it."""
+        self._polled_at: float | None = None
+        self._deliver_left: tuple[object, object, object] | None = None
+        """The human project's Deliver format, codec and mode as the broker last left them:
+        the snapshot's (set at every take of control), or what an op in the human's project
+        that reported changing them left. Read only by the restore."""
 
     # -- public API ------------------------------------------------------------------------
 
@@ -372,22 +442,25 @@ class Broker:
     def tick(self) -> TickOutcome:
         """Make one scheduling decision: run a batch, defer, restore, or nothing."""
         now = self._clock()
-        ctx = self._gw.get_context()
-        self._presence.observe(ctx, now)
+        polled = self._poll_due(now)
+        ctx = self._observe(now) if polled else self._latest()
         self._check_takeover(now)
 
         self._sweep_prechecks()
         runnable = self._runnable(notify=True)
         if not runnable:
-            return self._idle_or_restore(ctx, now)
+            return self._idle_or_restore(ctx, now, polled)
         self._drained_since = None
         self._notices.pop("restore", None)
 
         project, why = self._select(runnable, self._current_key(runnable, ctx), now)
         target = runnable[project][0].project
         decision = self._gate(ctx, target, now)
+        if decision.allowed and not polled:
+            ctx = self._look_again(now)
+            decision = self._gate(ctx, target, now)
         if decision.allowed:
-            decision = self._take_control(ctx, now)
+            decision = self._take_control(now)
         if not decision.allowed:
             self._notice("defer", "deferred", decision, project=project)
             return TickOutcome(
@@ -413,6 +486,52 @@ class Broker:
             if outcome.kind in _NO_PROGRESS:
                 return outcomes
         raise RuntimeError(f"broker still busy after {max_ticks} ticks")
+
+    # -- reading Resolve -------------------------------------------------------------------
+
+    def _poll_due(self, now: float) -> bool:
+        """Is the presence poll due? At most once per ``context_poll_seconds``, however fast
+        the runner ticks.
+
+        Between polls a tick works from the latest read (``_latest``): the last poll, or the
+        broker's own read since, after a switch or an op. That read is never older than the
+        interval, which is shorter than the guard's ``max_observation_age``. Before the broker
+        acts on it, it looks again (``_look_again``), and every op asserts a fresh read."""
+        last = self._polled_at
+        return (
+            self._context is None
+            or last is None
+            or not 0 <= now - last < self.config.context_poll_seconds
+        )
+
+    def _latest(self) -> ResolveContext:
+        assert self._context is not None  # set by the first tick's poll
+        return self._context
+
+    def _look_again(self, now: float) -> ResolveContext:
+        """Before acting on a reused read (taking control, switching, running a batch or
+        restoring): read the position again, so a human who moved since the last poll is seen
+        (and takes over a borrowed context) before the broker acts. Only ticks that may act
+        pay for it; a tick the gate refuses, as while a human works, reads nothing more."""
+        ctx = self._observe(now)
+        self._check_takeover(now)
+        return ctx
+
+    def _observe(self, now: float) -> ResolveContext:
+        """Read the working position (never the Deliver settings) and show it to the guard."""
+        ctx = self._gw.get_position()
+        self._presence.observe(ctx, now)
+        self._context, self._polled_at = ctx, now
+        return ctx
+
+    def _note_broker_context(self, ctx: ResolveContext | None = None) -> ResolveContext:
+        """Record a context the broker produced (a fresh position read unless ``ctx`` is
+        given): the guard never takes it for a human, and the next tick starts from it."""
+        if ctx is None:
+            ctx = self._gw.get_position()
+        self._presence.note_broker_context(ctx, self._clock())
+        self._context = ctx
+        return ctx
 
     # -- events ----------------------------------------------------------------------------
 
@@ -644,10 +763,14 @@ class Broker:
         except LeaseNotHeld as exc:
             self._emit("lease_lost", lease_id=exc.lease_id, reason=exc.reason)
 
-    def _take_control(self, ctx: ResolveContext, now: float) -> Decision:
+    def _take_control(self, now: float) -> Decision:
         decision = self._hold_instance_lease()
         if not decision.allowed or self._snapshot is not None:
             return decision
+        # A full read: the snapshot keeps the human's Deliver format, codec and mode, which the
+        # poll does not read.
+        ctx = self._gw.get_context()
+        self._deliver_left = _deliver_of(ctx)
         preset = None
         warnings: list[str] = []
         if self.config.snapshot_deliver_preset and ctx.project is not None:
@@ -662,7 +785,7 @@ class Broker:
             pm_path, human_project = self._snapshot_project_manager(ctx, warnings)
             ctx = replace(ctx, project_manager_path=pm_path)
             # The walk ends where it began; note it so it can never read as a human change.
-            self._presence.note_broker_context(self._gw.get_context(), now)
+            self._note_broker_context()
         elif ctx.project_id is not None:
             # Without Project Manager navigation only a locator the broker verified itself
             # can say where the human's project lives.
@@ -833,11 +956,6 @@ class Broker:
         self._emit("switch", source=ctx.project, target=key)
         return None
 
-    def _note_broker_context(self) -> ResolveContext:
-        ctx = self._gw.get_context()
-        self._presence.note_broker_context(ctx, self._clock())
-        return ctx
-
     # -- batches and ops -----------------------------------------------------------------------
 
     def _run_batch(self, project: str, why: str) -> TickOutcome:
@@ -856,8 +974,7 @@ class Broker:
                 if now - start >= cfg.batch_max_seconds:
                     exhausted, stop = True, "time"
                     break
-                ctx = self._gw.get_context()
-                self._presence.observe(ctx, now)
+                ctx = self._observe(now)  # did a human move while the last op ran?
                 if self._check_takeover(now):
                     stop = "human_took_over"
                     break
@@ -915,7 +1032,7 @@ class Broker:
             return None
         gw = self._gw
         want = op.project
-        ctx = gw.get_context()
+        ctx = gw.get_position()
         if not _is_open(want, ctx):
             self._emit("reselect", op_id=op.id, expected=want.key, actual=ctx.project)
             try:
@@ -1014,10 +1131,11 @@ class Broker:
             return None  # cancelled from another thread after the checks
         self._last_target = want
         snapshot = self._snapshot
+        in_human_project = False
         if snapshot is not None:
             human = _human_target(snapshot)
             if human is not None and _is_open(human, ctx):
-                self._touched_human_project = True
+                self._touched_human_project = in_human_project = True
         started = self._clock()
         self._emit(
             "op_started",
@@ -1029,9 +1147,11 @@ class Broker:
         )
         value: object = None
         error: OpError | None = None
+        deliver_changed: list[str] = []
         token = _RUNNING_OP.set(op.id)
         try:
-            value = op.fn(gw)
+            with deliver_changes(deliver_changed):
+                value = op.fn(gw)
         except HotOpFailure as exc:
             error = OpError(exc.code, exc.message, dict(exc.detail))
         except Exception as exc:
@@ -1044,7 +1164,10 @@ class Broker:
             _RUNNING_OP.reset(token)
         finished = self._clock()
         self._last_served[want.key] = finished
-        self._note_broker_context()
+        if deliver_changed and in_human_project:
+            self._note_deliver_left()
+        else:
+            self._note_broker_context()
         status = OpStatus.OK if error is None else OpStatus.FAILED
         result = OpResult(op.id, status, finished, value, error, started, ctx)
         self._record(result)
@@ -1064,7 +1187,7 @@ class Broker:
 
     # -- restore -------------------------------------------------------------------------------
 
-    def _idle_or_restore(self, ctx: ResolveContext, now: float) -> TickOutcome:
+    def _idle_or_restore(self, ctx: ResolveContext, now: float, polled: bool) -> TickOutcome:
         snapshot = self._snapshot
         if snapshot is None:
             return TickOutcome(TickKind.IDLE)
@@ -1080,6 +1203,11 @@ class Broker:
             self._notice("restore", "restore_pending", decision)
             return TickOutcome(TickKind.RESTORE_PENDING, code=decision.code, reason=decision.reason)
         decision = self._gate(ctx, _human_target(snapshot), now)
+        if decision.allowed and not polled:
+            ctx = self._look_again(now)
+            if self._snapshot is None:  # a human took over since the last poll
+                return TickOutcome(TickKind.IDLE)
+            decision = self._gate(ctx, _human_target(snapshot), now)
         if not decision.allowed:
             self._notice("restore", "restore_deferred", decision)
             return TickOutcome(
@@ -1132,26 +1260,40 @@ class Broker:
             step("project_manager_path", lambda: gw.open_project_manager_path(pm_path))
         preset = snapshot.deliver_preset
         kept: str | None = None
+        skipped: dict[str, object] | None = None
         if project_ok:  # never touch the rest of the context in the wrong project
             timeline_ok = want.timeline is not None and step(
                 "timeline", lambda: gw.set_current_timeline(want.timeline, want.timeline_id)
             )
             if want.folder is not None:
                 step("folder", lambda: gw.set_current_folder(want.folder))
-            if preset is not None:
-                if step("deliver_preset", lambda: gw.load_render_preset(preset)):
+            restores_deliver = preset is not None or _deliver_of(want) != (None, None, None)
+            changed = self._human_deliver_change() if restores_deliver else {}
+            if changed:
+                # A human changed the Deliver settings while the broker held the context:
+                # keep theirs. The preset is kept only if an op ran in their project.
+                skipped = {"reason": "human_change", "fields": changed}
+                if preset is not None and self._touched_human_project:
+                    kept = preset
+                elif preset is not None:
                     step("deliver_preset_cleanup", lambda: gw.delete_render_preset(preset))
-                else:
-                    kept = preset  # not applied: it still holds the human's Deliver settings
-            # After the preset: a preset round trip that loses the format or codec is
-            # corrected here, and it is the only Deliver restore when no preset was saved.
-            if want.render_format is not None and want.render_codec is not None:
-                step(
-                    "render_format",
-                    lambda: gw.set_render_format_and_codec(want.render_format, want.render_codec),
-                )
-            if want.render_mode is not None:
-                step("render_mode", lambda: gw.set_render_mode(want.render_mode))
+            else:
+                if preset is not None:
+                    if step("deliver_preset", lambda: gw.load_render_preset(preset)):
+                        step("deliver_preset_cleanup", lambda: gw.delete_render_preset(preset))
+                    else:
+                        kept = preset  # not applied: it still holds the human's Deliver settings
+                # After the preset: a preset round trip that loses the format or codec is
+                # corrected here, and it is the only Deliver restore when no preset was saved.
+                if want.render_format is not None and want.render_codec is not None:
+                    step(
+                        "render_format",
+                        lambda: gw.set_render_format_and_codec(
+                            want.render_format, want.render_codec
+                        ),
+                    )
+                if want.render_mode is not None:
+                    step("render_mode", lambda: gw.set_render_mode(want.render_mode))
             if want.page is not None:
                 step("page", lambda: gw.open_page(want.page))
             if want.playhead is not None and timeline_ok:  # never on some other timeline
@@ -1166,13 +1308,30 @@ class Broker:
                 # so the preset is redundant. Do not leave it behind.
                 step("deliver_preset_cleanup", lambda: gw.delete_render_preset(preset))
 
-        final = gw.get_context(with_pm_path=want.project_manager_path is not None)
-        self._presence.note_broker_context(final, self._clock())
+        # The final check: a full read, so it checks the Deliver settings came back too. When
+        # they were left to the human, a position read (its unread Deliver fields are not
+        # compared): the check before already read them, and nothing has set them since.
+        with_pm_path = want.project_manager_path is not None
+        if skipped is None:
+            final = gw.get_context(with_pm_path=with_pm_path)
+        else:
+            final = gw.get_position()
+            if with_pm_path:
+                final = replace(final, project_manager_path=gw.get_project_manager_path())
+        self._note_broker_context(final)
         mismatches = want.diff(final)
         report = RestoreReport(
-            not errors and not mismatches, snapshot, final, errors, mismatches, kept
+            not errors and not mismatches, snapshot, final, errors, mismatches, kept, skipped
         )
         self.last_restore = report
+        if skipped is not None:
+            _log.warning(
+                "broker %s: Deliver settings not restored in %r: a human changed %s while the "
+                "broker held the context (deliver_restore_skipped: human_change)",
+                self.config.broker_id,
+                want.project,
+                skipped["fields"],
+            )
         self._emit(
             "restored",
             ok=report.ok,
@@ -1181,9 +1340,31 @@ class Broker:
             mismatches={k: [str(a), str(b)] for k, (a, b) in mismatches.items()},
             deliver_preset=preset,
             kept_preset=kept,
+            deliver_restore_skipped=skipped,
         )
         self._drop_control()
         return report
+
+    def _note_deliver_left(self) -> None:
+        """After an op that reported leaving the human project's Deliver settings changed:
+        one full read of what it left, so the restore takes that for the broker's own change
+        (and puts the snapshot back), never for a human's."""
+        after = self._gw.get_context()
+        self._deliver_left = _deliver_of(after)
+        self._note_broker_context(after)
+
+    def _human_deliver_change(self) -> dict[str, list[object]]:
+        """Before the restore reapplies Deliver settings: one full read, compared with what
+        the broker last left in the human's project. The fields a human changed, or ``{}``."""
+        left = self._deliver_left
+        if left is None:
+            return {}
+        found = _deliver_of(self._gw.get_context())
+        return {
+            name: [mine, theirs]
+            for name, mine, theirs in zip(_DELIVER_NAMES, left, found, strict=True)
+            if mine != theirs
+        }
 
     def _recover_from_failed_load(
         self, before: ResolveContext, step: Callable[[str, Callable[[], None]], bool]
@@ -1193,13 +1374,21 @@ class Broker:
         A load can fail after ``LoadProject`` has already opened something (an id mismatch
         is only seen afterwards). Then go back to the project the broker was working in.
         """
-        now = self._gw.get_context()
+        now = self._gw.get_position()
         if before.project_id is None or now.project_id == before.project_id:
             return
         back = self._last_target
         if back is None or not _is_open(back, before):
             return
         step("project_recover", lambda: self._load(back))
+
+
+_DELIVER_NAMES = ("render_format", "render_codec", "render_mode")
+
+
+def _deliver_of(ctx: ResolveContext) -> tuple[object, object, object]:
+    """A full read's Deliver format, codec and mode."""
+    return (ctx.render_format, ctx.render_codec, ctx.render_mode)
 
 
 def _is_open(target: ProjectLocator, ctx: ResolveContext) -> bool:

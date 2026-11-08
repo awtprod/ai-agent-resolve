@@ -68,6 +68,16 @@ Every allowed project is an exact `ProjectLocator`; repeat `--project` to add an
 must match both this authenticated node and one configured Resolve project id. The worker also
 checks the complete locator before persisting the job.
 
+`--context-poll-seconds` (default 2) sets how often the node reads Resolve's working position
+for the presence guard. It is separate from `--tick-seconds`, which paces hub claims, heartbeats
+and job pumps. It must be finite and at least 0.5, and below the presence guard's configured
+maximum observation age (`max_observation_age`, default 30 seconds); otherwise the node refuses
+to start. The poll never reads the Deliver
+settings: on Resolve 21.1 `GetCurrentRenderMode` raises a page signal on every call, and reading
+it on every tick crashed Resolve (DESIGN R4, "never poll Deliver state"). If you change the
+Deliver settings while the node has borrowed your context, the node keeps your settings when it
+gives the context back, and logs a `deliver_restore_skipped: human_change` warning.
+
 Submit from the hub with an explicit idempotency key:
 
 ```text

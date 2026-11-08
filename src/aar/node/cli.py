@@ -10,6 +10,7 @@ import threading
 from typing import Any
 
 from aar import cli_io
+from aar.node.broker import DEFAULT_CONTEXT_POLL_SECONDS, MIN_CONTEXT_POLL_SECONDS
 from aar.node.ops import list_ops
 
 _PROG = "aar node"
@@ -47,6 +48,14 @@ def register(subparsers: Any) -> None:
     run.add_argument("--lease-seconds", type=float, default=60.0)
     run.add_argument("--heartbeat-seconds", type=float, default=15.0)
     run.add_argument("--tick-seconds", type=float, default=0.25)
+    run.add_argument(
+        "--context-poll-seconds",
+        type=float,
+        default=DEFAULT_CONTEXT_POLL_SECONDS,
+        help="Seconds between reads of Resolve's working position for the presence guard, "
+        f"separate from --tick-seconds (default {DEFAULT_CONTEXT_POLL_SECONDS:g}, at least "
+        f"{MIN_CONTEXT_POLL_SECONDS:g}). The poll never reads the Deliver settings.",
+    )
     run.add_argument("--connect-timeout", type=float, default=10.0)
     run.add_argument("--read-timeout", type=float, default=10.0)
     run.add_argument("--response-cap", type=int, default=4 << 20)
@@ -118,6 +127,7 @@ def _cmd_locate(args: argparse.Namespace, *, gateway_factory: Any = _live_gatewa
 
 def run_node(args: argparse.Namespace, *, gateway_factory: Any = _live_gateway) -> int:
     """Production loop with an injectable gateway factory for TCP acceptance tests."""
+    from aar.node.broker import BrokerConfig
     from aar.node.jobs import JobStore
     from aar.node.locator import ProjectLocator
     from aar.node.remote import RemoteConfig, RemoteJobClient, _NodeClient
@@ -128,6 +138,9 @@ def run_node(args: argparse.Namespace, *, gateway_factory: Any = _live_gateway) 
     ids = tuple(project.project_id for project in projects)
     if any(project_id is None for project_id in ids):
         raise ValueError("every --project locator needs project_id")
+    # Validated before Resolve is touched; the broker also checks it against the presence
+    # guard's max_observation_age.
+    broker_config = BrokerConfig(context_poll_seconds=args.context_poll_seconds)
     config = RemoteConfig(
         hub_url=args.hub_url,
         token_file=args.token_file,
@@ -158,6 +171,7 @@ def run_node(args: argparse.Namespace, *, gateway_factory: Any = _live_gateway) 
             connect_timeout=config.connect_timeout,
             read_timeout=config.read_timeout,
             response_cap=config.response_cap,
+            broker_config=broker_config,
         )
         job_client = RemoteJobClient(
             _NodeClient(config),
