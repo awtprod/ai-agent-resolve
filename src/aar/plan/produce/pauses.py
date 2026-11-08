@@ -5,7 +5,8 @@ squeeze (-42 dB, 0.90 s, keep 0.25 + 0.20 s) and CICGTD ``edl_v7.py`` (PRE 0.25,
 never swallowing a transcribed word). A pause is a run of source audio below the venue's
 silence threshold (``audio.pause_runs``), never a transcript gap: Whisper's word times are off
 by 0.1-0.2 s at joins. But a transcribed word inside a quiet run is trusted: the run is split
-around it, so a trim never removes a word.
+around it, so a trim never removes a word. Every word counts, a zero-length one included: it
+occupies at least ``min_word_ms`` around its time (``timeline.Words``).
 
 A pause qualifies when it lies strictly inside the keep range (silence at a range's edge is the
 human's choice) and lasts at least ``min_pause_s``. It keeps ``beat_lead_s`` after the
@@ -37,11 +38,11 @@ class Trim:
 
 
 def _sub_pauses(run: tuple[float, float], words: Words) -> list[tuple[float, float]]:
-    """``run`` less the cores of the words inside it."""
+    """``run`` less the spans the transcribed words occupy (``min_word_ms`` at least)."""
     start, end = run
     pieces: list[tuple[float, float]] = []
     cursor = start
-    for lo, hi in words.cores(start, end):
+    for lo, hi in words.spans(start, end):
         if lo > cursor:
             pieces.append((cursor, min(lo, end)))
         cursor = max(cursor, hi)

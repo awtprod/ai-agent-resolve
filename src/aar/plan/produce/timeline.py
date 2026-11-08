@@ -22,6 +22,7 @@ from aar.plan.inputs import Word
 from aar.plan.model import EditPlan, Fps
 from aar.plan.produce.errors import InvariantError, ProduceInputError
 from aar.plan.produce.inputs import CameraSchedule, KeepList
+from aar.plan.produce.report import PlannerWarning
 from aar.plan.rules.speech import word_at
 
 
@@ -61,35 +62,44 @@ def min_frames(seconds: float, fps: Fps) -> int:
 
 
 class Words:
-    """Transcript words in recording seconds, with the splice tolerance in seconds."""
+    """Transcript words in recording seconds, with the splice tolerance in seconds.
 
-    def __init__(self, words: Sequence[Word], tolerance_s: float, fps: Fps) -> None:
+    Two views of a word. ``inside`` is the linter's splice test (``word_at``): a cut point may
+    not fall strictly inside the word less ``tolerance_s`` at each end. ``speech_between`` and
+    ``spans`` are what no trim, nudge or fold may remove: the word's span less the tolerance,
+    but at least ``min_word_s`` long around its middle, so a zero-length or 15 ms word that
+    Whisper places in a pause still occupies the pause.
+    """
+
+    def __init__(
+        self, words: Sequence[Word], tolerance_s: float, fps: Fps, min_word_s: float = 0.0
+    ) -> None:
         self.words = list(words)
         self.tolerance_s = tolerance_s
         self.fps = fps
+        self.min_word_s = min_word_s
+        occupied: list[tuple[float, float, Word]] = []
+        for word in self.words:
+            half = max((word.end_s - word.start_s) / 2 - tolerance_s, min_word_s / 2)
+            if half > 0:
+                middle = (word.start_s + word.end_s) / 2
+                occupied.append((middle - half, middle + half, word))
+        self._spans = sorted(occupied, key=lambda item: (item[0], item[1]))
 
     def inside(self, rec_frame: int) -> Word | None:
         """The word a cut at ``rec_frame`` would split, as ``no-dialogue-splice`` judges it."""
         return word_at(self.words, self.fps.seconds(rec_frame), self.tolerance_s)
 
     def speech_between(self, start_s: float, end_s: float) -> Word | None:
-        """A word whose core (its span less the tolerance at each end) meets ``(start, end)``."""
-        tol = self.tolerance_s
-        for word in self.words:
-            lo, hi = word.start_s + tol, word.end_s - tol
-            if lo < hi and lo < end_s and hi > start_s:
+        """A word whose occupied span meets ``(start, end)``."""
+        for lo, hi, word in self._spans:
+            if lo < end_s and hi > start_s:
                 return word
         return None
 
-    def cores(self, start_s: float, end_s: float) -> list[tuple[float, float]]:
-        """The word cores that meet ``(start, end)``, in time order."""
-        tol = self.tolerance_s
-        found = []
-        for word in self.words:
-            lo, hi = word.start_s + tol, word.end_s - tol
-            if lo < hi and lo < end_s and hi > start_s:
-                found.append((lo, hi))
-        return sorted(found)
+    def spans(self, start_s: float, end_s: float) -> list[tuple[float, float]]:
+        """The occupied spans that meet ``(start, end)``, in time order."""
+        return [(lo, hi) for lo, hi, _ in self._spans if lo < end_s and hi > start_s]
 
 
 @dataclass(frozen=True)
@@ -101,7 +111,7 @@ class KeepFrames:
 
 @dataclass(frozen=True)
 class Snap:
-    """A keep-list edge that fell inside a word and was moved out of it, keeping the word."""
+    """A keep-list edge that fell inside a word and moved inward past it."""
 
     keep: int
     edge: str  # "in" or "out"
@@ -110,47 +120,54 @@ class Snap:
     to_frame: int
 
 
-def _step_out(words: Words, frame: int, step: int, limit: int) -> int:
-    """Move ``frame`` by ``step`` until it is not inside any word."""
-    for _ in range(limit):
-        if words.inside(frame) is None:
-            return frame
-        frame += step
-    raise InvariantError(
-        "dialogue-splice",
-        f"could not move recording frame {frame} out of the transcript's words",
-        hint="check the transcript for words that overlap or run for minutes",
-    )
-
-
 def keep_frames(
     keep: KeepList, words: Words, fps: Fps, *, min_shot_s: float
-) -> tuple[list[KeepFrames], list[Snap]]:
-    """The keep ranges in recording frames, every edge moved out of any word it splits.
+) -> tuple[list[KeepFrames], list[Snap], list[PlannerWarning]]:
+    """The keep ranges in recording frames, never wider than the human made them.
 
-    An in point inside a word moves back to the word's start and an out point forward to its
-    end, so the word is kept whole. Ranges that then overlap merge (nothing plays twice).
-    Each range must last at least ``min_shot_s``, or it could not be folded anywhere.
+    Ranges that touch merge first: they play unbroken, and a word across the seam is kept. An
+    edge inside a word (``no-dialogue-splice``'s test) moves **inward** past it: the in point to
+    the word's end, the out point to its start. The partial word is left out with the material
+    the human already excluded; the range never grows. A range that this empties is dropped
+    with a warning. Each remaining range must last at least ``min_shot_s``, or no fold could
+    keep it.
     """
-    limit = max(1, fps.nominal) * 600
+    merged: list[tuple[int, int, str | None]] = []
+    for item in keep.ranges:
+        start, end = fps.frames(item.start_s), fps.frames(item.end_s)
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end), merged[-1][2])
+        else:
+            merged.append((start, end, item.label))
     out: list[KeepFrames] = []
     snaps: list[Snap] = []
-    for index, item in enumerate(keep.ranges):
-        start, end = fps.frames(item.start_s), fps.frames(item.end_s)
-        for edge, frame, step in (("in", start, -1), ("out", end, 1)):
-            word = words.inside(frame)
-            if word is None:
-                continue
-            moved = _step_out(words, frame, step, limit)
-            snaps.append(Snap(index, edge, word.text, frame, moved))
-            if edge == "in":
-                start = max(0, moved)
-            else:
-                end = moved
-        if out and start < out[-1].end:
-            out[-1] = KeepFrames(out[-1].start, max(out[-1].end, end), out[-1].label)
-        else:
-            out.append(KeepFrames(start, end, item.label))
+    warnings: list[PlannerWarning] = []
+    for index, (start, end, label) in enumerate(merged):
+        first, last = start, end
+        while start < end and (word := words.inside(start)) is not None:
+            start += 1
+            if words.inside(start) is not word:
+                snaps.append(Snap(index, "in", word.text, first, start))
+                first = start
+        while end > start and (word := words.inside(end)) is not None:
+            end -= 1
+            if words.inside(end) is not word:
+                snaps.append(Snap(index, "out", word.text, last, end))
+                last = end
+        if end <= start:
+            warnings.append(
+                PlannerWarning(
+                    code="keep-dropped",
+                    message=(
+                        f"keep range {index} ({fps.seconds(merged[index][0]):.3f}-"
+                        f"{fps.seconds(merged[index][1]):.3f} s) lies inside a word; it is dropped"
+                    ),
+                    at_s=round(fps.seconds(merged[index][0]), 3),
+                    hint="start and end keep ranges in the pauses around whole words",
+                )
+            )
+            continue
+        out.append(KeepFrames(start, end, label))
     need = min_frames(min_shot_s, fps)
     for number, item in enumerate(out):
         if item.end - item.start < need:
@@ -158,10 +175,12 @@ def keep_frames(
                 "keep-too-short",
                 f"keep range {number} ({fps.seconds(item.start):.3f}-"
                 f"{fps.seconds(item.end):.3f} s) lasts {item.end - item.start} frames, under "
-                f"min_shot_s ({need} frames)",
+                f"min_shot_s ({need} frames), after leaving out any partial word at its edges",
                 hint="lengthen it, join it to a neighbouring range, or drop it",
             )
-    return out, snaps
+    if not out:
+        raise ProduceInputError("keep-empty", "every keep range lies inside a word")
+    return out, snaps, warnings
 
 
 def resolve_camera(plan: EditPlan, name: str) -> str:

@@ -40,6 +40,8 @@ min_pause_s = 0.9         # a pause at least this long ...
 beat_s = 0.45             # ... is trimmed to this beat
 beat_lead_s = 0.25        # of the beat, this much stays after the outgoing speech
 silence_db = -42.0        # pause = 10 ms RMS (loudest channel) below this; see [produce.venues]
+min_word_ms = 40          # a transcribed word occupies at least this long, so even a 0 ms word splits a pause
+no_pause_warn_s = 60      # warn when this much of a source's audio holds no pause at all
 scan_window_ms = 10       # RMS window of the pause scan
 scan_rate_hz = 16000      # the pause scan decodes the source audio at this rate ...
 scan_chunk_s = 30         # ... this many seconds at a time
@@ -64,7 +66,7 @@ safety_sigma_s = 0.3      # ... with a Gaussian ramp this wide
 safety_passes = 4
 warn_margin = 0.047       # a planner warning when the face comes closer to the crop edge
 key_step_s = 0.5          # reframe keyframe spacing
-speed_headroom = 0.9      # pan speed is clamped to this share of rules.no-whip-pan
+speed_headroom = 0.9      # pan speed is clamped to this share of rules.no-whip-pan (at most 0.95)
 
 # Shorts crop presets, alternated on every same-camera jump cut (zooms differ by at least
 # rules.no-same-camera-jump min_zoom_delta).
@@ -75,7 +77,7 @@ y = 0.5
 
 [[produce.framing]]
 name = "B"
-zoom = 1.25
+zoom = 1.22               # the house limit for a shorts punch-in
 y = 0.45
 
 # Segments from one recording play in source-time order: no reordering, no imported cold opens.

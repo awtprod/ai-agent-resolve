@@ -117,10 +117,21 @@ class Face(_Foreign):
     def centre_x(self) -> float:
         return self.box[0] + self.box[2] / 2
 
+    @property
+    def area(self) -> float:
+        return self.box[2] * self.box[3]
+
 
 class FaceFrame(_Foreign):
     file_s: float = Field(ge=0)
     faces: list[Face]
+
+    @model_validator(mode="after")
+    def _largest_first(self) -> FaceFrame:
+        # The faces worker writes them largest first, but the order is not trusted: the camera
+        # follows ``faces[0]``, so it is made the largest here (stable for equal sizes).
+        self.faces = sorted(self.faces, key=lambda face: -face.area)
+        return self
 
 
 class FaceInput(_Foreign):

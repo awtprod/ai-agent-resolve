@@ -141,11 +141,13 @@ class SteadySettings(_Settings):
     safety_passes: int = Field(default=4, ge=0)
     warn_margin: float = Field(default=0.047, ge=0, lt=0.5)
     key_step_s: float = Field(default=0.5, gt=0)
-    speed_headroom: float = Field(default=0.9, gt=0, le=1)
+    # At most 0.95: keyframe x is rounded to 4 decimals, so at 1.0 a clamped path can land just
+    # over no-whip-pan's limit and fail the producer's own lint gate.
+    speed_headroom: float = Field(default=0.9, gt=0, le=0.95)
 
 
 def _default_framing() -> list[FramingPreset]:
-    return [FramingPreset(name="A", zoom=1.0, y=0.5), FramingPreset(name="B", zoom=1.25, y=0.45)]
+    return [FramingPreset(name="A", zoom=1.0, y=0.5), FramingPreset(name="B", zoom=1.22, y=0.45)]
 
 
 class ProduceSettings(_Settings):
@@ -157,6 +159,7 @@ class ProduceSettings(_Settings):
 
     default_camera: str = Field(default="A", min_length=1)
     min_pause_s: float = Field(default=0.9, gt=0)
+    min_word_ms: float = Field(default=40.0, ge=0)
     beat_s: float = Field(default=0.45, ge=0)
     beat_lead_s: float = Field(default=0.25, ge=0)
     silence_db: float = Field(default=-42.0, lt=0)
@@ -165,6 +168,7 @@ class ProduceSettings(_Settings):
     scan_chunk_s: float = Field(default=30.0, gt=0)
     join_nudge_ms: float = Field(default=150.0, ge=0)
     min_shot_s: float = Field(default=1.0, gt=0)
+    no_pause_warn_s: float = Field(default=60.0, gt=0)
     end_after_ms: float = Field(default=200.0, ge=0)
     crossfade_frames: int = Field(default=2, ge=1)
     punch_in_zoom: float = Field(default=1.25, gt=0)

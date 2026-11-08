@@ -23,12 +23,12 @@ from aar.media.probe import parse_rational
 from aar.plan.inputs import LaughMap, Transcript
 from aar.plan.lint import LintReport, all_rules, lint, validate_profile
 from aar.plan.model import EditPlan, Fps, Source
-from aar.plan.produce.audio import JoinJudge, open_audio, pause_runs
+from aar.plan.produce.audio import JoinJudge, ScanStats, open_audio, pause_runs
 from aar.plan.produce.camera import crop_width, face_x, framing_levels, reframe_keys
 from aar.plan.produce.ending import Ending, end_on_laugh
 from aar.plan.produce.errors import InvariantError, LintGateError, ProduceError, ProduceInputError
 from aar.plan.produce.inputs import CameraSchedule, FaceTrack, KeepList, SyncReport, same_file
-from aar.plan.produce.joins import Judge, Nudge, place_joins
+from aar.plan.produce.joins import Judge, Nudge, place_joins, reach_frames
 from aar.plan.produce.pauses import Trim, find_trims, kept_spans
 from aar.plan.produce.report import PlannerWarning, ProduceReport
 from aar.plan.produce.slivers import Fold, fold_slivers
@@ -63,6 +63,7 @@ class RuleView:
     min_strength: float
     audio_type: str
     max_pan_speed: float | None
+    handle_frames: int  # media each side of a cut that the crossfade plays
 
 
 def _rule(profile: Profile, rule_id: str) -> dict[str, Any] | None:
@@ -116,9 +117,11 @@ def check_profile(profile: Profile, kind: str) -> RuleView:
                     f"min_zoom_delta {delta:g}; got {zooms}"
                 )
     audio_type = "Cross Fade 0 dB"
+    handle = math.ceil(s.crossfade_frames / 2)  # a crossfade is centred on its cut
     fade = _rule(profile, "audio-crossfade")
     if fade is not None:
         audio_type = str(fade["audio_type"])
+        handle = math.ceil(s.crossfade_frames * float(fade["handle_fraction"]))
         if s.crossfade_frames > int(fade["max_frames"]):
             raise ProfileError(
                 f"profile {profile.name!r}: produce.crossfade_frames {s.crossfade_frames} is "
@@ -131,7 +134,7 @@ def check_profile(profile: Profile, kind: str) -> RuleView:
             f"profile {profile.name!r}: a short's camera path is clamped to rules.no-whip-pan; "
             "enable that rule"
         )
-    return RuleView(tolerance, window, min_strength, audio_type, max_pan)
+    return RuleView(tolerance, window, min_strength, audio_type, max_pan, handle)
 
 
 def _matching(plan: EditPlan, path: str, media_root: Path | None) -> list[Source]:
@@ -407,7 +410,7 @@ def cut(
     ``judge``): pure and deterministic for pure arguments."""
     s = settings
     need = min_frames(s.min_shot_s, fps)
-    nudge_frames = math.floor(Fraction(str(s.join_nudge_ms)) / 1000 * fps.num / fps.den)
+    nudge_frames = reach_frames(s.join_nudge_ms, fps)
     pieces: list[Piece] = []
     trims: list[Trim] = []
     for index, k in enumerate(keeps):
@@ -447,7 +450,15 @@ def cut(
     nudges: list[Nudge] = []
     for _ in range(_JOIN_ROUNDS):
         pieces, nudged, join_warnings = place_joins(
-            pieces, judge, words, coverage, fps, nudge_frames=nudge_frames, need=need
+            pieces,
+            judge,
+            words,
+            coverage,
+            keeps,
+            fps,
+            nudge_frames=nudge_frames,
+            need=need,
+            handle=rules.handle_frames,
         )
         nudges += nudged
         pieces, more = fold_slivers(pieces, coverage, fps, need=need)
@@ -487,8 +498,16 @@ def produce(
     fps = stub.fps
     coverage = {src.id: Coverage(src.recording_origin, src.duration) for src in stub.sources}
     origins = {key: value.origin for key, value in coverage.items()}
-    words = Words(transcript.words, rules.word_tolerance_s, fps)
-    keeps, snaps = keep_frames(keep, words, fps, min_shot_s=s.min_shot_s)
+    if transcript.recording is None:
+        raise ProduceInputError(
+            "transcript-unnamed",
+            "the transcript does not name its recording, so its clock cannot be checked "
+            "against the sources",
+            hint='set "recording" to the sources\' recording_id (aar analyze transcript '
+            "--recording)",
+        )
+    words = Words(transcript.words, rules.word_tolerance_s, fps, s.min_word_ms / 1000)
+    keeps, snaps, keep_warnings = keep_frames(keep, words, fps, min_shot_s=s.min_shot_s)
     sched = schedule_frames(stub, schedule, s.default_camera)
     parts = [split(k.start, k.end, i, sched, coverage, fps) for i, k in enumerate(keeps)]
     used = list(dict.fromkeys(p.source for group in parts for p in group))
@@ -512,7 +531,7 @@ def produce(
                 f"the {what} is for recording {name!r}, not the one the cut comes from",
             )
     tracks = bind_faces(stub, faces, media_root)
-    warnings: list[PlannerWarning] = []
+    warnings: list[PlannerWarning] = list(keep_warnings)
     if tracks and stub.kind != "short":
         warnings.append(
             PlannerWarning(
@@ -532,8 +551,11 @@ def produce(
             window_s=s.scan_window_ms / 1000,
             rate=s.scan_rate_hz,
             chunk_s=s.scan_chunk_s,
+            min_pause_s=s.min_pause_s,
+            stats=stats,
         )
 
+    stats: dict[str, ScanStats] = {}
     done = cut(
         keeps,
         parts,
@@ -548,6 +570,20 @@ def produce(
         laughs=laughs,
     )
     warnings += done.warnings
+    for source_id, seen in stats.items():
+        if seen.scanned_s >= s.no_pause_warn_s and seen.pauses == 0:
+            warnings.append(
+                PlannerWarning(
+                    code="no-pauses",
+                    message=(
+                        f"{seen.scanned_s:.1f} s of source {source_id!r} holds no pause of "
+                        f"{s.min_pause_s:g} s below {silence_db:g} dB: the audio may be silent, "
+                        "or the venue's silence threshold wrong"
+                    ),
+                    source=source_id,
+                    hint="check the source's audio and the --venue",
+                )
+            )
     plan, framing_warnings = assemble(stub, done.pieces, keeps, coverage, tracks, profile, rules)
     warnings += framing_warnings
     report = lint(plan, profile, transcript=transcript, laughs=laughs)
