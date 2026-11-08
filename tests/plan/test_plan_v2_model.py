@@ -25,6 +25,7 @@ V2_USES: list[tuple[str, Loc, Any]] = [
     ("end_fade_frames", ("end_fade_frames",), 1),
     ("sources[1].color", ("sources", 1, "color"), {"lut": "match.cube"}),
     ("sources[1].frame_size", ("sources", 1, "frame_size"), [1920, 1080]),
+    ("sources[1].start_timecode", ("sources", 1, "start_timecode"), 86400),
     ("segments[2].transform", ("segments", 2, "transform"), {"zoom": 1.25}),
 ]
 V2_IDS = [use[0] for use in V2_USES]
@@ -38,6 +39,7 @@ V2_EMPTY: list[tuple[Loc, Any]] = [
     (("end_fade_frames",), None),
     (("sources", 0, "color"), None),
     (("sources", 0, "frame_size"), None),
+    (("sources", 0, "start_timecode"), None),
     (("segments", 0, "transform"), None),
 ]
 

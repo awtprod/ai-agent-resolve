@@ -13,8 +13,8 @@ Two clocks appear in a plan:
 
 Versions: a plan says which format it uses in ``version``. Version 2 (the default for a plan
 that does not say) adds the build-from-template fields: ``template``, ``head``, ``outro``,
-``audio_tracks``, ``end_fade_frames``, ``Source.color``, ``Source.frame_size`` and
-``Segment.transform``. Everything
+``audio_tracks``, ``end_fade_frames``, ``Source.color``, ``Source.frame_size``,
+``Source.start_timecode`` and ``Segment.transform``. Everything
 else is the same in both, so every valid version 1 plan is also valid as version 2. A plan that
 says ``"version": 1`` may not use a version 2 field: giving one a value is a validation error
 naming the field. Null (or an empty ``audio_tracks``) is not a use, so a full dump of a version
@@ -71,7 +71,7 @@ PlanVersion = Annotated[Literal[1, 2], BeforeValidator(_whole_number_version)]
 
 #: Fields only a version 2 plan may use, per model.
 V2_PLAN_FIELDS = ("template", "head", "outro", "audio_tracks", "end_fade_frames")
-V2_SOURCE_FIELDS = ("color", "frame_size")
+V2_SOURCE_FIELDS = ("color", "frame_size", "start_timecode")
 V2_SEGMENT_FIELDS = ("transform",)
 
 ShotSize = Literal["close", "medium", "wide", "unknown"]
@@ -109,6 +109,8 @@ Name = Annotated[str, AfterValidator(_not_blank)]
 #: A picture size, [width, height]: two whole numbers above zero (not booleans or decimals).
 FrameSize = Annotated[list[Annotated[StrictInt, Field(gt=0)]], Field(min_length=2, max_length=2)]
 Finite = Annotated[float, Field(allow_inf_nan=False)]
+#: A frame count from 00:00:00:00: a whole number, zero or more (not a boolean or a decimal).
+FrameCount = Annotated[StrictInt, Field(ge=0)]
 
 #: JSON Schema dialect the plan schema is written in (what pydantic emits).
 JSON_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
@@ -296,6 +298,14 @@ class Source(_Model):
         "(coded) pixel size (or any size with the same display aspect). Reframe x/y are "
         "shares of it; the FCPXML export needs it to frame a clip whose aspect differs from "
         "the timeline's.",
+    )
+    start_timecode: FrameCount | None = Field(
+        default=None,
+        description="Version 2. The media's embedded start timecode as a frame count from "
+        "00:00:00:00 at the source's frame rate (drop-frame timecode counted as the frames it "
+        "labels): 01:00:00:00 is 86400 at 24 fps and 108000 at 29.97 non-drop. Source positions "
+        "(src_in, src_out) still count from the file's first frame; the FCPXML export writes "
+        "the asset's start at this timecode, which Resolve needs to link a clip to its file.",
     )
 
 
