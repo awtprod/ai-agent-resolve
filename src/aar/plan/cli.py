@@ -1,5 +1,5 @@
-"""``aar plan`` commands: print the EditPlan JSON Schema, lint, compile (apply), produce and
-export plans."""
+"""``aar plan`` commands: print the EditPlan JSON Schema, lint, compile (apply), produce, export
+and render plans."""
 
 from __future__ import annotations
 
@@ -35,6 +35,8 @@ from aar.plan.lint import Finding, LintReport, Ref, lint
 from aar.plan.model import EditPlan
 from aar.plan.produce import cli as produce_cli
 from aar.plan.profile import ProfileError, load_profile
+from aar.plan.render import RUNTIME_CODES as RENDER_RUNTIME_CODES
+from aar.plan.render import RenderError, render_plan
 
 _PROG = "aar plan"
 EXIT_OK = 0
@@ -144,6 +146,40 @@ def register(subparsers: Any) -> None:
     )
     export.add_argument("--json", action="store_true", help="Print the report as JSON.")
     export.set_defaults(func=_cmd_export)
+
+    render = sub.add_parser(
+        "render",
+        help="Render a linted EditPlan v2 to MP4 with ffmpeg on the hub (no Resolve needed).",
+        description="Lints first (refuses a plan with lint errors), renders the plan from the "
+        "hub's own media copies with ffmpeg (the FCPXML export's layout: cuts, dissolves, "
+        "handles, reframe crops, titles, crossfades, gains, loudness to the profile), runs "
+        "aar qa check on the result, and writes the file and its report (<stem>.render.json) "
+        "as one pair. Exit: 0 rendered and QA did not fail, 1 rendered and QA failed, 2 refused "
+        "or unreadable input, 3 ffmpeg failed or timed out.",
+    )
+    render.add_argument("plan", type=Path, help="EditPlan JSON file.")
+    render.add_argument("--profile", help="Profile name or .toml path (default: the plan's).")
+    render.add_argument("--out", type=Path, required=True, help="MP4 (or .mov) file to write.")
+    render.add_argument(
+        "--media-map",
+        type=Path,
+        help="JSON object of linux_root -> windows_root (the export's map, read the other way), "
+        "for sources with edit-PC paths.",
+    )
+    render.add_argument(
+        "--preset",
+        choices=["review", "master"],
+        default="review",
+        help="review: H.264 High + AAC with faststart; master: higher quality H.264, or ProRes "
+        "(.mov) when the profile's [render] master_codec says so.",
+    )
+    render.add_argument("--transcript", type=Path, help="Transcript JSON, for the lint and QA.")
+    render.add_argument("--laughs", type=Path, help="Laugh map JSON, for the lint.")
+    render.add_argument(
+        "--overwrite", action="store_true", help="Replace an existing file and report."
+    )
+    render.add_argument("--json", action="store_true", help="Print the report as JSON.")
+    render.set_defaults(func=_cmd_render)
 
 
 def _cmd_schema(args: argparse.Namespace) -> int:
@@ -502,3 +538,96 @@ def _do_verify(path: Path, plan: EditPlan, profile: Any, media_map: Any, as_json
     if written != EXIT_OK:
         return written
     return EXIT_OK if result.ok else EXIT_ERRORS
+
+
+# -- render (S18b) ------------------------------------------------------------------------------
+
+EXIT_RENDER_FAILED = 3  # ffmpeg failed or timed out while rendering
+
+
+def _render_refusal(exc: RenderError, as_json: bool) -> int:
+    code = _export_refusal(exc, as_json)
+    if exc.code in RENDER_RUNTIME_CODES:
+        tail = exc.details.get("stderr_tail")
+        if tail and not as_json:
+            cli_io.warn(f"  ffmpeg: {tail.strip().splitlines()[-1] if tail.strip() else ''}")
+        return EXIT_RENDER_FAILED
+    return code
+
+
+def _render_text(report: dict[str, Any], out: Path, report_file: Path) -> str:
+    timeline = report["timeline"]
+    loud = report["loudness"]
+    qa = report["qa"]
+    measured = loud["output"].get("integrated_lufs")
+    lines = [
+        f"rendered {report['preset']} {report['format']}: {out} (sha256 {report['sha256'][:12]}, "
+        f"{report['size_bytes']} bytes)",
+        f"timeline {report['plan']['timeline']!r}: {timeline['fps']} fps, "
+        f"{timeline['total_frames']} frames, {timeline['resolution']}",
+        f"loudness: {loud['method']} to {loud['target_lufs']:g} LUFS"
+        + (f" -> {measured:g} LUFS" if measured is not None else "")
+        + (f" ({loud['note']})" if loud.get("note") else ""),
+        f"qa: {qa['status']}"
+        + (f" (unchecked: {', '.join(qa['unchecked'])})" if qa.get("unchecked") else ""),
+        *(
+            f"  {c['id']}: {c['status']}: {c['message']}"
+            for c in qa["checks"]
+            if c["status"] in ("fail", "warn")
+        ),
+        f"not rendered ({len(report['not_rendered'])}):",
+        *(
+            f"  {item['location']}: {item['detail']} -> {item['action']}"
+            for item in report["not_rendered"]
+        ),
+        f"notes ({len(report['notes'])}):",
+        *(f"  {item['location']}: {item['detail']}" for item in report["notes"]),
+        f"report: {report_file}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _cmd_render(args: argparse.Namespace) -> int:
+    as_json: bool = args.json
+    try:
+        plan = EditPlan.model_validate_json(args.plan.read_text(encoding="utf-8"))
+        transcript: Transcript | None = (
+            load_transcript(args.transcript) if args.transcript else None
+        )
+        laughs: LaughMap | None = load_laughs(args.laughs) if args.laughs else None
+        profile = load_profile(args.profile or plan.profile)
+        media_map = load_media_map(args.media_map) if args.media_map else None
+    except ValidationError as exc:
+        return _input_error(
+            "invalid-input", "input failed validation", _validation_details(exc), as_json
+        )
+    except ExportError as exc:
+        return _export_refusal(exc, as_json)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ProfileError) as exc:
+        return _input_error(type(exc).__name__, str(exc), [], as_json)
+    try:
+        result = render_plan(
+            plan,
+            profile,
+            out=args.out,
+            preset=args.preset,
+            media_map=media_map,
+            media_root=args.plan.resolve().parent,
+            transcript=transcript,
+            laughs=laughs,
+            overwrite=args.overwrite,
+        )
+    except RenderError as exc:
+        return _render_refusal(exc, as_json)
+    except OSError as exc:
+        return _input_error(type(exc).__name__, str(exc), [], as_json)
+    for finding in result.warnings:
+        cli_io.warn(f"warning {finding.rule}: {finding.message}")
+    if as_json:
+        text = json.dumps(result.report, indent=2, ensure_ascii=False) + "\n"
+    else:
+        text = _render_text(result.report, result.out, result.report_path)
+    written = cli_io.emit(_PROG, text)
+    if written != EXIT_OK:
+        return written
+    return EXIT_OK if result.qa_ok else EXIT_ERRORS
