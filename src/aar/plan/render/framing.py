@@ -141,14 +141,24 @@ def _num(value: float) -> str:
 
 def _piecewise(points: list[tuple[int, float]], t: str) -> str:
     """Linear between ``(time, value)`` points, held outside them, as an ffmpeg expression in
-    ``t``."""
+    ``t``. The pieces are chosen by a balanced tree of ``if(lt(...))`` tests, so the nesting
+    grows with the log of the key count (a long reframe has thousands of keys)."""
     if all(v == points[0][1] for _, v in points):
         return _num(points[0][1])
-    expr = _num(points[-1][1])
-    for (t0, v0), (t1, v1) in reversed(list(itertools.pairwise(points))):
-        piece = f"{_num(v0)}+({_num(v1 - v0)})*({t}-({t0}))/{t1 - t0}"
-        expr = f"if(lt({t},{t1}),{piece},{expr})"
-    return f"if(lt({t},{points[0][0]}),{_num(points[0][1])},{expr})"
+
+    def piece(k: int) -> str:
+        (t0, v0), (t1, v1) = points[k], points[k + 1]
+        return f"{_num(v0)}+({_num(v1 - v0)})*({t}-({t0}))/{t1 - t0}"
+
+    def tree(lo: int, hi: int) -> str:  # pieces lo .. hi - 1
+        if hi - lo == 1:
+            return piece(lo)
+        mid = (lo + hi) // 2
+        return f"if(lt({t},{points[mid][0]}),{tree(lo, mid)},{tree(mid, hi)})"
+
+    first, last = points[0], points[-1]
+    inner = tree(0, len(points) - 1)
+    return f"if(lt({t},{first[0]}),{_num(first[1])},if(lt({t},{last[0]}),{inner},{_num(last[1])}))"
 
 
 def _window_plan(geo: Geometry, keys: list[ReframeKey], lead: int, frames: int) -> WindowPlan:

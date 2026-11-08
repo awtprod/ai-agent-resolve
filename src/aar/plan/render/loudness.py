@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from aar.media import MediaError, input_url, measure_audio
+from aar.media import MediaError, MediaTimeout, input_url, measure_audio
 from aar.plan.profile import QATargets, RenderSettings
 from aar.plan.render.errors import RenderError
 from aar.plan.render.runner import run_ffmpeg
@@ -72,6 +72,14 @@ def _measure(path: Path, qa: QATargets, timeout_s: float) -> dict[str, float | N
         m = measure_audio(
             path, silence_db=qa.silence_db, silence_min_s=qa.silence_min_s, timeout_s=timeout_s
         )
+    except MediaTimeout as exc:
+        raise RenderError(
+            "render_timeout",
+            f"measuring the loudness of {path.name} ran past {exc.timeout_s:g} s",
+            "raise [render] timeout_per_media_s or timeout_base_s for this machine",
+            stage="loudness-measure",
+            timeout_s=exc.timeout_s,
+        ) from None
     except MediaError as exc:
         raise RenderError(
             "render_failed",

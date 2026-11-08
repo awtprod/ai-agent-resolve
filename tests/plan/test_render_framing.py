@@ -207,3 +207,30 @@ def test_unconformed_clips_scale_or_fit() -> None:
     )
     assert fit.mode == "fit" and fit.fitted == (1080, 608)
     assert picture_filters(fit, PORTRAIT) == ["scale=1080:608", "pad=1080:1920:0:656:black"]
+
+
+def test_a_long_reframe_nests_logarithmically_and_stays_exact() -> None:
+    keys = [
+        ReframeKey(time=12 * i, x=0.5 + 0.1 * math.sin(i / 7), zoom=1 + 0.2 * (i % 3))
+        for i in range(600)
+    ]
+    framing = framing_for(
+        _clip((1920, 1080), True),
+        keys=keys,
+        transform=Transform(zoom=1.1),
+        display=(640, 360),
+        resolution=PORTRAIT,
+        lead=0,
+        frames=12 * 600,
+    )
+    assert framing.window is not None
+    expr = framing.window.expressions[0]
+    depth = deepest = 0
+    for ch in expr:
+        depth += {"(": 1, ")": -1}.get(ch, 0)
+        deepest = max(deepest, depth)
+    assert deepest < 40  # a chain of 600 pieces would nest 600 deep
+    for frame in (0, 5, 3001, 4567, 12 * 599, 12 * 600 - 1):
+        want = _final_corners(framing, frame)
+        got = [_ffeval(e, frame + 1) for e in framing.window.expressions]
+        assert got == pytest.approx([c for corner in want for c in corner], abs=1e-6)

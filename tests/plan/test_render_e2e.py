@@ -495,3 +495,28 @@ def test_cli_exit_codes_for_qa_failure_and_ffmpeg_failure(media, tmp_path, capsy
         capsys, str(plan_file), "--profile", str(profile), "--out", str(tmp_path / "f.mp4")
     )
     assert code == 3 and "render_failed" in err
+
+
+def test_a_render_past_its_timeout_is_stopped_and_leaves_nothing(media, tmp_path: Path) -> None:
+    plan = plan_of(media, [{"source": "a", "src_in": 0, "src_out": 48}])
+    profile = quick()
+    tight = profile.model_copy(
+        update={
+            "render": profile.render.model_copy(
+                update={"timeout_base_s": 0.05, "timeout_per_media_s": 0.001}
+            )
+        }
+    )
+    out = tmp_path / "slow.mp4"
+    with pytest.raises(RenderError) as info:
+        render_plan(plan, tight, out=out)
+    assert info.value.code == "render_timeout" and info.value.details["stage"]
+    assert not out.exists() and not [p for p in tmp_path.iterdir() if "aar-render" in p.name]
+
+
+def test_a_missing_ffmpeg_is_refused(media, tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AAR_FFMPEG", str(tmp_path / "no-ffmpeg"))
+    plan = plan_of(media, [{"source": "a", "src_in": 0, "src_out": 12}])
+    with pytest.raises(RenderError) as info:
+        render_plan(plan, quick(), out=tmp_path / "x.mp4")
+    assert info.value.code == "tool_missing"

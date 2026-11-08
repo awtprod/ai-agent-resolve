@@ -21,7 +21,6 @@ Nothing touches ``/tmp`` or the network.
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
 import os
 import secrets
@@ -31,6 +30,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Literal
 
+from aar.host.transport import sha256_file
 from aar.media import MediaToolMissing, input_url, resolve_tool, timeout_for
 from aar.plan.apply.inputs import plan_hash
 from aar.plan.export.errors import ExportError
@@ -64,7 +64,6 @@ __all__ = [
 Preset = Literal["review", "master"]
 LUT_SUFFIXES = (".cube", ".3dl", ".dat", ".m3d", ".csp")
 LUT_MAX_BYTES = 64 * 1024 * 1024
-_HASH_CHUNK = 1024 * 1024
 
 
 @dataclass
@@ -172,14 +171,6 @@ def _luts(plan: EditPlan, used: list[str], media_root: Path | None) -> dict[str,
             if path.is_file() and os.access(path, os.R_OK) and path.stat().st_size < LUT_MAX_BYTES:
                 found[source.id] = path
     return found
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        while chunk := fh.read(_HASH_CHUNK):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _qa_plan(plan: EditPlan, hub: dict[str, HubSource]) -> EditPlan:
@@ -382,7 +373,7 @@ def _render(
         "format": container,
         "preset": preset,
         "file": out.name,
-        "sha256": _sha256(rendered_file),
+        "sha256": sha256_file(str(rendered_file)).lower(),  # streamed
         "size_bytes": rendered_file.stat().st_size,
         "plan": {
             "project": plan.project,
