@@ -35,10 +35,18 @@ from pydantic import TypeAdapter  # noqa: E402
 _EDIT_PATH = TypeAdapter(EditPath)
 
 
+#: Source fields added after ``plan_hash`` was first used (S18): left out while unset, so the
+#: hash of every plan written before them, and the phase results stamped with it, stay the same.
+_LATER_SOURCE_FIELDS = ("frame_size",)
+
+
 def plan_hash(plan: EditPlan) -> str:
-    canonical = json.dumps(
-        plan.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    )
+    data = plan.model_dump(mode="json")
+    for source in data["sources"]:
+        for name in _LATER_SOURCE_FIELDS:
+            if source.get(name) is None:
+                source.pop(name, None)
+    canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
