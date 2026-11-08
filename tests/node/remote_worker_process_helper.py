@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import threading
@@ -61,11 +62,13 @@ def main() -> int:
 
     def runtime_factory(*pos: object, **kw: object) -> NodeRuntime:
         clock = FakeClock()
+        # Keep the CLI's poll interval (run_node passes it in its BrokerConfig).
+        poll = kw.pop("broker_config").context_poll_seconds  # type: ignore[attr-defined]
         runtime = real_remote(
             *pos,
             **kw,
             clock=clock,
-            broker_config=JOB_CONFIG,
+            broker_config=dataclasses.replace(JOB_CONFIG, context_poll_seconds=poll),
             input_idle=None,
             idle_window=IDLE,
             drain_budget=None,
@@ -84,6 +87,7 @@ def main() -> int:
         lease_seconds=1,
         heartbeat_seconds=0.2,
         tick_seconds=0.02,
+        context_poll_seconds=2.0,
         connect_timeout=0.5,
         read_timeout=0.5,
         response_cap=4 << 20,

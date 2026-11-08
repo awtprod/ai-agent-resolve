@@ -1,0 +1,68 @@
+plan apply: CCN / Baking Resistance Ep1  (template 'CCN Longform Template', longform, 24000/1001 fps)
+profile ccn: 4 segment(s), 426 frame(s); batch size 10
+
+PHASE prepare - prepare (7 steps, 0 unresolved ref(s))
+  1. timeline.branch  [branch]
+       branch 'CCN Longform Template' (reuse)
+  2. media.import  [import:aar/A:0]
+       import 1 file(s) into aar/A
+  3. media.import  [import:aar/B:0]
+       import 1 file(s) into aar/B
+  4. media.import  [import:aar/A2:0]
+       import 1 file(s) into aar/A2
+  5. media.import  [import:aar/X:0]
+       import 1 file(s) into aar/X
+  6. media.find  [find:title:CCN Lower Third]
+       find title template 'CCN Lower Third'
+  7. media.find  [find:title:CCN Sting]
+       find title template 'CCN Sting'
+
+PHASE assemble - assemble (4 steps, 0 unresolved ref(s))
+  1. track.ensure  [tracks]
+       ensure 2 video and 6 audio track(s)
+  2. timeline.append_ranges  [append:v1:0]
+       append 4 range(s) on video track 1 (record 0..216)
+  3. timeline.append_ranges  [append:outro-v1]
+       append outro video on track 1 (record 306)
+  4. timeline.append_ranges  [append:outro-a5]
+       append outro audio on audio track 5 (A5)
+  append ranges per video/audio track:
+    A5: 306..426  (1 range(s))
+    V1: 0..72, 72..144, 144..216, 216..306, 306..426  (5 range(s))
+
+PHASE finish - finish (7 steps, 0 unresolved ref(s))
+  colour               segment 0 (video track 1 @0)
+       CDL slope (1.05, 1.0, 0.95) sat 1.1, LUT 'CCN Show LUT'
+  colour               segment 2 (video track 1 @144)
+       CDL slope (1.05, 1.0, 0.95) sat 1.1, LUT 'CCN Show LUT'
+  transform            segment 0 (video track 1 @0)
+       zoom 1.1, pan 0, tilt 0, rot 0, flip_h False, flip_v False
+  head_transition      head from black on segment 0 (video track 1)
+       Cross Dissolve, right (from black), 15 frames
+  audio_crossfade      after segment 2 (audio item 0)
+       Cross Fade 0 dB, center, 12 frames
+  outro_transition     content into outro (segment 3)
+       Cross Dissolve, right, 15 frames
+  fade                 first segment 0 (audio item 0)
+       fade_in 24 fade_out None
+  fade                 outro audio (audio item 0)
+       fade_in None fade_out 2
+  audio_gain           segment 2 (audio item 0)
+       -2 dB
+  title                title 0 on video track 2 (record 48..120)
+       template 'CCN Lower Third': Jane Doe / Head Judge
+  sting                sting on video track 2 (record 312..360)
+       template 'CCN Sting': Baking Resistance
+  marker               record 0
+       Green Act 1 (1f)
+  marker               record 144
+       Blue Act 2 (1f)
+
+WARNINGS (4)
+  ! audio track 'A1' is marked mute in the plan; mute is template state in 21.1, so it is not applied -- verify it in the template
+  ! audio track 'A2' is marked mute in the plan; mute is template state in 21.1, so it is not applied -- verify it in the template
+  ! audio track 'A3' is marked mute in the plan; mute is template state in 21.1, so it is not applied -- verify it in the template
+  ! audio track 'A4' is marked mute in the plan; mute is template state in 21.1, so it is not applied -- verify it in the template
+NOTES / GAPS (2)
+  - template 'CCN Longform Template' has 10 item(s) (<= 30)
+  - [I] head audio fade uses the clip fade handle (item.set_fades), not an audio transition from silence (inferred: the facts doc doesn't cover this)

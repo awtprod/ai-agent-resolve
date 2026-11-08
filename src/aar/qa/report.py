@@ -23,6 +23,7 @@ SkipReason = Literal[
     "render-unreadable",
     "no-audio",
     "not-applicable",
+    "no-mixed-audio",
 ]
 
 # Why a check that ran could not check everything (``measured["unchecked_reason"]``).

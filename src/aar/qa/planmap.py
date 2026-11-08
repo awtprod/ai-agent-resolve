@@ -74,8 +74,32 @@ def is_continuous(
     return abs(gap) <= tolerance
 
 
-def cuts(plan: EditPlan, tolerance_frames: int) -> list[Cut]:
-    """Every non-continuous join between usable segments, in ``plan.joins()`` order."""
+def carries_mixed_audio(plan: EditPlan, video_track: int) -> bool:
+    """Whether a content join on ``video_track`` carries audio that reaches the mix (S13b F3).
+
+    A plan does not name the audio track of a segment, so the convention is positional: video
+    track ``N`` carries its audio on ``audio_tracks[N-1]`` (A1 first). That audio reaches the mix
+    when the track is **unmuted, or routed to a bus (``bus`` set), or is itself a bus** that
+    another track feeds -- so the CCN A1-A4 (muted but bussed to A5) still carry the dialogue to
+    the mix. Only a muted, unrouted, non-bus track carries no mix. With no ``audio_tracks`` entry
+    for the track -- an empty list, as every v1 plan has, or a short one -- there is no routing
+    information, so the join is checked.
+    """
+    tracks = plan.audio_tracks
+    if not tracks or video_track > len(tracks):
+        return True
+    entry = tracks[video_track - 1]
+    bus_names = {t.bus for t in tracks if t.bus is not None}
+    return (not entry.mute) or entry.bus is not None or entry.name in bus_names
+
+
+def cuts(plan: EditPlan, tolerance_frames: int, *, only_mixed: bool = True) -> list[Cut]:
+    """Every non-continuous join between usable segments, in ``plan.joins()`` order.
+
+    With ``only_mixed`` (the default for the QA checks), joins on a track that carries no mixed
+    audio are dropped: their source audio never reaches the render, so a quiet-pause or
+    re-transcribe check there would judge audio the viewer never hears. The caller distinguishes
+    "no cuts" from "all cuts filtered" by also calling with ``only_mixed=False`` (S13b F3)."""
     sources = plan.source_map()
     ranges = plan.record_ranges()
     found: list[Cut] = []
@@ -83,6 +107,8 @@ def cuts(plan: EditPlan, tolerance_frames: int) -> list[Cut]:
         if not (_usable(plan, sources, outgoing) and _usable(plan, sources, incoming)):
             continue
         if is_continuous(plan, sources, outgoing, incoming, tolerance_frames):
+            continue
+        if only_mixed and not carries_mixed_audio(plan, plan.segments[incoming].track):
             continue
         seg = plan.segments[incoming]
         out_seg = plan.segments[outgoing]

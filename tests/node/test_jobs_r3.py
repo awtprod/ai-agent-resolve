@@ -1609,6 +1609,7 @@ def test_broker_crash_is_recorded_logged_and_explains_the_stall(
         raise RuntimeError("Resolve went away")
 
     world.gw.get_context = gone  # type: ignore[method-assign]
+    world.gw.get_position = gone  # type: ignore[method-assign]
     with caplog.at_level(logging.ERROR, logger="aar.node.jobs.runner"):
         for _ in range(5):
             world.runner.pump()

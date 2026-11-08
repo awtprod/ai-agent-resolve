@@ -2,7 +2,10 @@
 
 ``ResolveGateway`` is the minimal surface the session broker needs: read the current context
 (project, timeline, page, playhead, Deliver settings, media-pool bin, Project Manager folder)
-and put it back.
+and put it back. There are two reads. ``get_position`` reads the working position only and is
+the one the broker polls; ``get_context`` adds the Deliver settings, which on Resolve 21.1 must
+not be polled (``GetCurrentRenderMode`` raises a page signal on every call, and reading it on
+every worker tick crashed Resolve on 2026-11-07, DESIGN R4).
 ``ScriptApiGateway`` implements it on the real scripting objects of Resolve 21.1
 (``Resolve`` / ``ProjectManager`` / ``Project`` / ``Timeline`` / ``MediaPool`` / ``Folder``).
 
@@ -14,7 +17,9 @@ structured results instead of guessing.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass, fields
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, fields, replace
 from typing import Any, Protocol, runtime_checkable
 
 from aar.node.locator import ProjectLocator
@@ -26,7 +31,11 @@ VALID_PAGES: frozenset[str] = frozenset(
 
 # Fields of ``ResolveContext`` that are state rather than a human's working position: they are
 # not restored and a change in them is not a sign of human activity.
-_NON_POSITIONAL_FIELDS: frozenset[str] = frozenset({"rendering"})
+_NON_POSITIONAL_FIELDS: frozenset[str] = frozenset({"rendering", "render_measured"})
+
+# The Deliver fields: only the full read (``get_context``) takes them. When either side of a
+# comparison did not (``render_measured`` False), they are not compared.
+_DELIVER_FIELDS: frozenset[str] = frozenset({"render_format", "render_codec", "render_mode"})
 
 # Fields that are only measured on request (reading them navigates the Project Manager). A
 # ``None`` there means "not measured", which is never a difference.
@@ -34,6 +43,31 @@ _MEASURED_ON_REQUEST: frozenset[str] = frozenset({"project_manager_path"})
 
 # Project Manager folders nest; anything deeper than this is treated as a broken walk.
 MAX_PM_DEPTH = 64
+
+_DELIVER_CHANGED: ContextVar[list[str] | None] = ContextVar("aar_deliver_changed", default=None)
+
+
+def note_deliver_changed(why: str) -> None:
+    """Report that the running hot op may have left the Deliver settings changed.
+
+    The gateway's own Deliver setters report themselves. Op code that drives the API directly
+    reports what it leaves changed (``render.build`` does when its own Deliver restore fails).
+    The broker then reads the Deliver settings once after the op, so its restore takes them
+    for its own change, not a human's. Outside an op body (``deliver_changes``) it does
+    nothing, so the broker's own restore never reports itself."""
+    marks = _DELIVER_CHANGED.get()
+    if marks is not None:
+        marks.append(why)
+
+
+@contextmanager
+def deliver_changes(marks: list[str]) -> Iterator[None]:
+    """Collect the ``note_deliver_changed`` reports made inside the block into ``marks``."""
+    token = _DELIVER_CHANGED.set(marks)
+    try:
+        yield
+    finally:
+        _DELIVER_CHANGED.reset(token)
 
 
 class GatewayError(Exception):
@@ -83,9 +117,14 @@ class ResolveContext:
     """The full Project Manager path from the root, ``()`` at the root. Only measured on request
     (``get_context(with_pm_path=True)``), because reading it walks the folder tree."""
     rendering: bool = False
+    render_measured: bool = True
+    """Whether the Deliver fields were read. ``get_position`` does not read them: then they are
+    ``None`` for "not read", and a comparison skips them."""
 
     def position(self) -> dict[str, object]:
-        """The restorable working position, i.e. every field except state like ``rendering``."""
+        """The restorable working position, i.e. every field except state like ``rendering``.
+
+        Its Deliver fields mean "not read" when ``render_measured`` is False."""
         return {
             f.name: getattr(self, f.name)
             for f in fields(self)
@@ -100,13 +139,16 @@ class ResolveContext:
         """Position fields that differ, as ``{field: (self_value, other_value)}``.
 
         A field measured only on request (the Project Manager path) is compared only when
-        both sides measured it.
+        both sides measured it, and so are the Deliver fields: a position read
+        (``render_measured`` False) never shows a Deliver change, from or to a value.
         """
         mine, theirs = self.position(), other.position()
+        unread = _DELIVER_FIELDS if not (self.render_measured and other.render_measured) else ()
         return {
             k: (mine[k], theirs[k])
             for k in mine
             if mine[k] != theirs[k]
+            and k not in unread
             and not (k in _MEASURED_ON_REQUEST and (mine[k] is None or theirs[k] is None))
         }
 
@@ -147,8 +189,18 @@ class ResolveGateway(Protocol):
     """The minimal Resolve surface the broker needs. Mutators raise ``GatewayError`` on failure."""
 
     def get_context(self, *, with_pm_path: bool = False) -> ResolveContext:
-        """Read the current context. Read-only, except that ``with_pm_path`` walks the Project
-        Manager up to the root and back down to measure ``project_manager_path``."""
+        """Read the current context, Deliver fields included. Read-only, except that
+        ``with_pm_path`` walks the Project Manager up to the root and back down to measure
+        ``project_manager_path``. Never poll it: see ``get_position``."""
+        ...
+
+    def get_position(self) -> ResolveContext:
+        """Read the working position only: ``get_context`` without the Deliver fields.
+
+        The read to poll. It never calls ``GetCurrentRenderMode`` (on Resolve 21.1 each call
+        raises a "Main view page is changed" signal, and polling it crashed Resolve) or
+        ``GetCurrentRenderFormatAndCodec`` (untested there, so treated as suspect). The Deliver
+        fields are ``None`` and ``render_measured`` is False. Read-only."""
         ...
 
     def load_project(self, locator: ProjectLocator) -> None:
@@ -463,34 +515,35 @@ class ScriptApiGateway:
     def find_project_folders(self, name: str) -> list[tuple[str, ...]]:
         return [listing.path for listing in self.walk_project_manager() if name in listing.projects]
 
-    def get_context(self, *, with_pm_path: bool = False) -> ResolveContext:
+    def _read_position(self, *, with_pm_path: bool) -> tuple[ResolveContext, Any]:
+        """The position read, and the current project (``None`` if none) for the Deliver read.
+
+        Every call here raised no page signal on Resolve 21.1 (isolation run, 2026-11-07),
+        except ``GetCurrentTimecode``, which that run could not reach (no timeline open)."""
         pm = self._project_manager()
         pm_path = self.get_project_manager_path() if with_pm_path else None
         page = _str_or_none(self.resolve.GetCurrentPage())
         pm_folder = _str_or_none(pm.GetCurrentFolder())
         project = pm.GetCurrentProject()
         if project is None:
-            return ResolveContext(
+            position = ResolveContext(
                 project=None,
                 page=page,
                 project_manager_folder=pm_folder,
                 project_manager_path=pm_path,
+                render_measured=False,
             )
+            return position, None
         timeline = project.GetCurrentTimeline()
-        fmt = project.GetCurrentRenderFormatAndCodec() or {}
-        mode = project.GetCurrentRenderMode()
         media_pool = project.GetMediaPool()
         folder = media_pool.GetCurrentFolder() if media_pool is not None else None
-        return ResolveContext(
+        position = ResolveContext(
             project=_str_or_none(project.GetName()),
             project_id=_str_or_none(project.GetUniqueId()),
             timeline=_str_or_none(timeline.GetName()) if timeline is not None else None,
             timeline_id=_str_or_none(timeline.GetUniqueId()) if timeline is not None else None,
             page=page,
             playhead=_str_or_none(timeline.GetCurrentTimecode()) if timeline is not None else None,
-            render_format=_str_or_none(fmt.get("format")),
-            render_codec=_str_or_none(fmt.get("codec")),
-            render_mode=int(mode) if mode is not None else None,
             folder=(
                 FolderRef(str(folder.GetName()), _str_or_none(folder.GetUniqueId()))
                 if folder is not None
@@ -499,6 +552,25 @@ class ScriptApiGateway:
             project_manager_folder=pm_folder,
             project_manager_path=pm_path,
             rendering=bool(project.IsRenderingInProgress()),
+            render_measured=False,
+        )
+        return position, project
+
+    def get_position(self) -> ResolveContext:
+        return self._read_position(with_pm_path=False)[0]
+
+    def get_context(self, *, with_pm_path: bool = False) -> ResolveContext:
+        position, project = self._read_position(with_pm_path=with_pm_path)
+        if project is None:  # no project open: there are no Deliver settings to read
+            return replace(position, render_measured=True)
+        fmt = project.GetCurrentRenderFormatAndCodec() or {}
+        mode = project.GetCurrentRenderMode()
+        return replace(
+            position,
+            render_format=_str_or_none(fmt.get("format")),
+            render_codec=_str_or_none(fmt.get("codec")),
+            render_mode=int(mode) if mode is not None else None,
+            render_measured=True,
         )
 
     def load_project(self, locator: ProjectLocator) -> None:
@@ -594,6 +666,7 @@ class ScriptApiGateway:
             raise GatewayError("playhead_set_failed", f"SetCurrentTimecode({timecode!r}) failed")
 
     def set_render_format_and_codec(self, render_format: str, codec: str) -> None:
+        note_deliver_changed("SetCurrentRenderFormatAndCodec")
         if not self._project().SetCurrentRenderFormatAndCodec(render_format, codec):
             raise GatewayError(
                 "render_format_failed",
@@ -601,6 +674,7 @@ class ScriptApiGateway:
             )
 
     def set_render_mode(self, mode: int) -> None:
+        note_deliver_changed("SetCurrentRenderMode")
         if not self._project().SetCurrentRenderMode(mode):
             raise GatewayError("render_mode_failed", f"SetCurrentRenderMode({mode!r}) failed")
 
@@ -628,6 +702,7 @@ class ScriptApiGateway:
             raise GatewayError("preset_save_failed", f"SaveAsNewRenderPreset({name!r}) failed")
 
     def load_render_preset(self, name: str) -> None:
+        note_deliver_changed("LoadRenderPreset")
         if not self._project().LoadRenderPreset(name):
             raise GatewayError("preset_load_failed", f"LoadRenderPreset({name!r}) failed")
 

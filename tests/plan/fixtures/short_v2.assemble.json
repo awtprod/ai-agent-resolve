@@ -1,0 +1,94 @@
+{
+  "plan_sha256": "a78a3d895889cf301d1f0cb8279af7a5c5610ee97cf75b25b76d6a1f25b0f7f1",
+  "job_id": "job_assemble_test",
+  "branch": {
+    "name": "CCN Short Template [agent:ccn-bot v1]",
+    "unique_id": "tl-branch-0001"
+  },
+  "appends": [
+    {
+      "timeline": {
+        "name": "CCN Short Template [agent:ccn-bot v1]",
+        "unique_id": "tl-branch-0001"
+      },
+      "timeline_fps": 24.0,
+      "cursor": 0,
+      "next_cursor": null,
+      "done": true,
+      "ranges": [
+        {
+          "index": 0,
+          "status": "appended",
+          "planned_record_in": 0,
+          "planned_record_out": 120,
+          "planned_frames": 120,
+          "end_frame_used": 120,
+          "video": {
+            "item_id": "V1:0",
+            "track_type": "video",
+            "track": 1,
+            "start": 0,
+            "end": 120,
+            "duration": 120,
+            "record_in": 0,
+            "record_out": 120,
+            "source_start": 0,
+            "source_end": 120
+          },
+          "audio": [
+            {
+              "item_id": "A1:0",
+              "track_type": "audio",
+              "track": 1,
+              "start": 0,
+              "end": 120,
+              "duration": 120,
+              "record_in": 0,
+              "record_out": 120,
+              "source_start": 0,
+              "source_end": 120
+            }
+          ],
+          "notes": []
+        },
+        {
+          "index": 1,
+          "status": "appended",
+          "planned_record_in": 120,
+          "planned_record_out": 240,
+          "planned_frames": 120,
+          "end_frame_used": 240,
+          "video": {
+            "item_id": "V1:120",
+            "track_type": "video",
+            "track": 1,
+            "start": 120,
+            "end": 240,
+            "duration": 120,
+            "record_in": 120,
+            "record_out": 240,
+            "source_start": 120,
+            "source_end": 240
+          },
+          "audio": [
+            {
+              "item_id": "A1:120",
+              "track_type": "audio",
+              "track": 1,
+              "start": 120,
+              "end": 240,
+              "duration": 120,
+              "record_in": 120,
+              "record_out": 240,
+              "source_start": 120,
+              "source_end": 240
+            }
+          ],
+          "notes": []
+        }
+      ],
+      "gaps": [],
+      "notes": []
+    }
+  ]
+}
