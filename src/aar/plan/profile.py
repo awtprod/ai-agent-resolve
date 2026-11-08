@@ -92,11 +92,22 @@ class QATargets(_Model):
         return self
 
 
+class ExportSettings(_Model):
+    """Settings for ``aar plan export`` (FCPXML). Optional, so an older profile still loads."""
+
+    timeline_start: str = Field(
+        default="01:00:00:00",
+        pattern=r"^[0-9]{2}:[0-9]{2}:[0-9]{2}:[0-9]{2}$",
+        description="Non-drop timecode the exported timeline starts at.",
+    )
+
+
 class Profile(_Model):
     name: str
     description: str = ""
     qa: QATargets
     rules: dict[str, RuleConfig]
+    export: ExportSettings = Field(default_factory=ExportSettings)
 
 
 def parse_profile(data: dict[str, Any], *, origin: str = "profile") -> Profile:
