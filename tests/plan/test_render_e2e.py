@@ -45,7 +45,9 @@ def media(tmp_path_factory: pytest.TempPathFactory) -> dict[str, tuple[Path, Spe
         "a": Spec("red", 440, 200, centre=(110, 70), quiet=((22, 26),)),
         "b": Spec("green", 660, 200, centre=(200, 100), quiet=((22, 26),)),
         "voice": Spec("blue", 440, 240, tone_dbfs=-30.0, bursts=((60, 90, 8.0),)),
-        "laugh": Spec("yellow", 440, 240, tone_dbfs=-30.0, bursts=((60, 70, 26.0),)),
+        # A short loud laugh: too brief to move the integrated loudness much, so after the gain
+        # its peak goes past the ceiling and the limiter must hold it.
+        "laugh": Spec("yellow", 440, 240, tone_dbfs=-30.0, bursts=((60, 62, 18.0),)),
     }
     return {name: (make_media(root / f"{name}.mov", spec), spec) for name, spec in specs.items()}
 
@@ -234,7 +236,15 @@ def test_a_short_gets_gain_and_a_limiter_and_keeps_its_range(media, tmp_path, mo
 
 def test_a_loud_burst_is_held_under_the_true_peak_maximum(media, tmp_path: Path) -> None:
     result = render_plan(_short(media, "laugh"), quick(), out=tmp_path / "l.mp4")
-    assert result.report["loudness"]["method"] == "gain-limiter"
+    loud = result.report["loudness"]
+    assert loud["method"] == "gain-limiter"
+    # Without the limiter the burst would peak above full scale.
+    assert -30.0 + 18.0 + loud["gain_db"] > 0.0
+    pcm = read_pcm(result.out)
+    burst = 20 * math.log10(float(np.abs(pcm[sample_at(60) : sample_at(62)]).max()))
+    assert burst <= loud["process_true_peak_dbtp"] + 0.3
+    # Limiting the laugh lowered the loudness; the gain was measured again and corrected.
+    assert loud["passes"] >= 2 and abs(loud["output"]["integrated_lufs"] + 14.5) <= 0.15
     qa = {c["id"]: c for c in result.report["qa"]["checks"]}
     assert qa["loudness"]["status"] == "pass", qa["loudness"]["message"]
     assert qa["loudness"]["measured"]["true_peak_dbtp"] <= -1.0

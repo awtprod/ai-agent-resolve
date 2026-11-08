@@ -205,6 +205,7 @@ def _level(pcm: np.ndarray, frame_a: int, frame_b: int, hz: float) -> float:
 
 def test_longform_sound(longform: Rendered) -> None:
     pcm = read_pcm(longform.result.out)
+    assert pcm.shape[1] == 2 and np.allclose(pcm[:, 0], pcm[:, 1], atol=1e-3)  # mono on both
     tones = {sid: spec.tone_hz for sid, spec in longform.specs.items()}
     sounds = {s["location"]: s for s in longform.report["rendered"]["sounds"]}
     levels: dict[str, float] = {}

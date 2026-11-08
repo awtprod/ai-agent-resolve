@@ -257,8 +257,8 @@ class RenderSettings(_Settings):
         default=0.1,
         gt=0,
         le=1,
-        description="A short's gain is measured again after the limiter and corrected once when "
-        "it lands further than this from the target.",
+        description="A short's gain is measured again after the limiter and corrected (up to "
+        "twice) while it lands further than this from the target.",
     )
     fps_tolerance: float = Field(
         default=0.001,

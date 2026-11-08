@@ -6,7 +6,7 @@
 * **Short**: gain plus a limiter, never loudnorm, which flattened the laugh range on real shorts.
   The mix is measured, the gain is ``target - integrated``, and ``alimiter`` (run at 192 kHz, so
   its sample peak follows the true peak) holds the peaks. The result is measured again and the
-  gain corrected once when it lands more than ``[render] short_gain_tolerance_lu`` away.
+  gain corrected (at most twice) while it lands more than ``[render] short_gain_tolerance_lu`` away.
 
 Both process to ``[qa] true_peak_max_dbtp`` less ``[render] true_peak_margin_db``, so the AAC
 encode stays at or under the maximum, and both keep the exact sample length (``apad`` +
@@ -31,6 +31,9 @@ from aar.plan.render.runner import run_ffmpeg
 Method = Literal["loudnorm-2pass", "gain-limiter", "none"]
 #: Below this integrated loudness (or -inf) the mix is treated as silent.
 SILENT_LUFS = -70.0
+#: A short is rendered at most this many times: the gain, then up to two corrections (limiting
+#: a loud laugh lowers the loudness, so one correction can land short of the target).
+SHORT_GAIN_PASSES = 3
 _JSON_BLOCK = re.compile(r"\{[^{}]*\}", re.S)
 
 
@@ -205,7 +208,7 @@ def _gain_limiter(
     assert level is not None
     gain = result.target_lufs - level
     limit = 10 ** (result.process_true_peak_dbtp / 20)
-    for attempt in (1, 2):
+    for attempt in range(1, SHORT_GAIN_PASSES + 1):
         chain = (
             f"volume=volume={gain:.4f}dB,aresample=192000,"
             f"alimiter=limit={limit:.6f}:attack={settings.limiter_attack_ms:g}"
