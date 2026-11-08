@@ -12,15 +12,25 @@ Each destination is recorded before it is placed, with the identity of its tempo
 placement itself (the temporary's unlink, a signal) still rolls it back. The rollback touches a
 destination only while it is still that file. If another writer replaced or changed it after our
 placement, it is left alone, the backup (if any) is kept beside it as
-``.aar-backup-<name>.<token>``, and the failure is raised as ``output_conflict`` naming both; a
-backup that cannot be restored is kept and named the same way.
+``.aar-backup-<name>.<token>``, and the failure is raised as ``output_conflict``.
+
+The rollback is best effort per destination: a step that fails for one (a restore, renaming its
+backup, removing the new file) is recorded and the next destination is still rolled back, and
+every temporary file is still removed. Then one error lists every destination's final state
+(``restored``, ``untouched``, ``kept_backup`` with its path, ``other_writer``, ``unknown``):
+``rollback_failed`` when any rollback step failed or a temporary file could not be removed,
+``output_conflict`` when only another writer got in the way. It is chained to the original
+failure, which nothing in the rollback can mask. An interrupt (``KeyboardInterrupt``) is
+re-raised as itself, with the states as notes.
 """
 
 from __future__ import annotations
 
 import os
 import secrets
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from aar.drp.modify.write import _backup, _place, _temp
 from aar.plan.export.errors import ExportError
@@ -96,81 +106,163 @@ def write_pair(files: list[tuple[Path, bytes]], *, overwrite: bool) -> None:
             # Recorded before placing, so a failure inside the placement still rolls it back.
             placed.append((dest, tmp, _identity(tmp)))
             _place_one(tmp, dest, overwrite)
-    except FileExistsError as exc:
-        conflicts = _roll_back(placed, backups)
-        error = ExportError(
+    except BaseException as exc:
+        outcomes = _roll_back(placed, backups)  # never raises: each destination best effort
+        left = _discard([*temps, *backups.values()])
+        temps.clear()
+        backups.clear()
+        failure = _failure(exc, [dest for dest, _ in files], outcomes, left)
+        if failure is exc:
+            raise
+        if isinstance(failure, ExportError) and failure.code == "output_exists":
+            raise failure from None
+        raise failure from exc
+    finally:
+        _discard([*temps, *backups.values()])
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """Where the rollback left one destination."""
+
+    path: Path
+    #: restored | untouched | kept_backup | other_writer | unknown
+    state: str
+    kept_backup: Path | None
+    detail: str
+    #: A rollback step failed for this destination.
+    failed: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "path": str(self.path),
+            "state": self.state,
+            "kept_backup": None if self.kept_backup is None else str(self.kept_backup),
+            "detail": self.detail,
+        }
+
+    def line(self) -> str:
+        kept = f" (the previous file is at {str(self.kept_backup)!r})" if self.kept_backup else ""
+        return f"{str(self.path)!r}: {self.state}{kept}: {self.detail}"
+
+
+def _discard(paths: list[Path]) -> list[Path]:
+    """Remove each file, best effort; the ones that could not be removed."""
+    left: list[Path] = []
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            left.append(path)
+    return left
+
+
+def _failure(
+    exc: BaseException, dests: list[Path], outcomes: list[Outcome], left: list[Path]
+) -> BaseException:
+    """The error to raise for ``exc`` after the rollback: ``exc`` itself (``output_exists`` for a
+    destination that appeared) when everything was put back; else one error naming every
+    destination's final state."""
+    base: BaseException = exc
+    if isinstance(exc, FileExistsError):
+        base = ExportError(
             "output_exists",
             f"{exc.filename!r} appeared while writing",
             "choose another --out, or pass --overwrite",
         )
-        raise _conflict(error, conflicts) from None
-    except BaseException as exc:
-        conflicts = _roll_back(placed, backups)
-        if conflicts and isinstance(exc, Exception):
-            raise _conflict(exc, conflicts) from exc
-        raise
-    finally:
-        for tmp in temps:
-            tmp.unlink(missing_ok=True)
-        for backup in backups.values():
-            backup.unlink(missing_ok=True)
-
-
-def _conflict(
-    cause: BaseException, conflicts: list[tuple[Path, Path | None, str]]
-) -> BaseException:
-    """The failure, as ``output_conflict`` when the rollback could not put a destination back
-    (another writer replaced it, or the restore failed); else the failure itself."""
-    if not conflicts:
-        return cause
-    lines = [
-        f"{str(dest)!r} {why}"
-        + (f"; the previous file is kept as {str(kept)!r}" if kept is not None else "")
-        for dest, kept, why in conflicts
-    ]
+    failed = left or any(o.failed for o in outcomes)
+    if not failed and not any(o.state == "other_writer" for o in outcomes):
+        return base
+    by_path = {o.path: o for o in outcomes}
+    every = [by_path.get(d) or Outcome(d, "untouched", None, "never placed") for d in dests]
+    lines = [o.line() for o in every]
+    lines += [f"{str(path)!r}: a temporary file that could not be removed" for path in left]
+    if not isinstance(exc, Exception):  # an interrupt stays an interrupt, with the states noted
+        for line in lines:
+            exc.add_note(f"aar export rollback: {line}")
+        return exc
+    if failed:
+        return ExportError(
+            "rollback_failed",
+            f"writing the export failed ({base}), and the rollback could not put everything "
+            f"back: {'; '.join(lines)}",
+            "check each file named: keep the right one, put a kept previous file back by hand, "
+            "and remove what is left over",
+            destinations=[o.as_dict() for o in every],
+            left_behind=[str(path) for path in left],
+        )
     return ExportError(
         "output_conflict",
-        f"writing the export failed ({cause}), and {'; '.join(lines)}",
+        f"writing the export failed ({base}), and another writer changed a destination: "
+        f"{'; '.join(lines)}",
         "compare the files, keep the right one and remove the other",
-        conflicts=[
-            {"path": str(dest), "kept_backup": None if kept is None else str(kept), "reason": why}
-            for dest, kept, why in conflicts
-        ],
+        destinations=[o.as_dict() for o in every],
+        left_behind=[],
     )
 
 
 def _roll_back(
     placed: list[tuple[Path, Path, Identity]], backups: dict[Path, Path]
-) -> list[tuple[Path, Path | None, str]]:
-    """Put back every destination this call placed: its backup, or nothing when it was new, but
-    only while it is still the file placed (device, inode, size, mtime_ns). A destination whose
-    temporary file was never consumed was never placed and is left alone. One another writer
-    replaced after our placement is left in place and returned, with its backup kept beside it
-    under a clear name; so is one whose backup cannot be restored."""
-    conflicts: list[tuple[Path, Path | None, str]] = []
+) -> list[Outcome]:
+    """Put back every destination this call placed, best effort: one whose rollback fails is
+    recorded and the rest are still rolled back; this never raises an ``Exception``. A backup
+    reported as kept is taken out of ``backups`` (so it is not removed); one for a destination
+    never placed is left in it, to be removed."""
+    outcomes: list[Outcome] = []
     for dest, tmp, identity in reversed(placed):
         backup = backups.pop(dest, None)
         try:
-            ours = _identity(dest) == identity
-        except FileNotFoundError:
-            ours = False
-        if not ours:
-            if tmp.exists():
-                if backup is not None:
-                    backups[dest] = backup  # never placed: dest is untouched; drop the backup
-                continue
-            if backup is not None or dest.exists() or dest.is_symlink():
-                kept = _keep_backup(backup, dest) if backup is not None else None
-                conflicts.append((dest, kept, "was replaced by another writer and left in place"))
-            continue
+            outcome = _undo(dest, tmp, identity, backup)
+        except Exception as exc:
+            kept, why = _keep(backup, dest)
+            outcome = Outcome(dest, "unknown", kept, f"the rollback failed ({exc}){why}", True)
+        if outcome.state == "untouched" and backup is not None:
+            backups[dest] = backup  # never placed: the backup is a spare copy
+        outcomes.append(outcome)
+    return outcomes[::-1]
+
+
+def _undo(dest: Path, tmp: Path, identity: Identity, backup: Path | None) -> Outcome:
+    """Roll one destination back: its backup restored, or the new file removed when there was
+    none, but only while it is still the file placed (device, inode, size, mtime_ns)."""
+    try:
+        ours = _identity(dest) == identity
+    except FileNotFoundError:
+        ours = False
+    if not ours:
+        if tmp.exists():
+            return Outcome(dest, "untouched", None, "never placed")
+        there = dest.exists() or dest.is_symlink()
+        if backup is None and not there:
+            return Outcome(dest, "restored", None, "the new file is gone; there was none before")
+        what = "another writer's file is left in place" if there else "another writer removed it"
         if backup is None:
-            dest.unlink()
-            continue
+            return Outcome(dest, "other_writer", None, what)
+        kept, why = _keep(backup, dest)
+        return Outcome(dest, "other_writer", kept, what + why, kept is None)
+    if backup is None:
+        dest.unlink()
+        return Outcome(dest, "restored", None, "the new file was removed; there was none before")
+    try:
+        os.replace(backup, dest)
+    except OSError as exc:
+        kept, why = _keep(backup, dest)
+        state = "kept_backup" if kept is not None else "unknown"
+        detail = f"could not be restored ({exc}){why}; the new file is in place"
+        return Outcome(dest, state, kept, detail, True)
+    return Outcome(dest, "restored", None, "the previous file is back")
+
+
+def _keep(backup: Path | None, dest: Path) -> tuple[Path | None, str]:
+    """Keep a backup under a clear name, best effort: (where it is now, a note when renaming it
+    failed). When the rename fails the backup stays at its temporary name, which is reported."""
+    if backup is None:
+        return None, ""
+    try:
+        return _keep_backup(backup, dest), ""
+    except Exception as exc:
         try:
-            os.replace(backup, dest)
-        except OSError as exc:
-            kept = _keep_backup(backup, dest)
-            conflicts.append(
-                (dest, kept, f"could not be restored ({exc}); the new file is in place")
-            )
-    return conflicts
+            still = backup.exists()
+        except OSError:
+            still = False
+        return (backup if still else None), f"; keeping the backup failed ({exc})"

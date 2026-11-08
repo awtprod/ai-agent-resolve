@@ -292,13 +292,22 @@ def test_rollback_leaves_another_writers_file_and_keeps_the_backup(
     assert (tmp_path / "cut.report.json").read_bytes() == b"{old}"  # never replaced
     kept = [p for p in tmp_path.iterdir() if p.name.startswith(".aar-backup-cut.fcpxml.")]
     assert len(kept) == 1 and kept[0].read_bytes() == b"<old fcpxml/>"
-    assert caught.value.details["conflicts"] == [
+    assert caught.value.details["destinations"] == [
         {
             "path": str(tmp_path / "cut.fcpxml"),
+            "state": "other_writer",
             "kept_backup": str(kept[0]),
-            "reason": "was replaced by another writer and left in place",
-        }
+            "detail": "another writer's file is left in place",
+        },
+        {
+            "path": str(tmp_path / "cut.report.json"),
+            "state": "untouched",
+            "kept_backup": None,
+            "detail": "never placed",
+        },
     ]
+    assert caught.value.details["left_behind"] == []
+    assert isinstance(caught.value.__cause__, OSError)  # chained to the placement failure
     names = sorted(p.name for p in tmp_path.iterdir())
     assert names == sorted(["cut.fcpxml", "cut.report.json", kept[0].name])  # no temp left
 
@@ -311,13 +320,9 @@ def test_rollback_never_deletes_another_writers_file(
     with pytest.raises(ExportError) as caught:
         write_pair(_pair(tmp_path), overwrite=False)
     assert caught.value.code == "output_conflict"
-    assert caught.value.details["conflicts"] == [
-        {
-            "path": str(tmp_path / "cut.fcpxml"),
-            "kept_backup": None,
-            "reason": "was replaced by another writer and left in place",
-        }
-    ]
+    [fcpxml, report] = caught.value.details["destinations"]
+    assert (fcpxml["state"], fcpxml["kept_backup"]) == ("other_writer", None)
+    assert report["state"] == "untouched"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["cut.fcpxml"]
     assert (tmp_path / "cut.fcpxml").read_bytes() == b"<their fcpxml/>"
 
@@ -411,7 +416,7 @@ def test_a_failed_restore_keeps_the_backup_and_says_so(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """If putting the previous file back fails, the backup is kept under a clear name and the
-    failure is output_conflict naming it, not a lost previous file."""
+    failure is rollback_failed naming it, not a lost previous file."""
     _old(tmp_path)
     _fail_on("_place_one", 2, monkeypatch, OSError(28, "No space left on device"))
     real_replace = os.replace
@@ -427,12 +432,155 @@ def test_a_failed_restore_keeps_the_backup_and_says_so(
     monkeypatch.setattr(files.os, "replace", failing_restore)
     with pytest.raises(ExportError) as caught:
         write_pair(_pair(tmp_path), overwrite=True)
-    assert caught.value.code == "output_conflict"
+    assert caught.value.code == "rollback_failed"
     kept = [p for p in tmp_path.iterdir() if p.name.startswith(".aar-backup-cut.fcpxml.")]
     assert len(kept) == 1 and kept[0].read_bytes() == b"<old fcpxml/>"
-    [conflict] = caught.value.details["conflicts"]
-    assert conflict["kept_backup"] == str(kept[0])
-    assert conflict["reason"].startswith("could not be restored")
+    [fcpxml, report] = caught.value.details["destinations"]
+    assert (fcpxml["state"], fcpxml["kept_backup"]) == ("kept_backup", str(kept[0]))
+    assert fcpxml["detail"].startswith("could not be restored")
+    assert report["state"] == "untouched"
+
+
+def _restore_and_keep_fail_for(
+    name: str, monkeypatch: pytest.MonkeyPatch, exc: BaseException | None = None
+) -> None:
+    """Both placements land, then the run fails; rolling ``name`` back fails twice over: the
+    restore (os.replace of the backup) and keeping the backup (_keep_backup) both raise, as on
+    a file system gone read-only for that file."""
+    failure = exc if exc is not None else OSError(5, "Input/output error")
+    _fail_after_placing("cut.report.json", failure, monkeypatch)
+    real_replace = os.replace
+    onto = {"n": 0}
+
+    def failing_restore(src: Any, dst: Any) -> None:
+        if Path(dst).name == name:
+            onto["n"] += 1
+            if onto["n"] == 2:  # the first is the placement, the second the restore
+                raise OSError(30, "Read-only file system")
+        real_replace(src, dst)
+
+    def failing_keep(backup: Path, dest: Path) -> Path:
+        if dest.name == name:
+            raise OSError(30, "Read-only file system")
+        raise AssertionError("only the failing destination keeps a backup")
+
+    monkeypatch.setattr(files.os, "replace", failing_restore)
+    monkeypatch.setattr(files, "_keep_backup", failing_keep)
+
+
+@pytest.mark.parametrize("name", ["cut.fcpxml", "cut.report.json"])
+def test_a_failed_rollback_step_does_not_stop_the_others(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Prism (PR #13): the restore and the keep-backup both fail for one destination; the other
+    destination is still rolled back, every temporary file is removed, and one rollback_failed
+    error, chained to the original failure, lists each destination's final state. The previous
+    file of the failed one survives at its backup's temporary name, which is reported."""
+    _old(tmp_path)
+    _restore_and_keep_fail_for(name, monkeypatch)
+    with pytest.raises(ExportError) as caught:
+        write_pair(_pair(tmp_path), overwrite=True)
+    error = caught.value
+    assert error.code == "rollback_failed"
+    assert isinstance(error.__cause__, OSError) and error.__cause__.errno == 5
+    assert "Input/output error" in error.message
+    states = {Path(d["path"]).name: d for d in error.details["destinations"]}
+    other = "cut.report.json" if name == "cut.fcpxml" else "cut.fcpxml"
+    old = {"cut.fcpxml": b"<old fcpxml/>", "cut.report.json": b"{old}"}
+    new = {"cut.fcpxml": b"<new fcpxml/>", "cut.report.json": b"{new}"}
+    # The other destination is rolled back all the same.
+    assert states[other]["state"] == "restored"
+    assert (tmp_path / other).read_bytes() == old[other]
+    # The failed one: the new file is still in place, the previous file kept and named.
+    failed = states[name]
+    assert failed["state"] == "kept_backup"
+    assert "Read-only file system" in failed["detail"]
+    assert "keeping the backup failed" in failed["detail"]
+    assert (tmp_path / name).read_bytes() == new[name]
+    kept = Path(failed["kept_backup"])
+    assert kept.parent == tmp_path and kept.read_bytes() == old[name]
+    # Nothing else is left: no temporary file, no other backup.
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
+        ["cut.fcpxml", "cut.report.json", kept.name]
+    )
+    assert error.details["left_behind"] == []
+
+
+def test_an_unexpected_rollback_failure_is_unknown_and_the_rest_still_rolls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rollback step that raises where nothing expects it (here stat'ing the report) makes
+    that destination 'unknown', keeps its backup, and the FCPXML is still restored."""
+    _old(tmp_path)
+    _fail_after_placing("cut.report.json", OSError(5, "Input/output error"), monkeypatch)
+    real_identity = files._identity
+    calls = {"n": 0}
+
+    def flaky_identity(path: Path) -> Any:
+        if path.name == "cut.report.json":
+            calls["n"] += 1
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_identity(path)
+
+    monkeypatch.setattr(files, "_identity", flaky_identity)
+    with pytest.raises(ExportError) as caught:
+        write_pair(_pair(tmp_path), overwrite=True)
+    assert caught.value.code == "rollback_failed"
+    states = {Path(d["path"]).name: d for d in caught.value.details["destinations"]}
+    assert states["cut.fcpxml"]["state"] == "restored"
+    assert (tmp_path / "cut.fcpxml").read_bytes() == b"<old fcpxml/>"
+    report = states["cut.report.json"]
+    assert report["state"] == "unknown" and "Permission denied" in report["detail"]
+    kept = Path(report["kept_backup"])
+    assert kept.name.startswith(".aar-backup-cut.report.json.") and kept.read_bytes() == b"{old}"
+
+
+def test_a_temp_file_that_cannot_be_removed_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cleanup is best effort too: a temporary file that cannot be removed does not stop the
+    rest, and does not mask the original failure; it is named in left_behind."""
+    _old(tmp_path)
+    _fail_on("_place_one", 2, monkeypatch, OSError(28, "No space left on device"))
+    real_write_temp, real_unlink = files._write_temp, Path.unlink
+    temps: list[Path] = []
+
+    def recording(dest: Path, data: bytes) -> Path:
+        temps.append(real_write_temp(dest, data))
+        return temps[-1]
+
+    def stuck(self: Path, missing_ok: bool = False) -> None:
+        if self == temps[-1]:  # the report's temporary file, never placed
+            raise PermissionError(1, "Operation not permitted", str(self))
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(files, "_write_temp", recording)
+    monkeypatch.setattr(Path, "unlink", stuck)
+    with pytest.raises(ExportError) as caught:
+        write_pair(_pair(tmp_path), overwrite=True)
+    error = caught.value
+    assert error.code == "rollback_failed"
+    assert isinstance(error.__cause__, OSError) and error.__cause__.errno == 28
+    assert error.details["left_behind"] == [str(temps[-1])]
+    assert temps[-1].read_bytes() == b"{new}"
+    assert [d["state"] for d in error.details["destinations"]] == ["restored", "untouched"]
+    assert (tmp_path / "cut.fcpxml").read_bytes() == b"<old fcpxml/>"
+    assert (tmp_path / "cut.report.json").read_bytes() == b"{old}"
+
+
+def test_an_interrupt_stays_an_interrupt_with_the_states_noted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A KeyboardInterrupt is re-raised as itself; when the rollback could not put everything
+    back, the states ride along as notes."""
+    _old(tmp_path)
+    _restore_and_keep_fail_for("cut.fcpxml", monkeypatch, KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt) as caught:
+        write_pair(_pair(tmp_path), overwrite=True)
+    notes = getattr(caught.value, "__notes__", [])
+    assert any("cut.fcpxml" in n and "kept_backup" in n for n in notes), notes
+    assert any("cut.report.json" in n and "restored" in n for n in notes), notes
+    assert (tmp_path / "cut.report.json").read_bytes() == b"{old}"
 
 
 def test_the_cli_keeps_the_previous_pair_when_the_report_fails(

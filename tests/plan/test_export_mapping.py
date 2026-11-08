@@ -73,6 +73,7 @@ def test_export_codes_are_stable() -> None:
             "self_check_failed",
             "output_exists",
             "output_conflict",
+            "rollback_failed",
         ]
     )
 

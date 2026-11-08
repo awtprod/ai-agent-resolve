@@ -38,6 +38,7 @@ EXPORT_CODES = frozenset(
         "self_check_failed",
         "output_exists",
         "output_conflict",
+        "rollback_failed",
     }
 )
 
