@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
@@ -128,6 +129,80 @@ def test_a_report_appearing_mid_write_rolls_back(
     assert caught.value.code == "output_exists"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["cut.report.json"]
     assert (tmp_path / "cut.report.json").read_bytes() == b"{theirs}"
+
+
+def _other_writer_replaces_the_fcpxml(folder: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """On the second placement (the report), another writer first replaces the FCPXML this
+    call has just placed (a new inode), then the placement fails."""
+    real = files._place_one
+
+    def racing(tmp: Path, dest: Path, overwrite: bool) -> None:
+        if dest.name == "cut.report.json":
+            theirs = folder / "theirs.tmp"
+            theirs.write_bytes(b"<their fcpxml/>")
+            os.replace(theirs, folder / "cut.fcpxml")
+            raise OSError(28, "No space left on device")
+        real(tmp, dest, overwrite)
+
+    monkeypatch.setattr(files, "_place_one", racing)
+
+
+def test_rollback_leaves_another_writers_file_and_keeps_the_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--overwrite: the FCPXML is no longer the file this call placed, so the rollback does not
+    restore the backup over it; the backup stays beside it, named, and the error says so."""
+    _old(tmp_path)
+    _other_writer_replaces_the_fcpxml(tmp_path, monkeypatch)
+    with pytest.raises(ExportError) as caught:
+        write_pair(_pair(tmp_path), overwrite=True)
+    assert caught.value.code == "output_conflict"
+    assert "No space left" in caught.value.message
+    assert (tmp_path / "cut.fcpxml").read_bytes() == b"<their fcpxml/>"
+    assert (tmp_path / "cut.report.json").read_bytes() == b"{old}"  # never replaced
+    kept = [p for p in tmp_path.iterdir() if p.name.startswith(".aar-backup-cut.fcpxml.")]
+    assert len(kept) == 1 and kept[0].read_bytes() == b"<old fcpxml/>"
+    assert caught.value.details["conflicts"] == [
+        {"path": str(tmp_path / "cut.fcpxml"), "kept_backup": str(kept[0])}
+    ]
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert names == sorted(["cut.fcpxml", "cut.report.json", kept[0].name])  # no temp left
+
+
+def test_rollback_never_deletes_another_writers_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh export (no backup): the same identity rule keeps the other writer's FCPXML."""
+    _other_writer_replaces_the_fcpxml(tmp_path, monkeypatch)
+    with pytest.raises(ExportError) as caught:
+        write_pair(_pair(tmp_path), overwrite=False)
+    assert caught.value.code == "output_conflict"
+    assert caught.value.details["conflicts"] == [
+        {"path": str(tmp_path / "cut.fcpxml"), "kept_backup": None}
+    ]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["cut.fcpxml"]
+    assert (tmp_path / "cut.fcpxml").read_bytes() == b"<their fcpxml/>"
+
+
+def test_an_in_place_change_is_not_ours_either(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same inode, different size and mtime: another writer rewrote our file in place."""
+    _old(tmp_path)
+    real = files._place_one
+
+    def rewriting(tmp: Path, dest: Path, overwrite: bool) -> None:
+        if dest.name == "cut.report.json":
+            with open(tmp_path / "cut.fcpxml", "ab") as handle:
+                handle.write(b"<!-- edited -->")
+            raise OSError(5, "Input/output error")
+        real(tmp, dest, overwrite)
+
+    monkeypatch.setattr(files, "_place_one", rewriting)
+    with pytest.raises(ExportError) as caught:
+        write_pair(_pair(tmp_path), overwrite=True)
+    assert caught.value.code == "output_conflict"
+    assert (tmp_path / "cut.fcpxml").read_bytes() == b"<new fcpxml/><!-- edited -->"
 
 
 def test_the_cli_keeps_the_previous_pair_when_the_report_fails(

@@ -37,6 +37,7 @@ EXPORT_CODES = frozenset(
         "item_outside_timeline",
         "self_check_failed",
         "output_exists",
+        "output_conflict",
     }
 )
 
