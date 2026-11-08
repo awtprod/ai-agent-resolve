@@ -45,6 +45,7 @@ no_pause_warn_s = 60      # warn when this much of a source's audio holds no pau
 scan_window_ms = 10       # RMS window of the pause scan
 scan_rate_hz = 16000      # the pause scan decodes the source audio at this rate ...
 scan_chunk_s = 30         # ... this many seconds at a time
+out_quiet_preroll_ms = 20 # a human cut's out point needs quiet this long before it (the in side uses [qa] join_quiet_min_ms)
 join_nudge_ms = 150       # a cut's in point may move this far to find source-audio quiet
 min_shot_s = 1.0          # a shorter content segment folds into a neighbour
 end_after_ms = 200        # with a laugh map, the content ends this long after the final laugh's onset

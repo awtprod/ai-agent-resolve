@@ -83,7 +83,7 @@ class Words:
     """
 
     def __init__(
-        self, words: Sequence[Word], tolerance_s: float, fps: Fps, min_word_s: float = 0.0
+        self, words: Sequence[Word], tolerance_s: float, fps: Fps, min_word_s: float = 0.04
     ) -> None:
         self.words = list(words)
         self.tolerance_s = tolerance_s
@@ -135,6 +135,74 @@ class Snap:
     to_frame: int
 
 
+_TOUCH_S = 1e-6
+
+
+def _walk_inward(
+    words: Words, fps: Fps, frame: int, limit: int, *, up: bool
+) -> tuple[list[tuple[str, Word, int, int]], int]:
+    """Each word a keep edge at ``frame`` leaves behind when it moves inward (``up``: later)
+    towards ``limit``, as ``(edge, word, from_frame, to_frame)``, and the frame the edge settles on.
+
+    Where the next word touches this one (it starts exactly where this one ends), the frame
+    nearest the shared boundary on the inward side is allowed, even when it falls just inside
+    the next word: otherwise a boundary with no frame within the tolerance would pass the next
+    word, and the one after it, whole.
+    """
+    moves: list[tuple[str, Word, int, int]] = []
+    step = 1 if up else -1
+    first = frame
+    while (frame < limit if up else frame > limit) and (word := words.inside(frame)) is not None:
+        frame += step
+        following = words.inside(frame)
+        if following is word:
+            continue
+        moves.append(("in" if up else "out", word, first, frame))
+        first = frame
+        if (
+            following is not None
+            and _touching(word, following, up)
+            and frame == _boundary_frame(fps, word, up)
+        ):
+            break
+    return moves, frame
+
+
+def _touching(word: Word, following: Word, up: bool) -> bool:
+    gap = following.start_s - word.end_s if up else word.start_s - following.end_s
+    return abs(gap) <= _TOUCH_S
+
+
+def _boundary_frame(fps: Fps, word: Word, up: bool) -> int:
+    return inward_frame(word.end_s if up else word.start_s, fps, up=up)
+
+
+def _cuts_word(index: int, edge: str, word: Word, a: int, b: int, fps: Fps) -> PlannerWarning:
+    side = "start" if edge == "in" else "end"
+    return PlannerWarning(
+        code="keep-edge-cuts-word",
+        message=(
+            f"keep range {index}: its {edge} edge ({fps.seconds(a):.3f} s) cuts through "
+            f"{word.text!r} ({word.start_s:.3f}-{word.end_s:.3f} s), so the {side} of the range "
+            f"moves to {fps.seconds(b):.3f} s and the word is left out"
+        ),
+        at_s=round(fps.seconds(a), 3),
+        hint="move the edge into the pause beside the word to keep it, or leave it out",
+    )
+
+
+def _overlap_between(words: Words, start_s: float, end_s: float) -> bool:
+    """Whether transcript words meeting ``(start, end)`` truly overlap, not just touch."""
+    reach = -math.inf
+    for word in sorted(words.words, key=lambda w: (w.start_s, w.end_s)):
+        if word.end_s <= start_s or word.start_s >= end_s:
+            continue
+        if word.start_s < reach - _TOUCH_S:
+            return True
+        reach = max(reach, word.end_s)
+    return False
+
+
 def keep_frames(
     keep: KeepList, words: Words, fps: Fps, *, min_shot_s: float
 ) -> tuple[list[KeepFrames], list[Snap], list[PlannerWarning]]:
@@ -144,7 +212,10 @@ def keep_frames(
     edges round inward to whole frames. An edge inside a word (``no-dialogue-splice``'s test)
     moves **inward** past it: the in point to the word's end, the out point to its start. The
     partial word is left out with the material the human already excluded; the range never
-    grows. When transcript words overlap, a whole word can go with it, and a warning says so. A
+    grows. Each word an edge cuts through is named in a ``keep-edge-cuts-word`` warning. Where
+    transcript words touch, the frame nearest the shared boundary is allowed, so a boundary with
+    no frame in the tolerance does not pass whole words. When transcript words overlap, a whole
+    word can go with it, and a warning says so. A
     range that this empties is dropped with a warning. Each remaining range must last at least
     ``min_shot_s``, or no fold could keep it.
     """
@@ -161,30 +232,26 @@ def keep_frames(
     snaps: list[Snap] = []
     warnings: list[PlannerWarning] = []
     for index, (start, end, label) in enumerate(merged):
-        first, last = start, end
-        while start < end and (word := words.inside(start)) is not None:
-            start += 1
-            if words.inside(start) is not word:
-                snaps.append(Snap(index, "in", word.text, first, start))
-                first = start
-        while end > start and (word := words.inside(end)) is not None:
-            end -= 1
-            if words.inside(end) is not word:
-                snaps.append(Snap(index, "out", word.text, last, end))
-                last = end
+        moves, start = _walk_inward(words, fps, start, end, up=True)
+        more, end = _walk_inward(words, fps, end, start, up=False)
+        for edge, word, a, b in moves + more:
+            warnings.append(_cuts_word(index, edge, word, a, b, fps))
+            snaps.append(Snap(index, edge, word.text, a, b))
         lost = [
             w
             for lo, hi, w in words.occupied(spans[index][0], spans[index][1])
-            if lo < fps.seconds(start) or hi > fps.seconds(end)
+            if hi <= fps.seconds(start) or lo >= fps.seconds(end)
         ]
         if lost and end > start:
+            overlap = _overlap_between(words, spans[index][0], spans[index][1])
+            how = "overlap" if overlap else "touch"
             warnings.append(
                 PlannerWarning(
                     code="keep-edge-drops-word",
                     message=(
                         f"keep range {index}: leaving out a partial word at its edge also leaves "
-                        f"out {len(lost)} overlapping word(s) wholly inside it ({lost[0].text!r} "
-                        "first); the transcript's words overlap there"
+                        f"out {len(lost)} word(s) wholly inside it ({lost[0].text!r} "
+                        f"first); the transcript's words {how} there"
                     ),
                     at_s=round(fps.seconds(merged[index][0]), 3),
                     hint="check the transcript at this edge, or move the edge to a pause",

@@ -167,6 +167,7 @@ class ProduceSettings(_Settings):
     scan_rate_hz: int = Field(default=16000, ge=8000, le=192000)
     scan_chunk_s: float = Field(default=30.0, gt=0)
     join_nudge_ms: float = Field(default=150.0, ge=0)
+    out_quiet_preroll_ms: float = Field(default=20.0, gt=0)
     min_shot_s: float = Field(default=1.0, gt=0)
     no_pause_warn_s: float = Field(default=60.0, gt=0)
     end_after_ms: float = Field(default=200.0, ge=0)

@@ -565,7 +565,7 @@ def produce(
         settings=s,
         rules=rules,
         runs_for=runs_for,
-        judge=JoinJudge(audio, profile.qa, fps),
+        judge=JoinJudge(audio, profile.qa, fps, s.out_quiet_preroll_ms),
         laughs=laughs,
     )
     warnings += done.warnings

@@ -116,7 +116,7 @@ def _format(report: ProduceReport) -> str:
     log = report.log
     lines.append(
         f"      {len(log['trims'])} pause trim(s), {len(log['nudges'])} nudged join(s), "
-        f"{len(log['folds'])} fold(s), {len(log['snaps'])} keep edge(s) moved out of a word"
+        f"{len(log['folds'])} fold(s), {len(log['snaps'])} keep edge(s) moved inward past a word"
     )
     if log["ending"] is not None:
         lines.append(

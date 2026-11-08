@@ -180,14 +180,21 @@ class JoinJudge:
     ``in_quiet`` is QA's join-quiet test (``aar.qa.scan_join_quiet``, QA's window, rate and
     thresholds), plus, with ``handle`` > 0, the crossfade's incoming handle inside the same
     quiet run. ``out_quiet`` reads the outgoing source around src_out and needs one quiet run
-    (QA's threshold and window) from ``join_quiet_min_ms`` before src_out to ``handle`` frames
+    (QA's threshold and window) from ``out_quiet_preroll_ms`` before src_out to ``handle`` frames
     after it.
     """
 
-    def __init__(self, audio: dict[str, SourceAudio], qa: QATargets, fps: Fps) -> None:
+    def __init__(
+        self,
+        audio: dict[str, SourceAudio],
+        qa: QATargets,
+        fps: Fps,
+        out_preroll_ms: float = 20.0,
+    ) -> None:
         self.audio = audio
         self.qa = qa
         self.fps = fps
+        self.out_preroll_ms = out_preroll_ms
         self.cache: dict[tuple[str, str, int, int], bool] = {}
 
     def in_quiet(self, source: str, src_in: int, *, handle: int) -> bool:
@@ -228,7 +235,7 @@ class JoinJudge:
     def _out(self, source_id: str, src_out: int, handle: int) -> bool:
         audio = self.audio[source_id]
         at = self.fps.seconds(src_out)
-        lo, hi = at - self.qa.join_quiet_min_ms / 1000, at + self.fps.seconds(handle)
+        lo, hi = at - self.out_preroll_ms / 1000, at + self.fps.seconds(handle)
         if lo < 0 or (audio.duration_s is not None and hi > audio.duration_s + _EPS):
             return False
         pad = self.qa.join_quiet_window_ms / 1000

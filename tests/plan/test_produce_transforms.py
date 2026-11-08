@@ -836,7 +836,7 @@ def test_a_word_occupies_at_least_min_word_around_its_middle() -> None:
     w = Words([Word(text="uh", start_s=1.0, end_s=1.0)], 0.01, FPS, 0.04)
     assert w.spans(0.0, 2.0) == [pytest.approx((0.98, 1.02))]
     assert w.speech_between(1.019, 2.0) is not None and w.speech_between(1.021, 2.0) is None
-    assert Words([Word(text="uh", start_s=1.0, end_s=1.0)], 0.01, FPS).spans(0.0, 2.0) == []
+    assert Words([Word(text="uh", start_s=1.0, end_s=1.0)], 0.01, FPS, 0.0).spans(0.0, 2.0) == []
     long = Words([Word(text="long", start_s=1.0, end_s=2.0)], 0.01, FPS, 0.04)
     assert long.spans(0.0, 3.0) == [pytest.approx((1.01, 1.99))]  # the core, as before
 
@@ -878,6 +878,90 @@ def test_an_edge_that_loses_an_overlapping_whole_word_says_so() -> None:
         min_shot_s=1.0,
     )
     assert keeps[0].end == 50  # back past "noise" and the "real" it overlaps: never forward
-    assert [x.code for x in warnings] == ["keep-edge-drops-word"] and "'real'" in warnings[
-        0
-    ].message
+    drops = [x for x in warnings if x.code == "keep-edge-drops-word"]
+    assert len(drops) == 1 and "'real'" in drops[0].message and "overlap" in drops[0].message
+    assert {x.code for x in warnings} == {"keep-edge-drops-word", "keep-edge-cuts-word"}
+
+
+def test_an_edge_that_cuts_a_word_names_it() -> None:
+    """R2-1: the validator's punchline case. The human's out sits 50 ms after "Jackson"'s real
+    end, inside Whisper's stretched span; the word stays out (inward only) but is warned."""
+    fps = Fps(num=30000, den=1001)
+    w = Words(
+        [Word(text=t, start_s=a, end_s=b) for t, a, b in (
+            ("so", 9.0, 9.3), ("Michael", 9.4, 9.8), ("Jackson", 9.85, 10.45))],
+        0.010, fps, 0.040,
+    )  # fmt: skip
+    keeps, snaps, warnings = keep_frames(
+        KeepList.model_validate({"ranges": [{"start_s": 8.5, "end_s": 10.35}]}),
+        w, fps, min_shot_s=1.0,
+    )  # fmt: skip
+    assert fps.seconds(keeps[0].end) <= 9.85  # nothing comes back
+    assert [x.code for x in warnings] == ["keep-edge-cuts-word"]
+    assert "'Jackson'" in warnings[0].message and "out edge" in warnings[0].message
+    assert "9.850-10.450" in warnings[0].message and warnings[0].at_s == pytest.approx(
+        10.344, abs=0.04
+    )
+    assert [(s.edge, s.word) for s in snaps] == [("out", "Jackson")]
+
+
+def test_an_in_edge_inside_a_word_is_warned_too() -> None:
+    fps = Fps(num=30000, den=1001)
+    w = Words(
+        [Word(text=t, start_s=a, end_s=b) for t, a, b in (
+            ("well", 3.95, 4.30), ("I", 4.35, 4.45))],
+        0.010, fps, 0.040,
+    )  # fmt: skip
+    keeps, _, warnings = keep_frames(
+        KeepList.model_validate({"ranges": [{"start_s": 4.0, "end_s": 6.0}]}),
+        w, fps, min_shot_s=1.0,
+    )  # fmt: skip
+    assert fps.seconds(keeps[0].start) >= 4.30
+    assert [x.code for x in warnings] == ["keep-edge-cuts-word"]
+    assert "in edge" in warnings[0].message and "'well'" in warnings[0].message
+
+
+def test_touching_words_do_not_cascade_the_inward_walk() -> None:
+    """R2-3: the validator's constructed case. Words touch on a 20 ms grid at boundaries with
+    no frame within 10 ms; the walk used to pass 12 whole words at each edge."""
+    fps = Fps(num=30000, den=1001)
+
+    def clean(t: float) -> bool:
+        k = round(t * 30000 / 1001)
+        return any(abs(fps.seconds(j) - t) <= 0.010 for j in (k - 1, k, k + 1))
+
+    base, rows, t = 30.0, [], 30.0
+    while len(rows) < 12:
+        d = 0.18
+        while clean(round(t + d, 2)) and d < 0.6:
+            d += 0.02
+        rows.append((f"v{len(rows)}", round(t, 2), round(t + d, 2)))
+        t = round(t + d, 2)
+    w = Words([Word(text=x, start_s=a, end_s=b) for x, a, b in rows], 0.010, fps, 0.040)
+    keeps, snaps, warnings = keep_frames(
+        KeepList.model_validate({"ranges": [{"start_s": base + 0.05, "end_s": t + 1.5}]}),
+        w, fps, min_shot_s=1.0,
+    )  # fmt: skip
+    assert [s.word for s in snaps] == ["v0"]  # one word left out, not twelve
+    assert [x.code for x in warnings] == ["keep-edge-cuts-word"]
+    assert fps.seconds(keeps[0].start) == pytest.approx(rows[0][2], abs=0.034)
+    out_keeps, out_snaps, _ = keep_frames(
+        KeepList.model_validate({"ranges": [{"start_s": base - 1.0, "end_s": t - 0.05}]}),
+        w, fps, min_shot_s=1.0,
+    )  # fmt: skip
+    assert [s.word for s in out_snaps] == [rows[-1][0]]
+    assert fps.seconds(out_keeps[0].end) == pytest.approx(rows[-1][1], abs=0.034)
+
+
+def test_touching_words_are_not_called_overlapping() -> None:
+    from aar.plan.produce.timeline import _overlap_between
+
+    touching = words(("a", 2.0, 2.4), ("b", 2.4, 2.6), ("c", 2.6, 3.0))
+    assert not _overlap_between(touching, 0.0, 10.0)
+    assert _overlap_between(words(("a", 2.0, 2.8), ("b", 2.5, 3.0)), 0.0, 10.0)
+    assert not _overlap_between(words(("a", 2.0, 2.8), ("b", 2.5, 3.0)), 5.0, 10.0)
+
+
+def test_words_defaults_to_the_production_minimum_word_length() -> None:
+    w = Words([Word(text="uh", start_s=1.0, end_s=1.0)], 0.01, FPS)
+    assert w.spans(0.0, 2.0) == [pytest.approx((0.98, 1.02))]

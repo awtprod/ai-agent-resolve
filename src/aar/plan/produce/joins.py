@@ -9,7 +9,7 @@ least ``[qa] join_quiet_min_ms`` below ``join_quiet_db`` containing src_in
 human excluded and the crossfade plays a little of it:
 
 * the incoming crossfade handle (``handle`` frames before src_in) lies in that same quiet run;
-* the out side: the outgoing source's audio is quiet from ``join_quiet_min_ms`` before src_out
+* the out side: the outgoing source's audio is quiet from ``[produce] out_quiet_preroll_ms`` before src_out
   to the end of the outgoing handle after it. So the kept tail holds no real word tail that
   Whisper ended early, and the fade-out holds no onset of the next removed word. This is
   measured on the audio envelope, never taken from transcript times.
@@ -52,7 +52,7 @@ class Judge(Protocol):
         ...
 
     def out_quiet(self, source: str, src_out: int, *, handle: int) -> bool:
-        """Quiet from ``join_quiet_min_ms`` before src_out to ``handle`` frames after it."""
+        """Quiet from ``out_quiet_preroll_ms`` before src_out to ``handle`` frames after it."""
         ...
 
 

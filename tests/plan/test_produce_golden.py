@@ -530,3 +530,28 @@ def test_no_join_is_quiet_at_or_past_the_end_of_the_audio(longform: dict[str, Pa
     # QA's window is clipped at the end, so 0.17 s past it there is nothing left to read
     assert not judge.in_quiet("a", end + 5, handle=0)
     assert not judge.out_quiet("a", end, handle=1)
+
+
+def test_the_out_side_pre_roll_is_its_own_profile_key(tmp_path: Path) -> None:
+    """R2-2 (kills W08): the out point needs quiet from ``out_quiet_preroll_ms`` (20 ms) before
+    it, not none and not the in side's 60 ms."""
+    from produce_support import amp, ffmpeg
+
+    from aar.plan.model import Fps
+    from aar.plan.produce.audio import JoinJudge
+
+    fps = Fps(num=25)
+    qa = load_profile("ccn").qa
+    assert load_profile("ccn").produce.out_quiet_preroll_ms == 20.0
+    for loud_until, passes_20, passes_60, passes_0 in (
+        (0.990, False, False, True),  # tone ends 10 ms before the cut: no pre-roll would pass it
+        (0.970, True, False, True),  # 30 ms of quiet before the cut: 20 ms passes, 60 ms fails
+    ):
+        expr = f"if(lt(t\\,{loud_until})\\,{amp(-20)}*sin(2*PI*220*t)\\,0)"
+        path = tmp_path / f"out_{loud_until}.wav"
+        ffmpeg("-f", "lavfi", "-i", f"aevalsrc={expr}:s=16000:d=3", "-c:a", "pcm_s16le", str(path))
+        audio = {"a": SourceAudio(path, 1, 3.0)}
+        frame = fps.frames(1.0)
+        for preroll, expected in ((20.0, passes_20), (60.0, passes_60), (0.0001, passes_0)):
+            judge = JoinJudge(audio, qa, fps, preroll)
+            assert judge.out_quiet("a", frame, handle=0) is expected, (loud_until, preroll)
