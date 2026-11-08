@@ -242,9 +242,12 @@ def test_random_shows_give_plans_that_keep_every_house_rule(kind: str) -> None:
         for _, _, frame in cut_points(pieces):
             assert words.inside(frame) is None, where
         # nothing plays outside the keep ranges: no edge, nudge, fold or ending reaches past them
+        raw = [(r.start_s, r.end_s) for r in case["keep"].ranges]
         for piece in pieces:
             keep = keeps[piece.keep]
             assert keep.start <= piece.rec_in < piece.rec_out <= keep.end, where
+            a, b = sec(piece.rec_in), sec(piece.rec_out)
+            assert any(lo - 1e-9 <= a and b <= hi + 1e-9 for lo, hi in raw), where
         # no word is removed, however short: every word whose occupied span lies in a keep range
         # (and before the final out, which the ending may move) is wholly in the plan
         final = sec(pieces[-1].rec_out)

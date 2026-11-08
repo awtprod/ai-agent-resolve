@@ -91,7 +91,7 @@
       "track": 1,
       "source": "master",
       "src_in": 168,
-      "src_out": 387,
+      "src_out": 386,
       "reframe": [
         {
           "time": 0,
@@ -184,7 +184,7 @@
           "zoom": 1.22
         },
         {
-          "time": 218,
+          "time": 217,
           "x": 0.525,
           "y": 0.45,
           "zoom": 1.22

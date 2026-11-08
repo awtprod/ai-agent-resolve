@@ -72,7 +72,7 @@
       "track": 1,
       "source": "cam-b",
       "src_in": 180,
-      "src_out": 360,
+      "src_out": 359,
       "reframe": [],
       "gain_db": 0.0,
       "label": "store"

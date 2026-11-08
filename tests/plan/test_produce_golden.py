@@ -107,7 +107,7 @@ def test_the_longform_matches_its_golden_plan(longform: dict[str, Path]) -> None
     # sound runs to 19.45): the in point moves later, inward only, until the run holds the
     # crossfade's handle too. Never earlier, into material the human excluded.
     assert [(n["join"], n["side"], n["from_frame"], n["to_frame"]) for n in log["nudges"]] == [
-        (2, "in", 581, 584)
+        (2, "in", 582, 584)
     ]
     # camera B's half-second flash at 31.0 s folds into the A shot before it
     assert [(f["source"], f["into"], f["retrimmed"]) for f in log["folds"]] == [
@@ -248,7 +248,7 @@ def test_without_room_to_nudge_the_join_is_named_and_qa_agrees(
     result = produce_longform(longform, profile=load_profile(path))
     assert [(w.code, w.source, w.at_s) for w in result.warnings] == [
         ("end-dropped-speech", None, 35.202),
-        ("join-not-quiet", "cam-b", 19.386),
+        ("join-not-quiet", "cam-b", 19.419),  # 19.40 s rounded inward to frame 582
     ]
     assert result.lint.ok  # lint cannot hear the audio: the warning is the planner's job
     qa = load_profile("ccn").qa
@@ -452,21 +452,29 @@ def test_a_real_word_tail_past_whispers_end_is_named(tmp_path: Path) -> None:
     )
     warned = [w for w in result.warnings if w.code == "join-out-not-quiet"]
     assert len(warned) == 1 and "join 1" in warned[0].message
-    assert result.plan.segments[0].src_out == round(2.1 * 30000 / 1001)  # never moved outward
+    assert result.plan.segments[0].src_out == 62  # 2.1 s floored to frame 62, never moved outward
 
 
 @pytest.mark.parametrize("silent", [True, False])
-def test_a_long_source_with_no_pause_at_all_is_a_warning(tmp_path: Path, silent: bool) -> None:
-    """F10: 61 s of silence, or of unbroken sound, gives no pause to trim: suspicious."""
+@pytest.mark.parametrize("kept", [60.8, 20.0])
+def test_a_long_source_with_no_pause_at_all_is_a_warning(
+    tmp_path: Path, silent: bool, kept: float
+) -> None:
+    """F10: a source over 60 s of silence, or of unbroken sound, has no quiet stretch at all,
+    not even between words: suspicious, however little of it is kept."""
     result = _mini(
         tmp_path,
         bursts=[] if silent else [(0.0, 61.0)],
-        words=[("drone", 1.0, 60.0)],
-        keeps=[(0.5, 60.8)],
+        words=[("drone", 1.0, kept - 0.5)],
+        keeps=[(0.5, kept)],
         seconds=61.0,
         silent=silent,
     )
     assert [(w.code, w.source) for w in result.warnings] == [("no-pauses", "cam")]
+
+
+def test_ordinary_speech_gives_no_no_pauses_warning(longform: dict[str, Path]) -> None:
+    assert "no-pauses" not in [w.code for w in produce_longform(longform).warnings]
 
 
 def test_a_long_form_with_a_face_track_warns_that_it_is_ignored(

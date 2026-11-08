@@ -132,14 +132,14 @@ def pause_runs(
     window_s: float,
     rate: int,
     chunk_s: float,
-    min_pause_s: float = 0.0,
     stats: dict[str, ScanStats] | None = None,
 ) -> list[tuple[float, float]]:
     """Quiet runs over consecutive ``parts`` (each scanned in its own source's audio), in
     recording seconds; runs that meet at a scan chunk's edge or a camera change are joined.
 
-    ``stats`` (when given) gains, per source, the seconds scanned and the quiet runs of at least
-    ``min_pause_s`` that lie strictly inside a part: a source with none is suspicious.
+    ``stats`` (when given) gains, per source, the seconds scanned and the quiet runs (any length)
+    that lie strictly inside a part. Speech at the right threshold has many, if only between
+    words; none means silent audio (one run covering every part) or a wrong threshold.
     """
     runs: list[tuple[float, float]] = []
     join = 2.0 / rate
@@ -165,11 +165,7 @@ def pause_runs(
         if stats is not None:
             entry = stats.setdefault(part.source, ScanStats())
             entry.scanned_s += hi - lo
-            entry.pauses += sum(
-                1
-                for a, b in merged
-                if a > lo + join and b < hi - join and b - a >= min_pause_s - 1e-9
-            )
+            entry.pauses += sum(1 for a, b in merged if a > lo + join and b < hi - join)
         for a, b in ((a + origin_s, b + origin_s) for a, b in merged):
             if runs and a <= runs[-1][1] + join:
                 runs[-1] = (runs[-1][0], max(runs[-1][1], b))

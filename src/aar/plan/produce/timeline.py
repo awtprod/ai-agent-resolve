@@ -56,6 +56,17 @@ def is_cut(prev: Piece, cur: Piece) -> bool:
     return cur.rec_in != prev.rec_out
 
 
+#: Slack, in frames, when rounding a float frame time (e.g. 581 * 1001 / 30000) to its frame.
+_FRAME_SLACK = Fraction(1, 1000)
+
+
+def inward_frame(seconds: float, fps: Fps, *, up: bool) -> int:
+    """The frame at or after (``up``) or at or before ``seconds``: a keep edge rounded inward, so
+    a range never takes in even part of a frame the human excluded."""
+    exact = Fraction(repr(seconds)) * fps.num / fps.den
+    return math.ceil(exact - _FRAME_SLACK) if up else math.floor(exact + _FRAME_SLACK)
+
+
 def min_frames(seconds: float, fps: Fps) -> int:
     """Frames needed to last at least ``seconds`` (the ``min-shot`` rule's arithmetic)."""
     return math.ceil(Fraction(str(seconds)) * fps.num / fps.den)
@@ -101,6 +112,10 @@ class Words:
         """The occupied spans that meet ``(start, end)``, in time order."""
         return [(lo, hi) for lo, hi, _ in self._spans if lo < end_s and hi > start_s]
 
+    def occupied(self, start_s: float, end_s: float) -> list[tuple[float, float, Word]]:
+        """The words whose occupied span lies wholly inside ``[start, end]``."""
+        return [(lo, hi, w) for lo, hi, w in self._spans if start_s <= lo and hi <= end_s]
+
 
 @dataclass(frozen=True)
 class KeepFrames:
@@ -125,20 +140,23 @@ def keep_frames(
 ) -> tuple[list[KeepFrames], list[Snap], list[PlannerWarning]]:
     """The keep ranges in recording frames, never wider than the human made them.
 
-    Ranges that touch merge first: they play unbroken, and a word across the seam is kept. An
-    edge inside a word (``no-dialogue-splice``'s test) moves **inward** past it: the in point to
-    the word's end, the out point to its start. The partial word is left out with the material
-    the human already excluded; the range never grows. A range that this empties is dropped
-    with a warning. Each remaining range must last at least ``min_shot_s``, or no fold could
-    keep it.
+    Ranges that touch merge first: they play unbroken, and a word across the seam is kept. The
+    edges round inward to whole frames. An edge inside a word (``no-dialogue-splice``'s test)
+    moves **inward** past it: the in point to the word's end, the out point to its start. The
+    partial word is left out with the material the human already excluded; the range never
+    grows. When transcript words overlap, a whole word can go with it, and a warning says so. A
+    range that this empties is dropped with a warning. Each remaining range must last at least
+    ``min_shot_s``, or no fold could keep it.
     """
-    merged: list[tuple[int, int, str | None]] = []
+    spans: list[tuple[float, float, str | None]] = []
     for item in keep.ranges:
-        start, end = fps.frames(item.start_s), fps.frames(item.end_s)
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end), merged[-1][2])
+        if spans and item.start_s <= spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], item.end_s), spans[-1][2])
         else:
-            merged.append((start, end, item.label))
+            spans.append((item.start_s, item.end_s, item.label))
+    merged = [
+        (inward_frame(a, fps, up=True), inward_frame(b, fps, up=False), x) for a, b, x in spans
+    ]
     out: list[KeepFrames] = []
     snaps: list[Snap] = []
     warnings: list[PlannerWarning] = []
@@ -154,6 +172,24 @@ def keep_frames(
             if words.inside(end) is not word:
                 snaps.append(Snap(index, "out", word.text, last, end))
                 last = end
+        lost = [
+            w
+            for lo, hi, w in words.occupied(spans[index][0], spans[index][1])
+            if lo < fps.seconds(start) or hi > fps.seconds(end)
+        ]
+        if lost and end > start:
+            warnings.append(
+                PlannerWarning(
+                    code="keep-edge-drops-word",
+                    message=(
+                        f"keep range {index}: leaving out a partial word at its edge also leaves "
+                        f"out {len(lost)} overlapping word(s) wholly inside it ({lost[0].text!r} "
+                        "first); the transcript's words overlap there"
+                    ),
+                    at_s=round(fps.seconds(merged[index][0]), 3),
+                    hint="check the transcript at this edge, or move the edge to a pause",
+                )
+            )
         if end <= start:
             warnings.append(
                 PlannerWarning(

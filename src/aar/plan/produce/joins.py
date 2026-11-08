@@ -143,7 +143,6 @@ class _Placer:
                 prev.rec_out < at < cur.rec_out
                 and at >= keep_start
                 and at - origin >= self.handle
-                and cover.covers(at, cur.rec_out)
                 and self._keeps_words(at, cur.rec_in)
                 and _foldable(out, i, cur.rec_out - at, self.need)
             )

@@ -551,7 +551,6 @@ def produce(
             window_s=s.scan_window_ms / 1000,
             rate=s.scan_rate_hz,
             chunk_s=s.scan_chunk_s,
-            min_pause_s=s.min_pause_s,
             stats=stats,
         )
 
@@ -571,14 +570,15 @@ def produce(
     )
     warnings += done.warnings
     for source_id, seen in stats.items():
-        if seen.scanned_s >= s.no_pause_warn_s and seen.pauses == 0:
+        length = audio[source_id].duration_s or seen.scanned_s
+        if length >= s.no_pause_warn_s and seen.pauses == 0:
             warnings.append(
                 PlannerWarning(
                     code="no-pauses",
                     message=(
-                        f"{seen.scanned_s:.1f} s of source {source_id!r} holds no pause of "
-                        f"{s.min_pause_s:g} s below {silence_db:g} dB: the audio may be silent, "
-                        "or the venue's silence threshold wrong"
+                        f"source {source_id!r} ({length:.1f} s) holds no quiet stretch below "
+                        f"{silence_db:g} dB in the {seen.scanned_s:.1f} s kept: the audio may be "
+                        "silent, or the venue's silence threshold wrong"
                     ),
                     source=source_id,
                     hint="check the source's audio and the --venue",

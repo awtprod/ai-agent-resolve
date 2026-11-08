@@ -839,3 +839,45 @@ def test_a_word_occupies_at_least_min_word_around_its_middle() -> None:
     assert Words([Word(text="uh", start_s=1.0, end_s=1.0)], 0.01, FPS).spans(0.0, 2.0) == []
     long = Words([Word(text="long", start_s=1.0, end_s=2.0)], 0.01, FPS, 0.04)
     assert long.spans(0.0, 3.0) == [pytest.approx((1.01, 1.99))]  # the core, as before
+
+
+def test_keep_edges_round_inward_to_whole_frames() -> None:
+    keeps, _, _ = keep_frames(
+        KeepList.model_validate({"ranges": [{"start_s": 1.01, "end_s": 2.99}]}),
+        NO_WORDS,
+        FPS,
+        min_shot_s=1.0,
+    )
+    assert [(k.start, k.end) for k in keeps] == [(26, 74)]  # 25.25 -> 26, 74.75 -> 74
+    fps = Fps(num=30000, den=1001)
+    exact = KeepList.model_validate(
+        {"ranges": [{"start_s": fps.seconds(581), "end_s": fps.seconds(700)}]}
+    )
+    keeps, _, _ = keep_frames(exact, NO_WORDS, fps, min_shot_s=1.0)
+    assert [(k.start, k.end) for k in keeps] == [(581, 700)]  # float frame times stay put
+
+
+def test_touching_ranges_merge_before_rounding_so_no_one_frame_cut_appears() -> None:
+    keeps, _, _ = keep_frames(
+        KeepList.model_validate(
+            {"ranges": [{"start_s": 1.01, "end_s": 2.01}, {"start_s": 2.01, "end_s": 4.0}]}
+        ),
+        NO_WORDS,
+        FPS,
+        min_shot_s=1.0,
+    )
+    assert [(k.start, k.end) for k in keeps] == [(26, 100)]
+
+
+def test_an_edge_that_loses_an_overlapping_whole_word_says_so() -> None:
+    w = words(("real", 2.0, 2.8), ("noise", 2.5, 10.5))  # Whisper overlaps them
+    keeps, _, warnings = keep_frames(
+        KeepList.model_validate({"ranges": [{"start_s": 0.4, "end_s": 3.0}]}),
+        w,
+        FPS,
+        min_shot_s=1.0,
+    )
+    assert keeps[0].end == 50  # back past "noise" and the "real" it overlaps: never forward
+    assert [x.code for x in warnings] == ["keep-edge-drops-word"] and "'real'" in warnings[
+        0
+    ].message
