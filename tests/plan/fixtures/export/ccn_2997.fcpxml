@@ -27,7 +27,8 @@ outro.audio_track: outro sound is on the clip's own track (imported A1), not on 
 template: FCPXML builds a new timeline; it does not start from template 'CCN Longform Template', so its tracks, buses, Fusion titles and settings are not carried
 audio tracks after import:
 plan A1 (A1) -&gt; imported A1
-plan A2 (A2) -&gt; imported A2</note>
+plan A2 (A2) -&gt; imported A2
+split crossfades (transitions[0]): the overlapping sound -&gt; imported A3 (expected: the next free track; the exact track depends on Resolve)</note>
           <spine>
             <transition name="Cross Dissolve" offset="108108000/30000s" duration="15015/30000s">
               <filter-video ref="r2" name="Cross Dissolve" />

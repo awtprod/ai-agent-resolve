@@ -395,6 +395,11 @@ def _render_export(report: dict[str, Any], out: Path, report_file: Path) -> str:
             f"  {row['track']} {row['name']!r} -> {', '.join(row['imported'])}"
             for row in report["audio_tracks"]
         ),
+        *(
+            f"  split crossfade {row['location']} at {row['timecode']}: the overlapping sound "
+            f"-> {row['overlap_track']} (expected; the exact track depends on Resolve)"
+            for row in report["split_crossfade_audio"]
+        ),
         f"{report['not_imported']['heading']} ({len(report['not_imported']['markers'])}):",
         *(f"  marker {m['name']!r} at {m['timecode']}" for m in report["not_imported"]["markers"]),
         f"not expressible in FCPXML ({len(report['not_expressible'])}):",

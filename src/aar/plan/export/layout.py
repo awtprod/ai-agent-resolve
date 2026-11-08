@@ -259,12 +259,28 @@ class Layout:
             f"plan {plan} ({name}) -> imported {imported}"
             for plan, name, imported in self.audio_mapping()
         ]
+        overflow = self.split_overflow_track()
+        if overflow is not None:
+            splits = ", ".join(t.location for t in self.transitions if t.form == "split")
+            mapping.append(
+                f"split crossfades ({splits}): the overlapping sound -> imported A{overflow} "
+                "(expected: the next free track; the exact track depends on Resolve)"
+            )
         if not lines and not mapping:
             return None
         parts = ["aar export: not expressible in FCPXML (see the export report)", *lines]
         if mapping:
             parts += ["audio tracks after import:", *mapping]
         return "\n".join(parts)
+
+    def split_overflow_track(self) -> int | None:
+        """The audio track a split crossfade's overlapping sound is expected on after import: the
+        two clips' sound overlap, and Resolve puts one on another track (import test,
+        2026-11-08), expected to be the next free one after every track the clips' sound lands
+        on. The exact track depends on Resolve. None without a split crossfade."""
+        if not any(t.form == "split" for t in self.transitions):
+            return None
+        return max(self.imported_audio_track(c.lane) for c in self.clips) + 1
 
     def audio_mapping(self) -> list[tuple[str, str, str]]:
         """(plan track, its name, imported track) for every plan audio track a clip's sound is

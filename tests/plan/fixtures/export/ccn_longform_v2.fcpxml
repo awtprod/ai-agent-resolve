@@ -35,7 +35,8 @@ audio_tracks[3].mute: A4 'A4' is muted in the plan; exported audible (the CCN to
 audio_tracks[3].bus: A4 'A4' feeds bus 'A5'; FCPXML has no buses or Fairlight routing
 audio tracks after import:
 plan A1 (A1) -&gt; imported A1
-plan A5 (A5) -&gt; imported A1</note>
+plan A5 (A5) -&gt; imported A1
+split crossfades (transitions[0]): the overlapping sound -&gt; imported A2 (expected: the next free track; the exact track depends on Resolve)</note>
           <spine>
             <transition name="Cross Dissolve" offset="86486400/24000s" duration="15015/24000s">
               <filter-video ref="r2" name="Cross Dissolve" />

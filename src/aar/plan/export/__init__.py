@@ -94,6 +94,40 @@ def _audio_tracks(layout: Layout) -> list[dict[str, Any]]:
     return rows
 
 
+def _split_crossfade_audio(layout: Layout) -> list[dict[str, Any]]:
+    """Each split crossfade with the extra audio track it needs in Resolve: the two clips'
+    sound overlap there, and Resolve puts the overlapping sound on another track, expected to
+    be the next free one (the exact track depends on Resolve; round 3 fix-check R2)."""
+    overflow = layout.split_overflow_track()
+    if overflow is None:
+        return []
+    rows: list[dict[str, Any]] = []
+    for spec in layout.transitions:
+        if spec.form != "split":
+            continue
+        pair = [
+            c
+            for c in layout.clips
+            if c.lane == 0 and spec.cut in (c.record_in, c.record_out) and c.audio_track
+        ]
+        rows.append(
+            {
+                "location": spec.location,
+                "cut": spec.cut,
+                "timecode": layout.plan.fps.timecode(layout.tc_start + spec.cut),
+                "frames": spec.frames,
+                "plan_tracks": sorted({f"A{c.audio_track}" for c in pair}),
+                "imported": sorted({f"A{layout.imported_audio_track(c.lane)}" for c in pair}),
+                "overlap_track": f"A{overflow}",
+                "expected": (
+                    f"the overlapping sound lands on the next free audio track, A{overflow}; "
+                    "the exact track depends on Resolve"
+                ),
+            }
+        )
+    return rows
+
+
 def _lanes(layout: Layout) -> list[dict[str, Any]]:
     """Each lane in the file, the plan track it carries and the track it is expected on after
     import (lanes are dense, so plan V3 with no V2 imports as V2)."""
@@ -171,6 +205,7 @@ def build_report(
         "lanes": _lanes(layout),
         "titles": _titles(layout),
         "audio_tracks": _audio_tracks(layout),
+        "split_crossfade_audio": _split_crossfade_audio(layout),
         "transitions": [
             {
                 "location": t.location,

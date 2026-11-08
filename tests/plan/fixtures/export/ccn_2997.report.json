@@ -1,7 +1,7 @@
 {
   "format": "fcpxml",
   "fcpxml_version": "1.10",
-  "fcpxml_sha256": "0f090410e14d7e10a6eaaa249189beb8b0bcc321ba3b652b64207689f242176a",
+  "fcpxml_sha256": "9fbc8accbd306e9e356fbe80b8b18a6cb61a8d79cfec6099e8ad10613937357d",
   "plan": {
     "project": "CCN",
     "timeline": "Late Set 2997",
@@ -122,6 +122,22 @@
       "gain_db": -2.0,
       "mute": false,
       "bus": null
+    }
+  ],
+  "split_crossfade_audio": [
+    {
+      "location": "transitions[0]",
+      "cut": 600,
+      "timecode": "01:00:20:00",
+      "frames": 10,
+      "plan_tracks": [
+        "A1"
+      ],
+      "imported": [
+        "A1"
+      ],
+      "overlap_track": "A3",
+      "expected": "the overlapping sound lands on the next free audio track, A3; the exact track depends on Resolve"
     }
   ],
   "transitions": [

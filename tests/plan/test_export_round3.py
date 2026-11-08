@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from apply_builders import plan_data, seg, source
 from dtd_support import load_dtd, validate
-from export_support import GOLDEN_PLANS, ccn, export, load_plan
+from export_support import GOLDEN_PLANS, ccn, export, load_plan, permissive
 
 import aar.plan.export.files as files
 from aar.cli import main
@@ -129,6 +129,56 @@ def test_verify_rejects_titles_overlapping_on_one_lane() -> None:
     sting.set("lane", "-1")  # (lane 0 is refused by the reader already)
     problems = verify_plan_fcpxml(ET.tostring(root, encoding="unicode"), plan, ccn()).problems
     assert any("a title on lane -1 is not above the content lanes" in p for p in problems)
+
+
+# -- fix-check R2: the split crossfade's extra audio track ------------------------------------
+
+
+def test_the_split_crossfade_lists_its_extra_audio_track() -> None:
+    """The CCN golden's audio crossfade is a split edit: the two clips' sound overlap, and
+    Resolve puts the overlapping sound on another track (the import test saw a second one),
+    expected to be the next free one, A2. Listed in the report, the CLI and the file's note."""
+    result = export(load_plan(GOLDEN_PLANS["ccn_longform_v2"]), ccn())
+    assert result.report["split_crossfade_audio"] == [
+        {
+            "location": "transitions[0]",
+            "cut": 216,
+            "timecode": "01:00:09:00",
+            "frames": 12,
+            "plan_tracks": ["A1"],
+            "imported": ["A1"],
+            "overlap_track": "A2",
+            "expected": (
+                "the overlapping sound lands on the next free audio track, A2; "
+                "the exact track depends on Resolve"
+            ),
+        }
+    ]
+    note = ET.fromstring(result.fcpxml).findtext("library/event/project/sequence/note") or ""
+    assert (
+        "split crossfades (transitions[0]): the overlapping sound -> imported A2 "
+        "(expected: the next free track; the exact track depends on Resolve)"
+    ) in note
+
+
+def test_the_extra_audio_track_is_above_the_lanes_sound() -> None:
+    """With plan V2 in use its sound is on A2, so the overlapping sound is expected on A3."""
+    data = load_plan(GOLDEN_PLANS["ccn_longform_v2"]).model_dump(mode="json")
+    data["segments"].append(
+        {"track": 2, "source": "camB", "src_in": 0, "src_out": 48, "record_in": 24}
+    )
+    result = export(EditPlan.model_validate(data), permissive())  # CCN lint: not chronological
+    [row] = result.report["split_crossfade_audio"]
+    assert row["overlap_track"] == "A3"
+    assert row["imported"] == ["A1"]
+    assert [r["imported"] for r in result.report["audio_tracks"] if r["track"] == "A2"] == [["A2"]]
+
+
+def test_no_split_crossfade_needs_no_extra_track() -> None:
+    result = export(load_plan(GOLDEN_PLANS["short_reframe"]), ccn())
+    assert not any(t.form == "split" for t in result.layout.transitions)
+    assert result.report["split_crossfade_audio"] == []
+    assert result.layout.split_overflow_track() is None
 
 
 # -- item 9: the export pair, both or neither --------------------------------------------------

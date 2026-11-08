@@ -1,7 +1,7 @@
 {
   "format": "fcpxml",
   "fcpxml_version": "1.10",
-  "fcpxml_sha256": "9a290e773636c8fcaf2c7499426402958cf4ba07cea8ce141d1622fa99f1464d",
+  "fcpxml_sha256": "3ac78993a5777e7d52f14d0f2ca279cc113353ff42db7004f69f7a5e82234b51",
   "plan": {
     "project": "CCN",
     "timeline": "Baking Resistance Ep1",
@@ -115,6 +115,22 @@
       "gain_db": -1.0,
       "mute": false,
       "bus": null
+    }
+  ],
+  "split_crossfade_audio": [
+    {
+      "location": "transitions[0]",
+      "cut": 216,
+      "timecode": "01:00:09:00",
+      "frames": 12,
+      "plan_tracks": [
+        "A1"
+      ],
+      "imported": [
+        "A1"
+      ],
+      "overlap_track": "A2",
+      "expected": "the overlapping sound lands on the next free audio track, A2; the exact track depends on Resolve"
     }
   ],
   "transitions": [

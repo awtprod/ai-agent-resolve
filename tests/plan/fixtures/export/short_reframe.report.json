@@ -65,6 +65,7 @@
       "bus": null
     }
   ],
+  "split_crossfade_audio": [],
   "transitions": [],
   "not_imported": {
     "heading": "not imported: add by hand",
