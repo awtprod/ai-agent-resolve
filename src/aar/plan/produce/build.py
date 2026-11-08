@@ -20,7 +20,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from aar.media import MediaError, probe
-from aar.media.probe import parse_rational
+from aar.media.probe import parse_rational, timecode_frames
 from aar.plan.inputs import LaughMap, Transcript
 from aar.plan.lint import LintReport, all_rules, lint, validate_profile
 from aar.plan.model import EditPlan, Fps, Source
@@ -281,22 +281,42 @@ def source_frame_sizes(
     return sizes, warnings
 
 
+@dataclass(frozen=True)
+class Probed:
+    """What the media probe says about one source's file: its display size, its start timecode
+    tag as written, and its video rate (None without video)."""
+
+    frame_size: Size | None
+    timecode: str | None = None
+    fps: Fraction | None = None
+
+
 def probe_frame_sizes(
     stub: EditPlan, audio: Mapping[str, SourceAudio], media_root: Path | None
 ) -> tuple[dict[str, Size | None], list[PlannerWarning]]:
-    """The display size of every source the producer can read: the cut's sources from the probe
+    """The display size of every source the producer can read (see :func:`probe_sources`)."""
+    probed, warnings = probe_sources(stub, audio, media_root)
+    return {key: value.frame_size for key, value in probed.items()}, warnings
+
+
+def probe_sources(
+    stub: EditPlan, audio: Mapping[str, SourceAudio], media_root: Path | None
+) -> tuple[dict[str, Probed], list[PlannerWarning]]:
+    """The probe of every source the producer can read: the cut's sources from the probe
     ``open_audio`` already made, the rest (an outro clip, say) probed when their media is a local
     file. A file that cannot be probed is a warning, not a failure: the cut does not use it."""
-    sizes: dict[str, Size | None] = {key: value.frame_size for key, value in audio.items()}
+    found: dict[str, Probed] = {
+        key: Probed(value.frame_size, value.timecode, value.fps) for key, value in audio.items()
+    }
     warnings: list[PlannerWarning] = []
     for source in stub.sources:
-        if source.id in sizes:
+        if source.id in found:
             continue
         path = resolve_media(source.media, media_root)
         if path is None or not path.is_file():
             continue
         try:
-            video = probe(path).video
+            info = probe(path)
         except MediaError as exc:
             warnings.append(
                 PlannerWarning(
@@ -304,12 +324,78 @@ def probe_frame_sizes(
                     message=f"source {source.id!r}: its picture size could not be read "
                     f"({exc.summary()})",
                     source=source.id,
-                    hint="set the source's frame_size in the stub",
+                    hint="set the source's frame_size and start_timecode in the stub",
                 )
             )
             continue
-        sizes[source.id] = video.display_size if video is not None else None
-    return sizes, warnings
+        video = info.video
+        found[source.id] = Probed(
+            video.display_size if video is not None else None,
+            info.timecode,
+            video.fps if video is not None else None,
+        )
+    return found, warnings
+
+
+def source_start_timecodes(
+    stub: EditPlan, probed: Mapping[str, Probed]
+) -> tuple[dict[str, int], list[PlannerWarning]]:
+    """Each source's ``start_timecode`` (S18 round 4), as ``frame_size``: the stub's own wins,
+    else the media's timecode tag counted at the video stream's rate (the plan's for a file with
+    no video), drop-frame handled. A tag that cannot be read, a stub value the probe disagrees
+    with, and a stream rate other than the plan's are warnings; a source with neither gets none
+    (the export then reports it)."""
+    plan_fps = Fraction(stub.fps.num, stub.fps.den)
+    timecodes: dict[str, int] = {}
+    warnings: list[PlannerWarning] = []
+    for source in stub.sources:
+        seen = probed.get(source.id)
+        read: int | None = None
+        if seen is not None and seen.timecode is not None:
+            rate = seen.fps or plan_fps
+            try:
+                read = timecode_frames(seen.timecode, rate)
+            except ValueError as exc:
+                warnings.append(
+                    PlannerWarning(
+                        code="start-timecode-unread",
+                        message=f"source {source.id!r}: its media's start timecode tag cannot "
+                        f"be used ({exc})",
+                        source=source.id,
+                        hint="set the source's start_timecode in the stub",
+                    )
+                )
+            else:
+                if rate != plan_fps:
+                    warnings.append(
+                        PlannerWarning(
+                            code="start-timecode-rate",
+                            message=f"source {source.id!r}: its start timecode "
+                            f"{seen.timecode} is counted at the media's {float(rate):g} fps; the "
+                            f"plan runs at {float(plan_fps):g} fps, and the FCPXML export writes "
+                            "it at the plan's rate",
+                            source=source.id,
+                            hint="conform the media to the plan's rate, or check the clip's "
+                            "link in Resolve",
+                        )
+                    )
+        if source.start_timecode is not None:
+            timecodes[source.id] = source.start_timecode
+            if read is not None and read != source.start_timecode:
+                assert seen is not None
+                warnings.append(
+                    PlannerWarning(
+                        code="start-timecode-mismatch",
+                        message=f"source {source.id!r}: the stub gives start timecode frame "
+                        f"{source.start_timecode}, the media's tag {seen.timecode} (frame {read});"
+                        " the stub's is used",
+                        source=source.id,
+                        hint="check the media and the stub's start_timecode",
+                    )
+                )
+        elif read is not None:
+            timecodes[source.id] = read
+    return timecodes, warnings
 
 
 @dataclass
@@ -385,11 +471,14 @@ def assemble(
     rules: RuleView,
     *,
     frame_sizes: Mapping[str, tuple[int, int]] | None = None,
+    start_timecodes: Mapping[str, int] | None = None,
 ) -> tuple[EditPlan, list[PlannerWarning]]:
     """Transform 5 and the plan: framing, the camera path, segments and transitions.
 
     ``frame_sizes`` sets each source's ``frame_size`` (from :func:`source_frame_sizes`); without
-    it the stub's own sizes and the face tracks' are used."""
+    it the stub's own sizes and the face tracks' are used. ``start_timecodes`` sets each
+    source's ``start_timecode`` (from :func:`source_start_timecodes`); without it the stub's
+    own stay."""
     s = profile.produce
     fps = stub.fps
     sources = stub.source_map()
@@ -460,6 +549,8 @@ def assemble(
     for item in data["sources"]:
         if item["id"] in frame_sizes:
             item["frame_size"] = list(frame_sizes[item["id"]])
+        if start_timecodes is not None and item["id"] in start_timecodes:
+            item["start_timecode"] = start_timecodes[item["id"]]
     data.update(version=2, segments=segments, transitions=transitions)
     try:
         return EditPlan.model_validate(data), warnings
@@ -675,11 +766,21 @@ def produce(
                     hint="check the source's audio and the --venue",
                 )
             )
-    probed, size_warnings = probe_frame_sizes(stub, audio, media_root)
-    frame_sizes, mismatches = source_frame_sizes(stub, probed, tracks)
-    warnings += size_warnings + mismatches
+    probed, probe_warnings = probe_sources(stub, audio, media_root)
+    sizes = {key: value.frame_size for key, value in probed.items()}
+    frame_sizes, mismatches = source_frame_sizes(stub, sizes, tracks)
+    start_timecodes, timecode_warnings = source_start_timecodes(stub, probed)
+    warnings += probe_warnings + mismatches + timecode_warnings
     plan, framing_warnings = assemble(
-        stub, done.pieces, keeps, coverage, tracks, profile, rules, frame_sizes=frame_sizes
+        stub,
+        done.pieces,
+        keeps,
+        coverage,
+        tracks,
+        profile,
+        rules,
+        frame_sizes=frame_sizes,
+        start_timecodes=start_timecodes,
     )
     warnings += framing_warnings
     report = lint(plan, profile, transcript=transcript, laughs=laughs)

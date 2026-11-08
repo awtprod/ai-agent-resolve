@@ -9,16 +9,18 @@ and lunges. Both goldens lint clean under ``ccn``, and every cut passes QA's joi
 from __future__ import annotations
 
 import json
+import shutil
 import tomllib
 from importlib import resources
 from pathlib import Path
 from typing import Any
 
 import pytest
-from produce_support import FIXTURES, fixture, needs_ffmpeg, stage
+from produce_support import FIXTURES, ffmpeg, fixture, needs_ffmpeg, stage
 
 from aar.cli import main
 from aar.media import probe
+from aar.media.probe import timecode_frames
 from aar.plan.model import EditPlan
 from aar.plan.produce import (
     LintGateError,
@@ -148,6 +150,32 @@ def test_sources_get_their_frame_size_from_the_media(
     assert not [w for w in result.warnings if w.code.startswith("frame-size")]
     # The long-form's cameras are WAV files: audio only, so no frame size.
     assert all(s.frame_size is None for s in produce_longform(longform).plan.sources)
+
+
+def test_a_timecoded_master_gives_the_plan_its_start_timecode(
+    short: dict[str, Path], tmp_path: Path
+) -> None:
+    """S18 round 4, end to end: the short's master remuxed with an embedded 01:00:00:00; the
+    produced plan's source carries it, counted at the video stream's rate."""
+    folder = tmp_path / "short"
+    shutil.copytree(short["dir"], folder)
+    master = folder / "short_master.mov"
+    timed = folder / "timed.mov"
+    ffmpeg("-i", str(master), "-map", "0", "-c", "copy", "-timecode", "01:00:00:00", str(timed))
+    timed.replace(master)
+    info = probe(master)
+    assert info.timecode == "01:00:00:00" and info.video is not None and info.video.fps
+    faces = json.loads(short["faces"].read_text(encoding="utf-8"))
+    faces["header"]["input"]["path"] = str(master)  # the face track names its file
+    track = folder / "timed.faces.json"
+    track.write_text(json.dumps(faces), encoding="utf-8")
+    result = produce_short({**short, "dir": folder, "faces": track})
+    assert result.plan.sources[0].start_timecode == timecode_frames("01:00:00:00", info.video.fps)
+    assert not [
+        w for w in result.warnings if w.code in ("start-timecode-unread", "start-timecode-mismatch")
+    ]
+    # The untouched fixture has no timecode tag: no start_timecode, and the golden is unchanged.
+    assert produce_short(short).plan.sources[0].start_timecode is None
 
 
 @pytest.mark.parametrize("show", ["longform", "short"])
