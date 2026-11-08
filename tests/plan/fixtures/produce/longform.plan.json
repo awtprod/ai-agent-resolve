@@ -1,0 +1,218 @@
+{
+  "version": 2,
+  "project": "Synthetic Show S01",
+  "timeline": "Synthetic Long v1",
+  "template": "CCN Long Template",
+  "kind": "longform",
+  "fps": {
+    "num": 30000,
+    "den": 1001
+  },
+  "resolution": {
+    "width": 1920,
+    "height": 1080
+  },
+  "profile": "ccn",
+  "sources": [
+    {
+      "id": "cam-a",
+      "media": "longform_a.wav",
+      "camera": "A",
+      "shot_size": "close",
+      "recording_id": "show-1",
+      "recording_origin": 0,
+      "duration": 1198
+    },
+    {
+      "id": "cam-b",
+      "media": "longform_b.wav",
+      "camera": "B",
+      "shot_size": "wide",
+      "recording_id": "show-1",
+      "recording_origin": 60,
+      "duration": 1198
+    },
+    {
+      "id": "outro",
+      "media": "ccn_outro.mov",
+      "shot_size": "wide",
+      "recording_id": "outro",
+      "recording_origin": 0,
+      "duration": 302
+    }
+  ],
+  "segments": [
+    {
+      "track": 1,
+      "source": "cam-a",
+      "src_in": 30,
+      "src_out": 94,
+      "reframe": [],
+      "gain_db": 0.0,
+      "label": "store"
+    },
+    {
+      "track": 1,
+      "source": "cam-a",
+      "src_in": 126,
+      "src_out": 240,
+      "reframe": [],
+      "transform": {
+        "zoom": 1.25,
+        "pan": 0.0,
+        "tilt": 0.0,
+        "rotation_deg": 0.0,
+        "flip_h": false,
+        "flip_v": false
+      },
+      "gain_db": 0.0,
+      "label": "store"
+    },
+    {
+      "track": 1,
+      "source": "cam-b",
+      "src_in": 180,
+      "src_out": 359,
+      "reframe": [],
+      "gain_db": 0.0,
+      "label": "store"
+    },
+    {
+      "track": 1,
+      "source": "cam-b",
+      "src_in": 524,
+      "src_out": 682,
+      "reframe": [],
+      "transform": {
+        "zoom": 1.25,
+        "pan": 0.0,
+        "tilt": 0.0,
+        "rotation_deg": 0.0,
+        "flip_h": false,
+        "flip_v": false
+      },
+      "gain_db": 0.0,
+      "label": "married"
+    },
+    {
+      "track": 1,
+      "source": "cam-a",
+      "src_in": 761,
+      "src_out": 847,
+      "reframe": [],
+      "gain_db": 0.0,
+      "label": "married"
+    },
+    {
+      "track": 1,
+      "source": "cam-a",
+      "src_in": 878,
+      "src_out": 1055,
+      "reframe": [],
+      "transform": {
+        "zoom": 1.25,
+        "pan": 0.0,
+        "tilt": 0.0,
+        "rotation_deg": 0.0,
+        "flip_h": false,
+        "flip_v": false
+      },
+      "gain_db": 0.0,
+      "label": "married"
+    }
+  ],
+  "transitions": [
+    {
+      "after": 0,
+      "video": "cut",
+      "video_frames": 0,
+      "audio": {
+        "type": "Cross Fade 0 dB",
+        "frames": 2
+      }
+    },
+    {
+      "after": 2,
+      "video": "cut",
+      "video_frames": 0,
+      "audio": {
+        "type": "Cross Fade 0 dB",
+        "frames": 2
+      }
+    },
+    {
+      "after": 3,
+      "video": "cut",
+      "video_frames": 0,
+      "audio": {
+        "type": "Cross Fade 0 dB",
+        "frames": 2
+      }
+    },
+    {
+      "after": 4,
+      "video": "cut",
+      "video_frames": 0,
+      "audio": {
+        "type": "Cross Fade 0 dB",
+        "frames": 2
+      }
+    }
+  ],
+  "titles": [],
+  "captions": [],
+  "markers": [],
+  "head": {
+    "video": "dissolve",
+    "video_frames": 15,
+    "audio_fade_frames": 15
+  },
+  "outro": {
+    "source": "outro",
+    "src_in": 0,
+    "src_out": 302,
+    "track": 1,
+    "audio_track": "A5",
+    "transition": {
+      "video": "cut",
+      "video_frames": 0
+    }
+  },
+  "audio_tracks": [
+    {
+      "name": "A1",
+      "gain_db": 0.0,
+      "mute": true,
+      "bus": "A5"
+    },
+    {
+      "name": "A2",
+      "gain_db": 0.0,
+      "mute": true,
+      "bus": "A5"
+    },
+    {
+      "name": "A3",
+      "gain_db": 0.0,
+      "mute": true,
+      "bus": "A5"
+    },
+    {
+      "name": "A4",
+      "gain_db": 0.0,
+      "mute": true,
+      "bus": "A5"
+    },
+    {
+      "name": "A5",
+      "gain_db": 0.0,
+      "mute": false
+    },
+    {
+      "name": "A6",
+      "gain_db": 0.0,
+      "mute": false
+    }
+  ],
+  "end_fade_frames": 15
+}

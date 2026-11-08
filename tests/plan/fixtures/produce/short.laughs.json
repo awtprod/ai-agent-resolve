@@ -1,0 +1,15 @@
+{
+  "recording": "set-1",
+  "laughs": [
+    {
+      "start_s": 10.85,
+      "end_s": 11.15,
+      "strength": 0.6
+    },
+    {
+      "start_s": 23.3,
+      "end_s": 24.6,
+      "strength": 1.0
+    }
+  ]
+}

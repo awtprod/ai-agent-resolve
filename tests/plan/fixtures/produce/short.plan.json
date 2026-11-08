@@ -1,0 +1,330 @@
+{
+  "version": 2,
+  "project": "Synthetic Show S01",
+  "timeline": "Short 01 - Mom Calls",
+  "kind": "short",
+  "fps": {
+    "num": 30000,
+    "den": 1001
+  },
+  "resolution": {
+    "width": 1080,
+    "height": 1920
+  },
+  "profile": "ccn",
+  "sources": [
+    {
+      "id": "master",
+      "media": "short_master.mov",
+      "camera": "A",
+      "shot_size": "medium",
+      "recording_id": "set-1",
+      "recording_origin": 0,
+      "duration": 899
+    }
+  ],
+  "segments": [
+    {
+      "track": 1,
+      "source": "master",
+      "src_in": 30,
+      "src_out": 139,
+      "reframe": [
+        {
+          "time": 0,
+          "x": 0.4195,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 15,
+          "x": 0.4195,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 30,
+          "x": 0.4195,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 45,
+          "x": 0.4195,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 60,
+          "x": 0.4195,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 75,
+          "x": 0.4195,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 90,
+          "x": 0.4195,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 105,
+          "x": 0.4195,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 108,
+          "x": 0.4195,
+          "y": 0.5,
+          "zoom": 1.0
+        }
+      ],
+      "gain_db": 0.0
+    },
+    {
+      "track": 1,
+      "source": "master",
+      "src_in": 168,
+      "src_out": 386,
+      "reframe": [
+        {
+          "time": 0,
+          "x": 0.4171,
+          "y": 0.45,
+          "zoom": 1.22
+        },
+        {
+          "time": 15,
+          "x": 0.4171,
+          "y": 0.45,
+          "zoom": 1.22
+        },
+        {
+          "time": 30,
+          "x": 0.4171,
+          "y": 0.45,
+          "zoom": 1.22
+        },
+        {
+          "time": 45,
+          "x": 0.4172,
+          "y": 0.45,
+          "zoom": 1.22
+        },
+        {
+          "time": 60,
+          "x": 0.4181,
+          "y": 0.45,
+          "zoom": 1.22
+        },
+        {
+          "time": 75,
+          "x": 0.422,
+          "y": 0.45,
+          "zoom": 1.22
+        },
+        {
+          "time": 90,
+          "x": 0.4328,
+          "y": 0.45,
+          "zoom": 1.22
+        },
+        {
+          "time": 105,
+          "x": 0.4541,
+          "y": 0.45,
+          "zoom": 1.22
+        },
+        {
+          "time": 120,
+          "x": 0.4826,
+          "y": 0.45,
+          "zoom": 1.22
+        },
+        {
+          "time": 135,
+          "x": 0.5061,
+          "y": 0.45,
+          "zoom": 1.22
+        },
+        {
+          "time": 150,
+          "x": 0.52,
+          "y": 0.45,
+          "zoom": 1.22
+        },
+        {
+          "time": 165,
+          "x": 0.5239,
+          "y": 0.45,
+          "zoom": 1.22
+        },
+        {
+          "time": 180,
+          "x": 0.524,
+          "y": 0.45,
+          "zoom": 1.22
+        },
+        {
+          "time": 195,
+          "x": 0.5246,
+          "y": 0.45,
+          "zoom": 1.22
+        },
+        {
+          "time": 210,
+          "x": 0.5249,
+          "y": 0.45,
+          "zoom": 1.22
+        },
+        {
+          "time": 217,
+          "x": 0.525,
+          "y": 0.45,
+          "zoom": 1.22
+        }
+      ],
+      "gain_db": 0.0
+    },
+    {
+      "track": 1,
+      "source": "master",
+      "src_in": 492,
+      "src_out": 704,
+      "reframe": [
+        {
+          "time": 0,
+          "x": 0.5853,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 15,
+          "x": 0.5835,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 30,
+          "x": 0.5755,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 45,
+          "x": 0.5508,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 60,
+          "x": 0.5155,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 75,
+          "x": 0.4877,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 90,
+          "x": 0.477,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 105,
+          "x": 0.4753,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 120,
+          "x": 0.4743,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 135,
+          "x": 0.4741,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 150,
+          "x": 0.4741,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 165,
+          "x": 0.4741,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 180,
+          "x": 0.4741,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 195,
+          "x": 0.4741,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 210,
+          "x": 0.4741,
+          "y": 0.5,
+          "zoom": 1.0
+        },
+        {
+          "time": 211,
+          "x": 0.4741,
+          "y": 0.5,
+          "zoom": 1.0
+        }
+      ],
+      "gain_db": 0.0
+    }
+  ],
+  "transitions": [
+    {
+      "after": 0,
+      "video": "cut",
+      "video_frames": 0,
+      "audio": {
+        "type": "Cross Fade 0 dB",
+        "frames": 2
+      }
+    },
+    {
+      "after": 1,
+      "video": "cut",
+      "video_frames": 0,
+      "audio": {
+        "type": "Cross Fade 0 dB",
+        "frames": 2
+      }
+    }
+  ],
+  "titles": [],
+  "captions": [],
+  "caption_style": {
+    "font": "Montserrat",
+    "active_word_color": "#FFE800"
+  },
+  "markers": [],
+  "audio_tracks": [],
+  "end_fade_frames": 1
+}

@@ -1,4 +1,4 @@
-"""``aar plan`` commands: print the EditPlan JSON Schema and lint a plan."""
+"""``aar plan`` commands: print the EditPlan JSON Schema, lint a plan and produce one."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from aar.plan.apply.render import dumps_json, render_json, render_text
 from aar.plan.inputs import LaughMap, Transcript, load_laughs, load_transcript
 from aar.plan.lint import Finding, LintReport, Ref, lint
 from aar.plan.model import EditPlan
+from aar.plan.produce import cli as produce_cli
 from aar.plan.profile import ProfileError, load_profile
 
 _PROG = "aar plan"
@@ -52,6 +53,7 @@ def register(subparsers: Any) -> None:
     check.add_argument("--profile", help="Profile name or .toml path (default: the plan's).")
     check.add_argument("--json", action="store_true", help="Print the report as JSON.")
     check.set_defaults(func=_cmd_lint)
+    produce_cli.register(sub)
 
     apply = sub.add_parser(
         "apply",

@@ -27,6 +27,15 @@ def _cut_points(ctx: LintContext, tolerance: int) -> list[tuple[int, Point]]:
     return points
 
 
+def word_at(words: list[Word], at: float, tolerance: float) -> Word | None:
+    """The first word that ``at`` (seconds) falls strictly inside, ``tolerance`` from its edges.
+
+    This is the splice test of ``no-dialogue-splice``; the plan producers use it too, so a
+    produced cut and the linter agree on what "inside a word" means.
+    """
+    return next((w for w in words if w.start_s + tolerance < at < w.end_s - tolerance), None)
+
+
 def _pauses(words: list[Word], minimum_s: float) -> list[tuple[float, float]]:
     """Gaps between words that last at least ``minimum_s`` seconds."""
     found: list[tuple[float, float]] = []
@@ -67,10 +76,7 @@ def no_dialogue_splice(ctx: LintContext) -> list[Finding]:
         at = fps.seconds(frames)
         ref = ctx.ref(index, point)
         label = f"The {point} point of segment {index} ({ref.record_tc} on the timeline)"
-        inside = next(
-            (w for w in transcript.words if w.start_s + tol < at < w.end_s - tol),
-            None,
-        )
+        inside = word_at(transcript.words, at, tol)
         if inside is not None:
             before = _source_frame(ctx, index, inside.start_s)
             after = _source_frame(ctx, index, inside.end_s)
