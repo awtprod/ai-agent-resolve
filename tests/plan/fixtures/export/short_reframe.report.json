@@ -1,0 +1,127 @@
+{
+  "format": "fcpxml",
+  "fcpxml_version": "1.10",
+  "fcpxml_sha256": "5992e383ba4399ec86dea9c45e0537bd54b294f57f3c369bd499e2c596ec2da6",
+  "plan": {
+    "project": "CCN",
+    "timeline": "Ep1 Short 02 (reframe)",
+    "sha256": "65897b0cdb7814f80ed8ba5e1d576cf5ff18d206f1f397f8876528dc45dbcc7f"
+  },
+  "timeline": {
+    "fps": "24000/1001",
+    "frame_duration": "1001/24000s",
+    "start": "01:00:00:00",
+    "tc_start_frames": 86400,
+    "total_frames": 480,
+    "resolution": "1080x1920"
+  },
+  "exported": {
+    "segments": 2,
+    "outro": false,
+    "audio_only_clips": 0,
+    "transitions": 0,
+    "titles": 0,
+    "markers": 1,
+    "assets": 2
+  },
+  "media": [
+    {
+      "source": "camA",
+      "plan_media": "E:/CCN/Ep1/A001.braw",
+      "src": "file:///E:/CCN/Ep1/A001.braw",
+      "rule": "windows-path",
+      "windows_path": "E:/CCN/Ep1/A001.braw"
+    },
+    {
+      "source": "camB",
+      "plan_media": "E:\\CCN\\Ep1\\B 001 (wide).braw",
+      "src": "file:///E:/CCN/Ep1/B%20001%20%28wide%29.braw",
+      "rule": "windows-path",
+      "windows_path": "E:\\CCN\\Ep1\\B 001 (wide).braw"
+    }
+  ],
+  "lanes": [
+    {
+      "lane": 0,
+      "carries": "V1, the primary storyline, with its clips' sound (A1)"
+    }
+  ],
+  "transitions": [],
+  "not_expressible": [
+    {
+      "feature": "reframe_interpolation",
+      "location": "segments[0].reframe[0..1]",
+      "detail": "zoom and centre change together; FCPXML interpolates position and scale separately, so between these keyframes the path differs slightly from the plan's (exact at each keyframe)",
+      "action": "check the move in Resolve, or add keyframes"
+    },
+    {
+      "feature": "reframe_interpolation",
+      "location": "segments[0].reframe[1..2]",
+      "detail": "zoom and centre change together; FCPXML interpolates position and scale separately, so between these keyframes the path differs slightly from the plan's (exact at each keyframe)",
+      "action": "check the move in Resolve, or add keyframes"
+    },
+    {
+      "feature": "marker_color",
+      "location": "markers[0].color",
+      "detail": "FCPXML markers have no colour (Red)",
+      "action": "set the marker colour to Red in Resolve"
+    },
+    {
+      "feature": "template",
+      "location": "template",
+      "detail": "FCPXML builds a new timeline; it does not start from template 'CCN Short Template', so its tracks, buses, Fusion titles and settings are not carried",
+      "action": "import the timeline, then bring its clips into a branch of the template"
+    },
+    {
+      "feature": "audio_track_empty",
+      "location": "audio_tracks[1]",
+      "detail": "no clip sits on A2 'A2'; FCPXML cannot declare an empty track",
+      "action": "the template provides it"
+    },
+    {
+      "feature": "captions",
+      "location": "captions",
+      "detail": "2 caption(s) are not exported",
+      "action": "captions are burned in with ffmpeg (S13e)"
+    },
+    {
+      "feature": "caption_style",
+      "location": "caption_style",
+      "detail": "the caption style is not exported with the captions",
+      "action": "captions are burned in with ffmpeg (S13e)"
+    }
+  ],
+  "notes": [
+    {
+      "feature": "audio_fade",
+      "location": "head.audio_fade_frames",
+      "detail": "6-frame fade-in on the first segment's volume",
+      "action": "none"
+    },
+    {
+      "feature": "audio_fade",
+      "location": "end_fade_frames",
+      "detail": "1-frame fade-out on the last clip's volume",
+      "action": "none"
+    },
+    {
+      "feature": "source_timecode",
+      "location": "sources",
+      "detail": "each asset starts at 0s, so source frames count from each file's first frame",
+      "action": "check that clips land on the planned frames after import"
+    }
+  ],
+  "lint_warnings": [],
+  "self_check": {
+    "ok": true,
+    "problems": [],
+    "checked": {
+      "clips": 2,
+      "transitions": 0,
+      "titles": 0,
+      "markers": 1,
+      "assets": 2
+    }
+  },
+  "file": "short_reframe.fcpxml"
+}
