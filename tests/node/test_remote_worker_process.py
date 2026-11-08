@@ -20,7 +20,10 @@ from .test_remote_worker import AGENT, HUMAN, NODE, PARAMS, _registered, _submit
 def _wait(
     predicate: Callable[[], bool], *, description: str, node: subprocess.Popen | None = None
 ) -> None:
-    deadline = time.monotonic() + 15
+    # A generous deadline so a loaded host (concurrent suites) does not flake it; the loop still
+    # returns the instant the condition holds and fails fast if the node process dies, so the
+    # bound only bites a real hang, not slowness (S13h2 F15).
+    deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
         if predicate():
             return

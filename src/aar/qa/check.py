@@ -567,6 +567,27 @@ def _duration(ctx: _Ctx) -> QACheck:
     return QACheck(id="duration", status=status, message=message, measured=measured, target=target)
 
 
+def _no_cuts(check_id: str, plan: EditPlan, tolerance: int, target: dict[str, Any]) -> QACheck:
+    """The result when ``cuts()`` is empty: a true "no cuts" pass, or -- if cuts exist but every
+    one sits on a track that carries no mixed audio -- a skip with a reason, never a pass (F3)."""
+    unmixed = cuts(plan, tolerance, only_mixed=False)
+    if unmixed:
+        return skipped(
+            check_id,
+            "no-mixed-audio",
+            f"the plan has {len(unmixed)} cut(s), but every one is on a track that carries no "
+            "mixed audio (muted and unrouted), so the render's audio there cannot be judged",
+            **target,
+        )
+    return QACheck(
+        id=check_id,
+        status="pass",
+        message="The plan has no cuts: every join continues the same recording.",
+        measured={"cuts": 0},
+        target=target,
+    )
+
+
 def _cut_ref(plan: EditPlan, cut: Cut) -> dict[str, Any]:
     return {
         "join": cut.number,
@@ -637,13 +658,7 @@ def _join_quiet(ctx: _Ctx) -> QACheck:
         return skipped("join-quiet", "no-plan", "no plan was given", **target)
     cut_list = cuts(plan, qa.join_continuity_tolerance_frames)
     if not cut_list:
-        return QACheck(
-            id="join-quiet",
-            status="pass",
-            message="The plan has no cuts: every join continues the same recording.",
-            measured={"cuts": 0},
-            target=target,
-        )
+        return _no_cuts("join-quiet", plan, qa.join_continuity_tolerance_frames, target)
     sources = plan.source_map()
     details: list[dict[str, Any]] = []
     for cut in cut_list:
@@ -832,13 +847,7 @@ def _join_retranscribe(ctx: _Ctx) -> QACheck:
         return skipped("join-retranscribe", "no-audio", "the render has no audio", **target)
     cut_list = cuts(plan, qa.join_continuity_tolerance_frames)
     if not cut_list:
-        return QACheck(
-            id="join-retranscribe",
-            status="pass",
-            message="The plan has no cuts: every join continues the same recording.",
-            measured={"cuts": 0},
-            target=target,
-        )
+        return _no_cuts("join-retranscribe", plan, qa.join_continuity_tolerance_frames, target)
     _, render_end = ctx.render_duration()
     if render_end is None:
         render_end = info.duration_s or 0.0

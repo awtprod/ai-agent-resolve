@@ -1,0 +1,27 @@
+{
+  "plan_sha256": "a78a3d895889cf301d1f0cb8279af7a5c5610ee97cf75b25b76d6a1f25b0f7f1",
+  "job_id": "job_prepare_test",
+  "branch": {
+    "name": "CCN Short Template [agent:ccn-bot v1]",
+    "unique_id": "tl-branch-0001"
+  },
+  "sources": [
+    {
+      "source_id": "camA",
+      "media": {
+        "unique_id": "pool-camA",
+        "bin_path": null
+      },
+      "file_path": "E:/CCN/Ep1/A001.braw"
+    },
+    {
+      "source_id": "camB",
+      "media": {
+        "unique_id": "pool-camB",
+        "bin_path": null
+      },
+      "file_path": "E:/CCN/Ep1/B001.braw"
+    }
+  ],
+  "titles": []
+}
