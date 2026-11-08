@@ -1,7 +1,7 @@
 {
   "format": "fcpxml",
   "fcpxml_version": "1.10",
-  "fcpxml_sha256": "3ac78993a5777e7d52f14d0f2ca279cc113353ff42db7004f69f7a5e82234b51",
+  "fcpxml_sha256": "6f4483e49bd26e0ac716968c79a804ba0b8ce758e4b989fbda5970a74790a7db",
   "plan": {
     "project": "CCN",
     "timeline": "Baking Resistance Ep1",
@@ -17,8 +17,10 @@
   },
   "import": [
     "In Resolve use File > Import > Timeline and pick the .fcpxml.",
-    "For a non-16:9 or custom timeline size (a 9:16 short), tick 'Use sizing information' and 'Automatically set project settings': the scripted import ignores the FCPXML format size, so a 9:16 short came in at 1920x1080.",
-    "'Import source clips' can be left on in the dialog (the scripted import cancels with it on; import the media first there)."
+    "Leave 'Import source clips' on: it links each clip to its media file. A scripted import needs importSourceClips: True with sourceClipsPath (the folder holding the media); with it off the clips come in unlinked (Media Offline).",
+    "A clip links only when its asset starts at its file's start timecode (Source.start_timecode); the notes name every source without one.",
+    "A 9:16 short (any size other than the project's): importing it changes the project's resolution, which flips every timeline without custom settings. Import a short into a project of its own, or a timeline with custom settings, and tick 'Use sizing information' and 'Automatically set project settings' (the import otherwise ignores the FCPXML size: a 9:16 short came in at 1920x1080).",
+    "Audio crossfades and fades arrive as volume keyframes on overlapping clips; replace them with Fairlight crossfades by hand if preferred."
   ],
   "exported": {
     "segments": 4,
@@ -129,8 +131,7 @@
       "imported": [
         "A1"
       ],
-      "overlap_track": "A2",
-      "expected": "the overlapping sound lands on the next free audio track, A2; the exact track depends on Resolve"
+      "overlap": "the overlap goes on another audio track (observed: A1 holds the later clip's sound)"
     }
   ],
   "transitions": [
@@ -378,7 +379,7 @@
       "feature": "audio_crossfade",
       "location": "transitions",
       "detail": "audio-only crossfades are split edits: the picture cuts at the plan's cut, each clip's sound runs on under the other's (audioStart/audioDuration) and fades out or in over the crossfade (adjust-volume fadeIn/fadeOut)",
-      "action": "check them after import (Resolve puts the overlapping sound on another track)"
+      "action": "check them after import (the overlap goes on another audio track (observed: A1 holds the later clip's sound); the fades arrive as volume keyframes)"
     }
   ],
   "lint_warnings": [],

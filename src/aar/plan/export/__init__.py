@@ -22,7 +22,7 @@ from typing import Any
 from aar.plan.apply.inputs import plan_hash
 from aar.plan.export.errors import EXPORT_CODES, ExportError
 from aar.plan.export.fcpxml import FCPXML_VERSION, write_fcpxml
-from aar.plan.export.layout import Layout, build_layout
+from aar.plan.export.layout import SPLIT_OVERLAP, Layout, build_layout
 from aar.plan.export.media import MediaMap, load_media_map, media_map_from_mapping
 from aar.plan.export.timebase import frame_duration_text
 from aar.plan.export.verify import VerifyResult, verify_fcpxml
@@ -63,11 +63,18 @@ def layout_for(plan: EditPlan, profile: Profile, *, media_map: MediaMap | None =
 #: How to bring the file into Resolve (import test, 2026-11-08).
 IMPORT_STEPS = [
     "In Resolve use File > Import > Timeline and pick the .fcpxml.",
-    "For a non-16:9 or custom timeline size (a 9:16 short), tick 'Use sizing information' and "
-    "'Automatically set project settings': the scripted import ignores the FCPXML format size, "
-    "so a 9:16 short came in at 1920x1080.",
-    "'Import source clips' can be left on in the dialog (the scripted import cancels with it on; "
-    "import the media first there).",
+    "Leave 'Import source clips' on: it links each clip to its media file. A scripted import "
+    "needs importSourceClips: True with sourceClipsPath (the folder holding the media); with it "
+    "off the clips come in unlinked (Media Offline).",
+    "A clip links only when its asset starts at its file's start timecode "
+    "(Source.start_timecode); the notes name every source without one.",
+    "A 9:16 short (any size other than the project's): importing it changes the project's "
+    "resolution, which flips every timeline without custom settings. Import a short into a "
+    "project of its own, or a timeline with custom settings, and tick 'Use sizing information' "
+    "and 'Automatically set project settings' (the import otherwise ignores the FCPXML size: a "
+    "9:16 short came in at 1920x1080).",
+    "Audio crossfades and fades arrive as volume keyframes on overlapping clips; replace them "
+    "with Fairlight crossfades by hand if preferred.",
 ]
 
 
@@ -95,12 +102,9 @@ def _audio_tracks(layout: Layout) -> list[dict[str, Any]]:
 
 
 def _split_crossfade_audio(layout: Layout) -> list[dict[str, Any]]:
-    """Each split crossfade with the extra audio track it needs in Resolve: the two clips'
-    sound overlap there, and Resolve puts the overlapping sound on another track, expected to
-    be the next free one (the exact track depends on Resolve; round 3 fix-check R2)."""
-    overflow = layout.split_overflow_track()
-    if overflow is None:
-        return []
+    """Each split crossfade and where its overlapping sound goes: the two clips' sound overlap,
+    and Resolve puts the overlap on another audio track (the rerun found A1 holding the later
+    clip's sound, round 4), so no track is asserted."""
     rows: list[dict[str, Any]] = []
     for spec in layout.transitions:
         if spec.form != "split":
@@ -118,11 +122,7 @@ def _split_crossfade_audio(layout: Layout) -> list[dict[str, Any]]:
                 "frames": spec.frames,
                 "plan_tracks": sorted({f"A{c.audio_track}" for c in pair}),
                 "imported": sorted({f"A{layout.imported_audio_track(c.lane)}" for c in pair}),
-                "overlap_track": f"A{overflow}",
-                "expected": (
-                    f"the overlapping sound lands on the next free audio track, A{overflow}; "
-                    "the exact track depends on Resolve"
-                ),
+                "overlap": SPLIT_OVERLAP,
             }
         )
     return rows

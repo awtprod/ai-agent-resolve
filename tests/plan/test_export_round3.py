@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from apply_builders import plan_data, seg, source
 from dtd_support import load_dtd, validate
-from export_support import GOLDEN_PLANS, ccn, export, load_plan, permissive
+from export_support import GOLDEN_PLANS, ccn, export, load_plan
 
 import aar.plan.export.files as files
 from aar.cli import main
@@ -134,10 +134,10 @@ def test_verify_rejects_titles_overlapping_on_one_lane() -> None:
 # -- fix-check R2: the split crossfade's extra audio track ------------------------------------
 
 
-def test_the_split_crossfade_lists_its_extra_audio_track() -> None:
+def test_the_split_crossfade_lists_where_its_overlap_goes() -> None:
     """The CCN golden's audio crossfade is a split edit: the two clips' sound overlap, and
-    Resolve puts the overlapping sound on another track (the import test saw a second one),
-    expected to be the next free one, A2. Listed in the report, the CLI and the file's note."""
+    Resolve puts the overlap on another audio track. The rerun found A1 holding the later
+    clip's sound (round 4), so no track is asserted. In the report, the CLI and the note."""
     result = export(load_plan(GOLDEN_PLANS["ccn_longform_v2"]), ccn())
     assert result.report["split_crossfade_audio"] == [
         {
@@ -147,38 +147,26 @@ def test_the_split_crossfade_lists_its_extra_audio_track() -> None:
             "frames": 12,
             "plan_tracks": ["A1"],
             "imported": ["A1"],
-            "overlap_track": "A2",
-            "expected": (
-                "the overlapping sound lands on the next free audio track, A2; "
-                "the exact track depends on Resolve"
+            "overlap": (
+                "the overlap goes on another audio track (observed: A1 holds the later clip's "
+                "sound)"
             ),
         }
     ]
     note = ET.fromstring(result.fcpxml).findtext("library/event/project/sequence/note") or ""
     assert (
-        "split crossfades (transitions[0]): the overlapping sound -> imported A2 "
-        "(expected: the next free track; the exact track depends on Resolve)"
+        "split crossfades (transitions[0]): the overlap goes on another audio track (observed: "
+        "A1 holds the later clip's sound)"
     ) in note
+    assert "next free" not in note and "next free" not in json.dumps(result.report)
 
 
-def test_the_extra_audio_track_is_above_the_lanes_sound() -> None:
-    """With plan V2 in use its sound is on A2, so the overlapping sound is expected on A3."""
-    data = load_plan(GOLDEN_PLANS["ccn_longform_v2"]).model_dump(mode="json")
-    data["segments"].append(
-        {"track": 2, "source": "camB", "src_in": 0, "src_out": 48, "record_in": 24}
-    )
-    result = export(EditPlan.model_validate(data), permissive())  # CCN lint: not chronological
-    [row] = result.report["split_crossfade_audio"]
-    assert row["overlap_track"] == "A3"
-    assert row["imported"] == ["A1"]
-    assert [r["imported"] for r in result.report["audio_tracks"] if r["track"] == "A2"] == [["A2"]]
-
-
-def test_no_split_crossfade_needs_no_extra_track() -> None:
+def test_no_split_crossfade_lists_nothing() -> None:
     result = export(load_plan(GOLDEN_PLANS["short_reframe"]), ccn())
     assert not any(t.form == "split" for t in result.layout.transitions)
     assert result.report["split_crossfade_audio"] == []
-    assert result.layout.split_overflow_track() is None
+    note = ET.fromstring(result.fcpxml).findtext("library/event/project/sequence/note") or ""
+    assert "split crossfades" not in note
 
 
 # -- item 9: the export pair, both or neither --------------------------------------------------

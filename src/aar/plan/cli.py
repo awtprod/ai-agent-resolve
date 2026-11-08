@@ -396,8 +396,7 @@ def _render_export(report: dict[str, Any], out: Path, report_file: Path) -> str:
             for row in report["audio_tracks"]
         ),
         *(
-            f"  split crossfade {row['location']} at {row['timecode']}: the overlapping sound "
-            f"-> {row['overlap_track']} (expected; the exact track depends on Resolve)"
+            f"  split crossfade {row['location']} at {row['timecode']}: {row['overlap']}"
             for row in report["split_crossfade_audio"]
         ),
         f"{report['not_imported']['heading']} ({len(report['not_imported']['markers'])}):",

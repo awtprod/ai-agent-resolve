@@ -138,6 +138,13 @@ class TransitionSpec:
         return self.frames - self.head_part
 
 
+#: Where a split crossfade's overlapping sound goes after import: the rerun of the import test
+#: (2026-11-08) found it on A1, holding the later clip's sound, not on a next free track.
+SPLIT_OVERLAP = (
+    "the overlap goes on another audio track (observed: A1 holds the later clip's sound)"
+)
+
+
 @dataclass(frozen=True)
 class TitleSpec:
     location: str
@@ -269,28 +276,15 @@ class Layout:
             f"plan {plan} ({name}) -> imported {imported}"
             for plan, name, imported in self.audio_mapping()
         ]
-        overflow = self.split_overflow_track()
-        if overflow is not None:
-            splits = ", ".join(t.location for t in self.transitions if t.form == "split")
-            mapping.append(
-                f"split crossfades ({splits}): the overlapping sound -> imported A{overflow} "
-                "(expected: the next free track; the exact track depends on Resolve)"
-            )
+        splits = ", ".join(t.location for t in self.transitions if t.form == "split")
+        if splits:
+            mapping.append(f"split crossfades ({splits}): {SPLIT_OVERLAP}")
         if not lines and not mapping:
             return None
         parts = ["aar export: not expressible in FCPXML (see the export report)", *lines]
         if mapping:
             parts += ["audio tracks after import:", *mapping]
         return "\n".join(parts)
-
-    def split_overflow_track(self) -> int | None:
-        """The audio track a split crossfade's overlapping sound is expected on after import: the
-        two clips' sound overlap, and Resolve puts one on another track (import test,
-        2026-11-08), expected to be the next free one after every track the clips' sound lands
-        on. The exact track depends on Resolve. None without a split crossfade."""
-        if not any(t.form == "split" for t in self.transitions):
-            return None
-        return max(self.imported_audio_track(c.lane) for c in self.clips) + 1
 
     def audio_mapping(self) -> list[tuple[str, str, str]]:
         """(plan track, its name, imported track) for every plan audio track a clip's sound is
@@ -1202,7 +1196,7 @@ class _Builder:
                 "audio-only crossfades are split edits: the picture cuts at the plan's cut, each "
                 "clip's sound runs on under the other's (audioStart/audioDuration) and fades out "
                 "or in over the crossfade (adjust-volume fadeIn/fadeOut)",
-                "check them after import (Resolve puts the overlapping sound on another track)",
+                f"check them after import ({SPLIT_OVERLAP}; the fades arrive as volume keyframes)",
             )
         for source in plan.sources:
             if source.id in self.layout.media and source.frame_size is None:

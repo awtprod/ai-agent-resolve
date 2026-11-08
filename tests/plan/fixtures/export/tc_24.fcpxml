@@ -36,7 +36,7 @@ audio_tracks[3].bus: A4 'A4' feeds bus 'A5'; FCPXML has no buses or Fairlight ro
 audio tracks after import:
 plan A1 (A1) -&gt; imported A1
 plan A5 (A5) -&gt; imported A1
-split crossfades (transitions[0]): the overlapping sound -&gt; imported A2 (expected: the next free track; the exact track depends on Resolve)</note>
+split crossfades (transitions[0]): the overlap goes on another audio track (observed: A1 holds the later clip's sound)</note>
           <spine>
             <transition name="Cross Dissolve" offset="3600s" duration="15/24s">
               <filter-video ref="r2" name="Cross Dissolve" />

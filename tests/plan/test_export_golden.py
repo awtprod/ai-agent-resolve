@@ -267,10 +267,22 @@ def test_markers_are_listed_to_add_by_hand() -> None:
 
 
 def test_import_instructions_are_in_the_report() -> None:
+    """Round 4 (the rerun): import source clips stays on (scripted: importSourceClips with
+    sourceClipsPath); clips link only at the media's start timecode; a 9:16 import changes the
+    project's resolution; fades arrive as volume keyframes."""
     steps = _report("short_reframe")["import"]
+    assert len(steps) == 5
     assert steps[0].startswith("In Resolve use File > Import > Timeline")
-    assert "'Use sizing information' and 'Automatically set project settings'" in steps[1]
-    assert "Import source clips" in steps[2]
+    assert steps[1].startswith("Leave 'Import source clips' on")
+    assert "importSourceClips: True with sourceClipsPath" in steps[1]
+    assert "start timecode (Source.start_timecode)" in steps[2]
+    assert "changes the project's resolution" in steps[3]
+    assert "a project of its own, or a timeline with custom settings" in steps[3]
+    assert "'Use sizing information' and 'Automatically set project settings'" in steps[3]
+    assert steps[4] == (
+        "Audio crossfades and fades arrive as volume keyframes on overlapping clips; replace "
+        "them with Fairlight crossfades by hand if preferred."
+    )
 
 
 def test_gain_fades_conform_and_transform_on_content_clips() -> None:

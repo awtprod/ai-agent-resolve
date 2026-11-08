@@ -17,8 +17,10 @@
   },
   "import": [
     "In Resolve use File > Import > Timeline and pick the .fcpxml.",
-    "For a non-16:9 or custom timeline size (a 9:16 short), tick 'Use sizing information' and 'Automatically set project settings': the scripted import ignores the FCPXML format size, so a 9:16 short came in at 1920x1080.",
-    "'Import source clips' can be left on in the dialog (the scripted import cancels with it on; import the media first there)."
+    "Leave 'Import source clips' on: it links each clip to its media file. A scripted import needs importSourceClips: True with sourceClipsPath (the folder holding the media); with it off the clips come in unlinked (Media Offline).",
+    "A clip links only when its asset starts at its file's start timecode (Source.start_timecode); the notes name every source without one.",
+    "A 9:16 short (any size other than the project's): importing it changes the project's resolution, which flips every timeline without custom settings. Import a short into a project of its own, or a timeline with custom settings, and tick 'Use sizing information' and 'Automatically set project settings' (the import otherwise ignores the FCPXML size: a 9:16 short came in at 1920x1080).",
+    "Audio crossfades and fades arrive as volume keyframes on overlapping clips; replace them with Fairlight crossfades by hand if preferred."
   ],
   "exported": {
     "segments": 2,
