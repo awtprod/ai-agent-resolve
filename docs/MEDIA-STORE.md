@@ -73,6 +73,11 @@ $ aar media timecode B006_10010449_C074.braw
  "stub": {"start_timecode": 521420, "start_timecode_rate": {"num": 30000, "den": 1001}}, ...}
 ```
 
+`rate` is the tmcd track's timescale/frameDuration as written; the stub's rate is that rate
+snapped to a standard one (2997/100 is 30000/1001), as `aar plan produce` would. The tmcd track
+cannot say whether whole-numbered video is really 23.976 or 29.97: if its 24/1 or 30/1 tmcd sits
+on NTSC-rate video, give the video's rate instead.
+
 It exits 0 when it read a timecode, 1 when the file has none it can read (the error's `code` is
 `timecode_` plus `not_quicktime`, `no_timecode`, `malformed`, `unsupported`, `too_large` or
 `io`), and 2 when the file is missing or not a regular file.

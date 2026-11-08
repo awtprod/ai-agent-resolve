@@ -22,11 +22,12 @@ import pytest
 from media_support import FFPROBE, ffmpeg, needs_ffmpeg
 
 from aar.cli import main
-from aar.media import MediaError, MediaInputError
-from aar.media.probe import frames_timecode, timecode_frames
+from aar.media import MediaError, MediaInputError, quicktime
+from aar.media.probe import frames_timecode, parse_probe_json, snap_rate, timecode_frames
 from aar.media.quicktime import (
     MAX_ATOMS,
     MAX_MOOV_BYTES,
+    MAX_READ_BYTES,
     QuickTimeTimecode,
     TimecodeUnreadable,
     frames_per_day,
@@ -99,6 +100,40 @@ def test_frames_timecode_refuses(frames: int, fps: Fraction, drop: bool, why: st
         frames_timecode(frames, fps, drop_frame=drop)
 
 
+@pytest.mark.parametrize(
+    ("rate", "snapped"),
+    [
+        (Fraction(2953125, 98536), NTSC),  # the CCN BRAW's video average
+        (Fraction(2997, 100), NTSC),
+        (NTSC, NTSC),
+        (Fraction(30), Fraction(30)),
+        (Fraction(24), Fraction(24)),
+        (Fraction(2997, 125), Fraction(24000, 1001)),  # 23.976
+        (Fraction(5994, 100), NTSC60),
+        (Fraction(2401, 100), Fraction(24)),  # 0.04 % off
+        (Fraction(241, 10), None),  # 0.42 % off: no standard rate
+        (Fraction(25, 2), None),
+        (Fraction(120), None),
+        (Fraction(0), None),
+        (None, None),
+    ],
+)
+def test_snap_rate(rate: Fraction | None, snapped: Fraction | None) -> None:
+    assert snap_rate(rate) == snapped
+
+
+def test_the_probe_keeps_r_frame_rate_beside_the_average() -> None:
+    raw = {"index": 0, "codec_type": "video", "avg_frame_rate": "2953125/98536",
+           "r_frame_rate": "30000/1001"}  # fmt: skip
+    video = parse_probe_json({"streams": [raw], "format": {}}, "x.braw", 1).video
+    assert video is not None and (video.fps, video.base_fps) == (Fraction(2953125, 98536), NTSC)
+    assert video.to_dict()["base_fps"] == "30000/1001"
+    only_r = parse_probe_json(
+        {"streams": [{**raw, "avg_frame_rate": "0/0"}], "format": {}}, "x.mov", 1
+    ).video
+    assert only_r is not None and only_r.fps == only_r.base_fps == NTSC
+
+
 def test_frames_per_day() -> None:
     assert frames_per_day(Fraction(24), drop_frame=False) == 2073600
     assert frames_per_day(NTSC, drop_frame=False) == 2592000
@@ -134,6 +169,20 @@ def test_a_braw_like_file_gives_its_tmcd_sample(tmp_path: Path) -> None:
     }
 
 
+def test_the_stub_fields_take_the_snapped_rate() -> None:
+    movie = Movie(frame=108000)
+    movie.tmcd_stbl = [stsd(tmcd_entry(0, 2997, 100, 30)), co64(TMCD_AT)]
+    got = read_bytes(movie.build())
+    data = got.to_dict()
+    assert got.rate == Fraction(2997, 100) and data["rate"] == "2997/100"  # as written
+    assert data["stub"]["start_timecode_rate"] == {"num": 30000, "den": 1001}
+    movie.tmcd_stbl = [stsd(tmcd_entry(0, 25, 2, 12)), co64(TMCD_AT)]  # 12.5: no standard rate
+    assert read_bytes(movie.build()).to_dict()["stub"]["start_timecode_rate"] == {
+        "num": 25,
+        "den": 2,
+    }
+
+
 def test_a_64_bit_mdat_and_a_co64_offset_past_4_gib_are_read_by_seeking() -> None:
     view, size = Movie(frame=1234).big(5 * 2**30, 4 * 2**30 + 12345)
     got = read_timecode_from(view, size)
@@ -160,6 +209,16 @@ def test_the_media_handler_is_the_one_in_mdia_not_minf() -> None:
     decoy = trak(b"vide", stsd(tmcd_entry()), co64(10**9), minf_extra=[hdlr(b"tmcd")])
     got = read_bytes(Movie(tracks_before=[decoy]).build())
     assert got.frames == 521420
+
+
+def test_only_a_trak_is_a_track() -> None:
+    """An atom shaped like a tmcd track but not called 'trak' (here 'udta', pointing at other
+    bytes of the mdat) is not the timecode track."""
+    movie = Movie()
+    decoy = bytearray(movie.tmcd_track(TMCD_AT + 4))
+    decoy[4:8] = b"udta"
+    movie.tracks_before = [bytes(decoy)]
+    assert read_bytes(movie.build()).frames == 521420
 
 
 def test_the_first_tmcd_track_wins() -> None:
@@ -286,6 +345,8 @@ GOOD_STSD = stsd(tmcd_entry())
         pytest.param(Movie(with_tmcd=False).build(), "no_timecode", "no timecode", id="no-tmcd"),
         pytest.param(Movie().build()[:-4], "malformed", "'moov'.*past the end of the file",
                      id="moov-short-by-4"),
+        pytest.param(Movie().build()[:-1], "malformed", "'moov'.*past the end of the file",
+                     id="moov-short-by-1"),
         pytest.param(_tmcd(GOOD_STSD, co64(10**12)), "malformed", "the tmcd sample at",
                      id="offset-past-eof"),
         pytest.param(_tmcd(GOOD_STSD, stco(2**32 - 2)), "malformed", "the tmcd sample at",
@@ -351,8 +412,9 @@ def test_a_child_that_overruns_its_parent_is_malformed() -> None:
     good = trak(b"vide", stsd(atom(b"brvl", bytes(8))), co64(0))
     tkhd_end = 8 + 8 + 84  # trak header, tkhd
     mdia_size = struct.unpack(">I", good[tkhd_end : tkhd_end + 4])[0]
-    bad = good[:tkhd_end] + struct.pack(">I", mdia_size + 4) + good[tkhd_end + 4 :]
-    refused(Movie(tracks_before=[bad]).build(), "malformed", "'mdia'.*past the end of 'trak'")
+    for extra in (1, 4):
+        bad = good[:tkhd_end] + struct.pack(">I", mdia_size + extra) + good[tkhd_end + 4 :]
+        refused(Movie(tracks_before=[bad]).build(), "malformed", "'mdia'.*past the end of 'trak'")
 
 
 def test_padding_under_a_header_inside_a_container_is_ignored() -> None:
@@ -413,6 +475,83 @@ def test_an_atom_flood_stops_at_the_atom_cap() -> None:
     assert read_bytes(good[:moov_at] + atom(b"free") * 1000 + good[moov_at:]).frames == 521420
 
 
+def test_100k_atoms_64_kib_apart_stay_within_the_read_budget() -> None:
+    """The validator's case: 100k top-level 'free' atoms 64 KiB apart (a 6.5 GB file). Every
+    header costs exactly 8 bytes, so the walk reads under 1 MB and stops typed."""
+    count, step = 100_000, 65536
+    segments = {i * step: struct.pack(">I4s", step, b"free") for i in range(count)}
+    view = Sparse(count * step + 8, segments, fill=True)
+    with pytest.raises(TimecodeUnreadable) as caught:
+        read_timecode_from(view, view.size)
+    assert caught.value.code in ("malformed", "not_quicktime")
+    assert view.bytes_read <= 8 * (MAX_ATOMS + 1) < MAX_READ_BYTES
+    assert all(n == 8 for _, n in view.reads)
+
+
+def test_the_read_budget_is_typed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(quicktime, "MAX_READ_BYTES", 100)
+    with pytest.raises(TimecodeUnreadable, match="more than 100 bytes read") as caught:
+        read_bytes(Movie().build())
+    assert caught.value.code == "too_large"
+    monkeypatch.setattr(quicktime, "MAX_READ_BYTES", 400)  # the whole read takes under 400
+    assert read_bytes(Movie().build()).frames == 521420
+
+
+@pytest.mark.skipif(not Path("/proc/self/io").exists(), reason="needs /proc/self/io (Linux)")
+def test_reads_from_disk_are_unbuffered(tmp_path: Path) -> None:
+    """A buffered file would fill 4-8 KiB on every seek; the reader's 8-byte header reads must
+    stay 8 bytes at the system call (rchar), so a spaced-out file costs bytes, not megabytes."""
+    count, step = 500, 65536
+    path = tmp_path / "spaced.mov"
+    with path.open("wb") as out:
+        out.truncate(count * step + 8)
+        for i in range(count):
+            out.seek(i * step)
+            out.write(struct.pack(">I4s", step, b"free"))
+
+    def rchar() -> int:
+        text = Path("/proc/self/io").read_text()
+        return int(next(line for line in text.splitlines() if line.startswith("rchar")).split()[1])
+
+    before = rchar()
+    with pytest.raises(TimecodeUnreadable):
+        read_timecode(path)
+    assert rchar() - before < 64 * 1024  # 501 headers of 8 bytes, plus /proc itself
+
+
+@pytest.mark.parametrize(
+    ("where", "ok"),
+    [("mdat-first", True), ("mdat-last", True), ("zero", False), ("mdat-header", False),
+     ("moov", False), ("straddles-mdat-end", False), ("free", False)],
+)  # fmt: skip
+def test_the_sample_must_lie_in_an_mdat(where: str, ok: bool) -> None:
+    """The tmcd sample's 4 bytes must be inside a top-level mdat's payload; an offset into the
+    moov, a header or another atom is refused rather than read as a frame number."""
+    payload = struct.pack(">I", 777) + bytes(8) + struct.pack(">I", 888)
+    free = atom(b"free", bytes(16))
+    movie = Movie()
+    movie.tmcd_stbl = [GOOD_STSD, co64(0)]
+    head = atom(b"wide") + free
+    mdat_at = len(head)
+    mdat = atom(b"mdat", payload)
+    moov_at = mdat_at + len(mdat)
+    offsets = {
+        "mdat-first": mdat_at + 8,
+        "mdat-last": mdat_at + len(mdat) - 4,
+        "zero": 0,
+        "mdat-header": mdat_at + 2,
+        "moov": moov_at + 8,
+        "straddles-mdat-end": mdat_at + len(mdat) - 2,
+        "free": 8 + 8,
+    }
+    movie.tmcd_stbl = [GOOD_STSD, co64(offsets[where])]
+    data = head + mdat + movie.moov()
+    if ok:
+        assert read_bytes(data).frames == {"mdat-first": 777, "mdat-last": 888}[where]
+    else:
+        refused(data, "malformed", "not inside an mdat")
+
+
 def test_a_zero_size_atom_runs_to_the_end_of_its_parent() -> None:
     movie = Movie()
     data = movie.build()
@@ -466,6 +605,21 @@ def test_a_failing_stream_is_an_io_refusal() -> None:
     with pytest.raises(TimecodeUnreadable, match="Input/output error") as caught:
         read_timecode_from(Broken(), 1000)
     assert caught.value.code == "io"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
+def test_a_fifo_swapped_in_after_the_check_is_refused_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The path check and the open race: the descriptor is opened non-blocking and checked
+    again with fstat, so a FIFO put there in between is refused at once."""
+    fifo = tmp_path / "swapped.mov"
+    os.mkfifo(fifo)
+    monkeypatch.setattr(quicktime, "require_regular_file", lambda path, tool="": Path(path))
+    started = time.perf_counter()
+    with pytest.raises(TimecodeUnreadable, match="not a regular file") as caught:
+        read_timecode(fifo)
+    assert caught.value.code == "io" and time.perf_counter() - started < 5.0
 
 
 def test_missing_and_irregular_paths_are_input_errors(tmp_path: Path) -> None:

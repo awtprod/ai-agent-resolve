@@ -35,6 +35,7 @@ class Stream:
     rotation: int = 0  # display rotation in degrees, 0-359 (video)
     sample_aspect: Fraction | None = None  # pixel aspect; None when unknown or not video
     timecode: str | None = None  # the stream's ``timecode`` tag (a video or tmcd stream)
+    base_fps: Fraction | None = None  # ffprobe's r_frame_rate (video); ``fps`` is the average
 
     @property
     def display_size(self) -> tuple[int, int] | None:
@@ -46,6 +47,8 @@ class Stream:
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["fps"] = None if self.fps is None else f"{self.fps.numerator}/{self.fps.denominator}"
+        base = self.base_fps
+        data["base_fps"] = None if base is None else f"{base.numerator}/{base.denominator}"
         aspect = self.sample_aspect
         data["sample_aspect"] = (
             None if aspect is None else f"{aspect.numerator}/{aspect.denominator}"
@@ -163,6 +166,26 @@ def _timecode_tag(raw: Any) -> str | None:
 _TIMECODE = re.compile(r"(\d{2}):(\d{2}):(\d{2})([:;.])(\d{2,3})")
 #: The only rates drop-frame timecode exists at: 29.97 and 59.94.
 DROP_FRAME_RATES = (Fraction(30000, 1001), Fraction(60000, 1001))
+#: The frame rates a camera or an edit runs at, which :func:`snap_rate` rounds to.
+STANDARD_RATES = tuple(
+    Fraction(n, d)
+    for n, d in (
+        (24000, 1001), (24, 1), (25, 1), (30000, 1001), (30, 1),
+        (48000, 1001), (48, 1), (50, 1), (60000, 1001), (60, 1),
+    )
+)  # fmt: skip
+#: How far (relative) a measured rate may be from the standard one it snaps to: 0.1 %.
+SNAP_TOLERANCE = Fraction(1, 1000)
+
+
+def snap_rate(rate: Fraction | None) -> Fraction | None:
+    """The standard rate (:data:`STANDARD_RATES`) nearest ``rate``, if it is within 0.1 %; None
+    otherwise. A measured average such as BRAW's 2953125/98536 snaps to 30000/1001, and a tmcd
+    track's 2997/100 too; 12.5 or 120 fps snap to nothing."""
+    if rate is None or rate <= 0:
+        return None
+    nearest = min(STANDARD_RATES, key=lambda standard: abs(rate - standard))
+    return nearest if abs(rate - nearest) <= nearest * SNAP_TOLERANCE else None
 
 
 def timecode_frames(text: str, fps: Fraction) -> int:
@@ -248,11 +271,10 @@ def parse_probe_json(data: dict[str, Any], path: str, size_bytes: int) -> MediaI
         if not isinstance(raw, dict):
             continue
         kind = str(raw.get("codec_type") or "unknown")
-        fps = None
+        fps = base_fps = None
         if kind == "video":
-            fps = parse_rational(raw.get("avg_frame_rate")) or parse_rational(
-                raw.get("r_frame_rate")
-            )
+            base_fps = parse_rational(raw.get("r_frame_rate"))
+            fps = parse_rational(raw.get("avg_frame_rate")) or base_fps
         disposition = raw.get("disposition") or {}
         streams.append(
             Stream(
@@ -272,6 +294,7 @@ def parse_probe_json(data: dict[str, Any], path: str, size_bytes: int) -> MediaI
                     sample_aspect(raw.get("sample_aspect_ratio")) if kind == "video" else None
                 ),
                 timecode=_timecode_tag(raw),
+                base_fps=base_fps,
             )
         )
     return MediaInfo(

@@ -10,6 +10,7 @@ number) at offset 4096.
 
 from __future__ import annotations
 
+import bisect
 import io
 import struct
 from collections.abc import Sequence
@@ -135,6 +136,7 @@ class Sparse(io.RawIOBase):
     def __init__(self, size: int, segments: dict[int, bytes], *, fill: bool = False) -> None:
         self.size = size
         self.segments = sorted(segments.items())
+        self.starts = [offset for offset, _ in self.segments]
         self.fill = fill
         self.pos = 0
         self.reads: list[tuple[int, int]] = []
@@ -160,18 +162,18 @@ class Sparse(io.RawIOBase):
         out = bytearray()
         at = start
         while at < end:
-            hit = next(((o, d) for o, d in self.segments if o <= at < o + len(d)), None)
-            if hit is None:
-                if not self.fill:
-                    raise LookupError(f"read of unknown byte {at}")
-                nxt = min([o for o, _ in self.segments if o > at] or [end])
-                out += bytes(min(end, nxt) - at)
-                at = min(end, nxt)
+            i = bisect.bisect_right(self.starts, at) - 1  # the last segment starting at or before
+            if i >= 0 and at < self.starts[i] + len(self.segments[i][1]):
+                o, d = self.segments[i]
+                take = d[at - o : min(len(d), end - o)]
+                out += take
+                at += len(take)
                 continue
-            o, d = hit
-            take = d[at - o : min(len(d), end - o)]
-            out += take
-            at += len(take)
+            if not self.fill:
+                raise LookupError(f"read of unknown byte {at}")
+            nxt = self.starts[i + 1] if i + 1 < len(self.starts) else end
+            out += bytes(min(end, nxt) - at)
+            at = min(end, nxt)
         self.pos = end
         return bytes(out)
 

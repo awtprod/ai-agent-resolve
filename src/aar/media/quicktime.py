@@ -30,13 +30,16 @@ from dataclasses import dataclass
 from fractions import Fraction
 from typing import IO, Any, Literal
 
-from aar.media.probe import DROP_FRAME_RATES, frames_timecode
+from aar.media.probe import DROP_FRAME_RATES, frames_timecode, snap_rate
 from aar.media.tools import MediaError, require_regular_file
 
 #: The largest ``moov`` read; a longer one is refused as ``too_large``.
 MAX_MOOV_BYTES = 64 * 1024 * 1024
 #: The most atom headers one read visits (top level and inside ``moov`` together).
 MAX_ATOMS = 100_000
+#: The most bytes one read takes from the file; past it the read is refused as ``too_large``.
+#: Reads are unbuffered, so this bounds what reaches the disk, not just what is parsed.
+MAX_READ_BYTES = 8 * 1024 * 1024
 #: Suffixes the plan producer reads with this module when ffprobe gives no timecode.
 QUICKTIME_SUFFIXES = (".braw", ".mov", ".mp4")
 
@@ -81,7 +84,10 @@ class QuickTimeTimecode:
         return frames_timecode(self.frames, self.rate, drop_frame=self.drop_frame)
 
     def to_dict(self) -> dict[str, Any]:
-        rate = {"num": self.rate.numerator, "den": self.rate.denominator}
+        """The read as JSON. ``stub`` is what to put in a plan stub's source: the frame and the
+        tmcd rate snapped to a standard rate (2997/100 is 30000/1001), as the producer would."""
+        standard = snap_rate(self.rate) or self.rate
+        rate = {"num": standard.numerator, "den": standard.denominator}
         return {
             "frames": self.frames,
             "rate": f"{self.rate.numerator}/{self.rate.denominator}",
@@ -119,6 +125,7 @@ class _Source:
         self.stream = stream
         self.size = size
         self.atoms = 0
+        self.bytes_read = 0
 
     def read(self, offset: int, length: int) -> bytes:
         if offset < 0 or offset + length > self.size:
@@ -127,9 +134,14 @@ class _Source:
                 f"{self.size}-byte file",
                 code="malformed",
             )
+        self.bytes_read += length
+        if self.bytes_read > MAX_READ_BYTES:
+            raise TimecodeUnreadable(
+                f"more than {MAX_READ_BYTES} bytes read before the timecode", code="too_large"
+            )
         try:
             self.stream.seek(offset)
-            data = self.stream.read(length)
+            data = self.stream.read(length) or b""  # a raw read gives None only when it would block
         except OSError as exc:
             raise TimecodeUnreadable(
                 f"cannot read the file: {exc.strerror or exc}", code="io"
@@ -254,6 +266,19 @@ def _first_chunk(src: _Source, stbl: _Atom) -> int:
     raise TimecodeUnreadable("the tmcd track has no chunk offsets (stco or co64)", code="malformed")
 
 
+def _require_in_mdat(src: _Source, offset: int) -> None:
+    """The sample's four bytes must lie in the payload of a top-level ``mdat``: an offset into
+    ``moov``, a header or past the media is not a timecode sample."""
+    for atom in src.children(0, src.size, "the file"):
+        if atom.start > offset:
+            break
+        if atom.kind == b"mdat" and atom.body <= offset and offset + 4 <= atom.end:
+            return
+    raise TimecodeUnreadable(
+        f"the tmcd sample at {offset} is not inside an mdat atom's media", code="malformed"
+    )
+
+
 def _read(src: _Source) -> QuickTimeTimecode:
     mdia = _timecode_media(src, _movie(src))
     stbl = _require(src, _require(src, mdia, b"minf"), b"stbl")
@@ -301,6 +326,7 @@ def _read(src: _Source) -> QuickTimeTimecode:
             f"the tmcd sample at {offset} is past the end of the {src.size}-byte file",
             code="malformed",
         )
+    _require_in_mdat(src, offset)
     (frames,) = struct.unpack(">I", src.read(offset, 4))
     day = frames_per_day(rate, drop_frame=drop)
     if frames >= day:
@@ -341,7 +367,7 @@ def read_timecode(path: str | os.PathLike[str]) -> QuickTimeTimecode:
         fd = os.open(p, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
     except OSError as exc:
         raise TimecodeUnreadable(f"cannot open {p}: {exc.strerror or exc}", code="io") from None
-    with os.fdopen(fd, "rb") as stream:
+    with os.fdopen(fd, "rb", buffering=0) as stream:  # unbuffered: 8-byte reads stay 8 bytes
         try:
             info = os.fstat(stream.fileno())
         except OSError as exc:  # pragma: no cover - fstat on an open descriptor
@@ -354,6 +380,7 @@ def read_timecode(path: str | os.PathLike[str]) -> QuickTimeTimecode:
 __all__ = [
     "MAX_ATOMS",
     "MAX_MOOV_BYTES",
+    "MAX_READ_BYTES",
     "QUICKTIME_SUFFIXES",
     "QuickTimeTimecode",
     "TimecodeUnreadable",
