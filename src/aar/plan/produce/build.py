@@ -20,7 +20,13 @@ from typing import Any
 from pydantic import ValidationError
 
 from aar.media import MediaError, probe
-from aar.media.probe import parse_rational, timecode_frames
+from aar.media.probe import frames_timecode, is_drop_frame, parse_rational, timecode_frames
+from aar.media.quicktime import (
+    QUICKTIME_SUFFIXES,
+    QuickTimeTimecode,
+    TimecodeUnreadable,
+    read_timecode,
+)
 from aar.plan.inputs import LaughMap, Transcript
 from aar.plan.lint import LintReport, all_rules, lint, validate_profile
 from aar.plan.model import EditPlan, Fps, Source
@@ -283,12 +289,16 @@ def source_frame_sizes(
 
 @dataclass(frozen=True)
 class Probed:
-    """What the media probe says about one source's file: its display size, its start timecode
-    tag as written, and its video rate (None without video)."""
+    """What the media says about one source's file: its display size, its start timecode tag as
+    ffprobe reads it, and its video rate (None without video), from the probe; and its tmcd track
+    as :mod:`aar.media.quicktime` reads it (S18a), for a ``.braw``, ``.mov`` or ``.mp4`` file.
+    ``tmcd_problem`` says why that read failed, unless the file simply has no tmcd track."""
 
     frame_size: Size | None
     timecode: str | None = None
     fps: Fraction | None = None
+    tmcd: QuickTimeTimecode | None = None
+    tmcd_problem: str | None = None
 
 
 def probe_frame_sizes(
@@ -299,15 +309,31 @@ def probe_frame_sizes(
     return {key: value.frame_size for key, value in probed.items()}, warnings
 
 
+def read_tmcd(path: Path) -> tuple[QuickTimeTimecode | None, str | None]:
+    """The tmcd track of a QuickTime-family file (``QUICKTIME_SUFFIXES``), with the reason a read
+    failed; ``(None, None)`` for another kind of file or one with no tmcd track."""
+    if path.suffix.lower() not in QUICKTIME_SUFFIXES:
+        return None, None
+    try:
+        return read_timecode(path), None
+    except TimecodeUnreadable as exc:
+        return None, (None if exc.code == "no_timecode" else str(exc))
+    except MediaError as exc:  # gone or replaced since it was probed
+        return None, exc.summary()
+
+
 def probe_sources(
     stub: EditPlan, audio: Mapping[str, SourceAudio], media_root: Path | None
 ) -> tuple[dict[str, Probed], list[PlannerWarning]]:
     """The probe of every source the producer can read: the cut's sources from the probe
     ``open_audio`` already made, the rest (an outro clip, say) probed when their media is a local
-    file. A file that cannot be probed is a warning, not a failure: the cut does not use it."""
-    found: dict[str, Probed] = {
-        key: Probed(value.frame_size, value.timecode, value.fps) for key, value in audio.items()
-    }
+    file. A file that cannot be probed is a warning, not a failure: the cut does not use it.
+    Every QuickTime-family file also has its tmcd track read (S18a): BRAW's start timecode then
+    comes even when ffprobe cannot open the file, and with the timecode's own rate."""
+    found: dict[str, Probed] = {}
+    for key, value in audio.items():
+        tmcd, problem = read_tmcd(value.path)
+        found[key] = Probed(value.frame_size, value.timecode, value.fps, tmcd, problem)
     warnings: list[PlannerWarning] = []
     for source in stub.sources:
         if source.id in found:
@@ -315,6 +341,7 @@ def probe_sources(
         path = resolve_media(source.media, media_root)
         if path is None or not path.is_file():
             continue
+        tmcd, problem = read_tmcd(path)
         try:
             info = probe(path)
         except MediaError as exc:
@@ -327,12 +354,16 @@ def probe_sources(
                     hint="set the source's frame_size and start_timecode in the stub",
                 )
             )
+            if tmcd is not None:  # BRAW where ffprobe cannot open it: the timecode still counts
+                found[source.id] = Probed(None, tmcd=tmcd)
             continue
         video = info.video
         found[source.id] = Probed(
             video.display_size if video is not None else None,
             info.timecode,
             video.fps if video is not None else None,
+            tmcd,
+            problem,
         )
     return found, warnings
 
@@ -340,46 +371,122 @@ def probe_sources(
 @dataclass(frozen=True)
 class StartTimecode:
     """A source's start timecode: ``frames`` from 00:00:00:00 counted at ``rate`` (the media's
-    own frame rate; None when unknown, meaning the plan's)."""
+    own frame rate; None when unknown, meaning the plan's). ``origin`` says what supplied the
+    frames (``stub``, ``media probe`` or ``tmcd reader``) and ``rate_origin`` the rate when that
+    differs; ``drop_frame`` is the media's flag (None when the stub gave it). Equality compares
+    only the frames and the rate."""
 
     frames: int
     rate: Fraction | None = None
+    origin: str = field(default="stub", compare=False)
+    rate_origin: str | None = field(default=None, compare=False)
+    drop_frame: bool | None = field(default=None, compare=False)
+
+    def to_dict(self, plan_fps: Fraction) -> dict[str, Any]:
+        rate = self.rate or plan_fps
+        try:
+            label: str | None = frames_timecode(self.frames, rate, drop_frame=bool(self.drop_frame))
+        except ValueError:
+            label = None
+        return {
+            "frames": self.frames,
+            "rate": None if self.rate is None else f"{rate.numerator}/{rate.denominator}",
+            "timecode": label,
+            "drop_frame": self.drop_frame,
+            "from": self.origin,
+            "rate_from": self.rate_origin or (self.origin if self.rate is not None else "plan fps"),
+        }
+
+
+def _media_timecodes(
+    source_id: str, seen: Probed, stub_rate: Fraction | None, plan_fps: Fraction
+) -> tuple[list[tuple[StartTimecode, str]], list[PlannerWarning]]:
+    """What the media says a source's start timecode is, best first, each with how it reads
+    (``tag 01:00:00:00``): ffprobe's tag, then the tmcd track. A tag that cannot be parsed, or
+    one the tmcd track gives another frame for, is a warning."""
+    tmcd = seen.tmcd
+    found: list[tuple[StartTimecode, str]] = []
+    warnings: list[PlannerWarning] = []
+    if seen.timecode is not None:
+        tag = seen.timecode
+        rate = seen.fps or (tmcd.rate if tmcd is not None else None) or stub_rate or plan_fps
+        try:
+            read = timecode_frames(tag, rate)
+        except ValueError as exc:
+            warnings.append(
+                PlannerWarning(
+                    code="start-timecode-unread",
+                    message=f"source {source_id!r}: its media's start timecode tag cannot "
+                    f"be used ({exc})",
+                    source=source_id,
+                    hint="set the source's start_timecode in the stub",
+                )
+            )
+        else:
+            drop = is_drop_frame(tag)
+            if tmcd is not None and read == tmcd.frames:  # the same label: count at its rate
+                found.append(
+                    (
+                        StartTimecode(read, tmcd.rate, "media probe", "tmcd reader", drop),
+                        f"tag {tag}",
+                    )
+                )
+            else:
+                if tmcd is not None:
+                    warnings.append(
+                        PlannerWarning(
+                            code="start-timecode-reader-mismatch",
+                            message=f"source {source_id!r}: ffprobe reads its start timecode as "
+                            f"{tag} (frame {read}), its tmcd track as {tmcd.timecode} (frame "
+                            f"{tmcd.frames} at {float(tmcd.rate):g} fps); ffprobe's is used",
+                            source=source_id,
+                            hint="check the media, or set start_timecode in the stub",
+                        )
+                    )
+                found.append(
+                    (
+                        StartTimecode(read, seen.fps or stub_rate, "media probe", None, drop),
+                        f"tag {tag}",
+                    )
+                )
+    if tmcd is not None:
+        found.append(
+            (
+                StartTimecode(tmcd.frames, tmcd.rate, "tmcd reader", None, tmcd.drop_frame),
+                f"tmcd track {tmcd.timecode}",
+            )
+        )
+    return found, warnings
 
 
 def source_start_timecodes(
     stub: EditPlan, probed: Mapping[str, Probed]
 ) -> tuple[dict[str, StartTimecode], list[PlannerWarning]]:
-    """Each source's ``start_timecode`` and ``start_timecode_rate`` (S18 round 4), as
-    ``frame_size``: the stub's own win, else the media's timecode tag counted at the video
-    stream's rate (the plan's for a file with no video), drop-frame handled, with that rate. A tag
-    that cannot be read and a stub value the probe disagrees with are warnings; a source with
-    neither gets none (the export then refuses or reports it).
+    """Each source's ``start_timecode`` and ``start_timecode_rate`` (S18 round 4, S18a), as
+    ``frame_size``: the stub's own win; else the media's timecode tag (ffprobe) counted at the
+    video stream's rate (the plan's for a file with no video), drop-frame handled; else the tmcd
+    track's first sample (``aar.media.quicktime``, for BRAW, which ffprobe may not open). A tag
+    that cannot be read, a tmcd track that cannot be read when nothing else gives a timecode, a
+    stub value the media disagrees with, and a tag the tmcd track disagrees with are warnings; a
+    source with none gets none (the export then refuses or reports it).
 
-    A stub that gives ``start_timecode`` without its rate, for media the probe shows at another
-    rate than the plan's, is refused (``start-timecode-rate-required``): the frame count is
-    ambiguous, and the export would place the asset at the wrong time."""
+    When the tag and the tmcd track give the same frame number, the rate is the tmcd track's
+    (timescale/frameDuration): it is the rate a timecode counts at, where the video stream's
+    average can be off any frame grid (BRAW's is 2953125/98536 for 29.97, from one long sample).
+
+    A stub that gives ``start_timecode`` without its rate, for media whose timecode runs at
+    another rate than the plan's, is refused (``start-timecode-rate-required``): the frame count
+    is ambiguous, and the export would place the asset at the wrong time."""
     plan_fps = Fraction(stub.fps.num, stub.fps.den)
     timecodes: dict[str, StartTimecode] = {}
     warnings: list[PlannerWarning] = []
     for source in stub.sources:
-        seen = probed.get(source.id)
-        media_rate = seen.fps if seen is not None else None
+        seen = probed.get(source.id) or Probed(None)
         given = source.start_timecode_rate
         stub_rate = Fraction(given.num, given.den) if given is not None else None
-        read: int | None = None
-        if seen is not None and seen.timecode is not None:
-            try:
-                read = timecode_frames(seen.timecode, media_rate or stub_rate or plan_fps)
-            except ValueError as exc:
-                warnings.append(
-                    PlannerWarning(
-                        code="start-timecode-unread",
-                        message=f"source {source.id!r}: its media's start timecode tag cannot "
-                        f"be used ({exc})",
-                        source=source.id,
-                        hint="set the source's start_timecode in the stub",
-                    )
-                )
+        media, media_warnings = _media_timecodes(source.id, seen, stub_rate, plan_fps)
+        warnings += media_warnings
+        media_rate = seen.tmcd.rate if seen.tmcd is not None else seen.fps
         if source.start_timecode is not None:
             if stub_rate is None and media_rate is not None and media_rate != plan_fps:
                 raise ProduceInputError(
@@ -392,21 +499,33 @@ def source_start_timecodes(
                 )
             chosen = StartTimecode(source.start_timecode, stub_rate)
             timecodes[source.id] = chosen
-            if read is not None and seen is not None:
-                read_s = Fraction(read) / (media_rate or stub_rate or plan_fps)
-                if read_s != Fraction(chosen.frames) / (chosen.rate or plan_fps):
+            if media:
+                best, label = media[0]
+                media_s = Fraction(best.frames) / (best.rate or stub_rate or plan_fps)
+                if media_s != Fraction(chosen.frames) / (chosen.rate or plan_fps):
                     warnings.append(
                         PlannerWarning(
                             code="start-timecode-mismatch",
                             message=f"source {source.id!r}: the stub gives start timecode "
-                            f"frame {source.start_timecode}, the media's tag {seen.timecode} "
-                            f"(frame {read}); the stub's is used",
+                            f"frame {source.start_timecode}, the media's {label} (frame "
+                            f"{best.frames}); the stub's is used",
                             source=source.id,
                             hint="check the media and the stub's start_timecode",
                         )
                     )
-        elif read is not None:
-            timecodes[source.id] = StartTimecode(read, media_rate or stub_rate)
+        elif media:
+            timecodes[source.id] = media[0][0]
+        elif seen.tmcd_problem is not None:
+            warnings.append(
+                PlannerWarning(
+                    code="start-timecode-unread",
+                    message=f"source {source.id!r}: its media's tmcd track cannot be read "
+                    f"({seen.tmcd_problem})",
+                    source=source.id,
+                    hint="set the source's start_timecode in the stub (aar media timecode FILE "
+                    "prints it for a readable file)",
+                )
+            )
     return timecodes, warnings
 
 
@@ -420,6 +539,7 @@ class ProduceResult:
     nudges: list[Nudge] = field(default_factory=list)
     folds: list[Fold] = field(default_factory=list)
     ending: Ending | None = None
+    start_timecodes: dict[str, StartTimecode] = field(default_factory=dict)
 
     @property
     def cuts(self) -> int:
@@ -457,6 +577,10 @@ class ProduceResult:
             "ending": None
             if self.ending is None
             else {**asdict(self.ending), "out_s": sec(self.ending.to_frame)},
+            "start_timecodes": {
+                key: value.to_dict(Fraction(fps.num, fps.den))
+                for key, value in self.start_timecodes.items()
+            },
         }
 
     def report(self, out: str | None = None) -> ProduceReport:
@@ -811,5 +935,13 @@ def produce(
             report=report,
         )
     return ProduceResult(
-        plan, report, warnings, snaps, done.trims, done.nudges, done.folds, done.ending
+        plan,
+        report,
+        warnings,
+        snaps,
+        done.trims,
+        done.nudges,
+        done.folds,
+        done.ending,
+        start_timecodes,
     )

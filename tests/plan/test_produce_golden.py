@@ -179,8 +179,21 @@ def test_a_timecoded_master_gives_the_plan_its_start_timecode(
     assert not [
         w for w in result.warnings if w.code in ("start-timecode-unread", "start-timecode-mismatch")
     ]
+    # S18a: the log says what supplied it. ffprobe's tag gives the frame, and the tmcd track
+    # (the same frame) its rate, which for this file is the video stream's own.
+    source_id = result.plan.sources[0].id
+    entry = result.log()["start_timecodes"][source_id]
+    assert (entry["from"], entry["rate_from"], entry["timecode"]) == (
+        "media probe",
+        "tmcd reader",
+        "01:00:00:00",
+    )
+    assert entry["frames"] == result.plan.sources[0].start_timecode
+    assert entry["rate"] == f"{info.video.fps.numerator}/{info.video.fps.denominator}"
     # The untouched fixture has no timecode tag: no start_timecode, and the golden is unchanged.
-    assert produce_short(short).plan.sources[0].start_timecode is None
+    untouched = produce_short(short)
+    assert untouched.plan.sources[0].start_timecode is None
+    assert untouched.log()["start_timecodes"] == {}
 
 
 @pytest.mark.parametrize("show", ["longform", "short"])

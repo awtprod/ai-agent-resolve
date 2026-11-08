@@ -13,11 +13,17 @@ import pytest
 from export_support import GOLDEN_PLANS, ccn, export, load_plan
 from produce_support import ffmpeg, needs_ffmpeg
 
+from aar.media import MediaError
 from aar.media.probe import parse_probe_json, timecode_frames
+from aar.media.quicktime import QuickTimeTimecode, read_timecode
+from aar.plan.export import ExportError
+from aar.plan.export.timebase import parse_time
 from aar.plan.model import EditPlan
-from aar.plan.produce.audio import open_audio
+from aar.plan.produce import build as build_module
+from aar.plan.produce.audio import SourceAudio, open_audio
 from aar.plan.produce.build import Probed, StartTimecode, probe_sources, source_start_timecodes
 from aar.plan.produce.errors import ProduceInputError
+from qt_support import Movie
 
 FILM = Fraction(24000, 1001)
 NTSC = Fraction(30000, 1001)
@@ -265,3 +271,216 @@ def test_a_25_fps_file_at_01_00_00_00_exports_at_3600s_in_a_24_fps_plan(tmp_path
     result = export(EditPlan.model_validate(data), ccn())
     starts = {a.get("start") for a in ET.fromstring(result.fcpxml).iter("asset")}
     assert starts == {"3600s"}
+
+
+# -- S18a: the tmcd reader -----------------------------------------------------------------------
+
+#: BRAW's video stream averages 2953125/98536 fps (one 1002-tick sample in 1575 at 1/30000): what
+#: ffprobe gives as its rate, on no frame grid. Its tmcd track says 30000/1001.
+BRAW_AVG = Fraction(2953125, 98536)
+
+
+def _tmcd(frames: int = 521420, rate: Fraction = NTSC, drop: bool = False) -> QuickTimeTimecode:
+    per_second = round(rate)
+    return QuickTimeTimecode(
+        frames, rate, drop, True, 2 | drop, rate.numerator, rate.denominator, per_second, 4096
+    )
+
+
+BRAW_TAG = "04:49:40:20"
+
+
+def test_the_tmcd_track_is_the_fallback_when_the_probe_has_no_timecode() -> None:
+    stub = _stub(_source(media="A001.braw"), fps="30000/1001")
+    for seen in (Probed(None, tmcd=_tmcd()), Probed((4112, 2176), None, BRAW_AVG, _tmcd())):
+        timecodes, warnings = source_start_timecodes(stub, {"cam": seen})
+        assert timecodes == {"cam": StartTimecode(521420, NTSC)} and warnings == []
+        chosen = timecodes["cam"]
+        assert (chosen.origin, chosen.rate_origin, chosen.drop_frame) == (
+            "tmcd reader",
+            None,
+            False,
+        )
+
+
+def test_when_the_tag_and_the_tmcd_track_agree_the_rate_is_the_tmcd_tracks() -> None:
+    """The CCN BRAW on ffprobe 6.1: the tag reads 04:49:40:20 (frame 521420) at the video
+    stream's average rate; the tmcd track gives the same frame at 30000/1001, which is used."""
+    stub = _stub(_source(media="A001.braw"), fps="30000/1001")
+    seen = Probed((4112, 2176), BRAW_TAG, BRAW_AVG, _tmcd())
+    timecodes, warnings = source_start_timecodes(stub, {"cam": seen})
+    assert timecodes == {"cam": StartTimecode(521420, NTSC)} and warnings == []
+    chosen = timecodes["cam"]
+    assert (chosen.origin, chosen.rate_origin) == ("media probe", "tmcd reader")
+    # Without the tmcd track (dev before S18a) the rate was the average: on no 29.97 frame.
+    alone, _ = source_start_timecodes(stub, {"cam": Probed((4112, 2176), BRAW_TAG, BRAW_AVG)})
+    assert alone == {"cam": StartTimecode(521420, BRAW_AVG)}
+
+
+def test_when_the_tag_and_the_tmcd_track_disagree_the_probe_wins_with_a_warning() -> None:
+    stub = _stub(_source(), fps="30000/1001")
+    seen = Probed(None, "01:00:00:00", NTSC, _tmcd(5))
+    timecodes, warnings = source_start_timecodes(stub, {"cam": seen})
+    assert timecodes == {"cam": StartTimecode(108000, NTSC)}
+    assert timecodes["cam"].origin == "media probe"
+    assert [w.code for w in warnings] == ["start-timecode-reader-mismatch"]
+    assert "01:00:00:00 (frame 108000)" in warnings[0].message
+    assert "00:00:00:05 (frame 5" in warnings[0].message
+
+
+def test_a_tag_that_cannot_be_read_leaves_the_tmcd_track() -> None:
+    stub = _stub(_source(), fps="30000/1001")
+    timecodes, warnings = source_start_timecodes(
+        stub, {"cam": Probed(None, "junk", NTSC, _tmcd(900))}
+    )
+    assert timecodes == {"cam": StartTimecode(900, NTSC)}
+    assert timecodes["cam"].origin == "tmcd reader"
+    assert [w.code for w in warnings] == ["start-timecode-unread"]
+
+
+def test_a_drop_frame_tmcd_track_counts_real_frames() -> None:
+    stub = _stub(_source(), fps="30000/1001")
+    seen = Probed(None, "01:00:00;00", NTSC, _tmcd(107892, drop=True))
+    timecodes, warnings = source_start_timecodes(stub, {"cam": seen})
+    assert timecodes == {"cam": StartTimecode(107892, NTSC)} and warnings == []
+    assert timecodes["cam"].drop_frame is True
+    assert timecodes["cam"].to_dict(NTSC)["timecode"] == "01:00:00;00"
+
+
+def test_the_stub_still_wins_over_the_tmcd_track() -> None:
+    stub = _stub(_source(start_timecode=3, start_timecode_rate="30000/1001"), fps="30000/1001")
+    timecodes, warnings = source_start_timecodes(stub, {"cam": Probed(None, tmcd=_tmcd())})
+    assert timecodes == {"cam": StartTimecode(3, NTSC)}
+    assert timecodes["cam"].origin == "stub"
+    assert [w.code for w in warnings] == ["start-timecode-mismatch"]
+    assert "tmcd track 04:49:40:20 (frame 521420)" in warnings[0].message
+    agreeing = _stub(_source(start_timecode=521420), fps="30000/1001")
+    assert source_start_timecodes(agreeing, {"cam": Probed(None, tmcd=_tmcd())})[1] == []
+
+
+def test_the_rate_check_for_a_stub_value_uses_the_tmcd_rate() -> None:
+    """A stub frame count without its rate is fine for BRAW in a 29.97 plan (the tmcd track runs
+    at the plan's rate) even though the video stream averages another rate; refused when the
+    tmcd track runs at another rate."""
+    stub = _stub(_source(start_timecode=521420), fps="30000/1001")
+    seen = Probed((4112, 2176), BRAW_TAG, BRAW_AVG, _tmcd())
+    assert source_start_timecodes(stub, {"cam": seen}) == ({"cam": StartTimecode(521420)}, [])
+    with pytest.raises(ProduceInputError) as caught:
+        source_start_timecodes(stub, {"cam": Probed(None, tmcd=_tmcd(90000, Fraction(25)))})
+    assert caught.value.code == "start-timecode-rate-required"
+
+
+def test_a_tmcd_track_that_cannot_be_read_warns_only_when_nothing_else_gives_one() -> None:
+    stub = _stub(_source(media="A001.braw"), fps="30000/1001")
+    broken = Probed(None, tmcd_problem="the tmcd sample at 99 is past the end")
+    timecodes, warnings = source_start_timecodes(stub, {"cam": broken})
+    assert timecodes == {} and [w.code for w in warnings] == ["start-timecode-unread"]
+    assert "past the end" in warnings[0].message and "aar media timecode" in warnings[0].hint
+    tagged = Probed(None, "01:00:00:00", NTSC, None, "malformed")
+    assert source_start_timecodes(stub, {"cam": tagged}) == (
+        {"cam": StartTimecode(108000, NTSC)},
+        [],
+    )
+    given = _stub(_source(media="A001.braw", start_timecode=9), fps="30000/1001")
+    assert source_start_timecodes(given, {"cam": broken})[1] == []
+
+
+def test_read_tmcd_reads_only_quicktime_files(tmp_path: Path) -> None:
+    good = Movie().build()
+    for name in ("A001.braw", "B.MOV", "c.mp4", "D.Braw"):
+        (tmp_path / name).write_bytes(good)
+        tmcd, problem = build_module.read_tmcd(tmp_path / name)
+        assert tmcd is not None and tmcd.frames == 521420 and problem is None
+    for name in ("cam.wav", "cam.mkv", "cam.mxf"):
+        (tmp_path / name).write_bytes(good)
+        assert build_module.read_tmcd(tmp_path / name) == (None, None)
+    (tmp_path / "plain.mov").write_bytes(Movie(with_tmcd=False).build())
+    no_track = build_module.read_tmcd(tmp_path / "plain.mov")
+    assert no_track == (None, None)  # a file without a tmcd track: nothing to say
+    (tmp_path / "cut.braw").write_bytes(good[:5000])
+    tmcd, problem = build_module.read_tmcd(tmp_path / "cut.braw")
+    assert tmcd is None and problem is not None and "past the end of the file" in problem
+    tmcd, problem = build_module.read_tmcd(tmp_path / "gone.braw")
+    assert tmcd is None and problem is not None and "file not found" in problem
+
+
+def test_probe_sources_reads_braw_that_ffprobe_cannot_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ffprobe failing on a BRAW (an older ffprobe, or one without the mov demuxer): the
+    picture size is still a warning, and the start timecode comes from the tmcd track."""
+    braw = tmp_path / "A001.braw"
+    braw.write_bytes(Movie().build())
+    junk = tmp_path / "junk.mov"
+    junk.write_bytes(b"not a movie")
+
+    def no_ffprobe(path: object, **_: object) -> object:
+        raise MediaError("ffprobe exited 1", tool="ffprobe")
+
+    monkeypatch.setattr(build_module, "probe", no_ffprobe)
+    stub = _stub(_source(media=str(braw)), {"id": "junk", "media": str(junk)}, fps="30000/1001")
+    probed, warnings = probe_sources(stub, {}, None)
+    assert [(w.code, w.source) for w in warnings] == [
+        ("frame-size-unread", "cam"),
+        ("frame-size-unread", "junk"),
+    ]
+    assert probed == {"cam": Probed(None, tmcd=read_timecode(braw))}  # junk: nothing kept
+    timecodes, warnings = source_start_timecodes(stub, probed)
+    assert timecodes == {"cam": StartTimecode(521420, NTSC)} and warnings == []
+
+
+def test_probe_sources_reads_the_tmcd_track_of_the_cuts_sources(tmp_path: Path) -> None:
+    braw = tmp_path / "A001.braw"
+    braw.write_bytes(Movie().build())
+    stub = _stub(_source(media=str(braw)), fps="30000/1001")
+    audio = {"cam": SourceAudio(braw, 2, 52.5, (4112, 2176), BRAW_TAG, BRAW_AVG)}
+    probed, warnings = probe_sources(stub, audio, None)
+    assert warnings == []
+    assert probed == {"cam": Probed((4112, 2176), BRAW_TAG, BRAW_AVG, read_timecode(braw))}
+    timecodes, _ = source_start_timecodes(stub, probed)
+    assert timecodes == {"cam": StartTimecode(521420, NTSC)}
+
+
+def test_the_braw_timecode_exports_on_the_29_97_grid() -> None:
+    """End to end: the tmcd track's 521420 at 30000/1001 puts the asset at exactly
+    521420 x 1001/30000 s in a 29.97 plan; the video stream's average rate would put it between
+    two frames, which the export refuses."""
+    data = load_plan(GOLDEN_PLANS["tc_2997"]).model_dump(mode="json")
+    for source in data["sources"]:
+        source["start_timecode"] = 521420
+        source["start_timecode_rate"] = {"num": 30000, "den": 1001}
+    result = export(EditPlan.model_validate(data), ccn())
+    starts = {parse_time(a.get("start", "")) for a in ET.fromstring(result.fcpxml).iter("asset")}
+    assert starts == {Fraction(521420 * 1001, 30000)}
+    for source in data["sources"]:
+        source["start_timecode_rate"] = {"num": BRAW_AVG.numerator, "den": BRAW_AVG.denominator}
+    with pytest.raises(ExportError) as caught:
+        export(EditPlan.model_validate(data), ccn())
+    assert caught.value.code == "start_timecode_off_grid"
+
+
+def test_the_start_timecode_report_says_what_supplied_it() -> None:
+    plan_fps = Fraction(24)
+    rows = {
+        "stub": StartTimecode(86400),
+        "stub-rate": StartTimecode(90000, Fraction(25)),
+        "probe": StartTimecode(86400, plan_fps, "media probe"),
+        "both": StartTimecode(521420, NTSC, "media probe", "tmcd reader", False),
+        "tmcd-df": StartTimecode(107892, NTSC, "tmcd reader", None, True),
+    }
+    got = {key: value.to_dict(plan_fps) for key, value in rows.items()}
+    assert got["stub"] == {
+        "frames": 86400,
+        "rate": None,
+        "timecode": "01:00:00:00",
+        "drop_frame": None,
+        "from": "stub",
+        "rate_from": "plan fps",
+    }
+    assert (got["stub-rate"]["rate"], got["stub-rate"]["rate_from"]) == ("25/1", "stub")
+    assert (got["probe"]["from"], got["probe"]["rate_from"]) == ("media probe", "media probe")
+    assert got["both"]["rate"] == "30000/1001" and got["both"]["timecode"] == "04:49:40:20"
+    assert (got["both"]["from"], got["both"]["rate_from"]) == ("media probe", "tmcd reader")
+    assert got["tmcd-df"]["timecode"] == "01:00:00;00" and got["tmcd-df"]["drop_frame"] is True
+    # A label that cannot be written (drop-frame at the plan's 24) is left out, not raised.
+    assert StartTimecode(5, None, "stub", None, True).to_dict(plan_fps)["timecode"] is None
