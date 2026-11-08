@@ -15,7 +15,9 @@
       <project name="Ep1 Short 02 (reframe)">
         <sequence format="r1" duration="480480/24000s" tcStart="86486400/24000s" tcFormat="NDF" audioLayout="stereo" audioRate="48k">
           <note>aar export: not expressible in FCPXML (see the export report)
-template: FCPXML builds a new timeline; it does not start from template 'CCN Short Template', so its tracks, buses, Fusion titles and settings are not carried</note>
+template: FCPXML builds a new timeline; it does not start from template 'CCN Short Template', so its tracks, buses, Fusion titles and settings are not carried
+audio tracks after import:
+plan A1 (A1) -&gt; imported A1</note>
           <spine>
             <asset-clip ref="r2" offset="86486400/24000s" name="open on Jane" start="0s" duration="240240/24000s">
               <adjust-conform type="fill" />
@@ -40,7 +42,6 @@ template: FCPXML builds a new timeline; it does not start from template 'CCN Sho
                   <fadeIn type="linear" duration="6006/24000s" />
                 </param>
               </adjust-volume>
-              <marker start="0s" duration="1001/24000s" value="Hook" />
             </asset-clip>
             <asset-clip ref="r3" offset="86726640/24000s" name="B 001 (wide).braw" start="240240/24000s" duration="240240/24000s">
               <note>wide reframed to the speaker</note>

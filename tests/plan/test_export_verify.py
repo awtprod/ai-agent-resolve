@@ -9,14 +9,12 @@ from export_support import EXPORT_FIXTURES, GOLDEN_PLANS, ccn, load_plan
 from aar.plan.export import verify_plan_fcpxml
 from aar.plan.export.reader import MAX_BYTES, check_structure, read_fcpxml
 
-# The transition-form golden: its audio-only crossfade is a spine transition element.
-GOLDEN = (EXPORT_FIXTURES / "ccn_longform_v2.transition.fcpxml").read_text(encoding="utf-8")
+GOLDEN = (EXPORT_FIXTURES / "ccn_longform_v2.fcpxml").read_text(encoding="utf-8")
 PLAN = load_plan(GOLDEN_PLANS["ccn_longform_v2"])
-FORM = "transition"
 
 
 def _problems(text: str) -> list[str]:
-    result = verify_plan_fcpxml(text, PLAN, ccn(), audio_crossfade=FORM)
+    result = verify_plan_fcpxml(text, PLAN, ccn())
     assert not result.ok
     assert result.problems
     return result.problems
@@ -28,7 +26,7 @@ def _tamper(old: str, new: str) -> str:
 
 
 def test_the_golden_is_clean() -> None:
-    assert verify_plan_fcpxml(GOLDEN, PLAN, ccn(), audio_crossfade=FORM).problems == []
+    assert verify_plan_fcpxml(GOLDEN, PLAN, ccn()).problems == []
 
 
 @pytest.mark.parametrize(
@@ -43,30 +41,45 @@ def test_the_golden_is_clean() -> None:
         # A source in point one frame off.
         ('start="72072/24000s"', 'start="73073/24000s"', "segment 1"),
         # A clip pointing at another file.
-        ('ref="r6" offset="86558472/24000s"', 'ref="r7" offset="86558472/24000s"', "src"),
+        ('ref="r5" offset="86558472/24000s"', 'ref="r6" offset="86558472/24000s"', "src"),
         ("file:///E:/CCN/Ep1/B001.braw", "file:///E:/CCN/Ep1/B002.braw", "assets"),
-        # The crossfade's length and window.
-        ('duration="12012/24000s"', 'duration="13013/24000s"', "not in the plan"),
+        # The outro dissolve's window and length.
         (
-            'offset="86696610/24000s" duration',
-            'offset="86697611/24000s" duration',
+            'offset="86792706/24000s" duration="15015/24000s">',
+            'offset="86793707/24000s" duration="15015/24000s">',
             "not in the plan",
+        ),
+        (
+            'offset="86792706/24000s" duration="15015/24000s">',
+            'offset="86792706/24000s" duration="16016/24000s">',
+            "not in the plan",
+        ),
+        # Round 3: a spine clip overlapping the next (Resolve trims and duplicates).
+        (
+            'name="B001.braw" start="72072/24000s" duration="72072/24000s"',
+            'name="B001.braw" start="72072/24000s" duration="73073/24000s"',
+            "never overlap",
+        ),
+        # Round 3: srcEnable (Resolve ignores it) and markers (Resolve imports none) fail.
+        ('<asset-clip ref="r7" offset', '<asset-clip ref="r7" srcEnable="all" offset', "srcEnable"),
+        (
+            "</asset-clip>\n            <transition",
+            '<marker start="0s" value="x" /></asset-clip>\n            <transition',
+            "<marker> is not something aar's writer emits",
         ),
         # Timing header.
         ('tcStart="86486400/24000s"', 'tcStart="86400s"', "tcStart"),
         ('frameDuration="1001/24000s"', 'frameDuration="1/24s"', "frameDuration"),
         ('duration="426426/24000s"', 'duration="427427/24000s"', "sequence duration"),
-        # Sound: the split timing that stops the sound at the outro, a volume, a fade.
+        # Sound: the J cut of the split crossfade, a volume, a fade.
         (' audioStart="24024/24000s" audioDuration="96096/24000s"', "", "sound"),
         ('amount="-2dB"', 'amount="-3dB"', "volume_db"),
         ('<fadeOut type="linear" duration="2002/24000s" />', "", "fade_out"),
-        ('srcEnable="audio"', 'srcEnable="all"', "enable"),
-        ('lane="-4"', 'lane="-3"', "lane -4"),
+        ('<title ref="r3" lane="1"', '<title ref="r3" lane="2"', "titles"),
         # Picture: transform.
         ('scale="1.1 1.1"', 'scale="1.2 1.2"', "transform"),
-        # Titles and markers.
+        # Titles.
         ("Jane Doe\nHead Judge", "Jane Doe\nHead Judge!", "titles"),
-        ('value="Act 2"', 'value="Act 3"', "markers"),
         # Names the plan gives.
         ('<project name="Baking Resistance Ep1">', '<project name="Other">', "project"),
     ],
@@ -77,7 +90,7 @@ def test_tampering_is_caught(old: str, new: str, expect: str) -> None:
 
 
 def test_removed_transition_is_caught() -> None:
-    start = GOLDEN.index('<transition name="Audio Crossfade"')
+    start = GOLDEN.index('<transition name="Cross Dissolve" offset="86792706/24000s"')
     end = GOLDEN.index("</transition>", start) + len("</transition>")
     problems = _problems(GOLDEN[:start] + GOLDEN[end:])
     assert any("transitions" in p for p in problems), problems
@@ -91,7 +104,7 @@ def test_removed_head_transition_is_caught() -> None:
 
 
 def test_dropped_clip_is_caught() -> None:
-    start = GOLDEN.index('<asset-clip ref="r6"')
+    start = GOLDEN.index('<asset-clip ref="r5"')
     end = GOLDEN.index("/>", start) + 2
     problems = _problems(GOLDEN[:start] + GOLDEN[end:])
     assert any("segment 1" in p for p in problems), problems
@@ -102,16 +115,20 @@ def test_dropped_clip_is_caught() -> None:
     [
         ('ref="r7"', 'ref="r99"', "does not resolve to asset (found nothing)"),
         (
-            'ref="r6" offset="86558472/24000s"',
+            'ref="r5" offset="86558472/24000s"',
             'ref="r2" offset="86558472/24000s"',
             "does not resolve to asset (found effect)",
         ),
         ('<asset-clip ref="r6"', '<asset-clip bogus="1" ref="r6"', "not in FCPXML 1.10"),
-        ('srcEnable="video"', 'srcEnable="both"', "is not one of"),
+        (
+            '<asset-clip ref="r7" offset',
+            '<asset-clip ref="r7" srcEnable="both" offset',
+            "is not one of",
+        ),
         ('<effect id="r3"', '<effect id="r2"', "used twice"),
         ('offset="86558472/24000s"', 'offset="1/48000s"', "not a whole number of frames"),
         ('offset="86558472/24000s"', 'offset="3600.5s"', "not an FCPXML rational time"),
-        ('lane="-4" ', 'lane="0" ', "lane 0"),
+        ('<title ref="r3" lane="1"', '<title ref="r3" lane="0"', "lane 0"),
         ('<sequence format="r1"', "<sequence", "missing required attribute 'format'"),
         ('<fcpxml version="1.10">', '<fcpxml version="1.9">', "is not one of"),
     ],
@@ -122,17 +139,12 @@ def test_structure_problems_are_caught(old: str, new: str, expect: str) -> None:
 
 
 def test_child_order_follows_the_dtd() -> None:
-    # A marker before the anchored title breaks asset-clip's content model.
-    start = GOLDEN.index('<marker start="0s"')
-    end = GOLDEN.index("/>", start) + 2
-    marker = GOLDEN[start:end]
-    text = GOLDEN[:start] + GOLDEN[end:]
-    text = text.replace(
-        '<title ref="r4" lane="1" offset="48048',
-        marker + '<title ref="r4" lane="1" offset="48048',
-        1,
-    )
-    problems = _problems(text)
+    # adjust-transform before adjust-conform breaks asset-clip's content model.
+    conform = '<adjust-conform type="fill" />'
+    transform = '<adjust-transform position="0 0" scale="1.1 1.1" rotation="0" />'
+    pair = f"{conform}\n              {transform}"
+    assert pair in GOLDEN
+    problems = _problems(GOLDEN.replace(pair, f"{transform}\n              {conform}", 1))
     assert any("out of FCPXML 1.10 order" in p for p in problems), problems
 
 
@@ -177,6 +189,6 @@ def test_check_structure_on_the_golden_is_clean() -> None:
 
 def test_verify_against_another_plan_fails() -> None:
     other = load_plan(GOLDEN_PLANS["short_reframe"])
-    result = verify_plan_fcpxml(GOLDEN, other, ccn(), audio_crossfade=FORM)
+    result = verify_plan_fcpxml(GOLDEN, other, ccn())
     assert not result.ok
     assert any("segment 0" in p for p in result.problems)

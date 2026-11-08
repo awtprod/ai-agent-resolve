@@ -25,8 +25,6 @@ GOLDEN_PLANS: dict[str, Path] = {
     "short_reframe": EXPORT_FIXTURES / "short_reframe.plan.json",
     "ccn_2997": EXPORT_FIXTURES / "ccn_2997.plan.json",
 }
-#: Golden plans that also get a ``<name>.transition`` golden (audio-only crossfades).
-TRANSITION_GOLDENS = ("ccn_longform_v2", "ccn_2997")
 MEDIA_MAP = {"/srv/media": "E:\\Media", "/srv/media/ccn": "\\\\nas\\ccn"}
 _QA = {"longform_lufs": -22.0, "short_lufs": -14.5, "lufs_tolerance": 0.5, "review_mp4_max_mb": 20}
 
@@ -64,7 +62,6 @@ def reverify(result: ExportResult) -> VerifyResult:
         layout.plan,
         media_map=media_map_from_mapping(MEDIA_MAP),
         timeline_start=layout.timeline_start,
-        audio_crossfade=layout.audio_crossfade,
     )
     return verify_fcpxml(result.fcpxml, fresh)
 
@@ -88,11 +85,6 @@ _FRAME_SIZES = [
     (4096, 1716),
     (720, 1280),
 ]
-
-
-def crossfade_form(seed: int) -> str:
-    """The audio-crossfade form a random plan is exported with: both, by seed parity."""
-    return "split" if seed % 2 == 0 else "transition"
 
 
 _TEXT = ["Jane & Joe", "<b>Loud</b>", 'say "hi"', "it's", "Café ✨", "tab\there", "a\nb"]

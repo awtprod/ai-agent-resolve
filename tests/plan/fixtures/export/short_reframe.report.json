@@ -1,7 +1,7 @@
 {
   "format": "fcpxml",
   "fcpxml_version": "1.10",
-  "fcpxml_sha256": "684309b26eb65ca4038db3e53a3f15e4fa413d3f05db674024d897e09d532ed2",
+  "fcpxml_sha256": "d339f33247dfc4da28f940816936d1d639ee005a100ee3141a10d227f341f600",
   "plan": {
     "project": "CCN",
     "timeline": "Ep1 Short 02 (reframe)",
@@ -15,13 +15,16 @@
     "total_frames": 480,
     "resolution": "1080x1920"
   },
+  "import": [
+    "In Resolve use File > Import > Timeline and pick the .fcpxml.",
+    "For a non-16:9 or custom timeline size (a 9:16 short), tick 'Use sizing information' and 'Automatically set project settings': the scripted import ignores the FCPXML format size, so a 9:16 short came in at 1920x1080.",
+    "'Import source clips' can be left on in the dialog (the scripted import cancels with it on; import the media first there)."
+  ],
   "exported": {
     "segments": 2,
     "outro": false,
-    "audio_only_clips": 0,
     "transitions": 0,
     "titles": 0,
-    "markers": 1,
     "assets": 2
   },
   "media": [
@@ -43,15 +46,17 @@
   "lanes": [
     {
       "lane": 0,
-      "carries": "V1, the primary storyline, with its clips' sound (A1)"
+      "carries": "V1, the primary storyline, with its clips' sound",
+      "imported_video": "V1",
+      "imported_audio": "A1"
     }
   ],
   "audio_tracks": [
     {
       "track": "A1",
       "name": "A1",
-      "lanes": [
-        0
+      "imported": [
+        "A1"
       ],
       "clips": 2,
       "gain_db": 0.0,
@@ -59,8 +64,21 @@
       "bus": null
     }
   ],
-  "audio_crossfade": "split",
   "transitions": [],
+  "not_imported": {
+    "heading": "not imported: add by hand",
+    "markers": [
+      {
+        "location": "markers[0]",
+        "timecode": "01:00:00:00",
+        "record_frame": 0,
+        "duration": 1,
+        "name": "Hook",
+        "color": "Red",
+        "note": null
+      }
+    ]
+  },
   "not_expressible": [
     {
       "feature": "reframe_interpolation",
@@ -75,10 +93,10 @@
       "action": "check the move in Resolve, or add keyframes"
     },
     {
-      "feature": "marker_color",
-      "location": "markers[0].color",
-      "detail": "FCPXML markers have no colour (Red)",
-      "action": "set the marker colour to Red in Resolve"
+      "feature": "marker",
+      "location": "markers[0]",
+      "detail": "marker 'Hook' at 01:00:00:00 (1 frame(s), Red) is not imported by Resolve from FCPXML",
+      "action": "add it by hand at 01:00:00:00"
     },
     {
       "feature": "template",
@@ -133,7 +151,7 @@
       "clips": 2,
       "transitions": 0,
       "titles": 0,
-      "markers": 1,
+      "markers": 0,
       "assets": 2,
       "crop_windows": 5
     }

@@ -1,7 +1,7 @@
 {
   "format": "fcpxml",
   "fcpxml_version": "1.10",
-  "fcpxml_sha256": "57ea5fa753e285a5d7c59868b2a89f846234467cc7fd21ed29f44bb17b8d37c8",
+  "fcpxml_sha256": "0f090410e14d7e10a6eaaa249189beb8b0bcc321ba3b652b64207689f242176a",
   "plan": {
     "project": "CCN",
     "timeline": "Late Set 2997",
@@ -15,13 +15,16 @@
     "total_frames": 1050,
     "resolution": "1920x1080"
   },
+  "import": [
+    "In Resolve use File > Import > Timeline and pick the .fcpxml.",
+    "For a non-16:9 or custom timeline size (a 9:16 short), tick 'Use sizing information' and 'Automatically set project settings': the scripted import ignores the FCPXML format size, so a 9:16 short came in at 1920x1080.",
+    "'Import source clips' can be left on in the dialog (the scripted import cancels with it on; import the media first there)."
+  ],
   "exported": {
     "segments": 4,
     "outro": true,
-    "audio_only_clips": 1,
     "transitions": 3,
     "titles": 2,
-    "markers": 2,
     "assets": 4
   },
   "media": [
@@ -57,27 +60,29 @@
   "lanes": [
     {
       "lane": 2,
-      "carries": "titles and sting (V3)"
+      "carries": "titles and sting",
+      "imported_video": "V3",
+      "imported_audio": null
     },
     {
       "lane": 1,
-      "carries": "V2 (connected clips) with their sound (A2 by position)"
+      "carries": "plan V2 (connected clips) with their sound",
+      "imported_video": "V2",
+      "imported_audio": "A2"
     },
     {
       "lane": 0,
-      "carries": "V1, the primary storyline, with its clips' sound (A1)"
-    },
-    {
-      "lane": -1,
-      "carries": "A2 (audio-only clips)"
+      "carries": "V1, the primary storyline, with its clips' sound",
+      "imported_video": "V1",
+      "imported_audio": "A1"
     }
   ],
   "audio_tracks": [
     {
       "track": "A1",
       "name": "A1",
-      "lanes": [
-        0
+      "imported": [
+        "A1"
       ],
       "clips": 3,
       "gain_db": 0.0,
@@ -87,9 +92,9 @@
     {
       "track": "A2",
       "name": "A2",
-      "lanes": [
-        1,
-        -1
+      "imported": [
+        "A1",
+        "A2"
       ],
       "clips": 2,
       "gain_db": -2.0,
@@ -97,7 +102,6 @@
       "bus": null
     }
   ],
-  "audio_crossfade": "split",
   "transitions": [
     {
       "location": "head",
@@ -127,7 +131,36 @@
       "form": "transition"
     }
   ],
+  "not_imported": {
+    "heading": "not imported: add by hand",
+    "markers": [
+      {
+        "location": "markers[0]",
+        "timecode": "01:00:00:00",
+        "record_frame": 0,
+        "duration": 1,
+        "name": "Open",
+        "color": "Green",
+        "note": null
+      },
+      {
+        "location": "markers[1]",
+        "timecode": "01:00:20:00",
+        "record_frame": 600,
+        "duration": 30,
+        "name": "Time jump",
+        "color": null,
+        "note": "cut close to wide"
+      }
+    ]
+  },
   "not_expressible": [
+    {
+      "feature": "outro_sound_track",
+      "location": "outro.audio_track",
+      "detail": "outro sound is on the clip's own track (imported A1), not on A2 'A2' as planned; FCPXML cannot move a clip's sound to another track without doubling it in Resolve",
+      "action": "outro sound is on the clip's own track; move it to A2 by hand"
+    },
     {
       "feature": "title_template",
       "location": "titles[0]",
@@ -141,10 +174,16 @@
       "action": "replace it with template 'CCN Sting'"
     },
     {
-      "feature": "marker_color",
-      "location": "markers[0].color",
-      "detail": "FCPXML markers have no colour (Green)",
-      "action": "set the marker colour to Green in Resolve"
+      "feature": "marker",
+      "location": "markers[0]",
+      "detail": "marker 'Open' at 01:00:00:00 (1 frame(s), Green) is not imported by Resolve from FCPXML",
+      "action": "add it by hand at 01:00:00:00"
+    },
+    {
+      "feature": "marker",
+      "location": "markers[1]",
+      "detail": "marker 'Time jump' at 01:00:20:00 (30 frame(s), note 'cut close to wide') is not imported by Resolve from FCPXML",
+      "action": "add it by hand at 01:00:20:00"
     },
     {
       "feature": "template",
@@ -191,16 +230,10 @@
       "action": "none"
     },
     {
-      "feature": "outro_sound",
-      "location": "outro.transition",
-      "detail": "the dissolve overlaps the last segment's picture into its tail; its sound still ends at the outro (audioStart/audioDuration)",
-      "action": "check it in Resolve"
-    },
-    {
       "feature": "audio_crossfade",
       "location": "transitions",
       "detail": "audio-only crossfades are split edits: the picture cuts at the plan's cut, each clip's sound runs on under the other's (audioStart/audioDuration) and fades out or in over the crossfade (adjust-volume fadeIn/fadeOut)",
-      "action": "check them after import; --audio-crossfade transition writes spine transitions"
+      "action": "check them after import (Resolve puts the overlapping sound on another track)"
     },
     {
       "feature": "frame_size",
@@ -225,10 +258,10 @@
     "ok": true,
     "problems": [],
     "checked": {
-      "clips": 6,
+      "clips": 5,
       "transitions": 3,
       "titles": 2,
-      "markers": 2,
+      "markers": 0,
       "assets": 4,
       "crop_windows": 2
     }

@@ -23,6 +23,7 @@
       <project name="Baking Resistance Ep1">
         <sequence format="r1" duration="426426/24000s" tcStart="86486400/24000s" tcFormat="NDF" audioLayout="stereo" audioRate="48k">
           <note>aar export: not expressible in FCPXML (see the export report)
+outro.audio_track: outro sound is on the clip's own track (imported A1), not on A5 'A5' as planned; FCPXML cannot move a clip's sound to another track without doubling it in Resolve
 template: FCPXML builds a new timeline; it does not start from template 'CCN Longform Template', so its tracks, buses, Fusion titles and settings are not carried
 audio_tracks[0].mute: A1 'A1' is muted in the plan; exported audible (the CCN topology feeds the bus from muted tracks, so sound is never dropped)
 audio_tracks[0].bus: A1 'A1' feeds bus 'A5'; FCPXML has no buses or Fairlight routing
@@ -31,7 +32,10 @@ audio_tracks[1].bus: A2 'A2' feeds bus 'A5'; FCPXML has no buses or Fairlight ro
 audio_tracks[2].mute: A3 'A3' is muted in the plan; exported audible (the CCN topology feeds the bus from muted tracks, so sound is never dropped)
 audio_tracks[2].bus: A3 'A3' feeds bus 'A5'; FCPXML has no buses or Fairlight routing
 audio_tracks[3].mute: A4 'A4' is muted in the plan; exported audible (the CCN topology feeds the bus from muted tracks, so sound is never dropped)
-audio_tracks[3].bus: A4 'A4' feeds bus 'A5'; FCPXML has no buses or Fairlight routing</note>
+audio_tracks[3].bus: A4 'A4' feeds bus 'A5'; FCPXML has no buses or Fairlight routing
+audio tracks after import:
+plan A1 (A1) -&gt; imported A1
+plan A5 (A5) -&gt; imported A1</note>
           <spine>
             <transition name="Cross Dissolve" offset="86486400/24000s" duration="15015/24000s">
               <filter-video ref="r2" name="Cross Dissolve" />
@@ -51,7 +55,6 @@ Head Judge</text-style></text>
                   <text-style font="Helvetica" fontSize="60" fontColor="1 1 1 1" alignment="center" />
                 </text-style-def>
               </title>
-              <marker start="0s" duration="1001/24000s" value="Act 1" />
             </asset-clip>
             <asset-clip ref="r5" offset="86558472/24000s" name="B001.braw" start="72072/24000s" duration="72072/24000s" />
             <asset-clip ref="r4" offset="86630544/24000s" name="A001.braw" start="144144/24000s" duration="72072/24000s" audioStart="144144/24000s" audioDuration="78078/24000s">
@@ -60,9 +63,8 @@ Head Judge</text-style></text>
                   <fadeOut type="linear" duration="12012/24000s" />
                 </param>
               </adjust-volume>
-              <marker start="144144/24000s" duration="1001/24000s" value="Act 2" />
             </asset-clip>
-            <asset-clip ref="r6" offset="86702616/24000s" name="A002.mov" start="30030/24000s" duration="105105/24000s" audioStart="24024/24000s" audioDuration="96096/24000s">
+            <asset-clip ref="r6" offset="86702616/24000s" name="A002.mov" start="30030/24000s" duration="90090/24000s" audioStart="24024/24000s" audioDuration="96096/24000s">
               <adjust-volume>
                 <param name="amount">
                   <fadeIn type="linear" duration="12012/24000s" />
@@ -72,14 +74,12 @@ Head Judge</text-style></text>
             <transition name="Cross Dissolve" offset="86792706/24000s" duration="15015/24000s">
               <filter-video ref="r2" name="Cross Dissolve" />
             </transition>
-            <asset-clip ref="r7" offset="86792706/24000s" name="Outro.mov" start="0s" duration="120120/24000s" srcEnable="video">
-              <asset-clip ref="r7" lane="-4" offset="0s" name="Outro.mov" start="0s" duration="120120/24000s" srcEnable="audio">
-                <adjust-volume amount="-1dB">
-                  <param name="amount">
-                    <fadeOut type="linear" duration="2002/24000s" />
-                  </param>
-                </adjust-volume>
-              </asset-clip>
+            <asset-clip ref="r7" offset="86792706/24000s" name="Outro.mov" start="0s" duration="120120/24000s">
+              <adjust-volume amount="-1dB">
+                <param name="amount">
+                  <fadeOut type="linear" duration="2002/24000s" />
+                </param>
+              </adjust-volume>
               <title ref="r3" lane="1" offset="6006/24000s" name="Baking Resistance" duration="48048/24000s">
                 <text><text-style ref="ts2">Baking Resistance</text-style></text>
                 <text-style-def id="ts2">

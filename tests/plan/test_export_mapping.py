@@ -193,13 +193,15 @@ def test_outro_sound_follows_its_named_track() -> None:
     same = _plan(**base, outro={"source": "o", "src_out": 60, "audio_track": "A1"})
     spine = _spine(_xml(same))
     assert spine[1].get("srcEnable") is None and spine[1].find("asset-clip") is None
+    assert ("outro_sound_track", "outro.audio_track") not in _report(same)
+    # Round 3: the outro is always one clip with its own sound (Resolve ignores srcEnable); a
+    # different planned track is reported to fix by hand.
     bus = _plan(**base, outro={"source": "o", "src_out": 60, "audio_track": "Bus"})
     spine = _spine(_xml(bus))
-    assert spine[1].get("srcEnable") == "video"
-    sound = spine[1].find("asset-clip")
-    assert sound is not None and sound.get("lane") == "-2" and sound.get("srcEnable") == "audio"
+    assert "srcEnable" not in spine[1].attrib and spine[1].find("asset-clip") is None
+    assert ("outro_sound_track", "outro.audio_track") in _report(bus)
     off_spine = _plan(**base, outro={"source": "o", "src_out": 60, "track": 2, "audio_track": "A1"})
-    assert ("outro_audio_track", "outro.audio_track") in _report(off_spine)
+    assert ("outro_sound_track", "outro.audio_track") in _report(off_spine)
     _refused(
         _plan(**{**base, "audio_tracks": []}, outro={"source": "o", "src_out": 60}),
         "outro_audio_track_missing",
@@ -232,13 +234,14 @@ def test_transition_alignment_follows_the_handles(
     assert [t["alignment"] for t in result.report["transitions"]] == [alignment]
     spine = _spine(ET.fromstring(result.fcpxml))
     a, transition, b = spine
-    after = 11 - before
-    # The cut is at record 48; the window starts `before` frames ahead of it.
+    # The cut is at record 48; the window starts `before` frames ahead of it (Apple: offset and
+    # duration give the transition's position and extent) and plays from the handles: the
+    # clips keep their plan ranges and abut (round 3).
     assert transition.get("offset") == f"{(86400 + 48 - before) * 1001}/24000s"
     assert transition.get("duration") == "11011/24000s"
-    assert a.get("duration") == f"{(48 + after) * 1001}/24000s"
-    assert b.get("offset") == transition.get("offset")
-    assert b.get("start") == f"{(in_src - before) * 1001}/24000s"
+    assert a.get("duration") == f"{48 * 1001}/24000s"
+    assert b.get("offset") == f"{(86400 + 48) * 1001}/24000s"
+    assert b.get("start") == f"{in_src * 1001}/24000s"
     assert [c.tag for c in transition] == ["filter-video", "filter-audio"]
 
 
@@ -282,10 +285,12 @@ def test_non_dissolve_video_is_a_dissolve_placeholder() -> None:
     assert ("transition_type", "transitions[0].video") in _report(EditPlan.model_validate(data))
 
 
-def test_audio_only_crossfade_has_no_video_filter() -> None:
-    spine = _spine(_xml(_join(1000, 100, 8, video=False), audio_crossfade="transition"))
-    assert spine[1].get("name") == "Audio Crossfade"
-    assert [c.tag for c in spine[1]] == ["filter-audio"]
+def test_audio_only_crossfade_is_a_split_edit_not_a_transition() -> None:
+    """Round 3: a transition element moved the picture cut in Resolve; only the J/L form is
+    written."""
+    a, b = _spine(_xml(_join(1000, 100, 8, video=False)))
+    assert a.get("audioDuration") == f"{(48 + 4) * 1001}/24000s"
+    assert b.get("audioStart") == f"{(100 - 4) * 1001}/24000s"
 
 
 def test_off_spine_and_gapped_joins_are_reported_not_exported() -> None:
@@ -305,13 +310,13 @@ def test_off_spine_and_gapped_joins_are_reported_not_exported() -> None:
     assert ("transition", "transitions[0]") in _report(gapped)
 
 
-def test_head_after_a_gap_overlaps_the_gap() -> None:
+def test_head_after_a_gap_follows_the_gap() -> None:
     plan = _plan(
         segments=[seg(1, a=0, b=48, record_in=50)],
         head={"video": "dissolve", "video_frames": 10},
     )
     gap, transition, clip = _spine(_xml(plan))
-    assert gap.tag == "gap" and gap.get("duration") == f"{60 * 1001}/24000s"  # 0..50+10
+    assert gap.tag == "gap" and gap.get("duration") == f"{50 * 1001}/24000s"  # 0..50, no overlap
     assert transition.get("offset") == clip.get("offset") == f"{(86400 + 50) * 1001}/24000s"
 
 
@@ -438,17 +443,23 @@ def test_titles_and_markers() -> None:
     clip = _spine(ET.fromstring(result.fcpxml))[0]
     title = clip.find("title")
     assert title is not None and title.find("text/text-style").text == "A & B\n<two>"  # type: ignore[union-attr]
-    marker = clip.find("marker")
-    assert marker is not None
-    assert marker.attrib == {
-        "start": "5005/24000s",
-        "duration": "3003/24000s",
-        "value": "Hi",
-        "note": "n",
-    }
-    found = {(i["feature"], i["location"]) for i in result.report["not_expressible"]}
-    assert ("title_template", "titles[0]") in found
-    assert ("marker_color", "markers[0].color") in found
+    # Round 3: Resolve imports no FCPXML marker; none is written, each is listed with its TC.
+    assert clip.find("marker") is None
+    assert result.report["not_imported"]["markers"] == [
+        {
+            "location": "markers[0]",
+            "timecode": "01:00:00:05",
+            "record_frame": 5,
+            "duration": 3,
+            "name": "Hi",
+            "color": "Blue",
+            "note": "n",
+        }
+    ]
+    items = {i["location"]: i for i in result.report["not_expressible"]}
+    assert ("title_template", "titles[0]") in {(i["feature"], k) for k, i in items.items()}
+    assert items["markers[0]"]["action"] == "add it by hand at 01:00:00:05"
+    assert "Blue" in items["markers[0]"]["detail"] and "note 'n'" in items["markers[0]"]["detail"]
 
 
 @pytest.mark.parametrize(

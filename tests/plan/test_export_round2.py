@@ -80,8 +80,8 @@ GOLDEN = (EXPORT_FIXTURES / "ccn_longform_v2.fcpxml").read_text(encoding="utf-8"
 PLAN = load_plan(GOLDEN_PLANS["ccn_longform_v2"])
 
 
-def _problems(text: str, form: str = "split") -> list[str]:
-    result = verify_plan_fcpxml(text, PLAN, ccn(), audio_crossfade=form)  # type: ignore[arg-type]
+def _problems(text: str) -> list[str]:
+    result = verify_plan_fcpxml(text, PLAN, ccn())
     assert not result.ok
     return result.problems
 
@@ -178,11 +178,22 @@ def test_a_clip_reading_past_its_source_is_caught() -> None:
     source_end = PLAN.source_map()["camA2"].duration
     assert source_end == 1000
     text = _tamper(
-        'name="A002.mov" start="30030/24000s" duration="105105/24000s"',
+        'name="A002.mov" start="30030/24000s" duration="90090/24000s"',
         'name="A002.mov" start="30030/24000s" duration="1001000/24000s"',
     )
     problems = _problems(text)
     assert any("past the plan source's 1000 frames" in p for p in problems), problems
+
+
+def test_a_transition_reading_past_the_handle_is_caught() -> None:
+    """The outro dissolve plays camA2's frames 120..135 from its tail handle (the clip itself
+    ends at 120). An asset that declares only 130 frames fails, though every clip fits in it."""
+    text = _tamper(
+        '<asset id="r6" name="A002.mov" start="0s" duration="1001000/24000s"',
+        '<asset id="r6" name="A002.mov" start="0s" duration="130130/24000s"',
+    )
+    problems = _problems(text)
+    assert any("reads to frame 135, past its asset's 130 frames" in p for p in problems), problems
 
 
 def test_a_wrong_tcstart_with_every_offset_shifted_is_caught() -> None:
@@ -201,8 +212,10 @@ def test_a_wrong_tcstart_with_every_offset_shifted_is_caught() -> None:
 
 
 def test_an_anchored_item_outside_its_parent_is_caught() -> None:
-    """W27: the A5 outro sound anchored past the end of its 120-frame parent."""
-    problems = _problems(_tamper('lane="-4" offset="0s"', 'lane="-4" offset="121121/24000s"'))
+    """W27: the sting title anchored past the end of its 120-frame parent, the outro."""
+    problems = _problems(
+        _tamper('lane="1" offset="6006/24000s"', 'lane="1" offset="121121/24000s"')
+    )
     assert any("anchored outside its parent" in p for p in problems), problems
 
 
@@ -245,27 +258,6 @@ def test_effect_name_and_uid_are_checked(old: str, new: str) -> None:
 def test_split_crossfade_tampering_is_caught(old: str, new: str, expect: str) -> None:
     problems = _problems(_tamper(old, new))
     assert any(expect in p for p in problems), problems
-
-
-def test_both_forms_hold_the_same_cut_and_media() -> None:
-    """A split edit and a transition element describe the same 12-frame crossfade at 216."""
-    plans = {form: export(PLAN, ccn(), audio_crossfade=form) for form in ("split", "transition")}
-    for result in plans.values():
-        (join,) = [t for t in result.layout.transitions if t.kind == "join"]
-        assert (join.cut, join.frames, join.head_part, join.audio, join.video) == (
-            216,
-            12,
-            6,
-            True,
-            False,
-        )
-    assert [t.form for t in plans["split"].layout.transitions] == [
-        "transition",
-        "split",
-        "transition",
-    ]
-    split_spine = [e.tag for e in _spine(plans["split"].fcpxml)]
-    assert split_spine.count("transition") == 2
 
 
 def test_split_crossfade_fades_add_to_head_and_end_fades() -> None:
@@ -371,8 +363,9 @@ def test_transitions_that_exactly_fill_a_clip_are_allowed() -> None:
 
 
 def test_outro_sound_starts_at_the_cut_under_a_video_only_dissolve() -> None:
-    """W10: outro picture and sound together on V1/A1 with a centred dissolve: the picture starts
-    7 frames early under the dissolve, the sound only at the cut."""
+    """W10: outro picture and sound together on V1/A1 with a centred dissolve: the window starts
+    7 frames before the cut and plays the outro's head handle; the clip itself starts at its plan
+    in point at the cut, sound included (no split timing)."""
     plan = _plan(
         sources=[
             source("a", duration=1000, frame_size=SIZE),
@@ -389,10 +382,12 @@ def test_outro_sound_starts_at_the_cut_under_a_video_only_dissolve() -> None:
         },
     )
     result = export(plan)
-    outro = _spine(result.fcpxml)[-1]
-    assert outro.get("start") == f"{13 * 1001}/24000s"  # src_in 20 - 7 before the cut
-    assert outro.get("audioStart") == f"{20 * 1001}/24000s"  # the sound starts at the cut
-    assert outro.get("audioDuration") == f"{100 * 1001}/24000s"
+    spine = _spine(result.fcpxml)
+    transition, outro = spine[-2], spine[-1]
+    assert transition.get("offset") == f"{(86400 + 48 - 7) * 1001}/24000s"
+    assert outro.get("offset") == f"{(86400 + 48) * 1001}/24000s"
+    assert outro.get("start") == f"{20 * 1001}/24000s"
+    assert "audioStart" not in outro.attrib and "audioDuration" not in outro.attrib
 
 
 def test_marker_notes_xml_cannot_carry_are_refused() -> None:

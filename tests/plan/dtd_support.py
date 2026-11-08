@@ -131,7 +131,13 @@ def validate(dtd: Dtd, document: str) -> list[str]:
                 if value in ids:
                     problems.append(f"duplicate ID {value!r}")
                 ids.add(value)
-            elif attr.kind in ("IDREF", "IDREFS"):
+            elif attr.kind == "IDREF":
+                # An IDREF holds exactly one name; only IDREFS may be a whitespace list.
+                if not value or value != value.strip() or len(value.split()) != 1:
+                    problems.append(f"<{tag} {name}={value!r}> is not a single IDREF name")
+                else:
+                    refs.append((tag, value))
+            elif attr.kind == "IDREFS":
                 refs.extend((tag, v) for v in value.split())
         for name, attr in declared.items():
             if attr.required and name not in element.attrib:

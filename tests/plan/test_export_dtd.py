@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 from dtd_support import load_dtd, validate
-from export_support import EXPORT_FIXTURES, MEDIA_MAP, crossfade_form, permissive, random_plan
+from export_support import EXPORT_FIXTURES, MEDIA_MAP, permissive, random_plan
 
 from aar.plan.export import export_fcpxml, media_map_from_mapping
 from aar.plan.model import EditPlan
@@ -38,7 +38,7 @@ def _problems(document: str) -> list[str]:
 
 
 def test_every_golden_is_present() -> None:
-    assert len(GOLDEN_FILES) == 5
+    assert len(GOLDEN_FILES) == 3
 
 
 @pytest.mark.parametrize("path", GOLDEN_FILES, ids=[p.name for p in GOLDEN_FILES])
@@ -56,7 +56,6 @@ def test_random_export_is_valid_against_apples_dtd(seed: int) -> None:
         plan,
         permissive(start),
         media_map=media_map_from_mapping(MEDIA_MAP),
-        audio_crossfade=crossfade_form(seed),  # type: ignore[arg-type]
     )
     assert _problems(result.fcpxml) == []
 
@@ -72,7 +71,7 @@ def test_the_validator_sees_dtd_violations() -> None:
             "\n              <adjust-transform",
             1,
         ),
-        "enum": golden.replace('srcEnable="video"', 'srcEnable="both"', 1),
+        "enum": golden.replace('<asset-clip ref="r5"', '<asset-clip srcEnable="both" ref="r5"', 1),
         "unknown element": golden.replace("<spine>", "<spine><bogus />", 1),
         "dangling IDREF": golden.replace('ref="r2"', 'ref="r99"', 1),
         "fixed version": golden.replace('version="1.10"', 'version="1.9"', 1),

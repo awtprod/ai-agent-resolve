@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 from export_support import (
     MEDIA_MAP,
-    crossfade_form,
     permissive,
     random_plan,
     reverify,
@@ -26,7 +25,6 @@ def _export(seed: int):
         plan,
         permissive(start),
         media_map=media_map_from_mapping(MEDIA_MAP),
-        audio_crossfade=crossfade_form(seed),  # type: ignore[arg-type]
     )
 
 
@@ -46,24 +44,26 @@ def test_random_plan_round_trips_exactly(seed: int) -> None:
         "checked": result.report["self_check"]["checked"],
     }
     assert structure_problems(result.fcpxml) == []
+    # Never anything Resolve mishandles (import test, 2026-11-08): no srcEnable, no marker.
+    assert "srcEnable" not in result.fcpxml and "<marker" not in result.fcpxml
     again = reverify(result)
     assert again.ok, again.problems
-    # Independent of the verifier: the decoded file holds every plan segment and the spine
-    # (with transition overlaps taken out) spans exactly the plan's length.
+    # Independent of the verifier: the decoded file holds every plan segment at its plan record
+    # range and source range (no clip is widened for a transition), and the spine's clips and
+    # gaps abut, never overlap, from 0 to the plan's length.
     decoded = read_fcpxml(result.fcpxml)
     layout = result.layout
     ranges = plan.record_ranges()
-    spans = {(c.lane, c.raw_in, c.raw_out - c.raw_in) for c in decoded.clips}
+    spans = {(c.lane, c.raw_in, c.raw_out, c.start) for c in decoded.clips}
     for index, seg in enumerate(plan.segments):
-        if seg.track == 1:
-            continue  # spine clips may be widened under transitions; the verifier decodes them
-        assert (seg.track - 1, ranges[index][0], seg.length) in spans
-    entries = decoded.spine
-    overlap = sum(
-        e.raw_out - e.raw_in for k, e in enumerate(entries) if e.kind == "transition" and k > 0
-    )
-    spine = sum(e.raw_out - e.raw_in for e in entries if e.kind != "transition")
-    assert spine - overlap == layout.total_frames
+        row = (layout.lanes[seg.track], ranges[index][0], ranges[index][1], seg.src_in)
+        assert row in spans, row
+    elements = [e for e in decoded.spine if e.kind != "transition"]
+    assert [e.raw_in for e in elements] == [0, *(e.raw_out for e in elements[:-1])]
+    assert elements[-1].raw_out == layout.total_frames
+    for k, entry in enumerate(decoded.spine):
+        if entry.kind == "transition":  # always before the element it leads into
+            assert decoded.spine[k + 1].kind == "clip"
 
 
 @pytest.mark.parametrize("seed", range(0, 300, 37))
@@ -91,7 +91,6 @@ def test_the_generator_reaches_every_feature() -> None:
         seen |= {"video-transition" for t in layout.transitions if t.video}
         seen |= {"audio-only-transition" for t in layout.transitions if not t.video}
         seen |= {"connected" for c in layout.clips if c.lane > 0}
-        seen |= {"audio-only-clip" for c in layout.clips if c.enable == "audio"}
         seen |= {"keyframes" for c in layout.clips if c.transform and c.transform.keyframes}
         seen |= {"title" for _ in layout.titles}
         seen |= {"marker" for _ in layout.markers}
@@ -101,6 +100,8 @@ def test_the_generator_reaches_every_feature() -> None:
         seen |= {f"form:{t.form}" for t in layout.transitions if not t.video}
         seen |= {"conform" for c in layout.clips if c.conform}
         seen |= {"conform-unmoved" for c in layout.clips if c.conform and c.transform is None}
+        seen |= {"sparse-lanes" for t in layout.lanes if t != 1 and layout.lanes[t] != t - 1}
+        seen |= {"outro-moved" for i in layout.not_expressible if i.feature == "outro_sound_track"}
     want = {
         "align:center",
         "align:right",
@@ -111,7 +112,6 @@ def test_the_generator_reaches_every_feature() -> None:
         "video-transition",
         "audio-only-transition",
         "connected",
-        "audio-only-clip",
         "keyframes",
         "title",
         "marker",
@@ -121,8 +121,9 @@ def test_the_generator_reaches_every_feature() -> None:
         "gap",
         "split-audio",
         "form:split",
-        "form:transition",
         "conform",
         "conform-unmoved",
+        "sparse-lanes",
+        "outro-moved",
     }
     assert want <= seen, want - seen
