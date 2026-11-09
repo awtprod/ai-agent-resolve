@@ -336,10 +336,12 @@ def picture_filters(framing: Framing, resolution: Resolution) -> list[str]:
     if framing.mode == "fit":
         assert framing.fitted is not None
         fw, fh = framing.fitted
-        # In 4:4:4, so the pad's left edge is not rounded to an even pixel for the chroma.
+        # The pad in 4:4:4 (the format right before it, after the scale: a format before the
+        # scale lets the scale hand on 4:2:0 again), so the left margin is not rounded down to
+        # an even pixel for the chroma (round 3: 187, not 186).
         return [
-            "format=yuv444p",
             f"scale={fw}:{fh}",
+            "format=yuv444p",
             f"pad={width}:{height}:{(width - fw) // 2}:{(height - fh) // 2}:black",
         ]
     plan = framing.window

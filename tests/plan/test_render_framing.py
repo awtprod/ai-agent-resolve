@@ -207,8 +207,8 @@ def test_unconformed_clips_scale_or_fit() -> None:
     )
     assert fit.mode == "fit" and fit.fitted == (1080, 608)
     assert picture_filters(fit, PORTRAIT) == [
-        "format=yuv444p",
         "scale=1080:608",
+        "format=yuv444p",  # after the scale, right before the pad (round 3)
         "pad=1080:1920:0:656:black",
     ]
     # A 4:3 picture in an 854x480 frame: 640 wide, 107 px each side (4:4:4, so the left edge is
