@@ -4,8 +4,10 @@ counts from the video stream, stream start times kept)."""
 
 from __future__ import annotations
 
+import subprocess
 from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from export_support import permissive
@@ -14,6 +16,7 @@ from render_support import Spec, make_media
 from aar.plan import render
 from aar.plan.export import media_map_from_mapping
 from aar.plan.model import EditPlan, Fps, Source
+from aar.plan.render import media as render_media
 from aar.plan.render.errors import RenderError
 from aar.plan.render.media import resolve_source
 from aar.plan.render.timeline import build_timeline
@@ -175,3 +178,74 @@ def test_a_segment_past_the_last_video_frame_is_refused(hub_dir: Path, name: str
     assert info.value.details["needed_frames"] == 25 and info.value.details["media_frames"] == 24
     fits = _plan(str(hub_dir / name), 24)  # the last frame exactly
     assert build_timeline(render.render_layout(fits, hub, permissive()), hub).total_frames == 24
+
+
+@pytest.mark.parametrize(
+    ("output", "count", "uneven"),
+    [
+        (b"3600\n-3600\n0\n", 3, None),
+        (b"3600,MPEGTS Stream ID,224\n\n-3600,MPEGTS Stream ID,224\n0\n", 3, None),
+        (
+            b"0,MPEGTS Stream ID,224\n3600,MPEGTS Stream ID,224\n10800\n",
+            3,
+            (Fraction(1, 25), Fraction(2)),
+        ),
+        (b"N/A,MPEGTS Stream ID,224\n\n--3600\n0\n3600,224\n", 2, None),
+    ],
+)
+def test_packet_scan_reads_only_the_timestamp_csv_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output: bytes, count: int, uneven
+) -> None:
+    path = tmp_path / "packets.ts"
+    path.write_bytes(b"probe output injected below")
+    monkeypatch.setattr(render_media, "run_tool", lambda *a, **kw: SimpleNamespace(stdout=output))
+    assert render_media.scan_packets(path, 0, Fraction(1, 90000), Fraction(25)) == (count, uneven)
+
+
+@pytest.mark.slow
+def test_mpegts_packet_side_data_does_not_hide_frames(tmp_path: Path) -> None:
+    spec = Spec("blue", 880, 80, rate=Fraction(25))
+    mov = make_media(tmp_path / "source.mov", spec)
+    ts = tmp_path / "source.ts"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-nostdin",
+            "-i",
+            str(mov),
+            "-map",
+            "0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-f",
+            "mpegts",
+            str(ts),
+        ],
+        check=True,
+        timeout=30,
+    )
+    packets = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "packet=pts",
+            "-of",
+            "csv=p=0",
+            str(ts),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    ).stdout
+    assert b"," in packets  # side data is a name or an empty CSV field, depending on ffprobe
+    source = _resolve(Source(id="ts", media=str(ts)), Fps(num=25))
+    assert source.frames == 80 and source.fps == 25
+    assert source.video_start_s > 0

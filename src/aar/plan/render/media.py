@@ -317,7 +317,12 @@ def scan_packets(
         timeout_s=timeout_for(st.st_size / 20e6, base_s=TIMING_TIMEOUT_S, per_media_s=1.0),
         stdout_limit=SCAN_STDOUT_LIMIT,
     ).stdout
-    pts = sorted(int(t) for t in out.split() if t.lstrip(b"-").isdigit())
+    # ffprobe can append packet side data (including an empty field) after the PTS.
+    pts = sorted(
+        int(t)
+        for row in out.splitlines()
+        if (t := row.partition(b",")[0].strip()).removeprefix(b"-").isdigit()
+    )
     uneven = None
     if time_base and rate and len(pts) > 1:
         frame = 1 / (time_base * rate)  # ticks per frame
