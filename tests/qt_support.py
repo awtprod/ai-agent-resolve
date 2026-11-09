@@ -15,6 +15,7 @@ import io
 import struct
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 
 TMCD_AT = 4096  # where the real BRAW keeps its tmcd sample
 NTSC_SCALE, NTSC_DURATION = 30000, 1001
@@ -180,3 +181,16 @@ class Sparse(io.RawIOBase):
     @property
     def bytes_read(self) -> int:
         return sum(n for _, n in self.reads)
+
+
+def retime_tmcd(path: Path, timescale: int, duration: int, per_second: int | None = None) -> None:
+    """Rewrite the tmcd sample description of an ffmpeg-made file (the validator's dev.py
+    repro): timescale, frameDuration and, if given, numberOfFrames. The entry is found as 'tmcd',
+    6 reserved bytes, data reference 1."""
+    data = bytearray(path.read_bytes())
+    at = data.find(b"tmcd" + bytes(6) + b"\x00\x01")
+    assert at > 0 and data.find(b"tmcd" + bytes(6) + b"\x00\x01", at + 1) == -1
+    data[at + 20 : at + 28] = struct.pack(">II", timescale, duration)
+    if per_second is not None:
+        data[at + 28] = per_second
+    path.write_bytes(bytes(data))

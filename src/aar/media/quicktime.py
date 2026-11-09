@@ -37,6 +37,10 @@ from aar.media.tools import MediaError, require_regular_file
 MAX_MOOV_BYTES = 64 * 1024 * 1024
 #: The most atom headers one read visits (top level and inside ``moov`` together).
 MAX_ATOMS = 100_000
+#: The most top-level atoms one walk of the file visits. A real movie has about ten (ftyp/wide,
+#: mdat, moov, free); each costs a seek, and a cold disk reads a page per seek, so this bounds
+#: physical I/O to a few MB however the atoms are spread.
+MAX_TOP_LEVEL_ATOMS = 1000
 #: The most bytes one read takes from the file; past it the read is refused as ``too_large``.
 #: Reads are unbuffered, so this bounds what reaches the disk, not just what is parsed.
 MAX_READ_BYTES = 8 * 1024 * 1024
@@ -154,15 +158,24 @@ class _Source:
             )
         return data
 
-    def children(self, start: int, end: int, parent: str) -> Iterator[_Atom]:
-        """The atoms from ``start`` to ``end``. A remainder under 8 bytes is ignored, as
-        ffmpeg does; size 0 runs to ``end``; size 1 takes the 64-bit size after the type."""
+    def children(
+        self, start: int, end: int, parent: str, *, limit: int | None = None
+    ) -> Iterator[_Atom]:
+        """The atoms from ``start`` to ``end``, at most ``limit`` of them. A remainder under 8
+        bytes is ignored, as ffmpeg does; size 0 runs to ``end``; size 1 takes the 64-bit size
+        after the type."""
         offset = start
+        seen = 0
         while end - offset >= 8:
             self.atoms += 1
+            seen += 1
             if self.atoms > MAX_ATOMS:
                 raise TimecodeUnreadable(
                     f"more than {MAX_ATOMS} atoms before the timecode", code="malformed"
+                )
+            if limit is not None and seen > limit:
+                raise TimecodeUnreadable(
+                    f"more than {limit} atoms in {parent} before the timecode", code="malformed"
                 )
             size, kind = struct.unpack(">I4s", self.read(offset, 8))
             body = offset + 8
@@ -210,7 +223,7 @@ class _Source:
 
 
 def _movie(src: _Source) -> _Atom:
-    for atom in src.children(0, src.size, "the file"):
+    for atom in src.children(0, src.size, "the file", limit=MAX_TOP_LEVEL_ATOMS):
         if atom.kind == b"moov":
             if atom.end - atom.body > MAX_MOOV_BYTES:
                 raise TimecodeUnreadable(
@@ -269,7 +282,7 @@ def _first_chunk(src: _Source, stbl: _Atom) -> int:
 def _require_in_mdat(src: _Source, offset: int) -> None:
     """The sample's four bytes must lie in the payload of a top-level ``mdat``: an offset into
     ``moov``, a header or past the media is not a timecode sample."""
-    for atom in src.children(0, src.size, "the file"):
+    for atom in src.children(0, src.size, "the file", limit=MAX_TOP_LEVEL_ATOMS):
         if atom.start > offset:
             break
         if atom.kind == b"mdat" and atom.body <= offset and offset + 4 <= atom.end:
@@ -381,6 +394,7 @@ __all__ = [
     "MAX_ATOMS",
     "MAX_MOOV_BYTES",
     "MAX_READ_BYTES",
+    "MAX_TOP_LEVEL_ATOMS",
     "QUICKTIME_SUFFIXES",
     "QuickTimeTimecode",
     "TimecodeUnreadable",

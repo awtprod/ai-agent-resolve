@@ -23,11 +23,17 @@ from media_support import FFPROBE, ffmpeg, needs_ffmpeg
 
 from aar.cli import main
 from aar.media import MediaError, MediaInputError, quicktime
-from aar.media.probe import frames_timecode, parse_probe_json, snap_rate, timecode_frames
+from aar.media.probe import (
+    STANDARD_RATES,
+    frames_timecode,
+    parse_probe_json,
+    snap_rate,
+    timecode_frames,
+)
 from aar.media.quicktime import (
     MAX_ATOMS,
     MAX_MOOV_BYTES,
-    MAX_READ_BYTES,
+    MAX_TOP_LEVEL_ATOMS,
     QuickTimeTimecode,
     TimecodeUnreadable,
     frames_per_day,
@@ -110,6 +116,12 @@ def test_frames_timecode_refuses(frames: int, fps: Fraction, drop: bool, why: st
         (Fraction(24), Fraction(24)),
         (Fraction(2997, 125), Fraction(24000, 1001)),  # 23.976
         (Fraction(5994, 100), NTSC60),
+        (Fraction(47952, 1000), Fraction(48000, 1001)),  # 47.952
+        (Fraction(48000, 1001), Fraction(48000, 1001)),
+        (Fraction(4801, 100), Fraction(48)),
+        (Fraction(48), Fraction(48)),
+        (Fraction(50), Fraction(50)),
+        (Fraction(60), Fraction(60)),
         (Fraction(2401, 100), Fraction(24)),  # 0.04 % off
         (Fraction(241, 10), None),  # 0.42 % off: no standard rate
         (Fraction(25, 2), None),
@@ -120,6 +132,16 @@ def test_frames_timecode_refuses(frames: int, fps: Fraction, drop: bool, why: st
 )
 def test_snap_rate(rate: Fraction | None, snapped: Fraction | None) -> None:
     assert snap_rate(rate) == snapped
+
+
+def test_the_standard_rates_are_pinned() -> None:
+    """Validator R2-5 (N2): the list, 47.952 and 48 included."""
+    assert tuple(
+        Fraction(n, d)
+        for n, d in [(24000, 1001), (24, 1), (25, 1), (30000, 1001), (30, 1), (48000, 1001),
+                     (48, 1), (50, 1), (60000, 1001), (60, 1)]
+    ) == STANDARD_RATES  # fmt: skip
+    assert all(snap_rate(rate) == rate for rate in STANDARD_RATES)
 
 
 def test_the_probe_keeps_r_frame_rate_beside_the_average() -> None:
@@ -458,33 +480,66 @@ def test_a_huge_moov_is_refused_before_it_is_read() -> None:
     assert caught.value.code == "no_timecode"  # one zero-size child runs to its end: no trak
 
 
-def test_an_atom_flood_stops_at_the_atom_cap() -> None:
-    """Size-8 'free' atoms at the top level: each read moves 8 bytes, so a file of many of them
-    is cut off at MAX_ATOMS headers, not walked to its end."""
+def test_the_top_level_walk_stops_at_1000_atoms() -> None:
+    """Validator R2-3: each top-level atom costs a seek (a page read on a cold disk), so a walk
+    visits at most MAX_TOP_LEVEL_ATOMS of them. wide + mdat + N 'free' + moov: 1000 in all is
+    read, 1001 is refused before the 1001st header is read."""
+    assert MAX_TOP_LEVEL_ATOMS == 1000
+    good = Movie().build()
+    moov_at = len(good) - len(Movie().moov())
+    for free, ok in ((MAX_TOP_LEVEL_ATOMS - 3, True), (MAX_TOP_LEVEL_ATOMS - 2, False)):
+        data = good[:moov_at] + atom(b"free") * free + good[moov_at:]
+        view = Sparse(len(data), {0: data})
+        if ok:
+            assert read_timecode_from(view, len(data)).frames == 521420
+            continue
+        with pytest.raises(TimecodeUnreadable, match="more than 1000 atoms in the file") as caught:
+            read_timecode_from(view, len(data))
+        assert caught.value.code == "malformed"
+        assert len(view.reads) == MAX_TOP_LEVEL_ATOMS and view.bytes_read == 8 * 1000
+
+
+def test_the_walk_to_the_mdat_is_capped_too() -> None:
+    """moov first, then 'free' atoms, then the mdat holding the sample: the second top-level
+    walk (to check the sample is media) has the same 1000-atom cap."""
+    movie = Movie()
+    head = atom(b"ftyp", b"qt  \0\0\0\0")
+    movie.tmcd_stbl = [GOOD_STSD, co64(0)]
+    moov_len = len(movie.moov())
+    for free, ok in ((MAX_TOP_LEVEL_ATOMS - 3, True), (MAX_TOP_LEVEL_ATOMS - 2, False)):
+        sample_at = len(head) + moov_len + 8 * free + 8
+        movie.tmcd_stbl = [GOOD_STSD, co64(sample_at)]
+        data = head + movie.moov() + atom(b"free") * free + atom(b"mdat", struct.pack(">I", 99))
+        if ok:
+            assert read_bytes(data).frames == 99
+        else:
+            refused(data, "malformed", "more than 1000 atoms in the file")
+
+
+def test_an_atom_flood_inside_moov_stops_at_the_atom_cap() -> None:
+    """Size-8 'free' atoms inside moov: the walk is cut off at MAX_ATOMS headers in all."""
     count = MAX_ATOMS + 50
-    data = atom(b"free") * count + Movie().moov()
+    moov = atom(b"moov", atom(b"free") * count)
+    data = atom(b"wide") + moov
     view = Sparse(len(data), {0: data})
     started = time.perf_counter()
-    with pytest.raises(TimecodeUnreadable, match=f"more than {MAX_ATOMS} atoms") as caught:
+    with pytest.raises(TimecodeUnreadable, match=f"more than {MAX_ATOMS} atoms before") as caught:
         read_timecode_from(view, len(data))
     assert caught.value.code == "malformed"
     assert len(view.reads) == MAX_ATOMS and time.perf_counter() - started < 10.0
-    # Under the cap a flood is fine (here between mdat and moov, so the sample stays put).
-    good = Movie().build()
-    moov_at = len(good) - len(Movie().moov())
-    assert read_bytes(good[:moov_at] + atom(b"free") * 1000 + good[moov_at:]).frames == 521420
 
 
-def test_100k_atoms_64_kib_apart_stay_within_the_read_budget() -> None:
+def test_100k_atoms_64_kib_apart_stop_at_the_top_level_cap() -> None:
     """The validator's case: 100k top-level 'free' atoms 64 KiB apart (a 6.5 GB file). Every
-    header costs exactly 8 bytes, so the walk reads under 1 MB and stops typed."""
+    header costs exactly 8 bytes and the walk stops typed after 1000 of them: 8 KB read, 1000
+    seeks (a few MB from a cold disk), where round 1 read 409.6 MB."""
     count, step = 100_000, 65536
     segments = {i * step: struct.pack(">I4s", step, b"free") for i in range(count)}
     view = Sparse(count * step + 8, segments, fill=True)
-    with pytest.raises(TimecodeUnreadable) as caught:
+    with pytest.raises(TimecodeUnreadable, match="more than 1000 atoms in the file") as caught:
         read_timecode_from(view, view.size)
-    assert caught.value.code in ("malformed", "not_quicktime")
-    assert view.bytes_read <= 8 * (MAX_ATOMS + 1) < MAX_READ_BYTES
+    assert caught.value.code == "malformed"
+    assert len(view.reads) == MAX_TOP_LEVEL_ATOMS and view.bytes_read == 8 * 1000
     assert all(n == 8 for _, n in view.reads)
 
 
@@ -501,7 +556,7 @@ def test_the_read_budget_is_typed(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_reads_from_disk_are_unbuffered(tmp_path: Path) -> None:
     """A buffered file would fill 4-8 KiB on every seek; the reader's 8-byte header reads must
     stay 8 bytes at the system call (rchar), so a spaced-out file costs bytes, not megabytes."""
-    count, step = 500, 65536
+    count, step = 1500, 65536
     path = tmp_path / "spaced.mov"
     with path.open("wb") as out:
         out.truncate(count * step + 8)
@@ -516,7 +571,7 @@ def test_reads_from_disk_are_unbuffered(tmp_path: Path) -> None:
     before = rchar()
     with pytest.raises(TimecodeUnreadable):
         read_timecode(path)
-    assert rchar() - before < 64 * 1024  # 501 headers of 8 bytes, plus /proc itself
+    assert rchar() - before < 64 * 1024  # 1000 headers of 8 bytes, plus /proc itself
 
 
 @pytest.mark.parametrize(
