@@ -22,7 +22,9 @@ start before zero; read unsigned, -1 would wrap into an unrelated positive timec
 timescale/frameDuration. A track whose numberOfFrames is not that rate rounded is refused
 (``unsupported``) rather than rescaled, and so is drop-frame at a rate other than 29.97 or
 59.94. With the 24-hour flag (bit 1) a count past 24 hours wraps, as ffmpeg's timecode string
-does; without it, it is refused.
+does; without it, it is refused. A tmcd track whose first edit (``edts/elst``) is not trivial
+(media_time 0 at rate exactly 1: a trimmed start, an empty edit, another rate) is refused as
+``unsupported`` rather than applied; the video track's edits are not read.
 """
 
 from __future__ import annotations
@@ -252,16 +254,16 @@ def _movie(src: _Source) -> _Atom:
     )
 
 
-def _timecode_media(src: _Source, moov: _Atom) -> _Atom:
-    """The ``mdia`` of the first ``trak`` whose ``mdia/hdlr`` subtype is ``tmcd`` (``minf``
-    has a data-handler ``hdlr`` too, which is not the track's kind)."""
+def _timecode_track(src: _Source, moov: _Atom) -> tuple[_Atom, _Atom]:
+    """The first ``trak`` whose ``mdia/hdlr`` subtype is ``tmcd`` (``minf`` has a data-handler
+    ``hdlr`` too, which is not the track's kind), and its ``mdia``."""
     for trak in src.children(moov.body, moov.end, "moov"):
         if trak.kind != b"trak":
             continue
         mdia = src.child(trak, b"mdia")
         hdlr = src.child(mdia, b"hdlr") if mdia is not None else None
         if mdia is not None and hdlr is not None and src.body(hdlr, 4, at=8) == b"tmcd":
-            return mdia
+            return trak, mdia
     raise TimecodeUnreadable("the movie has no timecode (tmcd) track", code="no_timecode")
 
 
@@ -395,8 +397,54 @@ def _description(src: _Source, stsd: _Atom, index: int) -> int:
     return at
 
 
+def _require_unedited(src: _Source, trak: _Atom) -> None:
+    """The tmcd track's first edit (``edts/elst``) must be trivial: media_time 0 at rate exactly
+    1, so the track starts at its first sample. A trimmed start (media_time > 0), an empty edit
+    (-1: the track starts after the movie), any other negative time or another rate is refused
+    as ``unsupported``: how Resolve maps an edited tmcd is unverified, and camera files (the
+    CCN BRAW: one edit, 0, rate 1) do not need it. Later edits do not move the start. No edts,
+    no elst or no entries means no edit."""
+    edts = src.child(trak, b"edts")
+    found = src.child(edts, b"elst") if edts is not None else None
+    if found is None:
+        return
+    version, rows = struct.unpack(">B3xI", src.body(found, 8))
+    if version not in (0, 1):
+        raise TimecodeUnreadable(
+            f"the tmcd track's elst version {version} is not 0 or 1, so its edit is unknown",
+            code="unsupported",
+        )
+    width = 12 if version == 0 else 20
+    if rows * width > found.end - found.body - 8:
+        raise TimecodeUnreadable(
+            f"the tmcd track's elst lists {rows} edits but holds "
+            f"{(found.end - found.body - 8) // width}",
+            code="malformed",
+        )
+    if rows == 0:
+        return
+    row = ">Iihh" if version == 0 else ">Qqhh"
+    duration, media_time, rate, fraction = struct.unpack(row, src.body(found, width, at=8))
+    if media_time == 0 and (rate, fraction) == (1, 0):
+        return
+    time = f"media_time {media_time}"
+    if media_time == -1:
+        time += " (an empty edit: the track starts after the movie does)"
+    elif media_time > 0:
+        time += " (a trimmed start)"
+    elif media_time < 0:
+        time += " (a negative media time)"
+    speed = f"rate {rate}+{fraction}/65536" + ("" if (rate, fraction) == (1, 0) else " (not 1)")
+    raise TimecodeUnreadable(
+        f"the tmcd track's first edit (duration {duration}, {time}, {speed}) does not start at "
+        "its first sample at rate 1, and an edited timecode track is not supported",
+        code="unsupported",
+    )
+
+
 def _read(src: _Source) -> QuickTimeTimecode:
-    mdia = _timecode_media(src, _movie(src))
+    trak, mdia = _timecode_track(src, _movie(src))
+    _require_unedited(src, trak)
     stbl = _require(src, _require(src, mdia, b"minf"), b"stbl")
     stsd = _require(src, stbl, b"stsd")
     entry = _description(src, stsd, _description_index(src, stbl, stsd))

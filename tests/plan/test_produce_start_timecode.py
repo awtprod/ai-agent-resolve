@@ -23,7 +23,7 @@ from aar.plan.produce import build as build_module
 from aar.plan.produce.audio import SourceAudio, open_audio
 from aar.plan.produce.build import Probed, StartTimecode, probe_sources, source_start_timecodes
 from aar.plan.produce.errors import ProduceInputError
-from qt_support import TMCD_AT, Movie, co64, retime_tmcd, stsd, tmcd_entry
+from qt_support import TMCD_AT, Movie, co64, edit_tmcd_elst, retime_tmcd, stsd, tmcd_entry
 
 FILM = Fraction(24000, 1001)
 NTSC = Fraction(30000, 1001)
@@ -749,3 +749,31 @@ def test_a_real_120_fps_clip_with_a_tag_counts_at_120(tmp_path: Path) -> None:
             {"cam": StartTimecode(432000, Fraction(120))},
             [],
         )
+
+
+@needs_ffmpeg
+def test_an_edited_tmcd_track_blocks_the_tag_and_the_stub_settles_it(tmp_path: Path) -> None:
+    """Round 6 (Prism on PR #15): a real ffmpeg file with 01:00:00:00, its tmcd edit list
+    patched to start 300 media ticks in. The reader refuses it as unsupported, and the producer
+    uses neither ffprobe's tag nor the sample: a played source is refused; the stub's start
+    timecode settles it."""
+    out = tmp_path / "edited.mov"
+    ffmpeg(
+        "-f", "lavfi", "-i", "testsrc=size=64x48:rate=30:duration=1", "-f", "lavfi",
+        "-i", "sine=d=1", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-timecode", "01:00:00:00", str(out),
+    )  # fmt: skip
+    edit_tmcd_elst(out, 300)
+    tmcd, problem, code = build_module.read_tmcd(out)
+    assert tmcd is None and code == "unsupported" and "media_time 300" in (problem or "")
+    stub = _stub(_source(media=str(out)), fps="30/1")
+    for audio in (open_audio(stub, ["cam"], None), {}):  # a source of the cut, and not
+        probed, _ = probe_sources(stub, audio, None)
+        with pytest.raises(ProduceInputError, match="tmcd track cannot be used") as caught:
+            source_start_timecodes(stub, probed, {"cam"})
+        assert caught.value.code == "timecode-rate-ambiguous"
+        given = _stub(_source(media=str(out), start_timecode=108000, start_timecode_rate="30/1"),
+                      fps="30/1")  # fmt: skip
+        timecodes, warnings = source_start_timecodes(given, probed, {"cam"})
+        assert timecodes == {"cam": StartTimecode(108000, Fraction(30))}
+        assert not [w for w in warnings if w.code == "start-timecode-reader-mismatch"]

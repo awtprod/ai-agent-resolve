@@ -72,11 +72,26 @@ def stco(*offsets: int, count: int | None = None) -> bytes:
     return atom(b"stco", bytes(4), struct.pack(">I", n), *(struct.pack(">I", o) for o in offsets))
 
 
-def trak(handler: bytes, *stbl_children: bytes, minf_extra: Sequence[bytes] = ()) -> bytes:
+def elst(*entries: tuple[int, int, int, int], version: int = 0, count: int | None = None) -> bytes:
+    """An edit list: (segment_duration, media_time, rate_integer, rate_fraction) rows, media_time
+    signed (32-bit in version 0, 64-bit in version 1)."""
+    n = len(entries) if count is None else count
+    row = ">Iihh" if version == 0 else ">Qqhh"
+    rows = (struct.pack(row, *e) for e in entries)
+    return atom(b"elst", struct.pack(">B3x", version), struct.pack(">I", n), *rows)
+
+
+def trak(
+    handler: bytes,
+    *stbl_children: bytes,
+    minf_extra: Sequence[bytes] = (),
+    edts: bytes | None = None,
+    media_scale: int = NTSC_SCALE,
+) -> bytes:
     """A track whose ``mdia/hdlr`` is ``handler``; ``minf`` carries the ``alis`` data handler
     first, as BRAW's does, so a reader that takes any ``hdlr`` sees ``alis``."""
     tkhd = atom(b"tkhd", bytes(84))
-    mdhd = atom(b"mdhd", bytes(4), bytes(8), struct.pack(">II", NTSC_SCALE, 1576576), bytes(4))
+    mdhd = atom(b"mdhd", bytes(4), bytes(8), struct.pack(">II", media_scale, 1576576), bytes(4))
     minf = atom(
         b"minf",
         *minf_extra,
@@ -84,7 +99,8 @@ def trak(handler: bytes, *stbl_children: bytes, minf_extra: Sequence[bytes] = ()
         atom(b"dinf", atom(b"dref", bytes(4), struct.pack(">I", 1), atom(b"alis", b"\0\0\0\1"))),
         atom(b"stbl", *stbl_children),
     )
-    return atom(b"trak", tkhd, atom(b"mdia", mdhd, hdlr(handler), minf))
+    edits = [edts] if edts is not None else []
+    return atom(b"trak", tkhd, *edits, atom(b"mdia", mdhd, hdlr(handler), minf))
 
 
 @dataclass
@@ -98,6 +114,8 @@ class Movie:
     tracks_before: list[bytes] = field(default_factory=list)
     tracks_after: list[bytes] = field(default_factory=list)
     with_tmcd: bool = True
+    tmcd_edts: bytes | None = None  # an edts atom for the tmcd track (none by default)
+    tmcd_scale: int = NTSC_SCALE  # the tmcd track's mdhd timescale
 
     def tmcd_track(self, offset: int) -> bytes:
         children = self.tmcd_stbl or [
@@ -107,7 +125,13 @@ class Movie:
             atom(b"stsz", bytes(4), struct.pack(">II", 4, 1)),
             co64(offset),
         ]
-        return trak(b"tmcd", *children, minf_extra=[atom(b"gmhd", atom(b"gmin", bytes(16)))])
+        return trak(
+            b"tmcd",
+            *children,
+            minf_extra=[atom(b"gmhd", atom(b"gmin", bytes(16)))],
+            edts=self.tmcd_edts,
+            media_scale=self.tmcd_scale,
+        )
 
     def moov(self, offset: int = TMCD_AT) -> bytes:
         video = trak(b"vide", stsd(atom(b"brvl", bytes(78))), atom(b"skip", b"\0\0"), co64(4100))
@@ -202,3 +226,31 @@ def retime_tmcd(path: Path, timescale: int, duration: int, per_second: int | Non
     if per_second is not None:
         data[at + 28] = per_second
     path.write_bytes(bytes(data))
+
+
+def edit_tmcd_elst(path: Path, media_time: int, rate: tuple[int, int] = (1, 0)) -> None:
+    """Rewrite the first edit of the tmcd track's version-0 elst in an ffmpeg-made file (ffmpeg
+    writes one edit, media_time 0, rate 1, on every track). Walks the atoms itself."""
+    data = bytearray(path.read_bytes())
+
+    def kids(start: int, end: int):  # type: ignore[no-untyped-def]
+        while end - start >= 8:
+            size, kind = struct.unpack(">I4s", data[start : start + 8])
+            yield kind, start + 8, start + size
+            start += size
+
+    moov = next((b, e) for k, b, e in kids(0, len(data)) if k == b"moov")
+    for kind, body, end in kids(*moov):
+        if kind != b"trak":
+            continue
+        children = {k: (b, e) for k, b, e in kids(body, end)}
+        mdia = dict((k, (b, e)) for k, b, e in kids(*children[b"mdia"]))
+        if data[mdia[b"hdlr"][0] + 8 : mdia[b"hdlr"][0] + 12] != b"tmcd":
+            continue
+        elst_body = next(b for k, b, _ in kids(*children[b"edts"]) if k == b"elst")
+        assert data[elst_body] == 0, "version 0 only"
+        first = elst_body + 8
+        data[first + 4 : first + 12] = struct.pack(">ihh", media_time, *rate)
+        path.write_bytes(bytes(data))
+        return
+    raise AssertionError("no tmcd track")

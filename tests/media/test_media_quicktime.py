@@ -46,6 +46,7 @@ from qt_support import (
     Sparse,
     atom,
     co64,
+    elst,
     hdlr,
     stco,
     stsc,
@@ -405,6 +406,83 @@ def test_one_description_without_stsc_is_read_as_before() -> None:
 )  # fmt: skip
 def test_a_bad_sample_description_choice_is_malformed(rows: list[bytes], match: str) -> None:
     refused(_two(*rows), "malformed", match)
+
+
+# -- the tmcd track's edit list (Prism on PR #15, round 6) -----------------------------------
+
+
+def _edited(*edits: bytes, frame: int = 0, scale: int = 30) -> bytes:
+    """A 30 fps tmcd track (mdhd timescale ``scale``) with an edts holding ``edits``."""
+    movie = Movie(frame=frame, tmcd_scale=scale)
+    movie.tmcd_stbl = [stsd(tmcd_entry(0, 30, 1, 30)), co64(TMCD_AT)]
+    movie.tmcd_edts = atom(b"edts", *edits)
+    return movie.build()
+
+
+@pytest.mark.parametrize(
+    ("edits", "match"),
+    [
+        pytest.param([elst((30, 300, 1, 0))], r"media_time 300 \(a trimmed start\)",
+                     id="prism-media-time-300"),
+        pytest.param([elst((30, -1, 1, 0))], r"media_time -1 \(an empty edit",
+                     id="empty-first-edit"),
+        pytest.param([elst((30, -5, 1, 0))], "media_time -5", id="other-negative"),
+        pytest.param([elst((30, 0, 2, 0))], r"rate 2\+0/65536", id="rate-2-0"),
+        pytest.param([elst((30, 0, 1, 1))], r"rate 1\+1/65536", id="rate-1-1"),
+        pytest.param([elst((30, 300, 1, 0), version=1)], "media_time 300", id="v1-trimmed"),
+        pytest.param([elst((30, -1, 1, 0), version=1)], "media_time -1", id="v1-empty"),
+        pytest.param([elst((30, 2**62, 1, 0), version=1)], f"media_time {2**62}",
+                     id="v1-64-bit-trim"),
+        pytest.param([atom(b"elst", b"\x02\0\0\0", struct.pack(">I", 0))], "elst version 2",
+                     id="version-2"),
+    ],
+)  # fmt: skip
+def test_an_edited_tmcd_start_is_unsupported(edits: list[bytes], match: str) -> None:
+    """Prism's example: a 30 fps sample of 0 with its edit starting 300 media ticks in (mdhd
+    timescale 30) really starts at 00:00:10:00. How Resolve maps an edited tmcd is unverified,
+    so any first edit but the trivial one (media_time 0, rate exactly 1) is refused."""
+    error = refused(_edited(*edits), "unsupported", match)
+    assert "edit" in str(error)
+
+
+@pytest.mark.parametrize(
+    "edits",
+    [
+        pytest.param([elst((30, 0, 1, 0))], id="trivial-v0"),
+        pytest.param([elst((30, 0, 1, 0), version=1)], id="trivial-v1-64-bit-zero"),
+        pytest.param([elst((30, 0, 1, 0), (30, 300, 1, 0))], id="trivial-then-trimmed"),
+        pytest.param([elst()], id="no-edits"),
+        pytest.param([], id="edts-without-elst"),
+        pytest.param([atom(b"free"), elst((30, 0, 1, 0))], id="elst-after-another-atom"),
+    ],
+)
+def test_a_trivial_or_absent_first_edit_reads_the_sample(edits: list[bytes]) -> None:
+    got = read_bytes(_edited(*edits, frame=300))
+    assert (got.frames, got.timecode) == (300, "00:00:10:00")
+
+
+@pytest.mark.parametrize(
+    ("edit", "match"),
+    [
+        pytest.param(elst((30, 0, 1, 0), count=2), "elst lists 2 edits but holds 1",
+                     id="count-past-atom"),
+        pytest.param(elst((30, 0, 1, 0), version=1, count=2), "elst lists 2 edits but holds 1",
+                     id="v1-count-past-atom"),
+        pytest.param(atom(b"elst", bytes(4)), "too short", id="elst-cut"),
+        pytest.param(atom(b"elst", struct.pack(">B3xI", 0, 1), bytes(8)),
+                     "elst lists 1 edits but holds 0", id="row-cut"),
+    ],
+)  # fmt: skip
+def test_a_short_elst_is_malformed(edit: bytes, match: str) -> None:
+    refused(_edited(edit), "malformed", match)
+
+
+def test_the_video_tracks_edits_are_not_read() -> None:
+    """Out of scope (an S18 follow-up): only the tmcd track's edit list decides here."""
+    movie = Movie()
+    movie.tracks_before = [trak(b"vide", stsd(atom(b"brvl", bytes(8))), co64(4100),
+                                edts=atom(b"edts", elst((30, 300, 1, 0))))]  # fmt: skip
+    assert read_bytes(movie.build()).frames == 521420
 
 
 # -- against ffprobe ---------------------------------------------------------------------------
