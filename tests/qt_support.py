@@ -43,8 +43,9 @@ def tmcd_entry(
     *,
     kind: bytes = b"tmcd",
     size: int | None = None,
+    dref: int = 1,
 ) -> bytes:
-    body = bytes(6) + struct.pack(">H", 1) + bytes(4)
+    body = bytes(6) + struct.pack(">H", dref) + bytes(4)
     body += struct.pack(">IIIBB", flags, timescale, duration, per_second, 0)
     return struct.pack(">I4s", size if size is not None else 8 + len(body), kind) + body
 
@@ -81,31 +82,53 @@ def elst(*entries: tuple[int, int, int, int], version: int = 0, count: int | Non
     return atom(b"elst", struct.pack(">B3x", version), struct.pack(">I", n), *rows)
 
 
+SELF_DINF = atom(b"dinf", atom(b"dref", bytes(4), struct.pack(">I", 1), atom(b"alis", b"\0\0\0\1")))
+
+
+def dinf(*entries: bytes, count: int | None = None) -> bytes:
+    """A data-information atom: dref holding ``entries`` (each a data-reference atom)."""
+    n = len(entries) if count is None else count
+    return atom(b"dinf", atom(b"dref", bytes(4), struct.pack(">I", n), *entries))
+
+
+def dref_entry(kind: bytes = b"alis", flags: int = 1, data: bytes = b"") -> bytes:
+    """One data reference: flag 0x000001 means the data is in this file."""
+    return atom(kind, struct.pack(">I", flags), data)
+
+
+def stsz(uniform: int = 4, count: int = 1, *sizes: int) -> bytes:
+    """Sample sizes: ``uniform`` for all, or 0 and a per-sample table."""
+    return atom(b"stsz", bytes(4), struct.pack(">II", uniform, count),
+                *(struct.pack(">I", s) for s in sizes))  # fmt: skip
+
+
 def trak(
     handler: bytes,
     *stbl_children: bytes,
     minf_extra: Sequence[bytes] = (),
     edts: bytes | None = None,
     media_scale: int = NTSC_SCALE,
+    track_id: int = 0,
+    tref: Sequence[int] | None = None,
+    data_info: bytes | None = SELF_DINF,
 ) -> bytes:
     """A track whose ``mdia/hdlr`` is ``handler``; ``minf`` carries the ``alis`` data handler
-    first, as BRAW's does, so a reader that takes any ``hdlr`` sees ``alis``."""
-    tkhd = atom(b"tkhd", bytes(84))
+    first, as BRAW's does, so a reader that takes any ``hdlr`` sees ``alis``. ``tref`` lists the
+    track IDs of a ``tref/tmcd``; ``data_info`` is the ``dinf`` (None leaves it out)."""
+    tkhd = atom(b"tkhd", struct.pack(">B3xIII", 0, 0, 0, track_id), bytes(84 - 16))
     mdhd = atom(b"mdhd", bytes(4), bytes(8), struct.pack(">II", media_scale, 1576576), bytes(4))
-    minf = atom(
-        b"minf",
-        *minf_extra,
-        hdlr(b"alis", b"dhlr"),
-        atom(b"dinf", atom(b"dref", bytes(4), struct.pack(">I", 1), atom(b"alis", b"\0\0\0\1"))),
-        atom(b"stbl", *stbl_children),
-    )
+    infos = [data_info] if data_info is not None else []
+    minf = atom(b"minf", *minf_extra, hdlr(b"alis", b"dhlr"), *infos, atom(b"stbl", *stbl_children))
     edits = [edts] if edts is not None else []
-    return atom(b"trak", tkhd, *edits, atom(b"mdia", mdhd, hdlr(handler), minf))
+    refs = [atom(b"tref", atom(b"tmcd", *(struct.pack(">I", i) for i in tref)))] if tref else []
+    return atom(b"trak", tkhd, *edits, *refs, atom(b"mdia", mdhd, hdlr(handler), minf))
 
 
 @dataclass
 class Movie:
-    """The parts of a BRAW-like file, to change one at a time."""
+    """The parts of a BRAW-like file, to change one at a time. As in the real BRAW: video is
+    track 1 with ``tref/tmcd`` [2], the tmcd track is 2, sound is 3 (also naming 2), meta 4 and
+    5; every dref is one self-reference ('alis', flag 1)."""
 
     frame: int = 521420
     mdat_size: int = 8192  # bytes of mdat payload (the sample sits inside it)
@@ -116,31 +139,43 @@ class Movie:
     with_tmcd: bool = True
     tmcd_edts: bytes | None = None  # an edts atom for the tmcd track (none by default)
     tmcd_scale: int = NTSC_SCALE  # the tmcd track's mdhd timescale
+    tmcd_dinf: bytes | None = SELF_DINF  # the tmcd track's dinf (None: none)
+    video_tref: list[int] | str | None = "auto"  # [2] with a tmcd track, else none
+    add_stsz: bool = True  # give a custom tmcd_stbl the uniform 4-byte stsz it lacks
 
-    def tmcd_track(self, offset: int) -> bytes:
-        children = self.tmcd_stbl or [
+    def tmcd_track(self, offset: int, track_id: int = 2) -> bytes:
+        children = list(self.tmcd_stbl) or [
             stsd(tmcd_entry()),
             atom(b"stts", bytes(4), struct.pack(">III", 1, 1, 1576576)),
             atom(b"stsc", bytes(4), struct.pack(">IIII", 1, 1, 1, 1)),
-            atom(b"stsz", bytes(4), struct.pack(">II", 4, 1)),
+            stsz(4, 1),
             co64(offset),
         ]
+        if self.add_stsz and not any(c[4:8] in (b"stsz", b"stz2") for c in children):
+            children.append(stsz(4, 1))
         return trak(
             b"tmcd",
             *children,
             minf_extra=[atom(b"gmhd", atom(b"gmin", bytes(16)))],
             edts=self.tmcd_edts,
             media_scale=self.tmcd_scale,
+            track_id=track_id,
+            data_info=self.tmcd_dinf,
         )
 
     def moov(self, offset: int = TMCD_AT) -> bytes:
-        video = trak(b"vide", stsd(atom(b"brvl", bytes(78))), atom(b"skip", b"\0\0"), co64(4100))
-        sound = trak(b"soun", stsd(atom(b"in24", bytes(28))), co64(4100 + 2476032))
-        meta = trak(b"meta", stsd(atom(b"mebx", bytes(16))), co64(6000))
+        tref = ([2] if self.with_tmcd else None) if self.video_tref == "auto" else self.video_tref
+        assert not isinstance(tref, str)
+        video = trak(b"vide", stsd(atom(b"brvl", bytes(78))), atom(b"skip", b"\0\0"), co64(4100),
+                     track_id=1, tref=tref)  # fmt: skip
+        sound = trak(b"soun", stsd(atom(b"in24", bytes(28))), co64(4100 + 2476032), track_id=3,
+                     tref=tref)  # fmt: skip
+        metas = [trak(b"meta", stsd(atom(b"mebx", bytes(16))), co64(6000), track_id=i)
+                 for i in (4, 5)]  # fmt: skip
         tracks = [*self.tracks_before, video]
         if self.with_tmcd:
             tracks.append(self.tmcd_track(offset))
-        tracks += [sound, meta, meta, *self.tracks_after]
+        tracks += [sound, *metas, *self.tracks_after]
         return atom(b"moov", atom(b"mvhd", bytes(100)), *tracks, atom(b"meta", bytes(64)))
 
     def build(self) -> bytes:

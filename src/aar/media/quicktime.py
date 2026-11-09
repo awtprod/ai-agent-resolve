@@ -3,12 +3,14 @@
 BRAW (the CCN camera format) is a plain QuickTime container: ``wide`` and ``mdat`` at the
 start, ``moov`` at the end, a ``tmcd`` track whose first sample is the start timecode as a
 big-endian signed 32-bit frame number. :func:`read_timecode` finds it by seeking: it walks the
-top-level atoms to ``moov`` (wherever it is), takes the first ``trak`` whose ``mdia/hdlr``
-subtype is ``tmcd``, reads the ``stsd`` entry that ``stsc``'s first row gives chunk 1 (entry 1
-when there is one entry and no ``stsc``) for flags, timescale, frameDuration and
-numberOfFrames, the first chunk offset from ``stco`` or ``co64`` (the first sample starts its
-first chunk), and the four bytes there. It never reads the whole file: a few hundred bytes for a
-normal movie.
+top-level atoms to ``moov`` (wherever it is), takes the timecode track (the one the first video
+track's ``tref/tmcd`` names by tkhd ID, else the only track whose ``mdia/hdlr`` subtype is
+``tmcd``), reads the ``stsd`` entry that ``stsc``'s first row gives chunk 1 (entry 1 when there
+is one entry and no ``stsc``) for flags, timescale, frameDuration and numberOfFrames, checks
+that entry's data reference says the data is in this file and that ``stsz`` gives the first
+sample at least 4 bytes, takes the first chunk offset from ``stco`` or ``co64`` (the first
+sample starts its first chunk), and reads the four bytes there, which must lie in an ``mdat``.
+It never reads the whole file: well under a kilobyte for a normal movie.
 
 Every size and offset is checked against its parent atom and the file length, ``moov`` may be
 at most :data:`MAX_MOOV_BYTES`, and at most :data:`MAX_ATOMS` atom headers are read, so a
@@ -254,17 +256,156 @@ def _movie(src: _Source) -> _Atom:
     )
 
 
+def _track_id(src: _Source, trak: _Atom) -> int | None:
+    """A track's ID from its tkhd (version 0 or 1); None for a trak without a tkhd."""
+    tkhd = src.child(trak, b"tkhd")
+    if tkhd is None:
+        return None
+    version = src.body(tkhd, 1)[0]
+    if version not in (0, 1):
+        raise TimecodeUnreadable(
+            f"a track's tkhd version {version} is not 0 or 1, so its ID is unknown",
+            code="malformed",
+        )
+    (track_id,) = struct.unpack(">I", src.body(tkhd, 4, at=12 if version == 0 else 20))
+    return track_id
+
+
+def _named_timecode(src: _Source, video: _Atom) -> int | None:
+    """The first track ID of the video track's ``tref/tmcd``, if it has one."""
+    tref = src.child(video, b"tref")
+    tmcd = src.child(tref, b"tmcd") if tref is not None else None
+    if tmcd is None:
+        return None
+    if tmcd.end - tmcd.body < 4:
+        raise TimecodeUnreadable("the video's tref/tmcd names no track", code="malformed")
+    (track_id,) = struct.unpack(">I", src.body(tmcd, 4))
+    return track_id
+
+
 def _timecode_track(src: _Source, moov: _Atom) -> tuple[_Atom, _Atom]:
-    """The first ``trak`` whose ``mdia/hdlr`` subtype is ``tmcd`` (``minf`` has a data-handler
-    ``hdlr`` too, which is not the track's kind), and its ``mdia``."""
+    """The timecode track and its ``mdia``. The media type is ``mdia/hdlr``'s subtype (``minf``
+    has a data-handler ``hdlr`` too, which is not the track's kind). When the movie's first
+    video track names a timecode track (``tref/tmcd``, as cameras and ffmpeg write), that track
+    (by tkhd ID) is used and must be a tmcd track; otherwise the movie's only tmcd track. Several
+    tmcd tracks and no tref are refused rather than guessed between."""
+    tracks: list[tuple[_Atom, _Atom | None, bytes | None]] = []
+    video: _Atom | None = None
     for trak in src.children(moov.body, moov.end, "moov"):
         if trak.kind != b"trak":
             continue
         mdia = src.child(trak, b"mdia")
         hdlr = src.child(mdia, b"hdlr") if mdia is not None else None
-        if mdia is not None and hdlr is not None and src.body(hdlr, 4, at=8) == b"tmcd":
-            return trak, mdia
-    raise TimecodeUnreadable("the movie has no timecode (tmcd) track", code="no_timecode")
+        subtype = src.body(hdlr, 4, at=8) if hdlr is not None else None
+        tracks.append((trak, mdia, subtype))
+        if subtype == b"vide" and video is None:
+            video = trak
+    named = _named_timecode(src, video) if video is not None else None
+    if named is not None:
+        matches = [(trak, mdia, sub) for trak, mdia, sub in tracks if _track_id(src, trak) == named]
+        if not matches:
+            raise TimecodeUnreadable(
+                f"the video's tref/tmcd names track {named}, which is not in the movie",
+                code="malformed",
+            )
+        if len(matches) > 1:  # track IDs must be unique; which one is meant is unknown
+            raise TimecodeUnreadable(
+                f"the video's tref/tmcd names track {named}, and {len(matches)} tracks have "
+                "that ID",
+                code="malformed",
+            )
+        trak, mdia, subtype = matches[0]
+        if subtype != b"tmcd" or mdia is None:
+            kind = repr(subtype.decode("latin-1")) if subtype else "no media type"
+            raise TimecodeUnreadable(
+                f"the video's tref/tmcd names track {named}, which is {kind}, not a tmcd track",
+                code="malformed",
+            )
+        return trak, mdia
+    timecode = [(trak, mdia) for trak, mdia, subtype in tracks if subtype == b"tmcd" and mdia]
+    if not timecode:
+        raise TimecodeUnreadable("the movie has no timecode (tmcd) track", code="no_timecode")
+    if len(timecode) > 1:
+        raise TimecodeUnreadable(
+            f"the movie has several timecode tracks and the video names none ({len(timecode)} "
+            "tmcd tracks, no tref/tmcd), so which one is its start is unknown",
+            code="unsupported",
+        )
+    return timecode[0]
+
+
+def _require_local_data(src: _Source, minf: _Atom, entry: int) -> None:
+    """The chosen sample description's data_reference_index must name an entry of the track's
+    ``minf/dinf/dref`` whose flag 0x000001 says the data is in this file (any type: 'alis',
+    'url ', 'rsrc'). Otherwise the chunk offsets point into another file, and what this movie
+    holds there is not the timecode."""
+    (index,) = struct.unpack(">H", src.read(entry + 14, 2))
+    dref = _require(src, _require(src, minf, b"dinf"), b"dref")
+    (count,) = struct.unpack(">I", src.body(dref, 4, at=4))
+    if count * 12 > dref.end - dref.body - 8:
+        raise TimecodeUnreadable(
+            f"the tmcd track's dref lists {count} data references but holds at most "
+            f"{(dref.end - dref.body - 8) // 12}",
+            code="malformed",
+        )
+    if not 1 <= index <= count:
+        raise TimecodeUnreadable(
+            f"the tmcd sample description names data reference {index}, not 1-{count}",
+            code="malformed",
+        )
+    at = dref.body + 8
+    for number in range(1, index + 1):
+        left = dref.end - at
+        if left < 12:
+            raise TimecodeUnreadable(
+                f"the tmcd track's dref lists {count} data references but holds {number - 1}",
+                code="malformed",
+            )
+        size, kind, flags = struct.unpack(">I4sI", src.read(at, 12))
+        if not 12 <= size <= left:
+            raise TimecodeUnreadable(
+                f"the tmcd track's data reference {number} claims {size} bytes (at least 12, "
+                f"at most {left} fit)",
+                code="malformed",
+            )
+        if number == index and not flags & 0x000001:
+            raise TimecodeUnreadable(
+                f"timecode in an external file: the tmcd track's data reference {index} is "
+                f"{kind.decode('latin-1')!r} without the self-contained flag, so its chunk "
+                "offsets point into another file",
+                code="unsupported",
+            )
+        at += size
+
+
+def _require_sample_size(src: _Source, stbl: _Atom) -> None:
+    """The first sample must hold a frame number: stsz must count at least one sample, and the
+    first's size (uniform, or the first table entry) must be at least 4 bytes."""
+    sizes = _one_of(src, stbl, (b"stsz", b"stz2"))
+    if sizes is None or sizes.kind == b"stz2":
+        if sizes is not None:
+            raise TimecodeUnreadable(
+                "the tmcd track uses compact sample sizes (stz2), which this reader does not read",
+                code="unsupported",
+            )
+        raise TimecodeUnreadable("the tmcd track has no sample sizes (stsz)", code="malformed")
+    uniform, count = struct.unpack(">II", src.body(sizes, 8, at=4))
+    if count == 0:
+        raise TimecodeUnreadable("the tmcd track's stsz counts no samples", code="no_timecode")
+    first = uniform
+    if uniform == 0:
+        if count * 4 > sizes.end - sizes.body - 12:
+            raise TimecodeUnreadable(
+                f"the tmcd track's stsz lists {count} sizes but holds "
+                f"{(sizes.end - sizes.body - 12) // 4}",
+                code="malformed",
+            )
+        (first,) = struct.unpack(">I", src.body(sizes, 4, at=12))
+    if first < 4:
+        raise TimecodeUnreadable(
+            f"the tmcd track's first sample is {first} bytes, under the 4 of a frame number",
+            code="malformed",
+        )
 
 
 def _require(src: _Source, parent: _Atom, kind: bytes) -> _Atom:
@@ -276,23 +417,34 @@ def _require(src: _Source, parent: _Atom, kind: bytes) -> _Atom:
     return found
 
 
+def _one_of(src: _Source, stbl: _Atom, kinds: tuple[bytes, bytes]) -> _Atom | None:
+    """The one atom of ``kinds`` in ``stbl``; both (or two of one) is malformed, since which
+    governs the value is then unknown."""
+    found = [atom for atom in src.children(stbl.body, stbl.end, "stbl") if atom.kind in kinds]
+    if len(found) > 1:
+        names = " and ".join(atom.name for atom in found)
+        raise TimecodeUnreadable(f"the tmcd track's stbl has {names}", code="malformed")
+    return found[0] if found else None
+
+
 def _first_chunk(src: _Source, stbl: _Atom) -> int:
-    for atom in src.children(stbl.body, stbl.end, "stbl"):
-        if atom.kind not in (b"stco", b"co64"):
-            continue
-        width = 4 if atom.kind == b"stco" else 8
-        (count,) = struct.unpack(">I", src.body(atom, 4, at=4))
-        if count == 0:
-            raise TimecodeUnreadable("the tmcd track has no samples", code="no_timecode")
-        if count * width > atom.end - atom.body - 8:
-            raise TimecodeUnreadable(
-                f"the tmcd {atom.name} lists {count} chunks but holds "
-                f"{(atom.end - atom.body - 8) // width}",
-                code="malformed",
-            )
-        raw = src.body(atom, width, at=8)
-        return struct.unpack(">I" if width == 4 else ">Q", raw)[0]
-    raise TimecodeUnreadable("the tmcd track has no chunk offsets (stco or co64)", code="malformed")
+    atom = _one_of(src, stbl, (b"stco", b"co64"))
+    if atom is None:
+        raise TimecodeUnreadable(
+            "the tmcd track has no chunk offsets (stco or co64)", code="malformed"
+        )
+    width = 4 if atom.kind == b"stco" else 8
+    (count,) = struct.unpack(">I", src.body(atom, 4, at=4))
+    if count == 0:
+        raise TimecodeUnreadable("the tmcd track has no samples", code="no_timecode")
+    if count * width > atom.end - atom.body - 8:
+        raise TimecodeUnreadable(
+            f"the tmcd {atom.name} lists {count} chunks but holds "
+            f"{(atom.end - atom.body - 8) // width}",
+            code="malformed",
+        )
+    raw = src.body(atom, width, at=8)
+    return struct.unpack(">I" if width == 4 else ">Q", raw)[0]
 
 
 def _require_in_mdat(src: _Source, offset: int) -> None:
@@ -445,9 +597,11 @@ def _require_unedited(src: _Source, trak: _Atom) -> None:
 def _read(src: _Source) -> QuickTimeTimecode:
     trak, mdia = _timecode_track(src, _movie(src))
     _require_unedited(src, trak)
-    stbl = _require(src, _require(src, mdia, b"minf"), b"stbl")
+    minf = _require(src, mdia, b"minf")
+    stbl = _require(src, minf, b"stbl")
     stsd = _require(src, stbl, b"stsd")
     entry = _description(src, stsd, _description_index(src, stbl, stsd))
+    _require_local_data(src, minf, entry)
     flags, timescale, duration, per_second = struct.unpack(">IIIB", src.read(entry + 20, 13))
     if timescale == 0 or duration == 0 or per_second == 0:
         raise TimecodeUnreadable(
@@ -470,6 +624,7 @@ def _read(src: _Source) -> QuickTimeTimecode:
             "29.97 and 59.94",
             code="unsupported",
         )
+    _require_sample_size(src, stbl)
     offset = _first_chunk(src, stbl)
     if offset + 4 > src.size:
         raise TimecodeUnreadable(

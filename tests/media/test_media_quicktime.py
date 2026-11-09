@@ -46,11 +46,14 @@ from qt_support import (
     Sparse,
     atom,
     co64,
+    dinf,
+    dref_entry,
     elst,
     hdlr,
     stco,
     stsc,
     stsd,
+    stsz,
     tmcd_entry,
     trak,
 )
@@ -223,7 +226,7 @@ def test_a_64_bit_mdat_and_a_co64_offset_past_4_gib_are_read_by_seeking() -> Non
     got = read_timecode_from(view, size)
     assert (got.frames, got.sample_offset) == (1234, 4 * 2**30 + 12345)
     # Only headers and a few small fields: never the mdat, never the whole moov.
-    assert view.bytes_read < 1024 and len(view.reads) < 64
+    assert view.bytes_read < 1024 and len(view.reads) < 128
 
 
 def test_moov_at_the_start_and_32_bit_chunk_offsets() -> None:
@@ -254,12 +257,6 @@ def test_only_a_trak_is_a_track() -> None:
     decoy[4:8] = b"udta"
     movie.tracks_before = [bytes(decoy)]
     assert read_bytes(movie.build()).frames == 521420
-
-
-def test_the_first_tmcd_track_wins() -> None:
-    movie = Movie(frame=7)
-    movie.tracks_after = [movie.tmcd_track(TMCD_AT + 4)]  # a second one, pointing at zeros
-    assert read_bytes(movie.build()).frames == 7
 
 
 @pytest.mark.parametrize(
@@ -483,6 +480,206 @@ def test_the_video_tracks_edits_are_not_read() -> None:
     movie.tracks_before = [trak(b"vide", stsd(atom(b"brvl", bytes(8))), co64(4100),
                                 edts=atom(b"edts", elst((30, 300, 1, 0))))]  # fmt: skip
     assert read_bytes(movie.build()).frames == 521420
+
+
+# -- what the bytes are: data reference, which tmcd track, sample size (round 7) -------------
+
+
+def _with_dinf(info: bytes | None, dref: int = 1) -> bytes:
+    movie = Movie(tmcd_dinf=info)
+    movie.tmcd_stbl = [stsd(tmcd_entry(dref=dref)), co64(TMCD_AT)]
+    return movie.build()
+
+
+@pytest.mark.parametrize("kind", [b"url ", b"alis", b"rsrc"])
+def test_a_timecode_in_another_file_is_unsupported(kind: bytes) -> None:
+    """Prism on PR #15: with the data reference's self flag clear, the chunk offsets point into
+    another file, and whatever this movie has there is not the timecode."""
+    refused(_with_dinf(dinf(dref_entry(kind, 0))), "unsupported", "timecode in an external file")
+
+
+def test_the_entry_named_by_the_data_reference_index_decides() -> None:
+    both = dinf(dref_entry(b"url ", 0), dref_entry(b"alis", 1, b"\0" * 6))
+    assert read_bytes(_with_dinf(both, dref=2)).frames == 521420
+    refused(_with_dinf(both, dref=1), "unsupported", "external file")
+    assert read_bytes(_with_dinf(dinf(dref_entry(b"url ", 0x3)))).frames == 521420  # bit 0 set
+
+
+@pytest.mark.parametrize(
+    ("info", "index", "match"),
+    [
+        pytest.param(dinf(dref_entry()), 0, "data reference 0, not 1-1", id="index-0"),
+        pytest.param(dinf(dref_entry()), 2, "data reference 2, not 1-1", id="index-above-count"),
+        pytest.param(dinf(), 1, "data reference 1, not 1-0", id="dref-empty"),
+        pytest.param(None, 1, "no 'dinf'", id="no-dinf"),
+        pytest.param(atom(b"dinf"), 1, "no 'dref'", id="dinf-without-dref"),
+        pytest.param(dinf(dref_entry(data=bytes(18)), count=2), 2,
+                     "lists 2 data references but holds 1", id="walk-past-dref"),
+        pytest.param(dinf(dref_entry(), count=9), 1, "lists 9 data references but holds at most",
+                     id="count-past-dref"),
+        pytest.param(dinf(struct.pack(">I4s", 10, b"alis") + b"\0\0\0\1"), 1,
+                     "data reference 1 claims 10 bytes", id="entry-under-12"),
+        pytest.param(dinf(struct.pack(">I4s", 99, b"alis") + b"\0\0\0\1"), 1,
+                     "data reference 1 claims 99 bytes", id="entry-oversized"),
+        pytest.param(atom(b"dinf", atom(b"dref", bytes(4))), 1, "too short", id="dref-cut"),
+    ],
+)  # fmt: skip
+def test_a_bad_data_reference_is_malformed(info: bytes | None, index: int, match: str) -> None:
+    refused(_with_dinf(info, dref=index), "malformed", match)
+
+
+@needs_ffmpeg
+def test_an_ffmpeg_file_references_itself_with_url_flag_1(tmp_path: Path) -> None:
+    out = tmp_path / "ff.mov"
+    ffmpeg(
+        "-f", "lavfi", "-i", "testsrc=size=64x36:rate=25:duration=0.5", "-c:v", "libx264",
+        "-preset", "ultrafast", "-timecode", "10:00:00:00", str(out),
+    )  # fmt: skip
+    data = out.read_bytes()
+    at = data.find(b"dref")
+    count, kind, flags = struct.unpack(">I4x4sI", data[at + 8 : at + 24])
+    assert (count, kind, flags) == (1, b"url ", 1)  # flag 1: the data is in this file
+    assert read_timecode(out).timecode == "10:00:00:00"
+
+
+def _two_tracks(tref: list[int] | None, second_id: int = 7, second_value: int = 1234) -> bytes:
+    """The usual tmcd track (ID 2, 521420 at TMCD_AT) and a second (``second_id``, its own
+    value at TMCD_AT + 4), with the video naming ``tref``."""
+    movie = Movie(video_tref=tref)
+    movie.tracks_after = [movie.tmcd_track(TMCD_AT + 4, track_id=second_id)]
+    data = bytearray(movie.build())
+    data[TMCD_AT + 4 : TMCD_AT + 8] = struct.pack(">I", second_value)
+    return bytes(data)
+
+
+def test_the_video_names_the_timecode_track() -> None:
+    """Two tmcd tracks: the video's tref/tmcd picks which (ffprobe's rule too), not the order."""
+    assert read_bytes(_two_tracks([7])).frames == 1234
+    assert read_bytes(_two_tracks([2])).frames == 521420
+    assert read_bytes(_two_tracks([7, 2])).frames == 1234  # its first ID
+
+
+def test_two_tracks_with_the_named_id_are_malformed() -> None:
+    """Round 7 sweep: track IDs must be unique; with two tracks of the named ID, which one the
+    video means is unknown (round 6 and earlier took the first)."""
+    refused(_two_tracks([2], second_id=2), "malformed", "names track 2, and 2 tracks have that ID")
+
+
+def test_several_timecode_tracks_and_no_tref_are_unsupported() -> None:
+    refused(_two_tracks(None), "unsupported", "several timecode tracks and the video names none")
+
+
+def test_only_the_first_video_tracks_tref_counts() -> None:
+    movie = Movie(video_tref=[7])
+    movie.tracks_before = [trak(b"vide", stsd(atom(b"brvl", bytes(8))), co64(4100), track_id=9)]
+    movie.tracks_after = [movie.tmcd_track(TMCD_AT + 4, track_id=7)]
+    refused(movie.build(), "unsupported", "several timecode tracks")
+
+
+def test_one_timecode_track_needs_no_tref() -> None:
+    assert read_bytes(Movie(video_tref=None).build()).frames == 521420
+    no_video = Movie()
+    no_video.tracks_before = []
+    data = no_video.build().replace(b"vide", b"text")  # no video track at all
+    assert read_bytes(data).frames == 521420
+
+
+@pytest.mark.parametrize(
+    ("tref", "match"),
+    [
+        pytest.param([99], "names track 99, which is not in the movie", id="missing-track"),
+        pytest.param([3], "names track 3, which is 'soun', not a tmcd track", id="not-tmcd"),
+        pytest.param([0], "names track 0, which is not in the movie", id="track-0"),
+    ],
+)
+def test_a_tref_to_no_timecode_track_is_malformed(tref: list[int], match: str) -> None:
+    refused(Movie(video_tref=tref).build(), "malformed", match)
+
+
+def test_an_empty_tref_tmcd_is_malformed() -> None:
+    movie = Movie(video_tref=[])
+    movie.tracks_before = [atom(b"trak", atom(b"tkhd", struct.pack(">B3xIII", 0, 0, 0, 9)),
+                                atom(b"tref", atom(b"tmcd")),
+                                atom(b"mdia", hdlr(b"vide")))]  # fmt: skip
+    refused(movie.build(), "malformed", "tref/tmcd names no track")
+
+
+def _tkhd_v1(track: bytes, track_id: int) -> bytes:
+    """``track`` with its version-0 tkhd swapped for a version-1 one naming ``track_id``."""
+    old = atom(b"tkhd", struct.pack(">B3xIII", 0, 0, 0, 2), bytes(84 - 16))
+    new = atom(b"tkhd", struct.pack(">B3xQQI", 1, 0, 0, track_id), bytes(96 - 24))
+    assert track.count(old) == 1
+    body = track[8:].replace(old, new)
+    return struct.pack(">I4s", 8 + len(body), b"trak") + body
+
+
+def test_a_version_1_tkhd_gives_the_track_id() -> None:
+    movie = Movie(video_tref=[7], with_tmcd=False)
+    movie.tracks_after = [_tkhd_v1(movie.tmcd_track(TMCD_AT), 7)]
+    assert read_bytes(movie.build()).frames == 521420
+
+
+def test_an_unknown_or_short_tkhd_is_malformed() -> None:
+    movie = Movie(video_tref=[7], with_tmcd=False)
+    movie.tracks_after = [atom(b"trak", atom(b"tkhd", b"\x02" + bytes(83)))]
+    refused(movie.build(), "malformed", "tkhd version 2")
+    movie.tracks_after = [atom(b"trak", atom(b"tkhd", bytes(8)))]
+    refused(movie.build(), "malformed", "too short")
+
+
+@pytest.mark.parametrize(
+    ("table", "ok"),
+    [
+        pytest.param(stsz(4, 1), True, id="uniform-4"),
+        pytest.param(stsz(8, 3), True, id="uniform-8"),
+        pytest.param(stsz(0, 1, 4), True, id="per-sample-4"),
+        pytest.param(stsz(0, 2, 6, 0), True, id="per-sample-first-6"),
+    ],
+)
+def test_a_first_sample_of_4_bytes_or_more_is_read(table: bytes, ok: bool) -> None:
+    assert read_bytes(_two(stsd(TMCD_30), table)).timecode == "01:00:00:00"
+
+
+@pytest.mark.parametrize(
+    ("table", "code", "match"),
+    [
+        pytest.param(stsz(2, 1), "malformed", "first sample is 2 bytes", id="uniform-2"),
+        pytest.param(stsz(0, 1, 0), "malformed", "first sample is 0 bytes", id="per-sample-0"),
+        pytest.param(stsz(0, 1, 3), "malformed", "first sample is 3 bytes", id="per-sample-3"),
+        pytest.param(stsz(4, 0), "no_timecode", "stsz counts no samples", id="count-0"),
+        pytest.param(stsz(0, 2, 4), "malformed", "stsz lists 2 sizes but holds 1",
+                     id="table-past-atom"),
+        pytest.param(atom(b"stsz", bytes(8)), "malformed", "too short", id="stsz-cut"),
+        pytest.param(atom(b"stz2", bytes(12)), "unsupported", r"compact sample sizes \(stz2\)",
+                     id="stz2"),
+    ],
+)  # fmt: skip
+def test_a_bad_first_sample_size_is_refused(table: bytes, code: str, match: str) -> None:
+    refused(_two(stsd(TMCD_30), table), code, match)
+
+
+@pytest.mark.parametrize(
+    ("rows", "match"),
+    [
+        pytest.param([stco(TMCD_AT), co64(TMCD_AT + 4)], "stbl has 'stco' and 'co64'",
+                     id="stco-and-co64"),
+        pytest.param([co64(TMCD_AT), co64(TMCD_AT)], "stbl has 'co64' and 'co64'", id="two-co64"),
+        pytest.param([stsz(4, 1), atom(b"stz2", bytes(12)), co64(TMCD_AT)],
+                     "stbl has 'stsz' and 'stz2'", id="stsz-and-stz2"),
+    ],
+)  # fmt: skip
+def test_two_tables_for_one_value_are_malformed(rows: list[bytes], match: str) -> None:
+    """Round 7 sweep: with two chunk-offset (or sample-size) tables, which governs the first
+    sample is unknown; round 6 and earlier took whichever came first."""
+    movie = Movie()
+    movie.tmcd_stbl = [stsd(TMCD_30), *rows]
+    refused(movie.build(), "malformed", match)
+
+
+def test_a_missing_stsz_is_malformed() -> None:
+    movie = Movie(add_stsz=False)
+    movie.tmcd_stbl = [stsd(TMCD_30), co64(TMCD_AT)]
+    refused(movie.build(), "malformed", "no sample sizes")
 
 
 # -- against ffprobe ---------------------------------------------------------------------------
@@ -760,7 +957,7 @@ def test_the_read_budget_is_typed(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(TimecodeUnreadable, match="more than 100 bytes read") as caught:
         read_bytes(Movie().build())
     assert caught.value.code == "too_large"
-    monkeypatch.setattr(quicktime, "MAX_READ_BYTES", 400)  # the whole read takes under 400
+    monkeypatch.setattr(quicktime, "MAX_READ_BYTES", 1000)  # the whole read takes 637
     assert read_bytes(Movie().build()).frames == 521420
 
 
