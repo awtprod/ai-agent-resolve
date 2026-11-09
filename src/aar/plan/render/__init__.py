@@ -535,8 +535,11 @@ def _encode_chunks(
             work,
         )
         (work / name).unlink(missing_ok=True)
-        packets = _packets(part, "encode")
         want = chunk.end - chunk.start
+        try:
+            packets = _packets(part, "encode")
+        except RenderError:  # nothing readable came out (every frame missing): diagnose it
+            raise _short_chunk(tl, hub, chunk, 0, settings, work) from None
         if len(packets.times) != want:
             raise _short_chunk(tl, hub, chunk, len(packets.times), settings, work)
         if not packets.first_key:

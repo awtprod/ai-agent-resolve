@@ -393,27 +393,45 @@ def test_mix_passes_sum_to_the_one_pass_mix(media, tmp_path: Path, monkeypatch) 
 
 
 @pytest.mark.slow
-def test_a_damaged_source_is_refused_naming_it(media, tmp_path: Path) -> None:
-    """The validator's corrupt_middle: bytes zeroed in the middle of the file, the index
-    intact. The frames that no longer decode leave the chunk short; the render names the
-    source and its range instead of shifting the rest of the picture."""
+@pytest.mark.parametrize(
+    ("damage", "src", "decoded"),
+    [("zeroed", (50, 350), range(1, 300)), ("truncated", (300, 390), range(0, 1))],
+)
+def test_a_damaged_source_is_refused_naming_it(
+    media, tmp_path: Path, damage: str, src: tuple[int, int], decoded: range
+) -> None:
+    """The validator's corrupt_middle (bytes zeroed in the middle of the file, the index intact)
+    and truncated_mdat_past (a faststart file cut at 60 %, the range past the cut). The frames
+    that no longer decode leave the chunk short; the render names the source and its range
+    instead of shifting the rest of the picture."""
     path, spec = media["A"]
-    data = bytearray(path.read_bytes())
-    mid = len(data) // 2
-    data[mid : mid + 200_000] = bytes(200_000)
     damaged = tmp_path / "damaged.mov"
+    if damage == "zeroed":
+        data = bytearray(path.read_bytes())
+        mid = len(data) // 2
+        data[mid : mid + 200_000] = bytes(200_000)
+    else:
+        whole = tmp_path / "whole.mov"
+        subprocess.run(
+            [
+                *("ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", str(path), "-c", "copy"),
+                *("-movflags", "+faststart", str(whole)),
+            ],
+            check=True,
+        )
+        data = bytearray(whole.read_bytes()[: int(whole.stat().st_size * 0.6)])
     damaged.write_bytes(bytes(data))
     plan = _plan(
         {"A": (damaged, spec.frames, SIZE)},
-        [{"source": "A", "src_in": 50, "src_out": 350}],
+        [{"source": "A", "src_in": src[0], "src_out": src[1]}],
     )
     out = tmp_path / "d.mp4"
     with pytest.raises(RenderError) as info:
         render_plan(plan, quick(), out=out)
     err = info.value
     assert err.code == "render_incomplete" and err.details["source"] == "A"
-    assert (err.details["src_start"], err.details["src_end"]) == (50, 349)
-    assert err.details["decoded"] < 300 and "damaged.mov" in err.message
+    assert (err.details["src_start"], err.details["src_end"]) == (src[0], src[1] - 1)
+    assert err.details["decoded"] in decoded and "damaged.mov" in err.message
     assert not out.exists()
 
 
@@ -424,34 +442,56 @@ def cfr(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Spec]:
     return make_media(root / "cfr.mov", spec), spec
 
 
+def _retimed(path: Path, out: Path, vf: str) -> Path:
+    """``path`` re-encoded with ``vf``, keeping its timestamps exactly: the encoder's time base is
+    the container's tick (an encoder at 1/fps would round a sub-frame jump away, so the
+    validator's round-2 "20 ms" files held no jump at all; see PROGRESS round 3)."""
+    tick = "1:1000" if out.suffix == ".mkv" else "1:12800"
+    subprocess.run(
+        [
+            *("ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", str(path), "-vf", vf),
+            *("-fps_mode", "passthrough", "-enc_time_base:v", tick),
+            *("-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-c:a", "copy", str(out)),
+        ],
+        check=True,
+    )
+    return out
+
+
 @pytest.mark.slow
 @pytest.mark.parametrize(
     ("name", "ext", "vf", "at"),
     [
         ("jump20ms", "mkv", "setpts='if(gte(N,100),PTS+0.020/TB,PTS)'", "3.960 s"),
+        ("jump20ms", "mov", "setpts='if(gte(N,100),PTS+0.020/TB,PTS)'", "3.960 s"),
         ("jump30ms", "mov", "setpts='if(gte(N,120),PTS+0.030/TB,PTS)'", "4.760 s"),
+        ("jump10ms", "mov", "setpts='if(gte(N,120),PTS+0.010/TB,PTS)'", "4.760 s"),
         ("dropped", "mkv", "select='not(eq(n,150))'", "5.960 s"),
+        ("dropped", "mov", "select='not(eq(n,150))'", "5.960 s"),
     ],
 )
 def test_an_uneven_packet_step_is_refused_naming_its_time(
     cfr, tmp_path: Path, name: str, ext: str, vf: str, at: str
 ) -> None:
     path, spec = cfr
-    uneven = tmp_path / f"{name}.{ext}"
-    subprocess.run(
-        [
-            *("ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", str(path), "-vf", vf),
-            *("-fps_mode", "passthrough", "-c:v", "libx264", "-preset", "ultrafast", "-qp", "0"),
-            *("-c:a", "copy", str(uneven)),
-        ],
-        check=True,
-    )
+    uneven = _retimed(path, tmp_path / f"{name}.{ext}", vf)
     plan = _plan(
         {"s": (uneven, spec.frames - 2, SIZE)}, [{"source": "s", "src_in": 160, "src_out": 190}]
     )
     with pytest.raises(RenderError) as info:
         render_plan(plan, quick(), out=tmp_path / "v.mp4")
     assert info.value.code == "source_vfr" and at in info.value.message
+
+
+@pytest.mark.slow
+def test_a_step_within_an_eighth_of_a_frame_is_accepted(cfr, tmp_path: Path) -> None:
+    """3 ms at 25 fps is 0.075 frame: inside the 1/8-frame tolerance (and inside half a frame,
+    so the timestamp cut still picks every frame)."""
+    path, spec = cfr
+    near = _retimed(path, tmp_path / "jump3ms.mov", "setpts='if(gte(N,120),PTS+0.003/TB,PTS)'")
+    plan = _plan({"s": (near, spec.frames, SIZE)}, [{"source": "s", "src_in": 160, "src_out": 190}])
+    media = resolve_source(plan.sources[0], plan.fps, media_map=None, media_root=None)
+    assert media.frames == spec.frames
 
 
 @pytest.mark.slow
