@@ -274,6 +274,7 @@ class Timing:
     uneven: tuple[Fraction, Fraction] | None
     sample_rate: int | None
     time_base: Fraction | None = None  # the video stream's time base (its pts tick)
+    packets: int | None = None  # the video packets the scan could read
 
 
 def _stream(data: dict[str, Any], index: int | None) -> dict[str, Any]:
@@ -361,6 +362,7 @@ def timing_probe(path: Path, video_index: int, audio_index: int | None) -> Timin
         uneven,
         None if rate is None else int(rate),
         tb,
+        count,
     )
 
 
@@ -392,6 +394,22 @@ def _check_rate(source: Source, path: Path, timing: Timing, want: Fraction) -> N
             path=str(path),
             fps=None if base is None else f"{base.numerator}/{base.denominator}",
             plan_fps=f"{want.numerator}/{want.denominator}",
+        )
+    if (
+        timing.frames_from == "nb_frames"
+        and timing.packets is not None
+        and timing.frames is not None
+        and timing.packets < timing.frames
+    ):  # first: a truncated file's last packets leave a hole that looks like a variable rate
+        raise RenderError(
+            "media_unreadable",
+            f"source {source.id!r}: the index of {str(path)!r} lists {timing.frames} video "
+            f"frames but only {timing.packets} can be read (a truncated or damaged file)",
+            "copy the file to the hub again (or re-wrap it with ffmpeg -c copy), then render",
+            source=source.id,
+            path=str(path),
+            frames=timing.frames,
+            readable=timing.packets,
         )
     why = None
     if timing.uneven is not None:  # first: it names the time

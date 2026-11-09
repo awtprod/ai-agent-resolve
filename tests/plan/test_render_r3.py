@@ -230,6 +230,21 @@ def test_a_stream_without_a_time_base_is_refused() -> None:
     assert info.value.code == "media_unreadable"
 
 
+def test_an_index_with_more_frames_than_packets_is_refused_before_the_rate_tests() -> None:
+    """A truncated file: its index lists 250 frames, 180 packets can be read, and the last ones
+    leave a hole in the sorted timestamps (decode order) that would read as a variable rate."""
+    plan = _plan(
+        {"s": ("/srv/media/s.mov", 250, SIZE)}, [{"source": "s", "src_in": 0, "src_out": 10}]
+    )
+    cut = _timing(packets=180, uneven=(Fraction(7), Fraction(2)))
+    with pytest.raises(RenderError) as info:
+        _check_rate(plan.sources[0], Path("/srv/media/s.mov"), cut, F25)
+    assert info.value.code == "media_unreadable" and "only 180 can be read" in info.value.message
+    _check_rate(plan.sources[0], Path("/srv/media/s.mov"), _timing(packets=250), F25)
+    counted = _timing(packets=180, frames=180, frames_from="packet count", duration_frames=None)
+    _check_rate(plan.sources[0], Path("/srv/media/s.mov"), counted, F25)  # no index to compare
+
+
 def test_the_picture_seek_counts_the_video_streams_late_start() -> None:
     """R09: a video stream that starts 250 ms into its file is seeked from its own start. (The
     timestamp cut would still pick the right frames from an earlier seek; this pins the seek, so
@@ -401,9 +416,10 @@ def test_a_damaged_source_is_refused_naming_it(
     media, tmp_path: Path, damage: str, src: tuple[int, int], decoded: range
 ) -> None:
     """The validator's corrupt_middle (bytes zeroed in the middle of the file, the index intact)
-    and truncated_mdat_past (a faststart file cut at 60 %, the range past the cut). The frames
-    that no longer decode leave the chunk short; the render names the source and its range
-    instead of shifting the rest of the picture."""
+    and truncated_mdat_past (a faststart file cut at 60 %, the range past the cut). The zeroed
+    frames no longer decode and leave the chunk short; the render names the source and its range
+    instead of shifting the rest of the picture. A truncated file is refused before any work: its
+    index lists more frames than its packets hold."""
     path, spec = media["A"]
     damaged = tmp_path / "damaged.mov"
     if damage == "zeroed":
@@ -429,10 +445,13 @@ def test_a_damaged_source_is_refused_naming_it(
     with pytest.raises(RenderError) as info:
         render_plan(plan, quick(), out=out)
     err = info.value
-    assert err.code == "render_incomplete" and err.details["source"] == "A"
+    assert not out.exists() and err.details["source"] == "A" and "damaged.mov" in err.message
+    if damage == "truncated":  # the index lists frames the file no longer holds: refused up front
+        assert err.code == "media_unreadable" and err.details["readable"] < err.details["frames"]
+        return
+    assert err.code == "render_incomplete"
     assert (err.details["src_start"], err.details["src_end"]) == (src[0], src[1] - 1)
-    assert err.details["decoded"] in decoded and "damaged.mov" in err.message
-    assert not out.exists()
+    assert err.details["decoded"] in decoded
 
 
 @pytest.fixture(scope="module")
