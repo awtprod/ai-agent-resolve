@@ -13,11 +13,14 @@ at most :data:`MAX_MOOV_BYTES`, and at most :data:`MAX_ATOMS` atom headers are r
 malformed file ends in a typed :class:`TimecodeUnreadable` (``code`` says why), never another
 exception and never a hang. Stdlib only.
 
-The sample is a frame count, used as given, as ffmpeg does: for drop-frame (flag bit 0) it
-counts real frames (01:00:00;00 at 29.97 is 107892). The rate is timescale/frameDuration.
-A track whose numberOfFrames is not that rate rounded is refused (``unsupported``) rather than
-rescaled, and so is drop-frame at a rate other than 29.97 or 59.94. With the 24-hour flag
-(bit 1) a count past 24 hours wraps, as ffmpeg's timecode string does; without it, it is refused.
+The sample is a signed 32-bit frame count (QuickTime lets flag bit 2 allow negatives), used as
+given: for drop-frame (flag bit 0) it counts real frames (01:00:00;00 at 29.97 is 107892). A
+negative count is refused (``negative_timecode``) whatever the flags, since no FCPXML asset can
+start before zero; read unsigned, -1 would wrap into an unrelated positive timecode. The rate is
+timescale/frameDuration. A track whose numberOfFrames is not that rate rounded is refused
+(``unsupported``) rather than rescaled, and so is drop-frame at a rate other than 29.97 or
+59.94. With the 24-hour flag (bit 1) a count past 24 hours wraps, as ffmpeg's timecode string
+does; without it, it is refused.
 """
 
 from __future__ import annotations
@@ -52,7 +55,15 @@ FLAG_DROP_FRAME = 0x1
 FLAG_24_HOUR = 0x2
 _TMCD_ENTRY = 34  # the tmcd sample description: 34 bytes before any child atoms
 
-Reason = Literal["not_quicktime", "no_timecode", "malformed", "unsupported", "too_large", "io"]
+Reason = Literal[
+    "not_quicktime",
+    "no_timecode",
+    "malformed",
+    "unsupported",
+    "negative_timecode",
+    "too_large",
+    "io",
+]
 _TOOL = "quicktime"
 
 
@@ -60,8 +71,9 @@ class TimecodeUnreadable(MediaError):
     """The file has no start timecode this reader can use. ``code`` is one of:
     ``not_quicktime`` (no ``moov`` atom), ``no_timecode`` (no tmcd track, or one without a
     sample), ``malformed`` (a size or offset that does not fit), ``unsupported`` (a tmcd track
-    this reader will not guess at), ``too_large`` (``moov`` past :data:`MAX_MOOV_BYTES`) or
-    ``io`` (the file could not be read)."""
+    this reader will not guess at), ``negative_timecode`` (the signed sample is below zero),
+    ``too_large`` (``moov`` past :data:`MAX_MOOV_BYTES`) or ``io`` (the file could not be
+    read)."""
 
     def __init__(self, message: str, *, code: Reason) -> None:
         super().__init__(message, tool=_TOOL)
@@ -340,7 +352,13 @@ def _read(src: _Source) -> QuickTimeTimecode:
             code="malformed",
         )
     _require_in_mdat(src, offset)
-    (frames,) = struct.unpack(">I", src.read(offset, 4))
+    (frames,) = struct.unpack(">i", src.read(offset, 4))  # signed: flag 0x4 allows negatives
+    if frames < 0:
+        raise TimecodeUnreadable(
+            f"the tmcd sample is {frames}, before 00:00:00:00 (flags {flags:#x}); a negative "
+            "media start cannot be an FCPXML asset start",
+            code="negative_timecode",
+        )
     day = frames_per_day(rate, drop_frame=drop)
     if frames >= day:
         if not wraps:

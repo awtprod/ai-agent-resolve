@@ -273,6 +273,49 @@ def test_tmcd_flags_and_rates(
     assert got.frames == frame % frames_per_day(got.rate, drop_frame=got.drop_frame)
 
 
+@pytest.mark.parametrize(
+    ("flags", "raw", "value"),
+    [
+        pytest.param(0x6, 2**32 - 1, -1, id="negatives-allowed-minus-1"),  # Prism's case
+        pytest.param(0x2, 2**31 + 5, -(2**31) + 5, id="wrap-flag-above-2^31"),
+        pytest.param(0x0, 2**31, -(2**31), id="int32-min"),
+        pytest.param(0x4, 2**32 - 25, -25, id="negatives-allowed-minus-25"),
+    ],
+)
+def test_a_negative_sample_is_refused_whatever_the_flags(flags: int, raw: int, value: int) -> None:
+    """Prism on PR #15: tmcd samples are signed 32-bit. Read unsigned, -1 at 25 fps with the
+    24-hour flag wrapped to 887295 (09:51:31:20), an unrelated positive start."""
+    movie = Movie(frame=raw)
+    movie.tmcd_stbl = [stsd(tmcd_entry(flags, 25, 1, 25)), co64(TMCD_AT)]
+    error = refused(movie.build(), "negative_timecode", f"is {value}, before 00:00:00:00")
+    assert f"flags {flags:#x}" in str(error)
+
+
+@pytest.mark.parametrize(
+    ("flags", "frame", "want"),
+    [
+        (0x6, 90000, 90000),  # negatives allowed, the sample positive: unchanged
+        (0x4, 0, 0),
+        (0x2, 2**31 - 1, (2**31 - 1) % 2160000),  # the largest int32 wraps at 24 h (25 fps)
+    ],
+)
+def test_a_non_negative_sample_is_unchanged(flags: int, frame: int, want: int) -> None:
+    movie = Movie(frame=frame)
+    movie.tmcd_stbl = [stsd(tmcd_entry(flags, 25, 1, 25)), co64(TMCD_AT)]
+    assert read_bytes(movie.build()).frames == want
+
+
+def test_the_cli_reports_a_negative_start(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    movie = Movie(frame=2**32 - 1)
+    movie.tmcd_stbl = [stsd(tmcd_entry(0x6, 25, 1, 25)), co64(TMCD_AT)]
+    path = tmp_path / "negative.mov"
+    path.write_bytes(movie.build())
+    assert main(["media", "timecode", str(path)]) == 1
+    assert json.loads(capsys.readouterr().err)["error"]["code"] == "timecode_negative_timecode"
+
+
 # -- against ffprobe ---------------------------------------------------------------------------
 
 
@@ -404,7 +447,7 @@ GOOD_STSD = stsd(tmcd_entry())
         pytest.param(_tmcd(stsd(tmcd_entry(0x0)), co64(TMCD_AT), frame=2592000), "unsupported",
                      "past 24 hours", id="past-24h-no-wrap"),
         pytest.param(_tmcd(stsd(tmcd_entry(0x0)), co64(TMCD_AT), frame=2**32 - 1),
-                     "unsupported", "past 24 hours", id="garbage-sample"),
+                     "negative_timecode", "is -1, before 00:00:00:00", id="all-ones-sample"),
     ],
 )  # fmt: skip
 def test_malformed_input_is_a_typed_refusal(data: bytes, code: str, match: str) -> None:

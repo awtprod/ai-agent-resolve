@@ -380,9 +380,9 @@ def test_a_plain_hour_with_its_tmcd_track_warns_nothing() -> None:
         pytest.param(Probed(None, "01:00:00:00", Fraction(50), None,
                             "the tmcd track counts 50 frames a second at 25 fps", None,
                             "unsupported"),
-                     "cannot be read without guessing", id="unsupported-tmcd"),
+                     "tmcd track cannot be used", id="unsupported-tmcd"),
         pytest.param(Probed(None, None, None, None, "counts 50 at 25", None, "unsupported"),
-                     "cannot be read without guessing", id="unsupported-tmcd-no-tag"),
+                     "tmcd track cannot be used", id="unsupported-tmcd-no-tag"),
     ],
 )  # fmt: skip
 def test_an_ambiguous_rate_is_refused_unless_the_stub_gives_the_timecode(
@@ -397,6 +397,22 @@ def test_an_ambiguous_rate_is_refused_unless_the_stub_gives_the_timecode(
     timecodes, warnings = source_start_timecodes(given, {"cam": seen})
     assert timecodes == {"cam": StartTimecode(70, Fraction(50))}
     assert "start-timecode-reader-mismatch" not in [w.code for w in warnings]
+
+
+def test_a_negative_tmcd_start_blocks_the_tag_too() -> None:
+    """Prism on PR #15: a tmcd sample of -1 (flags 0x6) is refused by the reader; ffprobe reads
+    the same sample unsigned and wraps it into an unrelated positive tag, so the tag must not be
+    used either. The stub's value settles it."""
+    seen = Probed(None, "09:51:31:20", Fraction(25), None, "the tmcd sample is -1", None,
+                  "negative_timecode")  # fmt: skip
+    stub = _stub(_source(), fps="25/1")
+    with pytest.raises(ProduceInputError, match="tmcd track cannot be used") as caught:
+        source_start_timecodes(stub, {"cam": seen})
+    assert caught.value.code == "timecode-rate-ambiguous"
+    given = _stub(_source(start_timecode=0, start_timecode_rate={"num": 25}), fps="25/1")
+    assert source_start_timecodes(given, {"cam": seen})[0] == {
+        "cam": StartTimecode(0, Fraction(25))
+    }
 
 
 def test_the_r_frame_rate_snaps_when_the_average_does_not() -> None:
@@ -508,6 +524,10 @@ def test_read_tmcd_reads_only_quicktime_files(tmp_path: Path) -> None:
     odd.tmcd_stbl = [stsd(tmcd_entry(per_second=60)), co64(TMCD_AT)]
     (tmp_path / "odd.mov").write_bytes(odd.build())
     assert build_module.read_tmcd(tmp_path / "odd.mov")[2] == "unsupported"
+    negative = Movie(frame=2**32 - 1)  # -1 as a signed 32-bit sample
+    negative.tmcd_stbl = [stsd(tmcd_entry(0x6, 25, 1, 25)), co64(TMCD_AT)]
+    (tmp_path / "negative.mov").write_bytes(negative.build())
+    assert build_module.read_tmcd(tmp_path / "negative.mov")[2] == "negative_timecode"
     tmcd, problem, code = build_module.read_tmcd(tmp_path / "gone.braw")
     assert tmcd is None and problem is not None and "file not found" in problem
     assert code == "io"

@@ -449,17 +449,21 @@ def _media_timecodes(
     (``tag 01:00:00:00``): ffprobe's tag, then the tmcd track's sample, both counted at
     :func:`media_timecode_rate`. The third item, when set, says why neither can be used: a tmcd
     track that disagrees with that rate (its numberOfFrames is not the rate rounded, as a 25 fps
-    tmcd on a 50 fps stream; drop-frame at a rate without it) or one the reader will not guess
-    at. With no tmcd track there is nothing to disagree with. A tag that cannot be parsed, or
+    tmcd on a 50 fps stream; drop-frame at a rate without it), one the reader will not guess
+    at, or one whose signed start is negative. With no tmcd track there is nothing to disagree
+    with. A tag that cannot be parsed, or
     one the tmcd track gives another frame for, is a warning; the tag still wins."""
     tmcd, tag = seen.tmcd, seen.timecode
     found: list[tuple[StartTimecode, str]] = []
     warnings: list[PlannerWarning] = []
-    if seen.tmcd_code == "unsupported":  # a tmcd track whose rate the reader will not guess
+    # A tmcd track the reader will not guess at, or a negative start: ffprobe's tag comes from
+    # the same track (read unsigned, so -1 wraps to an unrelated positive timecode), so neither
+    # can be used.
+    if seen.tmcd_code in ("unsupported", "negative_timecode"):
         return (
             found,
             warnings,
-            f"its tmcd track cannot be read without guessing ({seen.tmcd_problem})",
+            f"its tmcd track cannot be used ({seen.tmcd_problem})",
         )
     if tag is None and tmcd is None:
         return found, warnings, None
