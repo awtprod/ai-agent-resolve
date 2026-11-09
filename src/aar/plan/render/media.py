@@ -244,6 +244,20 @@ def _tag_duration(raw: dict[str, Any]) -> Fraction | None:
     return None
 
 
+def _elapsed(raw: dict[str, Any]) -> Fraction | None:
+    """How long a stream lasts by its Matroska ``DURATION`` tag. ffmpeg's Matroska muxer writes
+    the tag as the stream's **end** timestamp, not its length (round 4, measured on ffmpeg 6.1: a
+    250-frame 25 fps video starting at 5 s says ``00:00:15``), so the stream's own start time
+    comes off; a missing start counts as 0. None when there is no tag, or when the result is not
+    a positive length (then the frame-count test does not run)."""
+    end = _tag_duration(raw)
+    if end is None:
+        return None
+    start = _fraction(raw.get("start_time"))
+    elapsed = end - (start if start is not None else Fraction(0))
+    return elapsed if elapsed > 0 else None
+
+
 def _ffprobe_json(path: Path, args: list[str], timeout_s: float) -> dict[str, Any]:
     result = run_tool(
         "ffprobe",
@@ -338,7 +352,7 @@ def timing_probe(path: Path, video_index: int, audio_index: int | None) -> Timin
     a_start = _fraction(audio.get("start_time")) if audio else None
     base = _fraction(video.get("r_frame_rate")) or _fraction(video.get("avg_frame_rate"))
     avg = _fraction(video.get("avg_frame_rate"))
-    duration = _fraction(video.get("duration")) or _tag_duration(video)
+    duration = _fraction(video.get("duration")) or _elapsed(video)
     duration_frames = None if duration is None or base is None else duration * base
     frames: int | None = None
     frames_from = "nb_frames"

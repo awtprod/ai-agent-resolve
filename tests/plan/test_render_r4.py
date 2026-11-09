@@ -313,3 +313,84 @@ def test_the_join_puts_90_one_frame_chunks_back_on_the_frame_grid(tmp_path: Path
         check=True,
     ).stdout.split()
     assert sorted(int(p) for p in probe) == [k * 1001 for k in range(n)]
+
+
+# -- a Matroska file that starts late (the PR #16 finding) ----------------------------------------
+
+
+def test_the_matroska_duration_tag_is_an_end_time() -> None:
+    from aar.plan.render.media import _elapsed
+
+    tag = {"tags": {"DURATION": "00:00:15.000000000"}}
+    assert _elapsed({**tag, "start_time": "5.000000"}) == 10  # ffmpeg 6.1: the stream's end
+    assert _elapsed(tag) == 15  # no start: from 0
+    assert _elapsed({**tag, "start_time": "0.000000"}) == 15
+    assert _elapsed({**tag, "start_time": "16.0"}) is None  # not a length: no frame-count test
+    assert _elapsed({"start_time": "5.0"}) is None
+
+
+@pytest.fixture(scope="module")
+def mkv(tmp_path_factory: pytest.TempPathFactory) -> dict[str, tuple[Path, Spec]]:
+    root = tmp_path_factory.mktemp("r4_mkv")
+    spec = Spec("blue", 880, 250, rate=F25, container="matroska")
+    zero = make_media(root / "zero.mkv", spec)
+    late = root / "late.mkv"  # the same file, its timestamps starting at 5 s
+    subprocess.run(
+        [
+            *("ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", str(zero), "-map", "0"),
+            *("-c", "copy", "-output_ts_offset", "5", str(late)),
+        ],
+        check=True,
+    )
+    short = Spec("red", 440, 100, rate=F25, container="matroska", audio=False)
+    video = make_media(root / "video100.mkv", short)
+    longaudio = root / "longaudio.mkv"  # its sound runs 3 s past its 100 frames of video
+    subprocess.run(
+        [
+            *("ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", str(video), "-f", "lavfi"),
+            *("-i", "sine=f=440:r=48000:d=7", "-map", "0:v", "-map", "1:a", "-c:v", "copy"),
+            *("-c:a", "pcm_s16le", str(longaudio)),
+        ],
+        check=True,
+    )
+    late_long = root / "late_longaudio.mkv"
+    subprocess.run(
+        [
+            *("ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", str(longaudio), "-map", "0"),
+            *("-c", "copy", "-output_ts_offset", "5", str(late_long)),
+        ],
+        check=True,
+    )
+    return {"zero": (zero, spec), "late": (late, spec), "longaudio": (longaudio, short),
+            "late_longaudio": (late_long, short)}  # fmt: skip
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("name", ["zero", "late"])
+def test_a_matroska_file_renders_whatever_its_start(mkv, tmp_path: Path, name: str) -> None:
+    from render_support import iter_frames, read_frame
+
+    from aar.plan.render.media import resolve_source
+
+    path, spec = mkv[name]
+    plan = _plan({"s": (path, spec.frames, SIZE)}, [{"source": "s", "src_in": 100, "src_out": 130}])
+    media = resolve_source(plan.sources[0], plan.fps, media_map=None, media_root=None)
+    assert media.frames == 250 and media.video_start_s == (5 if name == "late" else 0)
+    result = render_plan(plan, quick(), out=tmp_path / f"{name}.mp4")
+    got = {n: read_frame(f) for n, f in iter_frames(result.out, SIZE, [0, 15, 29])}
+    assert [(got[n].colour, got[n].index) for n in (0, 15, 29)] == [
+        ("blue", 100),
+        ("blue", 115),
+        ("blue", 129),
+    ]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("name", ["longaudio", "late_longaudio"])
+def test_a_matroska_segment_past_its_video_is_still_refused(mkv, tmp_path: Path, name: str) -> None:
+    """The validator's round-1 case: the sound runs past the video; the frames are the video's."""
+    path, _ = mkv[name]
+    plan = _plan({"s": (path, 180, SIZE)}, [{"source": "s", "src_in": 80, "src_out": 140}])
+    with pytest.raises(RenderError) as info:
+        render_plan(plan, quick(), out=tmp_path / "past.mp4")
+    assert info.value.code == "segment_past_media_end" and info.value.details["media_frames"] == 100
