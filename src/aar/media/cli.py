@@ -1,4 +1,5 @@
-"""``aar media``: ingest and resolve Linux-resident source media."""
+"""``aar media``: ingest and resolve Linux-resident source media, and read a file's start
+timecode (``aar media timecode FILE``, S18a) so an operator can fill a plan stub by hand."""
 
 from __future__ import annotations
 
@@ -11,6 +12,7 @@ from typing import Any
 from aar import cli_io
 from aar.hub.artifacts import ArtifactStore
 from aar.hub.events import Actor, EventLog
+from aar.media.quicktime import TimecodeUnreadable, read_timecode
 from aar.media.store import (
     MAX_MEDIA_BYTES,
     InvalidMediaInput,
@@ -20,6 +22,7 @@ from aar.media.store import (
     MediaUnavailable,
     UnknownProject,
 )
+from aar.media.tools import MediaInputError
 
 _PROG = "aar media"
 EXIT_OK = 0
@@ -62,6 +65,17 @@ def register(subparsers: Any) -> None:
     _add_hub(resolve)
     resolve.add_argument("--project", required=True, help="Registered project id.")
     resolve.set_defaults(func=_cmd_resolve)
+
+    timecode = commands.add_parser(
+        "timecode",
+        help="Print a QuickTime, MP4 or BRAW file's start timecode from its tmcd track, as JSON.",
+        description="Read the start timecode from the file's tmcd track without ffprobe (BRAW "
+        "included) and print the frame number, rate, drop-frame flag and HH:MM:SS:FF as JSON, "
+        "with the stub fields to copy (start_timecode, start_timecode_rate). Exit 0 when read, "
+        "1 when the file has no readable timecode, 2 when it is missing or not a regular file.",
+    )
+    timecode.add_argument("file", type=Path, help="Linux-local media file.")
+    timecode.set_defaults(func=_cmd_timecode)
 
 
 def _add_hub(parser: argparse.ArgumentParser) -> None:
@@ -165,3 +179,13 @@ def _cmd_resolve(args: argparse.Namespace) -> int:
         return _emit(result.to_dict())
 
     return _run(args, resolve, read_only=True)
+
+
+def _cmd_timecode(args: argparse.Namespace) -> int:
+    try:
+        found = read_timecode(args.file)
+    except MediaInputError as exc:
+        return _error("invalid_input", str(exc), EXIT_INPUT)
+    except TimecodeUnreadable as exc:
+        return _error(f"timecode_{exc.code}", str(exc), EXIT_UNAVAILABLE)
+    return _emit({"ok": True, "path": str(args.file), **found.to_dict()})
