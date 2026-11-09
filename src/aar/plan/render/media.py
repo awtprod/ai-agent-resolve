@@ -60,8 +60,11 @@ _DRIVE_URL_PATH = re.compile(r"^/[A-Za-z]:/")
 RATE_TOLERANCE = Fraction(1, 10000)
 #: How far the average rate may sit from the base rate before the video counts as variable.
 VFR_TOLERANCE = Fraction(1, 1000)
-#: How many leading video packets the timing probe reads to look for uneven timestamps.
+#: How many leading video frames the timing probe checks for uneven timestamps, and how many
+#: packets past them it reads: B-frames arrive out of order, so the last packets read may leave
+#: a hole in the sorted timestamps that is not a dropped frame.
 TIMING_PACKETS = 64
+REORDER_PACKETS = 32
 TIMING_TIMEOUT_S = 30.0
 
 
@@ -305,13 +308,16 @@ def timing_probe(path: Path, video_index: int, audio_index: int | None) -> Timin
         "ffprobe",
         [
             *("-hide_banner", "-v", "error", "-select_streams", str(video_index)),
-            *("-read_intervals", f"%+#{TIMING_PACKETS}", "-show_entries", "packet=pts"),
+            *("-read_intervals", f"%+#{TIMING_PACKETS + REORDER_PACKETS}"),
+            *("-show_entries", "packet=pts"),
             *("-of", "csv=p=0", input_url(path)),
         ],
         timeout_s=TIMING_TIMEOUT_S,
         stdout_limit=1024 * 1024,
     ).stdout.decode("utf-8", errors="replace")
     pts = sorted(int(line) for line in packets.split() if line.strip().lstrip("-").isdigit())
+    if len(pts) > TIMING_PACKETS:
+        pts = pts[:TIMING_PACKETS]  # complete: any B-frame among them has been read
     uneven = None
     if tb and base and len(pts) > 2:
         expected = 1 / (tb * base)  # ticks per frame
