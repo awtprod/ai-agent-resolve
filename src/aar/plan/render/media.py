@@ -17,16 +17,18 @@ it cannot be cut exactly (round 2):
 * ``media_unreadable`` (ffprobe cannot read it), ``no_video_stream``;
 * ``source_rate_mismatch``: the video's base rate is not the plan's within 0.01 % (24 fps in a
   23.976 plan drifts 0.6 s in 10 minutes, so it is refused, not accepted);
-* ``source_vfr``: a variable-frame-rate video (the base and average rates differ by more than
-  0.1 %, the first packets' timestamps are uneven, or the frame count is not the stream's
-  duration times its rate), because the picture is taken by frame index and the sound by time;
+* ``source_vfr``: a variable-frame-rate video: the base and average rates differ by more than
+  0.1 %, any step between its packets' timestamps (one scan over all of them, sorted, demuxing
+  only) is more than 1/8 frame off one frame (a dropped, doubled or shifted frame, named by its
+  time), or its frame count is not the stream's duration times its rate. The picture is cut by
+  timestamp and the sound by time, so they must agree;
 * ``size_not_renderable`` (no picture size), ``frame_size_mismatch`` (a ``Source.frame_size``
   whose aspect is not the file's display aspect).
 
-The frame count comes from the **video stream** (its ``nb_frames``, else its duration or
-duration tag times its rate, else a packet count), never from the container's duration, which
-is the longest stream's. Stream start times are kept, so a sound is cut where its picture is
-even when the audio starts after the video. Nothing here writes.
+The frame count comes from the **video stream** (its ``nb_frames``, else its packet count),
+never from the container's duration, which is the longest stream's. Stream start times are
+kept, so a sound is cut where its picture is even when the audio starts after the video.
+Nothing here writes.
 """
 
 from __future__ import annotations
@@ -60,11 +62,13 @@ _DRIVE_URL_PATH = re.compile(r"^/[A-Za-z]:/")
 RATE_TOLERANCE = Fraction(1, 10000)
 #: How far the average rate may sit from the base rate before the video counts as variable.
 VFR_TOLERANCE = Fraction(1, 1000)
-#: How many leading video frames the timing probe checks for uneven timestamps, and how many
-#: packets past them it reads: B-frames arrive out of order, so the last packets read may leave
-#: a hole in the sorted timestamps that is not a dropped frame.
-TIMING_PACKETS = 64
-REORDER_PACKETS = 32
+#: A packet interval further than this share of a frame from one frame is a variable rate.
+VFR_STEP_TOLERANCE = Fraction(1, 8)
+#: The packet scans already done, by file identity (path, device, inode, size, mtime): a source
+#: used by several renders in one process is scanned once.
+_SCANS: dict[tuple[str, int, int, int, int, int], tuple[int, tuple[Fraction, Fraction] | None]] = {}
+_SCAN_CACHE_SIZE = 256
+SCAN_STDOUT_LIMIT = 64 * 1024 * 1024
 TIMING_TIMEOUT_S = 30.0
 
 
@@ -94,6 +98,8 @@ class HubSource:
     video_start_s: Fraction = Fraction(0)
     audio_start_s: Fraction = Fraction(0)
     sample_rate: int | None = None
+    #: The video stream's time base: a picture is cut by timestamps in these ticks.
+    video_time_base: Fraction | None = None
 
     @property
     def video_offset_s(self) -> Fraction:
@@ -263,8 +269,11 @@ class Timing:
     frames: int | None
     frames_from: str
     duration_frames: Fraction | None  # stream duration x base rate, when known
-    uneven: tuple[int, int, int] | None  # (packet, delta, expected ticks) of the first uneven one
+    #: The first interval between packets (sorted by time) that is not one frame: (its start, s
+    #: after the video's start; its length in frames). None when every step is one frame.
+    uneven: tuple[Fraction, Fraction] | None
     sample_rate: int | None
+    time_base: Fraction | None = None  # the video stream's time base (its pts tick)
 
 
 def _stream(data: dict[str, Any], index: int | None) -> dict[str, Any]:
@@ -274,8 +283,42 @@ def _stream(data: dict[str, Any], index: int | None) -> dict[str, Any]:
     return {}
 
 
+def scan_packets(
+    path: Path, video_index: int, time_base: Fraction | None, rate: Fraction | None
+) -> tuple[int, tuple[Fraction, Fraction] | None]:
+    """Every video packet's timestamp, in one ffprobe pass (demuxing only, no decode): the packet
+    count, and the first step between them, sorted (B-frames come out of order), that is not one
+    frame within :data:`VFR_STEP_TOLERANCE`. Cached by the file's identity."""
+    st = path.stat()
+    key = (str(path), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, video_index)
+    if key in _SCANS:
+        return _SCANS[key]
+    out = run_tool(
+        "ffprobe",
+        [
+            *("-hide_banner", "-v", "error", "-select_streams", str(video_index)),
+            *("-show_entries", "packet=pts", "-of", "csv=p=0", input_url(path)),
+        ],
+        timeout_s=timeout_for(st.st_size / 20e6, base_s=TIMING_TIMEOUT_S, per_media_s=1.0),
+        stdout_limit=SCAN_STDOUT_LIMIT,
+    ).stdout
+    pts = sorted(int(t) for t in out.split() if t.lstrip(b"-").isdigit())
+    uneven = None
+    if time_base and rate and len(pts) > 1:
+        frame = 1 / (time_base * rate)  # ticks per frame
+        slack = frame * VFR_STEP_TOLERANCE
+        for a, b in itertools.pairwise(pts):
+            if abs((b - a) - frame) > slack:
+                uneven = ((a - pts[0]) * time_base, (b - a) / frame)
+                break
+    if len(_SCANS) >= _SCAN_CACHE_SIZE:
+        _SCANS.pop(next(iter(_SCANS)))
+    _SCANS[key] = (len(pts), uneven)
+    return _SCANS[key]
+
+
 def timing_probe(path: Path, video_index: int, audio_index: int | None) -> Timing:
-    """Stream start times, rates, the video's frame count and its first packets' spacing."""
+    """Stream start times, rates, the video's frame count and its packets' spacing."""
     data = _ffprobe_json(
         path,
         [
@@ -301,46 +344,10 @@ def timing_probe(path: Path, video_index: int, audio_index: int | None) -> Timin
     nb = video.get("nb_frames")
     if isinstance(nb, str) and nb.isdigit() and int(nb) > 0:
         frames = int(nb)
-    elif duration_frames is not None:
-        frames, frames_from = round(duration_frames), "stream duration"
     tb = _fraction(video.get("time_base"))
-    packets = run_tool(
-        "ffprobe",
-        [
-            *("-hide_banner", "-v", "error", "-select_streams", str(video_index)),
-            *("-read_intervals", f"%+#{TIMING_PACKETS + REORDER_PACKETS}"),
-            *("-show_entries", "packet=pts"),
-            *("-of", "csv=p=0", input_url(path)),
-        ],
-        timeout_s=TIMING_TIMEOUT_S,
-        stdout_limit=1024 * 1024,
-    ).stdout.decode("utf-8", errors="replace")
-    pts = sorted(int(line) for line in packets.split() if line.strip().lstrip("-").isdigit())
-    if len(pts) > TIMING_PACKETS:
-        pts = pts[:TIMING_PACKETS]  # complete: any B-frame among them has been read
-    uneven = None
-    if tb and base and len(pts) > 2:
-        expected = 1 / (tb * base)  # ticks per frame
-        slack = max(Fraction(1), expected / 10)
-        for n, (a, b) in enumerate(itertools.pairwise(pts), start=1):
-            if abs((b - a) - expected) > slack:
-                uneven = (n, b - a, round(expected))
-                break
-    if frames is None:
-        counted = _ffprobe_json(
-            path,
-            [
-                "-select_streams",
-                str(video_index),
-                "-count_packets",
-                "-show_entries",
-                "stream=nb_read_packets",
-            ],
-            timeout_for(None, base_s=120.0),
-        )
-        value = (counted.get("streams") or [{}])[0].get("nb_read_packets")
-        if isinstance(value, str) and value.isdigit():
-            frames, frames_from = int(value), "packet count"
+    count, uneven = scan_packets(path, video_index, tb, base)
+    if frames is None and count:
+        frames, frames_from = count, "packet count"
     rate = _fraction(audio.get("sample_rate")) if audio else None
     return Timing(
         start,
@@ -353,6 +360,7 @@ def timing_probe(path: Path, video_index: int, audio_index: int | None) -> Timin
         duration_frames,
         uneven,
         None if rate is None else int(rate),
+        tb,
     )
 
 
@@ -362,6 +370,15 @@ def _rate_text(rate: Fraction) -> str:
 
 def _check_rate(source: Source, path: Path, timing: Timing, want: Fraction) -> None:
     hint = "conform the hub copy to the plan's frame rate (constant) first, then render it"
+    if not timing.time_base:
+        raise RenderError(
+            "media_unreadable",
+            f"source {source.id!r}: the video of {str(path)!r} states no time base, so its "
+            "frames cannot be picked by timestamp",
+            "re-wrap the hub copy (ffmpeg -c copy into .mov or .mp4) and render again",
+            source=source.id,
+            path=str(path),
+        )
     base = timing.base_rate
     if base is None or abs(base / want - 1) > RATE_TOLERANCE:
         got = "an unknown rate" if base is None else _rate_text(base)
@@ -377,14 +394,16 @@ def _check_rate(source: Source, path: Path, timing: Timing, want: Fraction) -> N
             plan_fps=f"{want.numerator}/{want.denominator}",
         )
     why = None
-    if timing.avg_rate is not None and abs(timing.avg_rate / base - 1) > VFR_TOLERANCE:
+    if timing.uneven is not None:  # first: it names the time
+        at, step = timing.uneven
+        why = (
+            f"{float(at):.3f} s into its video a frame lasts {float(step):.3f} frames, not one "
+            "(a dropped or shifted frame)"
+        )
+    elif timing.avg_rate is not None and abs(timing.avg_rate / base - 1) > VFR_TOLERANCE:
         why = f"its average rate {_rate_text(timing.avg_rate)} is not its base rate"
-    elif timing.uneven is not None:
-        n, delta, expected = timing.uneven
-        why = f"packet {n} comes {delta} ticks after the one before, not {expected}"
     elif (
-        timing.frames_from == "nb_frames"
-        and timing.frames is not None
+        timing.frames is not None
         and timing.duration_frames is not None
         and abs(timing.frames - timing.duration_frames) > 1
     ):
@@ -494,6 +513,7 @@ def resolve_source(
         video_start_s=timing.video_start_s,
         audio_start_s=timing.audio_start_s,
         sample_rate=timing.sample_rate or (None if audio is None else audio.sample_rate),
+        video_time_base=timing.time_base,
     )
 
 
