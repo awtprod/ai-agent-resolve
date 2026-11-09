@@ -40,7 +40,19 @@ from aar.media.quicktime import (
     read_timecode,
     read_timecode_from,
 )
-from qt_support import TMCD_AT, Movie, Sparse, atom, co64, hdlr, stco, stsd, tmcd_entry, trak
+from qt_support import (
+    TMCD_AT,
+    Movie,
+    Sparse,
+    atom,
+    co64,
+    hdlr,
+    stco,
+    stsc,
+    stsd,
+    tmcd_entry,
+    trak,
+)
 
 NTSC = Fraction(30000, 1001)
 NTSC60 = Fraction(60000, 1001)
@@ -314,6 +326,85 @@ def test_the_cli_reports_a_negative_start(
     path.write_bytes(movie.build())
     assert main(["media", "timecode", str(path)]) == 1
     assert json.loads(capsys.readouterr().err)["error"]["code"] == "timecode_negative_timecode"
+
+
+# -- which sample description: stsc (Prism on PR #15, round 5) --------------------------------
+
+TMCD_24 = tmcd_entry(0, 24, 1, 24)
+TMCD_30 = tmcd_entry(0, 30, 1, 30)
+
+
+def _two(*rows: bytes, frame: int = 108000) -> bytes:
+    movie = Movie(frame=frame)
+    movie.tmcd_stbl = [*rows, co64(TMCD_AT)]
+    return movie.build()
+
+
+def test_stsc_picks_the_first_samples_description() -> None:
+    """Prism's example: a 24 fps description first, a 30 fps one second, and stsc giving chunk 1
+    description 2. Sample 108000 is 01:00:00:00 at 30, not 01:15:00:00 at 24."""
+    got = read_bytes(_two(stsd(TMCD_24, TMCD_30), stsc((1, 1, 2))))
+    assert (got.frames, got.rate, got.timecode) == (108000, Fraction(30000, 1000), "01:00:00:00")
+    assert got.frames_per_second == 30
+
+
+def test_stsc_choosing_description_1_of_2_reads_it() -> None:
+    got = read_bytes(_two(stsd(TMCD_24, TMCD_30), stsc((1, 1, 1), (5, 1, 2))))
+    assert (got.rate, got.timecode) == (Fraction(24), "01:15:00:00")
+
+
+def test_only_the_chosen_description_must_be_tmcd() -> None:
+    other = struct.pack(">I4s", 20, b"avc1") + bytes(12)  # a 20-byte entry of another kind
+    got = read_bytes(_two(stsd(other, TMCD_30), stsc((1, 1, 2))))
+    assert got.rate == Fraction(30)
+
+
+def test_one_description_without_stsc_is_read_as_before() -> None:
+    """Real cameras (the CCN BRAW included) write one description; a missing stsc must not
+    refuse them."""
+    got = read_bytes(_two(stsd(TMCD_30)))
+    assert (got.rate, got.timecode) == (Fraction(30), "01:00:00:00")
+
+
+@pytest.mark.parametrize(
+    ("rows", "match"),
+    [
+        pytest.param([stsd(TMCD_24, TMCD_30), stsc((1, 1, 0))],
+                     "description 0, not 1-2", id="index-0"),
+        pytest.param([stsd(TMCD_24, TMCD_30), stsc((1, 1, 3))],
+                     "description 3, not 1-2", id="index-entry-count-plus-1"),
+        pytest.param([stsd(TMCD_30), stsc((1, 1, 2))],
+                     "description 2, not 1-1", id="index-2-of-1"),
+        pytest.param([stsd(TMCD_24, TMCD_30), stsc((2, 1, 2))],
+                     "starts at chunk 2, not 1", id="first-chunk-2"),
+        pytest.param([stsd(TMCD_24, TMCD_30), stsc((0, 1, 2))],
+                     "starts at chunk 0, not 1", id="first-chunk-0"),
+        pytest.param([stsd(TMCD_24, TMCD_30), stsc((1, 0, 2))],
+                     "0 samples per chunk", id="no-samples-per-chunk"),
+        pytest.param([stsd(TMCD_24, TMCD_30), stsc()], "stsc is empty", id="stsc-empty"),
+        pytest.param([stsd(TMCD_24, TMCD_30), stsc((1, 1, 2), count=2)],
+                     "stsc lists 2 rows but holds 1", id="stsc-count-overflow"),
+        pytest.param([stsd(TMCD_24, TMCD_30), atom(b"stsc", bytes(4), struct.pack(">I", 1))],
+                     "stsc lists 1 rows but holds 0", id="stsc-cut"),
+        pytest.param([stsd(TMCD_24, TMCD_30)], "2 sample descriptions and no stsc",
+                     id="two-descriptions-no-stsc"),
+        pytest.param([stsd(TMCD_24, tmcd_entry(kind=b"avc1")), stsc((1, 1, 2))],
+                     "description 2 is 'avc1', not 'tmcd'", id="chosen-not-tmcd"),
+        pytest.param([stsd(TMCD_30, count=5), stsc((1, 1, 1))],
+                     "lists 5 sample descriptions but holds at most 4", id="count-past-stsd"),
+        pytest.param([stsd(TMCD_24, count=2), stsc((1, 1, 2))],
+                     "lists 2 or more sample descriptions but holds 1", id="truncated-walk"),
+        pytest.param([stsd(tmcd_entry(0, 24, 1, 24, size=200), TMCD_30), stsc((1, 1, 2))],
+                     "description 1 claims 200 bytes", id="oversized-walk"),
+        pytest.param([stsd(struct.pack(">I4s", 4, b"tmcd") + bytes(30), TMCD_30),
+                      stsc((1, 1, 2))],
+                     "description 1 claims 4 bytes", id="entry-under-8-bytes"),
+        pytest.param([stsd(TMCD_24, tmcd_entry(0, 30, 1, 30, size=33)), stsc((1, 1, 2))],
+                     "description 2 claims 33 bytes", id="chosen-entry-short"),
+    ],
+)  # fmt: skip
+def test_a_bad_sample_description_choice_is_malformed(rows: list[bytes], match: str) -> None:
+    refused(_two(*rows), "malformed", match)
 
 
 # -- against ffprobe ---------------------------------------------------------------------------

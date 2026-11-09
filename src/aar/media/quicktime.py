@@ -2,11 +2,13 @@
 
 BRAW (the CCN camera format) is a plain QuickTime container: ``wide`` and ``mdat`` at the
 start, ``moov`` at the end, a ``tmcd`` track whose first sample is the start timecode as a
-big-endian u32 frame number. :func:`read_timecode` finds it by seeking: it walks the top-level
-atoms to ``moov`` (wherever it is), takes the first ``trak`` whose ``mdia/hdlr`` subtype is
-``tmcd``, reads entry 0 of its ``stsd`` (flags, timescale, frameDuration, numberOfFrames) and the
-first chunk offset from ``stco`` or ``co64`` (the first sample starts its first chunk), and reads
-the four bytes there. It never reads the whole file: a few hundred bytes for a normal movie.
+big-endian signed 32-bit frame number. :func:`read_timecode` finds it by seeking: it walks the
+top-level atoms to ``moov`` (wherever it is), takes the first ``trak`` whose ``mdia/hdlr``
+subtype is ``tmcd``, reads the ``stsd`` entry that ``stsc``'s first row gives chunk 1 (entry 1
+when there is one entry and no ``stsc``) for flags, timescale, frameDuration and
+numberOfFrames, the first chunk offset from ``stco`` or ``co64`` (the first sample starts its
+first chunk), and the four bytes there. It never reads the whole file: a few hundred bytes for a
+normal movie.
 
 Every size and offset is checked against its parent atom and the file length, ``moov`` may be
 at most :data:`MAX_MOOV_BYTES`, and at most :data:`MAX_ATOMS` atom headers are read, so a
@@ -304,26 +306,101 @@ def _require_in_mdat(src: _Source, offset: int) -> None:
     )
 
 
+def _entries(src: _Source, stsd: _Atom) -> int:
+    (entries,) = struct.unpack(">I", src.body(stsd, 4, at=4))
+    if entries == 0:
+        raise TimecodeUnreadable("the tmcd track's stsd has no entries", code="malformed")
+    if entries * 8 > stsd.end - stsd.body - 8:
+        raise TimecodeUnreadable(
+            f"the tmcd track's stsd lists {entries} sample descriptions but holds at most "
+            f"{(stsd.end - stsd.body - 8) // 8}",
+            code="malformed",
+        )
+    return entries
+
+
+def _description_index(src: _Source, stbl: _Atom, stsd: _Atom) -> int:
+    """Which sample description (1-based) the first sample uses: the sample_description_index
+    of stsc's first row, which must start at chunk 1 (the first sample opens the first chunk).
+    A track with one description and no stsc uses it, as cameras write (the CCN BRAW has both);
+    with several, stsc is required."""
+    entries = _entries(src, stsd)
+    found = src.child(stbl, b"stsc")
+    if found is None:
+        if entries == 1:
+            return 1
+        raise TimecodeUnreadable(
+            f"the tmcd track has {entries} sample descriptions and no stsc to choose one",
+            code="malformed",
+        )
+    (rows,) = struct.unpack(">I", src.body(found, 4, at=4))
+    if rows == 0:
+        raise TimecodeUnreadable("the tmcd track's stsc is empty", code="malformed")
+    if rows * 12 > found.end - found.body - 8:
+        raise TimecodeUnreadable(
+            f"the tmcd track's stsc lists {rows} rows but holds "
+            f"{(found.end - found.body - 8) // 12}",
+            code="malformed",
+        )
+    first_chunk, per_chunk, index = struct.unpack(">III", src.body(found, 12, at=8))
+    if first_chunk != 1:
+        raise TimecodeUnreadable(
+            f"the tmcd track's stsc starts at chunk {first_chunk}, not 1", code="malformed"
+        )
+    if per_chunk < 1:
+        raise TimecodeUnreadable(
+            f"the tmcd track's stsc gives chunk 1 {per_chunk} samples per chunk",
+            code="malformed",
+        )
+    if not 1 <= index <= entries:
+        raise TimecodeUnreadable(
+            f"the tmcd track's stsc gives chunk 1 sample description {index}, not 1-{entries}",
+            code="malformed",
+        )
+    return index
+
+
+def _description(src: _Source, stsd: _Atom, index: int) -> int:
+    """The file offset of sample description ``index`` (1-based), walked by the entries' size
+    fields, each bounded by stsd; the chosen one must be a 'tmcd' of at least 34 bytes."""
+
+    def header(at: int, number: int, least: int) -> tuple[int, bytes]:
+        left = stsd.end - at
+        if left < 8:
+            raise TimecodeUnreadable(
+                f"the tmcd track's stsd lists {index} or more sample descriptions but holds "
+                f"{number - 1}",
+                code="malformed",
+            )
+        size, kind = struct.unpack(">I4s", src.read(at, 8))
+        if not least <= size <= left:
+            raise TimecodeUnreadable(
+                f"the tmcd track's sample description {number} claims {size} bytes (at least "
+                f"{least}, at most {left} fit)",
+                code="malformed",
+            )
+        return size, kind
+
+    at = stsd.body + 8
+    for number in range(1, index):  # the descriptions before the chosen one
+        size, _ = header(at, number, 8)
+        at += size
+    _, kind = header(at, index, _TMCD_ENTRY)
+    if kind != b"tmcd":
+        raise TimecodeUnreadable(
+            f"the tmcd track's sample description {index} is {kind.decode('latin-1')!r}, "
+            "not 'tmcd'",
+            code="malformed",
+        )
+    return at
+
+
 def _read(src: _Source) -> QuickTimeTimecode:
     mdia = _timecode_media(src, _movie(src))
     stbl = _require(src, _require(src, mdia, b"minf"), b"stbl")
     stsd = _require(src, stbl, b"stsd")
-    (entries,) = struct.unpack(">I", src.body(stsd, 4, at=4))
-    if entries == 0:
-        raise TimecodeUnreadable("the tmcd track's stsd has no entries", code="malformed")
-    size, kind = struct.unpack(">I4s", src.body(stsd, 8, at=8))
-    if kind != b"tmcd":
-        raise TimecodeUnreadable(
-            f"the tmcd track's sample description is {kind.decode('latin-1')!r}, not 'tmcd'",
-            code="malformed",
-        )
-    if not _TMCD_ENTRY <= size <= stsd.end - stsd.body - 8:
-        raise TimecodeUnreadable(
-            f"the tmcd sample description claims {size} bytes (at least {_TMCD_ENTRY}, at most "
-            f"{stsd.end - stsd.body - 8} fit)",
-            code="malformed",
-        )
-    flags, timescale, duration, per_second = struct.unpack(">IIIB", src.body(stsd, 13, at=28))
+    entry = _description(src, stsd, _description_index(src, stbl, stsd))
+    flags, timescale, duration, per_second = struct.unpack(">IIIB", src.read(entry + 20, 13))
     if timescale == 0 or duration == 0 or per_second == 0:
         raise TimecodeUnreadable(
             f"the tmcd track's timescale {timescale}, frameDuration {duration} and "

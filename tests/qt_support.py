@@ -54,6 +54,14 @@ def stsd(*entries: bytes, count: int | None = None) -> bytes:
     return atom(b"stsd", bytes(4), struct.pack(">I", n), *entries)
 
 
+def stsc(*entries: tuple[int, int, int], count: int | None = None) -> bytes:
+    """Sample-to-chunk: (first_chunk, samples_per_chunk, sample_description_index) rows."""
+    n = len(entries) if count is None else count
+    return atom(
+        b"stsc", bytes(4), struct.pack(">I", n), *(struct.pack(">III", *e) for e in entries)
+    )
+
+
 def co64(*offsets: int, count: int | None = None) -> bytes:
     n = len(offsets) if count is None else count
     return atom(b"co64", bytes(4), struct.pack(">I", n), *(struct.pack(">Q", o) for o in offsets))
