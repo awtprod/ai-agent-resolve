@@ -42,6 +42,7 @@ class SourceAudio:
     frame_size: tuple[int, int] | None = None  # the video's display size; None without video
     timecode: str | None = None  # the media's start timecode tag (S18 round 4)
     fps: Fraction | None = None  # the video stream's rate; None without video
+    base_fps: Fraction | None = None  # its r_frame_rate (S18a: snapped when the average is off)
 
 
 def open_audio(
@@ -74,8 +75,9 @@ def open_audio(
         video = info.video
         size = video.display_size if video is not None else None
         fps = video.fps if video is not None else None
+        base = video.base_fps if video is not None else None
         out[source_id] = SourceAudio(
-            path, info.audio.channels or 1, duration, size, info.timecode, fps
+            path, info.audio.channels or 1, duration, size, info.timecode, fps, base
         )
     return out
 

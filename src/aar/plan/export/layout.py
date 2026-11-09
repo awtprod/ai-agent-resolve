@@ -1090,16 +1090,16 @@ class _Builder:
             self.layout.assets.append(AssetSpec(src, name, duration, start))
         if unknown and not self.allow_unknown_timecode:
             # Fix-check Q4: Resolve shows such clips Media Offline unless the file's timecode
-            # happens to start at 00:00:00:00, and ffprobe cannot read BRAW's at all.
+            # happens to start at 00:00:00:00.
             names = ", ".join(f"{s.id!r} ({s.media})" for s in unknown)
             raise ExportError(
                 "start_timecode_unknown",
                 f"{len(unknown)} source(s) have no start_timecode, so Resolve would not link "
                 f"their clips unless the file's timecode starts at 00:00:00:00: {names}",
                 "set Source.start_timecode (and start_timecode_rate) from the clip's 'Start TC' "
-                "in Resolve or the camera metadata (aar plan produce reads it from media "
-                "ffprobe can open, not BRAW); or pass --allow-unknown-timecode to export with "
-                "the asset at 0s",
+                "in Resolve or the camera metadata (aar plan produce reads it from the media, "
+                "BRAW included, when the file is local; aar media timecode FILE prints it); or "
+                "pass --allow-unknown-timecode to export with the asset at 0s",
                 sources=[s.id for s in unknown],
             )
 
