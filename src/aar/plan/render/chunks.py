@@ -8,7 +8,8 @@ encode's memory is its base plus its chunk's uses, whatever the timeline's lengt
 
 * The **budget** is ``min(6 GiB, half of MemAvailable, the free headroom of every cgroup above the
   process that sets memory.max)``, read when the render starts; ``--memory-budget`` (or ``[render]
-  memory_budget_mb``) replaces it.
+  memory_budget_mb``) replaces it. A cgroup's headroom is ``memory.max - (memory.current -
+  inactive_file)``: reclaimable page cache is room (round 4).
 * The **cost model** is the measurement, rounded up: a base of 300 MB plus 1,000 MB at a 1080p
   output (scaled by the output's pixels), and per picture use 50 MB, or 80 MB when it is windowed
   (a crop, punch-in or moving reframe), at a 1080p 8-bit 4:2:0 source (scaled by the source's
@@ -84,11 +85,27 @@ def mem_available_mb(meminfo: Path = Path("/proc/meminfo")) -> float | None:
     return None
 
 
+def _inactive_file(stat: str | None) -> int | None:
+    """``inactive_file`` from a cgroup's ``memory.stat`` (bytes), or None when it is missing."""
+    for line in (stat or "").splitlines():
+        name, _, value = line.partition(" ")
+        if name == "inactive_file" and value.strip().isdigit():
+            return int(value.strip())
+    return None
+
+
 def cgroup_headroom_mb(
     proc_cgroup: Path = Path("/proc/self/cgroup"), root: Path = Path("/sys/fs/cgroup")
 ) -> float | None:
-    """The least ``memory.max - memory.current`` over the process's cgroup (v2) and every cgroup
-    above it that sets ``memory.max``; None when none does (or there is no cgroup v2)."""
+    """The least free headroom over the process's cgroup (v2) and every cgroup above it that
+    sets ``memory.max``; None when none does (or there is no cgroup v2).
+
+    A group's headroom is ``memory.max - (memory.current - inactive_file)``, floored at 0
+    (round 4): cgroup v2 lets page cache fill a group up to its limit, and inactive file pages
+    are reclaimed before anything is refused, so they are room, not use (Command Center's
+    group is mostly page cache: near its limit, ``memory.max - memory.current`` fell to about
+    1 GB with 40 GB reclaimable). When ``memory.stat`` is missing or unreadable, or names no
+    ``inactive_file``, the headroom is ``memory.max - memory.current``."""
     text = _read(proc_cgroup)
     if text is None:
         return None
@@ -105,7 +122,11 @@ def cgroup_headroom_mb(
         limit, current = limit.strip(), current.strip()
         if not limit.isdigit() or not current.isdigit():
             continue  # "max": no limit here
-        free = max(0, int(limit) - int(current)) / MB
+        used = int(current)
+        cache = _inactive_file(_read(folder / "memory.stat"))
+        if cache is not None:
+            used = max(0, used - cache)
+        free = max(0, int(limit) - used) / MB
         headroom = free if headroom is None else min(headroom, free)
     return headroom
 
@@ -208,9 +229,24 @@ def plan_chunks(
     max_script_bytes: int,
 ) -> list[Chunk]:
     """The chunks, each as long as the budget allows, cut only at :func:`cut_points`; or
-    ``render_too_large`` when the pictures between two cut points alone are over the budget."""
+    ``render_too_large`` when the encoder alone, or the pictures between two cut points with it,
+    are over the budget."""
     fps = tl.plan.fps
-    base = encode_base_mb(tl.plan.resolution)
+    res = tl.plan.resolution
+    base = encode_base_mb(res)
+    if base > budget.mb:  # round 4: say it is the encoder, not "1 overlapping picture"
+        raise RenderError(
+            "render_too_large",
+            f"the encoder alone needs about {base:.0f} MB at a {res.width}x{res.height} output "
+            f"(before any picture is opened), over the memory budget of {budget.mb:.0f} MB",
+            "give a larger --memory-budget, free memory on this machine (the default budget is "
+            "half of MemAvailable and the cgroup's free room, at most 6 GiB), or render a smaller "
+            "resolution",
+            reason="encoder_base",
+            base_mb=round(base),
+            budget_mb=round(budget.mb),
+            resolution=f"{res.width}x{res.height}",
+        )
     points = cut_points(tl)
     by_start = sorted(tl.pictures, key=lambda p: p.start)
     blocks: list[tuple[int, int, int, float, int]] = []  # start, end, pictures, MB, script bytes
@@ -232,17 +268,25 @@ def plan_chunks(
                 f"record frames {start}..{end} ({_timecode(start, fps.num, fps.den)} to "
                 f"{_timecode(end, fps.num, fps.den)})"
             )
+            held = (
+                "hold one picture"
+                if count == 1
+                else f"hold {count} pictures that overlap with no hard cut between them"
+            )
             raise RenderError(
                 "render_too_large",
-                f"{window} hold {count} overlapping picture(s) with no hard cut between them; "
-                f"encoding them at once needs about {base + cost:.0f} MB, over the memory "
-                f"budget of {budget.mb:.0f} MB",
+                f"{window} {held}; encoding {'it' if count == 1 else 'them at once'} needs about "
+                f"{base + cost:.0f} MB (the encoder's {base:.0f} MB at a {res.width}x{res.height} "
+                f"output plus {cost:.0f} MB for the pictures), over the memory budget of "
+                f"{budget.mb:.0f} MB",
                 "render smaller hub copies (proxies), put a hard cut in that stretch, or give "
                 "--memory-budget on a machine with the memory",
+                reason="pictures",
                 start=start,
                 end=end,
                 pictures=count,
                 estimated_mb=round(base + cost),
+                base_mb=round(base),
                 budget_mb=round(budget.mb),
             )
         if script > max_script_bytes:
