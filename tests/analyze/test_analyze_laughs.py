@@ -7,8 +7,12 @@ The clip is 20 s of steady speech-band room noise at -30 dBFS RMS with a laugh-l
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import http.client
 import json
+import socket
+import struct
 import traceback
 import urllib.parse
 from pathlib import Path
@@ -16,7 +20,7 @@ from typing import Any
 
 import pytest
 from analyze_support import laugh_clip, needs_ffmpeg, write_wav
-from gemini_stub import FILE, Stub
+from gemini_stub import FILE, KEY, Stub, carries_key, is_host_probe
 
 import aar.analyze.gemini as gemini
 from aar.analyze import AnalyzeError
@@ -31,7 +35,6 @@ from aar.analyze.laughs import (
 from aar.cli import main
 from aar.plan.inputs import load_laughs
 
-KEY = "test-key-0000"
 ONSET = 12.237
 LAUGH = {"start": "0:12", "end": "0:15", "level": 2, "kind": "laugh"}
 ITEMS = [
@@ -345,52 +348,93 @@ def test_the_key_never_leaks_from_a_hostile_success(tmp_path, clip, paid, capsys
     assert_no_key_anywhere(tmp_path, json.dumps(report), err)
 
 
-def _carries_key(request: dict[str, Any]) -> bool:
-    """The key, or the header the client sends it in, anywhere in a request the stub saw."""
-    headers = request["headers"]
-    body = request["body"] if isinstance(request["body"], bytes) else b""
-    return (
-        "x-goog-api-key" in headers
-        or any(KEY in str(value) for value in headers.values())
-        or KEY in request["path"] + request["query"]
-        or KEY.encode() in body
-    )
+def _send(stub: Stub, method: str = "GET", path: str = "/", headers: Any = None, body: Any = None):
+    """One plain HTTP request to a stub (http.client: no proxy, no redirects)."""
+    connection = http.client.HTTPConnection("127.0.0.1", stub.port, timeout=5)
+    try:
+        connection.request(method, path, body=body, headers=headers or {})
+        connection.getresponse().read()
+    finally:
+        connection.close()
 
 
-def _is_bare_probe(request: dict[str, Any]) -> bool:
-    """A request nobody under test made. On the awtprod host the Command Center server probes
-    every new localhost listener with a bare ``GET /`` (user-agent node, b3 and traceparent
-    headers), so a stub can see one at any moment; ``elsewhere.requests == []`` failed 4 runs in
-    5 on dev b1a9096 (aar-evidence/s18a-val). A probe is a GET of ``/`` with no query, no body
-    and no key; the client's own requests are POSTs to the Gemini paths with the key header."""
-    return (
-        request["method"] == "GET"
-        and request["path"] == "/"
-        and not request["query"]
-        and not request["body"]
-        and not _carries_key(request)
-    )
+PROBE = {"User-Agent": "node", "b3": "d4e8-92b4-1-64f0", "traceparent": "00-d4e8-92b4-01"}
 
 
-def test_only_a_bare_keyless_get_of_the_root_counts_as_a_host_probe() -> None:
-    def request(method="GET", path="/", query="", headers=None, body=b""):
-        return {"method": method, "path": path, "query": query, "headers": headers or {},
-                "body": body}  # fmt: skip
+def test_every_stub_ignores_the_hosts_bare_probe_and_nothing_else() -> None:
+    """The stub drops only a bare keyless GET of / (the Command Center probe), so every
+    ``requests == []`` in this file means "no request the code under test made"."""
+    stub = Stub()
+    try:
+        _send(stub, headers=PROBE)
+        assert stub.requests == []
+        b64 = base64.b64encode(KEY.encode()).decode()
+        leaks = [
+            {**PROBE, "X-Trace": b64},
+            {**PROBE, "X-Trace": base64.urlsafe_b64encode(KEY.encode()).decode().rstrip("=")},
+            {**PROBE, "Authorization": f"Bearer {KEY}"},
+            {**PROBE, "Authorization": "Basic " + base64.b64encode(f"u:{KEY}".encode()).decode()},
+            {**PROBE, "Cookie": f"k={urllib.parse.quote(KEY)}"},
+            {**PROBE, "x-goog-api-key": "anything"},
+        ]
+        for headers in leaks:
+            _send(stub, headers=headers)
+        _send(stub, path="/steal", headers=PROBE)  # a followed redirect
+        _send(stub, path="/?k=1", headers=PROBE)
+        _send(stub, method="POST", headers=PROBE, body=b"{}")
+        assert len(stub.requests) == len(leaks) + 3
+    finally:
+        stub.close()
 
-    probe = {"host": "localhost:1", "user-agent": "node", "b3": "x-y-1-z", "traceparent": "00-x"}
-    assert _is_bare_probe(request(headers=probe))
-    assert not _is_bare_probe(request(path="/steal"))  # a followed redirect
-    assert not _is_bare_probe(request(method="POST"))
-    assert not _is_bare_probe(request(query="a=1"))
-    assert not _is_bare_probe(request(body=b"{}"))
+
+def test_a_probe_that_resets_its_connection_prints_nothing(capfd) -> None:
+    """The Command Center probe can drop its keep-alive connection with a reset; the stub's
+    server thread must not print a traceback into the stderr the tests assert empty."""
+    stub = Stub()
+    try:
+        raw = socket.create_connection(("127.0.0.1", stub.port), timeout=5)
+        raw.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n"
+                    b"User-Agent: node\r\nb3: d4e8-92b4-1-64f0\r\n\r\n")  # fmt: skip
+        assert raw.recv(4096).startswith(b"HTTP/1.1 404")
+        raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        raw.close()  # a reset, not a FIN
+        _send(stub, method="POST", path="/after", body=b"{}")  # the server still answers
+    finally:
+        stub.close()
+    assert "Traceback" not in capfd.readouterr().err
+    assert [r["path"] for r in stub.requests] == ["/after"]
+
+
+def test_a_base64_key_leak_fails_a_nothing_reached_it_check() -> None:
+    """Validator R2-4: round 2's filter let a GET / with the key base64-encoded in a header
+    pass. Now it is recorded, so ``requests == []`` fails on it."""
+    stub = Stub()
+    try:
+        _send(stub, headers={**PROBE, "X-Trace": base64.b64encode(KEY.encode()).decode()})
+        assert stub.requests != []
+        assert carries_key(stub.requests[0]) and not is_host_probe(stub.requests[0])
+    finally:
+        stub.close()
+
+
+def test_carries_key_sees_every_encoding() -> None:
+    key = "k/+= y"  # characters that URL-encoding and base64 change
+
+    def request(**parts: Any) -> dict[str, Any]:
+        return {"method": "GET", "path": "/", "query": "", "headers": {}, "body": b"", **parts}
+
+    assert not carries_key(request(), key)
+    assert not carries_key(request(headers={"b3": "d4e8-92b4-1-64f0"}), key)
     for leak in (
-        request(headers={**probe, "x-goog-api-key": "anything"}),
-        request(headers={**probe, "authorization": f"Bearer {KEY}"}),
-        request(query=f"key={KEY}"),
-        request(body=KEY.encode()),
+        request(query="key=" + urllib.parse.quote(key, safe="")),
+        request(query="key=" + urllib.parse.quote_plus(key)),
+        request(headers={"x-a": base64.b64encode(key.encode()).decode()}),
+        request(headers={"x-a": base64.urlsafe_b64encode(key.encode()).decode().rstrip("=")}),
+        request(headers={"authorization": f"Bearer {key}"}),
+        request(body=json.dumps({"k": key}).encode()),
+        request(path="/" + urllib.parse.quote(key, safe="")),
     ):
-        assert _carries_key(leak) and not _is_bare_probe(leak)
-    assert not _carries_key(request(headers=probe))
+        assert carries_key(leak, key), leak
 
 
 @needs_ffmpeg
@@ -406,10 +450,7 @@ def test_redirects_are_refused_and_the_key_goes_nowhere_else(tmp_path, clip, pai
         code, body, _ = cli(capsys, *base_args(tmp_path, clip), "--allow-paid")
         assert code == 1 and body["error"]["type"] == "gemini-redirect"
         assert str(status) in body["error"]["message"]
-        # The redirect was not followed: nothing reached the other server but host probes,
-        # and nothing that reached it carries the key (header, query or body).
-        assert not [r for r in elsewhere.requests if _carries_key(r)]
-        assert [r for r in elsewhere.requests if not _is_bare_probe(r)] == []
+        assert elsewhere.requests == []  # the stub drops only the host's bare probe
         assert paid.calls()[-1] == f"DELETE /v1beta/{FILE}"  # still deleted
     finally:
         elsewhere.close()
