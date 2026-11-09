@@ -34,9 +34,11 @@ from aar.plan.produce import (
     read_transcript,
 )
 from aar.plan.produce.audio import SourceAudio, pause_runs
+from aar.plan.produce.errors import ProduceInputError
 from aar.plan.produce.timeline import Piece
 from aar.plan.profile import load_profile, parse_profile
 from aar.qa import cuts, join_quiet_window, resolve_media, scan_join_quiet
+from qt_support import retime_tmcd
 
 pytestmark = needs_ffmpeg
 
@@ -195,6 +197,76 @@ def test_a_timecoded_master_gives_the_plan_its_start_timecode(
     untouched = produce_short(short)
     assert untouched.plan.sources[0].start_timecode is None
     assert untouched.log()["start_timecodes"] == {}
+
+
+def _timed_short(short: dict[str, Path], tmp_path: Path) -> tuple[dict[str, Path], Path]:
+    """The short staged afresh with its master remuxed to carry 01:00:00:00 (a tmcd track)."""
+    folder = tmp_path / "short"
+    shutil.copytree(short["dir"], folder)
+    master = folder / "short_master.mov"
+    timed = folder / "timed.mov"
+    ffmpeg("-i", str(master), "-map", "0", "-c", "copy", "-timecode", "01:00:00:00", str(timed))
+    timed.replace(master)
+    faces = json.loads(short["faces"].read_text(encoding="utf-8"))
+    faces["header"]["input"]["path"] = str(master)
+    track = folder / "timed.faces.json"
+    track.write_text(json.dumps(faces), encoding="utf-8")
+    return {**short, "dir": folder, "faces": track}, master
+
+
+def test_sources_the_plan_does_not_play_never_block_the_produce(
+    short: dict[str, Path], tmp_path: Path
+) -> None:
+    """S18a round 3 (validator R2-1): a 120 fps clip with a timecode tag and no tmcd track, and
+    a clip whose 25 fps tmcd track sits on 50 fps video (ambiguous), both in the stub but not in
+    the cut: the produce runs, they keep the stub's (absent) timecodes, and nothing warns. The
+    outro is played, so its timecode is worked out."""
+    paths, _ = _timed_short(short, tmp_path)
+    folder = paths["dir"]
+    ffmpeg(
+        "-f", "lavfi", "-i", "testsrc=size=64x48:rate=120:duration=1", "-c:v", "libx264",
+        "-preset", "ultrafast", "-timecode", "01:00:00:00", str(folder / "slomo.mkv"),
+    )  # fmt: skip
+    odd = folder / "odd.mov"
+    ffmpeg(
+        "-f", "lavfi", "-i", "testsrc=size=64x48:rate=50:duration=1", "-c:v", "libx264",
+        "-preset", "ultrafast", "-timecode", "01:00:00:00", str(odd),
+    )  # fmt: skip
+    retime_tmcd(odd, 25, 1, 25)
+    ffmpeg(
+        "-f", "lavfi", "-i", "testsrc=size=160x90:rate=30000/1001:duration=2", "-f", "lavfi",
+        "-i", "sine=d=2", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-timecode", "02:00:00:00", str(folder / "outro.mov"),
+    )  # fmt: skip
+    stub = json.loads(paths["stub"].read_text(encoding="utf-8"))
+    stub["sources"] += [
+        {"id": "slomo", "media": "slomo.mkv"},
+        {"id": "odd", "media": "odd.mov"},
+        {"id": "outro", "media": "outro.mov", "duration": 60},
+    ]
+    stub["outro"] = {"source": "outro", "src_out": 30}  # played after the cut: worked out
+    staged = folder / "short.stub.json"
+    staged.write_text(json.dumps(stub), encoding="utf-8")
+    result = produce_short({**paths, "stub": staged})
+    sources = {s.id: s for s in result.plan.sources}
+    assert sources["slomo"].start_timecode is None and sources["odd"].start_timecode is None
+    assert sources["master"].start_timecode is not None  # the cut's source is still worked out
+    assert sources["outro"].start_timecode == 216000  # 02:00:00:00 at 29.97 non-drop
+    assert not [w for w in result.warnings if w.source in ("slomo", "odd")]
+    assert set(result.log()["start_timecodes"]) == {"master", "outro"}
+
+
+def test_a_played_source_whose_tmcd_disagrees_is_refused(
+    short: dict[str, Path], tmp_path: Path
+) -> None:
+    """The cut's own master with its tmcd track retimed to count 15 frames a second on 29.97
+    video: the producer refuses rather than guess (exit 2)."""
+    paths, master = _timed_short(short, tmp_path)
+    retime_tmcd(master, 15000, 1001, 15)
+    with pytest.raises(ProduceInputError) as caught:
+        produce_short(paths)
+    assert caught.value.code == "timecode-rate-ambiguous" and caught.value.exit_code == 2
+    assert "counts 15 frames a second" in caught.value.message
 
 
 @pytest.mark.parametrize("show", ["longform", "short"])
