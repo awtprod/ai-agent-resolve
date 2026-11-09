@@ -38,7 +38,8 @@ from aar.plan.apply.inputs import classify_media, is_edit_path
 from aar.plan.export.errors import ExportError
 from aar.plan.model import Source
 
-MediaRuleName = Literal["windows-path", "file-url", "media-map"]
+#: ``hub-path`` is the hub render's own rule (S18b): a hub-local file, never written to FCPXML.
+MediaRuleName = Literal["windows-path", "file-url", "media-map", "hub-path"]
 
 MEDIA_MAP_MAX_BYTES = 1_000_000
 _DRIVE = re.compile(r"^([A-Za-z]):[\\/](.*)$", re.S)

@@ -86,6 +86,26 @@ y = 0.45
 [export]
 timeline_start = "01:00:00:00"
 
+# Hub render (`aar plan render`): an EditPlan to MP4 with ffmpeg, no Resolve. Loudness targets are
+# the [qa] ones above, reached by one linear gain and a true-peak limiter (never loudnorm, R6).
+[render]
+font = "Montserrat"       # title font; DejaVu Sans when no Montserrat file is found (AAR_FONTS_DIR)
+master_codec = "h264"     # or "prores" (a .mov master, ProRes 422 HQ with PCM sound)
+review_crf = 20
+review_x264_preset = "medium"
+review_audio_kbps = 192
+master_crf = 14
+master_x264_preset = "slow"
+master_audio_kbps = 320
+true_peak_margin_db = 0.5 # process to true_peak_max_dbtp minus this, so the AAC stays under it
+limiter_attack_ms = 5.0   # the true-peak limiter (alimiter at 192 kHz)
+limiter_release_ms = 50.0
+gain_tolerance_lu = 0.1   # re-measure after the limiter; correct the gain (up to twice) past this
+limiter_warn_db = 3.0     # warn when the limiter takes more than this off the peaks
+# memory_budget_mb = 6144 # one ffmpeg's memory; unset: min(6 GiB, MemAvailable/2, cgroup room)
+timeout_base_s = 120.0    # every ffmpeg call: base + per second of source it decodes
+timeout_per_media_s = 8.0
+
 # Segments from one recording play in source-time order: no reordering, no imported cold opens.
 [rules.chronological]
 tolerance_frames = 0      # how far a segment may start before the previous one ended

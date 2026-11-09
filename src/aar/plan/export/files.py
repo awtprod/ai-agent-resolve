@@ -113,8 +113,15 @@ def _refuse_existing(dests: list[Path], overwrite: bool) -> None:
             )
 
 
-def write_pair(files: list[tuple[Path, bytes]], *, overwrite: bool) -> None:
-    """Write every ``(destination, bytes)`` or none of them, holding every destination's export
+#: What goes to one destination: its bytes, or a finished file already written, fsynced and closed
+#: on the destination's file system (the hub render's MP4 in its work dir beside the output,
+#: S18b). Such a file is placed as a temporary file would be (moved, never copied); until then the
+#: caller owns it, and a failed write may leave it where it was or remove it.
+Content = bytes | Path
+
+
+def write_pair(files: list[tuple[Path, Content]], *, overwrite: bool) -> None:
+    """Write every ``(destination, content)`` or none of them, holding every destination's export
     lock throughout (see the module docstring)."""
     api = _lock_api()
     held: list[int] = []
@@ -139,14 +146,17 @@ def write_pair(files: list[tuple[Path, bytes]], *, overwrite: bool) -> None:
             api.release_file_lock(fd)
 
 
-def _write_pair_locked(files: list[tuple[Path, bytes]], overwrite: bool) -> None:
+def _write_pair_locked(files: list[tuple[Path, Content]], overwrite: bool) -> None:
     _refuse_existing([dest for dest, _ in files], overwrite)
+    for dest, data in files:
+        if isinstance(data, Path) and data.stat().st_dev != dest.parent.stat().st_dev:
+            raise ValueError(f"{data} is not on the file system of {dest.parent}")
     temps: list[Path] = []
     backups: dict[Path, Path] = {}
     placed: list[tuple[Path, Path, Identity]] = []  # (destination, its temp, the temp's identity)
     try:
         for dest, data in files:
-            temps.append(_write_temp(dest, data))
+            temps.append(data if isinstance(data, Path) else _write_temp(dest, data))
         if overwrite:
             for dest, _ in files:
                 backup = _backup(dest.parent, dest)

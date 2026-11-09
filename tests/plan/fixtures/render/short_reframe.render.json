@@ -1,0 +1,143 @@
+{
+ "loudness_method": "gain-limiter",
+ "not_rendered": [
+  {
+   "action": "for the template's look, import the FCPXML export into a branch of it",
+   "detail": "the render builds the plan's own timeline; template 'CCN Short Template' (its look, Fusion titles and buses) is not applied",
+   "feature": "template",
+   "location": "template"
+  },
+  {
+   "action": "captions are burned in by the shorts compose (S13e)",
+   "detail": "2 caption(s) are not burned in",
+   "feature": "captions",
+   "location": "captions"
+  },
+  {
+   "action": "none",
+   "detail": "not applied (no captions drawn)",
+   "feature": "caption_style",
+   "location": "caption_style"
+  },
+  {
+   "action": "see the FCPXML export report for the marker list",
+   "detail": "marker 'Hook' at frame 0: an MP4 carries no markers",
+   "feature": "marker",
+   "location": "markers[0]"
+  }
+ ],
+ "notes": [],
+ "rendered": {
+  "dissolves": [],
+  "luts": {},
+  "pictures": [
+   {
+    "framing": "window",
+    "lane": 0,
+    "location": "segments[0]",
+    "record": [
+     0,
+     240
+    ],
+    "source": "camA",
+    "source_frames": [
+     0,
+     240
+    ],
+    "window": {
+     "box": [
+      115,
+      10,
+      118,
+      157
+     ],
+     "first": [
+      160.0,
+      90.0,
+      84.375,
+      150.0
+     ],
+     "last": [
+      192.0,
+      81.0,
+      76.705,
+      136.364
+     ],
+     "moving": true,
+     "pad": 0,
+     "units": "hub source pixels: centre x, centre y, width, height"
+    }
+   },
+   {
+    "framing": "window",
+    "lane": 0,
+    "location": "segments[1]",
+    "record": [
+     240,
+     480
+    ],
+    "source": "camB",
+    "source_frames": [
+     240,
+     480
+    ],
+    "window": {
+     "box": [
+      87,
+      18,
+      98,
+      144
+     ],
+     "first": [
+      128.0,
+      90.0,
+      77.885,
+      138.462
+     ],
+     "last": [
+      144.0,
+      90.0,
+      77.885,
+      138.462
+     ],
+     "moving": true,
+     "pad": 0,
+     "units": "hub source pixels: centre x, centre y, width, height"
+    }
+   }
+  ],
+  "sounds": [
+   {
+    "fade_in_frames": 6,
+    "fade_out_frames": 0,
+    "gain_db": 0.0,
+    "location": "segments[0]",
+    "record": [
+     0,
+     240
+    ],
+    "source": "camA"
+   },
+   {
+    "fade_in_frames": 0,
+    "fade_out_frames": 1,
+    "gain_db": 0.0,
+    "location": "segments[1]",
+    "record": [
+     240,
+     480
+    ],
+    "source": "camB"
+   }
+  ],
+  "titles": []
+ },
+ "timeline": {
+  "audio_samples": 960960,
+  "duration_s": 20.02,
+  "fps": "24000/1001",
+  "resolution": "1080x1920",
+  "sample_rate": 48000,
+  "total_frames": 480
+ }
+}

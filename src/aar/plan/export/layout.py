@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Literal
@@ -377,6 +378,11 @@ def transform_spec(
 # -- the build ---------------------------------------------------------------------------------
 
 
+#: How a source becomes a :class:`MediaRef`: the FCPXML rules (:func:`media_ref` with the media
+#: map) unless a caller gives its own, as the hub render does with hub-local paths (S18b).
+MediaResolver = Callable[[Source], MediaRef]
+
+
 class _Builder:
     def __init__(
         self,
@@ -384,10 +390,14 @@ class _Builder:
         media_map: MediaMap | None,
         timeline_start: str,
         allow_unknown_timecode: bool = False,
+        resolve_media: MediaResolver | None = None,
     ) -> None:
         self.plan = plan
         self.media_map = media_map
         self.allow_unknown_timecode = allow_unknown_timecode
+        self.resolve_media: MediaResolver = resolve_media or (
+            lambda source: media_ref(source, self.media_map)
+        )
         self.timebase = Timebase.of(plan.fps)
         try:
             tc_start = self.timebase.timecode_frames(timeline_start)
@@ -476,7 +486,7 @@ class _Builder:
             used.add(self.plan.outro.source)
         for source in self.plan.sources:
             if source.id in used and source.id not in self.layout.media:
-                self.layout.media[source.id] = media_ref(source, self.media_map)
+                self.layout.media[source.id] = self.resolve_media(source)
         self._check_shared_durations()
         self._check_shared_start_timecodes()
 
@@ -1263,8 +1273,10 @@ def build_layout(
     media_map: MediaMap | None = None,
     timeline_start: str = DEFAULT_TIMELINE_START,
     allow_unknown_timecode: bool = False,
+    resolve_media: MediaResolver | None = None,
 ) -> Layout:
     """Every export decision for ``plan``, or a typed :class:`ExportError`. A used source with no
     ``start_timecode`` is refused (``start_timecode_unknown``) unless ``allow_unknown_timecode``,
-    which writes its asset at 0s with a report note."""
-    return _Builder(plan, media_map, timeline_start, allow_unknown_timecode).build()
+    which writes its asset at 0s with a report note. ``resolve_media`` replaces the FCPXML media
+    rules (the hub render's hub-local paths, S18b); every other decision is the same."""
+    return _Builder(plan, media_map, timeline_start, allow_unknown_timecode, resolve_media).build()

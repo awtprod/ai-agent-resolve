@@ -228,8 +228,12 @@ def run_tool(
     stdout_limit: int = STDOUT_LIMIT,
     stderr_limit: int = STDERR_LIMIT,
     check: bool = True,
+    cwd: str | os.PathLike[str] | None = None,
 ) -> RunResult:
     """Run ``tool`` with ``args`` (a list, never a shell string) and wait at most ``timeout_s``.
+
+    ``cwd`` runs it in that directory (the hub render's work dir, so its filter scripts name their
+    side files by plain relative names and no path needs filtergraph escaping).
 
     stdout goes to ``stdout_sink`` chunk by chunk when given, otherwise it is collected and the
     process is killed if it passes ``stdout_limit`` bytes. stderr keeps only its last
@@ -255,6 +259,7 @@ def run_tool(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
+            cwd=cwd,
             **kwargs,  # type: ignore[call-overload]
         )
     except OSError as exc:
