@@ -246,11 +246,6 @@ def video_graph(
     return VideoGraph(";\n".join(lines) + "\n", titles, uses)
 
 
-def _channels(channels: int) -> str:
-    """The source's sound as stereo: a mono file on both sides, else its first two channels."""
-    return "pan=stereo|c0=c0|c1=c0" if channels == 1 else "pan=stereo|c0=c0|c1=c1"
-
-
 @dataclass(frozen=True)
 class MixGraph:
     text: str

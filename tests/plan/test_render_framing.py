@@ -325,3 +325,17 @@ def test_a_reframe_too_long_for_per_frame_expressions_is_refused_fast() -> None:
     assert info.value.code == "reframe_too_complex"
     assert info.value.details["location"] == "segments[0]"
     assert time.monotonic() - started < 2.0
+
+
+def test_one_pass_reframe_values_are_reframe_at_for_every_frame() -> None:
+    from aar.plan.render.framing import reframe_values
+
+    keys = [
+        ReframeKey(time=3, x=0.4, y=0.6, zoom=1.0),
+        ReframeKey(time=10, x=0.55, y=0.5, zoom=1.4),
+        ReframeKey(time=11, x=0.5, y=0.45, zoom=1.2),
+        ReframeKey(time=40, x=0.6, y=0.55, zoom=1.9),
+    ]
+    for lead in (0, 5):
+        values = reframe_values(keys, lead, 60)
+        assert values == [reframe_at(keys, i - lead) for i in range(60)]
