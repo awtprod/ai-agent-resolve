@@ -1,6 +1,11 @@
-[0:0]aresample=48000,pan=stereo|c0=c0|c1=c0,atrim=start_pts=0:end_pts=144144,asetpts=PTS-STARTPTS,apad=whole_len=144144,atrim=end_sample=144144,afade=t=in:start_sample=0:nb_samples=48048:curve=tri,apad=whole_len=852852,atrim=end_sample=852852[s0];
-[1:0]aresample=48000,pan=stereo|c0=c0|c1=c0,atrim=start_pts=144144:end_pts=288288,asetpts=PTS-STARTPTS,apad=whole_len=144144,atrim=end_sample=144144,adelay=delays=144144S:all=1,apad=whole_len=852852,atrim=end_sample=852852[s1];
-[2:0]aresample=48000,pan=stereo|c0=c0|c1=c0,atrim=start_pts=288288:end_pts=444444,asetpts=PTS-STARTPTS,apad=whole_len=156156,atrim=end_sample=156156,volume=volume=-2.000000dB,afade=t=out:start_sample=132132:nb_samples=24024:curve=tri,adelay=delays=288288S:all=1,apad=whole_len=852852,atrim=end_sample=852852[s2];
-[3:0]aresample=48000,pan=stereo|c0=c0|c1=c0,atrim=start_pts=48048:end_pts=240240,asetpts=PTS-STARTPTS,apad=whole_len=192192,atrim=end_sample=192192,afade=t=in:start_sample=0:nb_samples=24024:curve=tri,adelay=delays=420420S:all=1,apad=whole_len=852852,atrim=end_sample=852852[s3];
-[4:0]aresample=48000,pan=stereo|c0=c0|c1=c0,atrim=start_pts=0:end_pts=240240,asetpts=PTS-STARTPTS,apad=whole_len=240240,atrim=end_sample=240240,volume=volume=-1.000000dB,afade=t=out:start_sample=236236:nb_samples=4004:curve=tri,adelay=delays=612612S:all=1,apad=whole_len=852852,atrim=end_sample=852852[s4];
-[s0][s1][s2][s3][s4]amix=inputs=5:normalize=0:duration=longest[mix]
+[0:0]aresample=48000,pan=stereo|c0=c0|c1=c0,atrim=start_pts=0:end_pts=144144,asetpts=PTS-STARTPTS,apad=whole_len=144144,atrim=end_sample=144144,afade=t=in:start_sample=0:nb_samples=48048:curve=tri[s0];
+[1:0]aresample=48000,pan=stereo|c0=c0|c1=c0,atrim=start_pts=144144:end_pts=288288,asetpts=PTS-STARTPTS,apad=whole_len=144144,atrim=end_sample=144144[s1];
+[2:0]aresample=48000,pan=stereo|c0=c0|c1=c0,atrim=start_pts=288288:end_pts=444444,asetpts=PTS-STARTPTS,apad=whole_len=156156,atrim=end_sample=156156,volume=volume=-2.000000dB,afade=t=out:start_sample=132132:nb_samples=24024:curve=tri[s2];
+[3:0]aresample=48000,pan=stereo|c0=c0|c1=c0,atrim=start_pts=48048:end_pts=240240,asetpts=PTS-STARTPTS,apad=whole_len=192192,atrim=end_sample=192192,afade=t=in:start_sample=0:nb_samples=24024:curve=tri[s3];
+[4:0]aresample=48000,pan=stereo|c0=c0|c1=c0,atrim=start_pts=0:end_pts=240240,asetpts=PTS-STARTPTS,apad=whole_len=240240,atrim=end_sample=240240,volume=volume=-1.000000dB,afade=t=out:start_sample=236236:nb_samples=4004:curve=tri[s4];
+anullsrc=r=48000:cl=stereo,atrim=end_sample=168168[z0];
+[s0][s1][s2][z0][s4]concat=n=5:v=0:a=1[l0];
+anullsrc=r=48000:cl=stereo,atrim=end_sample=420420[z1];
+anullsrc=r=48000:cl=stereo,atrim=end_sample=240240[z2];
+[z1][s3][z2]concat=n=3:v=0:a=1[l1];
+[l0][l1]amix=inputs=2:normalize=0:duration=longest[mix]

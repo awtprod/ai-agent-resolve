@@ -102,7 +102,7 @@ limiter_attack_ms = 5.0   # the true-peak limiter (alimiter at 192 kHz)
 limiter_release_ms = 50.0
 gain_tolerance_lu = 0.1   # re-measure after the limiter; correct the gain (up to twice) past this
 limiter_warn_db = 3.0     # warn when the limiter takes more than this off the peaks
-decode_memory_mb = 16384  # the most memory the open decoders may need (one input per picture)
+# memory_budget_mb = 6144 # one ffmpeg's memory; unset: min(6 GiB, MemAvailable/2, cgroup room)
 timeout_base_s = 120.0    # every ffmpeg call: base + per second of source it decodes
 timeout_per_media_s = 8.0
 

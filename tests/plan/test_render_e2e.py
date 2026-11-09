@@ -363,17 +363,20 @@ def test_every_ffmpeg_call_is_bounded_and_stays_in_the_work_dir(media, tmp_path,
     for args, timeout, _ in calls:
         if "mix.ffgraph" in args:
             stages["mix"] = timeout
-        elif "video.ffgraph" in args:
+        elif any(a.endswith(".video.ffgraph") for a in args):
             stages["encode"] = timeout
+        elif "parts.ffconcat" in args:
+            stages["join"] = timeout
         else:
             stages.setdefault("loudness", timeout)
     # The timeouts follow the source each call decodes (round 2), not the timeline alone: the
     # sound's span plus its seek pre-roll, the picture's span plus a seek's slack, then the
-    # timeline again for the encode itself.
+    # chunk again for the encode itself; the join copies the timeline.
     assert stages["mix"] == pytest.approx(bound(seconds + 0.25))
     assert stages["loudness"] == pytest.approx(bound(seconds))
     assert stages["encode"] == pytest.approx(bound(seconds + 5 + seconds))
-    assert len(calls) >= 3  # mix, gain + limiter, encode
+    assert stages["join"] == pytest.approx(bound(seconds))
+    assert len(calls) >= 4  # mix, gain + limiter, encode, join
     work = calls[0][2]
     assert work.parent == out.parent and work.name.startswith(".b.mp4.aar-render-")
     assert not work.exists()  # removed afterwards

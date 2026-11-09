@@ -44,6 +44,7 @@ def fake_hub(plan: EditPlan, size: tuple[int, int] = (320, 180)) -> dict[str, Hu
             Fraction(plan.fps.num, plan.fps.den),
             source.duration,
             1,
+            video_time_base=Fraction(1, plan.fps.num),  # an MP4's: one frame is den ticks
         )
     return hub
 
@@ -70,12 +71,23 @@ def test_graphs_match_the_goldens(name: str) -> None:
 def test_trims_are_frame_indices_and_samples_never_seconds(name: str) -> None:
     video, mix = graphs(name)
     trims = re.findall(r"(?<![a-z])trim=([^,\[;]*)", video)
-    assert trims and all(re.fullmatch(r"end_frame=\d+", t) for t in trims)  # after the seek
+    # A picture is cut by its timestamps (round 3), then every piece by frame count; a gap is
+    # counted frames. Never seconds.
+    assert trims and all(
+        re.fullmatch(
+            r"start_pts=-?\d+:end_pts=-?\d+|start_frame=\d+:end_frame=\d+|end_frame=\d+", t
+        )
+        for t in trims
+    )
+    assert any(t.startswith("start_pts=") for t in trims)
     atrims = re.findall(r"atrim=([^,\[;]*)", mix)
     assert atrims and all(
         re.fullmatch(r"start_pts=\d+:end_pts=\d+|end_sample=\d+", t) for t in atrims
     )
-    assert "asplit" not in mix and "split=" not in video  # one input per use
+    assert "asplit" not in mix  # one input per use
+    inputs = re.findall(r"\[(\d+:\d+)\]", video)
+    assert inputs and len(inputs) == len(set(inputs))  # each input feeds one picture only
+    assert not re.search(r"\[\d+:\d+\]split", video)
     assert ("between(t" not in video and "enable='between(n," in video) or name == "short_reframe"
 
 
@@ -93,7 +105,13 @@ def test_longform_layout_is_the_exports() -> None:
     # starts on the cut (all on the outgoing tail), as the export's alignment rule says.
     assert outro.window_start == 306
     video, _ = graphs("ccn_longform_v2")
-    assert ":duration=0.625625:offset=12.76275[" in video  # 15 and 306 frames at 23.976
+    # The dissolve is a blend of the outgoing run's last 15 frames (from 306) and the incoming
+    # picture's first 15, at k/15 for its k-th frame, cut by frame count (round 3: a missing
+    # frame leaves the chunk short instead of shifting under a fixed xfade offset).
+    assert "[r0_1]trim=start_frame=306:end_frame=321," in video
+    assert "[p4_0]trim=start_frame=0:end_frame=15," in video
+    assert "[t0][h1]blend=all_expr='A+(B-A)*T*24000/(1001*15)+0.5':shortest=1," in video
+    assert "[b0][d1][b1]concat=n=3:v=1:a=0" in video and "xfade" not in video
     # The head's 15-frame dissolve from black is a fade on the first picture.
     assert "fade=t=in:start_frame=0:nb_frames=15" in video
 
@@ -117,8 +135,13 @@ def test_longform_split_crossfade_sounds_overlap_by_its_window() -> None:
     start = sample_at(plan.fps, 24)
     assert start == 24 * 2002  # 23.976 at 48 kHz: 2002 samples a frame, exactly
     assert f"atrim=start_pts={start}:end_pts={start + (306 - 210) * 2002}" in mix
-    assert f"adelay=delays={210 * 2002}S:all=1" in mix  # placed at record 210
-    assert "amix=inputs=5:normalize=0:duration=longest" in mix  # every sound, summed
+    # Placed at record 210 on the second layer (it overlaps segment 2 by the crossfade): 210
+    # frames of silence before it; no sound is padded to the timeline (round 3).
+    assert f"anullsrc=r=48000:cl=stereo,atrim=end_sample={210 * 2002}[z1]" in mix
+    assert "[z1][s3][z2]concat=n=3:v=0:a=1[l1]" in mix
+    assert "[s0][s1][s2][z0][s4]concat=n=5:v=0:a=1[l0]" in mix
+    assert "[l0][l1]amix=inputs=2:normalize=0:duration=longest[mix]" in mix
+    assert "adelay" not in mix.replace("adelay=delays=0", "")
 
 
 def test_short_reframe_windows_move_per_frame() -> None:

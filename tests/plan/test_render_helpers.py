@@ -96,7 +96,7 @@ def test_render_settings_defaults_and_the_ccn_block() -> None:
     assert RenderSettings().font == "Montserrat" and RenderSettings().master_codec == "h264"
     ccn = load_profile("ccn").render
     assert ccn.limiter_warn_db == 3.0 and ccn.true_peak_margin_db == 0.5
-    assert ccn.gain_tolerance_lu == 0.1 and ccn.decode_memory_mb == 16384
+    assert ccn.gain_tolerance_lu == 0.1 and ccn.memory_budget_mb is None  # the default budget
     assert ccn.review_x264_preset == "medium" and ccn.master_crf == 14
     assert permissive().render == RenderSettings()  # a profile without [render] still loads
     bad_values = (

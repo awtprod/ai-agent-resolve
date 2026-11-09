@@ -179,8 +179,26 @@ def register(subparsers: Any) -> None:
     render.add_argument(
         "--overwrite", action="store_true", help="Replace an existing file and report."
     )
+    render.add_argument(
+        "--memory-budget",
+        type=_memory_mb,
+        metavar="MB",
+        help="The memory one ffmpeg of the render may use, in MB (the picture is encoded in "
+        "chunks that fit it); default min(6 GiB, half of MemAvailable, the cgroup's free "
+        "headroom), or the profile's [render] memory_budget_mb.",
+    )
     render.add_argument("--json", action="store_true", help="Print the report as JSON.")
     render.set_defaults(func=_cmd_render)
+
+
+def _memory_mb(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number of MB") from None
+    if value < 64:
+        raise argparse.ArgumentTypeError("the memory budget must be at least 64 MB")
+    return value
 
 
 def _cmd_schema(args: argparse.Namespace) -> int:
@@ -567,6 +585,9 @@ def _render_text(report: dict[str, Any], out: Path, report_file: Path) -> str:
         f"{report['size_bytes']} bytes)",
         f"timeline {report['plan']['timeline']!r}: {timeline['fps']} fps, "
         f"{timeline['total_frames']} frames, {timeline['resolution']}",
+        f"memory: {len(report['memory']['chunks'])} picture chunk(s), "
+        f"{report['memory']['mix_passes']} mix pass(es), within a "
+        f"{report['memory']['budget']['mb']} MB budget",
         f"loudness: {loud['method']} to {loud['target_lufs']:g} LUFS"
         + (f" -> {measured:g} LUFS" if measured is not None else "")
         + (f" ({loud['note']})" if loud.get("note") else ""),
@@ -618,6 +639,7 @@ def _cmd_render(args: argparse.Namespace) -> int:
             transcript=transcript,
             laughs=laughs,
             overwrite=args.overwrite,
+            memory_budget_mb=args.memory_budget,
         )
     except RenderError as exc:
         return _render_refusal(exc, as_json)

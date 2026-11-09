@@ -261,11 +261,18 @@ class RenderSettings(_Settings):
         le=24,
         description="Warn when the true-peak limiter takes more than this off the peaks.",
     )
-    decode_memory_mb: int = Field(
-        default=16384,
+    memory_budget_mb: int | None = Field(
+        default=None,
         ge=256,
-        description="The most memory the render's open decoders may need (each picture is its own "
-        "input; each holds a few decoded frames); a bigger plan is refused (render_too_large).",
+        description="The memory one ffmpeg of the render may use; the picture is encoded in "
+        "chunks that fit it. Unset: min(6 GiB, half of MemAvailable, the cgroup's free headroom), "
+        "read at render start. `aar plan render --memory-budget` overrides it.",
+    )
+    decode_memory_mb: int | None = Field(
+        default=None,
+        ge=256,
+        description="Round 2's decoder cap; no longer used (round 3: memory_budget_mb), still "
+        "accepted so an older profile loads.",
     )
     timeout_base_s: float = Field(default=120.0, gt=0)
     timeout_per_media_s: float = Field(

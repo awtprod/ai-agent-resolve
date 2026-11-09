@@ -1,3 +1,4 @@
-[0:0]aresample=48000,pan=stereo|c0=c0|c1=c0,atrim=start_pts=0:end_pts=480480,asetpts=PTS-STARTPTS,apad=whole_len=480480,atrim=end_sample=480480,afade=t=in:start_sample=0:nb_samples=12012:curve=tri,apad=whole_len=960960,atrim=end_sample=960960[s0];
-[1:0]aresample=48000,pan=stereo|c0=c0|c1=c0,atrim=start_pts=480480:end_pts=960960,asetpts=PTS-STARTPTS,apad=whole_len=480480,atrim=end_sample=480480,afade=t=out:start_sample=478478:nb_samples=2002:curve=tri,adelay=delays=480480S:all=1,apad=whole_len=960960,atrim=end_sample=960960[s1];
-[s0][s1]amix=inputs=2:normalize=0:duration=longest[mix]
+[0:0]aresample=48000,pan=stereo|c0=c0|c1=c0,atrim=start_pts=0:end_pts=480480,asetpts=PTS-STARTPTS,apad=whole_len=480480,atrim=end_sample=480480,afade=t=in:start_sample=0:nb_samples=12012:curve=tri[s0];
+[1:0]aresample=48000,pan=stereo|c0=c0|c1=c0,atrim=start_pts=480480:end_pts=960960,asetpts=PTS-STARTPTS,apad=whole_len=480480,atrim=end_sample=480480,afade=t=out:start_sample=478478:nb_samples=2002:curve=tri[s1];
+[s0][s1]concat=n=2:v=0:a=1[l0];
+[l0]anull[mix]

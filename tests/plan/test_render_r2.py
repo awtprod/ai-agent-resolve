@@ -288,11 +288,12 @@ def test_refusals_before_any_work(media, tmp_path: Path, monkeypatch) -> None:
     )
     profile = quick()
     tight = profile.model_copy(
-        update={"render": profile.render.model_copy(update={"decode_memory_mb": 256})}
+        update={"render": profile.render.model_copy(update={"memory_budget_mb": 256})}
     )
-    with pytest.raises(RenderError) as info:
+    with pytest.raises(RenderError) as info:  # under the encode's own base: nothing fits
         render_plan(many, tight, out=tmp_path / "many.mp4")
-    assert info.value.code == "render_too_large" and info.value.details["inputs"] == 120
+    assert info.value.code == "render_too_large" and info.value.details["budget_mb"] == 256
+    assert info.value.details["start"] == 0 and info.value.details["pictures"] == 1
     assert calls == [] and not list(tmp_path.iterdir())
 
 
