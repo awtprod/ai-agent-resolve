@@ -34,6 +34,7 @@ from pathlib import Path
 from aar.media import input_url
 from aar.plan.export.layout import TitleSpec, stack_lanes
 from aar.plan.model import Fps, Resolution
+from aar.plan.render.fixed import decimal
 from aar.plan.render.framing import picture_filters
 from aar.plan.render.media import HubSource
 from aar.plan.render.timeline import Picture, Sound, Timeline
@@ -52,7 +53,7 @@ def sample_at(fps: Fps, frame: int, rate: int = SAMPLE_RATE) -> int:
 def seconds(fps: Fps, frames: int) -> str:
     """Frames as seconds for an ffmpeg duration option (microseconds; ffmpeg rounds the value
     back onto the frame)."""
-    return f"{Fraction(frames * fps.den, fps.num):.6f}".rstrip("0").rstrip(".") or "0"
+    return decimal(Fraction(frames * fps.den, fps.num), 6).rstrip("0").rstrip(".") or "0"
 
 
 def _rate(fps: Fps) -> str:
@@ -99,7 +100,7 @@ AUDIO_PREROLL_S = Fraction(1, 4)
 
 
 def _clock(value: Fraction) -> str:
-    return f"{max(value, Fraction(0)):.6f}"
+    return decimal(max(value, Fraction(0)), 6)  # never a format spec: 3.11's Fraction has none
 
 
 def picture_use(pic: Picture, hub: HubSource, fps: Fps) -> Use:
