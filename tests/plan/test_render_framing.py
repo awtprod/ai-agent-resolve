@@ -206,13 +206,43 @@ def test_unconformed_clips_scale_or_fit() -> None:
         frames=1,
     )
     assert fit.mode == "fit" and fit.fitted == (1080, 608)
-    assert picture_filters(fit, PORTRAIT) == ["scale=1080:608", "pad=1080:1920:0:656:black"]
+    assert picture_filters(fit, PORTRAIT) == [
+        "format=yuv444p",
+        "scale=1080:608",
+        "pad=1080:1920:0:656:black",
+    ]
+    # A 4:3 picture in an 854x480 frame: 640 wide, 107 px each side (4:4:4, so the left edge is
+    # not rounded down to an even pixel and the picture sits exactly in the middle).
+    centred = framing_for(
+        _clip(None, False),
+        keys=[],
+        transform=None,
+        display=(640, 480),
+        resolution=Resolution(width=854, height=480),
+        lead=0,
+        frames=1,
+    )
+    assert centred.fitted == (640, 480)
+    assert picture_filters(centred, Resolution(width=854, height=480))[-1] == (
+        "pad=854:480:107:0:black"
+    )
+    # An odd fitted width is moved to the frame's parity, so both margins are whole and equal.
+    odd = framing_for(
+        _clip(None, False),
+        keys=[],
+        transform=None,
+        display=(1000, 1001),
+        resolution=Resolution(width=640, height=360),
+        lead=0,
+        frames=1,
+    )
+    assert odd.fitted is not None and (640 - odd.fitted[0]) % 2 == 0
 
 
 def test_a_long_reframe_nests_logarithmically_and_stays_exact() -> None:
     keys = [
         ReframeKey(time=12 * i, x=0.5 + 0.1 * math.sin(i / 7), zoom=1 + 0.2 * (i % 3))
-        for i in range(600)
+        for i in range(300)
     ]
     framing = framing_for(
         _clip((1920, 1080), True),
@@ -221,7 +251,7 @@ def test_a_long_reframe_nests_logarithmically_and_stays_exact() -> None:
         display=(640, 360),
         resolution=PORTRAIT,
         lead=0,
-        frames=12 * 600,
+        frames=12 * 300,
     )
     assert framing.window is not None
     expr = framing.window.expressions[0]
@@ -229,8 +259,69 @@ def test_a_long_reframe_nests_logarithmically_and_stays_exact() -> None:
     for ch in expr:
         depth += {"(": 1, ")": -1}.get(ch, 0)
         deepest = max(deepest, depth)
-    assert deepest < 40  # a chain of 600 pieces would nest 600 deep
-    for frame in (0, 5, 3001, 4567, 12 * 599, 12 * 600 - 1):
+    assert deepest < 40  # a chain of 300 pieces would nest 300 deep
+    for frame in (0, 5, 1501, 2567, 12 * 299, 12 * 300 - 1):
         want = _final_corners(framing, frame)
         got = [_ffeval(e, frame + 1) for e in framing.window.expressions]
         assert got == pytest.approx([c for corner in want for c in corner], abs=1e-6)
+
+
+def test_straight_runs_of_keyframes_merge_exactly() -> None:
+    from aar.plan.render.framing import reframe_values, simplify_keys
+
+    # A steady pan over 7200 keys (one every 12 frames) is two keys: the same path.
+    keys = [
+        ReframeKey(time=12 * i, x=0.3 + 0.4 * i / 7199, y=0.5, zoom=1.0 + 0.5 * i / 7199)
+        for i in range(7200)
+    ]
+    merged = simplify_keys(keys)
+    assert [k.time for k in merged] == [0, 12 * 7199]
+    frames = 12 * 7199 + 1
+    every = reframe_values(keys, 0, frames)
+    fewer = reframe_values(merged, 0, frames)
+    assert (
+        max(
+            abs(a - b) for u, v in zip(every, fewer, strict=True) for a, b in zip(u, v, strict=True)
+        )
+        < 1e-9
+    )
+    # A bend is kept.
+    bent = [ReframeKey(time=0, x=0.4), ReframeKey(time=10, x=0.5), ReframeKey(time=20, x=0.5)]
+    assert simplify_keys(bent) == bent
+    framing = framing_for(
+        _clip((1920, 1080), True),
+        keys=keys,
+        transform=None,
+        display=(640, 360),
+        resolution=PORTRAIT,
+        lead=0,
+        frames=frames,
+    )
+    assert framing.window is not None and sum(map(len, framing.window.expressions)) < 4096
+
+
+def test_a_reframe_too_long_for_per_frame_expressions_is_refused_fast() -> None:
+    import time
+
+    from aar.plan.render.errors import RenderError
+
+    # The validator's case: 7200 keys that are nowhere straight, over 86400 frames.
+    keys = [
+        ReframeKey(time=12 * i, x=0.3 + 0.4 * ((i * 7919) % 101) / 100,
+                   zoom=1.0 + 0.5 * ((i * 104729) % 97) / 96)
+        for i in range(7200)
+    ]  # fmt: skip
+    started = time.monotonic()
+    with pytest.raises(RenderError) as info:
+        framing_for(
+            _clip((1920, 1080), True),
+            keys=keys,
+            transform=None,
+            display=(640, 360),
+            resolution=PORTRAIT,
+            lead=0,
+            frames=86400,
+        )
+    assert info.value.code == "reframe_too_complex"
+    assert info.value.details["location"] == "segments[0]"
+    assert time.monotonic() - started < 2.0

@@ -1,27 +1,37 @@
 """The ffmpeg filter graphs of a render, as text (S18b): deterministic, so a golden can pin them.
 
-The **video graph** trims each picture by frame index (``trim=start_frame:end_frame``, never
+Every picture and every sound is its own ffmpeg input (round 2): the file opened again with an
+accurate input seek just before the range it plays (``-ss``, half a frame before the first frame
+for a picture, a quarter second before the first sample for a sound), so nothing is decoded
+from the file's start, no decoded frames queue between two uses of one file, and each use is
+cut exactly where it begins. Each input decodes on one thread (``-threads 1``): an open decoder
+holds a few frames, so the open inputs' memory is bounded and estimated before a render.
+
+The **video graph** cuts each picture by frame count after its seek (``trim=end_frame``, never
 seconds), restamps it as frames at the plan's rate (``settb`` + ``setpts=N``), frames it
 (:mod:`~aar.plan.render.framing`), and assembles the spine: runs of pictures and black gaps joined
 by ``concat``, the runs joined by ``xfade`` at each dissolve (offset = the window's first frame,
 duration = its length, both whole frames). Connected clips (V2 and up) go on with ``overlay`` at
-their record frames, titles with ``drawtext`` on their record frames (``enable`` on the frame
-number). Side files (title text, the font, a LUT) are named relative to the work dir, which is
-ffmpeg's working directory, so no path needs filtergraph escaping.
+their record frames, the higher track on top, titles with ``drawtext`` on their record frames
+(``enable`` on the frame number). Side files (title text, the font, a LUT) are named relative to
+the work dir, which is ffmpeg's working directory, so no path needs filtergraph escaping.
 
-The **mix graph** trims each sound by sample (48 kHz, positions converted from frames exactly
-with :func:`sample_at`), applies its gain and fades (``afade``, linear: Resolve's "Cross Fade 0
-dB"), and lays the sounds on as few non-overlapping layers as there are overlaps (S18's
-``stack_lanes``), each a ``concat`` of silences and sounds to the timeline's exact length, mixed
-by summation (``amix`` with ``normalize=0``).
+The **mix graph** runs with ``-copyts``, so each sound is cut by timestamp (``atrim`` on
+``start_pts``/``end_pts`` at 48 kHz) at the absolute time its first frame is shown: a source whose
+audio starts after its video stays in sync, and an audio start after the sound's own start is
+silence. Each sound gets its gain and fades (``afade``, linear: Resolve's "Cross Fade 0 dB"), is
+delayed to its record position (``adelay``) and padded to the timeline's exact length (``apad``
++ ``atrim``), and all are summed (``amix`` with ``normalize=0``).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from fractions import Fraction
+from pathlib import Path
 
-from aar.plan.export.layout import TitleSpec, stack_lanes
+from aar.media import input_url
+from aar.plan.export.layout import TitleSpec
 from aar.plan.model import Fps, Resolution
 from aar.plan.render.framing import picture_filters
 from aar.plan.render.media import HubSource
@@ -63,27 +73,48 @@ class TitleText:
 class VideoGraph:
     text: str
     titles: list[TitleText]
+    uses: list[Use]
 
 
-def _video_inputs(uses: list[int]) -> tuple[list[str], dict[int, list[str]]]:
-    """One label per use of each input's video stream (``split`` when it is used more than once:
-    each use trims its own frames)."""
-    lines: list[str] = []
-    labels: dict[int, list[str]] = {}
-    for k in sorted(set(uses)):
-        count = uses.count(k)
-        names = [f"in{k}_{j}" for j in range(count)]
-        outs = "".join(f"[{name}]" for name in names)
-        lines.append(f"[{k}:v:0]{'null' if count == 1 else f'split={count}'}{outs}")
-        labels[k] = names
-    return lines, labels
+@dataclass(frozen=True)
+class Use:
+    """One ffmpeg input: a hub file opened for one picture or one sound."""
+
+    path: Path
+    stream: int  # the absolute stream index the graph reads
+    seek_s: Fraction | None  # input -ss, from the file's start; None: from its start
+    span_s: Fraction  # the source seconds it decodes (the timeout scales with these)
+
+    def args(self) -> list[str]:
+        seek = [] if self.seek_s is None else ["-ss", _clock(self.seek_s)]
+        return ["-threads", "1", *seek, "-i", input_url(self.path)]
+
+
+#: Seconds of source a seek may decode before the range (to the keyframe before it).
+SEEK_SLACK_S = Fraction(5)
+#: How far before a sound's first sample its input seeks (codec pre-roll, then cut by time).
+AUDIO_PREROLL_S = Fraction(1, 4)
+
+
+def _clock(value: Fraction) -> str:
+    return f"{max(value, Fraction(0)):.6f}"
+
+
+def picture_use(pic: Picture, hub: HubSource, fps: Fps) -> Use:
+    """The input for one picture: seeked half a frame before its first frame, so the seek keeps
+    exactly that frame first whatever the timestamps' rounding."""
+    frame = Fraction(fps.den, fps.num)
+    seek = None
+    if pic.src_start > 0:
+        seek = hub.video_offset_s + (pic.src_start - Fraction(1, 2)) * frame
+    return Use(hub.path, hub.video_index, seek, pic.frames * frame + SEEK_SLACK_S)
 
 
 def _picture_chain(
     pic: Picture, label: str, out: str, fps: Fps, res: Resolution, hub: HubSource, lut: str | None
 ) -> str:
     filters = [
-        f"trim=start_frame={pic.src_start}:end_frame={pic.src_start + pic.frames}",
+        f"trim=end_frame={pic.frames}",  # the seek kept frame src_start first
         f"settb={_tb(fps)}",
         f"setpts=N+{pic.start}" if pic.lane else "setpts=N",
     ]
@@ -149,24 +180,15 @@ def video_graph(
     plan = tl.plan
     fps, res = plan.fps, plan.resolution
     pictures = tl.pictures
-    lines, labels = _video_inputs([p.input for p in pictures])
-    taken: dict[int, int] = {}
+    lines: list[str] = []
+    uses: list[Use] = []
     chains: dict[str, str] = {}
     for n, pic in enumerate(pictures):
-        j = taken.get(pic.input, 0)
-        taken[pic.input] = j + 1
+        media = hub[pic.source_id]
+        uses.append(picture_use(pic, media, fps))
         out = f"p{n}"
-        lines.append(
-            _picture_chain(
-                pic,
-                labels[pic.input][j],
-                out,
-                fps,
-                res,
-                hub[pic.source_id],
-                luts.get(pic.source_id),
-            )
-        )
+        label = f"{n}:{media.video_index}"
+        lines.append(_picture_chain(pic, label, out, fps, res, media, luts.get(pic.source_id)))
         chains[pic.location] = out
     # The spine: runs joined by concat, the runs joined by xfade at each dissolve.
     incoming = {d.window_start: d for d in tl.dissolves}
@@ -221,7 +243,7 @@ def video_graph(
             titles += texts
     tail = [*drawn, f"format={out_pix_fmt}"]
     lines.append(f"[{acc}]{','.join(tail)}[vout]")
-    return VideoGraph(";\n".join(lines) + "\n", titles)
+    return VideoGraph(";\n".join(lines) + "\n", titles, uses)
 
 
 def _channels(channels: int) -> str:
@@ -229,13 +251,44 @@ def _channels(channels: int) -> str:
     return "pan=stereo|c0=c0|c1=c0" if channels == 1 else "pan=stereo|c0=c0|c1=c1"
 
 
-def _sound_chain(sound: Sound, label: str, out: str, fps: Fps) -> str:
-    start = sample_at(fps, sound.src_start)
+@dataclass(frozen=True)
+class MixGraph:
+    text: str
+    uses: list[Use]
+
+
+def sound_use(sound: Sound, hub: HubSource, fps: Fps) -> tuple[Use, int, int]:
+    """The input for one sound, and its first sample and the silence before the audio begins.
+
+    The sound starts at the absolute time its first source frame is shown (the video stream's
+    start plus the frames), which is a sample index in the copied timestamps at 48 kHz. When the
+    file's audio starts later than that, the gap is silence (``lead`` samples)."""
+    shown = hub.video_start_s + Fraction(sound.src_start * fps.den, fps.num)
+    first = round(shown * SAMPLE_RATE)
+    lead = max(0, round(hub.audio_start_s * SAMPLE_RATE) - first)
+    length = Fraction(sound.end - sound.start) * fps.den / fps.num
+    seek = shown - hub.start_s - AUDIO_PREROLL_S
+    use = Use(
+        hub.path,
+        hub.audio_index if hub.audio_index is not None else 0,
+        seek if seek > 0 else None,
+        length + AUDIO_PREROLL_S,
+    )
+    return use, first, lead
+
+
+def _sound_chain(sound: Sound, label: str, out: str, fps: Fps, channels: int, first: int,
+                 lead: int, total: int) -> str:  # fmt: skip
     length = sample_at(fps, sound.end) - sample_at(fps, sound.start)
     filters = [
-        f"atrim=start_sample={start}:end_sample={start + length}",
+        f"aresample={SAMPLE_RATE}",
+        _channels(channels),
+        f"atrim=start_pts={first}:end_pts={first + length}",
         "asetpts=PTS-STARTPTS",
     ]
+    if lead:
+        filters.append(f"adelay=delays={lead}S:all=1")
+    filters += [f"apad=whole_len={length}", f"atrim=end_sample={length}"]
     if sound.gain_db:
         filters.append(f"volume=volume={sound.gain_db:.6f}dB")
     if sound.fade_in:
@@ -244,68 +297,39 @@ def _sound_chain(sound: Sound, label: str, out: str, fps: Fps) -> str:
     if sound.fade_out:
         at = sample_at(fps, sound.end - sound.fade_out) - sample_at(fps, sound.start)
         filters.append(f"afade=t=out:start_sample={at}:nb_samples={length - at}:curve=tri")
-    filters += [f"apad=whole_len={length}", f"atrim=end_sample={length}"]
+    position = sample_at(fps, sound.start)
+    if position:
+        filters.append(f"adelay=delays={position}S:all=1")
+    filters += [f"apad=whole_len={total}", f"atrim=end_sample={total}"]
     return f"[{label}]{','.join(filters)}[{out}]"
 
 
-def _silence(out: str, samples: int) -> str:
-    return f"anullsrc=r={SAMPLE_RATE}:cl=stereo,atrim=end_sample={samples}[{out}]"
+def _channels(channels: int) -> str:
+    """The source's sound as stereo: a mono file on both sides, else its first two channels."""
+    return "pan=stereo|c0=c0|c1=c0" if channels == 1 else "pan=stereo|c0=c0|c1=c1"
 
 
-def mix_graph(tl: Timeline, hub: dict[str, HubSource]) -> str:
-    """The mix of every sound to the timeline's exact sample length, ending in ``[mix]``."""
+def mix_graph(tl: Timeline, hub: dict[str, HubSource]) -> MixGraph:
+    """The mix of every sound to the timeline's exact sample length, ending in ``[mix]``. Run it
+    with ``-copyts`` (each sound is cut by its timestamps)."""
     fps = tl.plan.fps
     total = sample_at(fps, tl.total_frames)
-    sounds = tl.sounds
-    per_input = {s.input: hub[s.source_id].channels or 1 for s in sounds}
     lines: list[str] = []
-    labels: dict[int, list[str]] = {}
-    for k in sorted(per_input):
-        count = sum(1 for s in sounds if s.input == k)
-        prep = f"aresample={SAMPLE_RATE},{_channels(per_input[k])}"
-        names = [f"a{k}_{j}" for j in range(count)]
-        outs = "".join(f"[{name}]" for name in names)
-        split = f",asplit={count}" if count > 1 else ""
-        lines.append(f"[{k}:a:0]{prep}{split}{outs}")
-        labels[k] = names
-    taken: dict[int, int] = {}
-    chains: list[str] = []
-    for n, sound in enumerate(sounds):
-        j = taken.get(sound.input, 0)
-        taken[sound.input] = j + 1
-        lines.append(_sound_chain(sound, labels[sound.input][j], f"s{n}", fps))
-        chains.append(f"s{n}")
-    layers = stack_lanes([(s.start, s.end) for s in sounds], 0)
-    count = max(layers, default=0) + 1
-    layer_labels: list[str] = []
-    gaps = 0
-    for layer in range(count):
-        members = sorted(
-            (i for i, lane in enumerate(layers) if lane == layer), key=lambda i: sounds[i].start
+    uses: list[Use] = []
+    for n, sound in enumerate(tl.sounds):
+        media = hub[sound.source_id]
+        use, first, lead = sound_use(sound, media, fps)
+        uses.append(use)
+        label = f"{n}:{use.stream}"
+        lines.append(
+            _sound_chain(sound, label, f"s{n}", fps, media.channels or 1, first, lead, total)
         )
-        pieces: list[str] = []
-        cursor = 0
-        for i in members:
-            at = sample_at(fps, sounds[i].start)
-            if at > cursor:
-                lines.append(_silence(f"z{gaps}", at - cursor))
-                pieces.append(f"z{gaps}")
-                gaps += 1
-            pieces.append(chains[i])
-            cursor = sample_at(fps, sounds[i].end)
-        if cursor < total:
-            lines.append(_silence(f"z{gaps}", total - cursor))
-            pieces.append(f"z{gaps}")
-            gaps += 1
-        if len(pieces) == 1:
-            layer_labels.append(pieces[0])
-            continue
-        ins = "".join(f"[{p}]" for p in pieces)
-        lines.append(f"{ins}concat=n={len(pieces)}:v=0:a=1[l{layer}]")
-        layer_labels.append(f"l{layer}")
-    if len(layer_labels) == 1:
-        lines.append(f"[{layer_labels[0]}]anull[mix]")
+    count = len(tl.sounds)
+    if count == 0:
+        lines.append(f"anullsrc=r={SAMPLE_RATE}:cl=stereo,atrim=end_sample={total}[mix]")
+    elif count == 1:
+        lines.append("[s0]anull[mix]")
     else:
-        ins = "".join(f"[{label}]" for label in layer_labels)
-        lines.append(f"{ins}amix=inputs={len(layer_labels)}:normalize=0:duration=longest[mix]")
-    return ";\n".join(lines) + "\n"
+        ins = "".join(f"[s{n}]" for n in range(count))
+        lines.append(f"{ins}amix=inputs={count}:normalize=0:duration=longest[mix]")
+    return MixGraph(";\n".join(lines) + "\n", uses)

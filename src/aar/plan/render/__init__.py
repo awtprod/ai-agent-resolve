@@ -25,13 +25,24 @@ import json
 import os
 import secrets
 import shutil
+import signal
+import threading
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Literal
 
 from aar.host.transport import sha256_file
-from aar.media import MediaToolMissing, input_url, resolve_tool, timeout_for
+from aar.media import (
+    MediaError,
+    MediaToolMissing,
+    input_url,
+    probe,
+    resolve_tool,
+    run_tool,
+    timeout_for,
+)
 from aar.plan.apply.inputs import plan_hash
 from aar.plan.export.errors import ExportError
 from aar.plan.export.files import _refuse_existing, write_pair
@@ -41,7 +52,7 @@ from aar.plan.inputs import LaughMap, Transcript
 from aar.plan.lint import Finding, lint
 from aar.plan.model import EditPlan, Source
 from aar.plan.profile import Profile
-from aar.plan.render.errors import RENDER_CODES, RUNTIME_CODES, RenderError
+from aar.plan.render.errors import RENDER_CODES, RUNTIME_CODES, RenderError, RenderTerminated
 from aar.plan.render.fonts import FontChoice, find_font
 from aar.plan.render.graph import SAMPLE_RATE, mix_graph, sample_at, video_graph
 from aar.plan.render.loudness import normalize
@@ -56,6 +67,7 @@ __all__ = [
     "Preset",
     "RenderError",
     "RenderResult",
+    "RenderTerminated",
     "render_layout",
     "render_plan",
     "render_report_path",
@@ -197,6 +209,117 @@ def _work_dir(out: Path) -> Path:
         return work
 
 
+#: The largest picture filter script a render writes (moving reframes take most of it).
+MAX_FILTER_SCRIPT_BYTES = 512 * 1024
+#: Decoded frames an open input holds (measured on ffmpeg 6.1 with one decoding thread: about 4
+#: frames of its picture), plus its own overhead; an audio input's overhead.
+FRAMES_PER_INPUT = 5
+INPUT_OVERHEAD_MB = 2.0
+
+
+def _bytes_per_pixel(pix_fmt: str | None) -> float:
+    fmt = pix_fmt or "yuv420p"
+    bpp = 3.0 if ("444" in fmt or "rgb" in fmt or "gbr" in fmt) else 2.0 if "422" in fmt else 1.5
+    return bpp * (2 if any(depth in fmt for depth in ("p10", "p12", "p16")) else 1)
+
+
+def estimated_memory_mb(tl: Timeline, hub: dict[str, HubSource]) -> float:
+    """What the open decoders of the larger pass (the picture or the sound pass) may hold."""
+    pictures = 0.0
+    for pic in tl.pictures:
+        media = hub[pic.source_id]
+        video = media.info.video
+        frame = media.display[0] * media.display[1] * _bytes_per_pixel(video and video.pix_fmt)
+        pictures += FRAMES_PER_INPUT * frame / 1e6 + INPUT_OVERHEAD_MB
+    sounds = INPUT_OVERHEAD_MB * len(tl.sounds)
+    return max(pictures, sounds)
+
+
+def _check_memory(tl: Timeline, hub: dict[str, HubSource], profile: Profile) -> None:
+    need = estimated_memory_mb(tl, hub)
+    if need > profile.render.decode_memory_mb:
+        raise RenderError(
+            "render_too_large",
+            f"the render opens {len(tl.pictures)} picture inputs, whose decoders may hold about "
+            f"{need:.0f} MB, over [render] decode_memory_mb {profile.render.decode_memory_mb}",
+            "render smaller hub copies (proxies), split the plan, or raise decode_memory_mb on a "
+            "machine with the memory",
+            inputs=len(tl.pictures),
+            estimated_mb=round(need),
+        )
+
+
+def _timeout(settings: Any, spans: list[Fraction]) -> float:
+    """A call's timeout from the source seconds it decodes (round 2: not the timeline's length;
+    each seek may decode back to the keyframe before its range, counted in the spans)."""
+    return timeout_for(
+        float(sum(spans, Fraction(0))),
+        base_s=settings.timeout_base_s,
+        per_media_s=settings.timeout_per_media_s,
+    )
+
+
+@contextlib.contextmanager
+def _sigterm_interrupts() -> Iterator[None]:
+    """SIGTERM raises :class:`RenderTerminated` (an interrupt) while rendering, so ffmpeg's
+    process group is killed and the work dir removed, as for Ctrl-C. Only in the main thread (a
+    signal handler cannot be set from any other); the previous handler comes back afterwards."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def stop(signum: int, _frame: Any) -> None:
+        raise RenderTerminated(signum)
+
+    previous = signal.signal(signal.SIGTERM, stop)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def _check_output(path: Path, frames: int) -> None:
+    """The encode left a video stream of exactly the timeline's frames and a sound stream, or
+    ``render_incomplete`` (never left to QA)."""
+    try:
+        info = probe(path)
+        video = info.video
+        counted = None
+        if video is not None:
+            data = run_tool(
+                "ffprobe",
+                [
+                    *("-hide_banner", "-v", "error", "-select_streams", str(video.index)),
+                    *("-count_packets", "-show_entries", "stream=nb_read_packets"),
+                    *("-of", "csv=p=0", input_url(path)),
+                ],
+                timeout_s=timeout_for(video.duration_s, base_s=60.0, per_media_s=0.5),
+            )
+            text = data.stdout.decode("utf-8", errors="replace").strip()
+            counted = int(text) if text.isdigit() else None
+    except MediaError as exc:
+        raise RenderError(
+            "render_incomplete",
+            f"the encoded file cannot be read back: {exc.summary()}",
+            "check the disk and ffmpeg, then render again",
+            stage="verify",
+        ) from None
+    problems = []
+    if video is None:
+        problems.append("it has no video stream")
+    elif counted != frames:
+        problems.append(f"its video holds {counted} frames, not the timeline's {frames}")
+    if info.audio is None:
+        problems.append("it has no audio stream")
+    if problems:
+        raise RenderError(
+            "render_incomplete",
+            f"the encode is incomplete: {'; '.join(problems)}",
+            "this is a render bug or a broken source; report the plan",
+            stage="verify",
+        )
+
+
 def render_plan(
     plan: EditPlan,
     profile: Profile,
@@ -215,6 +338,16 @@ def render_plan(
         raise ValueError("preset must be 'review' or 'master'")
     out = Path(os.path.abspath(out))
     container = _container(out, preset, profile)
+    res = plan.resolution
+    if res.width % 2 or res.height % 2:
+        raise RenderError(
+            "odd_resolution",
+            f"the plan's resolution {res.width}x{res.height} has an odd side; H.264 and ProRes "
+            "pictures (4:2:0 and 4:2:2) need even dimensions",
+            "give the plan an even width and height (e.g. 854x480, not 853x479)",
+            width=res.width,
+            height=res.height,
+        )
     report_file = render_report_path(out)
     try:
         _refuse_existing([out, report_file], overwrite)
@@ -243,7 +376,6 @@ def render_plan(
             plan.fps,
             media_map=media_map,
             media_root=media_root,
-            fps_tolerance=profile.render.fps_tolerance,
         )
         for sid in used
     }
@@ -252,33 +384,28 @@ def render_plan(
     font = find_font(profile.render.font)
     luts = _luts(plan, used, media_root)
     codec, out_fmt = _codec_args(preset, profile, container)
-    duration_s = float(Fraction(tl.total_frames * plan.fps.den, plan.fps.num))
-    timeout_s = timeout_for(
-        duration_s,
-        base_s=profile.render.timeout_base_s,
-        per_media_s=profile.render.timeout_per_media_s,
-    )
+    _check_memory(tl, hub, profile)
     work = _work_dir(out)
     try:
-        return _render(
-            plan,
-            profile,
-            tl,
-            hub,
-            font,
-            luts,
-            work=work,
-            out=out,
-            report_file=report_file,
-            preset=preset,
-            container=container,
-            codec=codec,
-            out_fmt=out_fmt,
-            timeout_s=timeout_s,
-            transcript=transcript,
-            warnings=warnings,
-            overwrite=overwrite,
-        )
+        with _sigterm_interrupts():
+            return _render(
+                plan,
+                profile,
+                tl,
+                hub,
+                font,
+                luts,
+                work=work,
+                out=out,
+                report_file=report_file,
+                preset=preset,
+                container=container,
+                codec=codec,
+                out_fmt=out_fmt,
+                transcript=transcript,
+                warnings=warnings,
+                overwrite=overwrite,
+            )
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -298,7 +425,6 @@ def _render(
     container: str,
     codec: list[str],
     out_fmt: str,
-    timeout_s: float,
     transcript: Transcript | None,
     warnings: list[Finding],
     overwrite: bool,
@@ -314,45 +440,67 @@ def _render(
         lut_names[sid] = f"lut{n}{path.suffix.lower()}"
         shutil.copyfile(path, work / lut_names[sid])
     graph = video_graph(tl, hub, font=font_name, luts=lut_names, out_pix_fmt=out_fmt)
+    mix = mix_graph(tl, hub)
+    script = len(graph.text.encode("utf-8"))
+    if script > MAX_FILTER_SCRIPT_BYTES:
+        raise RenderError(
+            "reframe_too_complex",
+            f"the picture's filter script is {script // 1024} KiB, over the "
+            f"{MAX_FILTER_SCRIPT_BYTES // 1024} KiB limit (moving reframes take most of it)",
+            "use fewer reframe keyframes, or render the plan in parts",
+            bytes=script,
+        )
     for text in graph.titles:
         (work / text.name).write_text(text.text, encoding="utf-8")
     (work / "video.ffgraph").write_text(graph.text, encoding="utf-8")
-    (work / "mix.ffgraph").write_text(mix_graph(tl, hub), encoding="utf-8")
-    inputs = [arg for path in tl.inputs for arg in ("-i", input_url(path))]
+    (work / "mix.ffgraph").write_text(mix.text, encoding="utf-8")
     samples = sample_at(plan.fps, tl.total_frames)
+    settings = profile.render
     run_ffmpeg(
         [
-            *("-v", "error", "-y", *inputs, "-filter_complex_script", "mix.ffgraph"),
-            *("-map", "[mix]", "-c:a", "pcm_f32le", "-ar", str(SAMPLE_RATE), "-ac", "2"),
+            *("-v", "error", "-y", "-copyts", *(a for use in mix.uses for a in use.args())),
+            *("-filter_complex_script", "mix.ffgraph", "-map", "[mix]"),
+            *("-c:a", "pcm_f32le", "-ar", str(SAMPLE_RATE), "-ac", "2"),
             *("-rf64", "auto", "-f", "wav", "mix.wav"),
         ],
         "mix",
-        timeout_s,
+        _timeout(settings, [use.span_s for use in mix.uses]),
         work,
     )
+    timeline_s = Fraction(tl.total_frames * plan.fps.den, plan.fps.num)
     loudness = normalize(
         work / "mix.wav",
         work / "final.wav",
         kind=plan.kind,
         qa=profile.qa,
-        settings=profile.render,
+        settings=settings,
         samples=samples,
-        timeout_s=timeout_s,
+        timeout_s=_timeout(settings, [timeline_s]),
         cwd=work,
     )
+    if loudness.output_samples != samples:
+        raise RenderError(
+            "render_incomplete",
+            f"the processed sound holds {loudness.output_samples} samples, not the timeline's "
+            f"{samples}",
+            "this is a render bug; report the plan",
+            stage="loudness",
+        )
     rendered_file = work / f"render.{container}"
     rate = f"{plan.fps.num}/{plan.fps.den}"
     run_ffmpeg(
         [
-            *("-v", "error", "-y", *inputs, "-i", "final.wav"),
-            *("-filter_complex_script", "video.ffgraph", "-map", "[vout]"),
-            *("-map", f"{len(tl.inputs)}:a:0", "-r", rate, "-fps_mode", "cfr", *codec),
-            rendered_file.name,
+            *("-v", "error", "-y", *(a for use in graph.uses for a in use.args())),
+            *("-i", "final.wav", "-filter_complex_script", "video.ffgraph", "-map", "[vout]"),
+            *("-map", f"{len(graph.uses)}:a:0", "-r", rate, "-fps_mode", "cfr", *codec),
+            # A movie timescale of 48 kHz states the sound's exact length (its edit list).
+            *("-movie_timescale", str(SAMPLE_RATE), rendered_file.name),
         ],
         "encode",
-        timeout_s,
+        _timeout(settings, [use.span_s for use in graph.uses] + [timeline_s]),
         work,
     )
+    _check_output(rendered_file, tl.total_frames)
     rendered_file.chmod(0o644)  # as the pair writer's report (and S18's files) get
     try:
         qa = qa_check(
@@ -394,7 +542,19 @@ def _render(
         "rendered": rendered(tl, font, {sid: str(path) for sid, path in luts.items()}),
         "loudness": loudness.as_dict(),
         "not_rendered": [item.as_dict() for item in not_rendered(plan, tl.layout, font, luts)],
-        "notes": [item.as_dict() for item in notes(tl, font, hub)],
+        "notes": [item.as_dict() for item in notes(tl, font, hub)]
+        + (
+            [
+                {
+                    "feature": "limiter",
+                    "location": "loudness",
+                    "detail": loudness.warning,
+                    "action": "check the peaks in the source, or limit them by hand",
+                }
+            ]
+            if loudness.warning
+            else []
+        ),
         "lint_warnings": [{"rule": f.rule, "message": f.message} for f in warnings],
         "qa": qa_dict,
     }

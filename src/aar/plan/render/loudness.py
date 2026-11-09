@@ -1,40 +1,40 @@
-"""Loudness of a render's mix, to the profile's ``[qa]`` target (S18b, R6 decision).
+"""Loudness of a render's mix, to the profile's ``[qa]`` target (S18b, R6 decision, round 2).
 
-* **Long-form**: two-pass ``loudnorm``. Pass one measures the mix; pass two normalizes with those
-  measurements (``linear=true``, so one gain when the target LRA and peak allow it; ffmpeg reports
-  ``dynamic`` otherwise, and the report says which), to ``[qa] longform_lufs``.
-* **Short**: gain plus a limiter, never loudnorm, which flattened the laugh range on real shorts.
-  The mix is measured, the gain is ``target - integrated``, and ``alimiter`` (run at 192 kHz, so
-  its sample peak follows the true peak) holds the peaks. The result is measured again and the
-  gain corrected (at most twice) while it lands more than ``[render] short_gain_tolerance_lu`` away.
+Both kinds get the same treatment, with their own target (``[qa] short_lufs`` or
+``longform_lufs``): the mix is measured, brought there by **one linear gain** (``target -
+integrated``), and a true-peak limiter (``alimiter`` at 192 kHz, so its sample peak follows the
+true peak, latency compensated) holds the peaks at ``[qa] true_peak_max_dbtp`` less ``[render]
+true_peak_margin_db`` (so the AAC encode stays at or under the maximum). Nothing compresses the
+programme: loudnorm's dynamic mode flattened the laugh range on shorts and missed the target on
+quiet long-forms with sharp peaks, so it is not used for either kind. The result is measured
+again and the gain corrected (at most twice) while it lands more than ``[render]
+gain_tolerance_lu`` from the target, since limiting loud peaks lowers the loudness.
 
-Both process to ``[qa] true_peak_max_dbtp`` less ``[render] true_peak_margin_db``, so the AAC
-encode stays at or under the maximum, and both keep the exact sample length (``apad`` +
-``atrim``: loudnorm and the resamplers must not pad the tail). A silent mix is not normalized
-(there is no loudness to measure); the report says so and QA's loudness check fails it.
+The report gives the achieved loudness and the limiter's gain reduction (the true peak the gain
+alone would give, less the true peak measured after the limiter), and a warning when that is more
+than ``[render] limiter_warn_db`` (3 dB): the material needs a louder recording or a manual
+limiter, not more of this one. The exact sample length is kept (``apad`` + ``atrim``: the
+resamplers must not pad the tail), and checked. A silent mix is not normalized (there is no
+loudness to measure); the report says so and QA's loudness check fails it.
 """
 
 from __future__ import annotations
 
-import json
 import math
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from aar.media import MediaError, MediaTimeout, input_url, measure_audio
+from aar.media import MediaError, MediaTimeout, input_url, measure_audio, probe
 from aar.plan.profile import QATargets, RenderSettings
 from aar.plan.render.errors import RenderError
 from aar.plan.render.runner import run_ffmpeg
 
-Method = Literal["loudnorm-2pass", "gain-limiter", "none"]
+Method = Literal["gain-limiter", "none"]
 #: Below this integrated loudness (or -inf) the mix is treated as silent.
 SILENT_LUFS = -70.0
-#: A short is rendered at most this many times: the gain, then up to two corrections (limiting
-#: a loud laugh lowers the loudness, so one correction can land short of the target).
-SHORT_GAIN_PASSES = 3
-_JSON_BLOCK = re.compile(r"\{[^{}]*\}", re.S)
+#: The mix is rendered at most this many times: the gain, then up to two corrections.
+GAIN_PASSES = 3
 
 
 @dataclass
@@ -46,7 +46,9 @@ class LoudnessResult:
     output: dict[str, float | None] = field(default_factory=dict)
     gain_db: float | None = None
     passes: int = 0
-    normalization_type: str | None = None
+    limiter_reduction_db: float | None = None
+    output_samples: int | None = None
+    warning: str | None = None
     note: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -58,7 +60,9 @@ class LoudnessResult:
             "output": self.output,
             "gain_db": self.gain_db,
             "passes": self.passes,
-            "normalization_type": self.normalization_type,
+            "limiter_reduction_db": self.limiter_reduction_db,
+            "output_samples": self.output_samples,
+            "warning": self.warning,
             "note": self.note,
         }
 
@@ -94,45 +98,6 @@ def _measure(path: Path, qa: QATargets, timeout_s: float) -> dict[str, float | N
     }
 
 
-def _loudnorm_json(stderr: str) -> dict[str, Any]:
-    """loudnorm's ``print_format=json`` block: the last JSON object in its log."""
-    blocks = _JSON_BLOCK.findall(stderr[stderr.rfind("Parsed_loudnorm") :])
-    if not blocks:
-        raise RenderError(
-            "render_failed",
-            "loudnorm printed no measurement",
-            "check ffmpeg's loudnorm filter",
-            stage="loudnorm",
-        )
-    try:
-        data = json.loads(blocks[-1])
-    except json.JSONDecodeError as exc:
-        raise RenderError(
-            "render_failed",
-            f"loudnorm printed unreadable JSON: {exc}",
-            "check ffmpeg's loudnorm filter",
-            stage="loudnorm",
-        ) from None
-    if not isinstance(data, dict):
-        raise RenderError(
-            "render_failed", "loudnorm JSON is not an object", "check ffmpeg", stage="loudnorm"
-        )
-    return data
-
-
-def _number(data: dict[str, Any], key: str) -> float:
-    try:
-        value = float(data[key])
-    except (KeyError, TypeError, ValueError):
-        raise RenderError(
-            "render_failed",
-            f"loudnorm's measurement has no number for {key!r}",
-            "check ffmpeg's loudnorm filter",
-            stage="loudnorm",
-        ) from None
-    return value
-
-
 def _exact_length(samples: int) -> str:
     return f"apad=whole_len={samples},atrim=end_sample={samples}"
 
@@ -147,6 +112,17 @@ def _write(mix: Path, out: Path, chain: str, stage: str, timeout_s: float, cwd: 
         timeout_s,
         cwd,
     )
+
+
+def _samples(path: Path) -> int | None:
+    """The sample count of a written WAV (its duration at 48 kHz)."""
+    try:
+        info = probe(path)
+    except MediaError:
+        return None
+    stream = info.audio
+    duration = None if stream is None else stream.duration_s
+    return None if duration is None else round(duration * 48000)
 
 
 def normalize(
@@ -164,59 +140,18 @@ def normalize(
     target = qa.short_lufs if kind == "short" else qa.longform_lufs
     peak = qa.true_peak_max_dbtp - settings.true_peak_margin_db
     measured = _measure(mix, qa, timeout_s)
-    method: Method = "gain-limiter" if kind == "short" else "loudnorm-2pass"
-    result = LoudnessResult(method, target, peak, measured)
+    result = LoudnessResult("gain-limiter", target, peak, measured)
     level = measured["integrated_lufs"]
     if level is None or level <= SILENT_LUFS:
         _write(mix, out, _exact_length(samples), "copy", timeout_s, cwd)
         result.method = "none"
         result.note = "the mix is silent: nothing to measure, so it is not normalized"
         result.output = _measure(out, qa, timeout_s)
+        result.output_samples = _samples(out)
         return result
-    if kind == "short":
-        return _gain_limiter(mix, out, result, qa, settings, samples, timeout_s, cwd)
-    lra = settings.longform_lra
-    head = f"loudnorm=I={target:g}:TP={peak:g}:LRA={lra:g}"
-    first = _loudnorm_json(
-        run_ffmpeg(
-            [
-                *("-v", "info", "-i", input_url(mix), "-map", "0:a:0"),
-                *("-af", f"{head}:print_format=json", "-f", "null", "-"),
-            ],
-            "loudnorm-measure",
-            timeout_s,
-            cwd,
-        )
-    )
-    values = {key: _number(first, key) for key in ("input_i", "input_tp", "input_lra")}
-    thresh, offset = _number(first, "input_thresh"), _number(first, "target_offset")
-    chain = (
-        f"{head}:measured_I={values['input_i']:g}:measured_TP={values['input_tp']:g}"
-        f":measured_LRA={values['input_lra']:g}:measured_thresh={thresh:g}:offset={offset:g}"
-        f":linear=true:print_format=json,aresample=48000,{_exact_length(samples)}"
-    )
-    second = _loudnorm_json(_write(mix, out, chain, "loudnorm", timeout_s, cwd))
-    result.passes = 2
-    result.normalization_type = str(second.get("normalization_type"))
-    result.output = _measure(out, qa, timeout_s)
-    return result
-
-
-def _gain_limiter(
-    mix: Path,
-    out: Path,
-    result: LoudnessResult,
-    qa: QATargets,
-    settings: RenderSettings,
-    samples: int,
-    timeout_s: float,
-    cwd: Path,
-) -> LoudnessResult:
-    level = result.mix["integrated_lufs"]
-    assert level is not None
-    gain = result.target_lufs - level
-    limit = 10 ** (result.process_true_peak_dbtp / 20)
-    for attempt in range(1, SHORT_GAIN_PASSES + 1):
+    gain = target - level
+    limit = 10 ** (peak / 20)
+    for attempt in range(1, GAIN_PASSES + 1):
         chain = (
             f"volume=volume={gain:.4f}dB,aresample=192000,"
             f"alimiter=limit={limit:.6f}:attack={settings.limiter_attack_ms:g}"
@@ -228,7 +163,17 @@ def _gain_limiter(
         result.gain_db = round(gain, 4)
         result.passes = attempt
         got = result.output["integrated_lufs"]
-        if got is None or abs(got - result.target_lufs) <= settings.short_gain_tolerance_lu:
+        if got is None or abs(got - target) <= settings.gain_tolerance_lu:
             break
-        gain += result.target_lufs - got
+        gain += target - got
+    mix_peak, out_peak = measured["true_peak_dbtp"], result.output["true_peak_dbtp"]
+    if mix_peak is not None and out_peak is not None and result.gain_db is not None:
+        result.limiter_reduction_db = round(max(0.0, mix_peak + result.gain_db - out_peak), 2)
+        if result.limiter_reduction_db > settings.limiter_warn_db:
+            result.warning = (
+                f"the limiter took {result.limiter_reduction_db:g} dB off the peaks to reach "
+                f"{target:g} LUFS (more than {settings.limiter_warn_db:g} dB): the peaks are far "
+                "above the programme; check the transients, or limit them by hand"
+            )
+    result.output_samples = _samples(out)
     return result

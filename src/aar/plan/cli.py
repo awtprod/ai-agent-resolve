@@ -36,7 +36,7 @@ from aar.plan.model import EditPlan
 from aar.plan.produce import cli as produce_cli
 from aar.plan.profile import ProfileError, load_profile
 from aar.plan.render import RUNTIME_CODES as RENDER_RUNTIME_CODES
-from aar.plan.render import RenderError, render_plan
+from aar.plan.render import RenderError, RenderTerminated, render_plan
 
 _PROG = "aar plan"
 EXIT_OK = 0
@@ -155,7 +155,8 @@ def register(subparsers: Any) -> None:
         "handles, reframe crops, titles, crossfades, gains, loudness to the profile), runs "
         "aar qa check on the result, and writes the file and its report (<stem>.render.json) "
         "as one pair. Exit: 0 rendered and QA did not fail, 1 rendered and QA failed, 2 refused "
-        "or unreadable input, 3 ffmpeg failed or timed out.",
+        "or unreadable input, 3 ffmpeg failed, timed out or left an incomplete file, 143 "
+        "stopped by SIGTERM (ffmpeg stopped, work dir removed).",
     )
     render.add_argument("plan", type=Path, help="EditPlan JSON file.")
     render.add_argument("--profile", help="Profile name or .toml path (default: the plan's).")
@@ -543,6 +544,7 @@ def _do_verify(path: Path, plan: EditPlan, profile: Any, media_map: Any, as_json
 # -- render (S18b) ------------------------------------------------------------------------------
 
 EXIT_RENDER_FAILED = 3  # ffmpeg failed or timed out while rendering
+EXIT_TERMINATED = 143  # SIGTERM (128 + 15), after ffmpeg was stopped and the work dir removed
 
 
 def _render_refusal(exc: RenderError, as_json: bool) -> int:
@@ -619,10 +621,15 @@ def _cmd_render(args: argparse.Namespace) -> int:
         )
     except RenderError as exc:
         return _render_refusal(exc, as_json)
+    except RenderTerminated as exc:
+        cli_io.warn(f"render stopped: {exc}; ffmpeg was stopped and the work dir removed")
+        return EXIT_TERMINATED
     except OSError as exc:
         return _input_error(type(exc).__name__, str(exc), [], as_json)
     for finding in result.warnings:
         cli_io.warn(f"warning {finding.rule}: {finding.message}")
+    if result.report["loudness"].get("warning"):
+        cli_io.warn(f"warning loudness: {result.report['loudness']['warning']}")
     if as_json:
         text = json.dumps(result.report, indent=2, ensure_ascii=False) + "\n"
     else:

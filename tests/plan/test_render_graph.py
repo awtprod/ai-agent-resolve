@@ -53,7 +53,7 @@ def graphs(name: str) -> tuple[str, str]:
     hub = fake_hub(plan)
     tl = build_timeline(render_layout(plan, hub, ccn()), hub)
     video = video_graph(tl, hub, font="font.ttf", luts={}, out_pix_fmt="yuv420p")
-    return video.text, mix_graph(tl, hub)
+    return video.text, mix_graph(tl, hub).text
 
 
 @pytest.mark.parametrize("name", NAMES)
@@ -70,9 +70,12 @@ def test_graphs_match_the_goldens(name: str) -> None:
 def test_trims_are_frame_indices_and_samples_never_seconds(name: str) -> None:
     video, mix = graphs(name)
     trims = re.findall(r"(?<![a-z])trim=([^,\[;]*)", video)
-    assert trims and all(re.fullmatch(r"(start_frame=\d+:)?end_frame=\d+", t) for t in trims)
+    assert trims and all(re.fullmatch(r"end_frame=\d+", t) for t in trims)  # after the seek
     atrims = re.findall(r"atrim=([^,\[;]*)", mix)
-    assert atrims and all(re.fullmatch(r"(start_sample=\d+:)?end_sample=\d+", t) for t in atrims)
+    assert atrims and all(
+        re.fullmatch(r"start_pts=\d+:end_pts=\d+|end_sample=\d+", t) for t in atrims
+    )
+    assert "asplit" not in mix and "split=" not in video  # one input per use
     assert ("between(t" not in video and "enable='between(n," in video) or name == "short_reframe"
 
 
@@ -113,8 +116,9 @@ def test_longform_split_crossfade_sounds_overlap_by_its_window() -> None:
     _, mix = graphs("ccn_longform_v2")
     start = sample_at(plan.fps, 24)
     assert start == 24 * 2002  # 23.976 at 48 kHz: 2002 samples a frame, exactly
-    assert f"atrim=start_sample={start}:end_sample={start + (306 - 210) * 2002}" in mix
-    assert "amix=inputs=2:normalize=0" in mix  # the overlap needs a second layer
+    assert f"atrim=start_pts={start}:end_pts={start + (306 - 210) * 2002}" in mix
+    assert f"adelay=delays={210 * 2002}S:all=1" in mix  # placed at record 210
+    assert "amix=inputs=5:normalize=0:duration=longest" in mix  # every sound, summed
 
 
 def test_short_reframe_windows_move_per_frame() -> None:
@@ -124,3 +128,25 @@ def test_short_reframe_windows_move_per_frame() -> None:
     )
     assert [mode for _, mode in perspectives] == ["frame", "frame"]
     assert all("(in-1)" in corners for corners, _ in perspectives)
+
+
+def test_every_use_is_its_own_input_seeked_before_its_range() -> None:
+    from aar.plan.render.graph import mix_graph as mix_of
+    from aar.plan.render.graph import picture_use
+
+    plan = load_plan(EXPORT_FIXTURES / "ccn_longform_v2.plan.json")
+    hub = fake_hub(plan)
+    tl = build_timeline(render_layout(plan, hub, ccn()), hub)
+    video = video_graph(tl, hub, font=None, luts={}, out_pix_fmt="yuv420p")
+    assert len(video.uses) == len(tl.pictures) == 5  # camA twice: two inputs, no split
+    frame = Fraction(1001, 24000)
+    seeks = [u.seek_s for u in video.uses]
+    assert seeks[0] is None  # segment 0 starts at frame 0: no seek
+    assert seeks[1] == (72 - Fraction(1, 2)) * frame  # half a frame before frame 72
+    assert seeks[2] == (144 - Fraction(1, 2)) * frame
+    assert video.uses[1].args()[:4] == ["-threads", "1", "-ss", "2.982146"]
+    assert picture_use(tl.pictures[0], hub["camA"], plan.fps).span_s > 72 * frame
+    mix = mix_of(tl, hub)
+    assert len(mix.uses) == len(tl.sounds) == 5
+    # A sound's input seeks a quarter second before its first sample (then cuts by time).
+    assert mix.uses[1].seek_s == 72 * frame - Fraction(1, 4)

@@ -17,7 +17,6 @@ and end fades, and each clip's volume (segment gain plus its audio track's gain)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from aar.plan.export.layout import ClipSpec, Layout, TitleSpec, TransitionSpec
 from aar.plan.model import EditPlan, Segment
@@ -32,7 +31,6 @@ class Picture:
 
     location: str
     source_id: str
-    input: int
     lane: int
     start: int
     frames: int
@@ -51,7 +49,6 @@ class Sound:
 
     location: str
     source_id: str
-    input: int
     start: int
     end: int
     src_start: int
@@ -75,7 +72,6 @@ class Timeline:
     plan: EditPlan
     layout: Layout
     total_frames: int
-    inputs: list[Path] = field(default_factory=list)
     pictures: list[Picture] = field(default_factory=list)
     sounds: list[Sound] = field(default_factory=list)
     dissolves: list[Dissolve] = field(default_factory=list)
@@ -142,19 +138,29 @@ def _muted_without_bus(plan: EditPlan, track: int | None) -> bool:
 
 
 def build_timeline(layout: Layout, hub: dict[str, HubSource]) -> Timeline:
-    """Pictures, sounds, dissolves and titles for the layout, or a typed refusal when a hub file
-    is too short for what the timeline plays from it."""
+    """Pictures, sounds, dissolves and titles for the layout, or ``segment_past_media_end`` when
+    a clip (handles included) plays past the last frame of its file's video stream."""
     plan = layout.plan
     tl = Timeline(plan, layout, layout.total_frames, titles=list(layout.titles))
-    index: dict[Path, int] = {}
-    need: dict[str, int] = {}
     for clip in layout.clips:
         source_id = _source_id(plan, clip)
         media = hub[source_id]
-        k = index.setdefault(media.path, len(index))
         seg = _segment(plan, clip)
         head, tail, fade = _picture_ends(layout, clip)
         frames = clip.record_out - clip.record_in + head + tail
+        if clip.src_in - head + frames > media.frames:
+            raise RenderError(
+                "segment_past_media_end",
+                f"{clip.location} plays source frames {clip.src_in - head}.."
+                f"{clip.src_in - head + frames} of {source_id!r} (handles included), but the "
+                f"video of {media.path.name} ends after frame {media.frames - 1} "
+                f"({media.frames} frames)",
+                "shorten the range or its transitions, or check the hub copy",
+                location=clip.location,
+                source=source_id,
+                needed_frames=clip.src_in - head + frames,
+                media_frames=media.frames,
+            )
         framing = framing_for(
             clip,
             keys=list(seg.reframe) if seg is not None else [],
@@ -164,19 +170,18 @@ def build_timeline(layout: Layout, hub: dict[str, HubSource]) -> Timeline:
             lead=head,
             frames=frames,
         )
-        picture = Picture(
-            clip.location,
-            source_id,
-            k,
-            clip.lane,
-            clip.record_in - head,
-            frames,
-            clip.src_in - head,
-            framing,
-            fade,
+        tl.pictures.append(
+            Picture(
+                clip.location,
+                source_id,
+                clip.lane,
+                clip.record_in - head,
+                frames,
+                clip.src_in - head,
+                framing,
+                fade,
+            )
         )
-        tl.pictures.append(picture)
-        need[source_id] = max(need.get(source_id, 0), picture.src_start + frames)
         start, end, fade_in, fade_out = _sound_range(layout, clip)
         src_start = clip.src_in - (clip.record_in - start)
         if _muted_without_bus(plan, clip.audio_track):
@@ -195,7 +200,6 @@ def build_timeline(layout: Layout, hub: dict[str, HubSource]) -> Timeline:
                 Sound(
                     clip.location,
                     source_id,
-                    k,
                     start,
                     end,
                     src_start,
@@ -204,21 +208,7 @@ def build_timeline(layout: Layout, hub: dict[str, HubSource]) -> Timeline:
                     fade_out,
                 )
             )
-            need[source_id] = max(need[source_id], src_start + end - start)
-    tl.inputs = list(index)
     for spec in layout.transitions:
         if spec.form == "transition" and spec.kind != "head":
             tl.dissolves.append(Dissolve(spec.location, spec.cut, spec.window_start, spec.frames))
-    for source_id, frames in need.items():
-        media = hub[source_id]
-        if media.frames is not None and frames > media.frames:
-            raise RenderError(
-                "media_too_short",
-                f"source {source_id!r}: the timeline plays up to frame {frames} of "
-                f"{media.path.name}, which holds {media.frames} frames",
-                "check the source ranges and handles against the hub copy, or re-ingest it",
-                source=source_id,
-                needed_frames=frames,
-                media_frames=media.frames,
-            )
     return tl

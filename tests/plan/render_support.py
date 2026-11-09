@@ -56,8 +56,28 @@ class Spec:
     quiet: tuple[tuple[int, int], ...] = ()
     #: Source frame spans [a, b) where the tone is louder by the given dB (a "laugh").
     bursts: tuple[tuple[int, int, float], ...] = ()
+    #: Times (seconds) of 4 ms clicks at 0.7 of full scale: sharp peaks with little energy.
+    clicks: tuple[float, ...] = ()
     rate: Fraction = RATE
     audio: bool = True
+    #: Different content on the right channel (a second tone), for stereo channel checks.
+    right_hz: float | None = None
+    container: str = "mov"  # or "matroska"
+    audio_offset_s: float = 0.0  # the audio starts this long after the video
+    sar: str | None = None  # a stored pixel aspect, e.g. "4/3" (anamorphic)
+    rotate: int | None = None  # a display rotation, in degrees
+    #: Frames dropped after encoding with their timestamps kept: a variable frame rate.
+    drop: tuple[int, ...] = ()
+    #: Seeded white noise (at ``tone_dbfs`` RMS) instead of a tone: sample-exact alignment checks.
+    noise_seed: int | None = None
+
+    def noise(self) -> np.ndarray:
+        """The noise this spec's audio holds, (samples, channels) float32."""
+        assert self.noise_seed is not None
+        n = round(Fraction(self.frames) / self.rate * SAMPLE_RATE)
+        rng = np.random.default_rng(self.noise_seed)
+        rms = 10 ** (self.tone_dbfs / 20)
+        return (rng.standard_normal((n, self.channels)) * rms).astype(np.float32)
 
     @property
     def block(self) -> tuple[int, int, int, int]:
@@ -81,7 +101,7 @@ def pattern_frame(spec: Spec, index: int) -> np.ndarray:
     return img
 
 
-def _audio_expr(spec: Spec) -> str:
+def _audio_expr(spec: Spec, tone_hz: float | None = None) -> str:
     amp = 10 ** (spec.tone_dbfs / 20)
     gate = "1"
     for a, b in spec.quiet:
@@ -92,30 +112,36 @@ def _audio_expr(spec: Spec) -> str:
         t0 = float(Fraction(a) / spec.rate)
         t1 = float(Fraction(b) / spec.rate)
         gate += f"*(1+{10 ** (db / 20) - 1:.6f}*between(t,{t0:.6f},{t1:.6f}))"
-    return f"{amp:.6f}*sin(2*PI*{spec.tone_hz}*t)*{gate}"
+    clicks = "".join(f"+0.7*between(t,{c:.6f},{c + 0.004:.6f})" for c in spec.clicks)
+    return f"{amp:.6f}*sin(2*PI*{tone_hz or spec.tone_hz}*t)*{gate}{clicks}"
 
 
 def make_media(path: Path, spec: Spec) -> Path:
     """Write ``spec`` as a small H.264 (lossless luma) + PCM file at ``path``."""
     w, h = spec.size
     seconds = float(Fraction(spec.frames) / spec.rate)
+    staged = path.with_name(f"pre.{path.name}") if spec.drop or spec.rotate is not None else path
     cmd = [FFMPEG, "-hide_banner", "-nostdin", "-v", "error", "-y"]
     cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}"]
     cmd += ["-r", f"{spec.rate.numerator}/{spec.rate.denominator}", "-i", "pipe:"]
-    if spec.audio:
+    raw = staged.with_name(f"{staged.name}.f32")
+    if spec.audio and spec.noise_seed is not None:
+        spec.noise().tofile(raw)
+        cmd += ["-f", "f32le", "-ar", str(SAMPLE_RATE), "-ac", str(spec.channels), "-i", str(raw)]
+        cmd += ["-map", "0:v", "-map", "1:a", "-c:a", "pcm_s24le"]
+    elif spec.audio:
         layout = "mono" if spec.channels == 1 else "stereo"
         expr = _audio_expr(spec)
         if spec.channels == 2:
-            expr = f"{expr}|{expr}"
-        cmd += [
-            "-f",
-            "lavfi",
-            "-i",
-            f"aevalsrc='{expr}':s={SAMPLE_RATE}:c={layout}:d={seconds:.6f}",
-        ]
-        cmd += ["-map", "0:v", "-map", "1:a", "-c:a", "pcm_s16le"]
+            expr = f"{expr}|{_audio_expr(spec, spec.right_hz)}"
+        if spec.audio_offset_s:
+            cmd += ["-itsoffset", f"{spec.audio_offset_s:.6f}"]
+        source = f"aevalsrc='{expr}':s={SAMPLE_RATE}:c={layout}:d={seconds:.6f}"
+        cmd += ["-f", "lavfi", "-i", source, "-map", "0:v", "-map", "1:a", "-c:a", "pcm_s16le"]
     cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-pix_fmt", "yuv420p"]
-    cmd += ["-f", "mov", str(path)]
+    if spec.sar:
+        cmd += ["-vf", f"setsar={spec.sar}"]
+    cmd += ["-f", spec.container, str(staged)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     assert proc.stdin is not None
     try:
@@ -123,7 +149,21 @@ def make_media(path: Path, spec: Spec) -> Path:
             proc.stdin.write(pattern_frame(spec, index).tobytes())
     finally:
         proc.stdin.close()
-    assert proc.wait(timeout=120) == 0, f"ffmpeg failed writing {path}"
+    assert proc.wait(timeout=120) == 0, f"ffmpeg failed writing {staged}"
+    raw.unlink(missing_ok=True)
+    tail = ["-f", spec.container, str(path)]
+    if spec.drop:
+        dropped = "+".join(f"eq(n\\,{n})" for n in spec.drop)
+        run = [FFMPEG, "-hide_banner", "-v", "error", "-y", "-i", str(staged)]
+        run += ["-vf", f"select='not({dropped})'", "-fps_mode", "passthrough"]
+        run += ["-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-c:a", "copy", *tail]
+        subprocess.run(run, check=True)
+        staged.unlink()
+    elif spec.rotate is not None:
+        run = [FFMPEG, "-hide_banner", "-v", "error", "-y", "-display_rotation:v:0"]
+        run += [str(spec.rotate), "-i", str(staged), "-map", "0", "-c", "copy", *tail]
+        subprocess.run(run, check=True)
+        staged.unlink()
     return path
 
 

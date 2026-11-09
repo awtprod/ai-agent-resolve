@@ -1,5 +1,5 @@
 {
- "loudness_method": "loudnorm-2pass",
+ "loudness_method": "gain-limiter",
  "not_rendered": [
   {
    "action": "for the template's look, import the FCPXML export into a branch of it",

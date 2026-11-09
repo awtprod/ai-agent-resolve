@@ -220,6 +220,8 @@ class RenderSettings(_Settings):
 
     Optional, with defaults in code, so an older profile still loads. The loudness targets are
     the ``[qa]`` ones; these are how the render reaches them. See docs/DESIGN.md "Hub render".
+    A source's frame rate must be the plan's within 0.01 % (fixed: frames are cut by index and
+    sound by time, so a looser rate drifts).
     """
 
     font: str = Field(
@@ -237,13 +239,6 @@ class RenderSettings(_Settings):
     master_crf: int = Field(default=14, ge=0, le=51)
     master_x264_preset: X264Preset = "slow"
     master_audio_kbps: int = Field(default=320, ge=64, le=512)
-    longform_lra: float = Field(
-        default=20.0,
-        ge=1,
-        le=50,
-        description="loudnorm's LRA target for long-forms: high, so the linear (one gain) mode "
-        "holds and the laugh range is kept.",
-    )
     true_peak_margin_db: float = Field(
         default=0.5,
         ge=0,
@@ -253,19 +248,24 @@ class RenderSettings(_Settings):
     )
     limiter_attack_ms: float = Field(default=5.0, ge=0.1, le=80)
     limiter_release_ms: float = Field(default=50.0, ge=1, le=8000)
-    short_gain_tolerance_lu: float = Field(
+    gain_tolerance_lu: float = Field(
         default=0.1,
         gt=0,
         le=1,
-        description="A short's gain is measured again after the limiter and corrected (up to "
-        "twice) while it lands further than this from the target.",
+        description="The gain is measured again after the limiter and corrected (up to twice) "
+        "while the loudness lands further than this from the target.",
     )
-    fps_tolerance: float = Field(
-        default=0.001,
-        ge=0,
-        lt=0.05,
-        description="How far (as a share) a source's frame rate may sit from the plan's. Frames "
-        "are taken by index and retimed to the plan's rate.",
+    limiter_warn_db: float = Field(
+        default=3.0,
+        gt=0,
+        le=24,
+        description="Warn when the true-peak limiter takes more than this off the peaks.",
+    )
+    decode_memory_mb: int = Field(
+        default=16384,
+        ge=256,
+        description="The most memory the render's open decoders may need (each picture is its own "
+        "input; each holds a few decoded frames); a bigger plan is refused (render_too_large).",
     )
     timeout_base_s: float = Field(default=120.0, gt=0)
     timeout_per_media_s: float = Field(

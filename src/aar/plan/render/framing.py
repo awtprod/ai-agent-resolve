@@ -29,6 +29,7 @@ from typing import Literal
 from aar.plan.export.layout import ClipSpec
 from aar.plan.export.verify import window_from_plan
 from aar.plan.model import ReframeKey, Resolution, Transform
+from aar.plan.render.errors import RenderError
 
 FramingMode = Literal["scale", "fit", "window"]
 Point = tuple[float, float]
@@ -161,9 +162,78 @@ def _piecewise(points: list[tuple[int, float]], t: str) -> str:
     return f"if(lt({t},{first[0]}),{_num(first[1])},if(lt({t},{last[0]}),{inner},{_num(last[1])}))"
 
 
-def _window_plan(geo: Geometry, keys: list[ReframeKey], lead: int, frames: int) -> WindowPlan:
-    keys = keys or [ReframeKey(time=0)]
-    values = [reframe_at(keys, i - lead) for i in range(frames)]
+#: Collinear keyframes are merged when the middle one sits on its neighbours' line to this.
+COLLINEAR_TOLERANCE = 1e-12
+#: The most bytes of corner expressions one moving window may take: perspective parses them again
+#: at every frame, so a path past this is refused (``reframe_too_complex``).
+MAX_EXPRESSION_BYTES = 256 * 1024
+
+
+def simplify_keys(keys: list[ReframeKey]) -> list[ReframeKey]:
+    """The keys without those that lie on the straight line between their neighbours in ``x``,
+    ``y`` and ``zoom`` (within :data:`COLLINEAR_TOLERANCE`): the same path, interpolated
+    linearly, with fewer pieces. The first and last keys always stay."""
+    if len(keys) < 3:
+        return list(keys)
+    kept = [keys[0]]
+    for middle, after in itertools.pairwise(keys[1:]):
+        before = kept[-1]
+        f = (middle.time - before.time) / (after.time - before.time)
+        on_line = all(
+            abs(getattr(before, name) + (getattr(after, name) - getattr(before, name)) * f
+                - getattr(middle, name)) <= COLLINEAR_TOLERANCE
+            for name in ("x", "y", "zoom")
+        )  # fmt: skip
+        if not on_line:
+            kept.append(middle)
+    kept.append(keys[-1])
+    return kept
+
+
+def reframe_values(
+    keys: list[ReframeKey], lead: int, frames: int
+) -> list[tuple[float, float, float]]:
+    """:func:`reframe_at` for rendered frames ``0 .. frames - 1`` (segment frame ``i - lead``),
+    in one pass over the keys."""
+    if not keys:
+        return [(0.5, 0.5, 1.0)] * frames
+    out: list[tuple[float, float, float]] = []
+    k = 0
+    for i in range(frames):
+        t = i - lead
+        while k + 1 < len(keys) and keys[k + 1].time <= t:
+            k += 1
+        a = keys[k]
+        if t <= keys[0].time or k + 1 >= len(keys):
+            out.append((a.x, a.y, a.zoom))
+            continue
+        b = keys[k + 1]
+        f = (t - a.time) / (b.time - a.time)
+        out.append((a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f, a.zoom + (b.zoom - a.zoom) * f))
+    return out
+
+
+def _window_plan(
+    geo: Geometry, keys: list[ReframeKey], lead: int, frames: int, location: str
+) -> WindowPlan:
+    keys = simplify_keys(keys) or [ReframeKey(time=0)]
+    t = f"(in-1-{lead})" if lead else "(in-1)"
+    xs = _piecewise([(k.time, k.x) for k in keys], t)
+    ys = _piecewise([(k.time, k.y) for k in keys], t)
+    zs = _piecewise([(k.time, k.zoom) for k in keys], t)
+    size = 4 * (len(xs) + len(ys) + 2 * len(zs)) + 400
+    if size > MAX_EXPRESSION_BYTES:
+        raise RenderError(
+            "reframe_too_complex",
+            f"{location}: its reframe needs about {size // 1024} KiB of per-frame corner "
+            f"expressions ({len(keys)} keyframes after merging straight runs), over the "
+            f"{MAX_EXPRESSION_BYTES // 1024} KiB limit",
+            "use fewer keyframes (aar plan produce's key_step_s), or split the segment",
+            location=location,
+            keyframes=len(keys),
+            bytes=size,
+        )
+    values = reframe_values(keys, lead, frames)
     moving = len(set(values)) > 1
     sample = values if moving else values[:1]
     points = [p for v in sample for p in geo.corners(*v)]
@@ -204,10 +274,6 @@ def _window_plan(geo: Geometry, keys: list[ReframeKey], lead: int, frames: int) 
             got = a * share + b / key.zoom + c
             if abs(got - direct[index // 2][index % 2]) > AFFINE_CHECK_PX:
                 raise AssertionError(f"corner {index} is not affine in x and 1/zoom")
-    t = f"(in-1-{lead})" if lead else "(in-1)"
-    xs = _piecewise([(k.time, k.x) for k in keys], t)
-    ys = _piecewise([(k.time, k.y) for k in keys], t)
-    zs = _piecewise([(k.time, k.zoom) for k in keys], t)
     exprs: list[str] = []
     for index, (a, b, c) in enumerate(coeffs):
         share = xs if index % 2 == 0 else ys
@@ -240,19 +306,26 @@ def framing_for(
     its plan range (S18's conform decides: ``fill`` is a window)."""
     if clip.conform and clip.frame_size is not None:
         geo = Geometry(transform or Transform(), clip.frame_size, display, resolution)
-        plan = _window_plan(geo, keys, lead, frames)
+        plan = _window_plan(geo, keys, lead, frames, clip.location)
         return Framing("window", display, None, plan, geo, tuple(keys), lead)
     width, height = resolution.width, resolution.height
     if display[0] * height == display[1] * width:
         return Framing("scale", display)
     fit = min(width / display[0], height / display[1])
     fitted = (
-        min(width, max(2, round(display[0] * fit))),
-        min(height, max(2, round(display[1] * fit))),
+        _centred(display[0] * fit, width),
+        _centred(display[1] * fit, height),
     )
     if abs(fitted[0] - width) <= 1 and abs(fitted[1] - height) <= 1:
         return Framing("scale", display)
     return Framing("fit", display, fitted)
+
+
+def _centred(exact: float, frame: int) -> int:
+    """The fitted size nearest ``exact`` that leaves an even margin, so the picture sits exactly
+    in the middle of the frame (the padding is the same on both sides)."""
+    options = [n for n in range(int(exact) - 1, int(exact) + 3) if 2 <= n <= frame]
+    return min((n for n in options if (frame - n) % 2 == 0), key=lambda n: (abs(n - exact), n))
 
 
 def picture_filters(framing: Framing, resolution: Resolution) -> list[str]:
@@ -263,7 +336,9 @@ def picture_filters(framing: Framing, resolution: Resolution) -> list[str]:
     if framing.mode == "fit":
         assert framing.fitted is not None
         fw, fh = framing.fitted
+        # In 4:4:4, so the pad's left edge is not rounded to an even pixel for the chroma.
         return [
+            "format=yuv444p",
             f"scale={fw}:{fh}",
             f"pad={width}:{height}:{(width - fw) // 2}:{(height - fh) // 2}:black",
         ]

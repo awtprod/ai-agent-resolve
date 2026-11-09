@@ -252,16 +252,20 @@ def test_a_loud_burst_is_held_under_the_true_peak_maximum(media, tmp_path: Path)
     assert qa["duration"]["status"] == "pass"
 
 
-def test_a_long_form_gets_two_pass_loudnorm(media, tmp_path: Path) -> None:
+def test_a_long_form_gets_one_gain_and_a_limiter_and_keeps_its_range(media, tmp_path) -> None:
     result = render_plan(
         _short(media, "voice").model_copy(update={"kind": "longform"}),
         quick(),
         out=tmp_path / "lf.mp4",
     )
     loud = result.report["loudness"]
-    assert loud["method"] == "loudnorm-2pass" and loud["passes"] == 2
+    assert loud["method"] == "gain-limiter" and loud["target_lufs"] == -22.0
     qa = {c["id"]: c for c in result.report["qa"]["checks"]}
     assert qa["loudness"]["measured"]["integrated_lufs"] == pytest.approx(-22.0, abs=0.5)
+    pcm = read_pcm(result.out)
+    voice = tone_dbfs(pcm, sample_at(10), sample_at(55), 440)
+    laugh = tone_dbfs(pcm, sample_at(62), sample_at(88), 440)
+    assert laugh - voice == pytest.approx(8.0, abs=0.5)  # one gain: the laugh range is kept
 
 
 def test_a_muted_track_with_no_bus_is_silent(media, tmp_path: Path) -> None:
@@ -347,19 +351,35 @@ def test_every_ffmpeg_call_is_bounded_and_stays_in_the_work_dir(media, tmp_path,
     out = tmp_path / "out" / "b.mp4"
     out.parent.mkdir()
     render_plan(plan, profile, out=out)
-    duration = 48 * 1001 / 24000
-    want = timeout_for(
-        duration,
-        base_s=profile.render.timeout_base_s,
-        per_media_s=profile.render.timeout_per_media_s,
-    )
-    assert len(calls) >= 4
+    settings = profile.render
+    seconds = 48 * 1001 / 24000
+
+    def bound(source_s: float) -> float:
+        return timeout_for(
+            source_s, base_s=settings.timeout_base_s, per_media_s=settings.timeout_per_media_s
+        )
+
+    stages = {}
+    for args, timeout, _ in calls:
+        if "mix.ffgraph" in args:
+            stages["mix"] = timeout
+        elif "video.ffgraph" in args:
+            stages["encode"] = timeout
+        else:
+            stages.setdefault("loudness", timeout)
+    # The timeouts follow the source each call decodes (round 2), not the timeline alone: the
+    # sound's span plus its seek pre-roll, the picture's span plus a seek's slack, then the
+    # timeline again for the encode itself.
+    assert stages["mix"] == pytest.approx(bound(seconds + 0.25))
+    assert stages["loudness"] == pytest.approx(bound(seconds))
+    assert stages["encode"] == pytest.approx(bound(seconds + 5 + seconds))
+    assert len(calls) >= 3  # mix, gain + limiter, encode
     work = calls[0][2]
     assert work.parent == out.parent and work.name.startswith(".b.mp4.aar-render-")
     assert not work.exists()  # removed afterwards
     media_url = f"file:{media['a'][0]}"
-    for args, timeout, cwd in calls:
-        assert timeout == pytest.approx(want) and cwd == work
+    for args, _, cwd in calls:
+        assert cwd == work
         assert "-filter_complex" not in args  # graphs go in -filter_complex_script files
         for arg in args:
             if arg.startswith(("/", "file:")):

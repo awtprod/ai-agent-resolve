@@ -95,10 +95,18 @@ def test_run_tool_runs_in_the_given_directory(tmp_path: Path) -> None:
 def test_render_settings_defaults_and_the_ccn_block() -> None:
     assert RenderSettings().font == "Montserrat" and RenderSettings().master_codec == "h264"
     ccn = load_profile("ccn").render
-    assert ccn.longform_lra == 20.0 and ccn.true_peak_margin_db == 0.5
+    assert ccn.limiter_warn_db == 3.0 and ccn.true_peak_margin_db == 0.5
+    assert ccn.gain_tolerance_lu == 0.1 and ccn.decode_memory_mb == 16384
     assert ccn.review_x264_preset == "medium" and ccn.master_crf == 14
     assert permissive().render == RenderSettings()  # a profile without [render] still loads
-    for bad in ({"master_codec": "dnxhd"}, {"true_peak_margin_db": float("nan")}, {"crf": 1}):
+    bad_values = (
+        {"master_codec": "dnxhd"},
+        {"true_peak_margin_db": float("nan")},
+        {"crf": 1},
+        {"fps_tolerance": 0.001},  # gone in round 2: a source's rate must be the plan's
+        {"longform_lra": 20.0},  # gone in round 2: no loudnorm
+    )
+    for bad in bad_values:
         with pytest.raises((ValidationError, ValueError)):
             RenderSettings.model_validate(bad)
     with pytest.raises(ValueError):

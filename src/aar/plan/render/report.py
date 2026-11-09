@@ -198,6 +198,16 @@ def notes(tl: Timeline, font: FontChoice, hub: Mapping[str, HubSource]) -> list[
     out = [Item(feature, location, detail) for feature, location, detail in tl.silent]
     for index, source in enumerate(tl.plan.sources):
         media = hub.get(source.id)
+        offset = None if media is None else media.audio_start_s - media.video_start_s
+        if media is not None and media.channels is not None and offset:
+            out.append(
+                Item(
+                    "audio_offset",
+                    f"sources[{index}]",
+                    f"{media.path.name}'s audio starts {float(offset):+.6f} s from its video; the "
+                    "sound is cut by time, so it stays in sync with the picture",
+                )
+            )
         if media is not None and media.channels is not None and media.channels > 2:
             out.append(
                 Item(

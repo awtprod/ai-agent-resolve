@@ -256,7 +256,9 @@ def test_longform_sound_is_placed_to_the_sample(longform: Rendered) -> None:
 def test_longform_loudness_and_qa(longform: Rendered) -> None:
     report = longform.report
     loud = report["loudness"]
-    assert loud["method"] == "loudnorm-2pass" and loud["normalization_type"] == "linear"
+    assert loud["method"] == "gain-limiter" and loud["target_lufs"] == -22.0
+    assert loud["limiter_reduction_db"] < 0.5 and loud["warning"] is None  # tones: no peaks
+    assert loud["output_samples"] == 852852  # 426 frames at 23.976, exactly
     qa = {c["id"]: c for c in report["qa"]["checks"]}
     assert report["qa"]["status"] == "pass" and report["qa"]["kind"] == "longform"
     measured = qa["loudness"]["measured"]
@@ -340,7 +342,7 @@ def test_short_crops_are_s18s_windows(short: Rendered) -> None:
 def test_short_loudness_is_gain_and_limiter(short: Rendered) -> None:
     report = short.report
     loud = report["loudness"]
-    assert loud["method"] == "gain-limiter" and loud["normalization_type"] is None
+    assert loud["method"] == "gain-limiter" and loud["target_lufs"] == -14.5
     assert loud["gain_db"] == pytest.approx(-14.5 - loud["mix"]["integrated_lufs"], abs=0.3)
     qa = {c["id"]: c for c in report["qa"]["checks"]}
     assert qa["loudness"]["status"] == "pass"
