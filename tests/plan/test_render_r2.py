@@ -287,13 +287,20 @@ def test_refusals_before_any_work(media, tmp_path: Path, monkeypatch) -> None:
         media, [{"source": "A", "src_in": 3 * i, "src_out": 3 * i + 3} for i in range(120)]
     )
     profile = quick()
-    tight = profile.model_copy(
-        update={"render": profile.render.model_copy(update={"memory_budget_mb": 256})}
-    )
-    with pytest.raises(RenderError) as info:  # under the encode's own base: nothing fits
-        render_plan(many, tight, out=tmp_path / "many.mp4")
+
+    def tight(mb: int) -> Profile:
+        return profile.model_copy(
+            update={"render": profile.render.model_copy(update={"memory_budget_mb": mb})}
+        )
+
+    with pytest.raises(RenderError) as info:  # under the encoder's own base (328 MB): it says so
+        render_plan(many, tight(256), out=tmp_path / "many.mp4")
     assert info.value.code == "render_too_large" and info.value.details["budget_mb"] == 256
-    assert info.value.details["start"] == 0 and info.value.details["pictures"] == 1
+    assert info.value.details["reason"] == "encoder_base" and "encoder alone" in info.value.message
+    with pytest.raises(RenderError) as info:  # the base fits, not with a picture (331 MB)
+        render_plan(many, tight(330), out=tmp_path / "many.mp4")
+    assert info.value.details["reason"] == "pictures" and info.value.details["pictures"] == 1
+    assert info.value.details["start"] == 0 and "hold one picture" in info.value.message
     assert calls == [] and not list(tmp_path.iterdir())
 
 
