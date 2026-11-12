@@ -9,12 +9,13 @@ runs only with ``AAR_WHISPER_MODEL`` set and faster-whisper installed.
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import os
 import sys
 import types
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ import pytest
 from analyze_support import needs_ffmpeg, tone, write_wav
 
 from aar.analyze import CCN_PRESET, AnalyzeError, WhisperTranscriber, transcribe_file
+from aar.analyze.audio import NORMALIZE_FILTER
 from aar.analyze.whisper import (
     checkpoint_path,
     explicit_offset,
@@ -143,7 +145,8 @@ KEPT_WORDS += ["compression", "edge", "good", "night"]
 
 @pytest.fixture
 def fake(monkeypatch: pytest.MonkeyPatch) -> Fake:
-    registry = Fake(list(SEGMENTS))
+    # A deep copy: a test that edits a segment must not change it for the tests after it.
+    registry = Fake(copy.deepcopy(SEGMENTS))
     monkeypatch.setitem(sys.modules, "faster_whisper", registry.module)
     return registry
 
@@ -772,3 +775,103 @@ def test_live_whisper_gives_a_valid_transcript(tmp_path):
     transcript = load_transcript(out)  # validates; an empty transcript is fine for a tone
     assert report["counts"]["words"] == len(transcript.words)
     assert not checkpoint_path(out).exists()
+
+
+# ---------------------------------------------------------------- S19d: normalize and wordless
+
+
+def test_normalize_is_in_the_checkpoint_hash_only_when_on():
+    # Off, the decode settings are exactly what they were before the option existed, so a
+    # checkpoint written by an older build still resumes.
+    base = {"model": "medium.en", "device": "cpu", "compute_type": "int8", **TRANSCRIBE_KWARGS}
+    assert CCN_PRESET.decode_settings() == base
+    on = replace(CCN_PRESET, normalize=True)
+    assert on.decode_settings() == {**base, "audio_filter": NORMALIZE_FILTER}
+    assert on.audio_filter == NORMALIZE_FILTER and CCN_PRESET.audio_filter is None
+    # The wordless report is not a decode setting.
+    assert replace(CCN_PRESET, wordless_min_s=5.0).decode_settings() == base
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(("first", "second"), [([], ["--normalize"]), (["--normalize"], [])])
+def test_resume_refuses_a_checkpoint_made_with_the_other_normalize(
+    tmp_path, fake, models, media, capsys, first, second
+):
+    out = tmp_path / "t.json"
+    fake.fail_after = 2
+    assert run_cli(capsys, media, "--out", out, *first)[0] == 1
+    fake.fail_after = None
+    before = checkpoint_path(out).read_bytes()
+    code, body = run_cli(capsys, media, "--out", out, "--resume", *second)
+    assert code == 2 and body["error"]["type"] == "checkpoint-mismatch"
+    assert "model or decode settings" in body["error"]["message"]
+    assert checkpoint_path(out).read_bytes() == before and not out.exists()
+    code, report = run_cli(capsys, media, "--out", out, "--resume", *first)
+    assert code == 0 and report["resume"]["segments_from_checkpoint"] == 2
+    assert report["settings"]["normalize"] is bool(first)
+
+
+def _transcript(capsys, *argv: object) -> tuple[int, dict[str, Any], str]:
+    code = main(["analyze", "transcript", *(str(a) for a in argv)])
+    captured = capsys.readouterr()
+    return code, json.loads(captured.out), captured.err
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("normalize", [False, True])
+def test_wordless_stretches_are_reported_with_the_source_level(
+    tmp_path, fake, models, media, capsys, normalize
+):
+    flags = ["--normalize"] if normalize else []
+    code, report, err = _transcript(
+        capsys, media, "--out", tmp_path / "t.json", "--offset-s", "100",
+        "--wordless-min-s", "1", *flags,
+    )  # fmt: skip
+    assert code == 0  # information, never a failure
+    wordless = report["wordless"]
+    # Kept words: 0.5-2.4, 4.5-8.8 (the guard dropped 2.5-4.4). The head (0.5 s) is under 1 s.
+    spans = [(s["file_start_s"], s["file_end_s"]) for s in wordless["stretches"]]
+    assert spans == [(2.4, 4.5), (8.8, 10.0)]
+    assert [(s["start_s"], s["end_s"]) for s in wordless["stretches"]] == [
+        (102.4, 104.5),
+        (108.8, 110.0),
+    ]
+    assert wordless["total_s"] == pytest.approx(3.3) and wordless["file_duration_s"] == 10.0
+    assert wordless["longest"] == wordless["stretches"][0]
+    # The media is a 300 Hz tone at peak 0.1: -23.0 dBFS RMS. With --normalize the level is
+    # still the source's, not the levelled audio Whisper heard.
+    assert [s["level_dbfs"] for s in wordless["stretches"]] == [-23.0, -23.0]
+    assert "not the same as silence" in wordless["note"]
+    [line] = [x for x in err.splitlines() if "warning" in x]
+    assert "3.3 s of 10.0 s has no transcribed words (2 stretch(es) of at least 1 s)" in line
+    assert "longest 102.4-104.5 s (2.1 s, -23 dBFS)" in line
+
+
+@needs_ffmpeg
+def test_no_wordless_stretch_no_warning_by_default(tmp_path, fake, models, media, capsys):
+    code, report, err = _transcript(capsys, media, "--out", tmp_path / "t.json")
+    assert code == 0
+    assert report["wordless"]["min_s"] == 60.0 and report["wordless"]["stretches"] == []
+    assert report["wordless"]["longest"] is None and report["wordless"]["total_s"] == 0
+    assert "warning" not in err
+
+
+@needs_ffmpeg
+def test_a_transcript_with_no_words_is_one_wordless_stretch(tmp_path, fake, models, capsys):
+    silent = write_wav(tmp_path / "silent.wav", np.zeros(int(SECONDS * RATE)))
+    fake.segments = []
+    code, report, err = _transcript(
+        capsys, silent, "--out", tmp_path / "t.json", "--wordless-min-s", "5"
+    )
+    assert code == 0 and report["counts"]["words"] == 0
+    [stretch] = report["wordless"]["stretches"]
+    assert (stretch["start_s"], stretch["end_s"], stretch["duration_s"]) == (0.0, 10.0, 10.0)
+    assert stretch["level_dbfs"] is None  # digital silence
+    assert "digital silence" in err
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_a_bad_wordless_min_is_refused(tmp_path, fake, models, media, capsys, value):
+    code, body = run_cli(capsys, media, "--out", tmp_path / "t.json", "--wordless-min-s", value)
+    assert code == 2 and body["error"]["type"] == "invalid-argument"
+    assert "wordless_min_s" in body["error"]["message"]

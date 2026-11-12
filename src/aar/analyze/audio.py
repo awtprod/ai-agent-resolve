@@ -9,6 +9,13 @@ told to stop at the cap (``-t``) and the sink refuses anything past it.
 
 Memory: 4 bytes per sample, e.g. 115 MB for an hour at 8 kHz. The buffer is allocated for the
 whole cap but only the pages ffmpeg fills become resident.
+
+**Normalisation** (``normalize=True``, S19d) passes the mono mix through ``NORMALIZE_FILTER``
+inside the same ffmpeg decode, after the downmix and resample. It is for transcription of
+far-field audio (a camera's room microphones at about -40 dBFS mean), where Whisper and its VAD
+miss quiet speech. The filter changes level only, never time: ffmpeg's ``dynaudnorm`` delays
+its output internally and hands back exactly as many samples, aligned to the input (pinned by
+``tests/analyze/test_analyze_normalize.py``).
 """
 
 from __future__ import annotations
@@ -22,6 +29,18 @@ from aar.analyze.errors import need_numpy
 from aar.media.tools import OutputTooLarge, input_url, require_regular_file, run_tool
 
 _BASE = ["-hide_banner", "-nostdin", "-nostats", "-v", "error"]
+
+#: The one normalisation filter (``read_mono(normalize=True)``), applied to the mono mix.
+#: ffmpeg ``dynaudnorm``: a gain per ``f`` = 250 ms frame (fine enough to lift one quiet
+#: speaker between two loud ones; the default 500 ms lags a change of speaker), smoothed by a
+#: Gaussian over ``g`` = 15 frames (about 3.75 s, so the gain follows a speaker or a room
+#: change but does not pump within a word), aiming each frame's peak at ``p`` = 0.9 (about
+#: -1 dBFS, headroom for the resampler), with at most ``m`` = 30x gain (+29.5 dB: room-mic
+#: speech at about -40 dBFS mean comes up to conversational level, while near-silence, which
+#: would need more, stays quiet rather than turning hiss into "speech"). These are the values
+#: the S19 pilot measured on a real 90-minute far-field show (raw + VAD 226 words in a
+#: 3-minute excerpt, normalised + VAD 351).
+NORMALIZE_FILTER = "dynaudnorm=f=250:g=15:p=0.9:m=30"
 
 
 def _fmt(value: float) -> str:
@@ -77,10 +96,12 @@ def read_mono(
     start_s: float = 0.0,
     duration_s: float | None = None,
     band_hz: tuple[float, float] | None = None,
+    normalize: bool = False,
 ) -> Mono:
     """Decode the first audio stream from ``start_s`` for ``duration_s`` (default: to the end),
     reading at most ``max_duration_s``. Channels are averaged to mono and resampled to ``rate``;
-    ``band_hz`` adds a high-pass and a low-pass at those corner frequencies.
+    ``band_hz`` adds a high-pass and a low-pass at those corner frequencies; ``normalize``
+    then passes the mono mix through ``NORMALIZE_FILTER`` (level only, never time).
 
     Raises ``MediaError`` subclasses (missing file, missing ffmpeg, timeout, decode failure) and
     ``AnalyzeError("missing-extra")`` without numpy.
@@ -97,9 +118,15 @@ def read_mono(
     sink = _Sink(np, math.ceil(limit * rate) + rate)
     args = [*_BASE, "-ss", _fmt(start_s), "-t", _fmt(limit), "-i", input_url(p)]
     args += ["-map", "0:a:0", "-ac", "1"]
+    chain: list[str] = []
     if band_hz is not None:
         low, high = band_hz
-        args += ["-af", f"aresample={rate},highpass=f={_fmt(low)},lowpass=f={_fmt(high)}"]
+        chain += [f"aresample={rate}", f"highpass=f={_fmt(low)}", f"lowpass=f={_fmt(high)}"]
+    if normalize:
+        # The downmix and resample happen first (aformat), so the gain is the mono mix's.
+        chain += [f"aformat=sample_rates={rate}:channel_layouts=mono", NORMALIZE_FILTER]
+    if chain:
+        args += ["-af", ",".join(chain)]
     args += ["-ar", str(rate), "-c:a", "pcm_f32le", "-f", "f32le", "-"]
     run_tool("ffmpeg", args, timeout_s=timeout_s, stdout_sink=sink.feed)
     return Mono(samples=sink.buf[: sink.n], rate=rate, start_s=start_s, non_finite=sink.non_finite)

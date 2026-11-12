@@ -36,6 +36,8 @@ INPUT_ERRORS = frozenset(
         "input-missing",
         "invalid-argument",
         "invalid-plan",
+        "invalid-transcript",
+        "output-exists",
         "input-too-long",
         "checkpoint-exists",
         "checkpoint-mismatch",

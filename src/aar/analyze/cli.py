@@ -32,6 +32,7 @@ from aar.analyze.faces import FaceSettings, analyse_faces
 from aar.analyze.gemini import KEY_ENV
 from aar.analyze.laughs import LaughSettings, analyse_laughs
 from aar.analyze.sync import SyncSettings, sync_files
+from aar.analyze.text import GAP_S, MAX_CHARS, NO_WORDS, WORDLESS_MIN_S, render_text
 from aar.analyze.whisper import (
     CCN_PRESET,
     MODEL_DIR_ENV,
@@ -40,8 +41,10 @@ from aar.analyze.whisper import (
     explicit_offset,
     offset_from_plan,
     transcribe_file,
+    wordless_warning,
     write_atomic,
 )
+from aar.plan.inputs import load_transcript
 from aar.plan.model import EditPlan, Fps
 
 _PROG = "aar analyze"
@@ -57,11 +60,13 @@ def register(subparsers: Any) -> None:
     """Add the ``analyze`` command group to the top-level parser."""
     analyze = subparsers.add_parser(
         "analyze",
-        help="Cold analysis: audio sync offsets, word-level transcripts, faces and laughs.",
+        help="Cold analysis: audio sync offsets, word-level transcripts (and their text), faces "
+        "and laughs.",
     )
     sub = analyze.add_subparsers(dest="analyze_command", metavar="COMMAND", required=True)
     _register_sync(sub)
     _register_transcript(sub)
+    _register_transcript_text(sub)
     _register_faces(sub)
     _register_laughs(sub)
 
@@ -123,7 +128,9 @@ def _register_transcript(sub: Any) -> None:
         description=(
             "Writes an aar Transcript JSON to --out and prints a report. The model is a name "
             f"looked up under --model-dir or ${MODEL_DIR_ENV}, or a model directory; it is "
-            "never downloaded. " + _EXITS
+            "never downloaded. Stretches of at least --wordless-min-s with no words are listed "
+            'in the report ("wordless") and summed in one warning line on stderr; they do not '
+            "change the exit status. " + _EXITS
         ),
     )
     run.add_argument("media", type=Path, help="The media file to transcribe.")
@@ -145,7 +152,53 @@ def _register_transcript(sub: Any) -> None:
     run.add_argument("--compression-ratio-max", type=float, default=d.compression_ratio_max)
     run.add_argument("--max-duration-s", type=float, default=d.max_duration_s)
     run.add_argument("--timeout-s", type=float, help="Timeout of the decode (default: scaled).")
+    run.add_argument(
+        "--normalize",
+        action="store_true",
+        help="Level the mono mix with ffmpeg dynaudnorm before Whisper (far-field room audio; "
+        "time is unchanged). Part of the checkpoint identity.",
+    )
+    run.add_argument(
+        "--wordless-min-s",
+        type=float,
+        default=d.wordless_min_s,
+        help=f"Report stretches this long with no words (default {d.wordless_min_s:g}).",
+    )
     run.set_defaults(func=_cmd_transcript)
+
+
+def _register_transcript_text(sub: Any) -> None:
+    run = sub.add_parser(
+        "transcript-text",
+        help="A Transcript JSON as timestamped text lines for a model to read.",
+        description=(
+            "Writes one '[start-end] words' line per spoken run (times in the transcript's "
+            "clock, recording seconds), a new line at every gap longer than --gap-s or when a "
+            "line would pass --max-chars, and a '(no words transcribed)' line for every gap of "
+            "at least --wordless-min-s. Refuses an existing --out unless --force. Exit status: "
+            "0 written, 2 the transcript cannot be read or an argument is bad, 74 the output "
+            "could not be written."
+        ),
+    )
+    run.add_argument("transcript", type=Path, help="Transcript JSON (aar analyze transcript).")
+    run.add_argument("--out", required=True, type=Path, help="Text file to write.")
+    run.add_argument(
+        "--gap-s", type=float, default=GAP_S, help=f"Line break gap (default {GAP_S:g})."
+    )
+    run.add_argument(
+        "--max-chars",
+        type=int,
+        default=MAX_CHARS,
+        help=f"Longest line text in characters (default {MAX_CHARS}).",
+    )
+    run.add_argument(
+        "--wordless-min-s",
+        type=float,
+        default=WORDLESS_MIN_S,
+        help=f"Show gaps this long as their own line (default {WORDLESS_MIN_S:g}).",
+    )
+    run.add_argument("--force", action="store_true", help="Overwrite an existing --out.")
+    run.set_defaults(func=_cmd_transcript_text)
 
 
 def _add_offset_args(run: Any, what: str) -> None:
@@ -329,6 +382,8 @@ def _settings(args: argparse.Namespace) -> WhisperSettings:
         "compression_ratio_max": args.compression_ratio_max,
         "max_duration_s": args.max_duration_s,
         "timeout_s": args.timeout_s,
+        "normalize": args.normalize,
+        "wordless_min_s": args.wordless_min_s,
     }
     assert set(values) <= {f.name for f in fields(WhisperSettings)}
     try:
@@ -373,7 +428,70 @@ def _cmd_transcript(args: argparse.Namespace) -> int:
         return _fail(exc)
     except OSError as exc:  # the checkpoint beside --out could not be written
         return _fail(AnalyzeError("output-error", f"cannot write beside {args.out}: {exc}"))
-    return _emit(report) or EXIT_OK
+    written = _emit(report)
+    warning = wordless_warning(report["wordless"])
+    if warning is not None:
+        cli_io.warn(f"{_PROG} transcript: {warning}")
+    return written or EXIT_OK
+
+
+# ---------------------------------------------------------------- transcript text
+
+
+def _cmd_transcript_text(args: argparse.Namespace) -> int:
+    try:
+        _check_input(args.transcript, "transcript")
+        _check_out(args.out)
+        if args.out.exists() and not args.force:
+            raise AnalyzeError(
+                "output-exists",
+                f"{args.out} exists",
+                hint="pass --force to overwrite it, or choose another --out",
+            )
+        try:
+            transcript = load_transcript(args.transcript)
+        except (OSError, ValueError) as exc:  # ValidationError and JSONDecodeError are ValueErrors
+            raise AnalyzeError(
+                "invalid-transcript",
+                f"cannot use the transcript {args.transcript}: {exc}",
+                hint="pass a Transcript JSON written by aar analyze transcript",
+            ) from None
+        try:
+            text = render_text(
+                transcript,
+                gap_s=args.gap_s,
+                max_chars=args.max_chars,
+                wordless_min_s=args.wordless_min_s,
+            )
+        except ValueError as exc:
+            raise _bad(str(exc)) from None
+        try:
+            write_atomic(args.out, text)
+        except OSError as exc:
+            raise AnalyzeError("output-error", f"cannot write {args.out}: {exc}") from None
+    except AnalyzeError as exc:
+        return _fail(exc)
+    lines = text.count("\n")
+    holes = text.count(NO_WORDS)
+    return (
+        _emit(
+            {
+                "ok": True,
+                "output": str(args.out),
+                "input": str(args.transcript),
+                "recording": transcript.recording,
+                "words": len(transcript.words),
+                "lines": lines,
+                "wordless_lines": holes,
+                "settings": {
+                    "gap_s": args.gap_s,
+                    "max_chars": args.max_chars,
+                    "wordless_min_s": args.wordless_min_s,
+                },
+            }
+        )
+        or EXIT_OK
+    )
 
 
 # ---------------------------------------------------------------- faces
