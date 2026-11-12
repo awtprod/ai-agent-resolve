@@ -919,6 +919,12 @@ def produce(
     ``ProduceError``/``InvariantError``/``LintGateError`` when no clean plan results (exit 1)."""
     if stub.segments or stub.transitions:
         raise ProduceInputError("stub-has-segments", "the plan stub already has segments")
+    if pause_trim is not None and not isinstance(pause_trim, bool):
+        raise ProduceInputError(
+            "invalid-argument",
+            f"pause_trim must be None, True or False, not {pause_trim!r}",
+            hint="pass a bool, or None to let the profile's [produce] pause_trim decide",
+        )
     rules = check_profile(profile, stub.kind)
     s = profile.produce
     trim_pauses = s.pause_trim if pause_trim is None else pause_trim
