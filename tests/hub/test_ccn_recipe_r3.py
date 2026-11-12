@@ -92,6 +92,46 @@ def test_the_sweep_keeps_everything_when_the_state_cannot_be_read(
     assert (area / cancelled / "nd_op").is_dir()
 
 
+# -- n21: a re-claimed render starts from an emptied scratch folder ----------------------------
+
+
+def test_a_render_whose_op_folder_holds_leftovers_starts_from_an_empty_folder(
+    ccn_env: CcnEnv,
+) -> None:
+    env = ccn_env
+    run = _cold(env, env.params(env.show()), "1")
+    agent_cut(env, run)
+    render = latest(env, run, "render")
+    assert render is not None and render.status in ("pending", "active")
+    leftover = env.work / "aar-render" / run / render.op_id
+    leftover.mkdir(parents=True)
+    (leftover / "Synthetic Long v1.review.mp4").write_bytes(b"half a render from a crash")
+    assert work(env) == 2
+    assert latest(env, run, "render").status == "done"
+    assert not leftover.exists()  # emptied, used and dropped
+    mp4 = env.hub.store.read_bytes(outputs(env, run, "render")["review_mp4"])
+    assert mp4 != b"half a render from a crash"
+
+
+# -- n35: the transcript step sweeps its area ---------------------------------------------------
+
+
+def test_the_transcript_step_sweeps_stale_folders_and_unheld_locks(ccn_env: CcnEnv) -> None:
+    env = ccn_env
+    area = env.work / AREA
+    stale, fresh = area / "nd_stale_key", area / "nd_fresh_key"
+    for folder in (stale, fresh):
+        folder.mkdir(parents=True)
+    old = time.time() - STALE_S - 60
+    os.utime(stale, (old, old))
+    orphan_lock = area / "nd_orphan.lock"
+    orphan_lock.write_text("")
+    _cold(env, env.params(env.show()), "1")
+    assert not stale.exists()
+    assert fresh.is_dir()  # not stale yet: kept
+    assert not orphan_lock.exists()
+
+
 # -- LOW-3: media replaced at the same path after the stub ---------------------------------------
 
 
