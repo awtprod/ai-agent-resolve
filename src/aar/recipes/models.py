@@ -79,7 +79,9 @@ class StepDef:
     """One step of a recipe. Only the fields its ``kind`` uses are meaningful.
 
     - ``cold``: ``callable_id`` names a registered cold callable; ``idempotent`` says whether a
-      lapsed-lease claim may be re-claimed.
+      lapsed-lease claim may be re-claimed; ``on_fail`` names the earlier ``agent`` step (one
+      this step needs, directly or through other steps) whose output a failure marked
+      ``upstream`` blames: ``recipe_reopen`` of that step is then the way on (S19f).
     - ``hot``: ``hot_kind`` is the request kind sent to the dispatcher; ``hot_params`` are static
       params merged under the recipe params.
     - ``agent``: ``instruction`` is the text the agent reads; ``expects`` is its output contract.
@@ -95,6 +97,7 @@ class StepDef:
     # cold
     callable_id: str | None = None
     idempotent: bool = False
+    on_fail: str | None = None
     # hot
     hot_kind: str | None = None
     hot_params: Mapping[str, Any] | None = None
@@ -205,6 +208,37 @@ def _check_kind_fields(step: StepDef, seen: dict[str, int]) -> None:
             )
 
 
+def _check_on_fail(step: StepDef, earlier: Mapping[str, StepDef]) -> None:
+    """``on_fail`` (S19f): cold steps only, naming an earlier ``agent`` step that ``step`` needs
+    directly or through other steps."""
+    if step.on_fail is None:
+        return
+    if step.kind != "cold":
+        raise RecipeDefError(f"{step.kind} step {step.id!r} cannot declare on_fail (cold only)")
+    target = earlier.get(step.on_fail) if isinstance(step.on_fail, str) else None
+    if target is None:
+        raise RecipeDefError(
+            f"cold step {step.id!r} on_fail {step.on_fail!r} must name an earlier step"
+        )
+    if target.kind != "agent":
+        raise RecipeDefError(
+            f"cold step {step.id!r} on_fail {step.on_fail!r} is a {target.kind} step; it must "
+            "name an agent step"
+        )
+    pending, reached = list(step.needs), set()
+    while pending:  # bounded: at most MAX_STEPS distinct earlier steps
+        need = pending.pop()
+        if need in reached:
+            continue
+        reached.add(need)
+        pending.extend(earlier[need].needs)
+    if step.on_fail not in reached:
+        raise RecipeDefError(
+            f"cold step {step.id!r} on_fail {step.on_fail!r} is not a step it needs, directly or "
+            "through other steps"
+        )
+
+
 def validate_recipe(recipe: RecipeDef, *, known_callables: Sequence[str] = ()) -> None:
     """Raise :class:`RecipeDefError` unless ``recipe`` satisfies every bound.
 
@@ -226,11 +260,14 @@ def validate_recipe(recipe: RecipeDef, *, known_callables: Sequence[str] = ()) -
     if len(recipe.steps) > MAX_STEPS:
         raise RecipeDefError(f"recipe {recipe.name!r} has over {MAX_STEPS} steps")
     seen: dict[str, int] = {}
+    earlier: dict[str, StepDef] = {}
     known = set(known_callables)
     for index, step in enumerate(recipe.steps):
         _check_step(step, seen)
+        _check_on_fail(step, earlier)
         if known_callables and step.kind == "cold" and step.callable_id not in known:
             raise RecipeDefError(
                 f"cold step {step.id!r} callable_id {step.callable_id!r} is not registered"
             )
         seen[step.id] = index
+        earlier[step.id] = step

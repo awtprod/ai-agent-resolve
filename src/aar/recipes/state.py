@@ -105,6 +105,15 @@ class OpAttempt:
     # supersede
     superseded: bool = False
     cancelled_reason: str | None = None
+    # reopen (S19f): ``reopened_for`` is the op node's own data (why this agent attempt exists);
+    # ``reopen`` is the plan of a reopen, recorded on the runner's supersede of the agent's done op
+    reopened_for: dict[str, Any] | None = None
+    reopen: dict[str, Any] | None = None
+
+    @property
+    def upstream(self) -> bool:
+        """Whether its failed result is marked upstream (``error.upstream`` exactly True)."""
+        return isinstance(self.result_error, dict) and self.result_error.get("upstream") is True
 
     @property
     def is_live(self) -> bool:
@@ -154,6 +163,28 @@ class RunState:
     def op_by_id(self, op_id: str) -> OpAttempt | None:
         for op in self.ops:
             if op.op_id == op_id:
+                return op
+        return None
+
+    def all_in_round(self, step_id: str, round_: int) -> list[OpAttempt]:
+        """Every op of ``step_id`` in ``round_``, superseded ones included."""
+        return [op for op in self.attempts_for(step_id) if op.round == round_]
+
+    def next_attempt(self, step_id: str, round_: int) -> int:
+        """The next attempt number of ``step_id`` in ``round_``: one past every op of the round,
+        superseded ones included, so a new op never collides with a superseded one's key."""
+        return 1 + max((op.attempt for op in self.all_in_round(step_id, round_)), default=0)
+
+    def upstream_failure(self, step_id: str, round_: int) -> OpAttempt | None:
+        """The latest attempt, in ``round_``, of the first cold step (recipe order) declaring
+        ``on_fail == step_id`` whose latest attempt failed with a result marked upstream."""
+        if self.recipe_def is None:
+            return None
+        for step in self.recipe_def.steps:
+            if step.kind != "cold" or step.on_fail != step_id:
+                continue
+            op = self.latest_in_round(step.id, round_)
+            if op is not None and op.status == "failed" and op.upstream:
                 return op
         return None
 
@@ -261,6 +292,7 @@ def _op_from_node(node: Any) -> OpAttempt | None:
         return None
     if isinstance(attempt, bool) or isinstance(round_, bool):
         return None
+    reopened_for = data.get("reopened_for")
     return OpAttempt(
         op_id=node.id,
         step_id=step_id,
@@ -268,6 +300,7 @@ def _op_from_node(node: Any) -> OpAttempt | None:
         round=round_,
         kind=data.get("step_kind") if isinstance(data.get("step_kind"), str) else "cold",
         created=node.created,
+        reopened_for=reopened_for if isinstance(reopened_for, dict) else None,
     )
 
 
@@ -357,6 +390,8 @@ def _fold_recipe_events(
         elif event.type == EVENT_CANCELLED:
             op.superseded = True
             op.cancelled_reason = _str(payload.get("reason"))
+            reopen = payload.get("reopen")
+            op.reopen = reopen if isinstance(reopen, dict) else None
     for op_id, op in ops.items():
         _apply_lease(op, claims.get(op_id, []), heartbeats.get(op_id, []))
     return started, run_cancelled

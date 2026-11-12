@@ -178,3 +178,112 @@ def submit_test_plan(hub: Any, recipe_node: str, actor: Actor, key: str) -> str:
         idempotency_key=key,
     )
     return result.body["node"]["id"]
+
+
+# -- S19f: a recipe whose cold build step declares on_fail on the agent plan step -------------
+
+REOPEN_RECIPE = "reopentest"
+#: plan sha256 -> whether the build step's failure on it is marked upstream (absent: it passes)
+BUILD_FAILS: dict[str, bool] = {}
+
+
+def _build(ctx: StepContext) -> StepOutput:
+    sha = ctx.needs["p"]["plan_sha256"]
+    if sha in BUILD_FAILS:
+        raise StepFailure(
+            "bad_plan" if BUILD_FAILS[sha] else "disk_full",
+            f"the build of plan {sha[:12]} failed",
+            "change the plan" if BUILD_FAILS[sha] else "free disk space and retry",
+            upstream=BUILD_FAILS[sha],
+        )
+    return StepOutput(outputs={"built": sha})
+
+
+def reopen_recipe_def() -> RecipeDef:
+    return RecipeDef(
+        name=REOPEN_RECIPE,
+        version=1,
+        params_model=RecTestParams,
+        steps=(
+            StepDef(id="c", kind="cold", callable_id="rectest.cold", idempotent=True),
+            StepDef(id="p", kind="agent", instruction="Submit a plan.", expects=PlanExpect()),
+            StepDef(
+                id="b",
+                kind="cold",
+                callable_id="reopentest.build",
+                idempotent=True,
+                needs=("p",),
+                on_fail="p",
+                max_attempts=2,
+            ),
+            StepDef(id="g", kind="gate", subject="p", on_reject="p", needs=("b",)),
+            StepDef(
+                id="report",
+                kind="cold",
+                callable_id="recipe.report",
+                idempotent=True,
+                needs=("c", "p", "b", "g"),
+            ),
+        ),
+    )
+
+
+def register_reopen_recipe() -> RecipeDef:
+    """Register the reopen test recipe and its callables (after a registry clear)."""
+    registry.clear()
+    BUILD_FAILS.clear()
+    registry.register_callable("rectest.cold", _cold)
+    registry.register_callable("reopentest.build", _build)
+    return registry.register(reopen_recipe_def())
+
+
+def make_reopen_run(hub: Any, *, actor: Actor = AGENT, max_review_rounds: int | None = None) -> str:
+    """A brief and a ``reopentest`` recipe node; returns the recipe node id."""
+    brief = create_brief(
+        hub.log,
+        brief_data(hub.project_id, recipe=REOPEN_RECIPE),
+        actor,
+        idempotency_key="brief-reopentest",
+    )
+    body: dict[str, Any] = {
+        "recipe": REOPEN_RECIPE,
+        "brief_id": brief.body["node"]["id"],
+        "params": {"qa_report": "0" * 64},
+    }
+    if max_review_rounds is not None:
+        body["max_review_rounds"] = max_review_rounds
+    recipe = create_recipe(
+        hub.log,
+        hub.project_id,
+        body,
+        actor,
+        idempotency_key="recipe-reopentest",
+        params_validator=registry.registry_params_validator,
+    )
+    return recipe.body["node"]["id"]
+
+
+def submit_variant(hub: Any, derives_from: str, actor: Actor, variant: int) -> tuple[str, str]:
+    """Submit the clean short plan with its timeline renamed ``variant`` (other bytes, still
+    clean), deriving from ``derives_from``; return ``(plan node id, plan sha256)``."""
+    from write_support import plan_fixture
+
+    from aar.hub.writes import submit_plan, typed_plan
+
+    plan = plan_fixture("short_clean")
+    plan["timeline"] = f"{plan['timeline']} v{variant}"
+    result = submit_plan(
+        hub.log,
+        hub.store,
+        hub.project_id,
+        plan,
+        actor,
+        derives_from=derives_from,
+        idempotency_key=f"plan-v{variant}-{derives_from}",
+    )
+    node = result.body["node"]
+    from aar.hub.graph import WorkGraph
+
+    data = typed_plan(WorkGraph(hub.log, hub.project_id).node(node["id"]))
+    assert data is not None
+    return node["id"], data.plan_sha256

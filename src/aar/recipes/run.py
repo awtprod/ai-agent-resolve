@@ -1,4 +1,5 @@
-"""The recipe library ops the CLI and MCP tools wrap: start, complete, retry, cancel, status.
+"""The recipe library ops the CLI and MCP tools wrap: start, complete, retry, reopen, cancel,
+status.
 
 Each returns plain JSON-ready data and refuses with :class:`~aar.hub.writes.WriteError`
 (``{code, message, fix_hint, details}``). Every write calls :func:`~aar.recipes.engine.advance`
@@ -32,12 +33,16 @@ from aar.recipes.engine import (
     _outputs_problem,
     _supersede_op,
     advance,
+    begin_reopen,
     create_attempt,
+    finish_reopen,
     record_result,
     record_run_cancelled,
     record_started,
+    reopen_plan,
 )
 from aar.recipes.events import (
+    OP_REOPEN,
     OP_RETRY,
     OP_STEP_COMPLETE,
     OUTCOME_DONE,
@@ -45,7 +50,8 @@ from aar.recipes.events import (
 )
 from aar.recipes.gates import plan_gate
 from aar.recipes.models import ArtifactExpect, JsonExpect, PlanExpect, RecipeDef, StepDef
-from aar.recipes.state import RunState, load_state, project_of_node
+from aar.recipes.reopen import reopen_refusal
+from aar.recipes.state import OpAttempt, RunState, load_state, project_of_node
 from aar.recipes.status import status_view
 
 _FINISHED = frozenset({"done", "cancelled"})
@@ -392,18 +398,23 @@ def _validate_plan(
             "Submit the plan with plan_submit so it carries a lint summary.",
             step_id=step.id,
         )
-    # F4: refuse a plan whose canonical bytes equal one a rejected review of this recipe covered.
-    rejected_shas = {
+    # F4 / S19f: refuse a plan whose canonical bytes equal any plan this recipe accepted before
+    # (any round, any attempt, superseded or not): one a human rejected, or one whose render or
+    # export failed because of it (a reopened attempt must change the plan).
+    accepted_shas = {
         op.result_outputs.get("plan_sha256")
         for op in state.ops
-        if op.step_id == step.id and op.round < current and isinstance(op.result_outputs, dict)
+        if op.kind == "agent"
+        and op.result_outcome == OUTCOME_DONE
+        and isinstance(op.result_outputs, dict)
     }
-    rejected_shas.discard(None)
-    if data.plan_sha256 in rejected_shas:
+    accepted_shas.discard(None)
+    if data.plan_sha256 in accepted_shas:
         raise WriteError(
             "plan_unchanged",
-            f"plan {plan_node_id!r} is byte-for-byte a plan a human already rejected",
-            "Change the plan in response to the rejection, then resubmit.",
+            f"plan {plan_node_id!r} is byte-for-byte a plan this recipe already took (a human "
+            "rejected it, or its render or export failed)",
+            "Change the plan in response to the rejection or the failure, then resubmit.",
             step_id=step.id,
             plan_sha256=data.plan_sha256,
         )
@@ -588,7 +599,7 @@ def recipe_retry(
         recipe_node=recipe_node,
         step=step,
         round_=current,
-        attempt=op.attempt + 1,
+        attempt=state.next_attempt(step_id, current),
         caller=actor,
         status=status,
     )
@@ -606,6 +617,106 @@ def recipe_retry(
         )
     advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
     return _result("recipe.retry", log, recipe_node, dispatcher, clock)
+
+
+def recipe_reopen(
+    log: EventLog,
+    recipe_node: str,
+    step_id: str,
+    actor: Actor,
+    *,
+    idempotency_key: str,
+    dispatcher: Any = None,
+    clock: Clock = utcnow,
+) -> dict[str, Any]:
+    """Reopen agent step ``step_id`` in the current round after a later cold step that declares
+    ``on_fail == step_id`` failed because of its output (S19f).
+
+    A reopen is a new attempt of the agent step in the same round: it supersedes every live or
+    done op of the round from ``step_id`` onward (the set a round rollback supersedes), then
+    creates the step's next attempt carrying ``reopened_for``. Rounds are untouched. Only the
+    recipe's creator or a human may reopen; each precondition is a typed refusal (see
+    :func:`~aar.recipes.reopen.reopen_refusal`). The caller's ``idempotency_key`` is honoured as for
+    ``recipe_retry``.
+
+    **Crash safety.** The first write supersedes the agent's done op with the whole reopen plan on
+    the event; the other writes (supersedes, the new attempt) are idempotent and are made by
+    :func:`~aar.recipes.engine.finish_reopen`. A crash after the first write is finished by the
+    next ``advance`` (any engine tick: the worker loop, any recipe tool) or by re-running this
+    command with the same key, whichever comes first; the caller's record is written last, so a
+    re-run after a finished reopen whose record was lost still writes it and returns ok.
+    """
+    actor = check_actor(actor)
+    caller_key = write_key(actor, idempotency_key)
+    step_id = check_id(step_id, "step_id")
+    project_id, graph, state, definition = _resolve(log, recipe_node)
+    _require_owner(graph, recipe_node, actor, "reopen")
+    step = _step(definition, step_id)
+    fingerprint = request_sha256(
+        OP_REOPEN,
+        {"project_id": project_id, "recipe_node": recipe_node, "step_id": step_id},
+    )
+    if (
+        _find_record(log, caller_key, idempotency_key, OP_REOPEN, project_id, actor, fingerprint)
+        is not None
+    ):
+        advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
+        return {**_result("recipe.reopen", log, recipe_node, dispatcher, clock), "replayed": True}
+    mine = _own_reopen(state, step_id, caller_key)
+    if mine is not None and state.recipe_status in _FINISHED:
+        mine = None  # a run cancelled since the crash is not reopened: refused below
+    if mine is None:
+        refusal = reopen_refusal(state, definition, step)
+        if refusal is not None:
+            raise refusal
+        current = state.current_round()
+        agent_op = state.latest_in_round(step_id, current)
+        failed = state.upstream_failure(step_id, current)
+        if agent_op is None or failed is None:  # reopen_refusal has checked both; never None
+            raise WriteError("step_not_done", f"step {step_id!r} cannot be reopened", "")
+        plan = reopen_plan(state, definition, step, failed, caller_key)
+        begin_reopen(log, state, agent_op, plan, actor)
+        state = load_state(log, recipe_node, project_id=project_id)
+        mine = _own_reopen(state, step_id, caller_key)
+        if mine is None:
+            # Lost a race: another call superseded the done op first. Help finish its reopen (so
+            # the run never waits on it), then refuse: one reopen happened, not two.
+            winner = state.op_by_id(agent_op.op_id)
+            if winner is not None and winner.reopen is not None:
+                finish_reopen(log, state, definition, winner, actor)
+            advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
+            raise WriteError(
+                "already_reopened",
+                f"step {step_id!r} was reopened (or superseded) by another call just now",
+                "Read recipe_status: the step's new attempt is open; do not reopen it again.",
+                step_id=step_id,
+            )
+    finish_reopen(log, state, definition, mine, actor)
+    with _in_transaction(log) as txn:
+        _append_record(
+            txn,
+            caller_key,
+            OP_REOPEN,
+            project_id,
+            actor,
+            fingerprint,
+            recipe_node=recipe_node,
+            step_id=step_id,
+            reopened_op=mine.op_id,
+        )
+    advance(log, recipe_node, actor=actor, dispatcher=dispatcher, clock=clock)
+    return _result("recipe.reopen", log, recipe_node, dispatcher, clock)
+
+
+def _own_reopen(state: RunState, step_id: str, caller_key: str) -> OpAttempt | None:
+    """The op carrying this caller's reopen plan of ``step_id`` in the current round, if one was
+    written (a re-run after a crash finds it here and finishes it)."""
+    current = state.current_round()
+    for op in state.all_in_round(step_id, current):
+        plan = op.reopen
+        if plan is not None and plan.get("caller") == caller_key and plan.get("round") == current:
+            return op
+    return None
 
 
 def recipe_cancel(

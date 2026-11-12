@@ -24,6 +24,7 @@ Every recipe write tool and the worker loop call ``advance``.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import timedelta
 from typing import Any
 
@@ -160,13 +161,16 @@ def _bound_text(value: Any, limit: int) -> Any:
 
 
 def _bound_error(error: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Keep only ``{code, message, fix_hint}`` and cap each field to 4 KiB of stored JSON (F6)."""
+    """Keep only ``{code, message, fix_hint}`` (plus ``upstream: true``, S19f) and cap each text
+    field to 4 KiB of stored JSON (F6)."""
     if not isinstance(error, dict):
         return error
     bounded = {
         "code": _bound_text(error.get("code"), MAX_ERROR_BYTES),
         "message": _bound_text(error.get("message"), MAX_ERROR_BYTES),
         "fix_hint": _bound_text(error.get("fix_hint"), MAX_ERROR_BYTES),
+        # S19f: kept only when exactly True, so every older result folds as not upstream.
+        "upstream": True if error.get("upstream") is True else None,
     }
     return {k: v for k, v in bounded.items() if v is not None}
 
@@ -189,12 +193,14 @@ def create_attempt(
     attempt: int,
     caller: Actor,
     status: str,
+    extra_data: Mapping[str, Any] | None = None,
 ) -> str | None:
     """Create the op node for one (step, round, attempt); return its id, or ``None`` if it exists.
 
     The op is created by RUNNER (so an agent cannot later move its graph status as evidence) and
     links to the recipe node with ``derives_from``. The global ``#node`` key makes this the single
     op for the attempt even under two concurrent callers. ``caller`` is the real caller, recorded.
+    ``extra_data`` adds fields to the op's data (``reopened_for`` on a reopened agent attempt).
     """
     base = _op_base_key(recipe_node, step.id, round_, attempt)
     if log.get_by_idempotency_key(base + "#node") is not None:
@@ -206,6 +212,7 @@ def create_attempt(
         "attempt": attempt,
         "round": round_,
         "step_kind": step.kind,
+        **dict(extra_data or {}),
     }
     title = f"{step.kind} {step.id} r{round_} a{attempt}"
     request = {
@@ -658,6 +665,8 @@ def advance(
     now = clock()
 
     if state.recipe_status in ("active", "blocked"):
+        if _finish_reopens(log, state, recipe_def, actor):
+            state = load_state(log, recipe_node, project_id=project_id)
         if _reap_leases(log, state, recipe_def, actor, now):
             state = load_state(log, recipe_node, project_id=project_id)
         if _process_gates(log, state, recipe_def, actor):
@@ -765,6 +774,20 @@ def _process_gates(log: EventLog, state: RunState, recipe_def: RecipeDef, caller
     return changed
 
 
+def round_ops_from(
+    state: RunState, recipe_def: RecipeDef, start_step: str | None, round_: int
+) -> list[OpAttempt]:
+    """Every non-cancelled op of ``round_`` for the steps from ``start_step`` onward in recipe
+    order: what a round rollback (and a reopen, S19f) supersedes."""
+    if start_step is None:
+        return []
+    try:
+        start = recipe_def.index(start_step)
+    except KeyError:
+        return []
+    return [op for step in recipe_def.steps[start:] for op in state.in_round(step.id, round_)]
+
+
 def _rollback_round(
     log: EventLog,
     state: RunState,
@@ -772,24 +795,26 @@ def _rollback_round(
     on_reject: str | None,
     round_: int,
     caller: Actor,
+    reason: str = "superseded by review rejection",
 ) -> bool:
-    if on_reject is None:
-        return False
-    try:
-        start = recipe_def.index(on_reject)
-    except KeyError:
-        return False
     changed = False
-    for step in recipe_def.steps[start:]:
-        for op in state.in_round(step.id, round_):
-            if _supersede_op(log, state.project_id, op, caller, "superseded by review rejection"):
-                changed = True
+    for op in round_ops_from(state, recipe_def, on_reject, round_):
+        if _supersede_op(log, state.project_id, op, caller, reason):
+            changed = True
     return changed
 
 
 def _supersede_op(
-    log: EventLog, project_id: str, op: OpAttempt, caller: Actor, reason: str
+    log: EventLog,
+    project_id: str,
+    op: OpAttempt,
+    caller: Actor,
+    reason: str,
+    extra: Mapping[str, Any] | None = None,
 ) -> bool:
+    """Supersede ``op`` with a runner ``recipe.cancelled`` (idempotent per op). ``extra`` adds
+    fields to the event's payload (the ``reopen`` plan, S19f); a different payload under the
+    same op's key is a lost race and returns ``False``."""
     base = f"aar.recipe.cancel/{op.op_id}"
     if log.get_by_idempotency_key(base + "#cancelled") is not None:
         return False
@@ -804,7 +829,7 @@ def _supersede_op(
             txn.append(
                 EVENT_CANCELLED,
                 RUNNER,
-                {"op_node": op.op_id, "reason": reason[:_MAX_REASON]},
+                {"op_node": op.op_id, "reason": reason[:_MAX_REASON], **dict(extra or {})},
                 project_id=project_id,
                 idempotency_key=base + "#cancelled",
             )
@@ -825,6 +850,123 @@ def _supersede_op(
     return True
 
 
+# -- reopen (S19f) -----------------------------------------------------------------------------
+
+
+def reopen_plan(
+    state: RunState, recipe_def: RecipeDef, step: StepDef, failed: OpAttempt, caller_key: str
+) -> dict[str, Any]:
+    """The plan of a reopen of agent ``step`` in the current round, because ``failed`` (the
+    latest attempt of a cold step declaring ``on_fail == step``) failed upstream: the ops to
+    supersede (the set a round rollback from ``step`` supersedes), the new attempt's number and
+    its ``reopened_for``. Recorded on the supersede of the agent's done op, so it is durable from
+    the first write and whoever finishes it (the command or the next ``advance``) writes the same
+    ops."""
+    current = state.current_round()
+    error = failed.result_error if isinstance(failed.result_error, dict) else {}
+    return {
+        "step": step.id,
+        "round": current,
+        "attempt": state.next_attempt(step.id, current),
+        "supersede": [op.op_id for op in round_ops_from(state, recipe_def, step.id, current)],
+        "reopened_for": {
+            "step": failed.step_id,
+            "attempt": failed.attempt,
+            "code": error.get("code"),
+            "message": error.get("message"),
+            "fix_hint": error.get("fix_hint"),
+            "op_node": failed.op_id,
+        },
+        "caller": caller_key,
+    }
+
+
+def begin_reopen(
+    log: EventLog, state: RunState, agent_op: OpAttempt, plan: dict[str, Any], caller: Actor
+) -> bool:
+    """The first write of a reopen: supersede the agent step's done op with ``plan`` on the
+    event. ``False`` when that op was already superseded (by another reopen, a rollback or a
+    cancel): the caller then reads the fold to see whose plan won."""
+    failed = plan["reopened_for"]["step"]
+    reason = f"superseded by a reopen of {plan['step']!r} after {failed!r} failed"
+    return _supersede_op(log, state.project_id, agent_op, caller, reason, extra={"reopen": plan})
+
+
+def _plan_shape_ok(plan: dict[str, Any]) -> bool:
+    supersede = plan.get("supersede")
+    return (
+        isinstance(plan.get("step"), str)
+        and _plain_int(plan.get("round"))
+        and _plain_int(plan.get("attempt"))
+        and isinstance(supersede, list)
+        and all(isinstance(op_id, str) for op_id in supersede)
+        and isinstance(plan.get("reopened_for"), dict)
+    )
+
+
+def _plain_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def reopen_unfinished(state: RunState, marker_op: OpAttempt) -> bool:
+    """Whether the reopen recorded on ``marker_op`` still has a write to make in this round: an op
+    it lists not yet superseded, or its new attempt not yet created."""
+    plan = marker_op.reopen
+    if plan is None or not _plan_shape_ok(plan) or plan["round"] != state.current_round():
+        return False
+    for op_id in plan["supersede"]:
+        op = state.op_by_id(op_id)
+        if op is not None and not op.is_cancelled:
+            return True
+    made = state.all_in_round(plan["step"], plan["round"])
+    return not any(op.attempt == plan["attempt"] for op in made)
+
+
+def finish_reopen(
+    log: EventLog, state: RunState, recipe_def: RecipeDef, marker_op: OpAttempt, caller: Actor
+) -> bool:
+    """Make the rest of the reopen recorded on ``marker_op``: supersede every op it lists, then
+    create the agent step's new attempt carrying ``reopened_for``. Each write is idempotent (a
+    superseded op stays superseded; the attempt's op key is global), so the command, a re-run of
+    it and any ``advance`` can all call this and the run ends in the same state. The supersedes
+    come first, so whenever the new attempt exists the old downstream ops are gone."""
+    plan = marker_op.reopen
+    if plan is None or not _plan_shape_ok(plan):
+        return False
+    try:
+        step = recipe_def.step(plan["step"])
+    except KeyError:
+        return False
+    changed = False
+    reason = f"superseded by a reopen of {step.id!r}"
+    for op_id in plan["supersede"]:
+        op = state.op_by_id(op_id)
+        if op is not None and not op.is_cancelled:
+            changed |= _supersede_op(log, state.project_id, op, caller, reason)
+    created = create_attempt(
+        log,
+        project_id=state.project_id,
+        recipe_node=state.recipe_node,
+        step=step,
+        round_=plan["round"],
+        attempt=plan["attempt"],
+        caller=caller,
+        status="active",
+        extra_data={"reopened_for": plan["reopened_for"]},
+    )
+    return changed or created is not None
+
+
+def _finish_reopens(log: EventLog, state: RunState, recipe_def: RecipeDef, caller: Actor) -> bool:
+    """Finish any reopen of this round whose writes were cut short (a crash after its first
+    write): the next engine tick completes it exactly as the command would have."""
+    changed = False
+    for op in state.ops:
+        if op.reopen is not None and reopen_unfinished(state, op):
+            changed |= finish_reopen(log, state, recipe_def, op, caller)
+    return changed
+
+
 def _create_ready(log: EventLog, state: RunState, recipe_def: RecipeDef, caller: Actor) -> bool:
     current = state.current_round()
     changed = False
@@ -842,7 +984,8 @@ def _create_ready(log: EventLog, state: RunState, recipe_def: RecipeDef, caller:
             recipe_node=state.recipe_node,
             step=step,
             round_=current,
-            attempt=1,
+            # 1 in a fresh round; after a reopen (S19f), one past the round's superseded ops
+            attempt=state.next_attempt(step.id, current),
             caller=caller,
             status=status,
         )

@@ -29,16 +29,32 @@ from aar.plan.profile import Profile
 
 
 class StepFailure(Exception):
-    """A controlled step failure: a stable ``code``, a ``message`` and a ``fix_hint``."""
+    """A controlled step failure: a stable ``code``, a ``message`` and a ``fix_hint``.
 
-    def __init__(self, code: str, message: str, fix_hint: str = "") -> None:
+    ``upstream`` (S19f) says the output of the step's ``on_fail`` step caused this failure, so
+    running this step again unchanged fails the same way; the worker records it in the failed
+    ``recipe.result`` (as ``error.upstream``, written only when true; a log without it folds as
+    false).
+    """
+
+    def __init__(
+        self, code: str, message: str, fix_hint: str = "", *, upstream: bool = False
+    ) -> None:
         super().__init__(f"{code}: {message}")
         self.code = code
         self.message = message
         self.fix_hint = fix_hint
+        self.upstream = upstream
 
     def to_error(self) -> dict[str, Any]:
-        return {"code": self.code, "message": self.message, "fix_hint": self.fix_hint}
+        error: dict[str, Any] = {
+            "code": self.code,
+            "message": self.message,
+            "fix_hint": self.fix_hint,
+        }
+        if self.upstream is True:
+            error["upstream"] = True
+        return error
 
 
 @dataclass(frozen=True, slots=True)

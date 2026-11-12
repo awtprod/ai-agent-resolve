@@ -62,6 +62,7 @@ OP_RESULT = "recipe.result"
 OP_REVIEW_OPEN = "recipe.review_open"
 OP_STEP_COMPLETE = "recipe.step_complete"
 OP_RETRY = "recipe.retry"
+OP_REOPEN = "recipe.reopen"
 OP_CANCEL = "recipe.cancel"
 OP_ADVANCE = "recipe.advance"
 

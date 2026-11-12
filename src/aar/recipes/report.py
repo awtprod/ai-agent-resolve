@@ -77,6 +77,9 @@ def build_report_text(log: EventLog, recipe_node: str) -> str:
             lines.append(
                 f"- round {op.round} attempt {op.attempt}: {outcome}{code} {_duration(op)}{flag}"
             )
+        fixes = _fix_attempts(attempts)
+        if fixes:
+            lines.append(f"- fix attempts: {fixes}")
         lines.append("")
 
     lines.append("## Gates")
@@ -134,6 +137,19 @@ def build_report_text(log: EventLog, recipe_node: str) -> str:
     lines.extend(art_lines or ["- (no artifacts)"])
     lines.append("")
     return "\n".join(lines)
+
+
+def _fix_attempts(attempts: list[OpAttempt]) -> str:
+    """For an agent step that any round gave more than one attempt (a reopen, S19f): the
+    attempts per round (``round 1: 2, round 2: 1``); else empty."""
+    if not attempts or attempts[0].kind != "agent":
+        return ""
+    per_round: dict[int, int] = {}
+    for op in attempts:
+        per_round[op.round] = per_round.get(op.round, 0) + 1
+    if max(per_round.values()) < 2:
+        return ""
+    return ", ".join(f"round {r}: {n}" for r, n in sorted(per_round.items()))
 
 
 def _canonical_value(value: object) -> str:

@@ -59,10 +59,12 @@ def build_guide(
     laughs: dict[str, Any],
     aar: Sequence[str],
     python: str,
+    cut_attempts: int = 3,
 ) -> str:
     """The guide's Markdown text for one run (module docstring). ``aar`` is the argv that runs
     the worker's own ``aar`` and ``python`` its interpreter: every command the guide prints
-    names them and quotes every word, so each line runs in ``sh`` exactly as printed."""
+    names them and quotes every word, so each line runs in ``sh`` exactly as printed.
+    ``cut_attempts`` is the cut step's ``max_attempts`` (its attempts in one round)."""
     where = {"db": db, "artifacts": artifacts, "project_id": project_id}
     fetch = [
         ("stub.json", stub["stub"], "the plan stub: sources, frame rate, timecodes"),
@@ -254,11 +256,30 @@ def build_guide(
         "make submit.json with that review's id as `derives_from` (the last argument of the",
         "python line in 6), not the recipe node, then submit and complete as in 6.",
         "",
-        "## After the cut",
+        "## 8. After the cut: a render or export your plan made fail",
         "",
         "The hub renders the plan, gates its QA and exports the FCPXML and the review MP4.",
-        "A render or QA failure cannot come back to this step: the run must be cancelled",
-        "and a new one started (its transcript is reused, so that is cheap).",
+        "When the render or the export fails because of the plan (QA failed, the render's",
+        "lint with the transcript found errors, a range runs past the end of the media, a",
+        "reframe too complex...), `recipe_status` shows that step `failed` with its error",
+        "(`code`, `message`, `fix_hint`, `upstream: true`) and the next action",
+        "`recipe_reopen cut`. Read the error, then reopen the cut:",
+        "",
+        "```sh",
+        f"{recipes} recipe reopen --db {_q(db)} --actor 'agent:<you>' "
+        f"--idempotency-key '<new key>' {_q(recipe_node)} cut",
+        "```",
+        "",
+        "(MCP: `recipe_reopen` with step_id `cut`; only the recipe's creator or a human may",
+        "reopen.) Step `cut` is then open again in the same round, its entry in",
+        "`recipe_status` showing `reopened_for` (the failure) and its attempt number. Change",
+        "keep.json, make, lint, submit and complete as in 5 and 6 (`derives_from` as before:",
+        "this recipe node in round 1, the rejecting review in a later round). A plan",
+        "byte-identical to one this run already took is refused `plan_unchanged`. The cut",
+        f"has {cut_attempts} attempts in a round, the reopened ones included; with none left",
+        "the run can only be cancelled and a new one started (its transcript is reused).",
+        "A failure that is not the plan's (`upstream` absent: media changed or unreadable, a",
+        "missing tool, a timeout, the disk) is not reopened: `recipe_status` says what to do.",
         "",
     ]
     return "\n".join(lines)
