@@ -155,16 +155,22 @@ def test_the_library_default_is_unchanged(hub: Hub) -> None:
     assert [p.name for p in Registry(hub.log).list()].count("Show") == 2
 
 
+HALF = "give source_kind and locator together, or neither"
+
+
 @pytest.mark.parametrize(
-    ("over", "field"),
+    ("over", "field", "says"),
     [
-        ({"source_kind": "local_db"}, "locator"),
-        ({"locator": dict(LOC)}, "source_kind"),
-        ({"host": "edit-pc"}, "host"),
+        ({"source_kind": "local_db"}, "locator", f"locator is missing: {HALF}"),
+        ({"locator": dict(LOC)}, "source_kind", f"source_kind is missing: {HALF}"),
+        ({"host": "edit-pc"}, "host", "host names where a source lives, and no source was given"),
     ],
 )
-def test_half_a_source_is_refused(hub: Hub, over: dict[str, Any], field: str) -> None:
-    assert _refused(hub, "invalid_input", **over).details["field"] == field
+def test_half_a_source_is_refused(hub: Hub, over: dict[str, Any], field: str, says: str) -> None:
+    """The half-source refusal, not a bad-source one (build_source names the same field)."""
+    err = _refused(hub, "invalid_input", **over)
+    assert err.details["field"] == field
+    assert err.message == says
 
 
 # -- attaching the Resolve source later --------------------------------------------------------
@@ -474,6 +480,7 @@ def test_project_register_tool_without_a_source_and_the_read_tools(hub: Hub) -> 
     half = _call(hub, "project_register", {**args, "idempotency_key": "m3", "locator": LOC})
     assert half.structured_content["error"]["code"] == "invalid_input"
     assert half.structured_content["error"]["details"]["field"] == "source_kind"
+    assert half.structured_content["error"]["message"] == f"source_kind is missing: {HALF}"
 
     got = _call(hub, "project_get", {"project_id": pid}).structured_content
     assert got["found"] is True and got["project"]["sources"] == []
