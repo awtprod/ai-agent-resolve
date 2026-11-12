@@ -149,9 +149,18 @@ aar media shrink <media root>/share/incoming/Show_1/Proxy --replace
 ```
 
 A file already marked as shrunk is never shrunk again (named alone it is refused, in a folder it
-is reported as `skipped`). Run `--replace` before a show's run starts: a run records each
+is reported as `skipped`). `--replace` refuses a symbolic link (`symlink`: run it on the file the
+link points to); on a file with several hard links it replaces only the name given, so the other
+names keep the full-size file. Run `--replace` before a show's run starts: a run records each
 source's size and modification time at its stub step and refuses (`media_changed`) a file
-replaced since. Errors are JSON with a `code` (`unreadable`, `vfr`, `audio_unsupported`,
-`already_shrunk`, `destination_exists`, `low_space`, `timeout`, `encode_failed`,
-`verify_failed`, ...) and a `fix_hint`; a killed run can leave a hidden
-`.<name>.aar-shrink-<random>.part` file, which is safe to delete.
+replaced since. Errors are JSON with a `code` (`unreadable`, `vfr`, `odd_size`,
+`negative_start`, `audio_unsupported`, `already_shrunk`, `symlink`, `destination_exists`,
+`not_writable`, `low_space`, `timeout`, `encode_failed`, `verify_failed`, `source_changed`,
+`interrupted`, ...) and a `fix_hint`.
+
+**Stopping a run.** Ctrl-C, `kill`, closing the terminal (Linux) or Ctrl-Break (Windows) stops
+ffmpeg, removes the partial copy, prints the file's line with the code `interrupted`, writes the
+report and exits 2; rerunning resumes (files already done are verified and skipped). A run killed
+outright (`kill -9`, Task Manager) or a closed console window on Windows cannot clean up: it can
+leave a hidden `.<name>.aar-shrink-<random>.part` file (after `kill -9` ffmpeg finishes it in
+the background, full size), which is safe to delete.
