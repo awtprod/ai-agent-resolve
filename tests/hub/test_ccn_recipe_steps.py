@@ -112,7 +112,7 @@ def test_cold_steps_one_camera_then_the_transcript_is_reused(ccn_env: CcnEnv) ->
     assert transcript["cached"] is False and transcript["words"] == 18
     assert transcript["model"] == "medium.en" and transcript["normalize"] is True
     assert ccn_env.calls == [{"media": str(show), "model": "medium.en", "normalize": True}]
-    # the head, the two one-second pauses and the tail (at the fake's 0.9 s minimum)
+    # the head, the two one-second pauses and the tail (at the fake's 1 s minimum)
     assert transcript["wordless"]["count"] == 4
     assert [s["start_s"] for s in transcript["wordless"]["stretches"]] == [0.0, 4.0, 8.0, 11.0]
     text = ccn_env.hub.store.read_bytes(transcript["text"]).decode()

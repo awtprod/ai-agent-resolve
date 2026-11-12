@@ -68,7 +68,7 @@ class CcnEnv:
 
 def fake_transcriber(env: CcnEnv) -> Callable[..., dict[str, Any]]:
     """Stands in for ``transcribe_file``: writes :data:`WORDS` as the transcript (shifted to
-    recording time) and returns a report with the real wordless block (at a 0.9 s minimum, so
+    recording time) and returns a report with the real wordless block (at a 1 s minimum, so
     the synthetic show's two one-second pauses are listed)."""
 
     def transcribe(
@@ -94,7 +94,7 @@ def fake_transcriber(env: CcnEnv) -> Callable[..., dict[str, Any]]:
             words,
             file_duration_s=SECONDS,
             offset_s=shift,
-            settings=replace(settings, wordless_min_s=0.9),
+            settings=replace(settings, wordless_min_s=1.0),
         )
         return {
             "ok": True,
