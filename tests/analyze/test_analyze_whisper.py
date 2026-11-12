@@ -9,12 +9,14 @@ runs only with ``AAR_WHISPER_MODEL`` set and faster-whisper installed.
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import types
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -23,7 +25,14 @@ import numpy as np
 import pytest
 from analyze_support import needs_ffmpeg, tone, write_wav
 
-from aar.analyze import CCN_PRESET, AnalyzeError, WhisperTranscriber, transcribe_file
+from aar.analyze import (
+    CCN_PRESET,
+    AnalyzeError,
+    WhisperSettings,
+    WhisperTranscriber,
+    transcribe_file,
+)
+from aar.analyze.audio import NORMALIZE_FILTER
 from aar.analyze.whisper import (
     checkpoint_path,
     explicit_offset,
@@ -143,7 +152,8 @@ KEPT_WORDS += ["compression", "edge", "good", "night"]
 
 @pytest.fixture
 def fake(monkeypatch: pytest.MonkeyPatch) -> Fake:
-    registry = Fake(list(SEGMENTS))
+    # A deep copy: a test that edits a segment must not change it for the tests after it.
+    registry = Fake(copy.deepcopy(SEGMENTS))
     monkeypatch.setitem(sys.modules, "faster_whisper", registry.module)
     return registry
 
@@ -772,3 +782,239 @@ def test_live_whisper_gives_a_valid_transcript(tmp_path):
     transcript = load_transcript(out)  # validates; an empty transcript is fine for a tone
     assert report["counts"]["words"] == len(transcript.words)
     assert not checkpoint_path(out).exists()
+
+
+# ---------------------------------------------------------------- S19d: normalize and wordless
+
+
+def test_normalize_is_in_the_checkpoint_hash_only_when_on():
+    # Off, the decode settings are exactly what they were before the option existed, so a
+    # checkpoint written by an older build still resumes.
+    base = {"model": "medium.en", "device": "cpu", "compute_type": "int8", **TRANSCRIBE_KWARGS}
+    assert CCN_PRESET.decode_settings() == base
+    on = replace(CCN_PRESET, normalize=True)
+    assert on.decode_settings() == {**base, "audio_filter": NORMALIZE_FILTER}
+    assert on.audio_filter == NORMALIZE_FILTER and CCN_PRESET.audio_filter is None
+    # The wordless report is not a decode setting.
+    assert replace(CCN_PRESET, wordless_min_s=5.0).decode_settings() == base
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(("first", "second"), [([], ["--normalize"]), (["--normalize"], [])])
+def test_resume_refuses_a_checkpoint_made_with_the_other_normalize(
+    tmp_path, fake, models, media, capsys, first, second
+):
+    out = tmp_path / "t.json"
+    fake.fail_after = 2
+    assert run_cli(capsys, media, "--out", out, *first)[0] == 1
+    fake.fail_after = None
+    before = checkpoint_path(out).read_bytes()
+    code, body = run_cli(capsys, media, "--out", out, "--resume", *second)
+    assert code == 2 and body["error"]["type"] == "checkpoint-mismatch"
+    assert "model or decode settings" in body["error"]["message"]
+    assert checkpoint_path(out).read_bytes() == before and not out.exists()
+    code, report = run_cli(capsys, media, "--out", out, "--resume", *first)
+    assert code == 0 and report["resume"]["segments_from_checkpoint"] == 2
+    assert report["settings"]["normalize"] is bool(first)
+
+
+def _transcript(capsys, *argv: object) -> tuple[int, dict[str, Any], str]:
+    code = main(["analyze", "transcript", *(str(a) for a in argv)])
+    captured = capsys.readouterr()
+    return code, json.loads(captured.out), captured.err
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("normalize", [False, True])
+def test_wordless_stretches_are_reported_with_the_source_level(
+    tmp_path, fake, models, media, capsys, normalize
+):
+    flags = ["--normalize"] if normalize else []
+    code, report, err = _transcript(
+        capsys, media, "--out", tmp_path / "t.json", "--offset-s", "100",
+        "--wordless-min-s", "1", *flags,
+    )  # fmt: skip
+    assert code == 0  # information, never a failure
+    wordless = report["wordless"]
+    # Kept words: 0.5-2.4, 4.5-8.8 (the guard dropped 2.5-4.4). The head (0.5 s) is under 1 s.
+    spans = [(s["file_start_s"], s["file_end_s"]) for s in wordless["stretches"]]
+    assert spans == [(2.4, 4.5), (8.8, 10.0)]
+    assert [(s["start_s"], s["end_s"]) for s in wordless["stretches"]] == [
+        (102.4, 104.5),
+        (108.8, 110.0),
+    ]
+    assert wordless["total_s"] == pytest.approx(3.3) and wordless["file_duration_s"] == 10.0
+    assert wordless["longest"] == wordless["stretches"][0]
+    # The media is a 300 Hz tone at peak 0.1: -23.0 dBFS RMS. With --normalize the level is
+    # still the source's, not the levelled audio Whisper heard.
+    assert [s["level_dbfs"] for s in wordless["stretches"]] == [-23.0, -23.0]
+    assert "not the same as silence" in wordless["note"]
+    [line] = [x for x in err.splitlines() if "warning" in x]
+    assert "3.3 s of 10.0 s has no transcribed words (2 stretch(es) of at least 1 s)" in line
+    assert "longest 102.4-104.5 s (2.1 s, -23 dBFS)" in line
+
+
+@needs_ffmpeg
+def test_no_wordless_stretch_no_warning_by_default(tmp_path, fake, models, media, capsys):
+    code, report, err = _transcript(capsys, media, "--out", tmp_path / "t.json")
+    assert code == 0
+    assert report["wordless"]["min_s"] == 60.0 and report["wordless"]["stretches"] == []
+    assert report["wordless"]["longest"] is None and report["wordless"]["total_s"] == 0
+    assert "warning" not in err
+
+
+@needs_ffmpeg
+def test_a_transcript_with_no_words_is_one_wordless_stretch(tmp_path, fake, models, capsys):
+    silent = write_wav(tmp_path / "silent.wav", np.zeros(int(SECONDS * RATE)))
+    fake.segments = []
+    code, report, err = _transcript(
+        capsys, silent, "--out", tmp_path / "t.json", "--wordless-min-s", "5"
+    )
+    assert code == 0 and report["counts"]["words"] == 0
+    [stretch] = report["wordless"]["stretches"]
+    assert (stretch["start_s"], stretch["end_s"], stretch["duration_s"]) == (0.0, 10.0, 10.0)
+    assert stretch["level_dbfs"] is None  # digital silence
+    assert "digital silence" in err
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_a_bad_wordless_min_is_refused(tmp_path, fake, models, media, capsys, value):
+    code, body = run_cli(capsys, media, "--out", tmp_path / "t.json", "--wordless-min-s", value)
+    assert code == 2 and body["error"]["type"] == "invalid-argument"
+    assert "wordless_min_s" in body["error"]["message"]
+
+
+# ---------------------------------------------------------------- S19d round 2
+
+
+def test_normalize_must_be_a_bool():
+    for value in ("yes", 1, 0, None):
+        with pytest.raises(ValueError, match="normalize must be true or false"):
+            WhisperSettings(normalize=value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", ["0.99", "0.4"])
+def test_wordless_min_has_a_floor(tmp_path, fake, models, media, capsys, value):
+    code, body = run_cli(capsys, media, "--out", tmp_path / "t.json", "--wordless-min-s", value)
+    assert code == 2 and body["error"]["type"] == "invalid-argument"
+    assert "at least 1" in body["error"]["message"]
+    assert WhisperSettings(wordless_min_s=1.0).wordless_min_s == 1.0
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("normalize", [False, True])
+def test_the_qa_transcriber_follows_normalize(fake, models, media, normalize):
+    settings = replace(CCN_PRESET, normalize=normalize)
+    transcriber = WhisperTranscriber(model_dir=models, settings=settings)
+    fake.window = (2.0, 6.0)
+    transcriber.transcribe(media, 2.0, 6.0)
+    peak = float(np.abs(fake.calls[-1]["audio"]).max())
+    # The media is a tone at peak 0.1; dynaudnorm lifts it (on a 4 s window it is still
+    # ramping up, so well short of its 0.9 target).
+    assert (peak > 0.2) is normalize and peak > 0.09
+
+
+def _break_after_transcription(fake: Fake, how: str, media: Path, monkeypatch) -> None:
+    original = fake._play
+
+    def play(audio: Any, kwargs: dict[str, Any]) -> Any:
+        yield from original(audio, kwargs)
+        if how == "delete":
+            media.unlink()
+        else:  # an ffmpeg that fails every later run
+            monkeypatch.setenv("AAR_FFMPEG", shutil.which("false") or "false")
+
+    fake._play = play  # type: ignore[method-assign]
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(("how", "kind"), [("delete", "input-missing"), ("fail", "decode-failed")])
+def test_a_failed_level_decode_never_fails_the_transcript(
+    tmp_path, fake, models, media, capsys, monkeypatch, how, kind
+):
+    out = tmp_path / "t.json"
+    _break_after_transcription(fake, how, media, monkeypatch)
+    code, report, err = _transcript(
+        capsys, media, "--out", out, "--normalize", "--wordless-min-s", "1"
+    )
+    assert code == 0 and out.exists() and not checkpoint_path(out).exists()
+    assert [w.text for w in load_transcript(out).words] == KEPT_WORDS
+    first, second = report["wordless"]["stretches"]  # 2.4-4.5 (longest, tried), 8.8-10.0
+    assert first["level_dbfs"] is None and first["level_error"]["type"] == kind
+    assert second["level_dbfs"] is None and second["level_error"]["type"] == "not-measured"
+    assert kind in second["level_error"]["message"]  # not tried after the first failure
+    assert f"level not measured: {kind}" in err
+
+
+def _spaced_segments(n: int) -> tuple[list[FakeSegment], float]:
+    """``n`` one-word segments with growing gaps (1.00, 1.05, ... s) between them."""
+    segments, t = [], 0.0
+    for i in range(n):
+        segments.append(seg(t, t + 0.2, f"w{i}"))
+        t += 0.2 + 1.0 + 0.05 * i
+    return segments, t
+
+
+@needs_ffmpeg
+def test_with_normalize_only_the_longest_stretches_are_decoded(
+    tmp_path, fake, models, capsys, monkeypatch
+):
+    import aar.analyze.whisper as whisper
+
+    segments, end = _spaced_segments(30)
+    seconds = round(end + 0.5)
+    long_media = write_wav(tmp_path / "long.wav", tone(seconds, 300.0, peak=0.1))
+    fake.segments, fake.total_s = segments, float(seconds)
+    decodes: list[float | None] = []
+    real = whisper.read_mono
+
+    def counting(*args: Any, **kwargs: Any) -> Any:
+        decodes.append(kwargs.get("duration_s"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(whisper, "read_mono", counting)
+    code, report, _ = _transcript(
+        capsys, long_media, "--out", tmp_path / "t.json", "--normalize", "--wordless-min-s", "1"
+    )
+    assert code == 0
+    stretches = report["wordless"]["stretches"]
+    assert len(stretches) == 30  # the 29 gaps between the 30 words and the tail
+    assert len(decodes) == 1 + whisper.MAX_LEVEL_DECODES  # the transcript decode, then 20
+    measured = [s for s in stretches if s["level_error"] is None]
+    skipped = [s for s in stretches if s["level_error"] is not None]
+    assert len(measured) == whisper.MAX_LEVEL_DECODES
+    assert all(s["level_error"]["type"] == "not-measured" for s in skipped)
+    assert max(s["duration_s"] for s in skipped) < min(s["duration_s"] for s in measured)
+    assert all(s["level_dbfs"] == -23.0 for s in measured)
+
+
+@needs_ffmpeg
+def test_the_longest_stretch_on_a_tie_is_the_earlier(tmp_path, fake, models, media, capsys):
+    fake.segments = [seg(0.0, 1.0, "a"), seg(3.0, 4.0, "b"), seg(6.0, 10.0, "c", "d")]
+    code, report, err = _transcript(
+        capsys, media, "--out", tmp_path / "t.json", "--wordless-min-s", "1"
+    )
+    assert code == 0
+    wordless = report["wordless"]
+    assert [(s["start_s"], s["end_s"]) for s in wordless["stretches"]] == [(1.0, 3.0), (4.0, 6.0)]
+    assert wordless["longest"]["start_s"] == 1.0 and "longest 1.0-3.0 s" in err
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("normalize", [False, True])
+def test_the_level_is_measured_over_the_stretch_only(tmp_path, fake, models, capsys, normalize):
+    # Loud (peak 0.5) to 2 s, quiet (peak 0.01, -43 dBFS) to 7 s, loud after: a level decode
+    # that started before the stretch or ran past its end would read a loud part.
+    samples = np.concatenate(
+        [tone(2.0, 300.0, peak=0.5), tone(5.0, 300.0, peak=0.01), tone(3.0, 300.0, peak=0.5)]
+    )
+    mixed = write_wav(tmp_path / "mixed.wav", samples)
+    fake.segments = [seg(0.0, 2.0, "a"), seg(7.0, 10.0, "b", "c")]
+    flags = ["--normalize"] if normalize else []
+    code, report, _ = _transcript(
+        capsys, mixed, "--out", tmp_path / "t.json", "--wordless-min-s", "1", *flags
+    )
+    assert code == 0
+    [stretch] = report["wordless"]["stretches"]
+    assert (stretch["file_start_s"], stretch["file_end_s"]) == (2.0, 7.0)
+    assert stretch["level_dbfs"] == pytest.approx(-43.0, abs=0.2)

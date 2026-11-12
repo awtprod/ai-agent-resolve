@@ -15,7 +15,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import ValidationError
 
@@ -616,6 +616,14 @@ def source_start_timecodes(
     return timecodes, warnings
 
 
+@dataclass(frozen=True)
+class PauseTrim:
+    """Whether transform 1 ran, and what decided it (the profile, or the caller's argument)."""
+
+    ran: bool = True
+    source: Literal["profile", "argument"] = "profile"
+
+
 @dataclass
 class ProduceResult:
     plan: EditPlan
@@ -627,6 +635,7 @@ class ProduceResult:
     folds: list[Fold] = field(default_factory=list)
     ending: Ending | None = None
     start_timecodes: dict[str, StartTimecode] = field(default_factory=dict)
+    pause_trim: PauseTrim = field(default_factory=PauseTrim)
 
     @property
     def cuts(self) -> int:
@@ -645,6 +654,7 @@ class ProduceResult:
             return round(fps.seconds(frame), 3)
 
         return {
+            "pause_trim": asdict(self.pause_trim),
             "snaps": [asdict(s) for s in self.snaps],
             "trims": [
                 {
@@ -816,25 +826,31 @@ def cut(
     runs_for: RunsFor,
     judge: Judge,
     laughs: LaughMap | None,
+    pause_trim: bool = True,
 ) -> Cut:
     """Transforms 1-4 and the invariants, with the media access injected (``runs_for``,
-    ``judge``): pure and deterministic for pure arguments."""
+    ``judge``): pure and deterministic for pure arguments. With ``pause_trim`` off, transform 1
+    does nothing (and ``runs_for`` is never called); every other step runs."""
     s = settings
     need = min_frames(s.min_shot_s, fps)
     nudge_frames = reach_frames(s.join_nudge_ms, fps)
     pieces: list[Piece] = []
     trims: list[Trim] = []
     for index, k in enumerate(keeps):
-        found = find_trims(
-            index,
-            k.start,
-            k.end,
-            runs_for(parts[index]),
-            words,
-            fps,
-            min_pause_s=s.min_pause_s,
-            beat_s=s.beat_s,
-            beat_lead_s=s.beat_lead_s,
+        found = (
+            find_trims(
+                index,
+                k.start,
+                k.end,
+                runs_for(parts[index]),
+                words,
+                fps,
+                min_pause_s=s.min_pause_s,
+                beat_s=s.beat_s,
+                beat_lead_s=s.beat_lead_s,
+            )
+            if pause_trim
+            else []
         )
         trims += found
         for a, b in kept_spans(k.start, k.end, found):
@@ -896,13 +912,22 @@ def produce(
     laughs: LaughMap | None = None,
     venue: str | None = None,
     media_root: Path | None = None,
+    pause_trim: bool | None = None,
 ) -> ProduceResult:
-    """Make the plan. Raises ``ProduceInputError``/``ProfileError`` for bad inputs (exit 2),
+    """Make the plan. ``pause_trim`` overrides the profile's ``[produce] pause_trim`` (None:
+    the profile decides). Raises ``ProduceInputError``/``ProfileError`` for bad inputs (exit 2),
     ``ProduceError``/``InvariantError``/``LintGateError`` when no clean plan results (exit 1)."""
     if stub.segments or stub.transitions:
         raise ProduceInputError("stub-has-segments", "the plan stub already has segments")
+    if pause_trim is not None and not isinstance(pause_trim, bool):
+        raise ProduceInputError(
+            "invalid-argument",
+            f"pause_trim must be None, True or False, not {pause_trim!r}",
+            hint="pass a bool, or None to let the profile's [produce] pause_trim decide",
+        )
     rules = check_profile(profile, stub.kind)
     s = profile.produce
+    trim_pauses = s.pause_trim if pause_trim is None else pause_trim
     silence_db = s.silence_for(venue)
     if sync is not None:
         stub = apply_sync(stub, sync, media_root)
@@ -978,6 +1003,7 @@ def produce(
         runs_for=runs_for,
         judge=JoinJudge(audio, profile.qa, fps, s.out_quiet_preroll_ms),
         laughs=laughs,
+        pause_trim=trim_pauses,
     )
     warnings += done.warnings
     for source_id, seen in stats.items():
@@ -1034,4 +1060,5 @@ def produce(
         done.folds,
         done.ending,
         start_timecodes,
+        PauseTrim(ran=trim_pauses, source="profile" if pause_trim is None else "argument"),
     )

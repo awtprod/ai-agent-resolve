@@ -34,7 +34,9 @@ class ProduceReport(_Model):
     warnings: list[PlannerWarning]
     log: dict[str, Any] = Field(
         default_factory=dict,
-        description="snaps, trims, nudges, folds and the ending, in recording frames and seconds; "
+        description="pause_trim: whether transform 1 ran ({ran, source}: the profile or the "
+        "caller's argument decided); snaps, trims, nudges, folds and the ending, in recording "
+        "frames and seconds; "
         "start_timecodes: each source's start timecode and what supplied it (stub, media probe or "
         "tmcd reader).",
     )

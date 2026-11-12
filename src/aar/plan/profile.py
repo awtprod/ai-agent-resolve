@@ -13,7 +13,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, model_validator
 
 Severity = Literal["error", "warn", "info"]
 
@@ -158,6 +158,11 @@ class ProduceSettings(_Settings):
     """
 
     default_camera: str = Field(default="A", min_length=1)
+    pause_trim: StrictBool = Field(  # TOML true/false only: "no" or 0 is a profile error
+        default=True,
+        description="Run transform 1, pause trim. Off for one camera on room microphones, where "
+        "quiet speech and audience reaction sit below silence_db and every trim is a jump cut.",
+    )
     min_pause_s: float = Field(default=0.9, gt=0)
     min_word_ms: float = Field(default=40.0, ge=0)
     beat_s: float = Field(default=0.45, ge=0)
