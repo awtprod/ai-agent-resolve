@@ -17,6 +17,7 @@ from aar.hub.writes import SEGMENT_RE, TitleText
 from aar.plan.export.errors import ExportError
 from aar.plan.export.media import media_map_from_mapping, media_ref
 from aar.plan.model import ShotSize, Source
+from aar.plan.stub import first_duplicate
 
 MEDIA_ROOT_ENV = "AAR_MEDIA_ROOT"
 MAX_SOURCES = 8
@@ -98,12 +99,13 @@ class CcnLongformParams(BaseModel):
 
     @model_validator(mode="after")
     def _distinct(self) -> CcnLongformParams:
-        seen: set[str] = set()
-        for n, source in enumerate(self.sources):
-            real = os.path.realpath(source.path)
-            if real in seen:
-                raise ValueError(f"sources[{n}] {source.path!r} is a file already given")
-            seen.add(real)
+        dup = first_duplicate([source.path for source in self.sources])
+        if dup is not None:
+            n = dup[1]
+            raise ValueError(
+                f"sources[{n}] {self.sources[n].path!r} is a file already given (sources"
+                f"[{dup[0]}]: the same path, a symlink or a hardlink)"
+            )
         return self
 
     @model_validator(mode="after")

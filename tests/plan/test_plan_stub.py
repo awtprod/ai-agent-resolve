@@ -184,18 +184,32 @@ def test_keep_ranges_from_the_written_stub_file_lint_clean(tmp_path: Path) -> No
 
 
 def test_a_fifo_a_non_utf8_path_and_one_file_twice_are_refused(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import os
 
+    import aar.plan.stub as stub_mod
+
+    probed: list[Path] = []
+
+    def no_probe(path: Path) -> None:  # ffprobe would block opening a FIFO with no writer
+        probed.append(path)
+        raise AssertionError(f"ffprobe was run on {path}")
+
     fifo = tmp_path / "pipe.mov"
     os.mkfifo(fifo)
-    assert _code([StubSource(fifo)]) == "unreadable"  # never handed to ffprobe
+    with monkeypatch.context() as patch:
+        patch.setattr(stub_mod, "probe", no_probe)
+        assert _code([StubSource(fifo)]) == "unreadable"
+    assert probed == []  # refused before ffprobe is run on it
     good = make_show(tmp_path / "a.mov")
     link = tmp_path / "same.mov"
     link.symlink_to(good)
+    hard = tmp_path / "hard.mov"
+    os.link(good, hard)
     assert _code([StubSource(good), StubSource(good, camera="B")]) == "duplicate_media"
     assert _code([StubSource(good), StubSource(link, camera="B")]) == "duplicate_media"
+    assert _code([StubSource(good), StubSource(hard, camera="B")]) == "duplicate_media"
     odd = Path(os.fsdecode(bytes(tmp_path) + b"/caf\xe9.mov"))
     make_show(odd)
     argv = ["plan", "stub", str(odd), "--out", str(tmp_path / "s.json"), "--recording", "r"]

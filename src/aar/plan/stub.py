@@ -26,6 +26,7 @@ opt-out), ``timecode_ambiguous`` (the media's timecode rate cannot be told),
 
 from __future__ import annotations
 
+import contextlib
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -162,6 +163,25 @@ def _regular_file(media: str | os.PathLike[str], sid: str) -> Path:
     return path
 
 
+def first_duplicate(paths: Sequence[str | os.PathLike[str]]) -> tuple[int, int] | None:
+    """``(i, j)``, ``i < j``, for the first path ``j`` that names the same file as an earlier
+    path ``i``: the same resolved path (a symlink) or the same ``(st_dev, st_ino)`` (a hardlink).
+    None when every path names its own file. A path that cannot be stat'ed is compared by its
+    resolved path alone; the callers refuse such a path on their own existence check."""
+    seen: dict[object, int] = {}
+    for j, path in enumerate(paths):
+        keys: list[object] = [os.path.realpath(path)]
+        with contextlib.suppress(OSError):
+            st = os.stat(path)
+            keys.append((st.st_dev, st.st_ino))
+        for key in keys:
+            if key in seen:
+                return seen[key], j
+        for key in keys:
+            seen.setdefault(key, j)
+    return None
+
+
 def _probe_rate(path: Path, sid: str) -> tuple[Fraction, tuple[int, int] | None]:
     """The rate a stub plan runs at for this file (produce's own rule) and its display size."""
     try:
@@ -296,17 +316,16 @@ def build_stub(
                 source=item.get("id"),
             )
     paths = [_regular_file(source.media, sid) for source, sid in zip(sources, ids, strict=True)]
-    seen_files: dict[str, str] = {}
-    for path, sid in zip(paths, ids, strict=True):
-        real = os.path.realpath(path)
-        if real in seen_files:
-            raise StubError(
-                "duplicate_media",
-                f"sources {seen_files[real]!r} and {sid!r} are the same file ({real!r})",
-                "give each camera's own file once",
-                sources=[seen_files[real], sid],
-            )
-        seen_files[real] = sid
+    dup = first_duplicate(paths)
+    if dup is not None:
+        first, again = ids[dup[0]], ids[dup[1]]
+        raise StubError(
+            "duplicate_media",
+            f"sources {first!r} and {again!r} are the same file ({str(paths[dup[1]])!r}, a "
+            "link or a second name of it)",
+            "give each camera's own file once",
+            sources=[first, again],
+        )
     rates: list[Fraction] = []
     for path, sid in zip(paths, ids, strict=True):
         rates.append(_probe_rate(path, sid)[0])
@@ -418,4 +437,12 @@ def _validated(data: dict[str, Any]) -> EditPlan:
         ) from None
 
 
-__all__ = ["BASE_KEYS", "CODES", "StubError", "StubResult", "StubSource", "build_stub"]
+__all__ = [
+    "BASE_KEYS",
+    "CODES",
+    "StubError",
+    "StubResult",
+    "StubSource",
+    "build_stub",
+    "first_duplicate",
+]

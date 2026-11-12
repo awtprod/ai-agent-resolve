@@ -140,3 +140,15 @@ def test_a_touched_file_with_the_same_size_is_refused_too(ccn_env: CcnEnv) -> No
     os.utime(show, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
     work(env)
     assert latest(env, run, "render").result_error["code"] == "media_changed"
+
+
+# -- LOW-4: one file twice through a hardlink ----------------------------------------------------
+
+
+def test_the_params_refuse_one_file_given_twice_through_a_hardlink(ccn_env: CcnEnv) -> None:
+    env = ccn_env
+    show = env.show()
+    hard = env.media / "hard.mov"
+    os.link(show, hard)
+    with pytest.raises(ValueError, match=r"sources\[1\].*hardlink"):
+        CcnLongformParams.model_validate(env.params(show, hard))
