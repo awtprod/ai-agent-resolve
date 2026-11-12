@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import fields, replace
 from fractions import Fraction
 from pathlib import Path
@@ -32,7 +33,14 @@ from aar.analyze.faces import FaceSettings, analyse_faces
 from aar.analyze.gemini import KEY_ENV
 from aar.analyze.laughs import LaughSettings, analyse_laughs
 from aar.analyze.sync import SyncSettings, sync_files
-from aar.analyze.text import GAP_S, MAX_CHARS, NO_WORDS, WORDLESS_MIN_S, render_text
+from aar.analyze.text import (
+    GAP_S,
+    MAX_CHARS,
+    WORDLESS_MIN_S,
+    check_times,
+    format_lines,
+    text_lines,
+)
 from aar.analyze.whisper import (
     CCN_PRESET,
     MODEL_DIR_ENV,
@@ -307,6 +315,16 @@ def _check_out(path: Path | None) -> None:
         raise _bad(f"{path} exists and is not a regular file")
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    """``a`` and ``b`` are one file (a hard link or a symlink included), or resolve to one path."""
+    try:
+        if a.exists() and b.exists():
+            return os.path.samefile(a, b)
+        return a.resolve() == b.resolve()
+    except OSError as exc:
+        raise _bad(f"cannot compare {a} with {b}: {exc}") from None
+
+
 def _check_input(path: Path, what: str) -> None:
     try:
         if not path.exists():
@@ -442,6 +460,8 @@ def _cmd_transcript_text(args: argparse.Namespace) -> int:
     try:
         _check_input(args.transcript, "transcript")
         _check_out(args.out)
+        if _same_file(args.out, args.transcript):
+            raise _bad(f"--out {args.out} is the input transcript; refusing to overwrite it")
         if args.out.exists() and not args.force:
             raise AnalyzeError(
                 "output-exists",
@@ -457,7 +477,15 @@ def _cmd_transcript_text(args: argparse.Namespace) -> int:
                 hint="pass a Transcript JSON written by aar analyze transcript",
             ) from None
         try:
-            text = render_text(
+            check_times(transcript.words)
+        except ValueError as exc:
+            raise AnalyzeError(
+                "invalid-transcript",
+                f"cannot use the transcript {args.transcript}: {exc}",
+                hint="every word time must be a finite number of seconds",
+            ) from None
+        try:
+            lines = text_lines(
                 transcript,
                 gap_s=args.gap_s,
                 max_chars=args.max_chars,
@@ -465,14 +493,13 @@ def _cmd_transcript_text(args: argparse.Namespace) -> int:
             )
         except ValueError as exc:
             raise _bad(str(exc)) from None
+        text = format_lines(lines)
         try:
             write_atomic(args.out, text)
         except OSError as exc:
             raise AnalyzeError("output-error", f"cannot write {args.out}: {exc}") from None
     except AnalyzeError as exc:
         return _fail(exc)
-    lines = text.count("\n")
-    holes = text.count(NO_WORDS)
     return (
         _emit(
             {
@@ -481,8 +508,8 @@ def _cmd_transcript_text(args: argparse.Namespace) -> int:
                 "input": str(args.transcript),
                 "recording": transcript.recording,
                 "words": len(transcript.words),
-                "lines": lines,
-                "wordless_lines": holes,
+                "lines": len(lines),
+                "wordless_lines": sum(line.wordless for line in lines),
                 "settings": {
                     "gap_s": args.gap_s,
                     "max_chars": args.max_chars,
