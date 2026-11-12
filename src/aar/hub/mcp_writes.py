@@ -170,6 +170,11 @@ def register_write_tools(
                     "`aar hub job cancel`.",
                 )
             )
+        except jobs.NotAResolveProject as exc:
+            # Only registry ids and Resolve uids in the text: safe to show the agent.
+            return _refused(
+                writes.WriteError(exc.code, exc.message, exc.fix_hint, field="project.project_id")
+            )
         except jobs.JobError as exc:
             return _result(
                 {

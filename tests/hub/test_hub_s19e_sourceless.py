@@ -18,7 +18,7 @@ from mcp.client import Client
 from write_support import AGENT, HUMAN, Hub, make_hub
 
 from aar.cli import main
-from aar.hub import project_register
+from aar.hub import jobs, project_register
 from aar.hub.mcp_server import build_server
 from aar.hub.registry import DuplicateProjectName, ProjectSource, Registry
 from aar.hub.writes import WriteError
@@ -26,6 +26,7 @@ from aar.node.hublink import LocalHubLink
 from aar.node.locator import ProjectLocator
 
 LOC = {"project_id": "uid-1", "name": "Fakes", "folder_path": ["Shows"]}
+PARAMS = {"steps": [{"op": "timeline.list", "params": {}}]}
 
 
 @pytest.fixture
@@ -188,6 +189,90 @@ def test_a_sourceless_project_cannot_take_a_uid_another_project_holds(hub: Hub) 
     assert err.value.code == "project_exists"
     assert err.value.details["existing_id"] == holder["project_id"]
     assert Registry(hub.log).get(pid).sources == []  # type: ignore[union-attr]
+
+
+# -- job submission ----------------------------------------------------------------------------
+
+
+def _submit(hub: Hub, project_id: str) -> tuple[jobs.HubJob, bool]:
+    return jobs.submit(
+        hub.log,
+        AGENT,
+        kind="ops.sequence",
+        params=PARAMS,
+        project=ProjectLocator(("Shows",), "Fakes", project_id),
+        agent_id=AGENT.id,
+        assigned_node="edit-pc",
+        idempotency_key="job-1",
+    )
+
+
+def test_a_resolve_job_for_a_sourceless_project_is_refused_typed(hub: Hub) -> None:
+    pid = _register(hub)["project_id"]
+    with pytest.raises(jobs.NotAResolveProject) as err:
+        _submit(hub, pid)
+    assert err.value.code == "not_a_resolve_project"
+    assert "no Resolve source" in err.value.message
+    assert "aar hub project source" in err.value.fix_hint
+    assert jobs.list_jobs(hub.log) == []
+    # once the source is attached, the registry id is still not what a job names
+    project_register.add_source(
+        hub.log, HUMAN, pid, source_kind="local_db", locator=dict(LOC), idempotency_key="s"
+    )
+    with pytest.raises(jobs.NotAResolveProject) as err:
+        _submit(hub, pid)
+    assert "uid-1" in err.value.fix_hint
+    job, replayed = _submit(hub, "uid-1")  # the Resolve uid is accepted
+    assert replayed is False and job.target.project_id == "uid-1"
+
+
+def test_the_job_refusal_is_typed_at_the_cli_and_the_tool(
+    hub: Hub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pid = _register(hub)["project_id"]
+    project = {"folder_path": ["Shows"], "name": "Fakes", "project_id": pid}
+    code = main(
+        [
+            "hub",
+            "job",
+            "submit",
+            "--db",
+            str(hub.root / "hub.db"),
+            "--actor",
+            "agent:agent-1",
+            "--kind",
+            "ops.sequence",
+            "--params",
+            json.dumps(PARAMS),
+            "--project",
+            json.dumps(project),
+            "--agent-id",
+            "agent-1",
+            "--node",
+            "edit-pc",
+            "--idempotency-key",
+            "cli-job",
+        ]
+    )
+    err = json.loads(capsys.readouterr().err.strip().splitlines()[-1])
+    assert code == 2 and err["error"]["code"] == "not_a_resolve_project"
+    result = _call(
+        hub,
+        "job_submit",
+        {
+            "agent_id": "agent-1",
+            "idempotency_key": "mcp-job",
+            "kind": "ops.sequence",
+            "params": PARAMS,
+            "project": project,
+            "assigned_node": "edit-pc",
+        },
+    )
+    assert result.is_error is True
+    error = result.structured_content["error"]
+    assert error["code"] == "not_a_resolve_project"
+    assert "aar hub project source" in error["fix_hint"]
+    assert jobs.list_jobs(hub.log) == []
 
 
 # -- CLI ---------------------------------------------------------------------------------------

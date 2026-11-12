@@ -30,6 +30,7 @@ from aar.hub.common import (
     utcnow,
 )
 from aar.hub.events import Actor, Event, EventLog, match_or_conflict
+from aar.hub.registry import Registry, source_resolve_uid
 from aar.node.branches import valid_agent_id
 from aar.node.jobs import get_kind
 from aar.node.jobs.model import TERMINAL_STATES
@@ -89,6 +90,19 @@ class StaleGeneration(JobError):
 
 class JobCorrupt(JobError):
     code = "job_corrupt"
+
+
+class NotAResolveProject(JobError):
+    """The job's ``project.project_id`` is a hub registry id (``prj_...``), not a Resolve
+    unique id, so no node could ever open it. ``fix_hint`` says what to pass instead; the
+    text (``str``) carries both, for surfaces that print one string."""
+
+    code = "not_a_resolve_project"
+
+    def __init__(self, message: str, fix_hint: str) -> None:
+        super().__init__(f"{message}. {fix_hint}")
+        self.message = message
+        self.fix_hint = fix_hint
 
 
 @dataclass(slots=True)
@@ -442,6 +456,7 @@ def submit(
     project_id = clean_text(project.project_id, "project.project_id", max_len=MAX_ID)
     if project_id != project.project_id:
         raise InvalidInput("project.project_id", "must have no surrounding whitespace")
+    _refuse_registry_id(log, project_id)
     project_data = _bounded_json(project.to_dict(), "project", max_bytes=16 * 1024)
     if isinstance(priority, bool) or not isinstance(priority, int) or abs(priority) > 1_000_000:
         raise InvalidInput("priority", "must be an integer between -1000000 and 1000000")
@@ -494,6 +509,29 @@ def submit(
             ts=iso(clock()),
         )
         return _must(fold(txn), event.payload["job_id"]), False
+
+
+def _refuse_registry_id(log: EventLog, project_id: str) -> None:
+    """Refuse a target whose ``project_id`` is a hub registry project rather than Resolve's.
+
+    A project registered without a source (a show edited from hub media) has no Resolve
+    project yet, so a Resolve job for it can never run; a sourced one names its uid.
+    """
+    found = Registry(log).get(project_id)
+    if found is None:
+        return
+    uids = sorted({uid for s in found.sources if (uid := source_resolve_uid(s)) is not None})
+    if not uids:
+        raise NotAResolveProject(
+            f"hub project {project_id!r} has no Resolve source, so no node can open it",
+            "Import the show into Resolve on the edit PC, attach that project with `aar hub "
+            "project source` (aar node locate prints its locator), then submit with the Resolve "
+            "unique id as project.project_id.",
+        )
+    raise NotAResolveProject(
+        f"{project_id!r} is a hub registry id, not a Resolve unique id",
+        f"Pass the Resolve project's locator: project.project_id is one of {uids}.",
+    )
 
 
 def list_jobs(log: EventLog) -> list[HubJob]:
