@@ -530,11 +530,12 @@ def _tool_missing(exc: MediaError) -> ShrinkError:
 # --- Checks ---------------------------------------------------------------------------------
 
 
-def check_source(facts: Facts, fmt: str | None = None) -> None:
+def check_source(facts: Facts, fmt: str | None = None, *, replace: bool = False) -> None:
     """Refuse a source this command cannot shrink exactly: an already shrunk copy, a variable
-    frame rate (the stub builder's wording), an odd frame size (H.264 4:2:0 needs even ones),
-    audio the lossless codecs cannot keep, or (given the destination's muxer ``fmt``) a channel
-    layout that muxer's codec does not carry."""
+    frame rate (the stub builder's wording), audio the lossless codecs cannot keep, a stream
+    that starts before the file, an odd frame size (H.264 4:2:0 needs even ones), or (given the
+    destination's muxer ``fmt``) a channel layout that muxer's codec does not carry (``replace``:
+    the destination is the source's own name, so the hint cannot be to choose another)."""
     path = facts.path
     if facts.mark is not None:
         raise ShrinkError(
@@ -551,6 +552,22 @@ def check_source(facts: Facts, fmt: str | None = None) -> None:
             "conform the file to a constant frame rate first",
             path=path,
         )
+    # The audio's format first: a lossy codec (AAC's priming starts it before the file does) is
+    # refused for what it is, not for its start.
+    for index, sample_fmt, bits in facts.audio_formats:
+        exact = sample_fmt in _INT16 or (
+            sample_fmt in _INT32 and bits is not None and 0 < bits <= 24
+        )
+        if not exact:
+            raise ShrinkError(
+                "audio_unsupported",
+                f"{path!r}: audio stream {index} is {sample_fmt or 'unknown'} "
+                f"({bits or 'unknown'} bits); FLAC and ALAC keep integer samples of at most "
+                "24 bits exactly",
+                "give the camera's proxy (24-bit or 16-bit PCM)",
+                path=path,
+                stream=index,
+            )
     starts = [("video", facts.video_start)]
     starts += [(f"audio stream {a.index}", a.start) for a in facts.audio]
     for what, at in starts:
@@ -571,20 +588,6 @@ def check_source(facts: Facts, fmt: str | None = None) -> None:
             "give the camera's proxy, or scale the file to an even size first",
             path=path,
         )
-    for index, sample_fmt, bits in facts.audio_formats:
-        exact = sample_fmt in _INT16 or (
-            sample_fmt in _INT32 and bits is not None and 0 < bits <= 24
-        )
-        if not exact:
-            raise ShrinkError(
-                "audio_unsupported",
-                f"{path!r}: audio stream {index} is {sample_fmt or 'unknown'} "
-                f"({bits or 'unknown'} bits); FLAC and ALAC keep integer samples of at most "
-                "24 bits exactly",
-                "give the camera's proxy (24-bit or 16-bit PCM)",
-                path=path,
-                stream=index,
-            )
     if fmt is None:
         return
     for audio in facts.audio:
@@ -594,7 +597,12 @@ def check_source(facts: Facts, fmt: str | None = None) -> None:
                 "audio_unsupported",
                 f"{path!r}: audio stream {audio.index} has the channel layout {audio.layout}, "
                 f"which {AUDIO_CODECS[fmt].upper()} in .{fmt} does not keep",
-                f"name the destination .{others[0]} (that container keeps it)"
+                (
+                    f"--replace keeps the .{fmt} name: shrink it with --out to a .{others[0]} "
+                    "file instead (that container keeps it)"
+                    if replace
+                    else f"name the destination .{others[0]} (that container keeps it)"
+                )
                 if others
                 else "give the camera's proxy (mono or stereo audio)",
                 path=path,
@@ -1129,7 +1137,7 @@ def shrink_file(
             path=str(src),
         )
     if not replace and os.path.lexists(final):
-        check_source(facts, fmt)
+        check_source(facts, fmt, replace=replace)
         try:
             out = verify(facts, final)
         except ShrinkError as exc:
@@ -1146,7 +1154,7 @@ def shrink_file(
         result.output_bytes = out.size_bytes
         result.output = out.summary()
         return result
-    check_source(facts, fmt)
+    check_source(facts, fmt, replace=replace)
     temp, out_facts, elapsed = _encode(
         facts,
         src,

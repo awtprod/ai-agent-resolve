@@ -674,6 +674,7 @@ def no_encode(monkeypatch: pytest.MonkeyPatch) -> None:
         ("odd_size", "odd_size"),
         ("surround_to_mp4", "audio_unsupported"),
         ("cut_mid_gop", "negative_start"),
+        ("aac_mp4", "audio_unsupported"),  # AAC's priming starts it early: the codec is the reason
     ],
 )
 def test_a_source_that_cannot_be_kept_is_refused_before_encoding(
@@ -687,6 +688,8 @@ def test_a_source_that_cannot_be_kept_is_refused_before_encoding(
         src = make_clip(tmp_path / "s.mp4", vf="scale=321:181", pix_fmt="yuv444p")
     elif case == "surround_to_mp4":
         src = make_clip(tmp_path / "s.mp4", layout="5.1")
+    elif case == "aac_mp4":
+        src = make_clip(tmp_path / "s.mp4", acodec="aac")
     else:  # cut with -c copy from inside a GOP: an edit list hides the frames before the cut
         base = make_clip(tmp_path / "base.mov", seconds=3.0, gop=30)
         src = tmp_path / "s.mp4"
@@ -700,6 +703,9 @@ def test_a_source_that_cannot_be_kept_is_refused_before_encoding(
     assert exc.value.code == code and exc.value.hint
     if case == "surround_to_mp4":
         assert "5.1" in exc.value.message and ".mov" in exc.value.hint
+    if case == "aac_mp4":
+        assert "fltp" in exc.value.message and "edit list" not in exc.value.message
+        assert "keyframe" not in exc.value.hint
     assert not dst.exists() and leftovers(tmp_path) == []
 
 
@@ -1129,3 +1135,22 @@ def test_a_noisy_fade_is_shrunk_and_a_shift_of_it_still_caught(tmp_path: Path) -
             shrink_mod.verify(facts, bad)
         assert any("shifted by a frame" in d for d in exc.value.details["differences"]), name
         bad.unlink()
+
+
+# --- Fix round 2: the right reason and message ------------------------------------------------
+
+
+def test_replace_of_an_unkept_layout_does_not_suggest_another_name(
+    tmp_path: Path, no_encode: None
+) -> None:
+    src = make_clip(tmp_path / "s.mp4", layout="5.1")
+    with pytest.raises(ShrinkError) as exc:
+        shrink_file(src, replace=True)
+    assert exc.value.code == "audio_unsupported"
+    assert "name the destination" not in exc.value.hint
+    assert (
+        "--replace keeps" in exc.value.hint
+        and "--out" in exc.value.hint
+        and ".mov" in exc.value.hint
+    )
+    assert leftovers(tmp_path) == []
