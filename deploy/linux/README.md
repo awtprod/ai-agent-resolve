@@ -40,11 +40,26 @@ Sizing: a 90-minute show's transcript takes about 25 minutes and 4 GB of memory 
 the review render runs at about 0.8x realtime of the cut, with at most 6 GiB for ffmpeg (less
 when the cgroup or the host has less free). One worker runs one step at a time.
 
-Stopping: on SIGTERM the worker claims nothing new and lets the current step finish. A render in
-progress is stopped at once (ffmpeg killed, the step failed `render_interrupted`: retry it with
-`aar recipe retry --step render`). A transcript cannot be interrupted; if it outlasts
-`TimeoutStopSec` (15 minutes) systemd kills it, and the next start resumes it from its
-checkpoint under `AAR_WORK_DIR`, because the step is idempotent and its lease lapses.
+Stopping: on SIGTERM the worker claims nothing new. A step that has not started its real work
+stops at its next check (before and after hashing the media, about 10 s for a 90-minute proxy;
+while waiting for another worker's transcription; before a render or an export) and records
+nothing; a render in progress is stopped too (ffmpeg's process group killed, its scratch
+removed). In both cases the worker exits with the claim held: the 60 s lease lapses and the next
+worker claims the step again, because these steps are idempotent, so a stop uses no attempt.
+A transcription in progress cannot be interrupted: past `TimeoutStopSec` (15 minutes) systemd
+kills the worker, and the next worker resumes the transcription from its checkpoint under
+`AAR_WORK_DIR`. A SIGKILL looks the same to the hub: a claim whose lease lapses.
+
+`KillMode=mixed` sends SIGTERM to the worker alone and, at the stop timeout or after a crash,
+SIGKILL to every process left in the unit's cgroup. That is what reaps an ffmpeg (a render's
+encode, or a decode) orphaned when the worker itself was killed: outside systemd such an ffmpeg
+keeps running (re-parented to init) until it finishes.
+
+Scratch: each render or laughs attempt works in `AAR_WORK_DIR/<area>/<recipe>/<op>/`, emptied
+when the attempt starts and removed when it ends; at every start the step also removes, at most
+200 entries at a time, the folders of finished or cancelled runs and of ops that are no longer
+running. Transcription folders and lock files nobody holds are swept the same way (folders kept
+two days for a resume).
 
 ## Choosing the root: not `/srv` for Command Center agents
 

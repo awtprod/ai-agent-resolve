@@ -23,7 +23,9 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
-ReadWritePaths=@AAR_ROOT@/data @AAR_WORK_DIR@ @AAR_EXPORT_DIR@
+ReadWritePaths=@AAR_ROOT@/data
+ReadWritePaths="@AAR_WORK_DIR@"
+ReadWritePaths="@AAR_EXPORT_DIR@"
 # The exports are read by the edit PC through the share: files 0644, folders 0755.
 UMask=0022
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
