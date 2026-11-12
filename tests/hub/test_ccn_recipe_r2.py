@@ -302,7 +302,7 @@ def test_render_scratch_of_finished_runs_and_dead_ops_is_swept_but_never_a_live_
     area = env.work / "aar-render"
     for name in (live_cut, done_stub):
         (area / run2 / name).mkdir(parents=True)
-    (area / "nd_gone").mkdir()  # a recipe this hub does not know
+    (area / "nd_gone").mkdir()  # a recipe this hub does not know: kept (round 3, LOW-2)
     # a third run renders: its sweep runs over the area
     run3 = _cold(env, env.params(show, timeline="Third"), "3")
     agent_cut(env, run3, key="r3")
@@ -310,7 +310,7 @@ def test_render_scratch_of_finished_runs_and_dead_ops_is_swept_but_never_a_live_
     assert latest(env, run3, "render").status == "done"
     assert (area / run2 / live_cut).is_dir()
     assert not (area / run2 / done_stub).exists()
-    assert not (area / "nd_gone").exists()
+    assert (area / "nd_gone").is_dir()
     assert not (area / run3).exists()
 
 

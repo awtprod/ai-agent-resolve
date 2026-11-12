@@ -5,8 +5,8 @@
   (an op is one attempt of one round), emptied at the start of every attempt. A worker that
   re-claims a lapsed op after a crash starts from an empty directory, and the result is stored
   content-addressed, so a repeat cannot duplicate anything.
-- :func:`sweep`: removes the scratch of finished and cancelled runs and of ops that are no longer
-  live, at most :data:`SWEEP_MAX` entries a call, never a live op's directory.
+- :func:`sweep`: removes the scratch of finished and cancelled runs and of ops that are known
+  not to be live, at most :data:`SWEEP_MAX` entries a call; anything it cannot place is kept.
 - :func:`key_lock`: an exclusive lock file per key that is unlinked by its holder, so lock files
   do not pile up; a waiter that locked a file someone unlinked meanwhile opens the new one.
   :func:`sweep_locks` removes lock files nobody holds (from a killed worker).
@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import sqlite3
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -79,40 +80,40 @@ def drop_scratch(folder: Path) -> None:
 
 
 def sweep(ctx: StepContext, base: Path) -> int:
-    """Remove scratch under ``base`` that no live op owns: a recipe folder whose run is finished
-    or unknown, an op folder whose op is not live. Bounded by :data:`SWEEP_MAX`; returns the
-    number of entries removed. The current op's folder is never removed here."""
+    """Remove scratch under ``base`` that is positively known to be dead: the folder of a run
+    that is done or cancelled, the folder of an op of a known run that is not live. Everything
+    else is kept: an entry that is not a plain directory, a folder this hub does not know as a
+    run (another hub may share ``AAR_WORK_DIR``), a run whose state cannot be read now (a
+    database error), an op folder that is not one of the run's ops. Bounded by
+    :data:`SWEEP_MAX`; returns the number of entries removed. The current op's folder is never
+    removed here."""
     if not base.is_dir():
         return 0
     removed = 0
     with os.scandir(base) as entries:
         recipes = [Path(e.path) for _, e in zip(range(SWEEP_MAX), entries, strict=False)]
     for folder in recipes:
-        if not folder.is_dir() or folder.is_symlink():
-            _remove(folder)
-            removed += 1
+        if folder.is_symlink() or not folder.is_dir():
             continue
         try:
             state = load_state(ctx.log, folder.name)
-        except Exception:  # not a recipe node of this hub: nobody owns it
-            state = None
-        finished = (
-            state is None
-            or state.recipe_data is None
-            or state.recipe_status in ("done", "cancelled")
-        )
-        if finished and folder.name != ctx.recipe_node:
-            _remove(folder)
-            removed += 1
+        except sqlite3.Error:
+            continue  # cannot tell now: keep it, the next sweep looks again
+        if state.recipe_data is None:
+            continue  # not a run this hub knows
+        if state.recipe_status in ("done", "cancelled"):
+            if folder.name != ctx.recipe_node:
+                _remove(folder)
+                removed += 1
             continue
-        live = {op.op_id for op in state.ops if op.is_live} if state is not None else set()
+        dead = {op.op_id for op in state.ops if not op.is_live}
         with os.scandir(folder) as entries:
             ops = [Path(e.path) for _, e in zip(range(SWEEP_MAX), entries, strict=False)]
         for op_folder in ops:
-            if op_folder.name != ctx.op_node and op_folder.name not in live:
+            if op_folder.name != ctx.op_node and op_folder.name in dead:
                 _remove(op_folder)
                 removed += 1
-        with contextlib.suppress(OSError):
+        with contextlib.suppress(OSError):  # only when empty
             folder.rmdir()
     return removed
 
