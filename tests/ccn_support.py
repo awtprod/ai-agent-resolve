@@ -30,7 +30,9 @@ needs_ffmpeg = pytest.mark.skipif(
     reason="ffmpeg/ffprobe not found on PATH or via AAR_FFMPEG/AAR_FFPROBE",
 )
 
-VOICE = "(0.5*sin(2*PI*220*t)+0.3*sin(2*PI*337*t)+0.2*sin(2*PI*513*t))"
+#: A voice: three partials plus seeded noise (``random(0)`` is deterministic per sample), so two
+#: cameras' copies of one take have a single clear correlation peak for ``aar analyze sync``.
+VOICE = "(0.4*sin(2*PI*220*t)+0.25*sin(2*PI*337*t)+0.15*sin(2*PI*513*t)+0.4*(2*random(0)-1))"
 ROOM = "0.001*sin(2*PI*120*t)"
 
 #: (text, start_s, end_s): three sentences with a one-second pause between them.
@@ -59,9 +61,9 @@ SECONDS = 12.0
 KEEP = {"ranges": [{"start_s": 0.9, "end_s": 4.1}, {"start_s": 8.9, "end_s": 11.1}]}
 
 
-def _audio_expr(words: tuple[tuple[str, float, float], ...], gain: float) -> str:
+def _audio_expr(words: tuple[tuple[str, float, float], ...], gain: float, room: bool) -> str:
     bursts = "+".join(f"between(t,{a},{b})" for _, a, b in words)
-    return f"{ROOM}+{gain}*({bursts})*{VOICE}"
+    return f"{ROOM if room else 0}+{gain}*({bursts})*{VOICE}"
 
 
 def make_show(
@@ -74,15 +76,16 @@ def make_show(
     audio: bool = True,
     words: tuple[tuple[str, float, float], ...] = WORDS,
     gain: float = 0.3,
+    room: bool = True,
     drop_frame_at: int | None = None,
 ) -> Path:
     """Write a synthetic camera file (module docstring); return its path. ``drop_frame_at``
-    removes one video frame (a variable frame rate)."""
+    removes one video frame (a variable frame rate); ``gain=0, room=False`` is digital silence."""
     assert FFMPEG is not None
     cmd = [FFMPEG, "-hide_banner", "-nostdin", "-v", "error", "-y"]
     cmd += ["-f", "lavfi", "-i", f"testsrc2=size={size}:rate={rate}:duration={seconds}"]
     if audio:
-        expr = _audio_expr(words, gain)
+        expr = _audio_expr(words, gain, room)
         cmd += ["-f", "lavfi", "-i", f"aevalsrc='{expr}|{expr}':s=48000:d={seconds}"]
         cmd += ["-map", "0:v", "-map", "1:a", "-c:a", "pcm_s16le"]
     if drop_frame_at is not None:
@@ -93,6 +96,18 @@ def make_show(
     cmd += ["-f", "mov", str(path)]
     subprocess.run(cmd, check=True, timeout=120)
     return path
+
+
+def delayed_copy(src: Path, dest: Path, *, delay_s: float, gain: float = 0.5) -> Path:
+    """``src`` as a second camera started ``delay_s`` later: the same picture, the same sound
+    shifted by ``delay_s`` (quieter), the same length."""
+    assert FFMPEG is not None
+    ms = round(delay_s * 1000)
+    cmd = [FFMPEG, "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", str(src)]
+    cmd += ["-af", f"adelay={ms}|{ms},volume={gain},atrim=0:{SECONDS}", "-c:v", "copy"]
+    cmd += ["-c:a", "pcm_s16le", "-timecode", "01:00:00:15", "-f", "mov", str(dest)]
+    subprocess.run(cmd, check=True, timeout=120)
+    return dest
 
 
 def transcript(recording: str, words: tuple[tuple[str, float, float], ...] = WORDS) -> dict:
