@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -71,6 +72,23 @@ class DuplicateResolveProject(ValueError):
         )
         self.resolve_uid = resolve_uid
         self.existing_id = existing_id
+
+
+class DuplicateProjectName(ValueError):
+    """Raised when a project without a source would take a name or alias another project has.
+
+    A source-less project has no Resolve unique id, so its name is its identity. ``name`` is
+    the text that collides; ``existing_id`` is the registry id (``prj_...``) that holds it.
+    """
+
+    def __init__(self, name: str, existing_id: str) -> None:
+        super().__init__(f"name {name!r} is already a name or alias of {existing_id!r}")
+        self.name = name
+        self.existing_id = existing_id
+
+
+def _nfc(text: str) -> str:
+    return unicodedata.normalize("NFC", text)
 
 
 def new_project_id() -> str:
@@ -259,12 +277,19 @@ class Registry:
         aliases: list[str] | None = None,
         project_id: str | None = None,
         idempotency_key: str | None = None,
+        unique_name: bool = False,
     ) -> Project:
         """Create a project and return it.
 
         An explicit ``project_id`` that already exists is rejected with
         :class:`DuplicateProjectId`, unless the same ``idempotency_key`` was used for
         the original create (a genuine retry), which returns the existing project.
+
+        ``unique_name`` (off by default; the agent-facing registration in
+        :mod:`aar.hub.project_register` sets it for a project without sources, whose name is
+        its identity) applies the reserved-name rule of :meth:`_refuse_taken_name`, raising
+        :class:`DuplicateProjectName`. It is checked inside the write transaction, after the
+        retry check, so a retry replays and two racing creates yield one project.
         """
         source_dicts = [s.to_dict() for s in (sources or [])]
         alias_list = list(aliases or [])
@@ -302,6 +327,8 @@ class Registry:
                 raise DuplicateProjectId(f"project id already exists: {pid!r}")
             for source in sources or []:
                 self._refuse_taken_uid(source, pid)
+            if unique_name:
+                self._refuse_taken_name([name, *alias_list], pid, sourceless=not sources)
             payload = {
                 "project_id": pid,
                 "name": name,
@@ -320,15 +347,22 @@ class Registry:
         return self._projects[pid]
 
     def rename_project(
-        self, project_id: str, new_name: str, actor: Actor, *, idempotency_key: str | None = None
+        self,
+        project_id: str,
+        new_name: str,
+        actor: Actor,
+        *,
+        idempotency_key: str | None = None,
+        unique_name: bool = False,
     ) -> Project:
-        """Rename a project, keeping its id."""
+        """Rename a project, keeping its id. ``unique_name``: as in :meth:`create_project`."""
         return self._mutate(
             project_id,
             EVENT_PROJECT_RENAMED,
             {"project_id": project_id, "name": new_name},
             actor,
             idempotency_key,
+            guard=self._name_guard(project_id, new_name) if unique_name else None,
         )
 
     def add_source(
@@ -350,15 +384,23 @@ class Registry:
         )
 
     def add_alias(
-        self, project_id: str, alias: str, actor: Actor, *, idempotency_key: str | None = None
+        self,
+        project_id: str,
+        alias: str,
+        actor: Actor,
+        *,
+        idempotency_key: str | None = None,
+        unique_name: bool = False,
     ) -> Project:
-        """Add an alternative name for the project."""
+        """Add an alternative name for the project. ``unique_name``: as in
+        :meth:`create_project`."""
         return self._mutate(
             project_id,
             EVENT_ALIAS_ADDED,
             {"project_id": project_id, "alias": alias},
             actor,
             idempotency_key,
+            guard=self._name_guard(project_id, alias) if unique_name else None,
         )
 
     # -- queries ------------------------------------------------------------
@@ -457,6 +499,29 @@ class Registry:
                 source_resolve_uid(held) == uid for held in project.sources
             ):
                 raise DuplicateResolveProject(uid, project.id)
+
+    def _name_guard(self, project_id: str, name: str) -> Callable[[], None]:
+        """The reserved-name check for a rename or alias, run by :meth:`_mutate` in its
+        transaction (after the retry check), when the project's sources are current."""
+        return lambda: self._refuse_taken_name(
+            [name], project_id, sourceless=not self._projects[project_id].sources
+        )
+
+    def _refuse_taken_name(self, names: list[str], owner_id: str, *, sourceless: bool) -> None:
+        """The reserved-name rule. A project without sources is known by its name, so a
+        name or alias a source-less project holds is reserved to it, and a source-less
+        project (``sourceless``) may not take a name or alias any other project holds. The
+        project ``owner_id`` itself never collides (renaming to its own name, re-adding its
+        own alias). Names compare NFC-normalised, so a composed and a decomposed spelling
+        are the same name; case still matters. Raises :class:`DuplicateProjectName` naming
+        the holder."""
+        for project in self.list():
+            if project.id == owner_id or (project.sources and not sourceless):
+                continue
+            held = {_nfc(text) for text in (project.name, *project.aliases)}
+            for name in names:
+                if _nfc(name) in held:
+                    raise DuplicateProjectName(name, project.id)
 
     def _refuse_unless_foldable(
         self, event_type: str, actor: Actor, payload: dict[str, Any]

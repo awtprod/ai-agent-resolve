@@ -30,6 +30,7 @@ from aar.hub.common import (
     utcnow,
 )
 from aar.hub.events import Actor, Event, EventLog, match_or_conflict
+from aar.hub.registry import Registry, source_resolve_uid
 from aar.node.branches import valid_agent_id
 from aar.node.jobs import get_kind
 from aar.node.jobs.model import TERMINAL_STATES
@@ -89,6 +90,19 @@ class StaleGeneration(JobError):
 
 class JobCorrupt(JobError):
     code = "job_corrupt"
+
+
+class NotAResolveProject(JobError):
+    """The job's ``project.project_id`` is a hub registry id (``prj_...``), not a Resolve
+    unique id, so no node could ever open it. ``fix_hint`` says what to pass instead; the
+    text (``str``) carries both, for surfaces that print one string."""
+
+    code = "not_a_resolve_project"
+
+    def __init__(self, message: str, fix_hint: str) -> None:
+        super().__init__(f"{message}. {fix_hint}")
+        self.message = message
+        self.fix_hint = fix_hint
 
 
 @dataclass(slots=True)
@@ -482,6 +496,7 @@ def submit(
             match_or_conflict(existing, EVENT_SUBMITTED, base, base.keys(), actor=actor)
             jobs = fold(txn)
             return _must(jobs, existing.payload["job_id"]), True
+        _refuse_registry_id(log, project_id)  # after the replay: a retry always replays
         if len(fold(txn)) >= MAX_JOBS:
             raise JobConflict(f"hub job limit ({MAX_JOBS}) reached")
         payload = {"job_id": "job_" + uuid.uuid4().hex, **base}
@@ -494,6 +509,33 @@ def submit(
             ts=iso(clock()),
         )
         return _must(fold(txn), event.payload["job_id"]), False
+
+
+def _refuse_registry_id(log: EventLog, project_id: str) -> None:
+    """Refuse a target whose ``project_id`` is a hub registry project rather than Resolve's.
+
+    A project registered without a source (a show edited from hub media) has no Resolve
+    project yet, so a Resolve job for it can never run; a sourced one names its uid. A
+    registry id that some project also lists as the Resolve unique id of a source is a
+    Resolve uid too, and is accepted. Called inside the submit transaction (the log's lock
+    is re-entrant, so the registry reads the same transaction's view).
+    """
+    registry = Registry(log)
+    found = registry.get(project_id)
+    if found is None or registry.find_by_resolve_uid(project_id) is not None:
+        return
+    uids = sorted({uid for s in found.sources if (uid := source_resolve_uid(s)) is not None})
+    if not uids:
+        raise NotAResolveProject(
+            f"hub project {project_id!r} has no Resolve source, so no node can open it",
+            "Import the show into Resolve on the edit PC, attach that project with `aar hub "
+            "project source` (aar node locate prints its locator), then submit with the Resolve "
+            "unique id as project.project_id.",
+        )
+    raise NotAResolveProject(
+        f"{project_id!r} is a hub registry id, not a Resolve unique id",
+        f"Pass the Resolve project's locator: project.project_id is one of {uids}.",
+    )
 
 
 def list_jobs(log: EventLog) -> list[HubJob]:

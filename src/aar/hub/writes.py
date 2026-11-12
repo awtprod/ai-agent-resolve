@@ -188,6 +188,7 @@ ERROR_CODES = frozenset(
         "too_many_facts",
         "project_exists",
         "actor_not_allowed",
+        "not_a_resolve_project",
     }
 )
 

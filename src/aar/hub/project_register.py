@@ -13,10 +13,21 @@ Rules, all checked before anything is written:
 - One Resolve unique id belongs to one registry project (``project_exists``, naming the
   existing id). The check runs inside the registry's write transaction, after the
   idempotent-retry check, so a genuine retry of the same request still succeeds.
+- A project may be registered without a source (a show edited from hub media before any
+  Resolve project exists): pass neither ``source_kind`` nor ``locator`` (one without the
+  other, or a ``host`` without them, is ``invalid_input``). Its name is then its identity: a
+  name or alias that any project already has as its name or an alias is refused with
+  ``project_exists`` naming the existing id, after the same retry check. The Resolve source
+  is attached later with :func:`add_source`, under the same one-uid-one-project rule.
+- :func:`rename` and :func:`add_alias` keep that identity: a name or alias a source-less
+  project holds is reserved to it, and a source-less project may not take one any other
+  project holds (``project_exists``). The library (:class:`Registry`) does not apply this
+  rule unless asked (``unique_name``).
 """
 
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -27,6 +38,7 @@ from aar.hub.registry import (
     RESOLVE_SOURCE_KINDS,
     SOURCE_KINDS,
     DuplicateProjectId,
+    DuplicateProjectName,
     DuplicateResolveProject,
     Project,
     ProjectSource,
@@ -67,6 +79,28 @@ def _text(value: Any, field: str, *, limit: int = MAX_NAME_CHARS) -> str:
             f"{field} must be text of 1-{limit} characters, not blank and without control "
             f"characters, got {value!r:.80}",
             f"Pass a printable, non-blank {field}.",
+            field=field,
+        )
+    return value
+
+
+# Control (C0 and C1), format (zero-width, BOM, bidi marks) and line/paragraph separators:
+# nothing a show name needs, and they make two names look alike.
+_NOT_IN_A_SHOW_NAME = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
+
+def _show_name(value: str, field: str) -> str:
+    """``value`` (already through :func:`_text`) if it is a plain show name: no surrounding
+    whitespace and nothing in :data:`_NOT_IN_A_SHOW_NAME`. Used where the name is the
+    project's identity (a source-less registration, ``rename`` and ``add_alias``)."""
+    bad = next((ch for ch in value if unicodedata.category(ch) in _NOT_IN_A_SHOW_NAME), None)
+    if value != value.strip() or bad is not None:
+        problem = "surrounding whitespace" if bad is None else f"the character U+{ord(bad):04X}"
+        raise WriteError(
+            "invalid_input",
+            f"{field} has {problem}, got {value!r:.80}",
+            f"Pass the {field} as plain text without surrounding spaces, control or "
+            "zero-width characters.",
             field=field,
         )
     return value
@@ -174,6 +208,40 @@ def _exists(error: DuplicateResolveProject) -> WriteError:
     )
 
 
+def _name_taken(error: DuplicateProjectName) -> WriteError:
+    return WriteError(
+        "project_exists",
+        f"{error.name!r} is already a name or alias of {error.existing_id!r}, and a project "
+        "without a source is known by its name",
+        f"Use {error.existing_id} (aar hub project show), or register under another name.",
+        existing_id=error.existing_id,
+        name=error.name,
+    )
+
+
+def _optional_source(source_kind: Any, locator: Any, host: Any) -> list[ProjectSource]:
+    """``[]`` when neither ``source_kind`` nor ``locator`` is given, else the one source."""
+    if source_kind is None and locator is None:
+        if host is not None:
+            raise WriteError(
+                "invalid_input",
+                "host names where a source lives, and no source was given",
+                "Drop host, or give source_kind and locator too.",
+                field="host",
+            )
+        return []
+    if source_kind is None or locator is None:
+        missing = "source_kind" if source_kind is None else "locator"
+        raise WriteError(
+            "invalid_input",
+            f"{missing} is missing: give source_kind and locator together, or neither",
+            "Pass both for a Resolve source, or neither to register the project without one "
+            "(attach it later with `aar hub project source`).",
+            field=missing,
+        )
+    return [build_source(source_kind, locator, host)]
+
+
 def _conflict(error: IdempotencyConflict) -> WriteError:
     return WriteError(
         "idempotency_conflict",
@@ -187,19 +255,23 @@ def register_project(
     actor: Actor,
     *,
     name: Any,
-    source_kind: Any,
-    locator: Any,
+    source_kind: Any = None,
+    locator: Any = None,
     host: Any = None,
     aliases: Sequence[Any] | None = None,
     project_id: Any = None,
     idempotency_key: Any,
 ) -> WriteResult:
-    """Register a project with one source. A retry with the same key and request replays."""
+    """Register a project with one source, or none. A retry with the same key and request
+    replays."""
     actor = check_registrant(actor)
     key = write_key(actor, idempotency_key)
     name = _text(name, "name")
-    source = build_source(source_kind, locator, host)
+    sources = _optional_source(source_kind, locator, host)
     alias_list = _aliases(aliases)
+    if not sources:  # the name is the identity; a sourced registration is as before
+        name = _show_name(name, "name")
+        alias_list = [_show_name(alias, "alias") for alias in alias_list]
     if project_id is not None:
         project_id = check_id(project_id, "project_id")
     registry = Registry(log)
@@ -208,13 +280,16 @@ def register_project(
         project = registry.create_project(
             name,
             actor,
-            sources=[source],
+            sources=sources,
             aliases=alias_list,
             project_id=project_id,
             idempotency_key=key,
+            unique_name=not sources,
         )
     except DuplicateResolveProject as exc:
         raise _exists(exc) from None
+    except DuplicateProjectName as exc:
+        raise _name_taken(exc) from None
     except DuplicateProjectId as exc:
         raise WriteError(
             "project_exists",
@@ -254,6 +329,8 @@ def _change(
         project = apply(registry, key)
     except DuplicateResolveProject as exc:
         raise _exists(exc) from None
+    except DuplicateProjectName as exc:
+        raise _name_taken(exc) from None
     except IdempotencyConflict as exc:
         raise _conflict(exc) from None
     except KeyError:
@@ -268,28 +345,32 @@ def _change(
 def add_alias(
     log: EventLog, actor: Actor, project_id: Any, alias: Any, *, idempotency_key: Any
 ) -> WriteResult:
-    text = _text(alias, "alias")
+    text = _show_name(_text(alias, "alias"), "alias")
     return _change(
         log,
         actor,
         project_id,
         idempotency_key,
         "project.alias",
-        lambda reg, key: reg.add_alias(project_id, text, actor, idempotency_key=key),
+        lambda reg, key: reg.add_alias(
+            project_id, text, actor, idempotency_key=key, unique_name=True
+        ),
     )
 
 
 def rename(
     log: EventLog, actor: Actor, project_id: Any, name: Any, *, idempotency_key: Any
 ) -> WriteResult:
-    text = _text(name, "name")
+    text = _show_name(_text(name, "name"), "name")
     return _change(
         log,
         actor,
         project_id,
         idempotency_key,
         "project.rename",
-        lambda reg, key: reg.rename_project(project_id, text, actor, idempotency_key=key),
+        lambda reg, key: reg.rename_project(
+            project_id, text, actor, idempotency_key=key, unique_name=True
+        ),
     )
 
 

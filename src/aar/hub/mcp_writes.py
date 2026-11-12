@@ -170,6 +170,11 @@ def register_write_tools(
                     "`aar hub job cancel`.",
                 )
             )
+        except jobs.NotAResolveProject as exc:
+            # Only registry ids and Resolve uids in the text: safe to show the agent.
+            return _refused(
+                writes.WriteError(exc.code, exc.message, exc.fix_hint, field="project.project_id")
+            )
         except jobs.JobError as exc:
             return _result(
                 {
@@ -268,22 +273,27 @@ def register_write_tools(
     @server.tool(
         name="project_register",
         description=(
-            "Register a Resolve project in the hub so a node can run its jobs. `aar node run` "
-            "will not start until the registry holds a project whose source carries the Resolve "
-            "project's unique id. One Resolve unique id maps to one registry project: a second "
-            "registration is refused with project_exists, and details.existing_id names the "
-            "project to use (see projects_list). "
+            "Register a project in the hub. `aar node run` will not start until the registry "
+            "holds a project whose source carries the Resolve project's unique id. One Resolve "
+            "unique id maps to one registry project: a second registration is refused with "
+            "project_exists, and details.existing_id names the project to use (see "
+            "projects_list). A show edited from hub media before any Resolve project exists is "
+            "registered without a source (omit source_kind, locator and host): its name is "
+            "then its identity, so a name or alias any project already has is refused with "
+            "project_exists and details.existing_id; the Resolve source is attached later "
+            "with `aar hub project source` (a human or an agent on the hub). "
             + _IDENTITY
             + "name is the display name (1-500 characters). source_kind is cloud_library | "
             "local_db | drp_file | drt_file. locator is an object; for cloud_library and "
             "local_db it must be exactly {project_id: the Resolve unique id "
             "(Project.GetUniqueId()), name: the Resolve project name, folder_path: [Project "
-            "Manager folder names from the root; [] is the root]}. host is optional text; "
+            "Manager folder names from the root; [] is the root]}. source_kind and locator "
+            "come together or not at all. host is optional text (only with a source); "
             "aliases is an optional list of text; project_id is an optional explicit registry "
             "id (prj_...). A node cannot register. Example: name 'Show', source_kind "
-            "'local_db', locator {project_id: 'a1b2', name: 'Show', folder_path: ['Shows']}. "
-            "Returns {ok: true, op: 'project.register', replayed, project_id, project: {id, "
-            "name, sources, aliases, created}}. " + _ERRORS
+            "'local_db', locator {project_id: 'a1b2', name: 'Show', folder_path: ['Shows']}; "
+            "without a source: name 'Show'. Returns {ok: true, op: 'project.register', "
+            "replayed, project_id, project: {id, name, sources, aliases, created}}. " + _ERRORS
         ),
         annotations=_WRITE,
     )
@@ -291,8 +301,8 @@ def register_write_tools(
         agent_id: str,
         idempotency_key: str,
         name: str,
-        source_kind: str,
-        locator: dict[str, Any],
+        source_kind: str | None = None,
+        locator: dict[str, Any] | None = None,
         host: str | None = None,
         aliases: list[str] | None = None,
         project_id: str | None = None,
