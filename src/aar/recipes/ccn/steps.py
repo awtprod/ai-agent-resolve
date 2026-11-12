@@ -23,8 +23,10 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sys
 from collections.abc import Callable
 from fractions import Fraction
+from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
@@ -315,6 +317,12 @@ def laughs_step(ctx: StepContext) -> StepOutput:
 # -- 5. guide ---------------------------------------------------------------------------------
 
 
+def _aar_command() -> str:
+    """The ``aar`` script beside this interpreter (the worker's own), else ``aar``."""
+    script = Path(sys.executable).with_name("aar")
+    return str(script) if script.is_file() else "aar"
+
+
 def guide_step(ctx: StepContext) -> StepOutput:
     """Write the ``cut`` step's full guide (:mod:`aar.recipes.ccn.guide`) as an artifact, with
     the hub paths this worker runs on and this run's input artifact ids."""
@@ -332,6 +340,8 @@ def guide_step(ctx: StepContext) -> StepOutput:
         sync=dict(ctx.needs["sync"]),
         transcript=dict(ctx.needs["transcript"]),
         laughs=dict(ctx.needs["laughs"]),
+        aar=_aar_command(),
+        python=sys.executable,
     )
     guide_id = ctx.put(text.encode("utf-8"), mime="text/markdown", meta={"role": "cut-guide"})
     read = (

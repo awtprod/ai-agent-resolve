@@ -16,6 +16,12 @@ from typing import Any
 from aar.hub.writes import Brief
 
 RECIPES_ENV = "AAR_RECIPES=aar.recipes.ccn"
+#: Writes submit.json from plan.json; its two arguments are the project id and ``derives_from``.
+MAKE_SUBMIT = (
+    """python3 -c 'import json,sys; json.dump({"project_id": sys.argv[1], """
+    """"derives_from": sys.argv[2], "plan": json.load(open("plan.json"))}, """
+    """open("submit.json", "w"))'"""
+)
 
 
 def _q(value: str) -> str:
@@ -34,6 +40,8 @@ def build_guide(
     sync: dict[str, Any],
     transcript: dict[str, Any],
     laughs: dict[str, Any],
+    aar: str = "aar",
+    python: str = "python3",
 ) -> str:
     """The guide's Markdown text for one run (module docstring)."""
     get = (
@@ -186,14 +194,15 @@ def build_guide(
         "",
         "## 6. Submit the plan and complete the step",
         "",
-        "Write submit.json, with `D` = this recipe node in round 1:",
+        "Make submit.json from plan.json; `D` is this recipe node in round 1 (in a later",
+        "round, the review that rejected the last cut: see 7):",
         "",
-        "```json",
-        json.dumps(
-            {"project_id": project_id, "derives_from": recipe_node, "plan": "<plan.json here>"},
-            indent=1,
-        ),
+        "```sh",
+        f"{MAKE_SUBMIT} {project_id} {recipe_node}",
         "```",
+        "",
+        "Then submit it, and complete the step with the node id the write prints",
+        "(`node.id`):",
         "",
         "```sh",
         f"aar hub write plan --db {_q(db)} --artifacts {_q(artifacts)} --actor agent:<you> "
@@ -221,7 +230,8 @@ def build_guide(
         f"`{recipe_node}` or from an earlier review of it) and whose decision is `reject`; its",
         "`reason` and `notes` (at timeline frames) say what to change. MCP: `review_get`.",
         "Change the cut accordingly (a plan identical to a rejected one is refused), and",
-        "submit it with `derives_from` = that review's id, not the recipe node.",
+        "make submit.json with that review's id as `derives_from` (the last argument of the",
+        "python3 line in 6), not the recipe node, then submit and complete as in 6.",
         "",
         "## After the cut",
         "",

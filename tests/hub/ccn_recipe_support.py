@@ -12,6 +12,8 @@ import json
 import os
 import re
 import shlex
+import subprocess
+import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -215,7 +217,7 @@ def agent_cut(
     produce and lint commands and its submit and complete commands, run as written (only the
     placeholders filled in). Returns the plan node id."""
     guide = read_guide(env, recipe_node)
-    fetch_block, make_block, submit_block, *_ = GUIDE_BLOCK.findall(guide)
+    fetch_block, make_block, json_block, submit_block, *_ = GUIDE_BLOCK.findall(guide)
     recording = json.loads(re.search(r'"recording": (".*?")', guide).group(1))
     (env.agent / "keep.json").write_text(
         json.dumps({"recording": recording, **(keep or KEEP)}), encoding="utf-8"
@@ -228,17 +230,11 @@ def agent_cut(
             assert main([*shlex.split(line)[1:], "--force"]) == 0, line
         for line in make_block.splitlines():
             assert main(shlex.split(line)[1:]) == 0, line
-    plan = json.loads((env.agent / "plan.json").read_text(encoding="utf-8"))
-    (env.agent / "submit.json").write_text(
-        json.dumps(
-            {
-                "project_id": env.hub.project_id,
-                "derives_from": derives_from or recipe_node,
-                "plan": plan,
-            }
-        ),
-        encoding="utf-8",
-    )
+    make_submit = shlex.split(json_block.strip())
+    assert make_submit[0] == "python3" and make_submit[-1] == recipe_node
+    if derives_from is not None:
+        make_submit[-1] = derives_from  # a later round: the review that rejected the cut
+    subprocess.run([sys.executable, *make_submit[1:]], cwd=env.agent, check=True, timeout=30)
     write_line, complete_line = submit_block.strip().splitlines()
     fill = {"<you>": "agent-1", "<new key>": f"plan-{key}"}
     for old, value in fill.items():
