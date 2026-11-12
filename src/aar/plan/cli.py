@@ -1,10 +1,11 @@
 """``aar plan`` commands: print the EditPlan JSON Schema, lint, compile (apply), produce, export
-and render plans."""
+and render plans, and import a timeline edited in Resolve back as a plan."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ from aar.plan.produce import cli as produce_cli
 from aar.plan.profile import ProfileError, load_profile
 from aar.plan.render import RUNTIME_CODES as RENDER_RUNTIME_CODES
 from aar.plan.render import RenderError, RenderTerminated, render_plan
+from aar.plan.timeline_import import TimelineImportError, import_timeline, read_timeline
 
 _PROG = "aar plan"
 EXIT_OK = 0
@@ -191,6 +193,34 @@ def register(subparsers: Any) -> None:
     )
     render.add_argument("--json", action="store_true", help="Print the report as JSON.")
     render.set_defaults(func=_cmd_render)
+
+    imp = sub.add_parser(
+        "import-timeline",
+        help="Bring a timeline edited in Resolve (.drt) back as an EditPlan and a diff.",
+        description="Reads the timeline exported from Resolve (File > Export > Timeline, .drt), "
+        "matches its items to the plan it was exported from (the same --media-map as the "
+        "export), and writes the edited plan (V1 items in record order become the segments) and "
+        "a JSON diff: per original segment unchanged, trimmed, moved, removed or split; added "
+        "segments; foreign items; and what the plan cannot hold (not_carried). The edited plan is "
+        "linted; lint errors do not stop it being written. Neither output is ever overwritten. "
+        "Exit: 0 written, 1 written but the edited plan has lint errors, 2 refused or unreadable "
+        "input.",
+    )
+    imp.add_argument("drt", type=Path, metavar="TIMELINE.drt", help="Timeline exported as .drt.")
+    imp.add_argument("--plan", type=Path, required=True, help="The plan the timeline came from.")
+    imp.add_argument(
+        "--media-map",
+        type=Path,
+        help="The export's JSON object of linux_root -> windows_root, read back the other way.",
+    )
+    imp.add_argument("--out", type=Path, required=True, help="Edited plan JSON to write.")
+    imp.add_argument("--report", type=Path, required=True, help="Diff JSON to write.")
+    imp.add_argument("--timeline", help="Timeline name, when the file holds several.")
+    imp.add_argument(
+        "--profile", help="Profile name or .toml path for the lint (default: the plan's)."
+    )
+    imp.add_argument("--json", action="store_true", help="Print the diff as JSON.")
+    imp.set_defaults(func=_cmd_import_timeline)
 
 
 def _memory_mb(text: str) -> int:
@@ -662,3 +692,112 @@ def _cmd_render(args: argparse.Namespace) -> int:
     if written != EXIT_OK:
         return written
     return EXIT_OK if result.qa_ok else EXIT_ERRORS
+
+
+# -- import-timeline (S20) ----------------------------------------------------------------------
+
+
+def _import_text(diff: dict[str, Any], out: Path, report: Path) -> str:
+    """A few lines an agent can act on; the diff file has everything."""
+    rows = diff["segments"]
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    tl = diff["timeline"]
+    lines = [
+        f"timeline {tl['name']!r} ({tl['frame_rate']:.3f} fps, {tl['items']} items): "
+        + ("no changes" if diff["unchanged"] else "edited"),
+        "segments: "
+        + (", ".join(f"{n} {status}" for status, n in sorted(counts.items())) or "none")
+        + f"; {len(diff['added'])} added; {len(diff['foreign'])} foreign",
+    ]
+    changed = [r for r in rows if r["status"] != "unchanged"]
+    for row in changed[:12]:
+        new = ", ".join(f"[{n['index']}] {n['record_in']}..{n['record_out']}" for n in row["new"])
+        trim = (
+            f" head {row['head_frames']:+d} tail {row['tail_frames']:+d}"
+            if row["status"] == "trimmed"
+            else ""
+        )
+        lines.append(
+            f"  segments[{row['index']}] {row['status']}{trim}: "
+            f"{row['old']['record_in']}..{row['old']['record_out']} -> {new or 'gone'}"
+        )
+    if len(changed) > 12:
+        lines.append(f"  ... {len(changed) - 12} more in the diff")
+    if diff["outro"] is not None and diff["outro"]["status"] != "unchanged":
+        lines.append(f"outro: {diff['outro']['status']}")
+    for key, title in (("not_carried", "not carried"), ("dropped", "dropped from the plan")):
+        entries = diff[key]
+        if entries:
+            codes: dict[str, int] = {}
+            for entry in entries:
+                codes[entry["code"]] = codes.get(entry["code"], 0) + 1
+            lines.append(
+                f"{title} ({len(entries)}): " + ", ".join(f"{c} x{n}" for c, n in codes.items())
+            )
+    lint_report = diff["lint"]
+    if lint_report is not None:
+        c = lint_report["counts"]
+        state = "ERRORS" if diff["lint_errors"] else "ok"
+        lines.append(f"lint: {state} ({c['error']} error, {c['warn']} warn, {c['info']} info)")
+    lines.append(f"wrote {out} and {report}")
+    return "\n".join(lines) + "\n"
+
+
+def _cmd_import_timeline(args: argparse.Namespace) -> int:
+    as_json: bool = args.json
+    try:
+        plan = EditPlan.model_validate_json(args.plan.read_text(encoding="utf-8"))
+        profile = load_profile(args.profile or plan.profile)
+        media_map = load_media_map(args.media_map) if args.media_map else None
+    except ValidationError as exc:
+        return _input_error(
+            "invalid-input", "input failed validation", _validation_details(exc), as_json
+        )
+    except ExportError as exc:
+        return _export_refusal(exc, as_json)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ProfileError) as exc:
+        return _input_error(type(exc).__name__, str(exc), [], as_json)
+    out: Path = args.out
+    report_file: Path = args.report
+    try:
+        for path in (out, report_file):
+            if os.path.lexists(path):
+                raise TimelineImportError(
+                    "output_exists",
+                    f"{path} exists; import-timeline never overwrites",
+                    "choose new --out and --report paths",
+                    path=str(path),
+                )
+        if out.resolve() == report_file.resolve():
+            raise TimelineImportError(
+                "output_exists",
+                f"--out and --report are the same file ({out})",
+                "give the plan and the diff different paths",
+                path=str(out),
+            )
+        timeline = read_timeline(args.drt, args.timeline)
+        result = import_timeline(
+            plan, timeline.timeline, timeline.media, media_map=media_map, profile=profile
+        )
+    except CompileError as exc:  # TimelineImportError, or the export's own refusals
+        return _export_refusal(exc, as_json)  # type: ignore[arg-type]
+    diff = result.diff
+    diff["timeline"] = {**diff["timeline"], "file": timeline.path, "sha256": timeline.sha256}
+    plan_text = result.plan.model_dump_json(indent=2, exclude_none=True) + "\n"
+    body = json.dumps(diff, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+    try:
+        write_pair(
+            [(out, plan_text.encode("utf-8")), (report_file, body.encode("utf-8"))],
+            overwrite=False,
+        )
+    except ExportError as exc:
+        return _export_refusal(exc, as_json)
+    except OSError as exc:
+        return _input_error(type(exc).__name__, str(exc), [], as_json)
+    text = body if as_json else _import_text(diff, out, report_file)
+    written = cli_io.emit(_PROG, text)
+    if written != EXIT_OK:
+        return written
+    return EXIT_ERRORS if result.lint_errors else EXIT_OK
