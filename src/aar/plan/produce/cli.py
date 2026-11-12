@@ -32,7 +32,8 @@ def register(sub: Any) -> None:
         help="Make a lint-clean EditPlan from a stub, a transcript and a keep list.",
         description=(
             "Pause trim, joins in source-audio quiet, sliver fold, end on the laugh and (shorts) "
-            "a steady camera path, then lint under the profile. Exit status: 0 the plan was "
+            "a steady camera path, then lint under the profile. --no-pause-trim / --pause-trim "
+            "override the profile's [produce] pause_trim. Exit status: 0 the plan was "
             "written (warnings allowed), 1 no lint-clean plan could be made, 2 an input or the "
             "profile could not be read or is malformed."
         ),
@@ -49,6 +50,21 @@ def register(sub: Any) -> None:
     run.add_argument("--laughs", type=Path, help="Laugh map JSON: end on the final laugh.")
     run.add_argument("--profile", help="Profile name or .toml path (default: the stub's).")
     run.add_argument("--venue", help="A [produce.venues] entry, e.g. loud.")
+    trim = run.add_mutually_exclusive_group()
+    trim.add_argument(
+        "--pause-trim",
+        dest="pause_trim",
+        action="store_const",
+        const=True,
+        help="Trim long pauses (default: the profile's [produce] pause_trim).",
+    )
+    trim.add_argument(
+        "--no-pause-trim",
+        dest="pause_trim",
+        action="store_const",
+        const=False,
+        help="Do not trim pauses: keep ranges play whole (one camera on room microphones).",
+    )
     run.add_argument("--json", action="store_true", help="Print the report as JSON.")
     run.set_defaults(func=_cmd_produce)
 
@@ -85,6 +101,7 @@ def _cmd_produce(args: argparse.Namespace) -> int:
             laughs=read_laughs(args.laughs) if args.laughs else None,
             venue=args.venue,
             media_root=args.stub.parent,
+            pause_trim=args.pause_trim,
         )
     except ProduceError as exc:
         return _fail(exc.to_dict(), exc.exit_code, as_json)
@@ -114,8 +131,9 @@ def _format(report: ProduceReport) -> str:
         if finding.severity != "info":
             lines.append(f"{finding.severity.upper():5} {finding.rule}: {finding.message}")
     log = report.log
+    trims = f"{len(log['trims'])} pause trim(s)" if log["pause_trim"]["ran"] else "pause trim off"
     lines.append(
-        f"      {len(log['trims'])} pause trim(s), {len(log['nudges'])} nudged join(s), "
+        f"      {trims}, {len(log['nudges'])} nudged join(s), "
         f"{len(log['folds'])} fold(s), {len(log['snaps'])} keep edge(s) moved inward past a word"
     )
     if log["ending"] is not None:

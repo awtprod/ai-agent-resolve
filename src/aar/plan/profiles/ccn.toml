@@ -36,6 +36,7 @@ word_straddle_s = 0.03    # a word may cross a cut or region edge by this much
 # is the [qa] join_quiet_* values above, so the planner and QA cannot drift apart.
 [produce]
 default_camera = "A"      # camera (Source.camera, else a source id) when no schedule is given
+pause_trim = true         # transform 1 on; off (or `aar plan produce --no-pause-trim`) for one camera on room mics
 min_pause_s = 0.9         # a pause at least this long ...
 beat_s = 0.45             # ... is trimmed to this beat
 beat_lead_s = 0.25        # of the beat, this much stays after the outgoing speech
