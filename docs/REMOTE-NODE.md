@@ -53,6 +53,11 @@ manage what is registered. An agent served with `aar hub serve --agent-writes` c
 with the `project_register` tool; a live node can answer `project.locate` for the project it has
 open (an op, so it needs the project's id as its target; `aar node locate` does not).
 
+A show that the hub already edits from media (registered without a source, see DESIGN "Project
+registry") keeps its `prj_...` id: once the project exists in Resolve, attach it with
+`aar hub project source PRJ --source-kind local_db --host edit-pc --locator '{...}'` instead of
+registering a second project. The same one-uid-one-project rule applies.
+
 On Windows, with Resolve Studio running and `DaVinciResolveScript` importable:
 
 ```text
