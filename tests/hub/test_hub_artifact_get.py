@@ -88,3 +88,23 @@ def test_refusals(hub: Hub, tmp_path: Path, capsys: pytest.CaptureFixture[str]) 
     bad_db = ["hub", "artifact", "get", aid, "--db", str(tmp_path / "none.db")]
     assert main([*bad_db, "--artifacts", str(tmp_path)]) == 2
     assert _error(capsys) == "database_unavailable"
+
+
+def test_a_closed_pipe_ends_quietly_with_141(hub: Hub, tmp_path: Path) -> None:
+    import os
+    import subprocess
+    import sys
+
+    data = os.urandom(8 * 1024 * 1024)  # far more than a pipe buffer
+    aid = hub.store.put(data, actor=AGENT, project_id=hub.project_id)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "aar", *_get(hub, tmp_path, aid)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert proc.stdout is not None and proc.stderr is not None
+    assert proc.stdout.read(1024)
+    proc.stdout.close()
+    err = proc.stderr.read()
+    assert proc.wait(timeout=60) == 141
+    assert b"Traceback" not in err

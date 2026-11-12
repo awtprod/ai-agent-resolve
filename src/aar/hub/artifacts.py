@@ -95,6 +95,11 @@ class ArtifactStore:
             raise FileNotFoundError(f"no artifact store directory at {self._root}")
         self._log = log
 
+    @property
+    def root(self) -> Path:
+        """The store's directory (as given)."""
+        return self._root
+
     def _path_for(self, artifact_id: str) -> Path:
         if not _ID_RE.fullmatch(artifact_id):
             raise InvalidArtifactId(
