@@ -1003,16 +1003,18 @@ def test_the_longest_stretch_on_a_tie_is_the_earlier(tmp_path, fake, models, med
 @needs_ffmpeg
 @pytest.mark.parametrize("normalize", [False, True])
 def test_the_level_is_measured_over_the_stretch_only(tmp_path, fake, models, capsys, normalize):
-    # Quiet (peak 0.01, -43 dBFS) up to 5 s, loud (peak 0.5) after: a level decode that ran
-    # past the stretch's end, or started before it, would read the loud part.
-    samples = np.concatenate([tone(5.0, 300.0, peak=0.01), tone(5.0, 300.0, peak=0.5)])
+    # Loud (peak 0.5) to 2 s, quiet (peak 0.01, -43 dBFS) to 7 s, loud after: a level decode
+    # that started before the stretch or ran past its end would read a loud part.
+    samples = np.concatenate(
+        [tone(2.0, 300.0, peak=0.5), tone(5.0, 300.0, peak=0.01), tone(3.0, 300.0, peak=0.5)]
+    )
     mixed = write_wav(tmp_path / "mixed.wav", samples)
-    fake.segments = [seg(0.0, 0.5, "a"), seg(5.0, 10.0, "b", "c")]
+    fake.segments = [seg(0.0, 2.0, "a"), seg(7.0, 10.0, "b", "c")]
     flags = ["--normalize"] if normalize else []
     code, report, _ = _transcript(
         capsys, mixed, "--out", tmp_path / "t.json", "--wordless-min-s", "1", *flags
     )
     assert code == 0
     [stretch] = report["wordless"]["stretches"]
-    assert (stretch["file_start_s"], stretch["file_end_s"]) == (0.5, 5.0)
+    assert (stretch["file_start_s"], stretch["file_end_s"]) == (2.0, 7.0)
     assert stretch["level_dbfs"] == pytest.approx(-43.0, abs=0.2)
