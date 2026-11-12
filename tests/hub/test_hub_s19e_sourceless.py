@@ -455,3 +455,72 @@ def test_project_register_tool_without_a_source_and_the_read_tools(hub: Hub) -> 
     assert pid in [p["id"] for p in listed["projects"]]
     board = _call(hub, "project_board", {"project_id": pid})
     assert board.is_error is False and board.structured_content["leases"] == []
+
+
+# -- rename and alias keep a source-less project's name its own (probe p1) ---------------------
+
+
+def _change(hub: Hub, capsys: pytest.CaptureFixture[str], verb: str, *argv: str) -> Any:
+    return _cli(hub, capsys, verb, *argv[:2], "--actor", "agent:agent-1", *argv[2:])
+
+
+def _add(hub: Hub, capsys: pytest.CaptureFixture[str], name: str, *extra: str) -> str:
+    code, out, err = _cli(
+        hub, capsys, "add", "--actor", "agent:agent-1", "--name", name, *extra,
+        "--idempotency-key", "add-" + name.replace(" ", "-"),
+    )  # fmt: skip
+    assert code == 0, err
+    return str(out["project_id"])
+
+
+def test_cli_rename_and_alias_cannot_make_a_twin_of_a_sourceless_name(
+    hub: Hub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    show = _add(hub, capsys, "Show")
+    other = _add(hub, capsys, "Other")
+    fourth = _add(hub, capsys, "Fourth")
+    sourced = _add(hub, capsys, "Real", "--source-kind", "local_db", "--locator", json.dumps(LOC))
+    before = hub.counts()
+    for verb, pid in (
+        ("rename", other),
+        ("alias", fourth),
+        ("rename", sourced),
+        ("alias", sourced),
+    ):
+        code, _, err = _change(hub, capsys, verb, pid, "Show", "--idempotency-key", f"{verb}{pid}")
+        assert code == 2 and err["error"]["code"] == "project_exists", (verb, pid, err)
+        assert err["error"]["details"] == {"existing_id": show, "name": "Show"}
+    # a source-less project may not take a name a sourced project holds either
+    code, _, err = _change(hub, capsys, "rename", other, "Real", "--idempotency-key", "r-real")
+    assert code == 2 and err["error"]["details"]["existing_id"] == sourced
+    assert hub.counts() == before
+    holders = [p for p in Registry(hub.log).list() if "Show" in (p.name, *p.aliases)]
+    assert [p.id for p in holders] == [show]
+
+
+def test_cli_rename_to_its_own_name_and_an_alias_it_has_work_as_before(
+    hub: Hub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    show = _add(hub, capsys, "Show")
+    assert _change(hub, capsys, "alias", show, "Show B", "--idempotency-key", "a1")[0] == 0
+    assert _change(hub, capsys, "alias", show, "Show B", "--idempotency-key", "a2")[0] == 0
+    assert _change(hub, capsys, "rename", show, "Show", "--idempotency-key", "r1")[0] == 0
+    code, out, _ = _change(hub, capsys, "rename", show, "Show B", "--idempotency-key", "r2")
+    assert code == 0 and out["project"]["name"] == "Show B"
+    # a sourced project may still share a name with another sourced project, as on dev
+    loc2 = {**LOC, "project_id": "uid-2"}
+    one = _add(hub, capsys, "Real", "--source-kind", "local_db", "--locator", json.dumps(LOC))
+    two = _add(hub, capsys, "Real 2", "--source-kind", "local_db", "--locator", json.dumps(loc2))
+    assert _change(hub, capsys, "rename", two, "Real", "--idempotency-key", "r3")[0] == 0
+    assert _change(hub, capsys, "alias", one, "Real 2", "--idempotency-key", "a3")[0] == 0
+
+
+def test_the_library_rename_and_alias_are_unchanged_by_default(hub: Hub) -> None:
+    registry = Registry(hub.log)
+    show = registry.create_project("Show", HUMAN)
+    other = registry.create_project("Other", HUMAN)
+    assert registry.rename_project(other.id, "Show", HUMAN).name == "Show"
+    assert registry.add_alias("prj_acme", "Show", HUMAN).aliases == ["Show"]
+    with pytest.raises(DuplicateProjectName) as err:
+        registry.add_alias("prj_other", "Show", HUMAN, unique_name=True)
+    assert err.value.existing_id in {show.id, other.id, "prj_acme"}

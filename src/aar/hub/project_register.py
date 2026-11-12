@@ -19,6 +19,10 @@ Rules, all checked before anything is written:
   name or alias that any project already has as its name or an alias is refused with
   ``project_exists`` naming the existing id, after the same retry check. The Resolve source
   is attached later with :func:`add_source`, under the same one-uid-one-project rule.
+- :func:`rename` and :func:`add_alias` keep that identity: a name or alias a source-less
+  project holds is reserved to it, and a source-less project may not take one any other
+  project holds (``project_exists``). The library (:class:`Registry`) does not apply this
+  rule unless asked (``unique_name``).
 """
 
 from __future__ import annotations
@@ -184,8 +188,8 @@ def _exists(error: DuplicateResolveProject) -> WriteError:
 def _name_taken(error: DuplicateProjectName) -> WriteError:
     return WriteError(
         "project_exists",
-        f"a project without a source is known by its name, and {error.name!r} is already a "
-        f"name or alias of {error.existing_id!r}",
+        f"{error.name!r} is already a name or alias of {error.existing_id!r}, and a project "
+        "without a source is known by its name",
         f"Use {error.existing_id} (aar hub project show), or register under another name.",
         existing_id=error.existing_id,
         name=error.name,
@@ -299,6 +303,8 @@ def _change(
         project = apply(registry, key)
     except DuplicateResolveProject as exc:
         raise _exists(exc) from None
+    except DuplicateProjectName as exc:
+        raise _name_taken(exc) from None
     except IdempotencyConflict as exc:
         raise _conflict(exc) from None
     except KeyError:
@@ -320,7 +326,9 @@ def add_alias(
         project_id,
         idempotency_key,
         "project.alias",
-        lambda reg, key: reg.add_alias(project_id, text, actor, idempotency_key=key),
+        lambda reg, key: reg.add_alias(
+            project_id, text, actor, idempotency_key=key, unique_name=True
+        ),
     )
 
 
@@ -334,7 +342,9 @@ def rename(
         project_id,
         idempotency_key,
         "project.rename",
-        lambda reg, key: reg.rename_project(project_id, text, actor, idempotency_key=key),
+        lambda reg, key: reg.rename_project(
+            project_id, text, actor, idempotency_key=key, unique_name=True
+        ),
     )
 
 
