@@ -380,13 +380,33 @@ def test_the_plan_stub_of_the_copy_equals_the_original_s(
     assert original[0]["sources"][0]["start_timecode"] == 108000  # 01:00:00:00
 
 
+# The child runs the module as ``-m`` does (runpy, ``__main__``), then writes the names of the
+# modules it really imported, from ``sys.modules`` as it exits. Not ``-X importtime``: that also
+# lists imports that were tried and failed (Python 3.11's ``copy`` tries ``org.python.core``).
+_RUN_AND_LIST_MODULES = """
+import json, runpy, sys
+listing, sys.argv = sys.argv[1], ["aar.media.shrink", *sys.argv[2:]]
+try:
+    runpy.run_module("aar.media.shrink", run_name="__main__", alter_sys=True)
+except SystemExit as exc:
+    code = exc.code
+else:
+    code = 0
+with open(listing, "w") as f:
+    json.dump(sorted(name for name, mod in sys.modules.items() if mod is not None), f)
+sys.exit(code)
+"""
+
+
 def test_runs_from_the_source_tree_with_the_standard_library_only(
     sources: dict[str, Path], tmp_path: Path
 ) -> None:
     """As on the edit PC: ``python -S -m aar.media.shrink`` with only ``PYTHONPATH=src``. ``-S``
     leaves out site-packages, so no third-party package can be imported (``-I`` cannot be used:
-    it ignores ``PYTHONPATH``). ``-X importtime`` lists every module the run imported."""
+    it ignores ``PYTHONPATH``). Every module the run imported must be the standard library's or
+    ``aar``'s."""
     dst = tmp_path / "copy.mp4"
+    listing = tmp_path / "modules.json"
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
     env["PYTHONPATH"] = str(SRC_ROOT)
     check = [
@@ -400,7 +420,7 @@ def test_runs_from_the_source_tree_with_the_standard_library_only(
     )
     done = subprocess.run(
         [
-            *(sys.executable, "-S", "-X", "importtime", "-m", "aar.media.shrink"),
+            *(sys.executable, "-S", "-c", _RUN_AND_LIST_MODULES, str(listing)),
             *(str(sources["short"]), "--out", str(dst)),
         ],
         capture_output=True,
@@ -411,12 +431,9 @@ def test_runs_from_the_source_tree_with_the_standard_library_only(
     )
     assert done.returncode == 0, done.stderr
     assert json.loads(done.stdout.splitlines()[-1])["status"] == "shrunk"
-    imported = set()
-    for line in done.stderr.splitlines():
-        fields = line.removeprefix("import time:").split("|")
-        if line.startswith("import time:") and fields[0].strip().isdigit():
-            imported.add(fields[-1].strip().split(".")[0])
-    assert "aar" in imported and "json" in imported
+    modules = json.loads(listing.read_text())
+    assert {"aar.media", "aar.media.tools", "json", "subprocess"} <= set(modules)
+    imported = {name.split(".")[0] for name in modules}
     assert sorted(imported - set(sys.stdlib_module_names) - {"aar", "__main__"}) == []
     assert dst.is_file()
 
