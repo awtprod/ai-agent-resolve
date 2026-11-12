@@ -61,8 +61,9 @@ def test_the_module_registers_the_recipe_from_the_env(tmp_path: Path) -> None:
         "report",
     ]  # fmt: skip
     assert len(CUT_INSTRUCTION.encode()) <= MAX_INSTRUCTION_BYTES
-    for words in ("aar hub artifact get", "read_guide", "guide.md", "aar plan produce",
-                  "aar plan lint", "step_complete", "never splice dialogue", "chronological",
+    for words in ("hub artifact get", "read_guide", "guide.md", "exactly as printed",
+                  "not on PATH", "plan produce", "plan lint", "step_complete",
+                  "never splice dialogue", "chronological",
                   "end on the laugh", "not silence", "pause_trim_flag", "derives_from",
                   "AAR_RECIPES=aar.recipes.ccn", "transcript.json word times"):  # fmt: skip
         assert words in CUT_INSTRUCTION

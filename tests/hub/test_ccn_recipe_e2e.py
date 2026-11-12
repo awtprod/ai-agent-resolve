@@ -4,8 +4,11 @@ then approved, and the report. No Resolve, no network, no model (the transcriber
 
 from __future__ import annotations
 
+import shlex
+import sys
 from pathlib import Path
 
+import pytest
 from ccn_recipe_support import PC_ROOT, CcnEnv, agent_cut, latest, make_run, outputs, start, work
 from write_support import HUMAN
 
@@ -104,3 +107,41 @@ def test_ccn_longform_runs_end_to_end(ccn_env: CcnEnv, tmp_path: Path) -> None:
     for step in ("stub", "sync", "transcript", "laughs", "guide"):
         assert len(state.attempts_for(step)) == 1, step
     assert len(state.attempts_for("cut")) == 2
+
+
+@pytest.mark.parametrize("with_script", [True, False], ids=["aar-script", "python-m-aar"])
+def test_the_guide_commands_run_as_printed_from_an_interpreter_dir_with_a_space(
+    ccn_env: CcnEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_script: bool
+) -> None:
+    """MED-1 (r2): the worker's interpreter lives in a folder whose name has a space and ``aar``
+    is not on PATH. ``read_guide`` and every guide command name that interpreter's own ``aar``
+    (or ``python -m aar`` when there is no script beside it), quoted, and run in ``sh`` as
+    printed; the wrappers log that they were the programs run."""
+    env = ccn_env
+    bin_dir = tmp_path / "py env" / "bin"
+    bin_dir.mkdir(parents=True)
+    log = tmp_path / "ran.log"
+    real_aar = Path(sys.executable).with_name("aar")
+    wrappers = {"python": sys.executable, **({"aar": str(real_aar)} if with_script else {})}
+    for name, target in wrappers.items():
+        wrapper = bin_dir / name
+        wrapper.write_text(
+            f'#!/bin/sh\necho {name} >> {shlex.quote(str(log))}\nexec {shlex.quote(target)} "$@"\n'
+        )
+        wrapper.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(bin_dir / "python"))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")  # no aar anywhere on PATH
+
+    show = env.show("cam-a.mov")
+    run = make_run(env, env.params(show), key="space")
+    start(env, run, "space")
+    assert work(env) == 5
+    read = outputs(env, run, "guide")["read_guide"]
+    want = [str(bin_dir / "aar")] if with_script else [str(bin_dir / "python"), "-m", "aar"]
+    assert shlex.split(read)[: len(want)] == want
+    assert read.startswith(shlex.quote(want[0]) + " ")  # quoted: the folder has a space
+    plan_node = agent_cut(env, run, key="r1")
+    ran = log.read_text().split()
+    assert ran.count("aar" if with_script else "python") >= 8  # guide, fetches, produce...
+    assert work(env) == 2  # render, export
+    assert outputs(env, run, "render")["subject_node"] == plan_node

@@ -43,7 +43,7 @@ def ccn_env(tmp_path, monkeypatch) -> Iterator[Any]:  # type: ignore[no-untyped-
 
     registry.clear()
     register_ccn()
-    root = tmp_path / "hub"
+    root = tmp_path / "hub root"  # a space: the guide's commands must quote the db path
     root.mkdir()
     folders = {name: tmp_path / name for name in ("media", "work", "exports", "agent")}
     for folder in folders.values():

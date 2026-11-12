@@ -11,21 +11,38 @@ from __future__ import annotations
 
 import json
 import shlex
+from collections.abc import Sequence
 from typing import Any
 
 from aar.hub.writes import Brief
 
 RECIPES_ENV = "AAR_RECIPES=aar.recipes.ccn"
-#: Writes submit.json from plan.json; its two arguments are the project id and ``derives_from``.
+#: The Python that writes submit.json from plan.json; its two arguments are the project id and
+#: ``derives_from``.
 MAKE_SUBMIT = (
-    """python3 -c 'import json,sys; json.dump({"project_id": sys.argv[1], """
-    """"derives_from": sys.argv[2], "plan": json.load(open("plan.json"))}, """
-    """open("submit.json", "w"))'"""
+    'import json,sys; json.dump({"project_id": sys.argv[1], "derives_from": sys.argv[2], '
+    '"plan": json.load(open("plan.json"))}, open("submit.json", "w"))'
 )
 
 
 def _q(value: str) -> str:
     return shlex.quote(value)
+
+
+def command(*words: str) -> str:
+    """One shell line from ``words``, each quoted: it can be pasted into ``sh`` as is."""
+    return shlex.join(words)
+
+
+def artifact_get(
+    aar: Sequence[str], artifact_id: str, out: str, *, db: str, artifacts: str, project_id: str
+) -> str:
+    """``aar hub artifact get`` of one artifact into ``out`` (replacing an earlier copy, so the
+    same line works again in a later round)."""
+    return command(
+        *aar, "hub", "artifact", "get", artifact_id, "--db", db, "--artifacts", artifacts,
+        "--project", project_id, "--out", out, "--force",
+    )  # fmt: skip
 
 
 def build_guide(
@@ -40,14 +57,13 @@ def build_guide(
     sync: dict[str, Any],
     transcript: dict[str, Any],
     laughs: dict[str, Any],
-    aar: str = "aar",
-    python: str = "python3",
+    aar: Sequence[str],
+    python: str,
 ) -> str:
-    """The guide's Markdown text for one run (module docstring)."""
-    get = (
-        f"aar hub artifact get {{id}} --db {_q(db)} --artifacts {_q(artifacts)} "
-        f"--project {_q(project_id)} --out {{file}}"
-    )
+    """The guide's Markdown text for one run (module docstring). ``aar`` is the argv that runs
+    the worker's own ``aar`` and ``python`` its interpreter: every command the guide prints
+    names them and quotes every word, so each line runs in ``sh`` exactly as printed."""
+    where = {"db": db, "artifacts": artifacts, "project_id": project_id}
     fetch = [
         ("stub.json", stub["stub"], "the plan stub: sources, frame rate, timecodes"),
         ("transcript.json", transcript["transcript"], "every word with start_s and end_s"),
@@ -58,19 +74,22 @@ def build_guide(
     if laughs.get("map"):
         fetch.append(("laughs.json", laughs["map"], "the laugh map for --laughs"))
     cameras = int(stub.get("cameras", 1))
-    produce = (
-        "aar plan produce stub.json --transcript transcript.json --keep keep.json "
-        f"--out plan.json {stub['pause_trim_flag']}"
-    )
+    produce_argv = [
+        *aar, "plan", "produce", "stub.json", "--transcript", "transcript.json",
+        "--keep", "keep.json", "--out", "plan.json", str(stub["pause_trim_flag"]),
+    ]  # fmt: skip
     if cameras > 1:
-        produce += " --schedule schedule.json"
+        produce_argv += ["--schedule", "schedule.json"]
     if sync.get("report"):
-        produce += " --sync sync.json"
+        produce_argv += ["--sync", "sync.json"]
     if laughs.get("map"):
-        produce += " --laughs laughs.json"
-    lint = "aar plan lint plan.json --transcript transcript.json"
+        produce_argv += ["--laughs", "laughs.json"]
+    produce = command(*produce_argv)
+    lint_argv = [*aar, "plan", "lint", "plan.json", "--transcript", "transcript.json"]
     if laughs.get("map"):
-        lint += " --laughs laughs.json"
+        lint_argv += ["--laughs", "laughs.json"]
+    lint = command(*lint_argv)
+    recipes = f"{RECIPES_ENV} {command(*aar)}"
     wordless = transcript.get("wordless") or {}
     stretches = wordless.get("stretches") or []
     labels = [s.get("camera") for s in stub.get("sources", [])]
@@ -88,7 +107,7 @@ def build_guide(
         f"- Artifact store: `{artifacts}`",
         f"- `aar recipe ...` commands need the recipe module: prefix them with `{RECIPES_ENV}`",
         "  (or pass `--recipes aar.recipes.ccn`).",
-        f"- Status: `{RECIPES_ENV} aar recipe status {recipe_node} --db {_q(db)}`",
+        f"- Status: `{recipes} recipe status {_q(recipe_node)} --db {_q(db)}`",
         "  (MCP: `recipe_status`).",
         "",
         "## The brief",
@@ -109,7 +128,7 @@ def build_guide(
         "",
         "```sh",
     ]
-    lines += [get.format(id=aid, file=name) for name, aid, _ in fetch]
+    lines += [artifact_get(aar, aid, name, **where) for name, aid, _ in fetch]
     lines += ["```", ""]
     lines += [f"- `{name}`: {what}" for name, _, what in fetch]
     lines += [
@@ -198,18 +217,19 @@ def build_guide(
         "round, the review that rejected the last cut: see 7):",
         "",
         "```sh",
-        f"{MAKE_SUBMIT} {project_id} {recipe_node}",
+        command(python, "-c", MAKE_SUBMIT, project_id, recipe_node),
         "```",
         "",
         "Then submit it, and complete the step with the node id the write prints",
-        "(`node.id`):",
+        "(`node.id`). Replace each `<...>` placeholder below with its value (keep the quotes):",
         "",
         "```sh",
-        f"aar hub write plan --db {_q(db)} --artifacts {_q(artifacts)} --actor agent:<you> "
-        "--idempotency-key <new key> submit.json",
+        f"{command(*aar)} hub write plan --db {_q(db)} --artifacts {_q(artifacts)} "
+        "--actor 'agent:<you>' --idempotency-key '<new key>' submit.json",
         'echo \'{"plan_node": "<node id the write printed>"}\' | '
-        f"{RECIPES_ENV} aar recipe complete --db {_q(db)} --artifacts {_q(artifacts)} "
-        f"--actor agent:<you> --idempotency-key <new key> --recipe {recipe_node} --step cut",
+        f"{recipes} recipe complete --db {_q(db)} --artifacts {_q(artifacts)} "
+        "--actor 'agent:<you>' --idempotency-key '<new key>' "
+        f"--recipe {_q(recipe_node)} --step cut",
         "```",
         "",
         "MCP: `plan_submit` with the same fields, then `step_complete` with",
@@ -221,8 +241,9 @@ def build_guide(
         "review that rejected the last cut and read why:",
         "",
         "```sh",
-        f"aar hub review list --db {_q(db)} --project {project_id} --all",
-        f"aar hub review show --db {_q(db)} --project {project_id} <review id>",
+        command(*aar, "hub", "review", "list", "--db", db, "--project", project_id, "--all"),
+        f"{command(*aar, 'hub', 'review', 'show', '--db', db, '--project', project_id)} "
+        "'<review id>'",
         "```",
         "",
         "It is the review titled `gate review (round N)` for the previous round N whose",
@@ -231,7 +252,7 @@ def build_guide(
         "`reason` and `notes` (at timeline frames) say what to change. MCP: `review_get`.",
         "Change the cut accordingly (a plan identical to a rejected one is refused), and",
         "make submit.json with that review's id as `derives_from` (the last argument of the",
-        "python3 line in 6), not the recipe node, then submit and complete as in 6.",
+        "python line in 6), not the recipe node, then submit and complete as in 6.",
         "",
         "## After the cut",
         "",
@@ -243,4 +264,4 @@ def build_guide(
     return "\n".join(lines)
 
 
-__all__ = ["RECIPES_ENV", "build_guide"]
+__all__ = ["RECIPES_ENV", "artifact_get", "build_guide", "command"]

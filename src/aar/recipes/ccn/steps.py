@@ -44,7 +44,7 @@ from aar.plan.stub import StubError, StubSource, build_stub
 from aar.qa.report import QAReport
 from aar.recipes.ccn import transcript as transcript_mod
 from aar.recipes.ccn.export_files import copy_out, safe_name
-from aar.recipes.ccn.guide import build_guide
+from aar.recipes.ccn.guide import artifact_get, build_guide
 from aar.recipes.ccn.params import CcnLongformParams, check_hub_file
 from aar.recipes.ccn.scratch import drop_scratch, op_scratch
 from aar.recipes.ccn.transcript import (
@@ -317,10 +317,11 @@ def laughs_step(ctx: StepContext) -> StepOutput:
 # -- 5. guide ---------------------------------------------------------------------------------
 
 
-def _aar_command() -> str:
-    """The ``aar`` script beside this interpreter (the worker's own), else ``aar``."""
+def aar_argv() -> list[str]:
+    """The argv that runs the worker's own ``aar``: the script beside this interpreter, else
+    this interpreter with ``-m aar``. Never a bare ``aar``: the hub's is not on PATH."""
     script = Path(sys.executable).with_name("aar")
-    return str(script) if script.is_file() else "aar"
+    return [str(script)] if script.is_file() else [sys.executable, "-m", "aar"]
 
 
 def guide_step(ctx: StepContext) -> StepOutput:
@@ -329,6 +330,7 @@ def guide_step(ctx: StepContext) -> StepOutput:
     state = load_state(ctx.log, ctx.recipe_node, project_id=ctx.project_id)
     db = os.path.abspath(ctx.log.path)
     artifacts = os.path.abspath(ctx.store.root)
+    aar = aar_argv()
     text = build_guide(
         db=db,
         artifacts=artifacts,
@@ -340,13 +342,12 @@ def guide_step(ctx: StepContext) -> StepOutput:
         sync=dict(ctx.needs["sync"]),
         transcript=dict(ctx.needs["transcript"]),
         laughs=dict(ctx.needs["laughs"]),
-        aar=_aar_command(),
+        aar=aar,
         python=sys.executable,
     )
     guide_id = ctx.put(text.encode("utf-8"), mime="text/markdown", meta={"role": "cut-guide"})
-    read = (
-        f"aar hub artifact get {guide_id} --db {db} --artifacts {artifacts} "
-        f"--project {ctx.project_id} --out guide.md"
+    read = artifact_get(
+        aar, guide_id, "guide.md", db=db, artifacts=artifacts, project_id=ctx.project_id
     )
     return StepOutput(
         outputs={"guide": guide_id, "read_guide": read, "db": db, "artifacts": artifacts},
@@ -520,6 +521,7 @@ def export_step(ctx: StepContext) -> StepOutput:
 __all__ = [
     "ALLOW_WARN",
     "REQUIRED_QA",
+    "aar_argv",
     "check_plan",
     "export_step",
     "guide_step",
