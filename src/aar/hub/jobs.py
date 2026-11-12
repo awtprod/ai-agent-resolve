@@ -456,7 +456,6 @@ def submit(
     project_id = clean_text(project.project_id, "project.project_id", max_len=MAX_ID)
     if project_id != project.project_id:
         raise InvalidInput("project.project_id", "must have no surrounding whitespace")
-    _refuse_registry_id(log, project_id)
     project_data = _bounded_json(project.to_dict(), "project", max_bytes=16 * 1024)
     if isinstance(priority, bool) or not isinstance(priority, int) or abs(priority) > 1_000_000:
         raise InvalidInput("priority", "must be an integer between -1000000 and 1000000")
@@ -497,6 +496,7 @@ def submit(
             match_or_conflict(existing, EVENT_SUBMITTED, base, base.keys(), actor=actor)
             jobs = fold(txn)
             return _must(jobs, existing.payload["job_id"]), True
+        _refuse_registry_id(log, project_id)  # after the replay: a retry always replays
         if len(fold(txn)) >= MAX_JOBS:
             raise JobConflict(f"hub job limit ({MAX_JOBS}) reached")
         payload = {"job_id": "job_" + uuid.uuid4().hex, **base}
@@ -515,10 +515,14 @@ def _refuse_registry_id(log: EventLog, project_id: str) -> None:
     """Refuse a target whose ``project_id`` is a hub registry project rather than Resolve's.
 
     A project registered without a source (a show edited from hub media) has no Resolve
-    project yet, so a Resolve job for it can never run; a sourced one names its uid.
+    project yet, so a Resolve job for it can never run; a sourced one names its uid. A
+    registry id that some project also lists as the Resolve unique id of a source is a
+    Resolve uid too, and is accepted. Called inside the submit transaction (the log's lock
+    is re-entrant, so the registry reads the same transaction's view).
     """
-    found = Registry(log).get(project_id)
-    if found is None:
+    registry = Registry(log)
+    found = registry.get(project_id)
+    if found is None or registry.find_by_resolve_uid(project_id) is not None:
         return
     uids = sorted({uid for s in found.sources if (uid := source_resolve_uid(s)) is not None})
     if not uids:

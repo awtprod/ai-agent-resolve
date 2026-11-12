@@ -236,6 +236,54 @@ def test_a_resolve_job_for_a_sourceless_project_is_refused_typed(hub: Hub) -> No
     assert replayed is False and job.target.project_id == "uid-1"
 
 
+UID = "8f3c2a10-1111-2222-3333-444455556666"
+
+
+def _submit_key(hub: Hub, project_id: str, key: str) -> tuple[jobs.HubJob, bool]:
+    return jobs.submit(
+        hub.log,
+        AGENT,
+        kind="ops.sequence",
+        params=PARAMS,
+        project=ProjectLocator(("Shows",), "Show", project_id),
+        agent_id=AGENT.id,
+        assigned_node="edit-pc",
+        idempotency_key=key,
+    )
+
+
+def test_a_registry_id_that_is_also_a_projects_resolve_uid_is_accepted(hub: Hub) -> None:
+    """Probe p5: a sourced project registered with its own Resolve uid as its registry id."""
+    loc = {"project_id": UID, "name": "Show", "folder_path": ["Shows"]}
+    _register(hub, name="Show", source_kind="local_db", locator=loc, project_id=UID)
+    job, replayed = _submit_key(hub, UID, "j1")
+    assert replayed is False and job.target.project_id == UID
+
+
+def test_a_retry_of_an_accepted_job_replays_after_the_id_became_a_registry_id(hub: Hub) -> None:
+    """Probe p4: the job is accepted first, then a source-less project takes the uid as its id."""
+    first, _ = _submit_key(hub, UID, "j1")
+    _register(hub, name="Show", project_id=UID)
+    again, replayed = _submit_key(hub, UID, "j1")  # the same request: replayed, not refused
+    assert replayed is True and again.job_id == first.job_id
+    with pytest.raises(jobs.NotAResolveProject):  # a new job for it is refused
+        _submit_key(hub, UID, "j2")
+    # once some project lists the text as its Resolve uid, it is a Resolve uid again
+    loc = {"project_id": UID, "name": "Show", "folder_path": ["Shows"]}
+    project_register.add_source(
+        hub.log, HUMAN, UID, source_kind="local_db", locator=loc, idempotency_key="s1"
+    )
+    job, replayed = _submit_key(hub, UID, "j3")
+    assert replayed is False and job.target.project_id == UID
+
+
+def test_the_refusal_hint_names_only_other_uids(hub: Hub) -> None:
+    pid = _register(hub, name="Show", source_kind="local_db", locator=dict(LOC))["project_id"]
+    with pytest.raises(jobs.NotAResolveProject) as err:
+        _submit_key(hub, pid, "j1")
+    assert "uid-1" in err.value.fix_hint and pid not in err.value.fix_hint
+
+
 def test_the_job_refusal_is_typed_at_the_cli_and_the_tool(
     hub: Hub, capsys: pytest.CaptureFixture[str]
 ) -> None:
