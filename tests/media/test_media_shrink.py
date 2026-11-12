@@ -561,6 +561,16 @@ WRONG: dict[str, tuple[list[str], set[str], str]] = {
         {"picture"},
         "shifted by a frame",
     ),
+    # Frames 0-2 (the first window) are the source's; from frame 3 on the copy shows the next
+    # frame (frame 3 dropped, the last repeated): only the later windows can see it.
+    "picture_shifted_after_the_first_window": (
+        [
+            *("-map", "0:v", "-map", "0:a", *ENC, "-c:a", "copy", *TC),
+            *("-vf", "select=not(eq(n\\,3)),setpts=N/FRAME_RATE/TB,tpad=stop=1:stop_mode=clone"),
+        ],
+        {"picture"},
+        "shifted by a frame",
+    ),
 }
 
 
@@ -1011,3 +1021,94 @@ def test_the_copy_is_flushed_before_its_rename_and_the_folder_after(
         shrink_file(src, tmp_path / "copy.mp4")
     folder = ["fsync folder"] if os.name == "posix" else []
     assert events == ["fsync file", "rename", *folder]
+
+
+# --- Fix round 2: the shift test decided over all windows, against the source's own motion ----
+
+
+def flat(*values: int, size: int = 100) -> list[bytes]:
+    """Frames of one gray level each: the mean difference of two is the difference of levels."""
+    return [bytes([v]) * size for v in values]
+
+
+def test_the_picture_windows_cover_the_whole_file() -> None:
+    assert shrink_mod.picture_windows(150) == [0, 37, 74, 110, 147]
+    assert shrink_mod.picture_windows(60) == [0, 14, 28, 43, 57]
+    assert shrink_mod.picture_windows(3) == [0]
+
+
+@pytest.mark.parametrize(("offset", "shifted"), [(54, True), (51, False), (50, False)])
+def test_the_shift_margin_is_a_share_of_the_source_s_own_motion(offset: int, shifted: bool) -> None:
+    # The source moves 100 levels a frame; each copy frame sits ``offset`` levels past its own
+    # frame, towards the next one: (2 * offset - 100) / 100 of the motion closer to the next
+    # frame than to its own (0.08, 0.02, 0).
+    theirs = flat(0, 100, 200)
+    ours = flat(*(v + offset for v in (0, 100, 200)))
+    found = shrink_mod.shift_difference([(ours, theirs)])
+    assert (found is not None) == shifted, found
+    if shifted:
+        assert "frames +1 better" in found and "by 0.08 of" in found  # type: ignore[operator]
+
+
+def test_the_shift_test_decides_over_all_windows() -> None:
+    # One window's frames lean towards the next frame (noise on a slow change); the others,
+    # where the picture moves, match their own frames. Decided together: not shifted.
+    noisy = (flat(27, 37, 40), flat(20, 30, 40))  # 0.4 of the motion closer to the next frame
+    moving = (flat(0, 100, 200), flat(0, 100, 200))
+    assert shrink_mod.shift_difference([noisy]) is not None  # alone, it would read as a shift
+    assert shrink_mod.shift_difference([noisy, moving, moving]) is None
+    # A copy shifted everywhere but its first window is shifted.
+    shifted = (flat(100, 200, 250), flat(0, 100, 200))
+    assert shrink_mod.shift_difference([moving, shifted, shifted, shifted]) is not None
+
+
+def test_a_window_too_still_to_tell_counts_neither_way() -> None:
+    # The source changes by one pixel in a hundred a frame (0.01 levels); the copy is exactly
+    # the next frame, yet nothing moves enough to tell: no evidence of a shift.
+    theirs = [bytes([100] * 99 + [100 + k]) for k in range(3)]
+    ours = theirs[1:] + theirs[-1:]
+    assert shrink_mod.shift_difference([(ours, theirs)]) is None
+    assert shrink_mod.shift_difference([(flat(0, 0, 0), flat(0, 0, 0))]) is None  # black
+
+
+def make_noisy_fade(path: Path, *, seed: int = 2) -> Path:
+    """A still picture fading out over 3 s with sensor-like temporal noise: house lights going
+    down on a locked-off camera (the validation's false refusal, at 640x360)."""
+    frames = 90
+    run(
+        *("-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30000/1001:duration=0.1"),
+        *("-f", "lavfi", "-i", f"aevalsrc={NOISE}|{NOISE}*0.5:s=48000:d=3"),
+        *("-map", "0:v", "-map", "1:a", "-vf"),
+        f"loop=loop={frames + 10}:size=1,trim=end_frame={frames},setpts=N/FRAME_RATE/TB,"
+        f"fade=out:0:{frames},noise=alls=15:allf=t+u:all_seed={seed},format=yuv420p",
+        *("-c:v", "libx264", "-preset", "veryfast", "-crf", "12", "-g", "60"),
+        *("-c:a", "pcm_s16le", *TC, "-t", "3", "-y", str(path)),
+    )
+    return path
+
+
+# The shifted copies are encoded as the shrink encodes (preset medium): ultrafast has no weighted
+# prediction, so on a fade its frames lag about a frame behind the brightness they should have,
+# which makes a copy shifted by one frame as close to the same frames as to the next ones.
+ENC_FADES = [*ENC[:3], "medium", *ENC[4:]]
+
+
+def test_a_noisy_fade_is_shrunk_and_a_shift_of_it_still_caught(tmp_path: Path) -> None:
+    src = make_noisy_fade(tmp_path / "fade.mp4")
+    good = tmp_path / "good.mp4"
+    assert shrink_file(src, good).status == "shrunk"  # was refused as "shifted by a frame"
+    facts = shrink_mod.read_facts(src)
+    for name, vf in (
+        ("plus1", "trim=start_frame=1,setpts=PTS-STARTPTS,tpad=stop=1:stop_mode=clone"),
+        ("minus1", f"tpad=start=1:start_mode=clone,trim=end_frame={facts.frames}"),
+    ):
+        bad = tmp_path / f"{name}.mp4"
+        run(
+            *("-i", str(good), "-i", str(src), "-map", "1:v", "-map", "0:a", "-vf", vf),
+            *ENC_FADES,
+            *("-c:a", "copy", *TC, *mark_args(), "-y", str(bad)),
+        )
+        with pytest.raises(ShrinkError) as exc:
+            shrink_mod.verify(facts, bad)
+        assert any("shifted by a frame" in d for d in exc.value.details["differences"]), name
+        bad.unlink()

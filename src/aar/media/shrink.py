@@ -124,12 +124,17 @@ PICTURE_RUN = 3
 PICTURE_SIZE = (128, 72)
 #: A copy's frame may differ from the source's same frame by at most this much on average.
 PICTURE_MAX_DIFF = 6.0
-#: A run of the copy's frames that is this much closer (mean gray levels) to the source's run
-#: one frame earlier or later than to the same frames is shifted. Measured on the pilot's
-#: proxy (two 10 s excerpts, about 100 windows each way, docs/DESIGN.md): a correct copy is
-#: always closer to the same frames (by at least 0.004), a shifted one is closer to the
-#: shifted frames by 0.005 to 0.24, median 0.10 on that low-motion footage.
-PICTURE_SHIFT_MARGIN = 0.03
+#: The shift test, decided over all windows together: the copy is shifted by a frame when its
+#: frames are closer to the source's frames one later (or one earlier) than to the same frames
+#: by more than this share of how much the source's own neighbouring frames differ there
+#: (summed over the windows; the share is between -1 and 1, since no frame can be closer to a
+#: neighbour than that neighbour is to the same frame). Measured (docs/DESIGN.md): true copies
+#: at most 0.006 (static grain) and -0.05 to -0.99 wherever the picture moves; copies shifted
+#: by one frame 0.10 (a noisy exposure ramp) to 0.99 wherever it moves.
+PICTURE_SHIFT_MARGIN = 0.05
+#: A window whose source frames differ from their neighbours by less than this (mean gray
+#: levels) is too still to tell a shift: it counts neither way.
+PICTURE_MIN_MOTION = 0.05
 #: One picture window (a seek and the decode of at most one keyframe interval) may take this.
 PICTURE_TIMEOUT_S = 120.0
 
@@ -696,21 +701,47 @@ def _mean_difference(a: bytes, b: bytes) -> float:
     return sum(abs(x - y) for x, y in zip(a, b, strict=True)) / max(1, len(a))
 
 
-def _alignment(ours: list[bytes], theirs: list[bytes], shift: int) -> float | None:
-    """The mean difference between the copy's frame k and the source's frame k + ``shift``."""
-    pairs = [(ours[k], theirs[k + shift]) for k in range(len(ours)) if 0 <= k + shift < len(theirs)]
-    if not pairs:
-        return None
-    return sum(_mean_difference(a, b) for a, b in pairs) / len(pairs)
+def shift_difference(runs: Sequence[tuple[Sequence[bytes], Sequence[bytes]]]) -> str | None:
+    """The shift test over every window's ``(copy frames, source frames)``, decided together.
+    For a shift s of +1 or -1 and each frame k with a neighbour k + s in its window, the gain
+    is how much closer the copy's frame k is to the source's frame k + s than to the source's
+    frame k, and the motion how far the source's frame k is from its frame k + s. A window
+    whose motion is under :data:`PICTURE_MIN_MOTION` per frame is too still to tell and counts
+    neither way. The copy is shifted by s when its gains summed over the windows exceed
+    :data:`PICTURE_SHIFT_MARGIN` of their motion summed: noise and the encoder's own errors
+    point either way from window to window and cancel, a shift points the same way in every
+    window that moves. A shift where nothing moves cannot be seen, and changes nothing there."""
+    for shift in (1, -1):
+        gain = motion = 0.0
+        windows = 0
+        for ours, theirs in runs:
+            ks = [k for k in range(min(len(ours), len(theirs))) if 0 <= k + shift < len(theirs)]
+            moved = sum(_mean_difference(theirs[k], theirs[k + shift]) for k in ks)
+            if not ks or moved < PICTURE_MIN_MOTION * len(ks):
+                continue
+            windows += 1
+            motion += moved
+            gain += sum(
+                _mean_difference(ours[k], theirs[k]) - _mean_difference(ours[k], theirs[k + shift])
+                for k in ks
+            )
+        if windows and gain > PICTURE_SHIFT_MARGIN * motion:
+            return (
+                f"picture: over {windows} window(s) the copy's frames match the source's frames "
+                f"{shift:+d} better than the same frames, by {gain / motion:.2f} of the source's "
+                f"own change from frame to frame (at most {PICTURE_SHIFT_MARGIN:g}): the picture "
+                "is shifted by a frame"
+            )
+    return None
 
 
 def picture_differences(source: Facts, out: Facts, out_path: Path) -> list[str]:
-    """Each picture window where the copy's frames are not the source's: a frame further than
-    :data:`PICTURE_MAX_DIFF` from the source's same frame (another picture), or a run that
-    matches the source's run one frame earlier or later better than the same frames, by more
-    than :data:`PICTURE_SHIFT_MARGIN` (frames shifted). A shift of a still picture cannot be
-    told apart, and does not matter."""
+    """How the copy's picture is not the source's, from :func:`picture_windows`: a window that
+    decodes another number of frames, a frame further than :data:`PICTURE_MAX_DIFF` from the
+    source's same frame (another picture), or frames shifted by one (:func:`shift_difference`,
+    over the other windows together)."""
     found: list[str] = []
+    runs: list[tuple[list[bytes], list[bytes]]] = []
     for first in picture_windows(source.frames):
         theirs = _gray_run(Path(source.path), source, first)
         ours = _gray_run(out_path, out, first)
@@ -728,16 +759,10 @@ def picture_differences(source: Facts, out: Facts, out_path: Path) -> list[str]:
                 f"levels on average (at most {PICTURE_MAX_DIFF:g}): another picture"
             )
             continue
-        same = _alignment(ours, theirs, 0)
-        for shift in (1, -1):
-            other = _alignment(ours, theirs, shift)
-            if same is not None and other is not None and same - other > PICTURE_SHIFT_MARGIN:
-                found.append(
-                    f"picture: frames {first}-{first + len(ours) - 1} of the copy match the "
-                    f"source's frames {shift:+d} ({other:.3f} gray levels apart) better than "
-                    f"the same frames ({same:.3f}): the picture is shifted by a frame"
-                )
-                break
+        runs.append((ours, theirs))
+    shifted = shift_difference(runs)
+    if shifted is not None:
+        found.append(shifted)
     return found
 
 
