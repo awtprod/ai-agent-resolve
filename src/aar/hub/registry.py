@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -84,6 +85,10 @@ class DuplicateProjectName(ValueError):
         super().__init__(f"name {name!r} is already a name or alias of {existing_id!r}")
         self.name = name
         self.existing_id = existing_id
+
+
+def _nfc(text: str) -> str:
+    return unicodedata.normalize("NFC", text)
 
 
 def new_project_id() -> str:
@@ -507,12 +512,15 @@ class Registry:
         name or alias a source-less project holds is reserved to it, and a source-less
         project (``sourceless``) may not take a name or alias any other project holds. The
         project ``owner_id`` itself never collides (renaming to its own name, re-adding its
-        own alias). Raises :class:`DuplicateProjectName` naming the holder."""
+        own alias). Names compare NFC-normalised, so a composed and a decomposed spelling
+        are the same name; case still matters. Raises :class:`DuplicateProjectName` naming
+        the holder."""
         for project in self.list():
             if project.id == owner_id or (project.sources and not sourceless):
                 continue
+            held = {_nfc(text) for text in (project.name, *project.aliases)}
             for name in names:
-                if name == project.name or name in project.aliases:
+                if _nfc(name) in held:
                     raise DuplicateProjectName(name, project.id)
 
     def _refuse_unless_foldable(

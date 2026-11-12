@@ -27,6 +27,7 @@ Rules, all checked before anything is written:
 
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -78,6 +79,28 @@ def _text(value: Any, field: str, *, limit: int = MAX_NAME_CHARS) -> str:
             f"{field} must be text of 1-{limit} characters, not blank and without control "
             f"characters, got {value!r:.80}",
             f"Pass a printable, non-blank {field}.",
+            field=field,
+        )
+    return value
+
+
+# Control (C0 and C1), format (zero-width, BOM, bidi marks) and line/paragraph separators:
+# nothing a show name needs, and they make two names look alike.
+_NOT_IN_A_SHOW_NAME = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
+
+def _show_name(value: str, field: str) -> str:
+    """``value`` (already through :func:`_text`) if it is a plain show name: no surrounding
+    whitespace and nothing in :data:`_NOT_IN_A_SHOW_NAME`. Used where the name is the
+    project's identity (a source-less registration, ``rename`` and ``add_alias``)."""
+    bad = next((ch for ch in value if unicodedata.category(ch) in _NOT_IN_A_SHOW_NAME), None)
+    if value != value.strip() or bad is not None:
+        problem = "surrounding whitespace" if bad is None else f"the character U+{ord(bad):04X}"
+        raise WriteError(
+            "invalid_input",
+            f"{field} has {problem}, got {value!r:.80}",
+            f"Pass the {field} as plain text without surrounding spaces, control or "
+            "zero-width characters.",
             field=field,
         )
     return value
@@ -246,6 +269,9 @@ def register_project(
     name = _text(name, "name")
     sources = _optional_source(source_kind, locator, host)
     alias_list = _aliases(aliases)
+    if not sources:  # the name is the identity; a sourced registration is as before
+        name = _show_name(name, "name")
+        alias_list = [_show_name(alias, "alias") for alias in alias_list]
     if project_id is not None:
         project_id = check_id(project_id, "project_id")
     registry = Registry(log)
@@ -319,7 +345,7 @@ def _change(
 def add_alias(
     log: EventLog, actor: Actor, project_id: Any, alias: Any, *, idempotency_key: Any
 ) -> WriteResult:
-    text = _text(alias, "alias")
+    text = _show_name(_text(alias, "alias"), "alias")
     return _change(
         log,
         actor,
@@ -335,7 +361,7 @@ def add_alias(
 def rename(
     log: EventLog, actor: Actor, project_id: Any, name: Any, *, idempotency_key: Any
 ) -> WriteResult:
-    text = _text(name, "name")
+    text = _show_name(_text(name, "name"), "name")
     return _change(
         log,
         actor,

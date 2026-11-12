@@ -93,11 +93,37 @@ def test_a_sourced_project_holding_the_name_or_alias_refuses_a_sourceless_twin(h
     )
 
 
-def test_names_compare_exactly_as_the_registry_does(hub: Hub) -> None:
-    _register(hub)
-    # Not the same text, so not the same name (the registry and the node compare exactly).
-    assert _register(hub, key="k2", name="fakes")["ok"]
-    assert _register(hub, key="k3", name="Fakes ")["ok"]
+def test_names_compare_nfc_normalised_and_case_sensitive(hub: Hub) -> None:
+    composed = _register(hub, name="Caf\u00e9")["project_id"]
+    err = _refused(hub, "project_exists", key="k2", name="Cafe\u0301")  # decomposed spelling
+    assert err.details["existing_id"] == composed
+    err = _refused(hub, "project_exists", key="k3", name="Other", aliases=["Cafe\u0301"])
+    assert err.details["existing_id"] == composed
+    assert _register(hub, key="k4", name="caf\u00e9")["ok"]  # case still matters, as on dev
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        " Fakes",
+        "Fakes ",
+        "Fakes\u00a0",  # a no-break space is whitespace too
+        "Fa\u0085kes",  # C1 control
+        "Fa\u200bkes",  # zero-width space
+        "Fa\u200dkes",  # zero-width joiner
+        "Fa\ufeffkes",  # zero-width no-break space (BOM)
+        "Fa\u2028kes",  # line separator
+    ],
+)
+def test_a_sourceless_name_or_alias_must_be_a_plain_show_name(hub: Hub, bad: str) -> None:
+    assert _refused(hub, "invalid_input", name=bad).details["field"] == "name"
+    assert _refused(hub, "invalid_input", aliases=[bad]).details["field"] == "alias"
+
+
+def test_a_sourced_registration_keeps_its_name_rules(hub: Hub) -> None:
+    """Unchanged from dev: a sourced project may carry surrounding whitespace."""
+    out = _register(hub, name=" Fakes ", aliases=["x\u200by"], source_kind="local_db", locator=LOC)
+    assert out["project"]["name"] == " Fakes " and out["project"]["aliases"] == ["x\u200by"]
 
 
 def test_a_sourced_registration_is_still_identified_by_its_uid_only(hub: Hub) -> None:
@@ -467,7 +493,7 @@ def _change(hub: Hub, capsys: pytest.CaptureFixture[str], verb: str, *argv: str)
 def _add(hub: Hub, capsys: pytest.CaptureFixture[str], name: str, *extra: str) -> str:
     code, out, err = _cli(
         hub, capsys, "add", "--actor", "agent:agent-1", "--name", name, *extra,
-        "--idempotency-key", "add-" + name.replace(" ", "-"),
+        "--idempotency-key", "add-" + name.encode().hex(),
     )  # fmt: skip
     assert code == 0, err
     return str(out["project_id"])
@@ -524,3 +550,18 @@ def test_the_library_rename_and_alias_are_unchanged_by_default(hub: Hub) -> None
     with pytest.raises(DuplicateProjectName) as err:
         registry.add_alias("prj_other", "Show", HUMAN, unique_name=True)
     assert err.value.existing_id in {show.id, other.id, "prj_acme"}
+
+
+@pytest.mark.parametrize("verb", ["rename", "alias"])
+def test_cli_rename_and_alias_refuse_what_a_show_name_does_not_need(
+    hub: Hub, capsys: pytest.CaptureFixture[str], verb: str
+) -> None:
+    show = _add(hub, capsys, "Caf\u00e9")
+    other = _add(hub, capsys, "Other")
+    before = hub.counts()
+    for i, bad in enumerate(["Other ", "Ot\u200bher", "Ot\u0085her"]):
+        code, _, err = _change(hub, capsys, verb, other, bad, "--idempotency-key", f"b{i}")
+        assert code == 2 and err["error"]["code"] == "invalid_input", (bad, err)
+    code, _, err = _change(hub, capsys, verb, other, "Cafe\u0301", "--idempotency-key", "nfd")
+    assert code == 2 and err["error"]["details"]["existing_id"] == show
+    assert hub.counts() == before
