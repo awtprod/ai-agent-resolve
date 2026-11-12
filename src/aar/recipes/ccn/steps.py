@@ -31,7 +31,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from aar.analyze.common import offset_from_plan
+from aar.analyze.common import input_identity, offset_from_plan
 from aar.analyze.errors import AnalyzeError
 from aar.analyze.laughs import LaughSettings, analyse_laughs
 from aar.analyze.sync import SyncSettings, sync_files
@@ -170,6 +170,12 @@ def stub_step(ctx: StepContext) -> StepOutput:
     sources = [
         StubSource(s.path, camera=s.camera, shot_size=s.shot_size, id=s.id) for s in params.sources
     ]
+    try:  # before the probes: a file replaced while they run differs at the render
+        identities = [input_identity(Path(s.path)) for s in params.sources]
+    except OSError as exc:
+        raise StepFailure(
+            "stub_unreadable", f"cannot stat a source: {exc}", "check the file"
+        ) from None
     try:
         result = build_stub(
             sources,
@@ -202,8 +208,9 @@ def stub_step(ctx: StepContext) -> StepOutput:
                     "camera": s["camera"],
                     "duration": s["duration"],
                     "start_timecode": (s["start_timecode"] or {}).get("timecode"),
+                    **identity,
                 }
-                for s in report["sources"]
+                for s, identity in zip(report["sources"], identities, strict=True)
             ],
             "unknown_timecode": report["unknown_timecode"],
             "pause_trim": "on" if trim else "off",
@@ -396,7 +403,30 @@ def check_plan(ctx: StepContext) -> tuple[str, EditPlan]:
             "the submitted plan does not match this run's stub: " + "; ".join(diffs[:10]),
             "make the plan with aar plan produce from the stub.json the guide fetches, unedited",
         )
+    _check_media_unchanged(ctx, plan)
     return plan_node, plan
+
+
+def _check_media_unchanged(ctx: StepContext, plan: EditPlan) -> None:
+    """``media_changed`` naming the file when a plan source's size or mtime_ns is not what the
+    stub step recorded (a file replaced at the same path since: the transcript the cut was made
+    on is not this file's)."""
+    recorded = {s.get("id"): s for s in _need(ctx, "stub", "sources")}
+    for source in plan.sources:
+        want = recorded.get(source.id) or {}
+        try:
+            now: dict[str, Any] = input_identity(Path(source.media))
+        except OSError as exc:
+            now = {"error": str(exc)}
+        was = {k: want.get(k) for k in ("size", "mtime_ns")}
+        if now != was:
+            raise StepFailure(
+                "media_changed",
+                f"{source.media!r} (source {source.id!r}) changed since the stub step: it was "
+                f"{was}, it is {now}",
+                "a file was replaced at the same path: cancel this run and start a new one, "
+                "which builds its stub and transcript from the file as it is now",
+            )
 
 
 # -- 6. render --------------------------------------------------------------------------------

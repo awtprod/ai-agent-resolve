@@ -90,3 +90,53 @@ def test_the_sweep_keeps_everything_when_the_state_cannot_be_read(
     with pytest.raises(RuntimeError, match="a bug"):  # not swallowed
         scratch.sweep(_sweeper(env), area)
     assert (area / cancelled / "nd_op").is_dir()
+
+
+# -- LOW-3: media replaced at the same path after the stub ---------------------------------------
+
+
+def _replace(env: CcnEnv, show: Path) -> None:
+    other = env.media / "other.mov"
+    make_show(other, timecode="02:00:00:00", gain=0.25)
+    os.replace(other, show)
+
+
+def test_media_replaced_before_the_render_is_refused_naming_the_file(ccn_env: CcnEnv) -> None:
+    env = ccn_env
+    show = env.show()
+    run = _cold(env, env.params(show), "1")
+    recorded = outputs(env, run, "stub")["sources"][0]
+    st = show.stat()
+    assert (recorded["size"], recorded["mtime_ns"]) == (st.st_size, st.st_mtime_ns)
+    _replace(env, show)
+    agent_cut(env, run)
+    work(env)
+    op = latest(env, run, "render")
+    assert op.status == "failed" and op.result_error["code"] == "media_changed"
+    assert str(show) in op.result_error["message"]
+    assert latest(env, run, "export") is None or latest(env, run, "export").status != "done"
+
+
+def test_media_replaced_between_the_render_and_the_export_is_refused(ccn_env: CcnEnv) -> None:
+    env = ccn_env
+    show = env.show()
+    run = _cold(env, env.params(show), "1")
+    agent_cut(env, run)
+    assert work(env, limit=1) == 1  # the render only
+    assert latest(env, run, "render").status == "done"
+    _replace(env, show)
+    work(env)
+    op = latest(env, run, "export")
+    assert op.status == "failed" and op.result_error["code"] == "media_changed"
+    assert str(show) in op.result_error["message"]
+
+
+def test_a_touched_file_with_the_same_size_is_refused_too(ccn_env: CcnEnv) -> None:
+    env = ccn_env
+    show = env.show()
+    run = _cold(env, env.params(show), "1")
+    agent_cut(env, run)
+    st = show.stat()
+    os.utime(show, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+    work(env)
+    assert latest(env, run, "render").result_error["code"] == "media_changed"

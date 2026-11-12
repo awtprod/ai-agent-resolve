@@ -102,8 +102,16 @@ def test_cold_steps_one_camera_then_the_transcript_is_reused(ccn_env: CcnEnv) ->
     stub = outputs(ccn_env, run1, "stub")
     assert stub["fps"] == "30000/1001" and stub["recording_id"] == "show-1"
     assert stub["pause_trim"] == "off" and stub["pause_trim_flag"] == "--no-pause-trim"
+    st = show.stat()
     assert stub["sources"] == [
-        {"id": "cam-a", "camera": "A", "duration": 360, "start_timecode": "01:00:00:00"}
+        {
+            "id": "cam-a",
+            "camera": "A",
+            "duration": 360,
+            "start_timecode": "01:00:00:00",
+            "size": st.st_size,
+            "mtime_ns": st.st_mtime_ns,
+        }
     ]
     assert outputs(ccn_env, run1, "sync") == {
         "synced": False,
