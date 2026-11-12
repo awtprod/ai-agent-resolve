@@ -523,3 +523,49 @@ def test_window_reframe() -> None:
     single = keys((0, 0.3))
     assert [(w.time, w.x) for w in window_reframe(single, 40, 80)] == [(0, 0.3)]
     assert copy.deepcopy(k) == k
+
+
+# -- matching corner cases ---------------------------------------------------------------------
+
+
+def test_a_range_used_twice_matches_the_use_at_its_own_position() -> None:
+    data = simple_data()
+    data["segments"][2] = {"source": "camA", "src_in": 0, "src_out": 200, "label": "again"}
+    plan = EditPlan.model_validate(data)
+    rows = layout_rows(plan)
+    first = content(rows)[0]
+    lifted = [r for r in rows if r is not first]  # deleted without a ripple: a gap is left
+    result = run(plan, lifted)
+    assert statuses(result) == ["removed", "unchanged", "unchanged", "unchanged"]
+    assert result.plan.segments[1].label == "again"
+
+
+def test_the_outro_is_the_last_item_of_its_source() -> None:
+    plan = simple()
+    rows = layout_rows(plan)
+    c = content(rows)
+    early = Row("V1", "video", 0, 20, 10, "E:\\Assets\\Outro.mov", sound="A1")
+    result = run(plan, ripple(rows, [*c[:2], early, *c[2:]]))
+    assert [(a["source"], a["src_in"]) for a in result.diff["added"]] == [("out", 10)]
+    assert result.diff["outro"]["status"] == "moved"
+    assert result.plan.outro == plan.outro
+
+
+def test_a_join_with_a_gap_drops_its_transition() -> None:
+    plan, rows = tc_rows()
+    third = content(rows)[2]
+    gapped = [replace(r, record_in=r.record_in + 10) if r is third else r for r in rows]
+    result = run(plan, gapped, rate=RATE_2997)
+    assert codes(result, "dropped") == ["transition_join_gone"]
+    assert result.plan.segments[2].record_in == 610
+
+
+def test_a_transition_of_another_length_is_added_and_the_plans_is_missing() -> None:
+    plan, rows = tc_rows()
+    longer = [
+        replace(r, duration=20) if r.kind == "transition" and r.record_in == 0 else r for r in rows
+    ]
+    result = run(plan, longer, rate=RATE_2997)
+    assert codes(result) == ["transition_added", "transition_missing"]
+    assert result.diff["not_carried"][1]["location"] == "head"
+    assert result.plan == plan

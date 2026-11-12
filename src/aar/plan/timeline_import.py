@@ -574,16 +574,19 @@ class _Importer:
         exact: set[int] = set()
         segs = self.plan.segments
 
-        def same(i: int, e: _Item) -> bool:
-            s = segs[i]
-            return (s.source, s.src_in, s.src_out) == (e.source, e.src_in, e.src_out)
-
+        by_range: dict[tuple[str, int, int], list[int]] = {}
+        by_source: dict[str, list[int]] = {}
+        for i in self.originals:
+            by_range.setdefault((segs[i].source, segs[i].src_in, segs[i].src_out), []).append(i)
+            by_source.setdefault(segs[i].source, []).append(i)
         for at_position in (True, False):
             for pos, entry in enumerate(self.content):
                 if pos in self.assigned:
                     continue
-                for i in self.originals:
-                    if i in exact or not same(i, entry):
+                assert entry.source is not None and entry.src_in is not None
+                assert entry.src_out is not None
+                for i in by_range.get((entry.source, entry.src_in, entry.src_out), []):
+                    if i in exact:
                         continue
                     if at_position and self.old_range[i][0] != entry.record_in:
                         continue
@@ -595,10 +598,8 @@ class _Importer:
                 continue
             assert entry.src_in is not None and entry.src_out is not None
             best: tuple[int, int, int] | None = None  # (not exact, overlap, -index)
-            for i in self.originals:
+            for i in by_source.get(entry.source or "", []):
                 s = segs[i]
-                if s.source != entry.source:
-                    continue
                 overlap = min(s.src_out, entry.src_out) - max(s.src_in, entry.src_in)
                 if overlap <= 0:
                     continue
@@ -808,6 +809,9 @@ class _Importer:
                     None,
                 )
             )
+        slots: dict[tuple[str, int, int], list[int]] = {}
+        for n, (_, track, rin, rout, _, _, _) in enumerate(expected):
+            slots.setdefault((track, rin, rout), []).append(n)
         found: set[int] = set()
         self.off_v1_changed: set[int] = set()
         for entry in self.items:
@@ -820,12 +824,9 @@ class _Importer:
             ):
                 continue
             hit = None
-            for n, (_, track, rin, rout, source, sin, sout) in enumerate(expected):
-                if (
-                    n in found
-                    or track != entry.track
-                    or (rin, rout) != (entry.record_in, entry.record_out)
-                ):
+            for n in slots.get((entry.track, entry.record_in, entry.record_out), []):
+                source, sin, sout = expected[n][4:]
+                if n in found:
                     continue
                 if (
                     source is None
@@ -941,16 +942,17 @@ class _Importer:
             for e in self.items
             if e.is_video and e.kind == "video" and not e.excluded and e.key is not None
         ]
+        in_sync: dict[tuple[str | None, int], list[_Item]] = {}  # (file, source - record)
+        for pic in pictures:
+            assert pic.src_in is not None
+            in_sync.setdefault((pic.key, pic.src_in - pic.record_in), []).append(pic)
         heard: set[int] = set()
         for entry in self.items:
             if entry.is_video or entry.excluded or entry.kind == "transition":
                 continue
             ok = False
-            for pic in pictures:
-                if pic.key != entry.key or entry.src_in is None or pic.src_in is None:
-                    continue
-                if entry.src_in - entry.record_in != pic.src_in - pic.record_in:
-                    continue
+            offset = entry.src_in - entry.record_in if entry.src_in is not None else None
+            for pic in in_sync.get((entry.key, offset), []) if offset is not None else []:
                 index = self.content_index.get(id(pic))
                 widen_in = split_before.get(index, 0) if index is not None else 0
                 widen_out = split_after.get(index, 0) if index is not None else 0
