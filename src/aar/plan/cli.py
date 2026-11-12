@@ -202,9 +202,9 @@ def register(subparsers: Any) -> None:
         "export), and writes the edited plan (V1 items in record order become the segments) and "
         "a JSON diff: per original segment unchanged, trimmed, moved, removed or split; added "
         "segments; foreign items; and what the plan cannot hold (not_carried). The edited plan is "
-        "linted; lint errors do not stop it being written. Neither output is ever overwritten. "
-        "Exit: 0 written, 1 written but the edited plan has lint errors, 2 refused or unreadable "
-        "input.",
+        "linted and laid out by the export; errors there do not stop it being written. Neither "
+        "output is ever overwritten. Exit: 0 written, 1 written but the edited plan has lint "
+        "errors or the export's layout refuses it, 2 refused or unreadable input.",
     )
     imp.add_argument("drt", type=Path, metavar="TIMELINE.drt", help="Timeline exported as .drt.")
     imp.add_argument("--plan", type=Path, required=True, help="The plan the timeline came from.")
@@ -697,8 +697,22 @@ def _cmd_render(args: argparse.Namespace) -> int:
 # -- import-timeline (S20) ----------------------------------------------------------------------
 
 
+#: Bounds on the stdout summary; the diff file keeps every entry.
+_TEXT_ROWS = 12
+_TEXT_PIECES = 3
+_TEXT_ENTRIES = 5
+
+
+def _counted(values: list[str]) -> str:
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return ", ".join(f"{v} x{n}" for v, n in counts.items())
+
+
 def _import_text(diff: dict[str, Any], out: Path, report: Path) -> str:
-    """A few lines an agent can act on; the diff file has everything."""
+    """A bounded summary an agent can act on (repeated entries grouped); the diff file has
+    everything."""
     rows = diff["segments"]
     counts: dict[str, int] = {}
     for row in rows:
@@ -712,35 +726,88 @@ def _import_text(diff: dict[str, Any], out: Path, report: Path) -> str:
         + f"; {len(diff['added'])} added; {len(diff['foreign'])} foreign",
     ]
     changed = [r for r in rows if r["status"] != "unchanged"]
-    for row in changed[:12]:
-        new = ", ".join(f"[{n['index']}] {n['record_in']}..{n['record_out']}" for n in row["new"])
-        trim = (
-            f" head {row['head_frames']:+d} tail {row['tail_frames']:+d}"
-            if row["status"] == "trimmed"
-            else ""
+    for row in changed[:_TEXT_ROWS]:
+        pieces = row["new"]
+        new = ", ".join(
+            f"[{n['index']}] {n['record_in']}..{n['record_out']}" for n in pieces[:_TEXT_PIECES]
         )
+        if len(pieces) > _TEXT_PIECES:
+            new += f", ... {len(pieces)} pieces in all"
+        extra = ""
+        if row["head_frames"] is not None:
+            extra = f" head {row['head_frames']:+d} tail {row['tail_frames']:+d}"
+        if row["joined"] is not None:
+            members = ", ".join(str(i) for i in row["joined"]["segments"])
+            extra += f" (joined {members}; fields of segments[{row['joined']['fields_from']}])"
         lines.append(
-            f"  segments[{row['index']}] {row['status']}{trim}: "
+            f"  segments[{row['index']}] {row['status']}{extra}: "
             f"{row['old']['record_in']}..{row['old']['record_out']} -> {new or 'gone'}"
         )
-    if len(changed) > 12:
-        lines.append(f"  ... {len(changed) - 12} more in the diff")
+    if len(changed) > _TEXT_ROWS:
+        lines.append(f"  ... {len(changed) - _TEXT_ROWS} more in the diff")
+    uncertain = diff["uncertain_matches"]
+    if uncertain:
+        shown = "; ".join(
+            f"[{u['index']}] -> segments[{u['assigned_to']}] (also overlaps "
+            + ", ".join(str(i) for i in u["also_overlaps"])
+            + ")"
+            for u in uncertain[:_TEXT_ENTRIES]
+        )
+        more = (
+            f"; ... {len(uncertain) - _TEXT_ENTRIES} more" if len(uncertain) > _TEXT_ENTRIES else ""
+        )
+        lines.append(f"uncertain matches ({len(uncertain)}), check them: {shown}{more}")
+    by_name = diff["matched_by_file_name"]
+    if by_name:
+        shown = "; ".join(
+            f"{e['track']} {e['record_in']} {e['media']} -> {e['source']}"
+            for e in by_name[:_TEXT_ENTRIES]
+        )
+        more = f"; ... {len(by_name) - _TEXT_ENTRIES} more" if len(by_name) > _TEXT_ENTRIES else ""
+        lines.append(f"matched by file name only ({len(by_name)}): {shown}{more}")
+    if diff["foreign"]:
+        lines.append(
+            f"foreign ({len(diff['foreign'])}): "
+            + _counted([str(f.get("reason")) for f in diff["foreign"]])
+        )
     if diff["outro"] is not None and diff["outro"]["status"] != "unchanged":
         lines.append(f"outro: {diff['outro']['status']}")
+    if diff["repositioned"]:
+        lines.append(
+            f"repositioned ({len(diff['repositioned'])}): "
+            + _counted(
+                [f"{e['location'].split('[')[0]} by {e['by']}" for e in diff["repositioned"]]
+            )
+        )
     for key, title in (("not_carried", "not carried"), ("dropped", "dropped from the plan")):
         entries = diff[key]
-        if entries:
-            codes: dict[str, int] = {}
-            for entry in entries:
-                codes[entry["code"]] = codes.get(entry["code"], 0) + 1
-            lines.append(
-                f"{title} ({len(entries)}): " + ", ".join(f"{c} x{n}" for c, n in codes.items())
-            )
+        if not entries:
+            continue
+        groups: dict[str, list[str]] = {}
+        for entry in entries:
+            groups.setdefault(entry["code"], []).append(str(entry.get("track") or "-"))
+        parts = []
+        for code, tracks in groups.items():
+            where = f" ({_counted(tracks)})" if key == "not_carried" else ""
+            parts.append(f"{code} x{len(tracks)}{where}")
+        lines.append(f"{title} ({len(entries)}): " + ", ".join(parts))
+    warnings = diff["reader_warnings"]
+    if warnings["count"]:
+        lines.append(
+            f"reader warnings ({warnings['count']}): "
+            + _counted([w["code"] for w in warnings["listed"]])
+        )
     lint_report = diff["lint"]
     if lint_report is not None:
         c = lint_report["counts"]
         state = "ERRORS" if diff["lint_errors"] else "ok"
         lines.append(f"lint: {state} ({c['error']} error, {c['warn']} warn, {c['info']} info)")
+    check = diff["export_check"]
+    if check["ok"]:
+        lines.append("export check: ok")
+    else:
+        error = check["error"]
+        lines.append(f"export check: REFUSED ({error['code']}): {error['message']}")
     lines.append(f"wrote {out} and {report}")
     return "\n".join(lines) + "\n"
 
@@ -770,6 +837,16 @@ def _cmd_import_timeline(args: argparse.Namespace) -> int:
                     "choose new --out and --report paths",
                     path=str(path),
                 )
+        for path in (out, report_file):
+            folder = path.parent
+            if not folder.is_dir():
+                raise TimelineImportError(
+                    "output_folder_missing",
+                    f"the folder {str(folder)!r} for {path} does not exist",
+                    "create the folder first, or choose --out and --report in an existing one",
+                    path=str(path),
+                    folder=str(folder),
+                )
         if out.resolve() == report_file.resolve():
             raise TimelineImportError(
                 "output_exists",
@@ -779,7 +856,12 @@ def _cmd_import_timeline(args: argparse.Namespace) -> int:
             )
         timeline = read_timeline(args.drt, args.timeline)
         result = import_timeline(
-            plan, timeline.timeline, timeline.media, media_map=media_map, profile=profile
+            plan,
+            timeline.timeline,
+            timeline.media,
+            media_map=media_map,
+            profile=profile,
+            reader_warnings=timeline.warnings,
         )
     except CompileError as exc:  # TimelineImportError, or the export's own refusals
         return _export_refusal(exc, as_json)  # type: ignore[arg-type]
@@ -800,4 +882,4 @@ def _cmd_import_timeline(args: argparse.Namespace) -> int:
     written = cli_io.emit(_PROG, text)
     if written != EXIT_OK:
         return written
-    return EXIT_ERRORS if result.lint_errors else EXIT_OK
+    return EXIT_ERRORS if result.has_errors else EXIT_OK

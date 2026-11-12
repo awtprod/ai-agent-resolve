@@ -12,10 +12,16 @@ from timeline_import_support import Row, build_timeline, content, rows_from_layo
 
 from aar.plan.export.layout import build_layout
 from aar.plan.model import EditPlan
-from aar.plan.timeline_import import import_timeline, media_key
+from aar.plan.timeline_import import import_timeline
 
 FILES = {"camA": "E:\\Show\\A.mov", "camB": "E:\\Show\\B.mov", "broll": "E:\\Show\\Crowd.mov"}
 DURATION = 3000
+
+
+def same_file(path: str) -> str:
+    """The test's own reading of two Windows paths naming one file (not the product's
+    ``media_key``, so a wrong ``media_key`` cannot pass here)."""
+    return path.replace("/", "\\").lower()
 
 
 def base_plan(rng: random.Random) -> EditPlan:
@@ -114,12 +120,12 @@ def test_random_edits_import_frame_exact(seed: int) -> None:
     layout = build_layout(result.plan, allow_unknown_timecode=True)
     paths = {ref.src: ref.windows_path for ref in layout.media.values()}
     planned = sorted(
-        (c.record_in, c.record_out, media_key(paths[c.src]), c.src_in, c.src_out)
+        (c.record_in, c.record_out, same_file(paths[c.src]), c.src_in, c.src_out)
         for c in layout.clips
         if c.lane == 0
     )
     on_v1 = sorted(
-        (r.record_in, r.record_out, media_key(r.path or ""), r.src_in, (r.src_in or 0) + r.duration)
+        (r.record_in, r.record_out, same_file(r.path or ""), r.src_in, (r.src_in or 0) + r.duration)
         for r in edited
         if r.track == "V1"
     )

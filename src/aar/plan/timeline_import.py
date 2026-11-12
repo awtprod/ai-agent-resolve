@@ -5,40 +5,52 @@ Timeline as ``.drt`` -> :func:`read_timeline` + :func:`import_timeline` -> an ed
 diff the agent reads. Pure and cold: nothing here talks to Resolve or the network, and the only
 file read is the ``.drt`` (through :mod:`aar.drp`, with its own size limits).
 
+The rule: **a wrong plan or a wrong diff is never returned without saying so.** Where the code
+cannot know, it reports; it does not guess quietly.
+
+* **Reader issues.** A reader issue that can hide or change an item refuses the import
+  (``damaged_timeline``); the others are passed through as ``reader_warnings``
+  (:data:`READER_WARNING_CODES`).
 * **Expected timeline.** S18's :func:`~aar.plan.export.layout.build_layout` is the original plan
   as timeline clips (lanes, record ranges, source ranges); nothing here re-derives its rules.
-* **Media.** An item's media path is compared with the edit-PC path the export named for each
-  plan source (:func:`~aar.plan.export.media.media_ref` with the export's media map, hub root ->
-  edit-PC root), separators unified and case folded. With no path hit, a file name unique among
-  the plan's media files (case folded). Anything else is foreign: reported, never guessed.
-* **Segments.** The picture items on the primary track (V1), in record order, become the plan's
-  segments, frame-exact. Each is matched to the original V1 segment of its source that it
-  overlaps most (an exact range first); it inherits that segment's other fields. Reframe keys are
-  measured from the segment's start, so a segment whose source range changed gets its keys
-  windowed to the new range: shifted by the head trim, and a side whose keys were cut away gets
-  one key interpolated (linearly, as the model says) at the new boundary.
-* **Everything else** in the plan is carried when it is still valid, and listed under ``dropped``
-  when it is not. What the timeline holds that a plan cannot (retimes, sub-frame positions, audio
-  edits, changes off V1, transitions added in Resolve) is listed under ``not_carried`` with a
-  reason code; the plan keeps its own version there.
+* **Media.** An item matches a source when its path is the edit-PC path the export named for
+  that source (:func:`~aar.plan.export.media.media_ref` with the export's media map). Only a
+  source whose edit-PC path is unknown can match by file name, and every such match is listed.
+  An item with a known source's file name but another path is foreign ("same name, different
+  file"). Anything else is foreign: reported, never guessed.
+* **Segments.** The picture items on each content track become the plan's segments on that
+  track, frame-exact, positions from the timeline. Items are assigned to original segments as a
+  whole: an exact range first, then the larger source overlap, then the nearer original record
+  position, then order. A matched segment inherits the original's other fields; reframe keys are
+  windowed to the new source range.
+* **Timing.** Whatever exists as an item in the timeline (segments on every track, titles) takes
+  its position from the timeline. What the plan positions in record frames but is never an item
+  (captions, markers) is re-anchored to the content it sat over, and dropped when that content
+  is gone. Every move and every drop is listed.
+* **Everything else** in the plan is carried when it is still valid and listed under ``dropped``
+  when it is not. What the timeline holds that a plan cannot (retimes, stills, sub-frame
+  positions, audio edits, changes on tracks the plan has no lane for, transitions added in
+  Resolve) is listed under ``not_carried`` with a reason code.
 
-The three assumptions that hold until a real round trip through Resolve confirms them are the
-three functions under "Assumptions" below (DESIGN.md, "Timeline import (S20)").
+The assumptions that hold until a real round trip through Resolve confirms them are the functions
+under "Assumptions" below (DESIGN.md, "Timeline import (S20)").
 """
 
 from __future__ import annotations
 
 import itertools
 import re
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import unquote, urlsplit
 
+from pydantic import ValidationError
+
 from aar.drp import read_drp
 from aar.drp.errors import DrpError
-from aar.drp.model import MediaClip, Timeline, TimelineItem
+from aar.drp.model import Issue, MediaClip, Timeline, TimelineItem
 from aar.plan.apply.errors import CompileError
 from aar.plan.export.errors import ExportError
 from aar.plan.export.layout import Layout, build_layout
@@ -47,15 +59,18 @@ from aar.plan.lint import LintReport, lint
 from aar.plan.model import EditPlan, ReframeKey, Segment, Source
 from aar.plan.profile import Profile
 
-FORMAT = "aar.timeline-import/1"
+FORMAT = "aar.timeline-import/2"
 #: Items read from one timeline, all tracks together; more is refused (``timeline_too_large``).
 MAX_ITEMS = 20_000
 #: A timeline or media rate (a float in the file) matches the plan's rational fps within this.
 FPS_TOLERANCE = 1e-3
+#: Reader issues listed in a refusal or in ``reader_warnings`` (the rest are counted).
+MAX_LISTED_ISSUES = 50
 
 IMPORT_CODES = frozenset(
     {
         "unreadable_timeline",
+        "damaged_timeline",
         "no_timeline",
         "several_timelines",
         "timeline_not_found",
@@ -64,30 +79,78 @@ IMPORT_CODES = frozenset(
         "media_fps_mismatch",
         "source_range_outside",
         "output_exists",
+        "output_folder_missing",
+        "invalid_edited_plan",
     }
 )
 
-#: Reason codes of ``not_carried`` (timeline changes a plan cannot hold) and ``dropped`` (plan
+#: Reason codes of ``not_carried`` (timeline content a plan cannot hold) and ``dropped`` (plan
 #: entries no longer valid after the edit). Pinned by the tests.
 NOT_CARRIED_CODES = (
     "retimed",
+    "still_image",
     "sub_frame",
+    "zero_length",
+    "outside_timeline",
+    "negative_source_in",
     "unreadable_item",
     "audio_only_edit",
     "other_picture_track",
+    "title_added",
     "transition_added",
     "transition_missing",
     "outro_missing",
     "outro_position",
     "outro_changed",
+    "sting_missing",
 )
-DROPPED_CODES = ("transition_join_gone", "title_past_end", "caption_past_end", "marker_past_end")
+DROPPED_CODES = (
+    "transition_join_gone",
+    "title_removed",
+    "title_past_end",
+    "caption_content_gone",
+    "caption_past_end",
+    "marker_content_gone",
+    "marker_past_end",
+)
+#: Why an item is foreign (``foreign[].reason``).
+FOREIGN_REASONS = ("unknown_file", "same_name_different_file", "ambiguous_file_name")
+
+#: Reader issue codes that cannot hide or change a timeline item, its position, its source range
+#: or its media path: passed through as ``reader_warnings``. Every other code (any ``scan-*``
+#: code, a missing or unreadable member or container, a blob that did not decode, a path taken
+#: from another stream, unresolved media, an uninterpreted track, a budget hit, ...) refuses the
+#: import as ``damaged_timeline``, including codes this list has never seen.
+READER_WARNING_CODES = frozenset(
+    {
+        "uninterpreted",  # Fusion comps and other payloads that are not timeline items
+        "linked-files",  # a clip also names a synced external file; its own path is read
+        "stale-media-file-path",  # a timeline <MediaFilePath> differs; the pool path is used
+        "orphan-markers",  # markers are not read into the plan
+        "marker-decode",
+        "issues-truncated",  # the code it counts decides on its own
+        "codec-unknown",
+        "no-version-header",
+        "version-mismatch",
+        "orphan-timeline",
+        "orphan-bin",
+        "bin-cycle",
+        "unknown-media",  # an item using it is caught by unresolved-media, which refuses
+        "drb-best-effort",
+        "no-timelines",  # no timeline at all is refused as no_timeline
+    }
+)
+
+#: File name endings of still images (when the media pool does not say the clip has 1 frame).
+STILL_EXTENSIONS = frozenset(
+    {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp", ".heic", ".dpx", ".exr"}
+)
 
 LIMITS = (
     "enabled_state: the reader cannot see whether an item is enabled; a disabled clip is "
     "imported as if it plays",
     "audio_transitions: transition items on audio tracks are not compared",
-    "titles: title items are compared by track and record range only; their text is not read",
+    "titles: title items are matched by track and record range only; their text is not read",
     "not_read: markers, grades, Fusion and Fairlight work in the .drt are not read into the plan",
 )
 
@@ -101,8 +164,9 @@ ASSUMPTIONS = (
     },
     {
         "id": "source_frames",
-        "text": "an item's source in point counts frames from the media file's first frame, as "
-        "the plan's src_in does (not from its start timecode)",
+        "text": "a moving-picture item's source in point counts frames from the media file's "
+        "first frame, as the plan's src_in does (not from its start timecode); stills are not "
+        "covered (a real export shows still in points near 01:00:00:00) and are not carried",
         "check": "the same round trip with sources whose start timecode is not 0: unchanged "
         "segments keep their src_in",
     },
@@ -130,8 +194,8 @@ def track_of_lane(lane: int) -> int:
 
 
 def source_frame(item: TimelineItem) -> int | None:
-    """Assumption ``source_frames``: the item's ``<In>`` is the plan's ``src_in`` (frames from the
-    file's first frame)."""
+    """Assumption ``source_frames``: a moving-picture item's ``<In>`` is the plan's ``src_in``
+    (frames from the file's first frame). Stills never reach here (:func:`is_still`)."""
     return item.source_in
 
 
@@ -141,17 +205,38 @@ def media_key(path: str) -> str:
     return path.replace("/", "\\").casefold()
 
 
+def file_name(path: str) -> str:
+    """The last component of a Windows or POSIX path, case folded (the file-name fallback)."""
+    return re.split(r"[\\/]", path)[-1].casefold()
+
+
+def is_still(item: TimelineItem, clip: MediaClip | None) -> bool:
+    """A still image: the media pool says the clip has one frame, or its file name says so."""
+    if clip is not None and clip.frames == 1:
+        return True
+    path = item.media_path or ""
+    dot = path.rfind(".")
+    return dot >= 0 and path[dot:].casefold() in STILL_EXTENSIONS
+
+
 # -- reading ------------------------------------------------------------------------------------
 
 
 @dataclass
 class TimelineFile:
-    """One timeline read from a ``.drt`` with :mod:`aar.drp`, and its media-pool clips."""
+    """One timeline read from a ``.drt`` with :mod:`aar.drp`, its media-pool clips and the
+    reader issues that cannot change an item (``warnings``)."""
 
     path: str
     sha256: str
     timeline: Timeline
     media: dict[str, MediaClip]
+    warnings: list[Issue] = field(default_factory=list)
+
+
+def _issue_text(issue: Issue) -> str:
+    member = f" in {issue.where.member}" if issue.where is not None else ""
+    return f"{issue.severity} {issue.code}{member}: {issue.message}"
 
 
 def read_timeline(path: Path, name: str | None = None) -> TimelineFile:
@@ -166,6 +251,20 @@ def read_timeline(path: Path, name: str | None = None) -> TimelineFile:
     if not drp.is_zip:
         raise TimelineImportError(
             "unreadable_timeline", f"{path} is not a .drt (not a zip archive)", hint
+        )
+    damage = [i for i in drp.issues if i.code not in READER_WARNING_CODES]
+    if damage:
+        listed = [_issue_text(i) for i in damage[:MAX_LISTED_ISSUES]]
+        if len(damage) > MAX_LISTED_ISSUES:
+            listed.append(f"... {len(damage) - MAX_LISTED_ISSUES} more")
+        raise TimelineImportError(
+            "damaged_timeline",
+            f"{path}: the reader found {len(damage)} problem(s) that can hide or change "
+            f"timeline items ({', '.join(sorted({i.code for i in damage}))})",
+            "export the timeline from Resolve again (File > Export > Timeline); if it repeats, "
+            "check the file with `aar drp describe`",
+            problems=listed,
+            issues=[{"severity": i.severity, "code": i.code} for i in damage],
         )
     timelines = [t for t in drp.timelines if t.kind == "timeline"]
     names = [t.name for t in timelines]
@@ -202,7 +301,7 @@ def read_timeline(path: Path, name: str | None = None) -> TimelineFile:
             f"timeline {timeline.name!r} has no readable frame rate or start frame",
             hint,
         )
-    return TimelineFile(str(path), drp.sha256, timeline, drp.media_by_id())
+    return TimelineFile(str(path), drp.sha256, timeline, drp.media_by_id(), list(drp.issues))
 
 
 # -- the import ---------------------------------------------------------------------------------
@@ -223,11 +322,22 @@ class _Item:
     key: str | None = None
     source: str | None = None
     match: str | None = None
+    foreign: str | None = None
     excluded: bool = False
+    used: bool = False
 
     @property
     def is_video(self) -> bool:
         return self.track.startswith("V")
+
+    @property
+    def is_picture(self) -> bool:
+        return self.is_video and self.kind not in ("transition", "audio")
+
+    @property
+    def is_title(self) -> bool:
+        """Assumption: a media-less picture item is a title (or a generator or solid)."""
+        return self.is_picture and not self.item.media_path
 
     def where(self) -> dict[str, Any]:
         return {
@@ -251,6 +361,15 @@ class ImportResult:
     @property
     def lint_errors(self) -> bool:
         return self.lint is not None and not self.lint.ok
+
+    @property
+    def export_errors(self) -> bool:
+        return bool(self.diff.get("export_errors"))
+
+    @property
+    def has_errors(self) -> bool:
+        """Exit 1 in the CLI: the plan is written but lint or the export's layout refuses it."""
+        return self.lint_errors or self.export_errors
 
 
 @dataclass
@@ -322,6 +441,88 @@ def window_reframe(keys: list[ReframeKey], start: int, end: int) -> list[Reframe
     return out
 
 
+def _with_segments(plan: EditPlan, segments: list[Segment]) -> EditPlan:
+    """``plan`` with another segment list, for the model's own ``record_ranges`` and ``joins``."""
+    return plan.model_copy(update={"segments": segments})
+
+
+def assign_items(
+    items: Sequence[tuple[str, int, int, int]],
+    originals: Sequence[tuple[int, str, int, int, int]],
+) -> tuple[dict[int, int], dict[int, list[int]]]:
+    """Assign items to original segments as a whole. ``items`` are ``(source, src_in, src_out,
+    record_in)`` in record order; ``originals`` are ``(index, source, src_in, src_out,
+    record_in)``. Returns item position -> original index, and for each item matched by overlap
+    the other originals it also overlaps (the diff lists them: the choice was not certain).
+
+    1. An exact source range at the original's record position, then an exact range anywhere
+       (the nearer original position first, then plan order); each original takes one exact item.
+    2. Every other item goes to the original of its source it overlaps most (never one an item
+       matched exactly: that item is added). Among originals it overlaps equally, one that no
+       item holds yet comes first (the assignment is taken as a whole: a trimmed copy is not a
+       piece of a segment that already has its own item), then the nearer original record
+       position; items still tied are given out in record order to their tied originals in plan
+       order. An item that overlaps nothing it can take is unassigned (added)."""
+    assigned: dict[int, int] = {}
+    exact: set[int] = set()
+    by_range: dict[tuple[str, int, int], list[tuple[int, int]]] = {}
+    by_source: dict[str, list[tuple[int, int, int, int]]] = {}
+    old_in: dict[int, int] = {}
+    for index, source, src_in, src_out, record_in in originals:
+        by_range.setdefault((source, src_in, src_out), []).append((index, record_in))
+        by_source.setdefault(source, []).append((index, src_in, src_out, record_in))
+        old_in[index] = record_in
+    for at_position in (True, False):
+        for pos, (source, src_in, src_out, record_in) in enumerate(items):
+            if pos in assigned:
+                continue
+            free = [
+                (abs(old - record_in), index)
+                for index, old in by_range.get((source, src_in, src_out), [])
+                if index not in exact and (not at_position or old == record_in)
+            ]
+            if free:
+                index = min(free)[1]
+                assigned[pos] = index
+                exact.add(index)
+    also: dict[int, list[int]] = {}
+    ties: list[tuple[int, list[int]]] = []
+    for pos, (source, src_in, src_out, _) in enumerate(items):
+        if pos in assigned:
+            continue
+        overlaps = {
+            index: min(o_out, src_out) - max(o_in, src_in)
+            for index, o_in, o_out, _ in by_source.get(source, [])
+            if index not in exact
+        }
+        overlaps = {i: o for i, o in overlaps.items() if o > 0}
+        if not overlaps:
+            continue
+        most = max(overlaps.values())
+        tied = sorted(i for i, o in overlaps.items() if o == most)
+        if len(tied) == 1:
+            assigned[pos] = tied[0]
+        else:
+            ties.append((pos, tied))
+        also[pos] = sorted(overlaps)
+    floor = -1
+    for pos, tied in ties:
+        record_in = items[pos][3]
+        held = set(assigned.values())
+        unheld = [i for i in tied if i not in held] or tied
+        near = min(abs(old_in[i] - record_in) for i in unheld)
+        nearest = [i for i in unheld if abs(old_in[i] - record_in) == near]
+        later = [i for i in nearest if i >= floor]
+        assigned[pos] = later[0] if later else nearest[0]
+        floor = assigned[pos]
+    alternatives = {
+        pos: [i for i in others if i != assigned[pos]]
+        for pos, others in also.items()
+        if len(others) > 1
+    }
+    return assigned, alternatives
+
+
 class _Importer:
     def __init__(
         self,
@@ -337,6 +538,7 @@ class _Importer:
         self.not_carried: list[dict[str, Any]] = []
         self.dropped: list[dict[str, Any]] = []
         self.foreign: list[dict[str, Any]] = []
+        self.repositioned: list[dict[str, Any]] = []
 
     # -- report helpers ------------------------------------------------------------------------
 
@@ -348,6 +550,17 @@ class _Importer:
         assert code in DROPPED_CODES
         self.dropped.append({"code": code, "location": location, "detail": detail})
 
+    def moved(self, location: str, by: str, old: tuple[int, int], new: tuple[int, int]) -> None:
+        if old != new:
+            self.repositioned.append(
+                {
+                    "location": location,
+                    "by": by,
+                    "old": {"record_in": old[0], "record_out": old[1]},
+                    "new": {"record_in": new[0], "record_out": new[1]},
+                }
+            )
+
     # -- steps ---------------------------------------------------------------------------------
 
     def run(self) -> tuple[EditPlan, dict[str, Any]]:
@@ -358,11 +571,11 @@ class _Importer:
             allow_unknown_timecode=True,
             resolve_media=_resolver(self.media_map),
         )
+        self.primary = f"V{track_of_lane(0)}"
         self._index_sources()
         self._collect()
         self._match_media()
         self._check_matched()
-        self.primary = f"V{track_of_lane(0)}"
         self._find_outro()
         self._match_segments()
         segments = self._segments()
@@ -371,13 +584,28 @@ class _Importer:
         draft = self.plan.model_copy(
             update={"segments": segments, "transitions": transitions, "outro": outro}
         )
-        titles, captions, markers = self._timed(draft)
-        edited = EditPlan.model_validate(
-            draft.model_copy(
-                update={"titles": titles, "captions": captions, "markers": markers}
-            ).model_dump()
-        )
-        self._other_tracks()
+        at = self._content_map(draft)
+        titles = self._titles(draft, at)
+        captions, markers = self._reanchored(draft, at)
+        try:
+            edited = EditPlan.model_validate(
+                draft.model_copy(
+                    update={"titles": titles, "captions": captions, "markers": markers}
+                ).model_dump()
+            )
+        except ValidationError as exc:
+            raise TimelineImportError(
+                "invalid_edited_plan",
+                f"the timeline gives a plan the plan model refuses: {exc.error_count()} "
+                "problem(s), the first at "
+                + ".".join(str(p) for p in exc.errors()[0]["loc"])
+                + f": {exc.errors()[0]['msg']}",
+                "check the timeline in Resolve at the place named; report it if it looks right",
+                problems=[
+                    f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()[:20]
+                ],
+            ) from None
+        self._leftovers()
         self._transition_items(edited)
         self._audio(edited)
         return edited, self._diff(edited, outro_diff)
@@ -396,20 +624,25 @@ class _Importer:
             )
 
     def _index_sources(self) -> None:
+        """Each source's edit-PC path when the export rules place it; the file names of known
+        paths (a same-name item elsewhere is foreign) and of unplaced sources (matched by name
+        when the name names one file)."""
         resolve = _resolver(self.media_map)
         self.refs = {s.id: self.layout.media.get(s.id) or resolve(s) for s in self.plan.sources}
         self.by_path: dict[str, list[str]] = {}
-        files_by_name: dict[str, set[str]] = {}
+        self.known_names: set[str] = set()
+        unplaced_files: dict[str, set[str]] = {}
         self.by_name: dict[str, list[str]] = {}
         for source in self.plan.sources:
             ref = self.refs[source.id]
+            name = ref.name.casefold()
             if ref.windows_path:
                 self.by_path.setdefault(media_key(ref.windows_path), []).append(source.id)
-            name = ref.name.casefold()
-            ident = media_key(ref.windows_path) if ref.windows_path else source.media
-            files_by_name.setdefault(name, set()).add(ident)
-            self.by_name.setdefault(name, []).append(source.id)
-        self.unique_names = {n for n, files in files_by_name.items() if len(files) == 1}
+                self.known_names.add(name)
+            else:
+                unplaced_files.setdefault(name, set()).add(source.media)
+                self.by_name.setdefault(name, []).append(source.id)
+        self.unique_names = {n for n, files in unplaced_files.items() if len(files) == 1}
 
     def _collect(self) -> None:
         start = self.timeline.start_frame
@@ -428,62 +661,84 @@ class _Importer:
                 counters[label] = counters.get(label, 0) + 1
                 entry = _Item(label, counters[label], item.kind, item)
                 self.items.append(entry)
-                if item.record_start is None or item.duration is None:
-                    entry.excluded = True
-                    self.carry_not(
-                        "unreadable_item",
-                        "the item's start or duration could not be read",
-                        {"track": label, "kind": item.kind, "name": item.name},
-                    )
-                    continue
-                entry.record_in = item.record_start - start
-                entry.record_out = entry.record_in + item.duration
-                if item.kind == "transition":
-                    continue
-                src_in = source_frame(item)
+                self._classify(entry, start)
+
+    def _classify(self, entry: _Item, start: int) -> None:
+        """Set the item's plan frames, or exclude it with a reason code."""
+        item = entry.item
+        if item.record_start is None or item.duration is None:
+            entry.excluded = True
+            self.carry_not(
+                "unreadable_item",
+                "the item's start or duration could not be read",
+                {"track": entry.track, "kind": item.kind, "name": item.name},
+            )
+            return
+        entry.record_in = item.record_start - start
+        entry.record_out = entry.record_in + item.duration
+        reason: tuple[str, str] | None = None
+        if entry.record_in < 0:
+            reason = (
+                "outside_timeline",
+                f"the item starts {-entry.record_in} frame(s) before the timeline's start; a "
+                "plan's record frames start at 0",
+            )
+        elif item.duration <= 0:
+            reason = ("zero_length", "the item has no length")
+        if reason is None and item.kind != "transition":
+            src_in = source_frame(item)
+            clip = self.media.get(item.media_clip_id or "")
+            if item.fractions:
+                fields = ", ".join(sorted(item.fractions))
+                reason = (
+                    "sub_frame",
+                    f"the item sits at a sub-frame position ({fields}); a plan holds whole frames",
+                )
+            elif item.media_path and is_still(item, clip):
+                reason = (
+                    "still_image",
+                    "the item shows a still image; its source in point is not counted from the "
+                    "file's first frame, so it cannot be read as a plan range",
+                )
+            elif item.timemap_form == "retimed" or (item.speed is not None and item.speed != 1.0):
+                reason = (
+                    "retimed",
+                    f"the item is retimed (speed {item.speed!r}); a plan plays sources at 100 %",
+                )
+            elif src_in is None and item.media_path:
+                reason = ("unreadable_item", "the item's source in point could not be read")
+            elif src_in is not None and src_in < 0:
+                reason = (
+                    "negative_source_in",
+                    f"the item's source in point is {src_in}, before the file's first frame",
+                )
+            else:
                 entry.src_in = src_in
                 entry.src_out = src_in + item.duration if src_in is not None else None
-                if item.fractions:
-                    entry.excluded = True
-                    fields = ", ".join(sorted(item.fractions))
-                    self.carry_not(
-                        "sub_frame",
-                        f"the item sits at a sub-frame position ({fields}); a plan holds whole "
-                        "frames",
-                        entry.where(),
-                    )
-                elif item.timemap_form == "retimed" or (
-                    item.speed is not None and item.speed != 1.0
-                ):
-                    entry.excluded = True
-                    self.carry_not(
-                        "retimed",
-                        f"the item is retimed (speed {item.speed!r}); a plan plays sources at "
-                        "100 %",
-                        entry.where(),
-                    )
-                elif src_in is None and item.media_path:
-                    entry.excluded = True
-                    self.carry_not(
-                        "unreadable_item",
-                        "the item's source in point could not be read",
-                        entry.where(),
-                    )
+        if reason is not None:
+            entry.excluded = True
+            self.carry_not(reason[0], reason[1], entry.where())
 
     def _match_media(self) -> None:
         for entry in self.items:
             path = entry.item.media_path
-            if entry.kind == "transition" or not path:
+            if entry.kind == "transition" or not path or entry.excluded:
                 continue
             entry.key = media_key(path)
             ids = self.by_path.get(entry.key)
             if ids:
                 entry.match = "path"
             else:
-                name = re.split(r"[\\/]", path)[-1].casefold()
-                if name in self.unique_names:
+                name = file_name(path)
+                if name in self.known_names:
+                    entry.foreign = "same_name_different_file"
+                elif name in self.unique_names:
                     ids = self.by_name[name]
                     entry.match = "file-name"
+                elif name in self.by_name:
+                    entry.foreign = "ambiguous_file_name"
+                else:
+                    entry.foreign = "unknown_file"
             if ids:
                 entry.source = self._pick(ids, entry)
 
@@ -535,127 +790,115 @@ class _Importer:
                     source=entry.source,
                 )
 
-    def _picture(self, track: str) -> list[_Item]:
-        return [
-            e
-            for e in self.items
-            if e.track == track and not e.excluded and e.kind not in ("transition", "audio")
-        ]
+    def _pictures(self, track: str) -> list[_Item]:
+        return [e for e in self.items if e.track == track and not e.excluded and e.is_picture]
 
     def _find_outro(self) -> None:
+        """Assumption: the outro is the last item of the outro's source on the outro's track."""
         self.outro_item: _Item | None = None
         outro = self.plan.outro
         if outro is None:
             return
         track = f"V{track_of_lane(self.layout.lanes[outro.track])}"
-        found = [e for e in self._picture(track) if e.source == outro.source]
+        found = [e for e in self._pictures(track) if e.source == outro.source]
         if found:
             self.outro_item = found[-1]
+            self.outro_item.used = True
 
     def _match_segments(self) -> None:
-        """Assign each V1 picture item to an original V1 segment: an exact range at its expected
-        position, then an exact range anywhere, then the largest overlap (preferring segments not
-        yet matched exactly). An item that matches nothing of its source is added."""
-        self.originals = [i for i, s in enumerate(self.plan.segments) if s.track == 1]
+        """Assign the picture items of each content track (one with a planned segment) to that
+        track's original segments (:func:`assign_items`). Items with a file the plan does not
+        know are foreign; known media on a track the plan has no segments on is not carried."""
+        segs = self.plan.segments
         clips = {c.location: c for c in self.layout.clips}
         self.old_range = {
             i: (clips[f"segments[{i}]"].record_in, clips[f"segments[{i}]"].record_out)
-            for i in range(len(self.plan.segments))
+            for i in range(len(segs))
         }
-        self.content: list[_Item] = []
-        for entry in self._picture(self.primary):
-            if entry is self.outro_item:
-                continue
-            if entry.source is None:
-                self.foreign.append(entry.where())
-                continue
-            self.content.append(entry)
-        self.assigned: dict[int, int] = {}  # content position -> original segment index
-        exact: set[int] = set()
-        segs = self.plan.segments
-
-        by_range: dict[tuple[str, int, int], list[int]] = {}
-        by_source: dict[str, list[int]] = {}
-        for i in self.originals:
-            by_range.setdefault((segs[i].source, segs[i].src_in, segs[i].src_out), []).append(i)
-            by_source.setdefault(segs[i].source, []).append(i)
-        for at_position in (True, False):
-            for pos, entry in enumerate(self.content):
-                if pos in self.assigned:
+        #: video track label -> plan track number, for the tracks that hold planned segments
+        self.plan_track = {f"V{track_of_lane(self.layout.lanes[s.track])}": s.track for s in segs}
+        self.content: dict[str, list[_Item]] = {}
+        self.assigned: dict[str, dict[int, int]] = {}
+        self.alternatives: dict[int, list[int]] = {}  # id(_Item) -> other originals it overlaps
+        labels = sorted(
+            {e.track for e in self.items if e.is_video}, key=lambda t: (t != self.primary, t)
+        )
+        for label in labels:
+            content: list[_Item] = []
+            for entry in self._pictures(label):
+                if entry.used or entry.is_title:
                     continue
-                assert entry.source is not None and entry.src_in is not None
-                assert entry.src_out is not None
-                for i in by_range.get((entry.source, entry.src_in, entry.src_out), []):
-                    if i in exact:
-                        continue
-                    if at_position and self.old_range[i][0] != entry.record_in:
-                        continue
-                    self.assigned[pos] = i
-                    exact.add(i)
-                    break
-        for pos, entry in enumerate(self.content):
-            if pos in self.assigned:
+                if entry.source is None:
+                    entry.used = True
+                    self.foreign.append({**entry.where(), "reason": entry.foreign})
+                elif label in self.plan_track:
+                    entry.used = True
+                    content.append(entry)
+            if label not in self.plan_track:
                 continue
-            assert entry.src_in is not None and entry.src_out is not None
-            best: tuple[int, int, int] | None = None  # (not exact, overlap, -index)
-            for i in by_source.get(entry.source or "", []):
-                s = segs[i]
-                overlap = min(s.src_out, entry.src_out) - max(s.src_in, entry.src_in)
-                if overlap <= 0:
-                    continue
-                rank = (i not in exact, overlap, -i)
-                if best is None or rank > best:
-                    best = rank
-            if best is not None and best[0]:
-                self.assigned[pos] = -best[2]
+            track = self.plan_track[label]
+            originals = [
+                (i, s.source, s.src_in, s.src_out, self.old_range[i][0])
+                for i, s in enumerate(segs)
+                if s.track == track
+            ]
+            items = []
+            for e in content:
+                assert e.source is not None and e.src_in is not None and e.src_out is not None
+                items.append((e.source, e.src_in, e.src_out, e.record_in))
+            self.content[label] = content
+            self.assigned[label], alternatives = assign_items(items, originals)
+            for pos, others in alternatives.items():
+                self.alternatives[id(content[pos])] = others
 
     def _segments(self) -> list[Segment]:
-        """The edited segment list: V1 items in record order, each inheriting from its original,
-        with the off-V1 originals kept after the V1 segment they followed in the plan."""
+        """The edited segment list: V1 items in record order, each inheriting from its original;
+        a segment on another track follows the V1 segment its original followed in the plan (an
+        added one, the last V1 segment starting at or before it). Positions from the timeline."""
         segs = self.plan.segments
         self.pieces: dict[int, list[int]] = {}  # original index -> new indexes, record order
         self.content_index: dict[int, int] = {}  # id(_Item) -> new index
-        anchored: dict[int | None, list[int]] = {}
-        anchor: int | None = None
+        primary = self.content.get(self.primary, [])
+        v1_assigned = self.assigned.get(self.primary, {})
+        last_piece: dict[int, int] = {}
+        for pos in range(len(primary)):
+            if pos in v1_assigned:
+                last_piece[v1_assigned[pos]] = pos
+        # the V1 original each off-V1 original followed in the plan, then its nearest survivor
+        anchor_of: dict[int, int | None] = {}
+        survivor: int | None = None
         for i, seg in enumerate(segs):
             if seg.track == 1:
-                anchor = i
-            else:
-                anchored.setdefault(anchor, []).append(i)
-        last_piece: dict[int, int] = {}
-        for pos, _ in enumerate(self.content):
-            if pos in self.assigned:
-                last_piece[self.assigned[pos]] = pos
-        # an off-V1 segment whose anchor left the timeline follows the nearest earlier survivor
-        survivors: dict[int | None, int | None] = {None: None}
-        alive: int | None = None
-        for i in self.originals:
-            if i in last_piece:
-                alive = i
-            survivors[i] = alive
-        after_pos: dict[int | None, list[int]] = {}
-        for key, ids in anchored.items():
-            target = survivors.get(key)
-            pos_key = last_piece[target] if target is not None else None
-            after_pos.setdefault(pos_key, []).extend(ids)
+                if i in last_piece:
+                    survivor = i
+                continue
+            anchor_of[i] = survivor
+        slots: dict[int | None, list[tuple[tuple[int, int, int], _Item, int | None, int]]] = {}
+        for label, content in self.content.items():
+            if label == self.primary:
+                continue
+            assigned = self.assigned[label]
+            for pos, entry in enumerate(content):
+                original = assigned.get(pos)
+                if original is not None:
+                    anchor = anchor_of.get(original)
+                    slot = last_piece[anchor] if anchor is not None else None
+                    order = (0, original, entry.record_in)
+                else:
+                    before = [p for p, e in enumerate(primary) if e.record_in <= entry.record_in]
+                    slot = before[-1] if before else None
+                    order = (1, entry.record_in, self.plan_track[label])
+                slots.setdefault(slot, []).append((order, entry, original, self.plan_track[label]))
 
         out: list[Segment] = []
         desired: list[int] = []
 
-        def keep_off_v1(ids: Iterable[int]) -> None:
-            for i in sorted(ids):
-                out.append(segs[i])
-                desired.append(self.old_range[i][0])
-                self.pieces.setdefault(i, []).append(len(out) - 1)
-
-        keep_off_v1(after_pos.get(None, []))
-        for pos, entry in enumerate(self.content):
+        def emit(entry: _Item, original: int | None, track: int) -> None:
             assert entry.source is not None and entry.src_in is not None
             assert entry.src_out is not None
-            original = self.assigned.get(pos)
             if original is None:
                 seg = Segment(
-                    track=1, source=entry.source, src_in=entry.src_in, src_out=entry.src_out
+                    track=track, source=entry.source, src_in=entry.src_in, src_out=entry.src_out
                 )
             else:
                 base = segs[original]
@@ -669,15 +912,26 @@ class _Importer:
             self.content_index[id(entry)] = len(out)
             out.append(seg)
             desired.append(entry.record_in)
-            keep_off_v1(after_pos.get(pos, []))
+
+        def emit_slot(slot: int | None) -> None:
+            for _, entry, original, track in sorted(slots.get(slot, []), key=lambda t: t[0]):
+                emit(entry, original, track)
+
+        emit_slot(None)
+        for pos, entry in enumerate(primary):
+            emit(entry, v1_assigned.get(pos), 1)
+            emit_slot(pos)
+        for original in self.pieces:
+            self.pieces[original].sort(key=lambda k: (desired[k], k))
         return _place(out, desired)
 
     def _transitions(self, segments: list[Segment]) -> list[Any]:
         """Plan transitions whose join survives, re-indexed; the others are dropped."""
         old_joins = dict(self.plan.joins())
         kept = []
-        new_joins = set(_joins(segments))
-        ranges = _ranges(segments)
+        draft = _with_segments(self.plan, segments)
+        new_joins = set(draft.joins())
+        ranges = draft.record_ranges()
         for number, tx in enumerate(self.plan.transitions):
             nxt = old_joins.get(tx.after)
             outgoing = self.pieces.get(tx.after, [])
@@ -701,7 +955,7 @@ class _Importer:
             return None, None
         source = self.plan.source_map()[outro.source]
         old_out = outro.src_out if outro.src_out is not None else source.duration
-        content_end = max((end for _, end in _ranges(segments)), default=0)
+        content_end = _with_segments(self.plan, segments).content_frames()
         old_start = self.plan.content_frames()
         diff: dict[str, Any] = {
             "status": "unchanged",
@@ -750,119 +1004,242 @@ class _Importer:
         diff["status"] = "trimmed"
         return outro.model_copy(update={"src_in": entry.src_in, "src_out": src_out}), diff
 
-    def _timed(self, draft: EditPlan) -> tuple[list[Any], list[Any], list[Any]]:
-        total = draft.total_frames()
-        titles, captions, markers = [], [], []
-        for kind, items, out, code in (
-            ("titles", self.plan.titles, titles, "title_past_end"),
-            ("captions", self.plan.captions, captions, "caption_past_end"),
-        ):
-            for index, entry in enumerate(items):
-                if entry.record_out <= total:
-                    out.append(entry)
-                else:
-                    self.drop(
-                        code,
-                        f"{kind}[{index}]",
-                        f"ends at frame {entry.record_out}, past the new end ({total})",
-                    )
-        for index, marker in enumerate(self.plan.markers):
-            if marker.record + marker.duration <= total:
-                markers.append(marker)
-            else:
-                self.drop(
-                    "marker_past_end",
-                    f"markers[{index}]",
-                    f"ends at frame {marker.record + marker.duration}, past the new end ({total})",
-                )
-        return titles, captions, markers
+    # -- timing off the segments ---------------------------------------------------------------
 
-    def _other_tracks(self) -> None:
-        """Off V1 the plan keeps its own version: an item there must be one the layout predicts
-        (a clip with the same source and ranges, or a title at the same range)."""
-        expected: list[tuple[str, str, int, int, str | None, int | None, int | None]] = []
-        for clip in self.layout.clips:
-            if clip.lane == 0 or clip.location == "outro":
+    def _content_map(self, draft: EditPlan) -> Callable[[int], int | None]:
+        """Old record frame -> new record frame of the same source frame of the same V1 segment
+        (or of the outro), or None when that frame is not in the edited timeline."""
+        segs = self.plan.segments
+        ranges = draft.record_ranges()
+        groups = self._join_groups()
+        spans: list[tuple[int, int, int, list[tuple[int, int, int]]]] = []
+        for i, seg in enumerate(segs):
+            if seg.track != 1:
                 continue
-            index = int(clip.location[len("segments[") : -1])
-            seg = self.plan.segments[index]
-            expected.append(
+            old_in, old_out = self.old_range[i]
+            pieces = [
+                (draft.segments[k].src_in, draft.segments[k].src_out, ranges[k][0])
+                for j in groups.get(i, [i])
+                for k in self.pieces.get(j, [])
+            ]
+            spans.append((old_in, old_out, seg.src_in, pieces))
+        old_outro, new_outro = self.plan.outro_range(), draft.outro_range()
+        if old_outro is not None and new_outro is not None:
+            assert self.plan.outro is not None and draft.outro is not None
+            new_src_in = draft.outro.src_in
+            pieces = [(new_src_in, new_src_in + new_outro[1] - new_outro[0], new_outro[0])]
+            spans.append((old_outro[0], old_outro[1], self.plan.outro.src_in, pieces))
+
+        def at(frame: int) -> int | None:
+            for old_in, old_out, src_in, pieces in spans:
+                if old_in <= frame < old_out:
+                    source = src_in + frame - old_in
+                    for a, b, record in pieces:
+                        if a <= source < b:
+                            return record + source - a
+                    return None
+            return None
+
+        return at
+
+    def _follow(
+        self, at: Callable[[int], int | None], record_in: int, record_out: int
+    ) -> tuple[int, int] | None:
+        """A span re-anchored to its content: its first and last frames both survive, the same
+        distance apart."""
+        first, last = at(record_in), at(record_out - 1)
+        if first is None or last is None or last - first != record_out - 1 - record_in:
+            return None
+        return first, last + 1
+
+    def _titles(self, draft: EditPlan, at: Callable[[int], int | None]) -> list[Any]:
+        """Titles are items: each plan title takes the record range of its title item (an exact
+        match on its track, then its range re-anchored to its content, then, per track, the
+        remaining titles in record order when as many items remain). A title with no item was
+        removed in Resolve."""
+        candidates = [e for e in self.items if e.is_title and not e.excluded and not e.used]
+        expected: list[tuple[str, str, int, int]] = []
+        for spec in self.layout.titles:
+            label = f"V{track_of_lane(spec.lane)}"
+            expected.append((spec.location, label, spec.record_in, spec.record_out))
+        found: dict[str, _Item] = {}
+
+        def take(location: str, entry: _Item) -> None:
+            found[location] = entry
+            entry.used = True
+
+        for location, label, rin, rout in expected:
+            hit = next(
                 (
-                    clip.location,
-                    f"V{track_of_lane(clip.lane)}",
-                    clip.record_in,
-                    clip.record_out,
-                    seg.source,
-                    clip.src_in,
-                    clip.src_out,
-                )
+                    e
+                    for e in candidates
+                    if not e.used and (e.track, e.record_in, e.record_out) == (label, rin, rout)
+                ),
+                None,
             )
-        for title in self.layout.titles:
-            expected.append(
+            if hit is not None:
+                take(location, hit)
+        for location, label, rin, rout in expected:
+            if location in found:
+                continue
+            if location == "outro.sting":
+                new_range = self._sting_range(draft)
+            else:
+                new_range = self._follow(at, rin, rout)
+            if new_range is None:
+                continue
+            hit = next(
                 (
-                    title.location,
-                    f"V{track_of_lane(title.lane)}",
-                    title.record_in,
-                    title.record_out,
-                    None,
-                    None,
-                    None,
-                )
+                    e
+                    for e in candidates
+                    if not e.used and (e.track, e.record_in, e.record_out) == (label, *new_range)
+                ),
+                None,
             )
-        slots: dict[tuple[str, int, int], list[int]] = {}
-        for n, (_, track, rin, rout, _, _, _) in enumerate(expected):
-            slots.setdefault((track, rin, rout), []).append(n)
-        found: set[int] = set()
-        self.off_v1_changed: set[int] = set()
-        for entry in self.items:
+            if hit is not None:
+                take(location, hit)
+        for label in sorted({e[1] for e in expected}):
+            missing = [e for e in expected if e[1] == label and e[0] not in found]
+            left = [e for e in candidates if e.track == label and not e.used]
+            if missing and len(missing) == len(left):
+                for (location, *_), entry in zip(
+                    sorted(missing, key=lambda e: (e[2], e[0])), left, strict=True
+                ):
+                    take(location, entry)
+        total = draft.total_frames()
+        titles = []
+        for index, title in enumerate(self.plan.titles):
+            location = f"titles[{index}]"
+            entry = found.get(location)
+            if entry is None:
+                self.drop(
+                    "title_removed",
+                    location,
+                    f"no title item on its track for {title.record_in}..{title.record_out}; "
+                    "removed in Resolve",
+                )
+                continue
+            if entry.record_out > total:
+                self.drop(
+                    "title_past_end",
+                    location,
+                    f"its item ends at frame {entry.record_out}, past the new end ({total})",
+                )
+                continue
+            new = (entry.record_in, entry.record_out)
+            self.moved(location, "timeline", (title.record_in, title.record_out), new)
+            titles.append(title.model_copy(update={"record_in": new[0], "record_out": new[1]}))
+        if "outro.sting" in [e[0] for e in expected]:
+            entry = found.get("outro.sting")
+            want = self._sting_range(draft)
+            if entry is None or (entry.record_in, entry.record_out) != want:
+                self.carry_not(
+                    "sting_missing",
+                    "no title item where the edited plan puts the outro's sting; the plan keeps "
+                    "its sting",
+                    {"location": "outro.sting"},
+                )
+        return titles
+
+    @staticmethod
+    def _sting_range(plan: EditPlan) -> tuple[int, int] | None:
+        if plan.outro is None or plan.outro.sting is None:
+            return None
+        start = plan.content_frames() + plan.outro.sting.start
+        return start, start + plan.outro.sting.frames
+
+    def _reanchored(
+        self, draft: EditPlan, at: Callable[[int], int | None]
+    ) -> tuple[list[Any], list[Any]]:
+        """Captions and markers are never timeline items: each moves with the content it sat
+        over, and is dropped when that content is gone."""
+        total = draft.total_frames()
+        captions = []
+        for index, caption in enumerate(self.plan.captions):
+            location = f"captions[{index}]"
+            new = self._follow(at, caption.record_in, caption.record_out)
+            if new is None:
+                self.drop(
+                    "caption_content_gone",
+                    location,
+                    f"the content under {caption.record_in}..{caption.record_out} is not in the "
+                    "edited timeline as one piece",
+                )
+            elif new[1] > total:
+                self.drop("caption_past_end", location, f"ends past the new end ({total})")
+            else:
+                self.moved(location, "content", (caption.record_in, caption.record_out), new)
+                captions.append(
+                    caption.model_copy(update={"record_in": new[0], "record_out": new[1]})
+                )
+        markers = []
+        for index, marker in enumerate(self.plan.markers):
+            location = f"markers[{index}]"
+            old = (marker.record, marker.record + marker.duration)
+            new = self._follow(at, *old)
+            if new is None:
+                self.drop(
+                    "marker_content_gone",
+                    location,
+                    f"the content under {old[0]}..{old[1]} is not in the edited timeline as one "
+                    "piece",
+                )
+            elif new[1] > total:
+                self.drop("marker_past_end", location, f"ends past the new end ({total})")
+            else:
+                self.moved(location, "content", old, new)
+                markers.append(marker.model_copy(update={"record": new[0]}))
+        return captions, markers
+
+    def _join_groups(self) -> dict[int, list[int]]:
+        """Neighbouring originals the owner joined into one item: each member -> the group.
+        Two plan neighbours on one track, contiguous in source and record, where one has no
+        piece and a piece of the other runs across their common source frame."""
+        segs = self.plan.segments
+        piece_src = self._piece_src
+        group_of: dict[int, list[int]] = {}
+        for a, b in self.plan.joins():
+            sa, sb = segs[a], segs[b]
             if (
-                not entry.is_video
-                or entry.track == self.primary
-                or entry.excluded
-                or entry.kind == "transition"
-                or entry is self.outro_item
+                sa.source != sb.source
+                or sa.src_out != sb.src_in
+                or self.old_range[a][1] != self.old_range[b][0]
             ):
                 continue
-            hit = None
-            for n in slots.get((entry.track, entry.record_in, entry.record_out), []):
-                source, sin, sout = expected[n][4:]
-                if n in found:
-                    continue
-                if (
-                    source is None
-                    and entry.item.media_path is not None
-                    and entry.source is not None
-                ):
-                    continue
-                if source is not None and (source, sin, sout) != (
-                    entry.source,
-                    entry.src_in,
-                    entry.src_out,
-                ):
-                    continue
-                hit = n
-                break
-            if hit is not None:
-                found.add(hit)
-            elif entry.item.media_path and entry.source is None:
-                self.foreign.append(entry.where())
+            ga, gb = group_of.get(a, [a]), group_of.get(b, [b])
+            pieces_a = [k for i in ga for k in self.pieces.get(i, [])]
+            pieces_b = [k for i in gb for k in self.pieces.get(i, [])]
+            if bool(pieces_a) == bool(pieces_b):
+                continue
+            boundary = sb.src_in
+            ranges = [piece_src[k] for k in pieces_a + pieces_b]
+            if any(lo < boundary < hi for lo, hi in ranges):
+                merged = ga + [i for i in gb if i not in ga]
+                for i in merged:
+                    group_of[i] = merged
+        return group_of
+
+    # -- what remains in the timeline -----------------------------------------------------------
+
+    def _leftovers(self) -> None:
+        """Picture items nothing above took: known media on a track the plan has no segments on,
+        and titles or generators the plan has no title for."""
+        for entry in self.items:
+            if entry.excluded or entry.used or not entry.is_picture:
+                continue
+            if entry.is_title:
+                self.carry_not(
+                    "title_added",
+                    "a title, generator or solid the plan has no title for (its text is not read)",
+                    entry.where(),
+                )
             else:
                 self.carry_not(
                     "other_picture_track",
-                    f"an item on {entry.track} that the plan does not have there; changes off "
-                    f"{self.primary} are not carried",
+                    f"an item on {entry.track}, a track the plan has no segments on; a plan "
+                    "cannot place it",
                     entry.where(),
                 )
-        for n, (location, track, rin, rout, _, _, _) in enumerate(expected):
-            if n in found:
-                continue
-            if location.startswith("segments["):
-                self.off_v1_changed.add(int(location[len("segments[") : -1]))
-            self.carry_not(
-                "other_picture_track",
-                f"{location} is not on {track} at {rin}..{rout} as planned; the plan keeps it",
-                {"track": track, "record_in": rin, "record_out": rout, "location": location},
-            )
 
     def _transition_items(self, plan: EditPlan) -> None:
         ranges = plan.record_ranges()
@@ -986,6 +1363,13 @@ class _Importer:
     def _diff(self, edited: EditPlan, outro: dict[str, Any] | None) -> dict[str, Any]:
         new_ranges = edited.record_ranges()
         segs = self.plan.segments
+        match_of = {self.content_index[id(e)]: e.match for c in self.content.values() for e in c}
+        also_of = {
+            self.content_index[i]: others
+            for i, others in self.alternatives.items()
+            if i in self.content_index
+        }
+        groups = self._join_groups()
         rows: list[dict[str, Any]] = []
         for i, seg in enumerate(segs):
             old_in, old_out = self.old_range[i]
@@ -1007,15 +1391,25 @@ class _Importer:
                         "src_out": edited.segments[k].src_out,
                         "record_in": new_ranges[k][0],
                         "record_out": new_ranges[k][1],
+                        "match": match_of.get(k),
+                        "also_overlaps": also_of.get(k, []),
                     }
                     for k in self.pieces.get(i, [])
                 ],
                 "head_frames": None,
                 "tail_frames": None,
+                "joined": None,
             }
             new = row["new"]
-            if seg.track != 1:
-                row["status"] = "kept_off_primary" if i in self.off_v1_changed else "unchanged"
+            group = groups.get(i)
+            if group is not None:
+                keeper = next(j for j in group if self.pieces.get(j))
+                row["joined"] = {"segments": group, "fields_from": keeper}
+            if group is not None and (not new or len(new) == 1):
+                row["status"] = "joined"
+                if new:
+                    row["head_frames"] = new[0]["src_in"] - segs[group[0]].src_in
+                    row["tail_frames"] = segs[group[-1]].src_out - new[0]["src_out"]
             elif not new:
                 row["status"] = "removed"
             elif len(new) > 1:
@@ -1030,21 +1424,38 @@ class _Importer:
                 row["status"] = "unchanged"
             rows.append(row)
         added = []
-        for pos, entry in enumerate(self.content):
-            if pos in self.assigned:
-                continue
-            k = self.content_index[id(entry)]
-            added.append(
-                {
-                    "index": k,
-                    "source": entry.source,
-                    "match": entry.match,
-                    "src_in": entry.src_in,
-                    "src_out": entry.src_out,
-                    "record_in": new_ranges[k][0],
-                    "record_out": new_ranges[k][1],
-                }
-            )
+        for label, content in self.content.items():
+            for pos, entry in enumerate(content):
+                if pos in self.assigned[label]:
+                    continue
+                k = self.content_index[id(entry)]
+                added.append(
+                    {
+                        "index": k,
+                        "track": edited.segments[k].track,
+                        "source": entry.source,
+                        "match": entry.match,
+                        "src_in": entry.src_in,
+                        "src_out": entry.src_out,
+                        "record_in": new_ranges[k][0],
+                        "record_out": new_ranges[k][1],
+                    }
+                )
+        added.sort(key=lambda a: a["index"])
+        uncertain = sorted(
+            (
+                {"index": k, "assigned_to": i, "also_overlaps": also_of[k]}
+                for i, ks in self.pieces.items()
+                for k in ks
+                if also_of.get(k)
+            ),
+            key=lambda u: u["index"],
+        )
+        by_name = [
+            {**e.where(), "source": e.source}
+            for e in self.items
+            if e.match == "file-name" and e.source is not None
+        ]
         matches = sorted(
             {e.match for e in self.items if e.source is not None and e.match is not None}
         )
@@ -1054,6 +1465,7 @@ class _Importer:
             and not self.foreign
             and not self.not_carried
             and not self.dropped
+            and not self.repositioned
             and (outro is None or outro["status"] == "unchanged")
         )
         tl = self.timeline
@@ -1068,9 +1480,12 @@ class _Importer:
             },
             "primary_track": self.primary,
             "media_matched_by": matches,
+            "matched_by_file_name": by_name,
             "segments": rows,
+            "uncertain_matches": uncertain,
             "added": added,
             "outro": outro,
+            "repositioned": self.repositioned,
             "foreign": self.foreign,
             "not_carried": self.not_carried,
             "dropped": self.dropped,
@@ -1078,25 +1493,15 @@ class _Importer:
             "assumptions": [dict(a) for a in ASSUMPTIONS],
         }
 
-
-def _joins(segments: list[Segment]) -> list[tuple[int, int]]:
-    last: dict[int, int] = {}
-    pairs = []
-    for index, seg in enumerate(segments):
-        if seg.track in last:
-            pairs.append((last[seg.track], index))
-        last[seg.track] = index
-    return pairs
-
-
-def _ranges(segments: list[Segment]) -> list[tuple[int, int]]:
-    cursor: dict[int, int] = {}
-    out = []
-    for seg in segments:
-        start = seg.record_in if seg.record_in is not None else cursor.get(seg.track, 0)
-        cursor[seg.track] = start + seg.length
-        out.append((start, start + seg.length))
-    return out
+    @property
+    def _piece_src(self) -> dict[int, tuple[int, int]]:
+        """New segment index -> its source range (from the matched items)."""
+        out: dict[int, tuple[int, int]] = {}
+        for content in self.content.values():
+            for entry in content:
+                assert entry.src_in is not None and entry.src_out is not None
+                out[self.content_index[id(entry)]] = (entry.src_in, entry.src_out)
+        return out
 
 
 def _place(segments: list[Segment], desired: list[int]) -> list[Segment]:
@@ -1116,6 +1521,24 @@ def _place(segments: list[Segment], desired: list[int]) -> list[Segment]:
     return out
 
 
+def export_check(plan: EditPlan, media_map: MediaMap | None) -> dict[str, Any]:
+    """The export's layout step on ``plan``, with the options the import laid out the original
+    with: ``{"ok": True, "error": None}`` or the export's refusal."""
+    try:
+        build_layout(
+            plan,
+            media_map=media_map,
+            allow_unknown_timecode=True,
+            resolve_media=_resolver(media_map),
+        )
+    except ExportError as exc:
+        return {
+            "ok": False,
+            "error": {"code": exc.code, "message": exc.message, "fix_hint": exc.fix_hint},
+        }
+    return {"ok": True, "error": None}
+
+
 def import_timeline(
     plan: EditPlan,
     timeline: Timeline,
@@ -1123,14 +1546,24 @@ def import_timeline(
     *,
     media_map: MediaMap | None = None,
     profile: Profile | None = None,
+    reader_warnings: Sequence[Issue] = (),
 ) -> ImportResult:
     """The edited plan and the diff of ``timeline`` against ``plan``, or a typed refusal
     (:class:`TimelineImportError`, or the export's :class:`ExportError` when the plan itself
-    cannot be laid out). With ``profile`` the edited plan is linted; lint errors do not stop the
-    import (the owner's edit stands), they set ``lint_errors`` in the diff."""
+    cannot be laid out). With ``profile`` the edited plan is linted. Lint errors and an export
+    layout refusal of the edited plan do not stop the import (the owner's edit stands); they set
+    ``lint_errors`` / ``export_errors`` in the diff."""
     importer = _Importer(plan, timeline, media, media_map)
     edited, diff = importer.run()
     report = lint(edited, profile) if profile is not None else None
     diff["lint"] = report.model_dump(mode="json") if report is not None else None
     diff["lint_errors"] = report is not None and not report.ok
+    check = export_check(edited, media_map)
+    diff["export_check"] = check
+    diff["export_errors"] = not check["ok"]
+    listed = [
+        {"severity": i.severity, "code": i.code, "message": i.message}
+        for i in list(reader_warnings)[:MAX_LISTED_ISSUES]
+    ]
+    diff["reader_warnings"] = {"count": len(reader_warnings), "listed": listed}
     return ImportResult(edited, diff, report)

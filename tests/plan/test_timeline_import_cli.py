@@ -163,7 +163,7 @@ def test_an_unreadable_file_is_refused(tmp_path: Path, capsys: pytest.CaptureFix
     assert code == 2 and "refused (unreadable_timeline)" in err
     code, _, err = call(tmp_path, capsys, tmp_path / "missing.drt", plan)
     assert code == 2 and "refused (unreadable_timeline)" in err
-    empty = write_drt(tmp_path / "empty.drt", {"project.xml": drt_members(CLIPS)["project.xml"]})
+    empty = write_drt(tmp_path / "empty.drt", drt_members(CLIPS, timelines=()))
     code, _, err = call(tmp_path, capsys, empty, plan)
     assert code == 2 and "refused (no_timeline)" in err
 
@@ -226,3 +226,122 @@ def test_an_unreadable_plan_is_an_input_error(
     bad = write_plan(tmp_path / "bad.json", {"version": 2})
     code, _, err = call(tmp_path, capsys, drt, bad)
     assert code == 2 and "input failed validation" in err
+
+
+# -- fix round (validator H3, M1, M2, L3, L6) --------------------------------------------------
+
+
+def damaged(members: dict[str, str | bytes], how: str) -> dict[str, str | bytes]:
+    key = next(k for k in members if k.startswith("SeqContainer/"))
+    text = members[key]
+    assert isinstance(text, str)
+    if how == "missing":
+        return {k: v for k, v in members.items() if k != key}
+    if how == "cut_after_first_item":
+        return {**members, key: text[: text.index("</Element>") + len("</Element>")]}
+    return {**members, key: text[: len(text) // 2]}
+
+
+@pytest.mark.parametrize("how", ["missing", "cut_after_first_item", "half"])
+def test_a_damaged_timeline_is_refused_with_its_problems(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], how: str
+) -> None:
+    """Validator H3: a truncated or missing sequence container read as 'clips removed', exit 0."""
+    _, plan = setup(tmp_path)
+    drt = write_drt(tmp_path / "damaged.drt", damaged(drt_members(CLIPS), how))
+    code, out, err = call(tmp_path, capsys, drt, plan)
+    assert code == 2 and "refused (damaged_timeline)" in err
+    assert ("missing-container" if how == "missing" else "scan-truncated") in err
+    assert out == "" and not (tmp_path / "edited.plan.json").exists()
+    assert not (tmp_path / "edited.diff.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("clip", "code"),
+    [
+        (DrtClip("D:\\Show\\A.mov", 0, 100, -5), "negative_source_in"),
+        (DrtClip("D:\\Show\\A.mov", -10, 100, 10), "outside_timeline"),
+        (DrtClip("D:\\Show\\A.mov", 0, 0, 10), "zero_length"),
+    ],
+)
+def test_hostile_item_values_are_typed_not_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], clip: DrtClip, code: str
+) -> None:
+    """Validator M1: these gave a pydantic traceback and exit 1 with nothing written."""
+    drt, plan = setup(tmp_path, [clip, *CLIPS[1:]])
+    status, out, err = call(tmp_path, capsys, drt, plan)
+    assert (status, err) == (0, "")
+    assert f"not carried (1): {code} x1 (V1 x1)" in out
+    diff = json.loads((tmp_path / "edited.diff.json").read_text())
+    assert [e["code"] for e in diff["not_carried"]] == [code]
+    assert diff["segments"][0]["status"] == "removed"
+
+
+def test_an_edited_plan_the_export_refuses_exits_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Validator M2: a 3-frame first clip under a 6-frame head dissolve linted clean, exit 0."""
+    data = plan_for(CLIPS, head={"video": "dissolve", "video_frames": 6})
+    edited = [DrtClip("D:\\Show\\A.mov", 0, 3, 10), *CLIPS[1:]]
+    drt, plan = setup(tmp_path, edited, data)
+    code, out, _ = call(tmp_path, capsys, drt, plan)
+    assert code == 1
+    assert "lint: ok" in out and "export check: REFUSED (transitions_overlap)" in out
+    diff = json.loads((tmp_path / "edited.diff.json").read_text())
+    assert (diff["lint_errors"], diff["export_errors"]) == (False, True)
+    assert (tmp_path / "edited.plan.json").is_file()
+
+
+def test_a_missing_output_folder_is_refused_by_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    drt, plan = setup(tmp_path)
+    missing = tmp_path / "no" / "such"
+    code = main(
+        [
+            "plan",
+            "import-timeline",
+            str(drt),
+            "--plan",
+            str(plan),
+            "--out",
+            str(missing / "p.json"),
+            "--report",
+            str(tmp_path / "r.json"),
+        ]
+    )
+    err = capsys.readouterr().err
+    assert code == 2 and "refused (output_folder_missing)" in err and str(missing) in err
+    assert ".aar-lock" not in err and not (tmp_path / "r.json").exists()
+
+
+def test_too_many_items_is_refused_through_the_cli(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("aar.plan.timeline_import.MAX_ITEMS", len(CLIPS))
+    drt, plan = setup(tmp_path)
+    code, _, err = call(tmp_path, capsys, drt, plan)
+    assert (code, err) == (0, "")  # exactly the limit is read
+    (tmp_path / "edited.plan.json").unlink()
+    (tmp_path / "edited.diff.json").unlink()
+    one_more = [*CLIPS, DrtClip("D:\\Show\\B.mov", 225, 10, 400)]
+    drt = write_drt(tmp_path / "more.drt", drt_members(one_more))
+    code, _, err = call(tmp_path, capsys, drt, plan)
+    assert code == 2 and "refused (timeline_too_large)" in err
+    assert "has 4 items, over the 3 limit" in err
+
+
+def test_a_locked_output_is_refused(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from aar.node.jobs import file_lock
+    from aar.plan.export.files import lock_path
+
+    drt, plan = setup(tmp_path)
+    fd = file_lock.acquire_file_lock(str(lock_path(tmp_path / "edited.plan.json")))
+    try:
+        code, _, err = call(tmp_path, capsys, drt, plan)
+        assert code == 2 and "refused (output_locked)" in err
+        assert not (tmp_path / "edited.plan.json").exists()
+    finally:
+        file_lock.release_file_lock(fd)
+    code, _, _ = call(tmp_path, capsys, drt, plan)
+    assert code == 0

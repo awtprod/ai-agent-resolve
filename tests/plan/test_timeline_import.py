@@ -131,9 +131,12 @@ def test_the_diff_says_what_the_reader_cannot_see_and_what_is_assumed() -> None:
         "timeline",
         "primary_track",
         "media_matched_by",
+        "matched_by_file_name",
         "segments",
+        "uncertain_matches",
         "added",
         "outro",
+        "repositioned",
         "foreign",
         "not_carried",
         "dropped",
@@ -141,6 +144,9 @@ def test_the_diff_says_what_the_reader_cannot_see_and_what_is_assumed() -> None:
         "assumptions",
         "lint",
         "lint_errors",
+        "export_check",
+        "export_errors",
+        "reader_warnings",
     ]
 
 
@@ -213,9 +219,20 @@ def test_ripple_delete_removes_one_and_moves_the_rest() -> None:
     assert statuses(result) == ["unchanged", "removed", "moved", "moved"]
     assert result.diff["segments"][1]["new"] == []
     assert [s.source for s in result.plan.segments] == ["camA", "camA", "camB"]
-    # the title (500..590) and the marker (550) are still inside the shorter timeline
+    # the title item stays where it is in the timeline (500..590); the marker (550, over the
+    # third segment) moves with that segment's content, 200 frames earlier
     assert result.plan.total_frames() == 700
     assert result.diff["dropped"] == []
+    assert result.plan.titles == plan.titles
+    assert [m.record for m in result.plan.markers] == [350]
+    assert result.diff["repositioned"] == [
+        {
+            "location": "markers[0]",
+            "by": "content",
+            "old": {"record_in": 550, "record_out": 551},
+            "new": {"record_in": 350, "record_out": 351},
+        }
+    ]
 
 
 def test_entries_past_the_new_end_are_dropped_and_reported() -> None:
@@ -223,9 +240,11 @@ def test_entries_past_the_new_end_are_dropped_and_reported() -> None:
     rows = layout_rows(plan)
     c = content(rows)
     result = run(plan, ripple(rows, [c[0], c[1]]))
-    assert codes(result, "dropped") == ["title_past_end", "marker_past_end"]
+    # the title item is still at 500..590, past the new end (500); the marker sat over the
+    # third segment, which is gone
+    assert codes(result, "dropped") == ["title_past_end", "marker_content_gone"]
     assert result.plan.titles == [] and result.plan.markers == []
-    assert result.diff["dropped"][0]["location"] == "titles[0]"
+    assert [d["location"] for d in result.diff["dropped"]] == ["titles[0]", "markers[0]"]
 
 
 def test_reorder() -> None:
@@ -242,6 +261,8 @@ def test_reorder() -> None:
         "src_out": 700,
         "record_in": 0,
         "record_out": 200,
+        "match": "path",
+        "also_overlaps": [],
     }
 
 
@@ -283,6 +304,7 @@ def test_an_added_range_from_a_known_source() -> None:
     assert result.diff["added"] == [
         {
             "index": 1,
+            "track": 1,
             "source": "broll",
             "match": "path",
             "src_in": 30,
@@ -372,8 +394,9 @@ def test_a_transition_whose_join_is_gone_is_dropped() -> None:
     result = run(plan, edited, rate=RATE_2997)
     assert codes(result, "dropped") == ["transition_join_gone"]
     assert result.plan.transitions == []
-    # the head and outro dissolves are still in the plan; the timeline here has none
-    assert codes(result) == ["transition_missing", "transition_missing"]
+    # the sting item stayed where the old outro began; the head and outro dissolves are still in
+    # the plan; the timeline here has none
+    assert codes(result) == ["sting_missing", "transition_missing", "transition_missing"]
 
 
 def test_a_surviving_transition_is_reindexed() -> None:
@@ -394,13 +417,16 @@ def test_a_transition_added_in_resolve_is_not_carried() -> None:
     assert result.plan == plan
 
 
-def test_a_change_on_another_picture_track_is_not_carried() -> None:
+def test_a_move_on_another_picture_track_follows_the_timeline() -> None:
     plan, rows = tc_rows()
     edited = [replace(r, record_in=r.record_in + 30) if r.track == "V2" else r for r in rows]
     result = run(plan, edited, rate=RATE_2997)
-    assert codes(result) == ["other_picture_track", "other_picture_track"]
-    assert result.diff["segments"][3]["status"] == "kept_off_primary"
-    assert result.plan == plan
+    assert result.diff["not_carried"] == []
+    row = result.diff["segments"][3]
+    assert (row["status"], row["track"], row["new"][0]["record_in"]) == ("moved", 2, 430)
+    assert result.plan.segments[3].record_in == 430
+    assert result.plan.segments[3].transform == plan.segments[3].transform
+    assert result.plan.segments[:3] == plan.segments[:3]
 
 
 def test_the_outro_trim_is_carried() -> None:
@@ -500,6 +526,9 @@ def test_codes_are_stable() -> None:
         "media_fps_mismatch",
         "source_range_outside",
         "output_exists",
+        "damaged_timeline",
+        "output_folder_missing",
+        "invalid_edited_plan",
     } == IMPORT_CODES
     assert set(NOT_CARRIED_CODES).isdisjoint(DROPPED_CODES)
 
