@@ -259,9 +259,10 @@ def build_guide(
         "## 8. After the cut: a render or export your plan made fail",
         "",
         "The hub renders the plan, gates its QA and exports the FCPXML and the review MP4.",
-        "When the render or the export fails because of the plan (QA failed, the render's",
-        "lint with the transcript found errors, a range runs past the end of the media, a",
-        "reframe too complex...), `recipe_status` shows that step `failed` with its error",
+        "When the render or the export fails because of the plan (QA measured the cut and",
+        "failed it, the render's lint with the transcript found errors, a range runs past",
+        "the end of the media, a reframe too complex...), `recipe_status` shows that step",
+        "`failed` with its error",
         "(`code`, `message`, `fix_hint`, `upstream: true`) and the next action",
         "`recipe_reopen cut`. Read the error, then reopen the cut:",
         "",
@@ -279,7 +280,8 @@ def build_guide(
         f"has {cut_attempts} attempts in a round, the reopened ones included; with none left",
         "the run can only be cancelled and a new one started (its transcript is reused).",
         "A failure that is not the plan's (`upstream` absent: media changed or unreadable, a",
-        "missing tool, a timeout, the disk) is not reopened: `recipe_status` says what to do.",
+        "missing tool, a timeout, the disk, a QA check that could not run) is not reopened:",
+        "`recipe_status` says what to do (usually `recipe_retry`).",
         "",
     ]
     return "\n".join(lines)

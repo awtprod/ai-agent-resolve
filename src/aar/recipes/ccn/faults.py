@@ -11,8 +11,10 @@ raises it (``aar.plan.render``, ``aar.plan.export``, :mod:`aar.recipes.ccn.steps
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
+
+from aar.qa.report import QACheck, QAReport
 
 #: Plan layout codes the exporter raises, and the renderer passes through (it builds the
 #: export's layout), that only the plan's content decides.
@@ -45,20 +47,42 @@ RENDER_PLAN_CODES = frozenset(
     }
 )
 
-#: ``render_too_large`` is the plan's only for this reason: too many overlapping pictures with no
-#: hard cut between them. Its other reasons (the encoder alone at the stub's resolution, a budget
-#: that holds no sound of the mix) are the machine's memory, not the cut.
+#: ``render_too_large`` is the plan's only for this reason, and only when more than one picture
+#: overlaps (``details["pictures"] > 1``): the cut can put a hard cut between them. One picture
+#: alone over the budget costs the stub source's frame size, which no cut changes, and the budget
+#: is the machine's free memory. Its other reasons (the encoder alone at the stub's resolution, a
+#: budget that holds no sound of the mix) are the machine's memory, not the cut.
 RENDER_TOO_LARGE_PLAN_REASON = "pictures"
 
 #: Codes the ccn steps raise themselves that a different plan fixes: the plan's frame, sources
-#: or names differ from the stub (``plan_not_from_stub``), and the review render's QA gate.
-STEP_PLAN_CODES = frozenset({"plan_not_from_stub", "qa_failed"})
+#: or names differ from the stub (``plan_not_from_stub``). ``qa_failed`` is decided per failure
+#: by :func:`qa_failure_upstream`, not here.
+STEP_PLAN_CODES = frozenset({"plan_not_from_stub"})
+
+#: The review render's QA checks whose failure can be a judgement about the cut, each with the
+#: measured key :mod:`aar.qa.check` writes only when the check ran on the content and judged it
+#: (the value may be ``None``: digital silence measures ``-inf``, stored as ``None``). A check
+#: that could not run fails without it: ``measure_audio`` or ``count_clipped`` raising a
+#: ``MediaError`` (a timeout, an ffmpeg error), no audio stream, NaN samples, an unknown render
+#: duration. ``decode`` (the renderer's output does not decode, or ffprobe timed out),
+#: ``longest-silence`` (it can only warn, which the gate allows: it fails the gate only when it
+#: could not measure or is incomplete) and ``size-cap`` (not applied to this review render) are
+#: never the cut's.
+QA_JUDGED_BY = {
+    "loudness": "integrated_lufs",
+    "clipping": "clipped_samples",
+    "duration": "diff_frames",
+}
+#: ``join-quiet`` judges each join; a join entry carries this key only when its source audio was
+#: read and judged (a join whose audio could not be read is ``unchecked``, or failed without it).
+JOIN_JUDGED_BY = "run_at_cut"
 
 
 def upstream_failure(code: str, details: Mapping[str, Any] | None = None) -> bool:
     """Whether the ``render``/``export`` step failure ``code`` (as the step records it:
     ``render_<code>``, ``export_<code>`` or a step code) is the cut's fault. ``details`` are the
-    library error's details (only ``render_too_large`` reads them: its ``reason``)."""
+    library error's details (only ``render_too_large`` reads them: ``reason`` and ``pictures``).
+    ``qa_failed`` is never decided here (see :func:`qa_failure_upstream`)."""
     if code in STEP_PLAN_CODES:
         return True
     if code.startswith("export_"):
@@ -66,15 +90,54 @@ def upstream_failure(code: str, details: Mapping[str, Any] | None = None) -> boo
     if code.startswith("render_"):
         inner = code.removeprefix("render_")
         if inner == "render_too_large":  # the step records it as render_render_too_large
-            return (details or {}).get("reason") == RENDER_TOO_LARGE_PLAN_REASON
+            found = details or {}
+            pictures = found.get("pictures")
+            return (
+                found.get("reason") == RENDER_TOO_LARGE_PLAN_REASON
+                and isinstance(pictures, int)
+                and not isinstance(pictures, bool)
+                and pictures > 1
+            )
         return inner in PLAN_LAYOUT_CODES or inner in RENDER_PLAN_CODES
     return False
 
 
+def qa_failure_upstream(report: QAReport, failing: Iterable[str]) -> bool:
+    """Whether a ``qa_failed`` of the review render is the cut's: every failing required check
+    (``failing``: the gate's failing check ids) ran on the content and judged it. A check that
+    could not run, or ran incomplete, or is missing from the report, or was skipped, leaves the
+    failure unmarked: a retry is the way on, since the plan may well be fine."""
+    names = list(failing)
+    if not names:
+        return False
+    by_id = {check.id: check for check in report.checks}
+    unchecked = set(report.unchecked)
+    for name in names:
+        check = by_id.get(name)
+        if check is None or check.incomplete or name in unchecked:
+            return False
+        if check.status not in ("fail", "warn"):
+            return False  # skipped (not as not applicable): it did not run
+        if not _judged(check):
+            return False
+    return True
+
+
+def _judged(check: QACheck) -> bool:
+    if check.id == "join-quiet":
+        failed = [d for d in check.details if d.get("status") == "fail"]
+        return bool(failed) and all(JOIN_JUDGED_BY in d for d in failed)
+    key = QA_JUDGED_BY.get(check.id)
+    return key is not None and key in check.measured
+
+
 __all__ = [
+    "JOIN_JUDGED_BY",
     "PLAN_LAYOUT_CODES",
+    "QA_JUDGED_BY",
     "RENDER_PLAN_CODES",
     "RENDER_TOO_LARGE_PLAN_REASON",
     "STEP_PLAN_CODES",
+    "qa_failure_upstream",
     "upstream_failure",
 ]

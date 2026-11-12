@@ -44,7 +44,7 @@ from aar.plan.stub import StubError, StubSource, build_stub
 from aar.qa.report import QAReport
 from aar.recipes.ccn import transcript as transcript_mod
 from aar.recipes.ccn.export_files import copy_out, safe_name
-from aar.recipes.ccn.faults import upstream_failure
+from aar.recipes.ccn.faults import qa_failure_upstream, upstream_failure
 from aar.recipes.ccn.guide import artifact_get, build_guide
 from aar.recipes.ccn.params import CcnLongformParams, check_hub_file
 from aar.recipes.ccn.scratch import drop_scratch, op_scratch
@@ -489,13 +489,25 @@ def render_step(ctx: StepContext) -> StepOutput:
     qa = QAReport.model_validate(report["qa"])
     gate = review_qa_gate(qa)
     if not gate.passed:
-        failing = [f"{r.name} ({r.detail})" for r in gate.reasons if not r.passed]
+        failed = [r for r in gate.reasons if not r.passed]
+        failing = [f"{r.name} ({r.detail})" for r in failed]
+        stored = f"the render and its report are stored (artifacts {mp4_id}, {report_id})"
+        # S19f: the cut's only when every failing check ran on the content and judged it; a
+        # check that could not run (a timeout, a MediaError, incomplete) is not the plan's.
+        if qa_failure_upstream(qa, [r.name for r in failed]):
+            raise StepFailure(
+                "qa_failed",
+                "the review render failed QA: " + "; ".join(failing),
+                f"{stored}; reopen the cut (recipe_reopen cut: recipe_status shows it) and "
+                "submit a changed plan",
+                upstream=True,
+            )
         raise StepFailure(
             "qa_failed",
             "the review render failed QA: " + "; ".join(failing),
-            f"the render and its report are stored (artifacts {mp4_id}, {report_id}); reopen "
-            "the cut (recipe_reopen cut: recipe_status shows it) and submit a changed plan",
-            upstream=upstream_failure("qa_failed"),
+            f"{stored}; a QA check could not run or could not check everything (the report "
+            "says which and why), so the failure is not put on the cut: retry the render "
+            "(recipe_retry render) once the cause is fixed",
         )
     loudness = report.get("loudness") or {}
     return StepOutput(

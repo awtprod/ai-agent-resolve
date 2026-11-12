@@ -5,6 +5,7 @@ changed cut, render, export, review, approve and the report. Plus the classifica
 
 from __future__ import annotations
 
+import importlib
 import json
 import re
 from pathlib import Path
@@ -26,16 +27,23 @@ from write_support import AGENT, HUMAN
 
 from aar.hub.reviews import decide
 from aar.hub.writes import WriteError
+from aar.media import MediaTimeout
 from aar.plan.export import ExportError
 from aar.plan.export.errors import EXPORT_CODES
 from aar.plan.render import RenderError
 from aar.plan.render.errors import RENDER_ONLY_CODES
+from aar.qa.report import QACheck, QAReport, build_report
 from aar.recipes.ccn import CCN_LONGFORM
-from aar.recipes.ccn.faults import PLAN_LAYOUT_CODES, RENDER_PLAN_CODES, upstream_failure
-from aar.recipes.ccn.steps import _library_failure
+from aar.recipes.ccn.faults import (
+    PLAN_LAYOUT_CODES,
+    RENDER_PLAN_CODES,
+    qa_failure_upstream,
+    upstream_failure,
+)
+from aar.recipes.ccn.steps import REQUIRED_QA, _library_failure, review_qa_gate
 from aar.recipes.context import StepFailure
 from aar.recipes.report import build_report_text
-from aar.recipes.run import step_complete
+from aar.recipes.run import recipe_reopen, recipe_retry, step_complete
 from aar.recipes.state import load_state
 from aar.recipes.status import status_view
 from ccn_support import WORDS, needs_ffmpeg
@@ -170,7 +178,13 @@ def test_render_too_large_is_marked_only_for_overlapping_pictures() -> None:
     def marked(**details: object) -> StepFailure:
         return _library_failure("render", RenderError("render_too_large", "m", "h", **details))
 
-    assert marked(reason="pictures").upstream is True
+    assert marked(reason="pictures", pictures=2).upstream is True
+    assert marked(reason="pictures", pictures=7).upstream is True
+    # one picture alone over the budget: its cost is the stub source's frame size, which no cut
+    # changes, and the budget is the machine's free memory
+    assert marked(reason="pictures", pictures=1).upstream is False
+    assert marked(reason="pictures").upstream is False  # no count: not shown to be the cut's
+    assert marked(reason="pictures", pictures=True).upstream is False
     assert marked(reason="encoder_base").upstream is False  # the stub's resolution, not the cut
     assert marked().upstream is False  # the budget holds no sound of the mix
     assert "upstream" not in marked(reason="encoder_base").to_error()
@@ -193,7 +207,9 @@ def test_environment_export_codes_stay_unmarked(code: str) -> None:
 
 
 def test_the_step_codes() -> None:
-    assert upstream_failure("plan_not_from_stub") and upstream_failure("qa_failed")
+    assert upstream_failure("plan_not_from_stub")
+    # qa_failed is decided per failure from the QA report (qa_failure_upstream), never by code
+    assert upstream_failure("qa_failed") is False
     for code in (
         "media_changed",
         "invalid_params",
@@ -232,3 +248,151 @@ def test_the_design_doc_lists_every_marked_code() -> None:
     section = design.split("Which render and export failures are the cut's")[1].split("\n\n**")[0]
     for code in sorted(PLAN_LAYOUT_CODES | RENDER_PLAN_CODES | {"plan_not_from_stub"}):
         assert f"`{code}`" in section, code
+
+
+# -- qa_failed: the cut's only when every failing check judged the content ---------------------
+
+
+def _report(*replaced: QACheck) -> QAReport:
+    """A review render's QA report with every required check passing except ``replaced``."""
+    checks = {cid: QACheck(id=cid, status="pass", message="ok") for cid in REQUIRED_QA}
+    for check in replaced:
+        checks[check.id] = check
+    return build_report(
+        file="r.review.mp4", kind="review", profile="p", media=None, checks=list(checks.values())
+    )
+
+
+def _qa_upstream(*replaced: QACheck) -> bool:
+    report = _report(*replaced)
+    gate = review_qa_gate(report)
+    assert not gate.passed
+    return qa_failure_upstream(report, [r.name for r in gate.reasons if not r.passed])
+
+
+def _fail(check_id: str, measured: dict[str, object] | None = None, **extra: object) -> QACheck:
+    return QACheck(id=check_id, status="fail", message="m", measured=measured or {}, **extra)
+
+
+LOUD = _fail("loudness", {"integrated_lufs": -31.0, "true_peak_dbtp": -3.0, "lra_lu": 4.0})
+#: digital silence: ebur128 reports -70 LUFS, the true peak is -inf (stored as None)
+SILENT = _fail("loudness", {"integrated_lufs": -70.0, "true_peak_dbtp": None})
+CLIPPED = _fail("clipping", {"sample_peak_dbfs": 0.0, "clipped_samples": 12, "scanned_samples": 9})
+LONG = _fail("duration", {"render_s": 9.5, "measured_from": "video", "diff_frames": 12.0})
+JOIN = QACheck(
+    id="join-quiet",
+    status="fail",
+    message="m",
+    measured={"cuts": 2, "failed": 1, "unchecked": 0},
+    details=[
+        {"join": 1, "status": "fail", "run_at_cut": None, "quiet_ms_at_cut": 0.0},
+        {"join": 2, "status": "pass", "run_at_cut": {"start_s": 1.0}},
+    ],
+)
+
+
+@pytest.mark.parametrize("checks", [(LOUD,), (SILENT,), (CLIPPED,), (LONG,), (JOIN,), (LOUD, LONG)])
+def test_a_qa_failure_judging_the_cut_is_marked(checks: tuple[QACheck, ...]) -> None:
+    assert _qa_upstream(*checks) is True
+
+
+#: the shapes aar.qa.check gives a check that could not run (or not fully)
+COULD_NOT_RUN = {
+    "audio not measured (MediaError, timeout)": _fail("loudness"),
+    "clipping not measured": _fail("clipping"),
+    "silence not measured": _fail("longest-silence"),
+    "no audio stream": _fail("loudness", {"audio_streams": 0}),
+    "NaN samples": _fail("clipping", {"sample_peak_dbfs": None, "non_finite_per_channel": 3}),
+    "clipped count failed": _fail(
+        "clipping", {"sample_peak_dbfs": 0.2, "non_finite_per_channel": 0}
+    ),
+    "decode timeout": _fail("decode", {"readable": False, "exit_code": None}),
+    "decode errors": _fail("decode", {"readable": True, "exit_code": 0, "error_lines": 3}),
+    "duration unknown": _fail("duration"),
+    "join audio unreadable": QACheck(
+        id="join-quiet",
+        status="fail",
+        message="m",
+        measured={"cuts": 1, "failed": 1, "unchecked": 0},
+        details=[{"join": 1, "status": "fail", "reason": "could not read the source audio"}],
+    ),
+    "join incomplete": QACheck(
+        id="join-quiet",
+        status="fail",
+        message="m",
+        measured={"cuts": 2, "failed": 1, "unchecked": 1},
+        details=[
+            {"join": 1, "status": "fail", "run_at_cut": None},
+            {"join": 2, "status": "unchecked", "reason": "timed out"},
+        ],
+        incomplete=True,
+    ),
+    "silence log truncated": QACheck(
+        id="longest-silence",
+        status="warn",
+        message="m",
+        measured={"longest_silence_s": 0.0, "log_truncated": True},
+        incomplete=True,
+    ),
+    "duration skipped": QACheck(
+        id="duration", status="skipped", skip_reason="no-plan", message="m"
+    ),
+    "size over the cap": _fail("size-cap", {"size_bytes": 9, "size_mb": 30.0}),
+}
+
+
+@pytest.mark.parametrize("name", sorted(COULD_NOT_RUN))
+def test_a_qa_failure_from_a_check_that_could_not_run_is_unmarked(name: str) -> None:
+    assert _qa_upstream(COULD_NOT_RUN[name]) is False
+    # one such check next to a judged failure still leaves the failure unmarked
+    assert (
+        _qa_upstream(LOUD if COULD_NOT_RUN[name].id != "loudness" else LONG, COULD_NOT_RUN[name])
+        is False
+    )
+
+
+def test_a_required_check_missing_from_the_report_is_unmarked() -> None:
+    report = _report(LOUD)
+    report = report.model_copy(update={"checks": [c for c in report.checks if c.id != "duration"]})
+    gate = review_qa_gate(report)
+    failing = [r.name for r in gate.reasons if not r.passed]
+    assert failing == ["loudness", "duration"]
+    assert qa_failure_upstream(report, failing) is False
+    assert qa_failure_upstream(report, []) is False
+
+
+@needs_ffmpeg
+def test_a_qa_check_that_could_not_run_is_retried_not_reopened(
+    ccn_env: CcnEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The QA audio measurement times out (a stalled mount) on a cut that is fine: qa_failed is not
+    the cut's, the status offers the retry of the render, a reopen is refused, and the retry
+    passes once the cause is gone."""
+    env = ccn_env
+    show = env.show("cam-a.mov", words=WORDS[13:], room=False)
+    run = make_run(env, env.params(show), key="qa-env")
+    start(env, run, "qa-env")
+    work(env)
+    qa_module = importlib.import_module("aar.qa.check")
+
+    def stalled(*args: object, **kwargs: object) -> object:
+        raise MediaTimeout("ffmpeg ran past its timeout", timeout_s=1.0, tool="ffmpeg")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(qa_module, "measure_audio", stalled)
+        agent_cut(env, run, keep=HEARD_LAST, key="c1")
+        work(env)
+    render = latest(env, run, "render")
+    assert render.status == "failed" and render.result_error["code"] == "qa_failed"
+    assert render.upstream is False and "upstream" not in render.result_error
+    assert "recipe_retry render" in render.result_error["fix_hint"]
+    assert "recipe_reopen" not in render.result_error["fix_hint"]
+    actions = status_view(env.hub.log, run)["next_actions"]
+    assert [a.get("tool") for a in actions if a["step_id"] == "render"] == ["recipe_retry"]
+    with pytest.raises(WriteError) as refused:
+        recipe_reopen(env.hub.log, run, "cut", AGENT, idempotency_key="re1")
+    assert refused.value.code == "no_upstream_failure"
+    recipe_retry(env.hub.log, run, "render", AGENT, idempotency_key="rr1")
+    work(env)
+    again = latest(env, run, "render")
+    assert (again.attempt, again.status) == (2, "done")
