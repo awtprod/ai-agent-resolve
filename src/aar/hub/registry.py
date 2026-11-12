@@ -73,6 +73,19 @@ class DuplicateResolveProject(ValueError):
         self.existing_id = existing_id
 
 
+class DuplicateProjectName(ValueError):
+    """Raised when a project without a source would take a name or alias another project has.
+
+    A source-less project has no Resolve unique id, so its name is its identity. ``name`` is
+    the text that collides; ``existing_id`` is the registry id (``prj_...``) that holds it.
+    """
+
+    def __init__(self, name: str, existing_id: str) -> None:
+        super().__init__(f"name {name!r} is already a name or alias of {existing_id!r}")
+        self.name = name
+        self.existing_id = existing_id
+
+
 def new_project_id() -> str:
     """Return a fresh, stable project id of the form ``prj_<hex>``."""
     return "prj_" + secrets.token_hex(8)
@@ -265,6 +278,10 @@ class Registry:
         An explicit ``project_id`` that already exists is rejected with
         :class:`DuplicateProjectId`, unless the same ``idempotency_key`` was used for
         the original create (a genuine retry), which returns the existing project.
+
+        A project created without sources is identified by its name: if its name or one of
+        its aliases is already the name or an alias of any project (with or without
+        sources), it is refused with :class:`DuplicateProjectName`, after the retry check.
         """
         source_dicts = [s.to_dict() for s in (sources or [])]
         alias_list = list(aliases or [])
@@ -302,6 +319,8 @@ class Registry:
                 raise DuplicateProjectId(f"project id already exists: {pid!r}")
             for source in sources or []:
                 self._refuse_taken_uid(source, pid)
+            if not sources:
+                self._refuse_taken_name([name, *alias_list])
             payload = {
                 "project_id": pid,
                 "name": name,
@@ -457,6 +476,13 @@ class Registry:
                 source_resolve_uid(held) == uid for held in project.sources
             ):
                 raise DuplicateResolveProject(uid, project.id)
+
+    def _refuse_taken_name(self, names: list[str]) -> None:
+        """Refuse names any project already has as its name or an alias (exact match)."""
+        for project in self.list():
+            for name in names:
+                if name == project.name or name in project.aliases:
+                    raise DuplicateProjectName(name, project.id)
 
     def _refuse_unless_foldable(
         self, event_type: str, actor: Actor, payload: dict[str, Any]
