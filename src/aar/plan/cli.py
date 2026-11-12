@@ -199,12 +199,17 @@ def register(subparsers: Any) -> None:
         help="Bring a timeline edited in Resolve (.drt) back as an EditPlan and a diff.",
         description="Reads the timeline exported from Resolve (File > Export > Timeline, .drt), "
         "matches its items to the plan it was exported from (the same --media-map as the "
-        "export), and writes the edited plan (V1 items in record order become the segments) and "
-        "a JSON diff: per original segment unchanged, trimmed, moved, removed or split; added "
-        "segments; foreign items; and what the plan cannot hold (not_carried). The edited plan is "
-        "linted and laid out by the export; errors there do not stop it being written. Neither "
-        "output is ever overwritten. Exit: 0 written, 1 written but the edited plan has lint "
-        "errors or the export's layout refuses it, 2 refused or unreadable input.",
+        "export), and writes the edited plan (the picture items on each track that holds planned "
+        "segments, in record order, become that track's segments; titles take their items' "
+        "places) and a JSON diff: per original segment unchanged, trimmed, moved, removed, "
+        "split, joined or kept (its item is not carried, so the plan keeps its own version); "
+        "uncertain matches and titles; elements found on another track than predicted "
+        "(track_mismatch); added segments; foreign items; and what the plan cannot hold "
+        "(not_carried). The edited plan is linted and laid out by the export; errors there do "
+        "not stop it being written. Neither output is ever overwritten. A reader problem "
+        "anywhere in the file refuses the import, even in a timeline --timeline does not pick. "
+        "Exit: 0 written, 1 written but the edited plan has lint errors or the export's layout "
+        "refuses it, 2 refused or unreadable input.",
     )
     imp.add_argument("drt", type=Path, metavar="TIMELINE.drt", help="Timeline exported as .drt.")
     imp.add_argument("--plan", type=Path, required=True, help="The plan the timeline came from.")
@@ -734,6 +739,8 @@ def _import_text(diff: dict[str, Any], out: Path, report: Path) -> str:
         if len(pieces) > _TEXT_PIECES:
             new += f", ... {len(pieces)} pieces in all"
         extra = ""
+        if row["kept_because"] is not None:
+            extra = f" ({row['kept_because']}: the plan keeps its own version)"
         if row["head_frames"] is not None:
             extra = f" head {row['head_frames']:+d} tail {row['tail_frames']:+d}"
         if row["joined"] is not None:
@@ -745,11 +752,33 @@ def _import_text(diff: dict[str, Any], out: Path, report: Path) -> str:
         )
     if len(changed) > _TEXT_ROWS:
         lines.append(f"  ... {len(changed) - _TEXT_ROWS} more in the diff")
+    mismatch = diff["track_mismatch"]
+    if mismatch:
+        shown = "; ".join(
+            f"{m['location']} on {m['found_track']} (expected {m['expected_track']})"
+            for m in mismatch[:_TEXT_ENTRIES]
+        )
+        more = (
+            f"; ... {len(mismatch) - _TEXT_ENTRIES} more" if len(mismatch) > _TEXT_ENTRIES else ""
+        )
+        lines.append(
+            f"TRACK ASSUMPTION FAILED ({len(mismatch)}), kept in the plan, check the tracks: "
+            f"{shown}{more}"
+        )
     uncertain = diff["uncertain_matches"]
+    why_text = {
+        "same_source_range": "same source range as",
+        "overlap": "also overlaps",
+        "not_carried_item": "same source, also",
+    }
     if uncertain:
         shown = "; ".join(
-            f"[{u['index']}] -> segments[{u['assigned_to']}] (also overlaps "
-            + ", ".join(str(i) for i in u["also_overlaps"])
+            f"[{u['index']}] -> segments[{u['assigned_to']}] ("
+            + (
+                f"{why_text[u['why']]} " + ", ".join(str(i) for i in u["also_overlaps"])
+                if u["also_overlaps"]
+                else "a not-carried item kept as it without evidence"
+            )
             + ")"
             for u in uncertain[:_TEXT_ENTRIES]
         )
@@ -757,6 +786,17 @@ def _import_text(diff: dict[str, Any], out: Path, report: Path) -> str:
             f"; ... {len(uncertain) - _TEXT_ENTRIES} more" if len(uncertain) > _TEXT_ENTRIES else ""
         )
         lines.append(f"uncertain matches ({len(uncertain)}), check them: {shown}{more}")
+    titles = diff["uncertain_titles"]
+    if titles:
+        shown = "; ".join(
+            f"{t['location']} -> {t['track']} {t['new']['record_in']}..{t['new']['record_out']}"
+            for t in titles[:_TEXT_ENTRIES]
+        )
+        more = f"; ... {len(titles) - _TEXT_ENTRIES} more" if len(titles) > _TEXT_ENTRIES else ""
+        lines.append(
+            f"uncertain titles ({len(titles)}), paired by order only (text not read), check "
+            f"them: {shown}{more}"
+        )
     by_name = diff["matched_by_file_name"]
     if by_name:
         shown = "; ".join(

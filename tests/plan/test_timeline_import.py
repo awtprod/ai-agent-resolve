@@ -124,7 +124,16 @@ def test_the_diff_says_what_the_reader_cannot_see_and_what_is_assumed() -> None:
     plan = simple()
     diff = run(plan, layout_rows(plan)).diff
     assert any(limit.startswith("enabled_state:") for limit in diff["limits"])
-    assert [a["id"] for a in diff["assumptions"]] == ["tracks", "source_frames", "media_path"]
+    assert [a["id"] for a in diff["assumptions"]] == [
+        "tracks",
+        "source_frames",
+        "media_path",
+        "cut_to_cut",
+        "transition_items",
+        "audio_frames",
+        "outro_item",
+        "titles_are_media_less",
+    ]
     assert list(diff) == [
         "format",
         "unchanged",
@@ -134,6 +143,8 @@ def test_the_diff_says_what_the_reader_cannot_see_and_what_is_assumed() -> None:
         "matched_by_file_name",
         "segments",
         "uncertain_matches",
+        "uncertain_titles",
+        "track_mismatch",
         "added",
         "outro",
         "repositioned",
@@ -340,8 +351,10 @@ def test_a_retimed_item_is_not_carried() -> None:
     result = run(plan, ripple(rows, [c[0], replace(c[1], speed=2.0, sound=None), *c[2:]]))
     assert codes(result) == ["retimed"]
     assert result.diff["not_carried"][0]["record_in"] == 200
-    assert statuses(result) == ["unchanged", "removed", "unchanged", "unchanged"]
-    assert result.plan.segments[1].record_in == 400
+    # the plan keeps its own version in the item's place (DESIGN: "not carried")
+    assert statuses(result) == ["unchanged", "kept", "unchanged", "unchanged"]
+    assert result.diff["segments"][1]["kept_because"] == "retimed"
+    assert result.plan.segments == plan.segments
 
 
 def test_an_item_at_a_sub_frame_position_is_not_carried() -> None:
@@ -351,7 +364,8 @@ def test_an_item_at_a_sub_frame_position_is_not_carried() -> None:
     moved = replace(c[3], fractions={"record_start": 0.5})
     result = run(plan, ripple(rows, [*c[:3], moved]))
     assert "sub_frame" in codes(result)
-    assert statuses(result)[3] == "removed"
+    assert statuses(result)[3] == "kept"
+    assert result.plan.segments[3] == plan.segments[3]
 
 
 def test_a_changed_audio_item_is_an_audio_only_edit() -> None:
@@ -529,6 +543,7 @@ def test_codes_are_stable() -> None:
         "damaged_timeline",
         "output_folder_missing",
         "invalid_edited_plan",
+        "nothing_matched",
     } == IMPORT_CODES
     assert set(NOT_CARRIED_CODES).isdisjoint(DROPPED_CODES)
 

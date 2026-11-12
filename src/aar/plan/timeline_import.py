@@ -20,13 +20,17 @@ cannot know, it reports; it does not guess quietly.
   file"). Anything else is foreign: reported, never guessed.
 * **Segments.** The picture items on each content track become the plan's segments on that
   track, frame-exact, positions from the timeline. Items are assigned to original segments as a
-  whole: an exact range first, then the larger source overlap, then the nearer original record
-  position, then order. A matched segment inherits the original's other fields; reframe keys are
-  windowed to the new source range.
+  whole (:func:`assign_items`): an exact range first (a range several originals share by
+  context, then position), then the larger source overlap, then the nearer original record
+  position, then order; every choice that was not certain is listed. A matched segment inherits
+  the original's other fields; reframe keys are windowed to the new source range. A retimed,
+  sub-frame or still item keeps the plan's own version of the segment it stands for (``kept``).
+  An element found on another track than the layout predicts is kept (``track_mismatch``).
 * **Timing.** Whatever exists as an item in the timeline (segments on every track, titles) takes
-  its position from the timeline. What the plan positions in record frames but is never an item
-  (captions, markers) is re-anchored to the content it sat over, and dropped when that content
-  is gone. Every move and every drop is listed.
+  its position from the timeline (a title on evidence of position only: its text is not read;
+  a pairing by order is kept but listed as uncertain). What the plan positions in record frames
+  but is never an item (captions, markers) is re-anchored to the content it sat over, and
+  dropped when that content is gone. Every move and every drop is listed.
 * **Everything else** in the plan is carried when it is still valid and listed under ``dropped``
   when it is not. What the timeline holds that a plan cannot (retimes, stills, sub-frame
   positions, audio edits, changes on tracks the plan has no lane for, transitions added in
@@ -81,6 +85,7 @@ IMPORT_CODES = frozenset(
         "output_exists",
         "output_folder_missing",
         "invalid_edited_plan",
+        "nothing_matched",
     }
 )
 
@@ -113,6 +118,9 @@ DROPPED_CODES = (
     "marker_content_gone",
     "marker_past_end",
 )
+#: Not-carried codes of a picture item that stands where a plan segment was: the plan keeps its
+#: own version of that segment in the item's place (``status: "kept"``, ``kept_because``).
+KEPT_CODES = ("retimed", "sub_frame", "still_image")
 #: Why an item is foreign (``foreign[].reason``).
 FOREIGN_REASONS = ("unknown_file", "same_name_different_file", "ambiguous_file_name")
 
@@ -150,20 +158,27 @@ LIMITS = (
     "enabled_state: the reader cannot see whether an item is enabled; a disabled clip is "
     "imported as if it plays",
     "audio_transitions: transition items on audio tracks are not compared",
-    "titles: title items are matched by track and record range only; their text is not read",
+    "titles: a title item's text is not read (a Resolve title's item name is its template, such "
+    "as 'Fusion Title'; the text sits in a Fusion comp the reader does not interpret), so plan "
+    "titles are paired with title items by position: the same range, else the range their "
+    "content moved to, else by order on their track, which is listed as uncertain",
     "not_read: markers, grades, Fusion and Fairlight work in the .drt are not read into the plan",
 )
 
 ASSUMPTIONS = (
     {
         "id": "tracks",
+        "code": "track_of_lane",
         "text": "after importing aar's FCPXML, Resolve's items sit on the tracks the layout "
-        "predicts: layout lane N on video track N+1, so the plan's V1 spine on V1",
+        "predicts: layout lane N on video track N+1, so the plan's V1 spine on V1 and each "
+        "clip's sound on A(N+1); an element found on another track is kept and listed under "
+        "track_mismatch",
         "check": "import an exported plan with a V2 clip and a title, export the timeline as "
         ".drt, and run import-timeline: the diff must be empty",
     },
     {
         "id": "source_frames",
+        "code": "source_frame",
         "text": "a moving-picture item's source in point counts frames from the media file's "
         "first frame, as the plan's src_in does (not from its start timecode); stills are not "
         "covered (a real export shows still in points near 01:00:00:00) and are not carried",
@@ -172,8 +187,43 @@ ASSUMPTIONS = (
     },
     {
         "id": "media_path",
+        "code": "media_key",
         "text": "an item's media path is the edit-PC path the FCPXML asset named",
         "check": "the same round trip: every item matches its source by path, none by file name",
+    },
+    {
+        "id": "cut_to_cut",
+        "code": "_classify",
+        "text": "a V1 clip's record range runs cut to cut; a dissolve is a separate transition "
+        "item that does not lengthen the clips around it",
+        "check": "the round trip with a plan dissolve between two clips: both segments "
+        "unchanged, the transition found",
+    },
+    {
+        "id": "transition_items",
+        "code": "_transition_items",
+        "text": "a transition item contains its cut and its length equals the plan's video_frames",
+        "check": "the same round trip: no transition_missing for any plan dissolve",
+    },
+    {
+        "id": "audio_frames",
+        "code": "_audio",
+        "text": "an audio item's in point counts video frames at the timeline's rate",
+        "check": "the same round trip with a camera clip's linked sound: no audio_only_edit",
+    },
+    {
+        "id": "outro_item",
+        "code": "_find_outro",
+        "text": "the outro is the last item of the outro's source on the outro's track",
+        "check": "the round trip with an outro whose source is also used in the content: "
+        "outro unchanged",
+    },
+    {
+        "id": "titles_are_media_less",
+        "code": "_Item.is_title",
+        "text": "a media-less picture item is a title (solids and generators count as titles)",
+        "check": "the round trip with a title and a solid added in Resolve: one title_added per "
+        "added item, the plan's titles matched",
     },
 )
 
@@ -324,7 +374,19 @@ class _Item:
     match: str | None = None
     foreign: str | None = None
     excluded: bool = False
+    #: The not-carried code that excluded the item.
+    reason: str | None = None
     used: bool = False
+    #: The track the layout predicts for the plan element this item was found to be, when the
+    #: item sits on another one (the tracks assumption failed for it; ``track_mismatch``).
+    placed: str | None = None
+    #: The original segment this not-carried item stands in for (the plan keeps its own version).
+    stands_for: int | None = None
+
+    @property
+    def home(self) -> str:
+        """The track the item is matched on: its own, or the one its plan element was laid on."""
+        return self.placed or self.track
 
     @property
     def is_video(self) -> bool:
@@ -384,7 +446,9 @@ class _Expected:
 
 def _fallback_ref(source: Source) -> MediaRef:
     """A source the export rules cannot place (no map, a pool name): no edit-PC path, so it can
-    match by file name only."""
+    match by file name only. The ``file:`` URL is decoded here rather than by the export's
+    parser (``media._from_file_url``): that parser only returns for URLs it can place and raises
+    for exactly the ones that reach this fallback."""
     media = source.media
     path = unquote(urlsplit(media).path) if media[:5].lower() == "file:" else media
     name = re.split(r"[\\/]", path)[-1]
@@ -449,20 +513,30 @@ def _with_segments(plan: EditPlan, segments: list[Segment]) -> EditPlan:
 def assign_items(
     items: Sequence[tuple[str, int, int, int]],
     originals: Sequence[tuple[int, str, int, int, int]],
+    same: Callable[[int, int], bool] | None = None,
 ) -> tuple[dict[int, int], dict[int, list[int]]]:
     """Assign items to original segments as a whole. ``items`` are ``(source, src_in, src_out,
     record_in)`` in record order; ``originals`` are ``(index, source, src_in, src_out,
-    record_in)``. Returns item position -> original index, and for each item matched by overlap
-    the other originals it also overlaps (the diff lists them: the choice was not certain).
+    record_in)``; ``same(a, b)`` says two originals are identical in every field but their
+    position (choosing between them changes nothing; without it every pair differs). Returns
+    item position -> original index, and for each item whose original was a choice the other
+    originals that were really in contention (the diff lists them as uncertain).
 
-    1. An exact source range at the original's record position, then an exact range anywhere
-       (the nearer original position first, then plan order); each original takes one exact item.
-    2. Every other item goes to the original of its source it overlaps most (never one an item
+    1. An exact source range that one original has: at the original's record position first,
+       then anywhere (in record order); each original takes one exact item.
+    2. An exact source range that several originals share (a teaser and its main take): by
+       context first (the item's neighbours in the timeline are the candidate's neighbours in
+       the plan, on its track, in record order), then the nearer original record position,
+       then plan order. The other candidates that differ in any field are always listed.
+    3. Every other item goes to the original of its source it overlaps most (never one an item
        matched exactly: that item is added). Among originals it overlaps equally, one that no
        item holds yet comes first (the assignment is taken as a whole: a trimmed copy is not a
        piece of a segment that already has its own item), then the nearer original record
        position; items still tied are given out in record order to their tied originals in plan
-       order. An item that overlaps nothing it can take is unassigned (added)."""
+       order. An item that overlaps nothing it can take is unassigned (added). Listed with it:
+       the originals it overlaps equally, or that cover at least half of it, or that it covers
+       at least half of (a sliver of overlap is not a contender)."""
+    differ = (lambda a, b: a != b) if same is None else (lambda a, b: a != b and not same(a, b))
     assigned: dict[int, int] = {}
     exact: set[int] = set()
     by_range: dict[tuple[str, int, int], list[tuple[int, int]]] = {}
@@ -472,24 +546,45 @@ def assign_items(
         by_range.setdefault((source, src_in, src_out), []).append((index, record_in))
         by_source.setdefault(source, []).append((index, src_in, src_out, record_in))
         old_in[index] = record_in
+    in_order = [o[0] for o in sorted(originals, key=lambda o: (o[4], o[0]))]
+    after = dict(itertools.pairwise(in_order))
+    before = {b: a for a, b in after.items()}
+    also: dict[int, list[int]] = {}
     for at_position in (True, False):
         for pos, (source, src_in, src_out, record_in) in enumerate(items):
-            if pos in assigned:
+            group = by_range.get((source, src_in, src_out), [])
+            if pos in assigned or len(group) != 1:
                 continue
-            free = [
-                (abs(old - record_in), index)
-                for index, old in by_range.get((source, src_in, src_out), [])
-                if index not in exact and (not at_position or old == record_in)
-            ]
-            if free:
-                index = min(free)[1]
+            [(index, old)] = group
+            if index not in exact and (not at_position or old == record_in):
                 assigned[pos] = index
                 exact.add(index)
-    also: dict[int, list[int]] = {}
+    for pos, (source, src_in, src_out, record_in) in enumerate(items):
+        group = by_range.get((source, src_in, src_out), [])
+        free = [(index, old) for index, old in group if index not in exact]
+        if pos in assigned or len(group) < 2 or not free:
+            continue
+
+        def context(index: int, pos: int = pos) -> int:
+            score = 0
+            if pos - 1 in assigned and assigned[pos - 1] == before.get(index):
+                score += 1
+            if pos + 1 in assigned and assigned[pos + 1] == after.get(index):
+                score += 1
+            return score
+
+        index = min(free, key=lambda f: (-context(f[0]), abs(f[1] - record_in), f[0]))[0]
+        assigned[pos] = index
+        exact.add(index)
+        others = [i for i, _ in group if differ(i, index)]
+        if others:
+            also[pos] = others
+    contenders: dict[int, list[int]] = {}
     ties: list[tuple[int, list[int]]] = []
     for pos, (source, src_in, src_out, _) in enumerate(items):
         if pos in assigned:
             continue
+        lengths = {index: o_out - o_in for index, o_in, o_out, _ in by_source.get(source, [])}
         overlaps = {
             index: min(o_out, src_out) - max(o_in, src_in)
             for index, o_in, o_out, _ in by_source.get(source, [])
@@ -504,7 +599,10 @@ def assign_items(
             assigned[pos] = tied[0]
         else:
             ties.append((pos, tied))
-        also[pos] = sorted(overlaps)
+        length = src_out - src_in
+        contenders[pos] = sorted(
+            i for i, o in overlaps.items() if o == most or 2 * o >= length or 2 * o >= lengths[i]
+        )
     floor = -1
     for pos, tied in ties:
         record_in = items[pos][3]
@@ -515,12 +613,11 @@ def assign_items(
         later = [i for i in nearest if i >= floor]
         assigned[pos] = later[0] if later else nearest[0]
         floor = assigned[pos]
-    alternatives = {
-        pos: [i for i in others if i != assigned[pos]]
-        for pos, others in also.items()
-        if len(others) > 1
-    }
-    return assigned, alternatives
+    for pos, others in contenders.items():
+        listed = [i for i in others if differ(i, assigned[pos])]
+        if listed:
+            also[pos] = listed
+    return assigned, also
 
 
 class _Importer:
@@ -539,6 +636,8 @@ class _Importer:
         self.dropped: list[dict[str, Any]] = []
         self.foreign: list[dict[str, Any]] = []
         self.repositioned: list[dict[str, Any]] = []
+        self.track_mismatch: list[dict[str, Any]] = []
+        self.uncertain_titles: list[dict[str, Any]] = []
 
     # -- report helpers ------------------------------------------------------------------------
 
@@ -549,6 +648,20 @@ class _Importer:
     def drop(self, code: str, location: str, detail: str) -> None:
         assert code in DROPPED_CODES
         self.dropped.append({"code": code, "location": location, "detail": detail})
+
+    def mismatch(self, location: str, expected: str, entry: _Item) -> None:
+        """The tracks assumption failed for one plan element: it was found on another track."""
+        self.track_mismatch.append(
+            {
+                "location": location,
+                "expected_track": expected,
+                "found_track": entry.track,
+                "record_in": entry.record_in,
+                "record_out": entry.record_out,
+                "detail": f"found on {entry.track}, not on {expected} where the layout puts it; "
+                "the plan keeps it (assumption 'tracks')",
+            }
+        )
 
     def moved(self, location: str, by: str, old: tuple[int, int], new: tuple[int, int]) -> None:
         if old != new:
@@ -575,8 +688,11 @@ class _Importer:
         self._index_sources()
         self._collect()
         self._match_media()
+        self._check_any_matched()
         self._check_matched()
+        self._old_ranges()
         self._find_outro()
+        self._place_by_content()
         self._match_segments()
         segments = self._segments()
         transitions = self._transitions(segments)
@@ -668,6 +784,7 @@ class _Importer:
         item = entry.item
         if item.record_start is None or item.duration is None:
             entry.excluded = True
+            entry.reason = "unreadable_item"
             self.carry_not(
                 "unreadable_item",
                 "the item's start or duration could not be read",
@@ -717,12 +834,14 @@ class _Importer:
                 entry.src_out = src_in + item.duration if src_in is not None else None
         if reason is not None:
             entry.excluded = True
+            entry.reason = reason[0]
             self.carry_not(reason[0], reason[1], entry.where())
 
     def _match_media(self) -> None:
+        """Every item with media, not-carried ones too (one may stand in for a plan segment)."""
         for entry in self.items:
             path = entry.item.media_path
-            if entry.kind == "transition" or not path or entry.excluded:
+            if entry.kind == "transition" or not path:
                 continue
             entry.key = media_key(path)
             ids = self.by_path.get(entry.key)
@@ -754,6 +873,27 @@ class _Importer:
                 if overlap > best_overlap:
                     best, best_overlap = seg.source, overlap
         return best
+
+    def _check_any_matched(self) -> None:
+        """A timeline whose media items match no plan source at all (media relinked to other
+        paths, or the wrong media map) is refused, not imported as "every segment removed"."""
+        media = [e for e in self.items if e.kind != "transition" and e.item.media_path]
+        if not media or any(e.source is not None for e in media):
+            return
+        reasons: dict[str, int] = {}
+        for e in media:
+            reasons[str(e.foreign)] = reasons.get(str(e.foreign), 0) + 1
+        raise TimelineImportError(
+            "nothing_matched",
+            f"none of the timeline's {len(media)} media item(s) matches a source of the plan "
+            f"({', '.join(f'{r} x{n}' for r, n in sorted(reasons.items()))}); the first is "
+            f"{media[0].item.media_path!r}",
+            "import against the plan this timeline was exported from, with the same --media-map "
+            "as the export; if the media were relinked in Resolve to other paths, relink them "
+            "back or export the plan again with a map to the new paths",
+            items=len(media),
+            reasons=reasons,
+        )
 
     def _check_matched(self) -> None:
         sources = self.plan.source_map()
@@ -791,37 +931,114 @@ class _Importer:
                 )
 
     def _pictures(self, track: str) -> list[_Item]:
-        return [e for e in self.items if e.track == track and not e.excluded and e.is_picture]
+        """The carried picture items matched on ``track``, in record order."""
+        found = [e for e in self.items if e.home == track and not e.excluded and e.is_picture]
+        return sorted(found, key=lambda e: (e.record_in, e.track, e.number))
+
+    def _label(self, plan_track: int) -> str:
+        """The video track the layout puts a plan track on (assumption ``tracks``)."""
+        return f"V{track_of_lane(self.layout.lanes[plan_track])}"
+
+    def _old_ranges(self) -> None:
+        clips = {c.location: c for c in self.layout.clips}
+        self.old_range = {
+            i: (clips[f"segments[{i}]"].record_in, clips[f"segments[{i}]"].record_out)
+            for i in range(len(self.plan.segments))
+        }
 
     def _find_outro(self) -> None:
-        """Assumption: the outro is the last item of the outro's source on the outro's track."""
+        """Assumption: the outro is the last item of the outro's source on the outro's track. Not
+        there: an item of exactly the outro's range on another track is the outro, listed under
+        ``track_mismatch``."""
         self.outro_item: _Item | None = None
         outro = self.plan.outro
         if outro is None:
             return
-        track = f"V{track_of_lane(self.layout.lanes[outro.track])}"
+        track = self._label(outro.track)
         found = [e for e in self._pictures(track) if e.source == outro.source]
         if found:
             self.outro_item = found[-1]
             self.outro_item.used = True
+            return
+        duration = self.plan.source_map()[outro.source].duration
+        want = (outro.src_in, outro.src_out if outro.src_out is not None else duration)
+        elsewhere = [
+            e
+            for e in self.items
+            if e.is_video
+            and e.is_picture
+            and not e.excluded
+            and e.source == outro.source
+            and (e.src_in, e.src_out) == want
+        ]
+        if elsewhere:
+            entry = max(elsewhere, key=lambda e: (e.record_in, e.track))
+            entry.placed = track
+            entry.used = True
+            self.outro_item = entry
+            self.mismatch("outro", track, entry)
+
+    def _place_by_content(self) -> None:
+        """Assumption ``tracks``, checked per segment: an original with no item of its source
+        range on its own track is the item of that exact source range on another video track
+        (never one on the primary track, which is the owner's spine, unless the primary track
+        holds no picture at all; never one that is an exact match on its own track). The item
+        is matched as if on the predicted track and listed under ``track_mismatch``."""
+        segs = self.plan.segments
+        pictures = [
+            e
+            for e in self.items
+            if e.is_video
+            and e.is_picture
+            and not e.is_title
+            and not e.excluded
+            and not e.used
+            and e.source is not None
+        ]
+        primary_empty = not any(e.track == self.primary for e in pictures)
+        home = {(s.source, s.src_in, s.src_out, self._label(s.track)) for s in segs}
+        for i, seg in enumerate(segs):
+            label = self._label(seg.track)
+            if label == self.primary and not primary_empty:
+                continue
+            key = (seg.source, seg.src_in, seg.src_out)
+            same = [e for e in pictures if (e.source, e.src_in, e.src_out) == key]
+            if any(e.track == label for e in same):
+                continue
+            free = [
+                e
+                for e in same
+                if e.placed is None
+                and e.track != self.primary
+                and (e.source, e.src_in, e.src_out, e.track) not in home
+            ]
+            if not free:
+                continue
+            old = self.old_range[i][0]
+            entry = min(free, key=lambda e: (abs(e.record_in - old), e.record_in, e.track))
+            entry.placed = label
+            self.mismatch(f"segments[{i}]", label, entry)
 
     def _match_segments(self) -> None:
         """Assign the picture items of each content track (one with a planned segment) to that
         track's original segments (:func:`assign_items`). Items with a file the plan does not
-        know are foreign; known media on a track the plan has no segments on is not carried."""
+        know are foreign; known media on a track the plan has no segments on is not carried. A
+        not-carried item (:data:`KEPT_CODES`) of a known source stands in for an original of
+        that source no item took: the plan keeps that original in the item's place."""
         segs = self.plan.segments
-        clips = {c.location: c for c in self.layout.clips}
-        self.old_range = {
-            i: (clips[f"segments[{i}]"].record_in, clips[f"segments[{i}]"].record_out)
-            for i in range(len(segs))
-        }
         #: video track label -> plan track number, for the tracks that hold planned segments
-        self.plan_track = {f"V{track_of_lane(self.layout.lanes[s.track])}": s.track for s in segs}
+        self.plan_track = {self._label(s.track): s.track for s in segs}
         self.content: dict[str, list[_Item]] = {}
         self.assigned: dict[str, dict[int, int]] = {}
-        self.alternatives: dict[int, list[int]] = {}  # id(_Item) -> other originals it overlaps
+        self.alternatives: dict[int, list[int]] = {}  # id(_Item) -> originals in contention
+        self.guessed: set[int] = set()  # id(_Item) of stand-ins chosen without evidence
+        fields = [s.model_dump(exclude={"record_in"}) for s in segs]
+
+        def same(a: int, b: int) -> bool:
+            return fields[a] == fields[b]
+
         labels = sorted(
-            {e.track for e in self.items if e.is_video}, key=lambda t: (t != self.primary, t)
+            {e.home for e in self.items if e.is_video}, key=lambda t: (t != self.primary, t)
         )
         for label in labels:
             content: list[_Item] = []
@@ -846,10 +1063,99 @@ class _Importer:
             for e in content:
                 assert e.source is not None and e.src_in is not None and e.src_out is not None
                 items.append((e.source, e.src_in, e.src_out, e.record_in))
-            self.content[label] = content
-            self.assigned[label], alternatives = assign_items(items, originals)
+            assigned, alternatives = assign_items(items, originals, same)
             for pos, others in alternatives.items():
                 self.alternatives[id(content[pos])] = others
+            stand_ins = self._stand_ins(label, originals, content, assigned, same)
+            merged = sorted(content + stand_ins, key=lambda e: (e.record_in, e.track, e.number))
+            pos_of = {id(e): p for p, e in enumerate(content)}
+            self.content[label] = merged
+            self.assigned[label] = {}
+            for p, e in enumerate(merged):
+                if e.stands_for is not None:
+                    self.assigned[label][p] = e.stands_for
+                elif pos_of[id(e)] in assigned:
+                    self.assigned[label][p] = assigned[pos_of[id(e)]]
+
+    def _stand_ins(
+        self,
+        label: str,
+        originals: list[tuple[int, str, int, int, int]],
+        content: list[_Item],
+        assigned: dict[int, int],
+        same: Callable[[int, int], bool],
+    ) -> list[_Item]:
+        """Not-carried picture items on ``label`` (retimed, sub-frame, still) of a known source,
+        each standing in for an original of that source no item took. Chosen by evidence: the
+        item's in point inside the original's source range (a retimed item keeps its ``<In>``;
+        a still's in point is not a plan frame, so stills have none), then context (the carried
+        items before and after it are the original's neighbours in the plan), then the nearer
+        original record position, then plan order. Listed with it (``uncertain_matches``,
+        ``why: not_carried_item``): the other originals of that source that no carried item took
+        for certain (another stand-in's choice, or an uncertain match, may be wrong) with as
+        much source evidence, that differ in any field. A choice without evidence (a readable
+        in point outside the original's range; or no in point, no context and not at the
+        original's own position) is still kept, so the plan loses nothing, and always listed."""
+        held = set(assigned.values())
+        certain = {i for p, i in assigned.items() if id(content[p]) not in self.alternatives}
+        in_order = [o[0] for o in sorted(originals, key=lambda o: (o[4], o[0]))]
+        after = dict(itertools.pairwise(in_order))
+        before = {b: a for a, b in after.items()}
+        placed = [(e.record_in, assigned[p]) for p, e in enumerate(content) if p in assigned]
+        out: list[_Item] = []
+        waiting = sorted(
+            (
+                e
+                for e in self.items
+                if e.excluded
+                and e.reason in KEPT_CODES
+                and e.source is not None
+                and e.is_picture
+                and e.track == label
+                and not e.used
+            ),
+            key=lambda e: (e.record_in, e.number),
+        )
+        for entry in waiting:
+            pool = [o for o in originals if o[0] not in certain and o[1] == entry.source]
+            free = [o for o in pool if o[0] not in held]
+            if not free:
+                continue
+            src_in = None if entry.reason == "still_image" else source_frame(entry.item)
+            span = entry.record_out - entry.record_in if entry.reason == "sub_frame" else 1
+            prev = [i for rin, i in placed if rin < entry.record_in]
+            nxt = [i for rin, i in placed if rin > entry.record_in]
+
+            def score(
+                o: tuple[int, str, int, int, int],
+                src_in: int | None = src_in,
+                span: int = span,
+                prev: int | None = prev[-1] if prev else None,
+                nxt: int | None = nxt[0] if nxt else None,
+                at: int = entry.record_in,
+            ) -> tuple[int, int, int, int]:
+                source = 0 if src_in is None else min(o[3], src_in + span) - max(o[2], src_in)
+                context = int(prev is not None and before.get(o[0]) == prev)
+                context += int(nxt is not None and after.get(o[0]) == nxt)
+                return (-max(0, source), -context, abs(o[4] - at), o[0])
+
+            best = min(free, key=score)
+            chosen = best[0]
+            entry.stands_for = chosen
+            entry.used = True
+            held.add(chosen)
+            others = [
+                o[0]
+                for o in pool
+                if o[0] != chosen and score(o)[0] == score(best)[0] and not same(o[0], chosen)
+            ]
+            if others:
+                self.alternatives[id(entry)] = others
+            source, context, distance, _ = score(best)
+            if source == 0 and (src_in is not None or (context == 0 and distance != 0)):
+                self.guessed.add(id(entry))  # no evidence: kept (nothing lost), always listed
+            out.append(entry)
+        return out
 
     def _segments(self) -> list[Segment]:
         """The edited segment list: V1 items in record order, each inheriting from its original;
@@ -894,6 +1200,12 @@ class _Importer:
         desired: list[int] = []
 
         def emit(entry: _Item, original: int | None, track: int) -> None:
+            if entry.stands_for is not None:  # not carried: the plan keeps its own version
+                self.pieces.setdefault(entry.stands_for, []).append(len(out))
+                self.content_index[id(entry)] = len(out)
+                out.append(segs[entry.stands_for])
+                desired.append(entry.record_in)
+                return
             assert entry.source is not None and entry.src_in is not None
             assert entry.src_out is not None
             if original is None:
@@ -1053,51 +1365,70 @@ class _Importer:
         return first, last + 1
 
     def _titles(self, draft: EditPlan, at: Callable[[int], int | None]) -> list[Any]:
-        """Titles are items: each plan title takes the record range of its title item (an exact
-        match on its track, then its range re-anchored to its content, then, per track, the
-        remaining titles in record order when as many items remain). A title with no item was
-        removed in Resolve."""
+        """Titles are items, but their text is not read (``LIMITS``), so a plan title is a title
+        item only on evidence of position: an item at its own record range (its lane's track
+        first, then any video track: ``track_mismatch``), then an item at the range its content
+        moved to (likewise). Without that evidence, per track, the remaining titles are paired
+        with the remaining title items in record order when as many remain: the pairing is kept
+        (a title the owner merely moved keeps its text) but listed under ``uncertain_titles``
+        and repositioned ``by: "order"``. A title with no item was removed in Resolve."""
         candidates = [e for e in self.items if e.is_title and not e.excluded and not e.used]
         expected: list[tuple[str, str, int, int]] = []
         for spec in self.layout.titles:
             label = f"V{track_of_lane(spec.lane)}"
             expected.append((spec.location, label, spec.record_in, spec.record_out))
-        found: dict[str, _Item] = {}
+        found: dict[str, tuple[_Item, str]] = {}
 
-        def take(location: str, entry: _Item) -> None:
-            found[location] = entry
+        def take(location: str, label: str, entry: _Item, by: str) -> None:
+            found[location] = (entry, by)
             entry.used = True
+            if entry.track != label:
+                entry.placed = label
+                self.mismatch(location, label, entry)
 
-        for location, label, rin, rout in expected:
-            hit = next(
+        def at_range(label: str, wanted: tuple[int, int], own: bool) -> _Item | None:
+            """An unused title item at ``wanted``: on ``label`` (``own``), else on another track
+            that misses none of its own expected titles (an item there is more likely one of
+            those, moved on its own track, than this title moved across tracks)."""
+            missing = {e[1] for e in expected if e[0] not in found}
+            return next(
                 (
                     e
                     for e in candidates
-                    if not e.used and (e.track, e.record_in, e.record_out) == (label, rin, rout)
+                    if not e.used
+                    and (e.record_in, e.record_out) == wanted
+                    and (e.track == label if own else e.track != label and e.track not in missing)
                 ),
                 None,
             )
-            if hit is not None:
-                take(location, hit)
-        for location, label, rin, rout in expected:
-            if location in found:
-                continue
-            if location == "outro.sting":
-                new_range = self._sting_range(draft)
-            else:
-                new_range = self._follow(at, rin, rout)
-            if new_range is None:
-                continue
-            hit = next(
-                (
-                    e
-                    for e in candidates
-                    if not e.used and (e.track, e.record_in, e.record_out) == (label, *new_range)
-                ),
-                None,
-            )
-            if hit is not None:
-                take(location, hit)
+
+        def evidence(own: bool) -> bool:
+            """One round of position evidence: each title's own range, then the range its
+            content moved to. True when a title was matched."""
+            before = len(found)
+            for location, label, rin, rout in expected:
+                if location not in found:
+                    hit = at_range(label, (rin, rout), own)
+                    if hit is not None:
+                        take(location, label, hit, "timeline")
+            for location, label, rin, rout in expected:
+                if location in found:
+                    continue
+                if location == "outro.sting":
+                    new_range = self._sting_range(draft)
+                else:
+                    new_range = self._follow(at, rin, rout)
+                hit = at_range(label, new_range, own) if new_range is not None else None
+                if hit is not None:
+                    take(location, label, hit, "content")
+            return len(found) > before
+
+        # every title's own track before any other track (two titles may share a range on two
+        # lanes); across tracks until nothing more is found (a match can free a track)
+        evidence(True)
+        for _ in expected:
+            if not evidence(False):
+                break
         for label in sorted({e[1] for e in expected}):
             missing = [e for e in expected if e[1] == label and e[0] not in found]
             left = [e for e in candidates if e.track == label and not e.used]
@@ -1105,18 +1436,19 @@ class _Importer:
                 for (location, *_), entry in zip(
                     sorted(missing, key=lambda e: (e[2], e[0])), left, strict=True
                 ):
-                    take(location, entry)
+                    take(location, label, entry, "order")
         total = draft.total_frames()
         titles = []
         for index, title in enumerate(self.plan.titles):
             location = f"titles[{index}]"
-            entry = found.get(location)
+            entry, by = found.get(location, (None, ""))
             if entry is None:
                 self.drop(
                     "title_removed",
                     location,
-                    f"no title item on its track for {title.record_in}..{title.record_out}; "
-                    "removed in Resolve",
+                    f"no title item on any video track at {title.record_in}..{title.record_out} "
+                    "or where its content went, and none left to pair by order; removed in "
+                    "Resolve",
                 )
                 continue
             if entry.record_out > total:
@@ -1127,10 +1459,23 @@ class _Importer:
                 )
                 continue
             new = (entry.record_in, entry.record_out)
-            self.moved(location, "timeline", (title.record_in, title.record_out), new)
+            old = (title.record_in, title.record_out)
+            self.moved(location, by, old, new)
+            if by == "order":
+                self.uncertain_titles.append(
+                    {
+                        "location": location,
+                        "track": entry.track,
+                        "old": {"record_in": old[0], "record_out": old[1]},
+                        "new": {"record_in": new[0], "record_out": new[1]},
+                        "detail": "paired by order on its track: no title item at its range or "
+                        "where its content went, and the text is not read, so this may be "
+                        "another title (one the owner added, or another plan title)",
+                    }
+                )
             titles.append(title.model_copy(update={"record_in": new[0], "record_out": new[1]}))
         if "outro.sting" in [e[0] for e in expected]:
-            entry = found.get("outro.sting")
+            entry = found.get("outro.sting", (None, ""))[0]
             want = self._sting_range(draft)
             if entry is None or (entry.record_in, entry.record_out) != want:
                 self.carry_not(
@@ -1364,11 +1709,18 @@ class _Importer:
         new_ranges = edited.record_ranges()
         segs = self.plan.segments
         match_of = {self.content_index[id(e)]: e.match for c in self.content.values() for e in c}
+        kept_by = {
+            self.content_index[id(e)]: e.reason
+            for c in self.content.values()
+            for e in c
+            if e.stands_for is not None
+        }
         also_of = {
             self.content_index[i]: others
             for i, others in self.alternatives.items()
             if i in self.content_index
         }
+        guessed = {self.content_index[i] for i in self.guessed if i in self.content_index}
         groups = self._join_groups()
         rows: list[dict[str, Any]] = []
         for i, seg in enumerate(segs):
@@ -1399,8 +1751,10 @@ class _Importer:
                 "head_frames": None,
                 "tail_frames": None,
                 "joined": None,
+                "kept_because": None,
             }
             new = row["new"]
+            kept = [kept_by[n["index"]] for n in new if n["index"] in kept_by]
             group = groups.get(i)
             if group is not None:
                 keeper = next(j for j in group if self.pieces.get(j))
@@ -1412,6 +1766,9 @@ class _Importer:
                     row["tail_frames"] = segs[group[-1]].src_out - new[0]["src_out"]
             elif not new:
                 row["status"] = "removed"
+            elif kept:
+                row["status"] = "kept"
+                row["kept_because"] = kept[0]
             elif len(new) > 1:
                 row["status"] = "split"
             elif (new[0]["src_in"], new[0]["src_out"]) != (seg.src_in, seg.src_out):
@@ -1442,12 +1799,26 @@ class _Importer:
                     }
                 )
         added.sort(key=lambda a: a["index"])
+
+        def why(k: int, i: int) -> str:
+            if k in kept_by:
+                return "not_carried_item"
+            key = (segs[i].source, segs[i].src_in, segs[i].src_out)
+            if all((segs[j].source, segs[j].src_in, segs[j].src_out) == key for j in also_of[k]):
+                return "same_source_range"
+            return "overlap"
+
         uncertain = sorted(
             (
-                {"index": k, "assigned_to": i, "also_overlaps": also_of[k]}
+                {
+                    "index": k,
+                    "assigned_to": i,
+                    "why": why(k, i),
+                    "also_overlaps": also_of.get(k, []),
+                }
                 for i, ks in self.pieces.items()
                 for k in ks
-                if also_of.get(k)
+                if also_of.get(k) or k in guessed
             ),
             key=lambda u: u["index"],
         )
@@ -1466,6 +1837,8 @@ class _Importer:
             and not self.not_carried
             and not self.dropped
             and not self.repositioned
+            and not self.track_mismatch
+            and not self.uncertain_titles
             and (outro is None or outro["status"] == "unchanged")
         )
         tl = self.timeline
@@ -1483,6 +1856,8 @@ class _Importer:
             "matched_by_file_name": by_name,
             "segments": rows,
             "uncertain_matches": uncertain,
+            "uncertain_titles": self.uncertain_titles,
+            "track_mismatch": self.track_mismatch,
             "added": added,
             "outro": outro,
             "repositioned": self.repositioned,
@@ -1499,6 +1874,10 @@ class _Importer:
         out: dict[int, tuple[int, int]] = {}
         for content in self.content.values():
             for entry in content:
+                if entry.stands_for is not None:
+                    seg = self.plan.segments[entry.stands_for]
+                    out[self.content_index[id(entry)]] = (seg.src_in, seg.src_out)
+                    continue
                 assert entry.src_in is not None and entry.src_out is not None
                 out[self.content_index[id(entry)]] = (entry.src_in, entry.src_out)
         return out

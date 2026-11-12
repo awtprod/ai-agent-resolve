@@ -499,8 +499,8 @@ def test_a_trimmed_recap_keeps_its_own_fields() -> None:
     assert [k.zoom for k in result.plan.segments[2].reframe] == [2.0]
     # the recap item overlapped the main take too: the diff says so
     assert result.diff["uncertain_matches"] == [
-        {"index": 0, "assigned_to": 0, "also_overlaps": [2]},
-        {"index": 2, "assigned_to": 2, "also_overlaps": [0]},
+        {"index": 0, "assigned_to": 0, "why": "overlap", "also_overlaps": [2]},
+        {"index": 2, "assigned_to": 2, "why": "overlap", "also_overlaps": [0]},
     ]
 
 
@@ -779,7 +779,7 @@ def test_a_ripple_delete_moves_broll_titles_captions_and_markers() -> None:
     assert [
         (e["location"], e["by"], e["new"]["record_in"]) for e in result.diff["repositioned"]
     ] == [
-        ("titles[0]", "timeline", 20),
+        ("titles[0]", "content", 20),
         ("captions[0]", "content", 60),
         ("markers[0]", "content", 10),
     ]
@@ -902,7 +902,9 @@ def test_stills_are_not_carried() -> None:
     result = import_timeline(plan, timeline, media, profile=permissive())
     # the photo, and both camB pictures with their sounds
     assert codes(result).count("still_image") == 5
-    assert statuses(result) == ["unchanged", "removed", "moved", "removed"]
+    # each camB still stands where its plan segment was: the plan keeps its own version
+    assert statuses(result) == ["unchanged", "kept", "moved", "kept"]
+    assert [result.diff["segments"][i]["kept_because"] for i in (1, 3)] == ["still_image"] * 2
 
 
 @pytest.mark.parametrize(
@@ -931,7 +933,7 @@ def test_a_speed_other_than_100_percent_is_retimed_whatever_the_timemap_says() -
     v1.items[1] = dataclasses.replace(v1.items[1], speed=0.5, timemap_form=None)
     result = import_timeline(plan, timeline, media, profile=permissive())
     assert codes(result)[0] == "retimed"
-    assert statuses(result)[1] == "removed"
+    assert statuses(result)[1] == "kept"
 
 
 def test_unreadable_items_are_not_carried() -> None:
