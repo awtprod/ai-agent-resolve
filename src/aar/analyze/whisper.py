@@ -60,8 +60,9 @@ and file time, with the source audio's level over it (RMS of the un-normalised m
 taken from the decode already in memory, or with normalisation on, from one more bounded decode
 of just that stretch, for at most the ``MAX_LEVEL_DECODES`` (20) longest; a level that is not
 measured or whose decode failed is null with a ``level_error``, and never fails the transcript).
-``wordless_min_s`` is at least ``WORDLESS_MIN_FLOOR_S`` (1 s). It is information, not an error (a real show has a silent house before it
-starts): **no words is not silence**. A stretch may hold speech the transcriber missed.
+``wordless_min_s`` is at least ``WORDLESS_MIN_FLOOR_S`` (1 s). It is information, not an error
+(a real show has a silent house before it starts): **no words is not silence**. A stretch may
+hold speech the transcriber missed.
 """
 
 from __future__ import annotations
