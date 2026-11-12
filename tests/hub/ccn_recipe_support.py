@@ -6,8 +6,13 @@ step's instruction says (``aar hub artifact get``, ``aar plan produce``, ``aar p
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
-from collections.abc import Callable
+import os
+import re
+import shlex
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -19,7 +24,7 @@ from aar.cli import main
 from aar.hub.writes import create_brief, create_recipe
 from aar.plan.inputs import Transcript, Word
 from aar.recipes import registry
-from aar.recipes.run import recipe_start, step_complete
+from aar.recipes.run import recipe_start
 from aar.recipes.state import load_state
 from aar.recipes.worker import run_worker
 from ccn_support import KEEP, SECONDS, WORDS, make_show
@@ -39,6 +44,7 @@ class CcnEnv:
     exports: Path
     agent: Path
     calls: list[dict[str, Any]] = field(default_factory=list)
+    resumes: list[bool] = field(default_factory=list)
     words: tuple[tuple[str, float, float], ...] = WORDS
 
     @property
@@ -84,6 +90,7 @@ def fake_transcriber(env: CcnEnv) -> Callable[..., dict[str, Any]]:
         env.calls.append(
             {"media": str(media), "model": settings.model, "normalize": settings.normalize}
         )
+        env.resumes.append(resume)
         shift = offset.offset_s if offset is not None else 0.0
         words = [Word(text=t, start_s=a + shift, end_s=b + shift) for t, a, b in env.words]
         Path(out).write_text(
@@ -106,18 +113,26 @@ def fake_transcriber(env: CcnEnv) -> Callable[..., dict[str, Any]]:
     return transcribe
 
 
-def make_run(env: CcnEnv, params: dict[str, Any], *, key: str = "1", kind: str = "longform") -> str:
+def make_run(
+    env: CcnEnv,
+    params: dict[str, Any],
+    *,
+    key: str = "1",
+    kind: str = "longform",
+    project: str | None = None,
+) -> str:
     """A typed brief and a ``ccn-longform`` recipe node; returns the recipe node id."""
     hub = env.hub
+    project_id = project or hub.project_id
     brief = create_brief(
         hub.log,
-        brief_data(hub.project_id, kind=kind, recipe=RECIPE, show="Synthetic Show"),
+        brief_data(project_id, kind=kind, recipe=RECIPE, show="Synthetic Show"),
         AGENT,
         idempotency_key=f"brief-{key}",
     )
     recipe = create_recipe(
         hub.log,
-        hub.project_id,
+        project_id,
         {"recipe": RECIPE, "brief_id": brief.body["node"]["id"], "params": params},
         AGENT,
         idempotency_key=f"recipe-{key}",
@@ -157,6 +172,36 @@ def fetch(env: CcnEnv, artifact_id: str, name: str) -> Path:
     return out
 
 
+GUIDE_BLOCK = re.compile(r"```sh\n(.*?)```", re.DOTALL)
+
+
+@contextlib.contextmanager
+def _in(folder: Path, **env: str) -> Iterator[None]:
+    old_cwd = Path.cwd()
+    old_env = {k: os.environ.get(k) for k in env}
+    os.chdir(folder)
+    os.environ.update(env)
+    try:
+        yield
+    finally:
+        os.chdir(old_cwd)
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def read_guide(env: CcnEnv, recipe_node: str) -> str:
+    """Fetch the guide with the exact command the guide step's outputs give."""
+    command = outputs(env, recipe_node, "guide")["read_guide"]
+    argv = shlex.split(command)
+    assert argv[0] == "aar"
+    with _in(env.agent), contextlib.redirect_stdout(io.StringIO()):
+        assert main([*argv[1:], "--force"]) == 0
+    return (env.agent / "guide.md").read_text(encoding="utf-8")
+
+
 def agent_cut(
     env: CcnEnv,
     recipe_node: str,
@@ -166,63 +211,51 @@ def agent_cut(
     key: str = "r1",
     schedule: dict[str, Any] | None = None,
 ) -> str:
-    """Do the ``cut`` step as an agent following its instruction; return the plan node id."""
-    stub_out = outputs(env, recipe_node, "stub")
-    text_out = outputs(env, recipe_node, "transcript")
-    stub = fetch(env, stub_out["stub"], "stub.json")
-    transcript = fetch(env, text_out["transcript"], "transcript.json")
-    fetch(env, text_out["text"], "transcript.txt")
-    keep_file = env.agent / "keep.json"
-    body = keep or KEEP
-    keep_file.write_text(
-        json.dumps({"recording": stub_out["recording_id"], **body}), encoding="utf-8"
+    """Do the ``cut`` step as an agent following the guide alone: its fetch commands, its
+    produce and lint commands and its submit and complete commands, run as written (only the
+    placeholders filled in). Returns the plan node id."""
+    guide = read_guide(env, recipe_node)
+    fetch_block, make_block, submit_block, *_ = GUIDE_BLOCK.findall(guide)
+    recording = json.loads(re.search(r'"recording": (".*?")', guide).group(1))
+    (env.agent / "keep.json").write_text(
+        json.dumps({"recording": recording, **(keep or KEEP)}), encoding="utf-8"
     )
-    plan = env.agent / f"plan.{key}.json"
-    argv = ["plan", "produce", str(stub), "--transcript", str(transcript)]
-    argv += ["--keep", str(keep_file), "--out", str(plan), stub_out["pause_trim_flag"]]
-    sync_out = outputs(env, recipe_node, "sync")
-    if sync_out.get("report"):
-        argv += ["--sync", str(fetch(env, sync_out["report"], "sync.json"))]
-    laughs_out = outputs(env, recipe_node, "laughs")
-    if laughs_out.get("map"):
-        argv += ["--laughs", str(fetch(env, laughs_out["map"], "laughs.json"))]
     if schedule is not None:
-        sched = env.agent / "schedule.json"
-        sched.write_text(json.dumps(schedule), encoding="utf-8")
-        argv += ["--schedule", str(sched)]
-    assert main(argv) == 0
-    assert main(["plan", "lint", str(plan), "--transcript", str(transcript)]) == 0
-    request = env.agent / f"submit.{key}.json"
-    request.write_text(
+        (env.agent / "schedule.json").write_text(json.dumps(schedule), encoding="utf-8")
+    quiet = io.StringIO()
+    with _in(env.agent), contextlib.redirect_stdout(quiet):
+        for line in fetch_block.splitlines():
+            assert main([*shlex.split(line)[1:], "--force"]) == 0, line
+        for line in make_block.splitlines():
+            assert main(shlex.split(line)[1:]) == 0, line
+    plan = json.loads((env.agent / "plan.json").read_text(encoding="utf-8"))
+    (env.agent / "submit.json").write_text(
         json.dumps(
             {
                 "project_id": env.hub.project_id,
                 "derives_from": derives_from or recipe_node,
-                "plan": json.loads(plan.read_text(encoding="utf-8")),
+                "plan": plan,
             }
         ),
         encoding="utf-8",
     )
-    write = ["hub", "write", "plan", "--db", env.db, "--artifacts", env.artifacts]
-    write += ["--actor", "agent:agent-1", "--idempotency-key", f"plan-{key}", str(request)]
-    plan_node = _json_main(write)["node"]["id"]
-    step_complete(
-        env.hub.log,
-        env.hub.store,
-        recipe_node,
-        "cut",
-        None,
-        {"plan_node": plan_node},
-        AGENT,
-        idempotency_key=f"cut-{key}",
-    )
+    write_line, complete_line = submit_block.strip().splitlines()
+    fill = {"<you>": "agent-1", "<new key>": f"plan-{key}"}
+    for old, value in fill.items():
+        write_line = write_line.replace(old, value)
+    with _in(env.agent):
+        plan_node = _json_main(shlex.split(write_line)[1:])["node"]["id"]
+    (env.agent / "complete.json").write_text(json.dumps({"plan_node": plan_node}))
+    complete = complete_line.split("|", 1)[1].replace("<you>", "agent-1")
+    complete = complete.replace("<new key>", f"cut-{key}")
+    words = shlex.split(complete)
+    assert words[0] == "AAR_RECIPES=aar.recipes.ccn" and words[1] == "aar"
+    with _in(env.agent, AAR_RECIPES="aar.recipes.ccn"):
+        _json_main([*words[2:], "complete.json"])
     return plan_node
 
 
 def _json_main(argv: list[str]) -> dict[str, Any]:
-    import contextlib
-    import io
-
     buffer = io.StringIO()
     with contextlib.redirect_stdout(buffer):
         code = main(argv)

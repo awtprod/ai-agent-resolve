@@ -97,6 +97,16 @@ class CcnLongformParams(BaseModel):
         return value
 
     @model_validator(mode="after")
+    def _distinct(self) -> CcnLongformParams:
+        seen: set[str] = set()
+        for n, source in enumerate(self.sources):
+            real = os.path.realpath(source.path)
+            if real in seen:
+                raise ValueError(f"sources[{n}] {source.path!r} is a file already given")
+            seen.add(real)
+        return self
+
+    @model_validator(mode="after")
     def _covered(self) -> CcnLongformParams:
         mapping = media_map_from_mapping(self.media_map)
         for n, source in enumerate(self.sources):

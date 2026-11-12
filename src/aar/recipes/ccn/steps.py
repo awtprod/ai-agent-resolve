@@ -1,41 +1,38 @@
 """The cold steps of ``ccn-longform``: each calls the library the CLI calls, never the CLI.
 
-Every step reads its inputs from the params and the earlier steps' outputs (artifact ids), keeps
-its scratch under ``AAR_WORK_DIR`` (never the system temp dir, never the artifact store's disk),
-removes that scratch on success and failure, stores what it makes as artifacts, and fails with a
-typed :class:`~aar.recipes.context.StepFailure` (a stable code and a fix hint). The transcriber and
-the laughs analysis are injectable (:func:`set_transcriber`, :func:`set_laughs_runner`) so tests
-need no model and no paid API.
+Every step reads its inputs from the params and the earlier steps' runner-recorded outputs
+(artifact ids), keeps its scratch under ``AAR_WORK_DIR`` (:mod:`~aar.recipes.ccn.scratch`: never
+the system temp dir, never the artifact store's disk), removes it on success and failure, stores
+what it makes as artifacts, and fails with a typed :class:`~aar.recipes.context.StepFailure` (a
+stable code and a fix hint). A worker that is stopping before a step's work began raises
+:class:`~aar.recipes.ccn.transcript.StepInterrupted` past the worker, so the claim lapses and the
+(idempotent) step is claimed again instead of using an attempt. The transcriber and the laughs
+analysis are injectable (:func:`set_transcriber`, :func:`set_laughs_runner`) so tests need no
+model and no paid API.
+
+**The agent's plan is checked against the run, not trusted** (:func:`check_plan`): before the
+render and the export, every source of the submitted plan must be one of the stub's, with the
+same media path (and that path inside ``AAR_MEDIA_ROOT``, as the params are checked) and the same
+recording, frame size and start timecode, and the plan's frame rate, resolution, kind, project
+and timeline must be the stub's. The export's folder and file names come from the stub step's
+runner-recorded outputs, never from the plan.
 """
 
 from __future__ import annotations
 
-import contextlib
-import hashlib
 import json
 import os
-import re
-import secrets
-import shutil
 import signal
-from collections.abc import Callable, Iterator, Mapping
-from dataclasses import replace
+from collections.abc import Callable
 from fractions import Fraction
-from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
 
 from aar.analyze.common import offset_from_plan
 from aar.analyze.errors import AnalyzeError
-from aar.analyze.laughs import analyse_laughs
+from aar.analyze.laughs import LaughSettings, analyse_laughs
 from aar.analyze.sync import SyncSettings, sync_files
-from aar.analyze.text import render_text
-from aar.analyze.whisper import CCN_PRESET, MODEL_DIR_ENV, WhisperSettings, transcribe_file
-from aar.host.transport import sha256_file
-from aar.hub.facts import facts_view
-from aar.hub.graph import WorkGraph
-from aar.node.jobs.file_lock import FileLockUnavailable, acquire_file_lock, release_file_lock
 from aar.plan.export import ExportError, export_fcpxml, media_map_from_mapping
 from aar.plan.inputs import LaughMap, Transcript
 from aar.plan.model import EditPlan
@@ -43,20 +40,37 @@ from aar.plan.profile import Profile
 from aar.plan.render import RenderError, RenderTerminated, render_plan
 from aar.plan.stub import StubError, StubSource, build_stub
 from aar.qa.report import QAReport
-from aar.recipes.ccn.params import CcnLongformParams
+from aar.recipes.ccn import transcript as transcript_mod
+from aar.recipes.ccn.export_files import copy_out, safe_name
+from aar.recipes.ccn.guide import build_guide
+from aar.recipes.ccn.params import CcnLongformParams, check_hub_file
+from aar.recipes.ccn.scratch import drop_scratch, op_scratch
+from aar.recipes.ccn.transcript import (
+    StepInterrupted,
+    check_cancelled,
+    library_timeout,
+    media_seconds,
+    set_transcriber,
+    transcript_cache_key,
+    whisper_settings,
+)
 from aar.recipes.context import StepContext, StepFailure, StepOutput
-from aar.recipes.events import RUNNER, STEP_SCHEMA
-from aar.recipes.gates import qa_gate
+from aar.recipes.gates import GateResult, qa_gate
 from aar.recipes.state import load_state
 
-WORK_DIR_ENV = "AAR_WORK_DIR"
-EXPORT_DIR_ENV = "AAR_EXPORT_DIR"
 #: The QA checks a review render must clear. ``size-cap`` is required too, but for a render QA'd
 #: at the plan's own kind it is skipped as not applicable (the gate counts that as clear): the
 #: review MP4 never leaves the hub, so the 20 MB review-transfer cap does not apply to it.
-REQUIRED_QA = ("decode", "loudness", "clipping", "longest-silence", "size-cap", "duration")
-#: A cut's joins must be quiet; with no cut (one segment) the check passes trivially.
-REQUIRED_QA_JOINS = ("join-quiet",)
+REQUIRED_QA = (
+    "decode",
+    "loudness",
+    "clipping",
+    "longest-silence",
+    "size-cap",
+    "duration",
+    "join-quiet",
+)
+#: Only the longest silence may warn; a loudness, clipping or join warning fails the gate.
 ALLOW_WARN = frozenset({"longest-silence"})
 SIZE_CAP_NOTE = (
     "not applied: QA runs at the plan's kind, so the 20 MB review-transfer cap (QA kind review) "
@@ -66,20 +80,12 @@ QA_NOT_REQUIRED = {
     "join-retranscribe": "needs a transcriber in QA; the hub render runs QA without one",
     "caption-coverage": "a long-form plan has no captions",
 }
-MAX_WORDLESS_LISTED = 20
-MAX_COPY_SUFFIX = 50
-_UNSAFE = re.compile(r"[^A-Za-z0-9 ._-]+")
-_RESERVED = re.compile(r"^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$", re.IGNORECASE)
+#: The plan source fields that must equal the stub's (produce copies them from the stub).
+SOURCE_FIELDS = ("media", "recording_id", "frame_size", "start_timecode", "start_timecode_rate")
+PLAN_FIELDS = ("fps", "resolution", "kind", "project", "timeline")
 
-Transcribe = Callable[..., dict[str, Any]]
 LaughsRunner = Callable[..., dict[str, Any]]
-_TRANSCRIBE: list[Transcribe] = [transcribe_file]
 _LAUGHS: list[LaughsRunner] = [analyse_laughs]
-
-
-def set_transcriber(fn: Transcribe | None) -> None:
-    """Use ``fn`` (``transcribe_file``'s signature) for the transcript step; None restores it."""
-    _TRANSCRIBE[0] = fn or transcribe_file
 
 
 def set_laughs_runner(fn: LaughsRunner | None) -> None:
@@ -106,37 +112,6 @@ def _profile(ctx: StepContext) -> Profile:
     return ctx.profile
 
 
-def work_root() -> Path:
-    """``AAR_WORK_DIR``: where every step keeps its scratch; a typed failure when unset."""
-    raw = os.environ.get(WORK_DIR_ENV, "").strip()
-    if not raw or not os.path.isabs(raw):
-        raise StepFailure(
-            "work_dir_unset",
-            f"{WORK_DIR_ENV} is not set to an absolute directory",
-            f"set {WORK_DIR_ENV} for the worker (a directory on the media disk, not /tmp)",
-        )
-    root = Path(raw)
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise StepFailure(
-            "work_dir_unusable", f"cannot use {WORK_DIR_ENV} {raw!r}: {exc}", "fix its permissions"
-        ) from None
-    return root
-
-
-@contextlib.contextmanager
-def _scratch(parent: Path) -> Iterator[Path]:
-    """A fresh private directory under ``parent``, removed afterwards whatever happens."""
-    parent.mkdir(parents=True, exist_ok=True)
-    path = parent / f"run-{secrets.token_hex(6)}"
-    path.mkdir(mode=0o700)
-    try:
-        yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
-
-
 def _need(ctx: StepContext, step: str, key: str) -> Any:
     value = ctx.needs.get(step, {}).get(key)
     if value is None:
@@ -149,18 +124,8 @@ def _json_artifact(ctx: StepContext, value: Any, role: str) -> str:
     return ctx.put(data, mime="application/json", meta={"role": role})
 
 
-def _read_json(ctx: StepContext, artifact_id: str) -> Any:
-    return json.loads(ctx.get(artifact_id).decode("utf-8"))
-
-
 def _stub_plan(ctx: StepContext) -> EditPlan:
     return EditPlan.model_validate_json(ctx.get(_need(ctx, "stub", "stub")))
-
-
-def _cut_plan(ctx: StepContext) -> tuple[str, EditPlan]:
-    plan_node = _need(ctx, "cut", "plan_node")
-    plan = EditPlan.model_validate_json(ctx.get(_need(ctx, "cut", "plan_sha256")))
-    return plan_node, plan
 
 
 def _transcript(ctx: StepContext) -> Transcript:
@@ -177,9 +142,9 @@ def _analyze_failure(step: str, exc: AnalyzeError) -> StepFailure:
     return StepFailure(f"{step}_{exc.type}", str(exc), exc.hint)
 
 
-def _check_cancelled(ctx: StepContext) -> None:
-    if ctx.cancelled():
-        raise StepFailure("cancelled", "the worker is stopping", "retry the step")
+def _round(ctx: StepContext) -> int:
+    state = load_state(ctx.log, ctx.recipe_node, project_id=ctx.project_id)
+    return next((op.round for op in state.ops if op.op_id == ctx.op_node), state.current_round())
 
 
 # -- 1. stub ----------------------------------------------------------------------------------
@@ -199,6 +164,7 @@ def stub_step(ctx: StepContext) -> StepOutput:
             f"the brief is a {brief.kind}, the params ask for a {params.kind}",
             "make the params' kind the brief's",
         )
+    check_cancelled(ctx)
     sources = [
         StubSource(s.path, camera=s.camera, shot_size=s.shot_size, id=s.id) for s in params.sources
     ]
@@ -221,6 +187,8 @@ def stub_step(ctx: StepContext) -> StepOutput:
     return StepOutput(
         outputs={
             "stub": stub_id,
+            "project": result.plan.project,
+            "timeline": result.plan.timeline,
             "fps": report["fps"],
             "resolution": report["resolution"],
             "recording_id": params.recording_id,
@@ -255,15 +223,16 @@ def sync_step(ctx: StepContext) -> StepOutput:
         return StepOutput(
             outputs={"synced": False, "report": None, "reason": "one source: nothing to sync"}
         )
-    _check_cancelled(ctx)
+    check_cancelled(ctx)
     fps = Fraction(stub.fps.num, stub.fps.den)
+    longest = max((media_seconds(stub, i) or 0.0) for i in range(len(media))) or None
     try:
         report = sync_files(
             media[0].media,
             [s.media for s in media[1:]],
             fps=fps,
             ref_origin=0,
-            settings=SyncSettings(),
+            settings=SyncSettings(timeout_s=library_timeout(ctx, longest)),
         )
     except AnalyzeError as exc:
         raise _analyze_failure("sync", exc) from None
@@ -292,222 +261,10 @@ def sync_step(ctx: StepContext) -> StepOutput:
 # -- 3. transcript ----------------------------------------------------------------------------
 
 
-def whisper_settings(params: CcnLongformParams) -> WhisperSettings:
-    """The CCN preset with the params' model, threads and normalisation."""
-    return replace(
-        CCN_PRESET,
-        model=params.whisper_model,
-        cpu_threads=params.whisper_threads,
-        normalize=params.normalize_audio,
-    )
-
-
-def transcript_cache_key(
-    media_sha256: str, settings: WhisperSettings, recording: str, offset_s: float
-) -> str:
-    """The ``transcript.<key>`` fact key part: the sha256 of the media's hash, the model and
-    every setting that changes the words or the report (not the thread count or the caps)."""
-    words = {
-        **settings.decode_settings(),
-        "no_speech_prob_max": settings.no_speech_prob_max,
-        "avg_logprob_min": settings.avg_logprob_min,
-        "compression_ratio_max": settings.compression_ratio_max,
-        "wordless_min_s": settings.wordless_min_s,
-    }
-    body = {
-        "media_sha256": media_sha256,
-        "settings": words,
-        "recording": recording,
-        "offset_s": offset_s,
-    }
-    canon = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(canon).hexdigest()
-
-
-def _made_by_a_transcript_step(ctx: StepContext, artifact_id: str) -> bool:
-    """Whether the artifact was stored by a runner-created ``transcript`` step op in this project
-    (so a fact anyone may record cannot point the cache at bytes a step never made)."""
-    meta = ctx.store.get_meta(artifact_id)
-    if meta is None or meta.project_id != ctx.project_id or meta.producing_op is None:
-        return False
-    graph = WorkGraph(ctx.log, ctx.project_id)
-    node = graph.node(meta.producing_op)
-    if node is None or node.kind != "op" or graph.creator(node.id) != RUNNER:
-        return False
-    data = node.payload
-    return (
-        isinstance(data, dict)
-        and data.get("schema") == STEP_SCHEMA
-        and data.get("step_id") == "transcript"
-    )
-
-
-def _cached(ctx: StepContext, key: str, media_sha256: str, model: str) -> dict[str, Any] | None:
-    fact = facts_view(ctx.log, ctx.project_id).get(f"transcript.{key}")
-    if fact is None or not isinstance(fact.current.value, dict):
-        return None
-    value = fact.current.value
-    if value.get("media_sha256") != media_sha256 or value.get("model") != model:
-        return None
-    ids = [value.get(name) for name in ("transcript", "text", "report")]
-    for artifact_id in ids:
-        if not isinstance(artifact_id, str) or not ctx.store.has(artifact_id):
-            return None
-        if not _made_by_a_transcript_step(ctx, artifact_id):
-            return None
-    return value
-
-
-def _wordless_summary(report: Mapping[str, Any]) -> dict[str, Any]:
-    wordless = report.get("wordless") or {}
-    stretches = list(wordless.get("stretches") or [])
-    return {
-        "total_s": wordless.get("total_s"),
-        "file_duration_s": wordless.get("file_duration_s"),
-        "longest": wordless.get("longest"),
-        "count": len(stretches),
-        "stretches": [
-            {k: s.get(k) for k in ("start_s", "end_s", "duration_s", "level_dbfs")}
-            for s in stretches[:MAX_WORDLESS_LISTED]
-        ],
-        "note": "no words is not silence: these stretches may hold quiet speech or laughter",
-    }
-
-
-def _transcribe(
-    ctx: StepContext,
-    media: Path,
-    settings: WhisperSettings,
-    stub: EditPlan,
-    reference: str,
-    key: str,
-) -> tuple[Path, dict[str, Any], Path]:
-    """Run the transcriber into ``<work>/aar-transcripts/<key>/`` under a lock (one run per file
-    and settings at a time), resuming a checkpoint an interrupted attempt left there."""
-    folder = work_root() / "aar-transcripts" / key
-    folder.mkdir(parents=True, exist_ok=True)
-    out = folder / "transcript.json"
-    offset = offset_from_plan(stub, reference)
-    kwargs = {
-        "settings": settings,
-        "model_dir": os.environ.get(MODEL_DIR_ENV) or None,
-        "offset": offset,
-        "recording": _params(ctx).recording_id,
-    }
-    try:
-        report = _TRANSCRIBE[0](media, out, resume=True, **kwargs)
-    except AnalyzeError as exc:
-        if exc.type not in ("checkpoint-mismatch", "checkpoint-corrupt"):
-            raise
-        # an interrupted run of other input bytes: start over, never splice two runs
-        for leftover in folder.iterdir():
-            if leftover.is_file():
-                leftover.unlink()
-        report = _TRANSCRIBE[0](media, out, resume=False, **kwargs)
-    return out, report, folder
-
-
 def transcript_step(ctx: StepContext) -> StepOutput:
-    """Transcribe the reference source (or reuse the stored transcript of the same file, model
-    and settings), store it with its readable text and report, and record the cache fact."""
-    params = _params(ctx)
-    stub = _stub_plan(ctx)
-    reference = stub.sources[0]
-    media = Path(reference.media)
-    settings = whisper_settings(params)
-    offset_s = offset_from_plan(stub, reference.id).offset_s
-    _check_cancelled(ctx)
-    try:
-        media_sha256 = sha256_file(str(media)).lower()
-    except OSError as exc:
-        raise StepFailure(
-            "transcript_unreadable", f"cannot read {str(media)!r}: {exc}", ""
-        ) from None
-    key = transcript_cache_key(media_sha256, settings, params.recording_id, offset_s)
-    common = {
-        "media_sha256": media_sha256,
-        "model": settings.model,
-        "normalize": settings.normalize,
-        "cache_key": key,
-        "recording": params.recording_id,
-    }
-    hit = _cached(ctx, key, media_sha256, settings.model)
-    if hit is not None:
-        report = _read_json(ctx, hit["report"])
-        words = len(_transcript_from(ctx.get(hit["transcript"])).words)
-        return StepOutput(
-            outputs={
-                **common,
-                "cached": True,
-                "transcript": hit["transcript"],
-                "text": hit["text"],
-                "report": hit["report"],
-                "words": words,
-                "wordless": _wordless_summary(report),
-            },
-            artifact_ids=(hit["transcript"], hit["text"], hit["report"]),
-        )
-    _check_cancelled(ctx)
-    lock = work_root() / "aar-transcripts" / f"{key}.lock"
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = acquire_file_lock(str(lock))
-    except FileLockUnavailable:
-        raise StepFailure(
-            "transcript_busy",
-            "another worker is transcribing this file with these settings",
-            "retry the step when that run finishes (its transcript is then reused)",
-        ) from None
-    folder: Path | None = None
-    try:
-        try:
-            out, report, folder = _transcribe(ctx, media, settings, stub, reference.id, key)
-        except AnalyzeError as exc:
-            raise _analyze_failure("transcript", exc) from None
-        raw = out.read_bytes()
-        transcript = _transcript_from(raw)
-        text = render_text(transcript, wordless_min_s=settings.wordless_min_s)
-        transcript_id = ctx.put(raw, mime="application/json", meta={"role": "transcript"})
-        text_id = ctx.put(text.encode("utf-8"), mime="text/plain", meta={"role": "transcript-text"})
-        report_id = _json_artifact(ctx, report, "transcript-report")
-        ctx.record_fact(
-            f"transcript.{key}",
-            {
-                "media_sha256": media_sha256,
-                "model": settings.model,
-                "recording": params.recording_id,
-                "transcript": transcript_id,
-                "text": text_id,
-                "report": report_id,
-            },
-        )
-    finally:
-        if folder is not None:
-            shutil.rmtree(folder, ignore_errors=True)
-        release_file_lock(fd)
-    return StepOutput(
-        outputs={
-            **common,
-            "cached": False,
-            "transcript": transcript_id,
-            "text": text_id,
-            "report": report_id,
-            "words": len(transcript.words),
-            "wordless": _wordless_summary(report),
-        },
-        artifact_ids=(transcript_id, text_id, report_id),
-    )
-
-
-def _transcript_from(raw: bytes) -> Transcript:
-    try:
-        return Transcript.model_validate_json(raw)
-    except ValidationError as exc:
-        raise StepFailure(
-            "transcript_invalid",
-            f"the transcript does not validate ({exc.error_count()} problem(s))",
-            "this is a transcriber bug; report it",
-        ) from None
+    """The reference source's transcript (:mod:`aar.recipes.ccn.transcript`)."""
+    _params(ctx)
+    return transcript_mod.transcript_step(ctx, _stub_plan(ctx))
 
 
 # -- 4. laughs --------------------------------------------------------------------------------
@@ -520,8 +277,9 @@ def laughs_step(ctx: StepContext) -> StepOutput:
         return StepOutput(outputs={"skipped": "not requested", "map": None})
     stub = _stub_plan(ctx)
     reference = stub.sources[0]
-    _check_cancelled(ctx)
-    with _scratch(work_root() / "aar-laughs") as folder:
+    check_cancelled(ctx)
+    folder = op_scratch(ctx, "aar-laughs")
+    try:
         out, map_out = folder / "laughs.json", folder / "laughs.map.json"
         try:
             report = _LAUGHS[0](
@@ -529,6 +287,7 @@ def laughs_step(ctx: StepContext) -> StepOutput:
                 out,
                 work_dir=folder / "work",
                 allow_paid=True,
+                settings=LaughSettings(timeout_s=library_timeout(ctx, media_seconds(stub))),
                 offset=offset_from_plan(stub, reference.id),
                 recording=params.recording_id,
                 map_out=map_out,
@@ -544,6 +303,8 @@ def laughs_step(ctx: StepContext) -> StepOutput:
                 "laughs_invalid", f"the laugh map does not validate: {exc}", ""
             ) from None
         map_id = ctx.put(raw_map, mime="application/json", meta={"role": "laugh-map"})
+    finally:
+        drop_scratch(folder)
     summary = {k: report.get(k) for k in ("model", "counts") if k in report}
     return StepOutput(
         outputs={"laughs": laughs_id, "map": map_id, "count": count, **summary},
@@ -551,45 +312,102 @@ def laughs_step(ctx: StepContext) -> StepOutput:
     )
 
 
+# -- 5. guide ---------------------------------------------------------------------------------
+
+
+def guide_step(ctx: StepContext) -> StepOutput:
+    """Write the ``cut`` step's full guide (:mod:`aar.recipes.ccn.guide`) as an artifact, with
+    the hub paths this worker runs on and this run's input artifact ids."""
+    state = load_state(ctx.log, ctx.recipe_node, project_id=ctx.project_id)
+    db = os.path.abspath(ctx.log.path)
+    artifacts = os.path.abspath(ctx.store.root)
+    text = build_guide(
+        db=db,
+        artifacts=artifacts,
+        project_id=ctx.project_id,
+        recipe_node=ctx.recipe_node,
+        brief_id=state.recipe_data.brief_id if state.recipe_data is not None else None,
+        brief=ctx.brief,
+        stub=dict(ctx.needs["stub"]),
+        sync=dict(ctx.needs["sync"]),
+        transcript=dict(ctx.needs["transcript"]),
+        laughs=dict(ctx.needs["laughs"]),
+    )
+    guide_id = ctx.put(text.encode("utf-8"), mime="text/markdown", meta={"role": "cut-guide"})
+    read = (
+        f"aar hub artifact get {guide_id} --db {db} --artifacts {artifacts} "
+        f"--project {ctx.project_id} --out guide.md"
+    )
+    return StepOutput(
+        outputs={"guide": guide_id, "read_guide": read, "db": db, "artifacts": artifacts},
+        artifact_ids=(guide_id,),
+    )
+
+
+# -- the agent's plan, checked ------------------------------------------------------------------
+
+
+def _dump(value: Any) -> Any:
+    return value.model_dump(mode="json") if hasattr(value, "model_dump") else value
+
+
+def check_plan(ctx: StepContext) -> tuple[str, EditPlan]:
+    """The submitted plan, when it matches this run's stub (module docstring); else
+    ``plan_not_from_stub`` naming each difference."""
+    plan_node = _need(ctx, "cut", "plan_node")
+    plan = EditPlan.model_validate_json(ctx.get(_need(ctx, "cut", "plan_sha256")))
+    stub = _stub_plan(ctx)
+    diffs: list[str] = []
+    for name in PLAN_FIELDS:
+        got, want = _dump(getattr(plan, name)), _dump(getattr(stub, name))
+        if got != want:
+            diffs.append(f"{name} is {got!r}, the stub's {want!r}")
+    known = stub.source_map()
+    for source in plan.sources:
+        mine = known.get(source.id)
+        if mine is None:
+            diffs.append(f"source {source.id!r} is not one of the stub's ({', '.join(known)})")
+            continue
+        for name in SOURCE_FIELDS:
+            got, want = _dump(getattr(source, name)), _dump(getattr(mine, name))
+            if got != want:
+                diffs.append(f"source {source.id!r} {name} is {got!r}, the stub's {want!r}")
+        try:
+            check_hub_file(source.media)
+        except ValueError as exc:
+            diffs.append(f"source {source.id!r}: {exc}")
+        else:
+            if os.path.realpath(source.media) != os.path.realpath(mine.media):
+                diffs.append(f"source {source.id!r} media resolves to another file")
+    if diffs:
+        raise StepFailure(
+            "plan_not_from_stub",
+            "the submitted plan does not match this run's stub: " + "; ".join(diffs[:10]),
+            "make the plan with aar plan produce from the stub.json the guide fetches, unedited",
+        )
+    return plan_node, plan
+
+
 # -- 6. render --------------------------------------------------------------------------------
 
 
-def _stale_render_dirs(ctx: StepContext, folder: Path) -> None:
-    """Remove the render dirs earlier attempts of this recipe left (a killed worker), never a
-    live one's."""
-    if not folder.is_dir():
-        return
-    state = load_state(ctx.log, ctx.recipe_node, project_id=ctx.project_id)
-    live = {op.op_id for op in state.ops if op.is_live}
-    for child in folder.iterdir():
-        if child.is_dir() and child.name != ctx.op_node and child.name not in live:
-            shutil.rmtree(child, ignore_errors=True)
-
-
-def safe_name(text: str) -> str:
-    """``text`` as one file or folder name both Linux and Windows accept."""
-    name = _UNSAFE.sub("_", text).strip(" .")[:100].strip(" .")
-    if not name or name in (".", ".."):
-        name = "untitled"
-    if _RESERVED.match(name):
-        name = f"_{name}"
-    return name
+def review_qa_gate(qa: QAReport) -> GateResult:
+    """The review render's QA gate: :data:`REQUIRED_QA`, warnings only in :data:`ALLOW_WARN`."""
+    return qa_gate(qa, required=REQUIRED_QA, allow_warn=ALLOW_WARN)
 
 
 def render_step(ctx: StepContext) -> StepOutput:
     """Render the submitted plan with the review preset on the hub, store the MP4 and its report,
-    and gate the render's QA (failing checks named)."""
+    and gate the render's QA (failing checks named). Idempotent: a re-claimed op starts from an
+    emptied scratch folder and stores content-addressed artifacts."""
     profile = _profile(ctx)
-    plan_node, plan = _cut_plan(ctx)
+    plan_node, plan = check_plan(ctx)
     transcript = _transcript(ctx)
     laughs = _laughs(ctx)
-    _check_cancelled(ctx)
-    recipe_dir = work_root() / "aar-render" / ctx.recipe_node
-    _stale_render_dirs(ctx, recipe_dir)
-    folder = recipe_dir / ctx.op_node
-    folder.mkdir(parents=True, exist_ok=True)
+    check_cancelled(ctx)
+    folder = op_scratch(ctx, "aar-render")
     try:
-        out = folder / f"{safe_name(plan.timeline)}.review.mp4"
+        out = folder / f"{safe_name(_need(ctx, 'stub', 'timeline'))}.review.mp4"
         try:
             result = render_plan(
                 plan, profile, out=out, preset="review", transcript=transcript, laughs=laughs
@@ -597,25 +415,18 @@ def render_step(ctx: StepContext) -> StepOutput:
         except RenderError as exc:
             raise StepFailure(f"render_{exc.code}", exc.message, exc.fix_hint) from None
         except RenderTerminated as exc:
-            # The render's own SIGTERM handler killed ffmpeg and removed its work dir; the
-            # worker's handler is back now, so hand it the signal (it stops claiming work) and
-            # record a retryable failure instead of dying with the claim held.
+            # The render's SIGTERM handler killed ffmpeg and removed its work dir; the worker's
+            # handler is back now: hand it the signal (it stops claiming) and leave the claim to
+            # lapse, so the op is claimed again rather than failed (no attempt is used).
             signal.raise_signal(exc.signum)
-            raise StepFailure(
-                "render_interrupted",
-                f"the render was stopped by signal {exc.signum}",
-                "retry the render step once the worker runs again",
-            ) from None
+            raise StepInterrupted(f"the render was stopped by signal {exc.signum}") from None
         report = result.report
         mp4_id = ctx.put(result.out, mime="video/mp4", meta={"role": "review", "file": out.name})
         report_id = _json_artifact(ctx, report, "render-report")
     finally:
-        shutil.rmtree(folder, ignore_errors=True)
-        with contextlib.suppress(OSError):
-            recipe_dir.rmdir()  # only when empty
+        drop_scratch(folder)
     qa = QAReport.model_validate(report["qa"])
-    required = REQUIRED_QA + REQUIRED_QA_JOINS
-    gate = qa_gate(qa, required=required, allow_warn=ALLOW_WARN)
+    gate = review_qa_gate(qa)
     if not gate.passed:
         failing = [f"{r.name} ({r.detail})" for r in gate.reasons if not r.passed]
         raise StepFailure(
@@ -652,50 +463,14 @@ def render_step(ctx: StepContext) -> StepOutput:
 # -- 7. export --------------------------------------------------------------------------------
 
 
-def _sha256_of(path: Path) -> str:
-    return sha256_file(str(path)).lower()
-
-
-def _copy_targets(folder: Path, stem: str, digests: list[tuple[str, str]]) -> list[Path] | None:
-    """Free (or already identical) destinations for ``(suffix, sha256)`` files named after
-    ``stem``; ``-2``, ``-3``... until none of the set is taken by other bytes. None if all of
-    :data:`MAX_COPY_SUFFIX` are."""
-    for n in range(1, MAX_COPY_SUFFIX + 1):
-        name = stem if n == 1 else f"{stem}-{n}"
-        paths = [folder / f"{name}{suffix}" for suffix, _ in digests]
-        if all(
-            not p.exists() or (p.is_file() and _sha256_of(p) == sha)
-            for p, (_, sha) in zip(paths, digests, strict=True)
-        ):
-            return paths
-    return None
-
-
-def _place_copy(ctx: StepContext, dest: Path, artifact_id: str) -> None:
-    """Copy one artifact to ``dest`` (a temporary file beside it, fsynced, then placed without
-    ever replacing a file); nothing to do when ``dest`` already holds those bytes."""
-    from aar.drp.modify.write import _place
-
-    if dest.exists():
-        return  # _copy_targets checked it holds these bytes
-    tmp = dest.with_name(f".{dest.name}.aar-copy-{secrets.token_hex(4)}")
-    try:
-        with ctx.store.open(artifact_id) as src, tmp.open("xb") as sink:
-            shutil.copyfileobj(src, sink, 1024 * 1024)
-            sink.flush()
-            os.fsync(sink.fileno())
-        tmp.chmod(0o644)
-        _place(tmp, dest, False)
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
 def export_step(ctx: StepContext) -> StepOutput:
     """Export the submitted plan as FCPXML with the params' media map, store it and its report,
-    and copy the FCPXML and the review MP4 to ``AAR_EXPORT_DIR/<project>/<timeline>/``."""
+    and copy the FCPXML and the review MP4 to ``AAR_EXPORT_DIR/<project>/<timeline>/``, named
+    from the stub step's runner-recorded outputs."""
     params = _params(ctx)
     profile = _profile(ctx)
-    _plan_node, plan = _cut_plan(ctx)
+    _plan_node, plan = check_plan(ctx)
+    check_cancelled(ctx)
     try:
         result = export_fcpxml(
             plan,
@@ -707,66 +482,40 @@ def export_step(ctx: StepContext) -> StepOutput:
         )
     except ExportError as exc:
         raise StepFailure(f"export_{exc.code}", exc.message, exc.fix_hint) from None
-    fcpxml = result.fcpxml.encode("utf-8")
-    fcpxml_id = ctx.put(fcpxml, mime="application/xml", meta={"role": "fcpxml"})
+    fcpxml_id = ctx.put(
+        result.fcpxml.encode("utf-8"), mime="application/xml", meta={"role": "fcpxml"}
+    )
     report_id = _json_artifact(ctx, result.report, "export-report")
-    outputs: dict[str, Any] = {
-        "fcpxml": fcpxml_id,
-        "export_report": report_id,
-        "assets": [m.get("src") for m in result.report.get("media", [])][:16],
-    }
     review_mp4 = _need(ctx, "render", "review_mp4")
-    outputs["copy"] = _copy_out(ctx, plan, fcpxml_id, review_mp4)
-    return StepOutput(outputs=outputs, artifact_ids=(fcpxml_id, report_id))
-
-
-def _copy_out(ctx: StepContext, plan: EditPlan, fcpxml_id: str, mp4_id: str) -> dict[str, Any]:
-    raw = os.environ.get(EXPORT_DIR_ENV, "").strip()
-    if not raw:
-        return {"copied": False, "reason": f"{EXPORT_DIR_ENV} is not set: nothing was copied"}
-    root = Path(raw)
-    if not root.is_absolute() or not root.is_dir():
-        raise StepFailure(
-            "export_dir_unusable",
-            f"{EXPORT_DIR_ENV} {raw!r} is not an existing absolute directory",
-            "create it (the media root's share/exports) or unset it",
-        )
-    _check_cancelled(ctx)
-    state = load_state(ctx.log, ctx.recipe_node, project_id=ctx.project_id)
-    round_ = next((op.round for op in state.ops if op.op_id == ctx.op_node), state.current_round())
-    folder = root / safe_name(plan.project) / safe_name(plan.timeline)
-    try:
-        folder.mkdir(parents=True, exist_ok=True)
-        stem = f"{safe_name(plan.timeline)}.r{round_}"
-        digests = [(".fcpxml", fcpxml_id), (".review.mp4", mp4_id)]
-        targets = _copy_targets(folder, stem, digests)
-        if targets is None:
-            raise StepFailure(
-                "export_names_taken",
-                f"{folder} already holds {MAX_COPY_SUFFIX} other copies named {stem}",
-                "move old exports away",
-            )
-        for dest, (_, artifact_id) in zip(targets, digests, strict=True):
-            _place_copy(ctx, dest, artifact_id)
-    except OSError as exc:
-        raise StepFailure(
-            "export_copy_failed", f"cannot copy into {str(folder)!r}: {exc}", "check the share"
-        ) from None
-    return {
-        "copied": True,
-        "dir": str(folder),
-        "fcpxml": str(targets[0]),
-        "review_mp4": str(targets[1]),
-        "round": round_,
-    }
+    copy = copy_out(
+        ctx,
+        _need(ctx, "stub", "project"),
+        _need(ctx, "stub", "timeline"),
+        _round(ctx),
+        [(".fcpxml", fcpxml_id), (".review.mp4", review_mp4)],
+    )
+    if copy.get("copied"):
+        copy["fcpxml"], copy["review_mp4"] = copy.pop("files")
+    return StepOutput(
+        outputs={
+            "fcpxml": fcpxml_id,
+            "export_report": report_id,
+            "assets": [m.get("src") for m in result.report.get("media", [])][:16],
+            "copy": copy,
+        },
+        artifact_ids=(fcpxml_id, report_id),
+    )
 
 
 __all__ = [
     "ALLOW_WARN",
     "REQUIRED_QA",
+    "check_plan",
     "export_step",
+    "guide_step",
     "laughs_step",
     "render_step",
+    "review_qa_gate",
     "safe_name",
     "set_laughs_runner",
     "set_transcriber",

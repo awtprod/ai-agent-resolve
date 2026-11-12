@@ -31,7 +31,7 @@ def test_ccn_longform_runs_end_to_end(ccn_env: CcnEnv, tmp_path: Path) -> None:
     show = env.show("cam-a.mov")
     run = make_run(env, env.params(show), key="e2e")
     start(env, run, "e2e")
-    assert work(env) == 4
+    assert work(env) == 5
     assert latest(env, run, "cut").status == "active"
 
     # Someone else's file already holds the first export name: it is never overwritten.
@@ -100,3 +100,7 @@ def test_ccn_longform_runs_end_to_end(ccn_env: CcnEnv, tmp_path: Path) -> None:
     report = env.hub.store.read_bytes(outputs(env, run, "report")["report_sha256"]).decode()
     assert "ccn-longform" in report and "approve" in report
     assert len(env.calls) == 1  # transcribed once for the whole run
+    # the rejection went back to the cut only: one attempt each of the steps before it
+    for step in ("stub", "sync", "transcript", "laughs", "guide"):
+        assert len(state.attempts_for(step)) == 1, step
+    assert len(state.attempts_for("cut")) == 2

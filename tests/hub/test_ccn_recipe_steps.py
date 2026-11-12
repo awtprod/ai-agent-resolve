@@ -57,12 +57,14 @@ def test_the_module_registers_the_recipe_from_the_env(tmp_path: Path) -> None:
     names = [r["name"] for r in json.loads(run.stdout)["recipes"]]
     assert "ccn-longform" in names
     assert [s.id for s in CCN_LONGFORM.steps] == [
-        "stub", "sync", "transcript", "laughs", "cut", "render", "export", "review", "report"
+        "stub", "sync", "transcript", "laughs", "guide", "cut", "render", "export", "review",
+        "report",
     ]  # fmt: skip
     assert len(CUT_INSTRUCTION.encode()) <= MAX_INSTRUCTION_BYTES
-    for words in ("aar hub artifact get", "aar plan produce", "aar plan lint", "step_complete",
-                  "never splice dialogue", "chronological", "end on the laugh", "not silence",
-                  "pause_trim_flag", "derives_from"):  # fmt: skip
+    for words in ("aar hub artifact get", "read_guide", "guide.md", "aar plan produce",
+                  "aar plan lint", "step_complete", "never splice dialogue", "chronological",
+                  "end on the laugh", "not silence", "pause_trim_flag", "derives_from",
+                  "AAR_RECIPES=aar.recipes.ccn", "transcript.json word times"):  # fmt: skip
         assert words in CUT_INSTRUCTION
 
 
@@ -85,7 +87,7 @@ def test_params_are_validated_at_the_boundary(ccn_env: CcnEnv, tmp_path: Path) -
         problems = _problems(ccn_env, params)
         assert problems and any(expected in p for p in problems), (expected, problems)
     one = CcnLongformParams.model_validate(ccn_env.params(show))
-    two = CcnLongformParams.model_validate(ccn_env.params(show, show))
+    two = CcnLongformParams.model_validate(ccn_env.params(show, ccn_env.show("cam-b.mov")))
     assert (one.pause_trim_on(), two.pause_trim_on()) == (False, True)
     forced = CcnLongformParams.model_validate(ccn_env.params(show, pause_trim="on"))
     assert forced.pause_trim_on() is True
@@ -95,7 +97,7 @@ def test_cold_steps_one_camera_then_the_transcript_is_reused(ccn_env: CcnEnv) ->
     show = ccn_env.show()
     run1 = make_run(ccn_env, ccn_env.params(show), key="1")
     start(ccn_env, run1, "1")
-    assert work(ccn_env) == 4  # stub, sync, transcript, laughs
+    assert work(ccn_env) == 5  # stub, sync, transcript, laughs, guide
     stub = outputs(ccn_env, run1, "stub")
     assert stub["fps"] == "30000/1001" and stub["recording_id"] == "show-1"
     assert stub["pause_trim"] == "off" and stub["pause_trim_flag"] == "--no-pause-trim"
@@ -321,13 +323,18 @@ def test_without_an_export_dir_the_copy_is_skipped_and_said(
     assert latest(ccn_env, run1, "review").review_id is not None
 
 
-def test_a_sigterm_during_the_render_fails_it_retryably_and_drains_the_worker(
+def test_a_sigterm_during_the_render_leaves_the_claim_to_lapse_and_it_is_reclaimed(
     ccn_env: CcnEnv, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """MED-3: a stopped render uses no attempt: the worker exits with the claim held, the
+    lease lapses, and the next worker claims the (idempotent) render again and finishes it."""
     import signal
+    from datetime import timedelta
 
-    from aar.plan.render import RenderTerminated
+    from aar.hub.common import utcnow
+    from aar.plan.render import RenderTerminated, render_plan
     from aar.recipes.ccn import steps
+    from aar.recipes.ccn.transcript import StepInterrupted
     from aar.recipes.worker import run_worker
 
     show = ccn_env.show()
@@ -335,18 +342,27 @@ def test_a_sigterm_during_the_render_fails_it_retryably_and_drains_the_worker(
     start(ccn_env, run1, "1")
     work(ccn_env)
     agent_cut(ccn_env, run1)
+    scratch: list[Path] = []
 
-    def terminated(*_args: Any, **_kw: Any) -> Any:
+    def terminated(plan: Any, profile: Any, *, out: Path, **kw: Any) -> Any:
+        scratch.append(out.parent)
+        (out.parent / "partial.mp4").write_bytes(b"half a render")
         raise RenderTerminated(signal.SIGTERM)  # what render_plan raises on SIGTERM
 
     monkeypatch.setattr(steps, "render_plan", terminated)
     previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
-        ran = run_worker(ccn_env.hub.log, ccn_env.hub.store, AGENT, install_signals=True)
+        with pytest.raises(StepInterrupted):
+            run_worker(ccn_env.hub.log, ccn_env.hub.store, AGENT, install_signals=True)
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
-    assert ran == 1  # the worker stopped after the interrupted step instead of claiming more
     op = latest(ccn_env, run1, "render")
-    assert op.status == "failed" and op.result_error["code"] == "render_interrupted"
-    assert "retry" in op.result_error["fix_hint"]
+    assert op.status == "active" and op.result_error is None  # no result, no attempt used
+    assert not scratch[0].exists()
+    # SIGKILL looks the same to the hub: a claim whose lease lapses. The next worker re-claims.
+    monkeypatch.setattr(steps, "render_plan", render_plan)
+    later = utcnow() + timedelta(seconds=300)
+    assert run_worker(ccn_env.hub.log, ccn_env.hub.store, AGENT, once=True, clock=lambda: later)
+    again = latest(ccn_env, run1, "render")
+    assert again.op_id == op.op_id and again.attempt == 1 and again.status == "done"

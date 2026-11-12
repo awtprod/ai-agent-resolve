@@ -10,12 +10,15 @@ the recipe and its cold callables. The steps, on the S13g2 engine:
    default), its readable text and report stored; reused through a ``transcript.<key>`` fact
    keyed on the file's sha256, the model and the settings.
 4. ``laughs`` (cold, idempotent): ``aar.analyze.laughs`` only when the params ask (a paid API).
-5. ``cut`` (agent): the agent writes the keep list, runs ``aar plan produce`` and ``aar plan
-   lint`` itself, and submits the plan; the plan gate refuses lint errors.
-6. ``render`` (cold, not idempotent): the review render on the hub and its QA gate.
-7. ``export`` (cold, idempotent): FCPXML with the media map, stored and copied to the PC's share.
-8. ``review`` (gate): a human reviews the render; a rejection goes back to ``cut``.
-9. ``report``: the built-in ``recipe.report``.
+5. ``guide`` (cold, idempotent): the cut step's full guide as an artifact (exact commands with the
+   hub's own paths, this run's artifact ids, the brief, the house rules, later rounds).
+6. ``cut`` (agent): the agent reads the guide, writes the keep list, runs ``aar plan produce``
+   and ``aar plan lint`` itself, and submits the plan; the plan gate refuses lint errors.
+7. ``render`` (cold, idempotent): the plan checked against the stub, the review render on the
+   hub and its QA gate.
+8. ``export`` (cold, idempotent): FCPXML with the media map, stored and copied to the PC's share.
+9. ``review`` (gate): a human reviews the render; a rejection goes back to ``cut``.
+10. ``report``: the built-in ``recipe.report``.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from aar.recipes.ccn.instruction import CUT_INSTRUCTION
 from aar.recipes.ccn.params import CcnLongformParams
 from aar.recipes.ccn.steps import (
     export_step,
+    guide_step,
     laughs_step,
     render_step,
     set_laughs_runner,
@@ -46,11 +50,12 @@ CALLABLES = {
     "ccn.laughs": laughs_step,
     "ccn.render": render_step,
     "ccn.export": export_step,
+    "ccn.guide": guide_step,
 }
 
 CCN_LONGFORM = RecipeDef(
     name=RECIPE_NAME,
-    version=1,
+    version=2,
     params_model=CcnLongformParams,
     steps=(
         # a packet scan of each proxy (seconds for a 90-minute show)
@@ -82,19 +87,29 @@ CCN_LONGFORM = RecipeDef(
             timeout_s=2 * HOUR,
         ),
         StepDef(
+            id="guide",
+            kind="cold",
+            callable_id="ccn.guide",
+            idempotent=True,
+            needs=("stub", "sync", "transcript", "laughs"),
+            timeout_s=HOUR,
+        ),
+        StepDef(
             id="cut",
             kind="agent",
-            needs=("stub", "sync", "transcript", "laughs"),
+            needs=("stub", "sync", "transcript", "laughs", "guide"),
             instruction=CUT_INSTRUCTION,
             expects=PlanExpect(),
             timeout_s=24 * HOUR,
         ),
-        # about 0.8x realtime of the cut (S19 pilot: 236 s in 189 s), plus QA
+        # about 0.8x realtime of the cut (S19 pilot: 236 s in 189 s), plus QA; idempotent: a
+        # re-claimed op starts from emptied scratch and stores content-addressed artifacts
         StepDef(
             id="render",
             kind="cold",
             callable_id="ccn.render",
-            needs=("cut", "transcript", "laughs"),
+            idempotent=True,
+            needs=("stub", "cut", "transcript", "laughs"),
             timeout_s=4 * HOUR,
         ),
         StepDef(
@@ -102,7 +117,7 @@ CCN_LONGFORM = RecipeDef(
             kind="cold",
             callable_id="ccn.export",
             idempotent=True,
-            needs=("cut", "render", "transcript", "laughs"),
+            needs=("stub", "cut", "render", "transcript", "laughs"),
             timeout_s=HOUR,
         ),
         StepDef(
@@ -118,7 +133,17 @@ CCN_LONGFORM = RecipeDef(
             kind="cold",
             callable_id="recipe.report",
             idempotent=True,
-            needs=("stub", "sync", "transcript", "laughs", "cut", "render", "export", "review"),
+            needs=(
+                "stub",
+                "sync",
+                "transcript",
+                "laughs",
+                "guide",
+                "cut",
+                "render",
+                "export",
+                "review",
+            ),
             timeout_s=HOUR,
         ),
     ),
