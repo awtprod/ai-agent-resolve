@@ -4,6 +4,8 @@ After=network.target
 
 [Service]
 ExecStart=@AAR_ROOT@/venv/bin/aar hub console --db @AAR_ROOT@/data/hub.db --artifacts @AAR_ROOT@/data/artifacts --host 127.0.0.1 --port 8788 --trust-tailscale-headers --allowed-host @CONSOLE_HOSTNAME@
+# AAR_RECIPES (recipe_create accepts ccn-longform) and AAR_MEDIA_ROOT (its params' paths)
+EnvironmentFile=@AAR_ROOT@/hub.env
 User=@AAR_USER@
 Group=@AAR_GROUP@
 WorkingDirectory=@AAR_ROOT@/data

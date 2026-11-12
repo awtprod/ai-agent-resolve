@@ -17,6 +17,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import replace
 from fractions import Fraction
@@ -39,7 +40,7 @@ from aar.plan.export import ExportError, export_fcpxml, media_map_from_mapping
 from aar.plan.inputs import LaughMap, Transcript
 from aar.plan.model import EditPlan
 from aar.plan.profile import Profile
-from aar.plan.render import RenderError, render_plan
+from aar.plan.render import RenderError, RenderTerminated, render_plan
 from aar.plan.stub import StubError, StubSource, build_stub
 from aar.qa.report import QAReport
 from aar.recipes.ccn.params import CcnLongformParams
@@ -595,6 +596,16 @@ def render_step(ctx: StepContext) -> StepOutput:
             )
         except RenderError as exc:
             raise StepFailure(f"render_{exc.code}", exc.message, exc.fix_hint) from None
+        except RenderTerminated as exc:
+            # The render's own SIGTERM handler killed ffmpeg and removed its work dir; the
+            # worker's handler is back now, so hand it the signal (it stops claiming work) and
+            # record a retryable failure instead of dying with the claim held.
+            signal.raise_signal(exc.signum)
+            raise StepFailure(
+                "render_interrupted",
+                f"the render was stopped by signal {exc.signum}",
+                "retry the render step once the worker runs again",
+            ) from None
         report = result.report
         mp4_id = ctx.put(result.out, mime="video/mp4", meta={"role": "review", "file": out.name})
         report_id = _json_artifact(ctx, report, "render-report")

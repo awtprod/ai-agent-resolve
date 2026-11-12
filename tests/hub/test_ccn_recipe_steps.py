@@ -319,3 +319,34 @@ def test_without_an_export_dir_the_copy_is_skipped_and_said(
     assert ccn_env.hub.store.has(export["fcpxml"])
     assert not list(ccn_env.exports.iterdir())
     assert latest(ccn_env, run1, "review").review_id is not None
+
+
+def test_a_sigterm_during_the_render_fails_it_retryably_and_drains_the_worker(
+    ccn_env: CcnEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import signal
+
+    from aar.plan.render import RenderTerminated
+    from aar.recipes.ccn import steps
+    from aar.recipes.worker import run_worker
+
+    show = ccn_env.show()
+    run1 = make_run(ccn_env, ccn_env.params(show), key="1")
+    start(ccn_env, run1, "1")
+    work(ccn_env)
+    agent_cut(ccn_env, run1)
+
+    def terminated(*_args: Any, **_kw: Any) -> Any:
+        raise RenderTerminated(signal.SIGTERM)  # what render_plan raises on SIGTERM
+
+    monkeypatch.setattr(steps, "render_plan", terminated)
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        ran = run_worker(ccn_env.hub.log, ccn_env.hub.store, AGENT, install_signals=True)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    assert ran == 1  # the worker stopped after the interrupted step instead of claiming more
+    op = latest(ccn_env, run1, "render")
+    assert op.status == "failed" and op.result_error["code"] == "render_interrupted"
+    assert "retry" in op.result_error["fix_hint"]

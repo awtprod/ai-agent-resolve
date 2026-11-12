@@ -81,3 +81,32 @@ on NTSC-rate video, give the video's rate instead.
 It exits 0 when it read a timecode, 1 when the file has none it can read (the error's `code` is
 `timecode_` plus `not_quicktime`, `no_timecode`, `malformed`, `unsupported`, `too_large` or
 `io`), and 2 when the file is missing or not a regular file.
+
+## Proxies-only media root (S19a, decisions D8/D9)
+
+For the Linux-only editing run (`ccn-longform`, DESIGN "CCN long-form recipe") the hub keeps
+**proxy copies only**: the camera proxies (1080p H.264 with a tmcd timecode track), never the
+camera originals. They live on one media root, which is read-only inside agent sandboxes; only
+the hub's own units write to it.
+
+```
+<media root>/models/          Whisper (faster-whisper-medium.en/) and YuNet models, never downloaded
+<media root>/share/incoming/  proxies copied from the edit PC (<show>/Proxy/<clip>.mp4)
+<media root>/share/exports/   results for the edit PC: <project>/<timeline>/<timeline>.r<N>.fcpxml
+                              and .r<N>.review.mp4
+<media root>/work/            step scratch (transcripts, renders), removed after each step
+```
+
+The edit PC maps `<media root>/share` as a network drive, so `incoming/` is where the proxies
+arrive and `exports/` where the timeline and the review copy come back. The hub units name these
+folders in `hub.env`: `AAR_MEDIA_ROOT`, `AAR_MODEL_DIR`, `AAR_WORK_DIR`, `AAR_EXPORT_DIR`.
+
+Recipe params name the proxies by their hub paths (under `AAR_MEDIA_ROOT`). The plan keeps
+those paths, so the hub render reads them directly. The FCPXML must instead name the PC's copy
+of the same file: the recipe's `media_map` (`{"<hub folder>": "<PC folder>"}`, the export's
+`--media-map`) rewrites each hub path under a mapped folder into the PC path, as a `file:` URL,
+and each asset starts at the proxy's own start timecode, which is how Resolve links a clip to
+its file. For example `{"<media root>/share/incoming/Show_1": "E:\\Show_1"}` turns
+`<media root>/share/incoming/Show_1/Proxy/A001.mp4` into `file:///E:/Show_1/Proxy/A001.mp4`.
+The map must cover every source (the params refuse one it does not), and the PC's copy must be
+byte-identical to the hub's, so its timecode and frames are the same.

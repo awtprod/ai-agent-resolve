@@ -1,0 +1,32 @@
+[Unit]
+Description=AI-Agent-Resolve hub: cold recipe worker (ccn-longform: transcript, render, export)
+After=network.target
+
+[Service]
+ExecStart=@AAR_ROOT@/venv/bin/aar recipe worker --db @AAR_ROOT@/data/hub.db --artifacts @AAR_ROOT@/data/artifacts --actor agent:hub-worker --recipes aar.recipes.ccn
+# AAR_MODEL_DIR, AAR_YUNET_MODEL, AAR_WORK_DIR, AAR_EXPORT_DIR, AAR_MEDIA_ROOT (see hub.env.in)
+EnvironmentFile=@AAR_ROOT@/hub.env
+User=@AAR_USER@
+Group=@AAR_GROUP@
+WorkingDirectory=@AAR_ROOT@/data
+Restart=on-failure
+RestartSec=10
+# SIGTERM: the worker claims nothing new and lets the current step finish; a render in progress
+# is stopped (ffmpeg killed, step failed render_interrupted, retry it). A transcript cannot be
+# interrupted: past this timeout systemd kills it and the next start resumes it from its
+# checkpoint (the step is idempotent).
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=900
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=@AAR_ROOT@/data @AAR_WORK_DIR@ @AAR_EXPORT_DIR@
+# The exports are read by the edit PC through the share: files 0644, folders 0755.
+UMask=0022
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
