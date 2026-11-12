@@ -924,6 +924,16 @@ def test_hostile_item_values_are_not_carried(change: dict[str, int], code: str) 
     assert result.plan.segments[0].src_in >= 0
 
 
+def test_a_speed_other_than_100_percent_is_retimed_whatever_the_timemap_says() -> None:
+    plan = simple()
+    timeline, media = build_timeline(layout_rows(plan), rate=25.0)
+    v1 = next(t for t in timeline.tracks if t.label == "V1")
+    v1.items[1] = dataclasses.replace(v1.items[1], speed=0.5, timemap_form=None)
+    result = import_timeline(plan, timeline, media, profile=permissive())
+    assert codes(result)[0] == "retimed"
+    assert statuses(result)[1] == "removed"
+
+
 def test_unreadable_items_are_not_carried() -> None:
     plan = simple()
     timeline, media = build_timeline(layout_rows(plan), rate=25.0)
