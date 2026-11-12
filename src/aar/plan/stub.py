@@ -19,7 +19,8 @@ not a regular readable file, or ffprobe cannot read it), ``no_video``, ``no_audi
 variable frame rate), ``rates_differ`` (the sources' rates differ from each other),
 ``timecode_unknown`` (no start timecode, unless ``allow_unknown_timecode``, the exporter's own
 opt-out), ``timecode_ambiguous`` (the media's timecode rate cannot be told),
-``duplicate_source_id``, ``resolution_required`` (a short with no resolution), ``bad_base`` and
+``duplicate_source_id``, ``duplicate_media`` (one file twice, directly or through a symlink),
+``resolution_required`` (a short with no resolution), ``bad_base`` and
 ``invalid_stub``.
 """
 
@@ -61,6 +62,7 @@ CODES = frozenset(
         "timecode_unknown",
         "timecode_ambiguous",
         "duplicate_source_id",
+        "duplicate_media",
         "resolution_required",
         "bad_base",
         "invalid_stub",
@@ -139,6 +141,15 @@ def _source_ids(sources: Sequence[StubSource], cameras: Sequence[str]) -> list[s
 
 def _regular_file(media: str | os.PathLike[str], sid: str) -> Path:
     path = Path(os.path.abspath(media))
+    try:
+        str(path).encode("utf-8")
+    except UnicodeEncodeError:
+        raise StubError(
+            "unreadable",
+            f"source {sid!r}: the path {str(path)!r} is not valid UTF-8; a plan cannot name it",
+            "rename the file (or its folder) to a UTF-8 name",
+            source=sid,
+        ) from None
     if not path.is_file() or not os.access(path, os.R_OK):
         what = "does not exist" if not path.exists() else "is not a readable regular file"
         raise StubError(
@@ -285,6 +296,17 @@ def build_stub(
                 source=item.get("id"),
             )
     paths = [_regular_file(source.media, sid) for source, sid in zip(sources, ids, strict=True)]
+    seen_files: dict[str, str] = {}
+    for path, sid in zip(paths, ids, strict=True):
+        real = os.path.realpath(path)
+        if real in seen_files:
+            raise StubError(
+                "duplicate_media",
+                f"sources {seen_files[real]!r} and {sid!r} are the same file ({real!r})",
+                "give each camera's own file once",
+                sources=[seen_files[real], sid],
+            )
+        seen_files[real] = sid
     rates: list[Fraction] = []
     for path, sid in zip(paths, ids, strict=True):
         rates.append(_probe_rate(path, sid)[0])

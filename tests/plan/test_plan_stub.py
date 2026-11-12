@@ -181,3 +181,32 @@ def test_keep_ranges_from_the_written_stub_file_lint_clean(tmp_path: Path) -> No
     produce_argv = ["plan", "produce", str(stub), "--transcript", str(t), "--keep", str(keep)]
     assert main([*produce_argv, "--out", str(plan), "--no-pause-trim"]) == 0
     assert main(["plan", "lint", str(plan), "--transcript", str(t)]) == 0
+
+
+def test_a_fifo_a_non_utf8_path_and_one_file_twice_are_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import os
+
+    fifo = tmp_path / "pipe.mov"
+    os.mkfifo(fifo)
+    assert _code([StubSource(fifo)]) == "unreadable"  # never handed to ffprobe
+    good = make_show(tmp_path / "a.mov")
+    link = tmp_path / "same.mov"
+    link.symlink_to(good)
+    assert _code([StubSource(good), StubSource(good, camera="B")]) == "duplicate_media"
+    assert _code([StubSource(good), StubSource(link, camera="B")]) == "duplicate_media"
+    odd = Path(os.fsdecode(bytes(tmp_path) + b"/caf\xe9.mov"))
+    make_show(odd)
+    argv = ["plan", "stub", str(odd), "--out", str(tmp_path / "s.json"), "--recording", "r"]
+    assert main([*argv, "--project", "P", "--timeline", "T", "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "unreadable"
+
+
+def test_the_resolution_is_the_first_sources_display_size(tmp_path: Path) -> None:
+    small = make_show(tmp_path / "small.mov")
+    big = make_show(tmp_path / "big.mov", size="640x360")
+    plan = _stub([StubSource(small), StubSource(big, camera="B")]).plan  # type: ignore[attr-defined]
+    assert (plan.resolution.width, plan.resolution.height) == (320, 180)
+    plan = _stub([StubSource(big), StubSource(small, camera="B")]).plan  # type: ignore[attr-defined]
+    assert (plan.resolution.width, plan.resolution.height) == (640, 360)
