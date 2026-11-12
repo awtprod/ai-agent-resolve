@@ -58,7 +58,9 @@ The QA transcriber follows its settings' ``normalize`` too.
 ``wordless_min_s`` (60 s) with no kept word, the file's head and tail included, in recording
 and file time, with the source audio's level over it (RMS of the un-normalised mono mix, dBFS;
 taken from the decode already in memory, or with normalisation on, from one more bounded decode
-of just that stretch). It is information, not an error (a real show has a silent house before it
+of just that stretch, for at most the ``MAX_LEVEL_DECODES`` (20) longest; a level that is not
+measured or whose decode failed is null with a ``level_error``, and never fails the transcript).
+``wordless_min_s`` is at least ``WORDLESS_MIN_FLOOR_S`` (1 s). It is information, not an error (a real show has a silent house before it
 starts): **no words is not silence**. A stretch may hold speech the transcriber missed.
 """
 
@@ -90,7 +92,7 @@ from aar.analyze.common import (
 )
 from aar.analyze.common import read_checkpoint as read_common
 from aar.analyze.errors import AnalyzeError, from_media_error, need_faster_whisper, need_numpy
-from aar.analyze.text import WORDLESS_MIN_S, wordless_stretches
+from aar.analyze.text import WORDLESS_MIN_S, Stretch, wordless_stretches
 from aar.media import MediaError, probe, timeout_for
 from aar.media.pcm import db
 from aar.media.tools import require_regular_file
@@ -99,6 +101,10 @@ from aar.plan.inputs import Transcript, Word
 MODEL_DIR_ENV = "AAR_MODEL_DIR"
 WHISPER_RATE = 16000
 _KIND = "aar.analyze.transcript"
+#: With --normalize, at most this many wordless stretches get a level decode (the longest).
+MAX_LEVEL_DECODES = 20
+#: --wordless-min-s may not go below this: the report is for holes, not pauses between words.
+WORDLESS_MIN_FLOOR_S = 1.0
 
 
 @dataclass(frozen=True)
@@ -151,9 +157,12 @@ class WhisperSettings:
         if not isinstance(self.normalize, bool):
             raise ValueError("normalize must be true or false")
         if isinstance(self.wordless_min_s, bool) or not (
-            math.isfinite(self.wordless_min_s) and self.wordless_min_s > 0
+            math.isfinite(self.wordless_min_s) and self.wordless_min_s >= WORDLESS_MIN_FLOOR_S
         ):
-            raise ValueError("wordless_min_s must be a finite number of seconds above 0")
+            raise ValueError(
+                f"wordless_min_s must be a finite number of seconds, at least "
+                f"{WORDLESS_MIN_FLOOR_S:g}"
+            )
 
     def model_kwargs(self) -> dict[str, Any]:
         """Keyword arguments for ``WhisperModel(model_dir, ...)``."""
@@ -444,6 +453,11 @@ def _level_dbfs(samples: Any) -> float | None:
     return round(db(total / len(samples)), 1)
 
 
+def _measure_order(stretches: Sequence[Stretch]) -> list[int]:
+    """Indexes of ``stretches``, longest first (the earlier one on a tie)."""
+    return sorted(range(len(stretches)), key=lambda k: (-stretches[k].duration_s, k))
+
+
 def wordless_report(
     media: Path,
     words: Sequence[Word],
@@ -453,53 +467,82 @@ def wordless_report(
     settings: WhisperSettings,
     raw: Any = None,
 ) -> dict[str, Any]:
-    """The report's ``wordless`` block (see the module docstring). ``raw`` is the whole file's
-    un-normalised 16 kHz mono decode when it is in memory; otherwise each stretch is decoded
-    once more, without the filter, to measure its level."""
+    """The report's ``wordless`` block (see the module docstring).
+
+    ``raw`` is the whole file's un-normalised 16 kHz mono decode when it is in memory: every
+    stretch's level comes from it. Otherwise (``--normalize``) each stretch is decoded once more,
+    without the filter, but only the ``MAX_LEVEL_DECODES`` longest; a stretch not measured, or
+    whose decode failed, has ``level_dbfs`` null and a ``level_error`` saying why. A failed
+    decode never fails the transcript (every word is in hand), and after one failure the rest
+    are not tried.
+    """
     stretches = wordless_stretches(
         words,
         settings.wordless_min_s,
         start_s=offset_s,
         end_s=offset_s + file_duration_s,
     )
-    listed = []
-    for stretch in stretches:
-        file_start = max(0.0, stretch.start_s - offset_s)
-        file_end = min(file_duration_s, stretch.end_s - offset_s)
-        if raw is not None:
-            samples = raw[round(file_start * WHISPER_RATE) : round(file_end * WHISPER_RATE)]
-        else:
-            length = file_end - file_start
+    bounds = [
+        (max(0.0, s.start_s - offset_s), min(file_duration_s, s.end_s - offset_s))
+        for s in stretches
+    ]
+    levels: dict[int, float | None] = {}
+    errors: dict[int, dict[str, str]] = {}
+    if raw is not None:
+        for k, (a, b) in enumerate(bounds):
+            levels[k] = _level_dbfs(raw[round(a * WHISPER_RATE) : round(b * WHISPER_RATE)])
+    else:
+        failed: dict[str, str] | None = None
+        for rank, k in enumerate(_measure_order(stretches)):
+            if rank >= MAX_LEVEL_DECODES:
+                errors[k] = {
+                    "type": "not-measured",
+                    "message": f"only the {MAX_LEVEL_DECODES} longest stretches are measured "
+                    "with --normalize (one more decode each)",
+                }
+                continue
+            if failed is not None:
+                errors[k] = {
+                    "type": "not-measured",
+                    "message": f"an earlier level decode failed ({failed['type']})",
+                }
+                continue
+            a, b = bounds[k]
             try:
                 samples = read_mono(
                     media,
                     rate=WHISPER_RATE,
-                    start_s=file_start,
-                    duration_s=length,
-                    max_duration_s=length,
-                    timeout_s=_decode_timeout(settings, length),
+                    start_s=a,
+                    duration_s=b - a,
+                    max_duration_s=b - a,
+                    timeout_s=_decode_timeout(settings, b - a),
                 ).samples
             except MediaError as exc:
-                raise from_media_error(exc, f"input {media} (wordless level)") from None
-        listed.append(
-            {
-                "start_s": round(stretch.start_s, 3),
-                "end_s": round(stretch.end_s, 3),
-                "file_start_s": round(file_start, 3),
-                "file_end_s": round(file_end, 3),
-                "duration_s": round(stretch.duration_s, 3),
-                "level_dbfs": _level_dbfs(samples),
-            }
-        )
-    longest = max(listed, key=lambda x: (x["duration_s"], -x["start_s"]), default=None)
+                failed = from_media_error(exc, f"input {media} (wordless level)").to_dict()
+                errors[k] = failed
+                continue
+            levels[k] = _level_dbfs(samples)
+    listed = [
+        {
+            "start_s": round(stretch.start_s, 3),
+            "end_s": round(stretch.end_s, 3),
+            "file_start_s": round(a, 3),
+            "file_end_s": round(b, 3),
+            "duration_s": round(stretch.duration_s, 3),
+            "level_dbfs": levels.get(k),
+            "level_error": errors.get(k),
+        }
+        for k, (stretch, (a, b)) in enumerate(zip(stretches, bounds, strict=True))
+    ]
+    order = _measure_order(stretches)
     return {
         "min_s": settings.wordless_min_s,
         "total_s": round(sum(s.duration_s for s in stretches), 3),
         "file_duration_s": round(file_duration_s, 3),
-        "longest": longest,
+        "longest": listed[order[0]] if listed else None,
         "stretches": listed,
         "level": "RMS of the source's un-normalised mono mix over the stretch, dBFS (null: "
-        "digital silence)",
+        "digital silence, or not measured: see level_error)",
         "note": "no words were transcribed here; that is not the same as silence (quiet or "
         "far-field speech, audience reaction)",
     }
@@ -511,7 +554,12 @@ def wordless_warning(wordless: dict[str, Any]) -> str | None:
     if longest is None:
         return None
     level = longest["level_dbfs"]
-    level_text = "digital silence" if level is None else f"{level:g} dBFS"
+    if longest["level_error"] is not None:
+        level_text = f"level not measured: {longest['level_error']['type']}"
+    elif level is None:
+        level_text = "digital silence"
+    else:
+        level_text = f"{level:g} dBFS"
     return (
         f"warning: {wordless['total_s']:.1f} s of {wordless['file_duration_s']:.1f} s has no "
         f"transcribed words ({len(wordless['stretches'])} stretch(es) of at least "
@@ -756,7 +804,9 @@ class WhisperTranscriber:
 __all__ = [
     "CCN_PRESET",
     "CHECKPOINT_SUFFIX",
+    "MAX_LEVEL_DECODES",
     "MODEL_DIR_ENV",
+    "WORDLESS_MIN_FLOOR_S",
     "RecordingOffset",
     "WhisperSettings",
     "WhisperTranscriber",
