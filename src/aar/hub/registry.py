@@ -272,6 +272,7 @@ class Registry:
         aliases: list[str] | None = None,
         project_id: str | None = None,
         idempotency_key: str | None = None,
+        unique_name: bool = False,
     ) -> Project:
         """Create a project and return it.
 
@@ -279,9 +280,11 @@ class Registry:
         :class:`DuplicateProjectId`, unless the same ``idempotency_key`` was used for
         the original create (a genuine retry), which returns the existing project.
 
-        A project created without sources is identified by its name: if its name or one of
-        its aliases is already the name or an alias of any project (with or without
-        sources), it is refused with :class:`DuplicateProjectName`, after the retry check.
+        ``unique_name`` (off by default; the agent-facing registration in
+        :mod:`aar.hub.project_register` sets it for a project without sources, whose name is
+        its identity) refuses a name or alias that any project already has as its name or an
+        alias with :class:`DuplicateProjectName`. It is checked inside the write transaction,
+        after the retry check, so a retry replays and two racing creates yield one project.
         """
         source_dicts = [s.to_dict() for s in (sources or [])]
         alias_list = list(aliases or [])
@@ -319,7 +322,7 @@ class Registry:
                 raise DuplicateProjectId(f"project id already exists: {pid!r}")
             for source in sources or []:
                 self._refuse_taken_uid(source, pid)
-            if not sources:
+            if unique_name:
                 self._refuse_taken_name([name, *alias_list])
             payload = {
                 "project_id": pid,

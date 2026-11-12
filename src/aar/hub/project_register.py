@@ -254,6 +254,7 @@ def register_project(
             aliases=alias_list,
             project_id=project_id,
             idempotency_key=key,
+            unique_name=not sources,
         )
     except DuplicateResolveProject as exc:
         raise _exists(exc) from None

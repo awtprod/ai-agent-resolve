@@ -107,16 +107,26 @@ def test_a_sourced_registration_is_still_identified_by_its_uid_only(hub: Hub) ->
     assert sourced != loose
 
 
-def test_the_registry_itself_refuses_a_sourceless_twin(hub: Hub) -> None:
+def test_the_registry_refuses_a_twin_only_when_asked(hub: Hub) -> None:
     registry = Registry(hub.log)
-    first = registry.create_project("Show", HUMAN, idempotency_key="lib-1")
-    assert registry.create_project("Show", HUMAN, idempotency_key="lib-1").id == first.id
+    first = registry.create_project("Show", HUMAN, idempotency_key="lib-1", unique_name=True)
+    again = registry.create_project("Show", HUMAN, idempotency_key="lib-1", unique_name=True)
+    assert again.id == first.id  # a retry replays before the name check
     with pytest.raises(DuplicateProjectName) as err:
-        registry.create_project("Show", HUMAN, idempotency_key="lib-2")
+        registry.create_project("Show", HUMAN, idempotency_key="lib-2", unique_name=True)
     assert (err.value.existing_id, err.value.name) == (first.id, "Show")
     with pytest.raises(DuplicateProjectName):
-        registry.create_project("Show", HUMAN)
+        registry.create_project("Show", HUMAN, unique_name=True)
     assert [p.name for p in Registry(hub.log).list()].count("Show") == 1
+
+
+def test_the_library_default_is_unchanged(hub: Hub) -> None:
+    """A library caller (not the agent-facing registration) may still share names and aliases."""
+    registry = Registry(hub.log)
+    first = registry.create_project("Show", HUMAN, aliases=["alias-0"])
+    second = registry.create_project("Show", HUMAN, aliases=["alias-0"])
+    assert first.id != second.id
+    assert [p.name for p in Registry(hub.log).list()].count("Show") == 2
 
 
 @pytest.mark.parametrize(
