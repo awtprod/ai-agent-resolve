@@ -13,6 +13,12 @@ Rules, all checked before anything is written:
 - One Resolve unique id belongs to one registry project (``project_exists``, naming the
   existing id). The check runs inside the registry's write transaction, after the
   idempotent-retry check, so a genuine retry of the same request still succeeds.
+- A project may be registered without a source (a show edited from hub media before any
+  Resolve project exists): pass neither ``source_kind`` nor ``locator`` (one without the
+  other, or a ``host`` without them, is ``invalid_input``). Its name is then its identity: a
+  name or alias that any project already has as its name or an alias is refused with
+  ``project_exists`` naming the existing id, after the same retry check. The Resolve source
+  is attached later with :func:`add_source`, under the same one-uid-one-project rule.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from aar.hub.registry import (
     RESOLVE_SOURCE_KINDS,
     SOURCE_KINDS,
     DuplicateProjectId,
+    DuplicateProjectName,
     DuplicateResolveProject,
     Project,
     ProjectSource,
@@ -174,6 +181,40 @@ def _exists(error: DuplicateResolveProject) -> WriteError:
     )
 
 
+def _name_taken(error: DuplicateProjectName) -> WriteError:
+    return WriteError(
+        "project_exists",
+        f"a project without a source is known by its name, and {error.name!r} is already a "
+        f"name or alias of {error.existing_id!r}",
+        f"Use {error.existing_id} (aar hub project show), or register under another name.",
+        existing_id=error.existing_id,
+        name=error.name,
+    )
+
+
+def _optional_source(source_kind: Any, locator: Any, host: Any) -> list[ProjectSource]:
+    """``[]`` when neither ``source_kind`` nor ``locator`` is given, else the one source."""
+    if source_kind is None and locator is None:
+        if host is not None:
+            raise WriteError(
+                "invalid_input",
+                "host names where a source lives, and no source was given",
+                "Drop host, or give source_kind and locator too.",
+                field="host",
+            )
+        return []
+    if source_kind is None or locator is None:
+        missing = "source_kind" if source_kind is None else "locator"
+        raise WriteError(
+            "invalid_input",
+            f"{missing} is missing: give source_kind and locator together, or neither",
+            "Pass both for a Resolve source, or neither to register the project without one "
+            "(attach it later with `aar hub project source`).",
+            field=missing,
+        )
+    return [build_source(source_kind, locator, host)]
+
+
 def _conflict(error: IdempotencyConflict) -> WriteError:
     return WriteError(
         "idempotency_conflict",
@@ -187,18 +228,19 @@ def register_project(
     actor: Actor,
     *,
     name: Any,
-    source_kind: Any,
-    locator: Any,
+    source_kind: Any = None,
+    locator: Any = None,
     host: Any = None,
     aliases: Sequence[Any] | None = None,
     project_id: Any = None,
     idempotency_key: Any,
 ) -> WriteResult:
-    """Register a project with one source. A retry with the same key and request replays."""
+    """Register a project with one source, or none. A retry with the same key and request
+    replays."""
     actor = check_registrant(actor)
     key = write_key(actor, idempotency_key)
     name = _text(name, "name")
-    source = build_source(source_kind, locator, host)
+    sources = _optional_source(source_kind, locator, host)
     alias_list = _aliases(aliases)
     if project_id is not None:
         project_id = check_id(project_id, "project_id")
@@ -208,13 +250,15 @@ def register_project(
         project = registry.create_project(
             name,
             actor,
-            sources=[source],
+            sources=sources,
             aliases=alias_list,
             project_id=project_id,
             idempotency_key=key,
         )
     except DuplicateResolveProject as exc:
         raise _exists(exc) from None
+    except DuplicateProjectName as exc:
+        raise _name_taken(exc) from None
     except DuplicateProjectId as exc:
         raise WriteError(
             "project_exists",

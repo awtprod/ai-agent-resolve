@@ -299,28 +299,32 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     )
     project_sub = project.add_subparsers(dest="project_command", required=True)
 
-    def _source_args(parser: argparse.ArgumentParser) -> None:
+    def _source_args(parser: argparse.ArgumentParser, *, required: bool = True) -> None:
+        optional = "" if required else " Give it with --locator, or neither for no source."
         parser.add_argument(
             "--source-kind",
-            required=True,
+            required=required,
             choices=sorted(SOURCE_KINDS),
-            help="Where the project lives.",
+            help="Where the project lives." + optional,
         )
         parser.add_argument(
             "--locator",
-            required=True,
+            required=required,
             help='Source locator as a JSON object; local_db and cloud_library need {"project_id": '
-            'Resolve unique id, "name": ..., "folder_path": [...]}.',
+            'Resolve unique id, "name": ..., "folder_path": [...]}.' + optional,
         )
         parser.add_argument("--host", help="Host that holds the source (e.g. the node's name).")
 
     project_add = project_sub.add_parser(
-        "add", help="Register a project (one Resolve unique id maps to one registry project)."
+        "add",
+        help="Register a project (one Resolve unique id maps to one registry project). "
+        "Without a source (no --source-kind/--locator) the name is its identity: a name or "
+        "alias another project has is refused; attach the source later with `source`.",
     )
     _add_db(project_add)
     _add_actor(project_add)
     project_add.add_argument("--name", required=True, help="Display name.")
-    _source_args(project_add)
+    _source_args(project_add, required=False)
     project_add.add_argument("--alias", action="append", default=[], help="Repeatable.")
     project_add.add_argument("--project-id", help="Explicit registry id (prj_...); else generated.")
     project_add.add_argument("--idempotency-key", required=True)
@@ -641,13 +645,19 @@ def _locator_arg(raw: str) -> Any:
 
 def _project_add_action(log: Any, actor: Any, args: argparse.Namespace) -> dict[str, Any]:
     from aar.hub import project_register
+    from aar.hub.writes import WriteError
 
+    locator = None if args.locator is None else _locator_arg(args.locator)
+    if args.locator is not None and locator is None:  # `--locator null` is not "no source"
+        raise WriteError(
+            "invalid_input", "--locator is null", "Pass a JSON object.", field="locator"
+        )
     return project_register.register_project(
         log,
         actor,
         name=args.name,
         source_kind=args.source_kind,
-        locator=_locator_arg(args.locator),
+        locator=locator,
         host=args.host,
         aliases=args.alias,
         project_id=args.project_id,
