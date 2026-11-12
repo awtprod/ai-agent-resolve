@@ -30,6 +30,17 @@ VALID: list[tuple[str, dict[str, Any]]] = [
     ("qa.lufs.master", {"value": -22.1, "unit": "LUFS"}),
     ("qa.true-peak.short-1", {"value": -1.2, "unit": "dBTP"}),
     ("qa.longest_silence.short-1", {"value": 0.48, "unit": "s"}),
+    (
+        "transcript." + "c" * 64,
+        {
+            "media_sha256": "a" * 64,
+            "model": "medium.en",
+            "recording": "show-1",
+            "transcript": "b" * 64,
+            "text": "d" * 64,
+            "report": "e" * 64,
+        },
+    ),
 ]
 
 
@@ -85,6 +96,7 @@ def test_namespaces_are_a_closed_set() -> None:
         "path.map.<name>",
         "render.hash.[review|master.]<deliverable>",
         "qa.<metric>.<deliverable>",
+        "transcript.<key>",
     ]
 
 
@@ -447,3 +459,29 @@ def test_render_hash_role_segment_is_restricted_to_review_or_master(hub: Hub) ->
         assert facts.facts_view(hub.log, hub.project_id).get(f"render.hash.{role}.ep1") is not None
     err = _refused("invalid_fact", lambda: _record(hub, "render.hash.draft.ep1", value, ikey="kd"))
     assert err.details["field"] == "key"
+
+
+TRANSCRIPT_VALUE = {
+    "media_sha256": "a" * 64,
+    "model": "medium.en",
+    "recording": "show-1",
+    "transcript": "b" * 64,
+    "text": "d" * 64,
+    "report": "e" * 64,
+}
+
+
+@pytest.mark.parametrize(
+    ("key", "change"),
+    [
+        ("transcript." + "c" * 64 + ".extra", {}),  # one <key> part, no dots
+        ("transcript.", {}),
+        ("transcript." + "c" * 64, {"transcript": "not-a-sha"}),
+        ("transcript." + "c" * 64, {"text": "B" * 64}),
+        ("transcript." + "c" * 64, {"media_sha256": "a" * 63}),
+        ("transcript." + "c" * 64, {"model": ""}),
+    ],
+)
+def test_transcript_facts_have_a_strict_shape(hub: Hub, key: str, change: dict[str, Any]) -> None:
+    """S19a: the transcript cache's key part and every artifact id are checked."""
+    _refused("invalid_fact", lambda: _record(hub, key, {**TRANSCRIPT_VALUE, **change}, ikey="t"))

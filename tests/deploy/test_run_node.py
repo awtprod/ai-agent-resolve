@@ -253,11 +253,14 @@ def test_unit_templates_use_only_known_placeholders() -> None:
     import re
 
     known = {"AAR_ROOT", "AAR_USER", "AAR_GROUP", "TAILNET_IP", "CONSOLE_HOSTNAME"}
+    # S19a: the worker also writes the work and export folders install-units.sh fills in
+    known |= {"AAR_WORK_DIR", "AAR_EXPORT_DIR"}
     units = sorted((DEPLOY / "linux").glob("*.service.in"))
     assert [u.name for u in units] == [
         "aar-hub-console.service.in",
         "aar-hub-mcp.service.in",
         "aar-hub-nodeapi.service.in",
+        "aar-hub-worker.service.in",
     ]
     for unit in units:
         text = unit.read_text(encoding="utf-8")

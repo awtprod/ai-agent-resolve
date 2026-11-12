@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from aar import cli_io
 from aar.node.ops.read import DescribeResult
+from aar.plan import stub_cli
 from aar.plan.apply import (
     AssembleResult,
     CompileError,
@@ -65,6 +66,7 @@ def register(subparsers: Any) -> None:
     check.add_argument("--json", action="store_true", help="Print the report as JSON.")
     check.set_defaults(func=_cmd_lint)
     produce_cli.register(sub)
+    stub_cli.register(sub)
 
     apply = sub.add_parser(
         "apply",

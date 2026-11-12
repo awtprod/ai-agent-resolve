@@ -452,6 +452,11 @@ class EventLog:
             self._conn.close()
             raise
 
+    @property
+    def path(self) -> str:
+        """The database path this log was opened with (as given)."""
+        return self._path
+
     def _open(self, read_only: bool) -> sqlite3.Connection:
         if not read_only:
             return sqlite3.connect(self._path, check_same_thread=False)

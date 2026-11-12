@@ -15,6 +15,11 @@ key                                        value
 ``path.map.<name>``                        ``{from, to}``, paths up to 1024 characters
 ``render.hash.<deliverable>``              ``{sha256, bytes}``
 ``qa.<metric>.<deliverable>``              ``{value, unit}``: a finite number and its unit
+``transcript.<key>``                       ``{media_sha256, model, recording, transcript,
+                                           text, report}``: a stored transcript of one media
+                                           file; ``<key>`` is the sha256 of the file's hash,
+                                           the model and the settings (S19a, so a recipe run
+                                           on the same show skips the transcription)
 =========================================  ==============================================
 
 Every ``<...>`` part matches ``[A-Za-z0-9][A-Za-z0-9_-]{0,63}`` (no dots), so a key parses
@@ -144,6 +149,21 @@ class QaMetric(StrictModel):
     unit: Annotated[str, Field(pattern=r"^[A-Za-z%][A-Za-z0-9%/._-]{0,15}$")]
 
 
+class TranscriptCache(StrictModel):
+    """``transcript.<key>``: where a finished transcript of one media file is stored.
+
+    ``<key>`` is the sha256 of the file's sha256, the model and every setting that changes the
+    words (``aar.recipes.ccn.transcript_cache_key``). ``transcript``, ``text`` and ``report`` are
+    artifact ids: the Transcript JSON, its readable text and the transcriber's report."""
+
+    media_sha256: Sha256
+    model: TitleText
+    recording: TitleText
+    transcript: Sha256
+    text: Sha256
+    report: Sha256
+
+
 @dataclass(frozen=True, slots=True)
 class Namespace:
     """One closed fact namespace: its key shape and its value model."""
@@ -180,6 +200,9 @@ NAMESPACES: tuple[Namespace, ...] = (
         RenderHash,
     ),
     Namespace("qa", re.compile(rf"qa\.{_SEG}\.{_SEG}"), "qa.<metric>.<deliverable>", QaMetric),
+    Namespace(
+        "transcript", re.compile(rf"transcript\.{_SEG}"), "transcript.<key>", TranscriptCache
+    ),
 )
 
 
