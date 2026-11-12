@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import secrets
+import shutil
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -196,6 +200,29 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     )
     _add_db(node_list)
     node_list.set_defaults(func=_node_list)
+
+    artifact = hub_sub.add_parser("artifact", help="Read stored artifacts (renders, plans...).")
+    artifact_sub = artifact.add_subparsers(dest="artifact_command", required=True)
+    artifact_get = artifact_sub.add_parser(
+        "get",
+        help="Write a stored artifact's bytes to a file (or stdout), verified against its hash.",
+        description=(
+            "Copy one artifact out of the store, checked against its sha256 id as it is read. "
+            "With --out the file is written (never over an existing one unless --force) and a "
+            "JSON line describes it; without --out the bytes go to stdout. --project refuses an "
+            "artifact recorded for another project. Exit 0 written, 2 refused (JSON error on "
+            "stderr: invalid_input, unknown_artifact, artifact_missing, artifact_corrupt, "
+            "wrong_project, output_exists, output_error, database_unavailable, "
+            "artifact_store_unavailable)."
+        ),
+    )
+    _add_db(artifact_get)
+    artifact_get.add_argument("--artifacts", required=True, help="Artifact store directory.")
+    artifact_get.add_argument("artifact_id", help="The artifact id (64 lowercase hex).")
+    artifact_get.add_argument("--out", type=Path, help="Write here instead of stdout.")
+    artifact_get.add_argument("--force", action="store_true", help="Replace an existing --out.")
+    artifact_get.add_argument("--project", help="Refuse an artifact of another project.")
+    artifact_get.set_defaults(func=_artifact_get)
 
     nodeapi = hub_sub.add_parser(
         "nodeapi",
@@ -793,6 +820,92 @@ def _open_store(root: str, log: Any) -> Any:
         return ArtifactStore(root, log, create=False)
     except OSError as exc:
         raise _StoreUnavailable(f"no artifact store directory at {root!r}") from exc
+
+
+def _artifact_get(args: argparse.Namespace) -> int:
+    """``aar hub artifact get``: stream one verified artifact to --out or stdout (S19a)."""
+    from aar.hub.artifacts import CorruptArtifact, InvalidArtifactId
+
+    try:
+        log = _open_existing(args.db, read_only=True)
+    except _DatabaseUnavailable as exc:
+        return _fail("database_unavailable", str(exc))
+    try:
+        try:
+            store = _open_store(args.artifacts, log)
+        except _StoreUnavailable as exc:
+            return _fail("artifact_store_unavailable", str(exc))
+        try:
+            store.has(args.artifact_id)  # validates the id's shape before any lookup
+        except InvalidArtifactId as exc:
+            return _fail("invalid_input", str(exc))
+        meta = store.get_meta(args.artifact_id)
+        if meta is None:
+            return _fail("unknown_artifact", f"no artifact {args.artifact_id!r} is recorded")
+        if args.project is not None and meta.project_id != args.project:
+            return _fail(
+                "wrong_project",
+                f"artifact {args.artifact_id!r} belongs to project {meta.project_id!r}, "
+                f"not {args.project!r}",
+            )
+        try:
+            if args.out is None:
+                return _artifact_to_stdout(store, args.artifact_id)
+            return _artifact_to_file(store, meta, args.out, args.force)
+        except FileNotFoundError:
+            return _fail("artifact_missing", f"the content of {args.artifact_id!r} is missing")
+        except CorruptArtifact as exc:
+            return _fail("artifact_corrupt", str(exc))
+    finally:
+        log.close()
+
+
+def _artifact_to_stdout(store: Any, artifact_id: str) -> int:
+    stream = getattr(sys.stdout, "buffer", None)
+    if stream is None:
+        return _fail("output_error", "stdout takes no bytes")
+    with store.open(artifact_id) as handle:  # verified against its hash on open
+        try:
+            shutil.copyfileobj(handle, stream, 1024 * 1024)
+            stream.flush()
+        except BrokenPipeError:
+            return cli_io.EXIT_PIPE_CLOSED
+        except OSError as exc:
+            return _fail("output_error", f"cannot write stdout: {exc}")
+    return 0
+
+
+def _artifact_to_file(store: Any, meta: Any, out: Path, force: bool) -> int:
+    from aar.drp.modify.write import _place
+    from aar.hub.artifacts import CorruptArtifact
+
+    if out.is_dir() or (out.exists() and not force):
+        return _fail("output_exists", f"{str(out)!r} exists (pass --force to replace a file)")
+    tmp = out.with_name(f".{out.name}.aar-get-{secrets.token_hex(4)}")
+    try:
+        with store.open(meta.id) as handle, tmp.open("xb") as sink:
+            shutil.copyfileobj(handle, sink, 1024 * 1024)
+            sink.flush()
+            os.fsync(sink.fileno())
+        _place(tmp, out, force)  # without force, never over a file that appeared meanwhile
+    except FileExistsError:
+        return _fail("output_exists", f"{str(out)!r} exists (pass --force to replace a file)")
+    except (FileNotFoundError, CorruptArtifact):
+        raise
+    except OSError as exc:
+        return _fail("output_error", f"cannot write {str(out)!r}: {exc}")
+    finally:
+        tmp.unlink(missing_ok=True)
+    return _print(
+        {
+            "ok": True,
+            "artifact_id": meta.id,
+            "size": meta.size,
+            "mime": meta.mime,
+            "project_id": meta.project_id,
+            "out": str(out),
+        }
+    )
 
 
 def _parse_actor(value: str) -> Any:

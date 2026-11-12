@@ -30,6 +30,17 @@ VALID: list[tuple[str, dict[str, Any]]] = [
     ("qa.lufs.master", {"value": -22.1, "unit": "LUFS"}),
     ("qa.true-peak.short-1", {"value": -1.2, "unit": "dBTP"}),
     ("qa.longest_silence.short-1", {"value": 0.48, "unit": "s"}),
+    (
+        "transcript." + "c" * 64,
+        {
+            "media_sha256": "a" * 64,
+            "model": "medium.en",
+            "recording": "show-1",
+            "transcript": "b" * 64,
+            "text": "d" * 64,
+            "report": "e" * 64,
+        },
+    ),
 ]
 
 
@@ -85,6 +96,7 @@ def test_namespaces_are_a_closed_set() -> None:
         "path.map.<name>",
         "render.hash.[review|master.]<deliverable>",
         "qa.<metric>.<deliverable>",
+        "transcript.<key>",
     ]
 
 

@@ -734,6 +734,7 @@ _VALUE_HINTS = {
     "path.map": "{from: path, to: path}",
     "render.hash": "{sha256: 64 hex, bytes: int}",
     "qa": "{value: finite number, unit: e.g. LUFS, dBTP, s, MB}",
+    "transcript": "{media_sha256, model, recording, transcript, text, report: artifact ids}",
 }
 
 
