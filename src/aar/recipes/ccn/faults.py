@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from aar.qa.check import NO_LOUDNESS_LUFS
 from aar.qa.report import QACheck, QAReport
 
 #: Plan layout codes the exporter raises, and the renderer passes through (it builds the
@@ -63,15 +64,17 @@ STEP_PLAN_CODES = frozenset({"plan_not_from_stub"})
 #: measured key :mod:`aar.qa.check` writes only when the check ran on the content and judged it
 #: (the value may be ``None``: digital silence measures ``-inf``, stored as ``None``). A check
 #: that could not run fails without it: ``measure_audio`` or ``count_clipped`` raising a
-#: ``MediaError`` (a timeout, an ffmpeg error), no audio stream, NaN samples, an unknown render
-#: duration. ``decode`` (the renderer's output does not decode, or ffprobe timed out),
-#: ``longest-silence`` (it can only warn, which the gate allows: it fails the gate only when it
-#: could not measure or is incomplete) and ``size-cap`` (not applied to this review render) are
-#: never the cut's.
+#: ``MediaError`` (a timeout, an ffmpeg error), no audio stream, NaN samples. A loudness failure
+#: on a gated loudness whose true peak was not measured (:func:`_true_peak_unmeasured`) is a
+#: check that could not run either. ``decode`` (the renderer's output does not decode, or ffprobe
+#: timed out), ``duration`` (the renderer already refuses output that does not hold the
+#: timeline's frames, ``render_incomplete``, so a QA duration failure after it is the container
+#: or the measurement, which no cut fixes), ``longest-silence`` (it can only warn, which the gate
+#: allows: it fails the gate only when it could not measure or is incomplete) and ``size-cap``
+#: (not applied to this review render) are never the cut's.
 QA_JUDGED_BY = {
     "loudness": "integrated_lufs",
     "clipping": "clipped_samples",
-    "duration": "diff_frames",
 }
 #: ``join-quiet`` judges each join; a join entry carries this key only when its source audio was
 #: read and judged (a join whose audio could not be read is ``unchecked``, or failed without it).
@@ -128,7 +131,20 @@ def _judged(check: QACheck) -> bool:
         failed = [d for d in check.details if d.get("status") == "fail"]
         return bool(failed) and all(JOIN_JUDGED_BY in d for d in failed)
     key = QA_JUDGED_BY.get(check.id)
-    return key is not None and key in check.measured
+    if key is None or key not in check.measured:
+        return False
+    return not (check.id == "loudness" and _true_peak_unmeasured(check.measured))
+
+
+def _true_peak_unmeasured(measured: Mapping[str, Any]) -> bool:
+    """Whether a loudness check failed (also) because the true peak was not measured: the gated
+    loudness is a number above :data:`~aar.qa.check.NO_LOUDNESS_LUFS` (so ``evaluate_loudness``
+    went on to the true peak) and the true peak is missing. Digital silence (``-70`` LUFS or
+    ``None``) fails on the loudness alone and stays judged."""
+    lufs = measured.get("integrated_lufs")
+    if not isinstance(lufs, (int, float)) or isinstance(lufs, bool) or lufs <= NO_LOUDNESS_LUFS:
+        return False
+    return measured.get("true_peak_dbtp") is None
 
 
 __all__ = [

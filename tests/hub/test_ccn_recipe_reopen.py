@@ -291,7 +291,7 @@ JOIN = QACheck(
 )
 
 
-@pytest.mark.parametrize("checks", [(LOUD,), (SILENT,), (CLIPPED,), (LONG,), (JOIN,), (LOUD, LONG)])
+@pytest.mark.parametrize("checks", [(LOUD,), (SILENT,), (CLIPPED,), (JOIN,), (LOUD, CLIPPED)])
 def test_a_qa_failure_judging_the_cut_is_marked(checks: tuple[QACheck, ...]) -> None:
     assert _qa_upstream(*checks) is True
 
@@ -309,6 +309,25 @@ COULD_NOT_RUN = {
     "decode timeout": _fail("decode", {"readable": False, "exit_code": None}),
     "decode errors": _fail("decode", {"readable": True, "exit_code": 0, "error_lines": 3}),
     "duration unknown": _fail("duration"),
+    # fix round 2 (LOW-A): the renderer already refuses output that does not hold the
+    # timeline's frames (render_incomplete), so a measured duration failure is not the cut's
+    "duration measured off": LONG,
+    # fix round 2 (LOW-A): a gated loudness whose true peak was not measured, in target or not
+    "true peak not measured": _fail("loudness", {"integrated_lufs": -14.0, "true_peak_dbtp": None}),
+    "true peak not measured, loudness off": _fail(
+        "loudness", {"integrated_lufs": -31.0, "true_peak_dbtp": None}
+    ),
+    # fix round 2 (LOW-B, M17): one judged join failure next to one whose audio was not read
+    "one join judged, one join unread": QACheck(
+        id="join-quiet",
+        status="fail",
+        message="m",
+        measured={"cuts": 2, "failed": 2, "unchecked": 0},
+        details=[
+            {"join": 1, "status": "fail", "run_at_cut": None, "quiet_ms_at_cut": 0.0},
+            {"join": 2, "status": "fail", "reason": "could not read the source audio"},
+        ],
+    ),
     "join audio unreadable": QACheck(
         id="join-quiet",
         status="fail",
@@ -346,7 +365,7 @@ def test_a_qa_failure_from_a_check_that_could_not_run_is_unmarked(name: str) -> 
     assert _qa_upstream(COULD_NOT_RUN[name]) is False
     # one such check next to a judged failure still leaves the failure unmarked
     assert (
-        _qa_upstream(LOUD if COULD_NOT_RUN[name].id != "loudness" else LONG, COULD_NOT_RUN[name])
+        _qa_upstream(LOUD if COULD_NOT_RUN[name].id != "loudness" else CLIPPED, COULD_NOT_RUN[name])
         is False
     )
 
