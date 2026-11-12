@@ -1162,29 +1162,45 @@ def shrink_file(
         min_free_fraction=min_free_fraction,
         encode_timeout_s=encode_timeout_s,
     )
+    copy = None
     try:
-        _flush_file(temp)
-        _check_unchanged(src, before)
-        if replace:
-            os.replace(temp, src)
-        else:
-            try:
-                _no_clobber_rename(temp, final)
-            except FileExistsError:
-                raise ShrinkError(
-                    "destination_exists",
-                    f"{str(final)!r} appeared while shrinking; it was not overwritten",
-                    "check what else writes there, then run again",
-                    path=str(final),
-                ) from None
-        _flush_folder(final.parent)
-    finally:
-        _unlink(temp)
-    result.status = "shrunk"
-    result.encode_s = elapsed
-    result.output_bytes = out_facts.size_bytes
-    result.output = out_facts.summary()
-    return result
+        try:
+            _flush_file(temp)
+            copy = os.stat(temp)
+            _check_unchanged(src, before)
+            if replace:
+                os.replace(temp, src)
+            else:
+                try:
+                    _no_clobber_rename(temp, final)
+                except FileExistsError:
+                    raise ShrinkError(
+                        "destination_exists",
+                        f"{str(final)!r} appeared while shrinking; it was not overwritten",
+                        "check what else writes there, then run again",
+                        path=str(final),
+                    ) from None
+            _flush_folder(final.parent)
+        finally:
+            _unlink(temp)
+        result.status = "shrunk"
+        result.encode_s = elapsed
+        result.output_bytes = out_facts.size_bytes
+        result.output = out_facts.summary()
+        return result
+    except KeyboardInterrupt as exc:
+        # Stopped after the rename or the link: the verified copy already has its name.
+        if copy is not None and _holds(final, copy):
+            exc.placed = str(final)  # type: ignore[attr-defined]
+        raise
+
+
+def _holds(path: Path, copy: os.stat_result) -> bool:
+    """Whether ``path`` is now the file ``copy`` was taken of."""
+    try:
+        return os.path.samestat(os.stat(path), copy)
+    except OSError:
+        return False
 
 
 def video_files(directory: Path) -> list[Path]:
@@ -1306,23 +1322,36 @@ class Stopped(KeyboardInterrupt):
 STOP_SIGNALS = ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK")
 
 
+class StopState:
+    """What :func:`stop_signals` saw: the first stop signal's name (None until one came), and
+    whether signals are only noted now (``deferred``: set while the results are written)."""
+
+    def __init__(self) -> None:
+        self.signal_name: str | None = None
+        self.deferred = False
+
+
 @contextlib.contextmanager
-def stop_signals() -> Any:
-    """While the block runs, turn :data:`STOP_SIGNALS` into :class:`Stopped`. Only the first
-    signal raises (later ones are ignored, so a second Ctrl-C cannot cut the cleanup short). A
-    signal this process already ignores (``nohup``) stays ignored. Outside the main thread, or
-    where a signal does not exist, nothing changes."""
+def stop_signals(*, ending: bool = False) -> Any:
+    """While the block runs, turn :data:`STOP_SIGNALS` into :class:`Stopped`; yields a
+    :class:`StopState`. Only the first signal raises (later ones are ignored, so a second
+    Ctrl-C cannot cut the cleanup short), and none raises once ``deferred`` is set (it is only
+    noted). A signal this process already ignores (``nohup``) stays ignored. On the way out the
+    previous handlers are restored, except with ``ending`` (the command line, whose process ends
+    with the run) after a stop: then later signals stay ignored, so one arriving after the
+    cleanup cannot end the process by the signal instead of the typed exit status. Outside the
+    main thread, or where a signal does not exist, nothing changes."""
+    state = StopState()
     if threading.current_thread() is not threading.main_thread():
-        yield
+        yield state
         return
-    stopping = False
 
     def handler(signum: int, _frame: Any) -> None:
-        nonlocal stopping
-        if stopping:
+        if state.signal_name is not None:
             return
-        stopping = True
-        raise Stopped(signal.Signals(signum).name)
+        state.signal_name = signal.Signals(signum).name
+        if not state.deferred:
+            raise Stopped(state.signal_name)
 
     previous: dict[int, Any] = {}
     for name in STOP_SIGNALS:
@@ -1336,20 +1365,38 @@ def stop_signals() -> Any:
         except (OSError, ValueError, RuntimeError):  # not settable here
             continue
     try:
-        yield
+        yield state
     finally:
-        for signum, old in previous.items():
-            with contextlib.suppress(OSError, ValueError, RuntimeError, TypeError):
-                signal.signal(signum, old)
+        if not (ending and state.signal_name is not None):
+            for signum, old in previous.items():
+                with contextlib.suppress(OSError, ValueError, RuntimeError, TypeError):
+                    signal.signal(signum, old)
 
 
 def interrupted_error(exc: BaseException, path: str | None = None) -> ShrinkError:
     """The typed error for a run stopped by a signal or Ctrl-C."""
     name = getattr(exc, "signal_name", "SIGINT")
-    where = f" while shrinking {path!r}" if path else ""
+    placed = getattr(exc, "placed", None)
+    if placed is not None:  # after the rename or the link: the work for this file is done
+        return ShrinkError(
+            "interrupted",
+            f"stopped by {name} while shrinking {path!r}, just after the verified copy was put "
+            f"in place as {placed!r}: that copy is complete",
+            "run again for the rest: files already shrunk are verified and skipped",
+            signal=name,
+            placed=placed,
+            **({"path": path} if path else {}),
+        )
+    if path is None:
+        what = f"stopped by {name} while no file was being shrunk; nothing was left half written"
+    else:
+        what = (
+            f"stopped by {name} while shrinking {path!r}; ffmpeg was stopped and the partial "
+            "copy removed"
+        )
     return ShrinkError(
         "interrupted",
-        f"stopped by {name}{where}; ffmpeg was stopped and the partial copy removed",
+        what,
         "run again: files already shrunk are verified and skipped",
         signal=name,
         **({"path": path} if path else {}),
@@ -1378,7 +1425,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help="Write beside the source, verify, then put the small file in its place.",
     )
     parser.add_argument("--report", type=Path, help="Also write a JSON report of the run here.")
-    parser.set_defaults(func=run_args)
+    parser.set_defaults(func=run_command)
 
 
 def build_parser(prog: str = "python -m aar.media.shrink") -> argparse.ArgumentParser:
@@ -1403,10 +1450,12 @@ def _print(line: str, stream: Any) -> None:
         pass
 
 
-def run_args(args: argparse.Namespace) -> int:
+def run_args(args: argparse.Namespace, *, ending: bool = False) -> int:
     """Run ``shrink`` for parsed arguments; print one JSON line per file; 0 or 2. A stop signal
     or Ctrl-C (:func:`stop_signals`) ends the run with the typed ``interrupted`` error, its JSON
-    line and the report, exit 2."""
+    line and the report, exit 2; so does one that arrives while the results are written (it is
+    noted, not raised, from the moment the files are done). ``ending``: the process ends with
+    this run (see :func:`stop_signals`)."""
     failed = False
     results: list[FileResult] = []
     interrupted: ShrinkError | None = None
@@ -1419,21 +1468,38 @@ def run_args(args: argparse.Namespace) -> int:
         if result.error is not None:
             _print(f"aar media shrink: {result.error} (fix: {result.error.hint})", sys.stderr)
 
-    with stop_signals():
+    def stopped(error: ShrinkError) -> None:
+        _print(json.dumps({"ok": False, "error": error.to_dict()}, sort_keys=True), sys.stdout)
+        _print(f"aar media shrink: {error} (fix: {error.hint})", sys.stderr)
+
+    with stop_signals(ending=ending) as stop:
         try:
-            shrink(args.source, args.out, replace=bool(args.replace), emit=emit)
+            try:
+                shrink(args.source, args.out, replace=bool(args.replace), emit=emit)
+            finally:
+                stop.deferred = True
         except ShrinkError as exc:
-            _print(json.dumps({"ok": False, "error": exc.to_dict()}, sort_keys=True), sys.stdout)
-            _print(f"aar media shrink: {exc} (fix: {exc.hint})", sys.stderr)
+            stopped(exc)
             return EXIT_FAILED
         except KeyboardInterrupt as exc:
             failed = True
-            interrupted = interrupted_error(exc)
-            if not results or results[-1].reason != "interrupted":  # stopped between files
-                line = {"ok": False, "error": interrupted.to_dict()}
-                _print(json.dumps(line, sort_keys=True), sys.stdout)
-                _print(f"aar media shrink: {interrupted} (fix: {interrupted.hint})", sys.stderr)
-        return _write_report(args, results, failed, interrupted)
+            last = results[-1] if results else None
+            if last is not None and last.reason == "interrupted" and last.error is not None:
+                interrupted = last.error  # the file's own line says it
+            else:  # stopped between files
+                interrupted = interrupted_error(exc)
+                stopped(interrupted)
+        code = _write_report(args, results, failed, interrupted)
+        if interrupted is None and stop.signal_name is not None:  # came while writing them
+            interrupted = interrupted_error(Stopped(stop.signal_name))
+            stopped(interrupted)
+            code = _write_report(args, results, True, interrupted)
+        return code
+
+
+def run_command(args: argparse.Namespace) -> int:
+    """``aar media shrink``: :func:`run_args` for a process that ends with the run."""
+    return run_args(args, ending=True)
 
 
 def _write_report(
@@ -1458,11 +1524,12 @@ def _write_report(
     return EXIT_FAILED if failed else EXIT_OK
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """``python -m aar.media.shrink``: the same command without the rest of ``aar``."""
+def main(argv: Sequence[str] | None = None, *, ending: bool = False) -> int:
+    """``python -m aar.media.shrink``: the same command without the rest of ``aar``
+    (``ending``: see :func:`stop_signals`)."""
     args = build_parser().parse_args(argv)
-    return run_args(args)
+    return run_args(args, ending=ending)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(ending=True))

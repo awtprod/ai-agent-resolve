@@ -160,7 +160,9 @@ replaced since. Errors are JSON with a `code` (`unreadable`, `vfr`, `odd_size`,
 
 **Stopping a run.** Ctrl-C, `kill`, closing the terminal (Linux) or Ctrl-Break (Windows) stops
 ffmpeg, removes the partial copy, prints the file's line with the code `interrupted`, writes the
-report and exits 2; rerunning resumes (files already done are verified and skipped). A run killed
+report and exits 2, also when a second signal follows or the signal lands while the report is
+written; rerunning resumes (files already done are verified and skipped). A signal that lands
+just after a copy got its name says so (`placed`): that copy is complete. A run killed
 outright (`kill -9`, Task Manager) or a closed console window on Windows cannot clean up: it can
 leave a hidden `.<name>.aar-shrink-<random>.part` file (after `kill -9` ffmpeg finishes it in
 the background, full size), which is safe to delete.

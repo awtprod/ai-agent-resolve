@@ -1154,3 +1154,178 @@ def test_replace_of_an_unkept_layout_does_not_suggest_another_name(
         and ".mov" in exc.value.hint
     )
     assert leftovers(tmp_path) == []
+
+
+@posix_only
+@pytest.mark.parametrize("mode", ["out", "replace"])
+def test_a_signal_just_after_the_copy_is_in_place_says_so(
+    sources: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mode: str,
+) -> None:
+    import signal
+
+    src = tmp_path / "cam.mp4"
+    src.write_bytes(sources["short"].read_bytes())
+    dst = src if mode == "replace" else tmp_path / "copy.mp4"
+    real = shrink_mod._flush_folder
+
+    def flush_after_a_signal(folder: Path) -> None:  # runs right after the rename or the link
+        os.kill(os.getpid(), signal.SIGTERM)
+        real(folder)
+
+    monkeypatch.setattr(shrink_mod, "_flush_folder", flush_after_a_signal)
+    where = ["--replace"] if mode == "replace" else ["--out", str(dst)]
+    assert shrink_mod.main([str(src), *where]) == 2
+    line = json.loads(capsys.readouterr().out.splitlines()[-1])
+    error = line["error"]
+    assert error["code"] == "interrupted" and error["details"]["placed"] == str(dst)
+    assert "removed" not in error["message"] and "in place" in error["message"]
+    monkeypatch.undo()
+    shrink_mod.verify(shrink_mod.read_facts(sources["short"]), dst)  # it is: complete, verified
+    assert leftovers(tmp_path) == []
+
+
+# --- Fix round 2: stopping, pinned ------------------------------------------------------------
+
+
+def _signal_from(monkeypatch: pytest.MonkeyPatch, name: str, sig: str = "SIGTERM") -> None:
+    """Make ``shrink_mod.<name>`` send this process ``sig`` each time, then do its real work."""
+    import signal
+
+    real = getattr(shrink_mod, name)
+
+    def spy(*args: object, **kw: object) -> object:
+        os.kill(os.getpid(), getattr(signal, sig))
+        return real(*args, **kw)
+
+    monkeypatch.setattr(shrink_mod, name, spy)
+
+
+@posix_only
+def test_only_the_first_signal_stops_and_the_stopped_file_has_its_own_line(
+    sources: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    src = tmp_path / "cam.mp4"
+    src.write_bytes(sources["short"].read_bytes())
+    report = tmp_path / "report.json"
+    _signal_from(monkeypatch, "verify")  # the first signal: the copy is being checked
+    _signal_from(monkeypatch, "_unlink")  # a second one in the middle of the cleanup
+    rc = shrink_mod.main([str(src), "--out", str(tmp_path / "copy.mp4"), "--report", str(report)])
+    monkeypatch.undo()
+    assert rc == 2
+    assert leftovers(tmp_path) == [] and not (tmp_path / "copy.mp4").exists()
+    lines = [json.loads(ln) for ln in capsys.readouterr().out.splitlines()]
+    assert len(lines) == 1 and lines[0]["source"] == str(src)  # the file's own line, only
+    assert lines[0]["error"]["code"] == "interrupted"
+    assert lines[0]["error"]["details"]["path"] == str(src)
+    written = json.loads(report.read_text())
+    assert [f["source"] for f in written["files"]] == [str(src)]
+    assert written["interrupted"]["details"]["path"] == str(src)
+
+
+@posix_only
+def test_a_signal_already_ignored_stays_ignored(
+    sources: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import signal
+
+    before = signal.signal(signal.SIGTERM, signal.SIG_IGN)  # as under nohup
+    try:
+        _signal_from(monkeypatch, "verify")
+        rc = shrink_mod.main([str(sources["short"]), "--out", str(tmp_path / "copy.mp4")])
+        monkeypatch.undo()
+        assert rc == 0 and (tmp_path / "copy.mp4").is_file()
+        assert signal.getsignal(signal.SIGTERM) == signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGTERM, before)
+
+
+@posix_only
+def test_the_previous_handlers_are_restored(
+    sources: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import signal
+
+    def mine(_signum: int, _frame: object) -> None:  # pragma: no cover - never called
+        raise AssertionError
+
+    before = signal.signal(signal.SIGTERM, mine)
+    try:
+        assert shrink_mod.main([str(sources["short"]), "--out", str(tmp_path / "a.mp4")]) == 0
+        assert signal.getsignal(signal.SIGTERM) is mine
+        _signal_from(monkeypatch, "verify")  # an interrupted run restores them too
+        assert shrink_mod.main([str(sources["short"]), "--out", str(tmp_path / "b.mp4")]) == 2
+        monkeypatch.undo()
+        assert signal.getsignal(signal.SIGTERM) is mine
+    finally:
+        signal.signal(signal.SIGTERM, before)
+
+
+# The command as ``python -m`` runs it (``main(ending=True)``), with a stop signal sent at one
+# moment by wrapping a function of the module: "after_cleanup" stops the run while the copy is
+# checked, then sends a second signal once main() has returned; "report" sends the only signal
+# while the report is being written.
+_SIGNAL_CHILD = """
+import os, pathlib, signal, sys, time
+from aar.media import shrink as S
+
+def kill():
+    os.kill(os.getpid(), signal.SIGTERM)
+
+moment, argv = sys.argv[1], sys.argv[2:]
+if moment == "after_cleanup":
+    real = S.verify
+    def verify(*a, **k):
+        kill()
+        return real(*a, **k)
+    S.verify = verify
+    code = S.main(argv, ending=True)
+    kill()
+    time.sleep(0.2)
+    sys.exit(code)
+real_write = pathlib.Path.write_text
+def write_text(self, *a, **k):
+    kill()
+    return real_write(self, *a, **k)
+pathlib.Path.write_text = write_text
+sys.exit(S.main(argv, ending=True))
+"""
+
+
+@posix_only
+@pytest.mark.parametrize("moment", ["after_cleanup", "report"])
+def test_a_late_signal_still_ends_with_the_typed_exit_status(
+    sources: dict[str, Path], tmp_path: Path, moment: str
+) -> None:
+    report = tmp_path / "report.json"
+    copy = tmp_path / "copy.mp4"
+    env = {**os.environ, "PYTHONPATH": str(SRC_ROOT)}
+    done = subprocess.run(
+        [
+            *(sys.executable, "-c", _SIGNAL_CHILD, moment, str(sources["short"])),
+            *("--out", str(copy), "--report", str(report)),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        cwd=tmp_path,
+        preexec_fn=_default_signals,
+    )
+    assert done.returncode == 2, (done.returncode, done.stderr)
+    assert "Traceback" not in done.stderr
+    last = json.loads(done.stdout.splitlines()[-1])
+    assert last["error"]["code"] == "interrupted"
+    written = json.loads(report.read_text())
+    assert written["ok"] is False and written["interrupted"]["details"]["signal"] == "SIGTERM"
+    if moment == "report":  # the file itself was done before the signal
+        assert written["files"][0]["status"] == "shrunk" and copy.is_file()
+    else:
+        assert not copy.exists()
+    assert leftovers(tmp_path) == []
