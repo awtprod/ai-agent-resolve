@@ -237,16 +237,85 @@ def register_reopen_recipe() -> RecipeDef:
     return registry.register(reopen_recipe_def())
 
 
-def make_reopen_run(hub: Any, *, actor: Actor = AGENT, max_review_rounds: int | None = None) -> str:
-    """A brief and a ``reopentest`` recipe node; returns the recipe node id."""
+# -- S19f fix round: a failure two steps after the agent step, a gate in parallel -------------
+
+DEEP_RECIPE = "reopendeep"
+#: plan sha256 values whose ship step (two steps after ``p``) fails, marked upstream
+SHIP_FAILS: set[str] = set()
+
+
+def _mid(ctx: StepContext) -> StepOutput:
+    return StepOutput(outputs={"mid": ctx.needs["p"]["plan_sha256"]})
+
+
+def _ship(ctx: StepContext) -> StepOutput:
+    sha = ctx.needs["m"]["mid"]
+    if sha in SHIP_FAILS:
+        raise StepFailure("bad_ship", f"plan {sha[:12]} does not ship", "change it", upstream=True)
+    return StepOutput(outputs={"shipped": sha})
+
+
+def deep_recipe_def() -> RecipeDef:
+    """``c`` cold, ``p`` agent plan, ``m`` cold on ``p``, ``g`` a gate on ``p`` in parallel with
+    ``m`` (it needs only ``p``), ``x`` cold on ``m`` with ``on_fail="p"`` (two steps after
+    ``p``), ``report``."""
+    return RecipeDef(
+        name=DEEP_RECIPE,
+        version=1,
+        params_model=RecTestParams,
+        steps=(
+            StepDef(id="c", kind="cold", callable_id="rectest.cold", idempotent=True),
+            StepDef(id="p", kind="agent", instruction="Submit a plan.", expects=PlanExpect()),
+            StepDef(
+                id="m", kind="cold", callable_id="reopendeep.mid", idempotent=True, needs=("p",)
+            ),
+            StepDef(id="g", kind="gate", subject="p", on_reject="p", needs=("p",)),
+            StepDef(
+                id="x",
+                kind="cold",
+                callable_id="reopendeep.ship",
+                idempotent=True,
+                needs=("m",),
+                on_fail="p",
+                max_attempts=2,
+            ),
+            StepDef(
+                id="report",
+                kind="cold",
+                callable_id="recipe.report",
+                idempotent=True,
+                needs=("c", "p", "m", "g", "x"),
+            ),
+        ),
+    )
+
+
+def register_deep_recipe() -> RecipeDef:
+    """Register the ``reopendeep`` recipe and its callables (after a registry clear)."""
+    registry.clear()
+    SHIP_FAILS.clear()
+    registry.register_callable("rectest.cold", _cold)
+    registry.register_callable("reopendeep.mid", _mid)
+    registry.register_callable("reopendeep.ship", _ship)
+    return registry.register(deep_recipe_def())
+
+
+def make_reopen_run(
+    hub: Any,
+    *,
+    actor: Actor = AGENT,
+    max_review_rounds: int | None = None,
+    recipe: str = REOPEN_RECIPE,
+) -> str:
+    """A brief and a ``reopentest`` (or ``recipe``) recipe node; returns the recipe node id."""
     brief = create_brief(
         hub.log,
-        brief_data(hub.project_id, recipe=REOPEN_RECIPE),
+        brief_data(hub.project_id, recipe=recipe),
         actor,
-        idempotency_key="brief-reopentest",
+        idempotency_key=f"brief-{recipe}",
     )
     body: dict[str, Any] = {
-        "recipe": REOPEN_RECIPE,
+        "recipe": recipe,
         "brief_id": brief.body["node"]["id"],
         "params": {"qa_report": "0" * 64},
     }
@@ -257,7 +326,7 @@ def make_reopen_run(hub: Any, *, actor: Actor = AGENT, max_review_rounds: int | 
         hub.project_id,
         body,
         actor,
-        idempotency_key="recipe-reopentest",
+        idempotency_key=f"recipe-{recipe}",
         params_validator=registry.registry_params_validator,
     )
     return recipe.body["node"]["id"]

@@ -66,6 +66,7 @@ from aar.recipes.events import (
 )
 from aar.recipes.models import RecipeDef, StepDef
 from aar.recipes.ports import HOT_STATES
+from aar.recipes.reopen import _plan_shape_ok, reopening, unfinished_reopens
 from aar.recipes.state import OpAttempt, RunState, load_state, project_of_node
 
 MAX_BAD_POLLS = 5
@@ -665,7 +666,7 @@ def advance(
     now = clock()
 
     if state.recipe_status in ("active", "blocked"):
-        if _finish_reopens(log, state, recipe_def, actor):
+        if finish_reopens(log, state, recipe_def, actor):
             state = load_state(log, recipe_node, project_id=project_id)
         if _reap_leases(log, state, recipe_def, actor, now):
             state = load_state(log, recipe_node, project_id=project_id)
@@ -892,36 +893,6 @@ def begin_reopen(
     return _supersede_op(log, state.project_id, agent_op, caller, reason, extra={"reopen": plan})
 
 
-def _plan_shape_ok(plan: dict[str, Any]) -> bool:
-    supersede = plan.get("supersede")
-    return (
-        isinstance(plan.get("step"), str)
-        and _plain_int(plan.get("round"))
-        and _plain_int(plan.get("attempt"))
-        and isinstance(supersede, list)
-        and all(isinstance(op_id, str) for op_id in supersede)
-        and isinstance(plan.get("reopened_for"), dict)
-    )
-
-
-def _plain_int(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def reopen_unfinished(state: RunState, marker_op: OpAttempt) -> bool:
-    """Whether the reopen recorded on ``marker_op`` still has a write to make in this round: an op
-    it lists not yet superseded, or its new attempt not yet created."""
-    plan = marker_op.reopen
-    if plan is None or not _plan_shape_ok(plan) or plan["round"] != state.current_round():
-        return False
-    for op_id in plan["supersede"]:
-        op = state.op_by_id(op_id)
-        if op is not None and not op.is_cancelled:
-            return True
-    made = state.all_in_round(plan["step"], plan["round"])
-    return not any(op.attempt == plan["attempt"] for op in made)
-
-
 def finish_reopen(
     log: EventLog, state: RunState, recipe_def: RecipeDef, marker_op: OpAttempt, caller: Actor
 ) -> bool:
@@ -957,22 +928,30 @@ def finish_reopen(
     return changed or created is not None
 
 
-def _finish_reopens(log: EventLog, state: RunState, recipe_def: RecipeDef, caller: Actor) -> bool:
+def finish_reopens(log: EventLog, state: RunState, recipe_def: RecipeDef, caller: Actor) -> bool:
     """Finish any reopen of this round whose writes were cut short (a crash after its first
-    write): the next engine tick completes it exactly as the command would have."""
+    write), exactly as the command would have. Runs first in every ``advance`` pass and at the
+    start of every recipe write command (``aar.recipes.run``), so nothing else writes while a
+    reopen is half made. A run that is not active or blocked (cancelled, done) is left alone."""
+    if state.recipe_status not in ("active", "blocked"):
+        return False
     changed = False
-    for op in state.ops:
-        if op.reopen is not None and reopen_unfinished(state, op):
-            changed |= finish_reopen(log, state, recipe_def, op, caller)
+    for op in unfinished_reopens(state):
+        changed |= finish_reopen(log, state, recipe_def, op, caller)
     return changed
 
 
 def _create_ready(log: EventLog, state: RunState, recipe_def: RecipeDef, caller: Actor) -> bool:
     current = state.current_round()
     changed = False
+    # S19f: a step an unfinished reopen will still create is left to the reopen, so its attempt
+    # always carries reopened_for (a pass that loaded its state inside the window gets here).
+    held, _ = reopening(state)
     for step in recipe_def.steps:
         if state.is_step_done(step.id):
             continue  # already done (carried forward from an earlier round); never re-run it
+        if step.id in held:
+            continue
         if state.in_round(step.id, current):
             continue  # already has a (non-cancelled) op this round
         if not all(state.is_step_done(need) for need in step.needs):

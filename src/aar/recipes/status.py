@@ -21,7 +21,7 @@ from aar.hub.common import Clock, utcnow
 from aar.hub.events import EventLog
 from aar.recipes.models import StepDef
 from aar.recipes.ports import HOT_STATES
-from aar.recipes.reopen import reopen_offer
+from aar.recipes.reopen import in_progress_action, reopen_offer, reopening
 from aar.recipes.state import OpAttempt, RunState, load_state
 
 MAX_OUTPUTS_KEYS = 32
@@ -44,12 +44,18 @@ def status_view(
     registered = state.recipe_def is not None
     step_defs: list[StepDef] = list(state.recipe_def.steps) if registered else []
     truncated = False
+    # S19f: while a reopen is unfinished, the ops it will supersede and the step it will create
+    # get its in-progress action instead of a retry or a run (MED-1 of the validation).
+    held_steps, held_ops = reopening(state)
     for step in step_defs:
         op = state.latest_in_round(step.id, current)
         # F17: a step done in an earlier round carries forward as done here.
         if op is None and state.is_step_done(step.id):
             op = state.done_op(step.id)
         step_state, action = _step_state(state, step, op, current, dispatcher)
+        held = held_ops.get(op.op_id) if op is not None else held_steps.get(step.id)
+        if held is not None and step_state != "done":
+            action = in_progress_action(held)
         outputs, out_trunc = _summary(op.result_outputs) if op is not None else (None, False)
         error, err_trunc = _error(op.result_error) if op is not None else (None, False)
         truncated = truncated or out_trunc or err_trunc

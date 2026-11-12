@@ -36,6 +36,7 @@ from aar.recipes.engine import (
     begin_reopen,
     create_attempt,
     finish_reopen,
+    finish_reopens,
     record_result,
     record_run_cancelled,
     record_started,
@@ -105,6 +106,18 @@ def _resolve(log: EventLog, recipe_node: str) -> tuple[str, WorkGraph, RunState,
     return project_id, graph, state, definition
 
 
+def _finish_reopens_first(
+    log: EventLog, state: RunState, definition: RecipeDef, actor: Actor
+) -> RunState:
+    """S19f: every recipe write command first finishes a reopen whose writes were cut short (a
+    crash after its first write), then decides on the state that leaves. Without this a command
+    run inside that window (a ``recipe_retry`` of the failed step, say) writes next to the
+    half-made reopen and the reopen never supersedes what it wrote."""
+    if finish_reopens(log, state, definition, actor):
+        return load_state(log, state.recipe_node, project_id=state.project_id)
+    return state
+
+
 def _revalidate_params(state: RunState, definition: RecipeDef) -> None:
     """Re-validate the stored recipe params against the registered model (F12).
 
@@ -154,6 +167,7 @@ def recipe_start(
     write_key(actor, idempotency_key)  # validate the key shape early
     project_id, _graph, state, definition = _resolve(log, recipe_node)
     _require_owner(_graph, recipe_node, actor, "start")
+    state = _finish_reopens_first(log, state, definition, actor)
     _revalidate_params(state, definition)
     if state.recipe_status in _FINISHED:
         raise WriteError(
@@ -222,6 +236,7 @@ def step_complete(
             step_id=step_id,
         )
     project_id, _graph, state, definition = _resolve(log, recipe_node)
+    state = _finish_reopens_first(log, state, definition, actor)
     fingerprint = request_sha256(
         OP_STEP_COMPLETE,
         {
@@ -550,6 +565,7 @@ def recipe_retry(
     step_id = check_id(step_id, "step_id")
     project_id, graph, state, definition = _resolve(log, recipe_node)
     _require_owner(graph, recipe_node, actor, "retry")
+    state = _finish_reopens_first(log, state, definition, actor)
     step = _step(definition, step_id)
     # F9: a repeated retry with the same key replays the first result whatever has happened since.
     # The key is checked BEFORE the "has a failed attempt" check (so a replay after the step moved
@@ -642,15 +658,18 @@ def recipe_reopen(
     **Crash safety.** The first write supersedes the agent's done op with the whole reopen plan on
     the event; the other writes (supersedes, the new attempt) are idempotent and are made by
     :func:`~aar.recipes.engine.finish_reopen`. A crash after the first write is finished by the
-    next ``advance`` (any engine tick: the worker loop, any recipe tool) or by re-running this
-    command with the same key, whichever comes first; the caller's record is written last, so a
-    re-run after a finished reopen whose record was lost still writes it and returns ok.
+    next ``advance`` (any engine tick: the worker loop), by any recipe write command (each one
+    finishes it before it decides anything: start, step_complete, retry, reopen, cancel) or by
+    re-running this command with the same key, whichever comes first; the caller's record is
+    written last, so a re-run after a finished reopen whose record was lost still writes it and
+    returns ok.
     """
     actor = check_actor(actor)
     caller_key = write_key(actor, idempotency_key)
     step_id = check_id(step_id, "step_id")
     project_id, graph, state, definition = _resolve(log, recipe_node)
     _require_owner(graph, recipe_node, actor, "reopen")
+    state = _finish_reopens_first(log, state, definition, actor)
     step = _step(definition, step_id)
     fingerprint = request_sha256(
         OP_REOPEN,
@@ -737,8 +756,9 @@ def recipe_cancel(
     """
     actor = check_actor(actor)
     write_key(actor, idempotency_key)
-    project_id, graph, state, _ = _resolve(log, recipe_node)
+    project_id, graph, state, definition = _resolve(log, recipe_node)
     _require_owner(graph, recipe_node, actor, "cancel")
+    state = _finish_reopens_first(log, state, definition, actor)
     # N5: cancelling a finished run is a no-op that reports already_finished (never flips a done
     # run to cancelled).
     if state.recipe_status in _FINISHED:

@@ -3,7 +3,8 @@
 :func:`reopen_refusal` is the one precondition check: ``recipe_reopen`` raises what it returns,
 and the status view offers ``recipe_reopen`` exactly when it returns ``None``
 (:func:`reopen_offer`). The writes are :func:`aar.recipes.engine.begin_reopen` and
-:func:`aar.recipes.engine.finish_reopen`.
+:func:`aar.recipes.engine.finish_reopen`; :func:`reopen_unfinished` and :func:`reopening` tell
+the engine, the write commands and the status view that a reopen's writes are not all made yet.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from typing import Any
 
 from aar.hub.writes import WriteError
 from aar.recipes.models import RecipeDef, StepDef
-from aar.recipes.state import RunState
+from aar.recipes.state import OpAttempt, RunState
 
 _FINISHED = frozenset({"done", "cancelled"})
 
@@ -104,6 +105,69 @@ def reopen_blocker(state: RunState, definition: RecipeDef, step: StepDef) -> str
     return None
 
 
+def _plan_shape_ok(plan: dict[str, Any]) -> bool:
+    supersede = plan.get("supersede")
+    return (
+        isinstance(plan.get("step"), str)
+        and _plain_int(plan.get("round"))
+        and _plain_int(plan.get("attempt"))
+        and isinstance(supersede, list)
+        and all(isinstance(op_id, str) for op_id in supersede)
+        and isinstance(plan.get("reopened_for"), dict)
+    )
+
+
+def _plain_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def reopen_unfinished(state: RunState, marker_op: OpAttempt) -> bool:
+    """Whether the reopen recorded on ``marker_op`` still has a write to make in this round: an op
+    it lists not yet superseded, or its new attempt not yet created."""
+    plan = marker_op.reopen
+    if plan is None or not _plan_shape_ok(plan) or plan["round"] != state.current_round():
+        return False
+    for op_id in plan["supersede"]:
+        op = state.op_by_id(op_id)
+        if op is not None and not op.is_cancelled:
+            return True
+    made = state.all_in_round(plan["step"], plan["round"])
+    return not any(op.attempt == plan["attempt"] for op in made)
+
+
+def unfinished_reopens(state: RunState) -> list[OpAttempt]:
+    """The marker ops of every reopen of the current round whose writes are not all made yet
+    (the window between a reopen's first write and the next engine pass or recipe command)."""
+    return [op for op in state.ops if op.reopen is not None and reopen_unfinished(state, op)]
+
+
+def reopening(state: RunState) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """For the status view and the ready pass, while reopens are unfinished: ``(steps, ops)``,
+    the step ids whose new attempt they will still create and the op ids they will still
+    supersede, each mapped to its reopen's plan."""
+    steps: dict[str, dict[str, Any]] = {}
+    ops: dict[str, dict[str, Any]] = {}
+    for marker in unfinished_reopens(state):
+        plan = marker.reopen or {}
+        steps[plan["step"]] = plan
+        for op_id in plan["supersede"]:
+            ops[op_id] = plan
+    return steps, ops
+
+
+def in_progress_action(plan: dict[str, Any]) -> dict[str, Any]:
+    """The status view's action while a reopen is unfinished: nothing for anyone to do; the next
+    engine tick, or any recipe command, finishes it. Never a retry (it would race the reopen)."""
+    why = plan.get("reopened_for") or {}
+    return {
+        "who": "worker",
+        "what": (
+            f"a reopen of {plan.get('step')!r} after {why.get('step')!r} failed is being finished: "
+            "the next engine tick (or any recipe command) completes it; do not retry"
+        ),
+    }
+
+
 def reopen_offer(state: RunState, failed_step: StepDef) -> dict[str, Any] | None:
     """For the status view: what to do about ``failed_step``'s upstream failure, or ``None``
     when it is not one (no ``on_fail``, or the failure is not marked upstream)."""
@@ -142,4 +206,12 @@ def reopen_offer(state: RunState, failed_step: StepDef) -> dict[str, Any] | None
     return None
 
 
-__all__ = ["reopen_blocker", "reopen_offer", "reopen_refusal"]
+__all__ = [
+    "in_progress_action",
+    "reopen_blocker",
+    "reopen_offer",
+    "reopen_refusal",
+    "reopen_unfinished",
+    "reopening",
+    "unfinished_reopens",
+]

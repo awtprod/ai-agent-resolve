@@ -19,8 +19,11 @@ import pytest
 from mcp import Client
 from recipe_support import (
     BUILD_FAILS,
+    DEEP_RECIPE,
+    SHIP_FAILS,
     RecTestParams,
     make_reopen_run,
+    register_deep_recipe,
     register_reopen_recipe,
     submit_variant,
 )
@@ -311,7 +314,18 @@ def test_the_agent_step_has_max_attempts_in_a_round(hub: Hub, reopen_recipe: Any
     says so and names what remains."""
     rn, _ = failed_build(hub)
     for n in (2, 3):
+        failed = latest(hub, rn, "b")
         reopen(hub, rn, key=f"re{n}")
+        # each reopen creates the next attempt itself, carrying the failure it answers (the
+        # second one names b's attempt 2, the one after the first reopen)
+        opened = latest(hub, rn, "p")
+        assert (opened.attempt, opened.status) == (n, "active")
+        assert opened.reopened_for is not None
+        assert (opened.reopened_for["attempt"], opened.reopened_for["op_node"]) == (
+            failed.attempt,
+            failed.op_id,
+        )
+        assert failed.attempt == n - 1
         node, sha = submit_variant(hub, rn, AGENT, n)
         BUILD_FAILS[sha] = True
         complete(hub, rn, node, f"p{n}")
@@ -681,3 +695,253 @@ def test_the_mcp_tool(hub: Hub, reopen_recipe: Any) -> None:
     assert "recipe_reopen" in names
     assert ok.structured_content["op"] == "recipe.reopen"
     assert no.is_error and no.structured_content["error"]["code"] == "step_not_done"
+
+
+# -- the fix round: the window between a reopen's first write and the rest ---------------------
+
+
+def _window(hub: Hub, monkeypatch: pytest.MonkeyPatch) -> tuple[str, Any, Any]:
+    """A run whose reopen of ``p`` died after its first write: ``(recipe node, p a1, b a1)``."""
+    rn, _ = failed_build(hub)
+    first, failed = latest(hub, rn, "p"), latest(hub, rn, "b")
+    with monkeypatch.context() as patch:
+        _crash_after_first_write(patch)
+        with pytest.raises(RuntimeError, match="killed"):
+            reopen(hub, rn, key="k1")
+    state = load_state(hub.log, rn)
+    assert state.op_by_id(first.op_id).is_cancelled and state.latest_in_round("p", 1) is None
+    assert state.op_by_id(failed.op_id).status == "failed"  # not yet superseded
+    return rn, first, failed
+
+
+#: Every recipe command that writes, each driven once inside the window. The first element names
+#: the function in ``aar.recipes.run`` (checked against the module below).
+WINDOW_COMMANDS: dict[str, Any] = {
+    "recipe_start": lambda hub, rn: recipe_start(hub.log, rn, AGENT, idempotency_key="s2"),
+    "step_complete": lambda hub, rn: complete(hub, rn, submit_variant(hub, rn, AGENT, 2)[0], "p2"),
+    "recipe_retry": lambda hub, rn: recipe_retry(hub.log, rn, "b", AGENT, idempotency_key="rb"),
+    "recipe_reopen": lambda hub, rn: reopen(hub, rn, key="k2"),
+    "recipe_cancel": lambda hub, rn: recipe_cancel(hub.log, rn, AGENT, idempotency_key="cx"),
+}
+
+
+def test_the_window_list_is_every_recipe_write_command() -> None:
+    """Every public function of ``aar.recipes.run`` that takes an idempotency key (a write) is in
+    :data:`WINDOW_COMMANDS`, so a new write command cannot skip the window test."""
+    import inspect
+
+    writes = {
+        name
+        for name, fn in vars(run_mod).items()
+        if inspect.isfunction(fn)
+        and fn.__module__ == run_mod.__name__
+        and not name.startswith("_")
+        and "idempotency_key" in inspect.signature(fn).parameters
+    }
+    assert writes == set(WINDOW_COMMANDS)
+
+
+@pytest.mark.parametrize("command", sorted(WINDOW_COMMANDS))
+def test_every_write_command_finishes_an_unfinished_reopen_first(
+    hub: Hub, reopen_recipe: Any, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    rn, _first, failed = _window(hub, monkeypatch)
+    # inside the window the status view offers nothing to retry: the reopen is being finished
+    view = status_view(hub.log, rn)
+    assert not any(a.get("tool") == "recipe_retry" for a in view["next_actions"])
+    for step in ("b", "p"):
+        todo = action(view, step)
+        assert todo["who"] == "worker" and "tool" not in todo
+        assert "a reopen of 'p' after 'b' failed is being finished" in todo["what"]
+
+    try:
+        WINDOW_COMMANDS[command](hub, rn)
+        outcome = "ok"
+    except WriteError as exc:
+        outcome = exc.code
+    state = load_state(hub.log, rn)
+    # the reopen finished before the command decided anything: b a1 superseded, p a2 made by the
+    # reopen (with reopened_for), and nothing else of b written next to it
+    assert state.op_by_id(failed.op_id).is_cancelled
+    p_ops = state.all_in_round("p", 1)
+    assert [op.attempt for op in p_ops] == [1, 2]
+    assert p_ops[1].reopened_for is not None
+    assert p_ops[1].reopened_for["op_node"] == failed.op_id
+    # (a completed changed plan creates b's attempt 2 by the normal ready pass, on that plan)
+    assert [op.attempt for op in state.all_in_round("b", 1)] == (
+        [1, 2] if command == "step_complete" else [1]
+    )
+    if command == "recipe_cancel":
+        assert outcome == "ok" and state.recipe_status == "cancelled"
+        assert not any(op.is_live for op in state.ops)
+        return
+    expected = {"recipe_retry": "step_not_open", "recipe_reopen": "step_not_done"}
+    assert outcome == expected.get(command, "ok")
+    # and the run goes on: a changed plan builds b again (its attempt 2)
+    if command != "step_complete":
+        complete(hub, rn, submit_variant(hub, rn, AGENT, 2)[0], "p2")
+    assert work(hub) == 1
+    built = latest(hub, rn, "b")
+    assert (built.attempt, built.status) == (2, "done")
+
+
+def test_a_ready_pass_inside_the_window_leaves_the_step_to_the_reopen(
+    hub: Hub, reopen_recipe: Any
+) -> None:
+    """Another process's ``advance`` that loaded its state after the reopen's first write and
+    reached its ready pass: it must not create ``p``'s attempt, which would then lack
+    ``reopened_for``."""
+    rn, _ = failed_build(hub)
+    state = load_state(hub.log, rn)
+    definition = state.recipe_def
+    failed = state.upstream_failure("p", 1)
+    plan = engine.reopen_plan(state, definition, definition.step("p"), failed, "agent:x/k1")
+    assert engine.begin_reopen(hub.log, state, state.latest_in_round("p", 1), plan, AGENT)
+    assert engine._create_ready(hub.log, load_state(hub.log, rn), definition, AGENT) is False
+    assert load_state(hub.log, rn).all_in_round("p", 1)[-1].attempt == 1
+    advance(hub.log, rn, actor=AGENT)
+    _assert_finished(hub, rn, failed.op_id)
+    entry = next(s for s in status_view(hub.log, rn)["steps"] if s["step_id"] == "p")
+    assert entry["reopened_for"]["op_node"] == failed.op_id
+
+
+def test_reopen_unfinished_reads_each_write(
+    hub: Hub, reopen_recipe: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unfinished while a listed op is live or the new attempt is missing; finished after both."""
+    from aar.recipes.reopen import reopen_unfinished
+
+    rn, first, failed = _window(hub, monkeypatch)
+    marker = load_state(hub.log, rn).op_by_id(first.op_id)
+    assert marker.reopen is not None
+    assert reopen_unfinished(load_state(hub.log, rn), marker) is True  # nothing else made
+    # the new attempt made but b a1 still live: still unfinished
+    plan = marker.reopen
+    engine.create_attempt(
+        hub.log,
+        project_id=hub.project_id,
+        recipe_node=rn,
+        step=marker_step(),
+        round_=1,
+        attempt=plan["attempt"],
+        caller=AGENT,
+        status="active",
+        extra_data={"reopened_for": plan["reopened_for"]},
+    )
+    state = load_state(hub.log, rn)
+    assert not state.op_by_id(failed.op_id).is_cancelled
+    assert reopen_unfinished(state, marker) is True
+    advance(hub.log, rn, actor=AGENT)  # supersedes b a1
+    state = load_state(hub.log, rn)
+    assert state.op_by_id(failed.op_id).is_cancelled
+    assert reopen_unfinished(state, state.op_by_id(first.op_id)) is False
+    _assert_finished(hub, rn, failed.op_id)
+
+
+def marker_step() -> StepDef:
+    return registry.get("reopentest").step("p")
+
+
+def test_a_crash_then_a_cancel_then_the_same_key_is_refused(
+    hub: Hub, reopen_recipe: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rn, _first, _failed = _window(hub, monkeypatch)
+    recipe_cancel(hub.log, rn, AGENT, idempotency_key="cx")
+    before = hub.counts()
+    assert refusal(lambda: reopen(hub, rn, key="k1")) == "recipe_not_open"
+    assert hub.counts() == before
+    state = load_state(hub.log, rn)
+    assert state.recipe_status == "cancelled" and not any(op.is_live for op in state.ops)
+    assert work(hub) == 0
+
+
+# -- a failure two steps after the agent step; a gate in parallel ------------------------------
+
+
+@pytest.fixture
+def deep_recipe() -> Iterator[RecipeDef]:
+    definition = register_deep_recipe()
+    yield definition
+    registry.clear()
+    SHIP_FAILS.clear()
+
+
+def _deep_failed(hub: Hub) -> tuple[str, str]:
+    """A started ``reopendeep`` run whose ship step ``x`` failed upstream on plan variant 1; the
+    gate ``g`` (in parallel) has its review open."""
+    rn = make_reopen_run(hub, recipe=DEEP_RECIPE)
+    recipe_start(hub.log, rn, AGENT, idempotency_key="start")
+    work(hub)
+    node, sha = submit_variant(hub, rn, AGENT, 1)
+    SHIP_FAILS.add(sha)
+    complete(hub, rn, node, "p1")
+    work(hub)
+    state = load_state(hub.log, rn)
+    assert state.latest_in_round("m", 1).status == "done"
+    assert state.latest_in_round("x", 1).status == "failed"
+    assert state.latest_in_round("g", 1).review_id is not None
+    return rn, sha
+
+
+def test_a_reopen_after_a_failure_two_steps_down_supersedes_from_the_agent_step(
+    hub: Hub, deep_recipe: Any
+) -> None:
+    """``x`` (two steps after ``p``) failed: the reopen supersedes from ``p`` onward, so the done
+    ``m`` and the gate are superseded too and run again on the changed plan; a superseded gate's
+    open review stays open, as after a gate rejection's rollback, and deciding it changes
+    nothing."""
+    rn, _ = _deep_failed(hub)
+    before = load_state(hub.log, rn)
+    mid, gate, ship = (before.latest_in_round(s, 1) for s in ("m", "g", "x"))
+    reopen(hub, rn)
+    state = load_state(hub.log, rn)
+    for op in (mid, gate, ship):
+        assert state.op_by_id(op.op_id).is_cancelled, op.step_id
+    assert not state.is_step_done("m")
+    p2 = state.latest_in_round("p", 1)
+    assert (p2.attempt, p2.reopened_for["step"], p2.reopened_for["op_node"]) == (2, "x", ship.op_id)
+    # the old review is left open, as a gate rejection's rollback leaves it; a decision on it
+    # moves nothing, because its op is superseded
+    old_review = WorkGraph(hub.log, hub.project_id).node(gate.review_id)
+    assert old_review.status == "active"
+    decide(hub.log, hub.project_id, gate.review_id, "approve", "stale", HUMAN)
+    advance(hub.log, rn, actor=AGENT)
+    state = load_state(hub.log, rn)
+    assert state.op_by_id(gate.op_id).is_cancelled and not state.is_step_done("g")
+    # a changed plan: m runs again on it, the gate opens a new review, x ships
+    node2, sha2 = submit_variant(hub, rn, AGENT, 2)
+    complete(hub, rn, node2, "p2")
+    work(hub)
+    state = load_state(hub.log, rn)
+    m2 = state.latest_in_round("m", 1)
+    assert (m2.attempt, m2.result_outputs["mid"]) == (2, sha2)
+    x2 = state.latest_in_round("x", 1)
+    assert (x2.attempt, x2.status) == (2, "done")
+    g2 = state.latest_in_round("g", 1)
+    assert g2.attempt == 2 and g2.review_id not in (None, gate.review_id)
+    decide(hub.log, hub.project_id, g2.review_id, "approve", "ok", HUMAN)
+    advance(hub.log, rn, actor=AGENT)
+    work(hub)
+    assert load_state(hub.log, rn).recipe_status == "done"
+
+
+def test_a_rejection_inside_the_window_drops_the_unfinished_reopen(
+    hub: Hub, deep_recipe: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reopen died after its first write and the human then rejected the gate: the round is
+    now 2, so the round-1 reopen writes nothing more; the rejection's rollback supersedes round 1
+    and ``p`` starts round 2 at attempt 1."""
+    rn, _ = _deep_failed(hub)
+    gate = latest(hub, rn, "g")
+    with monkeypatch.context() as patch:
+        _crash_after_first_write(patch)
+        with pytest.raises(RuntimeError, match="killed"):
+            reopen(hub, rn, key="k1")
+    decide(hub.log, hub.project_id, gate.review_id, "reject", "no", HUMAN)
+    advance(hub.log, rn, actor=AGENT)
+    state = load_state(hub.log, rn)
+    assert state.current_round() == 2
+    assert [op.attempt for op in state.all_in_round("p", 1)] == [1]  # no round-1 attempt 2
+    assert not any(op.is_live for op in state.ops if op.round == 1)
+    p = state.latest_in_round("p", 2)
+    assert (p.attempt, p.status, p.reopened_for) == (1, "active", None)
