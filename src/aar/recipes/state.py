@@ -23,7 +23,7 @@ from typing import Any
 from aar.hub.common import parse_ts
 from aar.hub.events import EventLog
 from aar.hub.graph import GRAPH_EVENT_TYPES, WorkGraph
-from aar.hub.reviews import Review, review_view
+from aar.hub.reviews import Decision, Review, review_view
 from aar.hub.writes import RecipeData, typed_recipe
 from aar.recipes import registry
 from aar.recipes.events import (
@@ -206,17 +206,34 @@ class RunState:
 
     # -- rounds -------------------------------------------------------------
 
+    def reopen_superseded(self) -> frozenset[str]:
+        """The op ids a reopen supersedes (S19f): every op listed in the plan of a reopen whose
+        first write landed, whether or not the rest of its writes are made yet."""
+        listed: set[str] = set()
+        for op in self.ops:
+            if op.reopen is not None and plan_shape_ok(op.reopen):
+                listed.update(op.reopen["supersede"])
+        return frozenset(listed)
+
+    def gate_decision(self, op: OpAttempt) -> Decision | None:
+        """The human decision on gate op ``op``'s review, or ``None``. A decision on the review of a
+        gate op a reopen superseded is ignored (S19f): the reopen withdraws that review, but a
+        decision made before the withdrawal landed (in the window, or racing it) must neither open
+        a round nor count as the gate's decision."""
+        if op.kind != "gate" or op.review_id is None:
+            return None
+        review = self.reviews.get(op.review_id)
+        if review is None or review.decision is None:
+            return None
+        if op.op_id in self.reopen_superseded():
+            return None
+        return review.decision
+
     def _rejected_rounds(self) -> set[int]:
         rejected: set[int] = set()
         for op in self.ops:
-            if op.kind != "gate" or op.review_id is None:
-                continue
-            review = self.reviews.get(op.review_id)
-            if (
-                review is not None
-                and review.decision is not None
-                and review.decision.decision == "reject"
-            ):
+            decision = self.gate_decision(op)
+            if decision is not None and decision.decision == "reject":
                 rejected.add(op.round)
         return rejected
 
@@ -395,6 +412,24 @@ def _fold_recipe_events(
     for op_id, op in ops.items():
         _apply_lease(op, claims.get(op_id, []), heartbeats.get(op_id, []))
     return started, run_cancelled
+
+
+def plan_shape_ok(plan: dict[str, Any]) -> bool:
+    """Whether a reopen plan (S19f) recorded on a runner ``recipe.cancelled`` has the shape the
+    engine acts on; a plan without it is ignored everywhere."""
+    supersede = plan.get("supersede")
+    return (
+        isinstance(plan.get("step"), str)
+        and _plain_int(plan.get("round"))
+        and _plain_int(plan.get("attempt"))
+        and isinstance(supersede, list)
+        and all(isinstance(op_id, str) for op_id in supersede)
+        and isinstance(plan.get("reopened_for"), dict)
+    )
+
+
+def _plain_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _str(value: Any) -> str | None:

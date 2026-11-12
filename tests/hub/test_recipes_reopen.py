@@ -35,7 +35,7 @@ from aar.hub.events import EventLog
 from aar.hub.graph import WorkGraph
 from aar.hub.mcp_server import build_server
 from aar.hub.registry import Registry
-from aar.hub.reviews import decide, withdraw
+from aar.hub.reviews import ReviewNotOpen, decide, withdraw
 from aar.hub.writes import WriteError
 from aar.recipes import engine, registry
 from aar.recipes import run as run_mod
@@ -866,10 +866,10 @@ def deep_recipe() -> Iterator[RecipeDef]:
     SHIP_FAILS.clear()
 
 
-def _deep_failed(hub: Hub) -> tuple[str, str]:
+def _deep_failed(hub: Hub, rounds: int | None = None) -> tuple[str, str]:
     """A started ``reopendeep`` run whose ship step ``x`` failed upstream on plan variant 1; the
     gate ``g`` (in parallel) has its review open."""
-    rn = make_reopen_run(hub, recipe=DEEP_RECIPE)
+    rn = make_reopen_run(hub, recipe=DEEP_RECIPE, max_review_rounds=rounds)
     recipe_start(hub.log, rn, AGENT, idempotency_key="start")
     work(hub)
     node, sha = submit_variant(hub, rn, AGENT, 1)
@@ -883,13 +883,49 @@ def _deep_failed(hub: Hub) -> tuple[str, str]:
     return rn, sha
 
 
+def _review_status(hub: Hub, review_id: str) -> str:
+    return WorkGraph(hub.log, hub.project_id).node(review_id).status
+
+
+def _ships_on_a_changed_plan(hub: Hub, rn: str, stale_review: str) -> None:
+    """After a reopen of ``p`` in round 1 (and whatever a human did to the stale review): round 1,
+    one live ``p`` (the reopened attempt), a changed plan runs ``m``, ``g`` and ``x`` again, the
+    new gate's approval finishes the run, and REPORT.md lists only that decision."""
+    state = load_state(hub.log, rn)
+    assert (state.current_round(), state.recipe_status, state.blocked_reason()) == (
+        1,
+        "active",
+        None,
+    )
+    p_live = live(hub, rn, "p")
+    assert len(p_live) == 1 and p_live[0].round == 1 and p_live[0].reopened_for is not None
+    entry = next(s for s in status_view(hub.log, rn)["steps"] if s["step_id"] == "p")
+    assert entry["state"] == "needs_agent"
+    node2, _ = submit_variant(hub, rn, AGENT, 2)
+    complete(hub, rn, node2, "p2")
+    work(hub)
+    state = load_state(hub.log, rn)
+    assert (state.latest_in_round("x", 1).attempt, state.latest_in_round("x", 1).status) == (
+        2,
+        "done",
+    )
+    g2 = state.latest_in_round("g", 1)
+    assert g2.attempt == 2 and g2.review_id not in (None, stale_review)
+    decide(hub.log, hub.project_id, g2.review_id, "approve", "ok", HUMAN)
+    advance(hub.log, rn, actor=AGENT)
+    work(hub)
+    assert load_state(hub.log, rn).recipe_status == "done"
+    gates = build_report_text(hub.log, rn).split("## Gates\n", 1)[1].split("\n\n", 1)[0]
+    assert gates == f"- g round 1: approve by {HUMAN.kind}:{HUMAN.id} -- ok"
+    assert "- review rounds: used 1 of" in build_report_text(hub.log, rn)
+
+
 def test_a_reopen_after_a_failure_two_steps_down_supersedes_from_the_agent_step(
     hub: Hub, deep_recipe: Any
 ) -> None:
     """``x`` (two steps after ``p``) failed: the reopen supersedes from ``p`` onward, so the done
-    ``m`` and the gate are superseded too and run again on the changed plan; a superseded gate's
-    open review stays open, as after a gate rejection's rollback, and deciding it changes
-    nothing."""
+    ``m`` and the gate are superseded too and run again on the changed plan; the superseded gate's
+    open review is withdrawn by the runner (fix round 2, MED-A), so no human can decide it."""
     rn, _ = _deep_failed(hub)
     before = load_state(hub.log, rn)
     mid, gate, ship = (before.latest_in_round(s, 1) for s in ("m", "g", "x"))
@@ -900,37 +936,103 @@ def test_a_reopen_after_a_failure_two_steps_down_supersedes_from_the_agent_step(
     assert not state.is_step_done("m")
     p2 = state.latest_in_round("p", 1)
     assert (p2.attempt, p2.reopened_for["step"], p2.reopened_for["op_node"]) == (2, "x", ship.op_id)
-    # the old review is left open, as a gate rejection's rollback leaves it; a decision on it
-    # moves nothing, because its op is superseded
-    old_review = WorkGraph(hub.log, hub.project_id).node(gate.review_id)
-    assert old_review.status == "active"
-    decide(hub.log, hub.project_id, gate.review_id, "approve", "stale", HUMAN)
-    advance(hub.log, rn, actor=AGENT)
-    state = load_state(hub.log, rn)
-    assert state.op_by_id(gate.op_id).is_cancelled and not state.is_step_done("g")
-    # a changed plan: m runs again on it, the gate opens a new review, x ships
-    node2, sha2 = submit_variant(hub, rn, AGENT, 2)
-    complete(hub, rn, node2, "p2")
-    work(hub)
-    state = load_state(hub.log, rn)
-    m2 = state.latest_in_round("m", 1)
-    assert (m2.attempt, m2.result_outputs["mid"]) == (2, sha2)
-    x2 = state.latest_in_round("x", 1)
-    assert (x2.attempt, x2.status) == (2, "done")
-    g2 = state.latest_in_round("g", 1)
-    assert g2.attempt == 2 and g2.review_id not in (None, gate.review_id)
-    decide(hub.log, hub.project_id, g2.review_id, "approve", "ok", HUMAN)
-    advance(hub.log, rn, actor=AGENT)
-    work(hub)
-    assert load_state(hub.log, rn).recipe_status == "done"
+    assert _review_status(hub, gate.review_id) == "cancelled"
+    # replaying the reopen writes nothing more (the withdrawal included)
+    before_counts = hub.counts()
+    assert reopen(hub, rn)["replayed"] is True
+    assert hub.counts() == before_counts
+    _ships_on_a_changed_plan(hub, rn, gate.review_id)
 
 
-def test_a_rejection_inside_the_window_drops_the_unfinished_reopen(
+@pytest.mark.parametrize("rounds", [1, 3])
+@pytest.mark.parametrize("act", ["approve", "reject", "withdraw"])
+def test_the_stale_review_after_a_finished_reopen_takes_no_decision(
+    hub: Hub, deep_recipe: Any, act: str, rounds: int
+) -> None:
+    """MED-A: after the reopen the superseded gate's review is closed; a human's approve, reject
+    or withdraw of it is refused, and the run goes on in round 1 (with one review round too)."""
+    rn, _ = _deep_failed(hub, rounds)
+    gate = latest(hub, rn, "g")
+    reopen(hub, rn)
+    with pytest.raises(ReviewNotOpen):
+        if act == "withdraw":
+            withdraw(hub.log, hub.project_id, gate.review_id, "stale", HUMAN)
+        else:
+            decide(hub.log, hub.project_id, gate.review_id, act, "stale", HUMAN)
+    advance(hub.log, rn, actor=AGENT)
+    _ships_on_a_changed_plan(hub, rn, gate.review_id)
+
+
+@pytest.mark.parametrize("rounds", [1, 3])
+@pytest.mark.parametrize("act", ["approve", "reject", "withdraw"])
+def test_a_stale_review_decided_inside_the_window_is_ignored(
+    hub: Hub, deep_recipe: Any, monkeypatch: pytest.MonkeyPatch, act: str, rounds: int
+) -> None:
+    """MED-A in the crash window: the reopen died after its first write, before it superseded the
+    gate and withdrew its review, and a human then decided (or withdrew) that review. The decision
+    neither opens a round (nor, with one review round, blocks the run) nor shows in the report;
+    the next tick finishes the reopen, which leaves the decided review as it is."""
+    rn, _ = _deep_failed(hub, rounds)
+    gate = latest(hub, rn, "g")
+    with monkeypatch.context() as patch:
+        _crash_after_first_write(patch)
+        with pytest.raises(RuntimeError, match="killed"):
+            reopen(hub, rn, key="k1")
+    # inside the window the gate's entry says what its action says: the worker acts (LOW-C)
+    entry = next(s for s in status_view(hub.log, rn)["steps"] if s["step_id"] == "g")
+    assert entry["state"] == "waiting:reopen"
+    assert action(status_view(hub.log, rn), "g")["who"] == "worker"
+    if act == "withdraw":
+        withdraw(hub.log, hub.project_id, gate.review_id, "stale", HUMAN)
+    else:
+        decide(hub.log, hub.project_id, gate.review_id, act, "stale", HUMAN)
+    state = load_state(hub.log, rn)
+    assert (state.current_round(), state.blocked_reason()) == (1, None)
+    assert "- g round 1:" not in build_report_text(hub.log, rn)
+    advance(hub.log, rn, actor=AGENT)  # finishes the reopen
+    state = load_state(hub.log, rn)
+    assert state.op_by_id(gate.op_id).is_cancelled
+    assert state.op_by_id(gate.op_id).result_outcome is None  # no gate result was recorded
+    _ships_on_a_changed_plan(hub, rn, gate.review_id)
+
+
+@pytest.mark.parametrize("rounds", [1, 3])
+@pytest.mark.parametrize("act", ["approve", "reject", "withdraw"])
+def test_a_stale_review_decided_racing_the_withdrawal_is_ignored(
+    hub: Hub, deep_recipe: Any, monkeypatch: pytest.MonkeyPatch, act: str, rounds: int
+) -> None:
+    """MED-A after the window: the human's decision lands between the reopen's read of the review
+    (open) and its withdrawal. The withdrawal is then refused by the review, the reopen still
+    finishes, and the decision is ignored."""
+    rn, _ = _deep_failed(hub, rounds)
+    gate = latest(hub, rn, "g")
+    real = engine.get_review
+
+    def read_then_human(log: EventLog, project_id: str, review_id: str) -> Any:
+        found = real(log, project_id, review_id)
+        if review_id == gate.review_id and found is not None and found.pending:
+            if act == "withdraw":
+                withdraw(log, project_id, review_id, "stale", HUMAN)
+            else:
+                decide(log, project_id, review_id, act, "stale", HUMAN)
+        return found  # the read from before the human's write
+
+    with monkeypatch.context() as patch:
+        patch.setattr(engine, "get_review", read_then_human)
+        assert reopen(hub, rn)["ok"] is True
+    state = load_state(hub.log, rn)
+    assert state.op_by_id(gate.op_id).is_cancelled
+    assert _review_status(hub, gate.review_id) != "active"
+    _ships_on_a_changed_plan(hub, rn, gate.review_id)
+
+
+def test_a_rejection_inside_the_window_is_ignored_and_the_reopen_finishes(
     hub: Hub, deep_recipe: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The reopen died after its first write and the human then rejected the gate: the round is
-    now 2, so the round-1 reopen writes nothing more; the rejection's rollback supersedes round 1
-    and ``p`` starts round 2 at attempt 1."""
+    """The reopen died after its first write and the human then rejected the gate the reopen
+    supersedes (fix round 2, MED-A; before it this opened round 2 and dropped the reopen): the
+    rejection is ignored, the next tick finishes the reopen in round 1, and the derivation rule
+    does not take the ignored review as a round-2 parent."""
     rn, _ = _deep_failed(hub)
     gate = latest(hub, rn, "g")
     with monkeypatch.context() as patch:
@@ -940,8 +1042,96 @@ def test_a_rejection_inside_the_window_drops_the_unfinished_reopen(
     decide(hub.log, hub.project_id, gate.review_id, "reject", "no", HUMAN)
     advance(hub.log, rn, actor=AGENT)
     state = load_state(hub.log, rn)
+    assert state.current_round() == 1
+    assert [op.attempt for op in state.all_in_round("p", 1)] == [1, 2]
+    assert state.all_in_round("p", 2) == []
+    # a plan derived from the ignored review is refused: round 1 wants the recipe node
+    node, _ = submit_variant(hub, gate.review_id, AGENT, 3)
+    assert refusal(lambda: complete(hub, rn, node, "pr")) == "expects_unmet"
+    _ships_on_a_changed_plan(hub, rn, gate.review_id)
+
+
+def test_a_reopen_left_in_a_run_cancelled_before_its_first_write_is_never_finished(
+    hub: Hub, reopen_recipe: Any
+) -> None:
+    """LOW-B (M01): a cancel loaded the run before the reopen's first write and cancelled it right
+    after, so the run is cancelled with the reopen's plan recorded and nothing else. No command
+    and no tick may then finish it (it would make a live op in a cancelled run)."""
+    rn, _ = failed_build(hub)
+    state = load_state(hub.log, rn)
+    definition = state.recipe_def
+    failed = state.upstream_failure("p", 1)
+    caller = run_mod.write_key(AGENT, "k1")
+    plan = engine.reopen_plan(state, definition, definition.step("p"), failed, caller)
+    assert engine.begin_reopen(hub.log, state, state.latest_in_round("p", 1), plan, AGENT)
+    # the cancel's own writes, decided on its state from before the reopen's first write
+    engine.record_run_cancelled(
+        hub.log, project_id=hub.project_id, recipe_node=rn, caller=AGENT, reason="cancel"
+    )
+    state = load_state(hub.log, rn)
+    assert state.recipe_status == "cancelled"
+    assert engine.finish_reopens(hub.log, state, definition, AGENT) is False
+    assert refusal(lambda: reopen(hub, rn, key="k1")) == "recipe_not_open"
+    advance(hub.log, rn, actor=AGENT)
+    work(hub)
+    state = load_state(hub.log, rn)
+    assert [op.attempt for op in state.all_in_round("p", 1)] == [1]
+    assert not any(op.is_live for op in state.ops)
+
+
+@pytest.mark.parametrize("act", ["approve", "reject", "withdraw"])
+def test_a_gate_pass_inside_the_window_leaves_the_condemned_gate_to_the_reopen(
+    hub: Hub, deep_recipe: Any, monkeypatch: pytest.MonkeyPatch, act: str
+) -> None:
+    """MED-A: another process's ``advance`` that loaded its state inside the window (the plan
+    recorded, the gate not yet superseded) after a human closed the stale review reaches its gate
+    pass: it records no gate result and rolls no round back; the reopen then finishes."""
+    rn, _ = _deep_failed(hub)
+    gate = latest(hub, rn, "g")
+    with monkeypatch.context() as patch:
+        _crash_after_first_write(patch)
+        with pytest.raises(RuntimeError, match="killed"):
+            reopen(hub, rn, key="k1")
+    if act == "withdraw":
+        withdraw(hub.log, hub.project_id, gate.review_id, "stale", HUMAN)
+    else:
+        decide(hub.log, hub.project_id, gate.review_id, act, "stale", HUMAN)
+    state = load_state(hub.log, rn)
+    before = hub.counts()
+    assert engine._process_gates(hub.log, state, state.recipe_def, AGENT) is False
+    assert hub.counts() == before
+    advance(hub.log, rn, actor=AGENT)
+    _ships_on_a_changed_plan(hub, rn, gate.review_id)
+
+
+def test_round_two_derives_only_from_the_real_rejection_not_the_ignored_one(
+    hub: Hub, deep_recipe: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MED-A: the stale review rejected inside the window is ignored; the new gate's rejection
+    then opens round 2 exactly as before, and round 2's plan must derive from that rejection, not
+    from the ignored one."""
+    rn, _ = _deep_failed(hub, 3)
+    stale = latest(hub, rn, "g")
+    with monkeypatch.context() as patch:
+        _crash_after_first_write(patch)
+        with pytest.raises(RuntimeError, match="killed"):
+            reopen(hub, rn, key="k1")
+    decide(hub.log, hub.project_id, stale.review_id, "reject", "stale", HUMAN)
+    advance(hub.log, rn, actor=AGENT)
+    node2, _ = submit_variant(hub, rn, AGENT, 2)
+    complete(hub, rn, node2, "p2")
+    work(hub)
+    g2 = latest(hub, rn, "g")
+    assert (g2.round, g2.attempt) == (1, 2)
+    decide(hub.log, hub.project_id, g2.review_id, "reject", "real", HUMAN)
+    advance(hub.log, rn, actor=AGENT)
+    state = load_state(hub.log, rn)
     assert state.current_round() == 2
-    assert [op.attempt for op in state.all_in_round("p", 1)] == [1]  # no round-1 attempt 2
-    assert not any(op.is_live for op in state.ops if op.round == 1)
-    p = state.latest_in_round("p", 2)
-    assert (p.attempt, p.status, p.reopened_for) == (1, "active", None)
+    assert [(op.round, op.attempt) for op in live(hub, rn, "p")] == [(2, 1)]
+    from_stale, _ = submit_variant(hub, stale.review_id, AGENT, 3)
+    assert refusal(lambda: complete(hub, rn, from_stale, "p3")) == "expects_unmet"
+    from_real, _ = submit_variant(hub, g2.review_id, AGENT, 4)
+    complete(hub, rn, from_real, "p4")
+    assert latest(hub, rn, "p").status == "done"
+    gates = build_report_text(hub.log, rn).split("## Gates\n", 1)[1].split("\n\n", 1)[0]
+    assert gates == f"- g round 1: reject by {HUMAN.kind}:{HUMAN.id} -- real"

@@ -31,6 +31,7 @@ from typing import Any
 from aar.hub.common import Clock, iso, parse_ts, utcnow
 from aar.hub.events import Actor, EventLog
 from aar.hub.graph import WorkGraph, allowed_transitions
+from aar.hub.reviews import ReviewNotOpen, get_review, withdraw
 from aar.hub.writes import (
     _append_record,
     _in_transaction,
@@ -66,8 +67,8 @@ from aar.recipes.events import (
 )
 from aar.recipes.models import RecipeDef, StepDef
 from aar.recipes.ports import HOT_STATES
-from aar.recipes.reopen import _plan_shape_ok, reopening, unfinished_reopens
-from aar.recipes.state import OpAttempt, RunState, load_state, project_of_node
+from aar.recipes.reopen import reopening, unfinished_reopens
+from aar.recipes.state import OpAttempt, RunState, load_state, plan_shape_ok, project_of_node
 
 MAX_BAD_POLLS = 5
 
@@ -719,10 +720,13 @@ def _reap_leases(
 def _process_gates(log: EventLog, state: RunState, recipe_def: RecipeDef, caller: Actor) -> bool:
     changed = False
     current = state.current_round()
+    # S19f: a gate op a reopen supersedes is the reopen's to close; its review's decision is
+    # ignored (RunState.gate_decision), so it never records a result or rolls a round back
+    condemned = state.reopen_superseded()
     for op in state.ops:
         if op.kind != "gate" or op.review_id is None or op.is_cancelled:
             continue
-        if op.status in ("done", "failed"):
+        if op.status in ("done", "failed") or op.op_id in condemned:
             continue
         review = state.reviews.get(op.review_id)
         if review is None:
@@ -896,13 +900,15 @@ def begin_reopen(
 def finish_reopen(
     log: EventLog, state: RunState, recipe_def: RecipeDef, marker_op: OpAttempt, caller: Actor
 ) -> bool:
-    """Make the rest of the reopen recorded on ``marker_op``: supersede every op it lists, then
+    """Make the rest of the reopen recorded on ``marker_op``: supersede every op it lists, withdraw
+    the open reviews of the gate ops among them (as RUNNER, as ``recipe_cancel`` does), then
     create the agent step's new attempt carrying ``reopened_for``. Each write is idempotent (a
-    superseded op stays superseded; the attempt's op key is global), so the command, a re-run of
-    it and any ``advance`` can all call this and the run ends in the same state. The supersedes
-    come first, so whenever the new attempt exists the old downstream ops are gone."""
+    superseded op stays superseded, a closed review is left alone, the attempt's op key is
+    global), so the command, a re-run of it and any ``advance`` can all call this and the run ends
+    in the same state. The create comes last, so whenever the new attempt exists the old
+    downstream ops are gone and their reviews closed."""
     plan = marker_op.reopen
-    if plan is None or not _plan_shape_ok(plan):
+    if plan is None or not plan_shape_ok(plan):
         return False
     try:
         step = recipe_def.step(plan["step"])
@@ -914,6 +920,10 @@ def finish_reopen(
         op = state.op_by_id(op_id)
         if op is not None and not op.is_cancelled:
             changed |= _supersede_op(log, state.project_id, op, caller, reason)
+    for op_id in plan["supersede"]:
+        op = state.op_by_id(op_id)
+        if op is not None:
+            changed |= _withdraw_superseded_review(log, state, op, reason)
     created = create_attempt(
         log,
         project_id=state.project_id,
@@ -926,6 +936,22 @@ def finish_reopen(
         extra_data={"reopened_for": plan["reopened_for"]},
     )
     return changed or created is not None
+
+
+def _withdraw_superseded_review(log: EventLog, state: RunState, op: OpAttempt, reason: str) -> bool:
+    """Withdraw, as RUNNER (its requester), the review of gate op ``op`` while it is open. A
+    review a human decided or withdrew first (the race this loses) is left as it is: the fold
+    ignores a decision on a gate op a reopen superseded (``RunState.gate_decision``)."""
+    if op.kind != "gate" or op.review_id is None or op.review_id not in state.reviews:
+        return False
+    review = get_review(log, state.project_id, op.review_id)
+    if review is None or not review.pending:
+        return False
+    try:
+        withdraw(log, state.project_id, op.review_id, reason, RUNNER, idempotency_key=None)
+    except ReviewNotOpen:
+        return False  # decided or withdrawn between the read and the write
+    return True
 
 
 def finish_reopens(log: EventLog, state: RunState, recipe_def: RecipeDef, caller: Actor) -> bool:

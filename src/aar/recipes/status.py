@@ -29,6 +29,9 @@ MAX_STEP_OUTPUTS_BYTES = 8 * 1024
 MAX_STEP_ERROR_BYTES = 4 * 1024
 MAX_VIEW_BYTES = 64 * 1024
 MAX_ACTION_WHAT_BYTES = 256
+#: The state of a step while an unfinished reopen will still supersede its op or create its
+#: attempt (S19f): the worker acts next (``in_progress_action``), not a human or an agent.
+REOPENING_STATE = "waiting:reopen"
 
 
 def status_view(
@@ -55,7 +58,8 @@ def status_view(
         step_state, action = _step_state(state, step, op, current, dispatcher)
         held = held_ops.get(op.op_id) if op is not None else held_steps.get(step.id)
         if held is not None and step_state != "done":
-            action = in_progress_action(held)
+            # the state agrees with the action: the worker finishes the reopen, nobody else acts
+            step_state, action = REOPENING_STATE, in_progress_action(held)
         outputs, out_trunc = _summary(op.result_outputs) if op is not None else (None, False)
         error, err_trunc = _error(op.result_error) if op is not None else (None, False)
         truncated = truncated or out_trunc or err_trunc

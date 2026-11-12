@@ -86,12 +86,9 @@ def build_report_text(log: EventLog, recipe_node: str) -> str:
     gate_lines = []
     for step_id in _step_order(state):
         for op in sorted(state.attempts_for(step_id), key=lambda op: (op.round, op.attempt)):
-            if op.kind != "gate" or op.review_id is None:
+            d = state.gate_decision(op)  # None on a gate op a reopen superseded (S19f)
+            if d is None:
                 continue
-            review = state.reviews.get(op.review_id)
-            if review is None or review.decision is None:
-                continue
-            d = review.decision
             gate_lines.append(
                 f"- {step_id} round {op.round}: {d.decision} by {d.by.kind}:{d.by.id} -- {d.reason}"
             )

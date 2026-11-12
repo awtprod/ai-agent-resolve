@@ -13,7 +13,7 @@ from typing import Any
 
 from aar.hub.writes import WriteError
 from aar.recipes.models import RecipeDef, StepDef
-from aar.recipes.state import OpAttempt, RunState
+from aar.recipes.state import OpAttempt, RunState, plan_shape_ok
 
 _FINISHED = frozenset({"done", "cancelled"})
 
@@ -105,27 +105,11 @@ def reopen_blocker(state: RunState, definition: RecipeDef, step: StepDef) -> str
     return None
 
 
-def _plan_shape_ok(plan: dict[str, Any]) -> bool:
-    supersede = plan.get("supersede")
-    return (
-        isinstance(plan.get("step"), str)
-        and _plain_int(plan.get("round"))
-        and _plain_int(plan.get("attempt"))
-        and isinstance(supersede, list)
-        and all(isinstance(op_id, str) for op_id in supersede)
-        and isinstance(plan.get("reopened_for"), dict)
-    )
-
-
-def _plain_int(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
 def reopen_unfinished(state: RunState, marker_op: OpAttempt) -> bool:
     """Whether the reopen recorded on ``marker_op`` still has a write to make in this round: an op
     it lists not yet superseded, or its new attempt not yet created."""
     plan = marker_op.reopen
-    if plan is None or not _plan_shape_ok(plan) or plan["round"] != state.current_round():
+    if plan is None or not plan_shape_ok(plan) or plan["round"] != state.current_round():
         return False
     for op_id in plan["supersede"]:
         op = state.op_by_id(op_id)

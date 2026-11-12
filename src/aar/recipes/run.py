@@ -390,12 +390,10 @@ def _validate_plan(
         prev_rejected = {
             op.review_id
             for op in state.ops
-            if op.kind == "gate"
-            and op.round == current - 1
-            and op.review_id is not None
-            and (rev := state.reviews.get(op.review_id)) is not None
-            and rev.decision is not None
-            and rev.decision.decision == "reject"
+            if op.round == current - 1
+            # S19f: not the review of a gate op a reopen superseded (its decision is ignored)
+            and (decision := state.gate_decision(op)) is not None
+            and decision.decision == "reject"
         }
         if not (_is_review(graph, parent) and parent in prev_rejected):
             raise WriteError(
