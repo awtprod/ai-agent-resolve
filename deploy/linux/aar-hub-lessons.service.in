@@ -1,0 +1,27 @@
+[Unit]
+Description=AI-Agent-Resolve hub: draft lessons from decided reviews (one bounded pass)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=@AAR_ROOT@/venv/bin/aar hub lessons propose --db @AAR_ROOT@/data/hub.db --limit 5
+# lessons.env holds AAR_LLM_API_KEY (the model gateway's key) and optionally AAR_LESSONS_MODEL and
+# AAR_LLM_BASE_URL. Without it each run exits non-zero with not_configured (see the README).
+EnvironmentFile=@AAR_ROOT@/hub.env
+EnvironmentFile=-@AAR_ROOT@/lessons.env
+User=@AAR_USER@
+Group=@AAR_GROUP@
+WorkingDirectory=@AAR_ROOT@/data
+# A pass reads the gateway's model list once and makes at most 5 model calls. Each request is at
+# most 3 tries of 60 s with 2 waits of at most 30 s (4 minutes), so 24 minutes at worst. A pass
+# killed here is picked up by the next one: a review whose proposals were written gets its marker
+# without a second model call.
+TimeoutStartSec=30min
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=@AAR_ROOT@/data
+UMask=0077
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
