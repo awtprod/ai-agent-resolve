@@ -104,6 +104,14 @@ def status_view(
         "diagnostics": _diagnostics(log, state.project_id, recipe_node),
         "truncated": truncated,
     }
+    ignored_decisions = state.ignored_decisions()
+    if ignored_decisions:
+        # S19f: a human decision the fold ignores (recorded after a reopen superseded its gate),
+        # one line each, so whoever decided is not left guessing
+        view["ignored_decisions"] = [
+            {"review_id": d["review_id"], "decision": d["decision"], "what": d["what"]}
+            for d in ignored_decisions
+        ]
     return _enforce_total_bound(view)
 
 

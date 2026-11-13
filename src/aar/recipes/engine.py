@@ -24,7 +24,7 @@ Every recipe write tool and the worker loop call ``advance``.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import timedelta
 from typing import Any
 
@@ -67,7 +67,7 @@ from aar.recipes.events import (
 )
 from aar.recipes.models import RecipeDef, StepDef
 from aar.recipes.ports import HOT_STATES
-from aar.recipes.reopen import reopening, unfinished_reopens
+from aar.recipes.reopen import reopen_refusal, reopening, unfinished_reopens
 from aar.recipes.state import OpAttempt, RunState, load_state, plan_shape_ok, project_of_node
 
 MAX_BAD_POLLS = 5
@@ -720,13 +720,16 @@ def _reap_leases(
 def _process_gates(log: EventLog, state: RunState, recipe_def: RecipeDef, caller: Actor) -> bool:
     changed = False
     current = state.current_round()
-    # S19f: a gate op a reopen supersedes is the reopen's to close; its review's decision is
-    # ignored (RunState.gate_decision), so it never records a result or rolls a round back
+    # S19f: a gate op a reopen supersedes is the reopen's to close; a decision on its review
+    # recorded after the reopen's first write is ignored (RunState.gate_decision), so it never
+    # records a result or rolls a round back. One recorded before that write counts as ever.
     condemned = state.reopen_superseded()
     for op in state.ops:
         if op.kind != "gate" or op.review_id is None or op.is_cancelled:
             continue
-        if op.status in ("done", "failed") or op.op_id in condemned:
+        if op.status in ("done", "failed"):
+            continue
+        if op.op_id in condemned and state.gate_decision(op) is None:
             continue
         review = state.reviews.get(op.review_id)
         if review is None:
@@ -816,15 +819,22 @@ def _supersede_op(
     caller: Actor,
     reason: str,
     extra: Mapping[str, Any] | None = None,
+    guard: Callable[[], Mapping[str, Any]] | None = None,
 ) -> bool:
     """Supersede ``op`` with a runner ``recipe.cancelled`` (idempotent per op). ``extra`` adds
     fields to the event's payload (the ``reopen`` plan, S19f); a different payload under the
-    same op's key is a lost race and returns ``False``."""
+    same op's key is a lost race and returns ``False``. ``guard`` (S19f) runs inside the write
+    transaction, before the append: it may raise a refusal (nothing is written) or return the
+    ``extra`` to write, computed from the log as of the transaction."""
     base = f"aar.recipe.cancel/{op.op_id}"
     if log.get_by_idempotency_key(base + "#cancelled") is not None:
         return False
     try:
         with _in_transaction(log) as txn:
+            if guard is not None:
+                if txn.find_by_idempotency_key(base + "#cancelled") is not None:
+                    return False  # superseded since the check above: a lost race, as below
+                extra = guard()
             graph = WorkGraph(log, project_id)
             node = graph.node(op.op_id)
             if node is None:
@@ -891,10 +901,50 @@ def begin_reopen(
 ) -> bool:
     """The first write of a reopen: supersede the agent step's done op with ``plan`` on the
     event. ``False`` when that op was already superseded (by another reopen, a rollback or a
-    cancel): the caller then reads the fold to see whose plan won."""
+    cancel): the caller then reads the fold to see whose plan won. Conditional (fix round 3): the
+    write is made only if, re-read inside its transaction, the run is still in ``plan``'s round
+    and the reopen still applies; the plan written is the one made from that read. Otherwise it
+    raises the typed refusal (``no_upstream_failure`` when the round moved on) and writes
+    nothing."""
     failed = plan["reopened_for"]["step"]
     reason = f"superseded by a reopen of {plan['step']!r} after {failed!r} failed"
-    return _supersede_op(log, state.project_id, agent_op, caller, reason, extra={"reopen": plan})
+
+    def still_current() -> Mapping[str, Any]:
+        # R3-1: the plan was made from a state read before this transaction. Re-fold the run as of
+        # the transaction (it holds the write lock, so nothing lands between this check and the
+        # append) and write only if the reopen still applies: a human decision recorded since (a
+        # rejection opening the next round or exhausting the rounds) wins, and nothing is written.
+        fresh = load_state(log, state.recipe_node, project_id=state.project_id)
+        if fresh.current_round() != plan["round"]:
+            raise _round_moved(plan, fresh.current_round())
+        recipe_def = fresh.recipe_def
+        if recipe_def is None:
+            raise _round_moved(plan, fresh.current_round())
+        step = recipe_def.step(plan["step"])
+        refusal = reopen_refusal(fresh, recipe_def, step)
+        if refusal is not None:
+            raise refusal
+        failed_op = fresh.upstream_failure(step.id, plan["round"])
+        if failed_op is None:  # reopen_refusal has checked it; never None
+            raise _round_moved(plan, fresh.current_round())
+        return {"reopen": reopen_plan(fresh, recipe_def, step, failed_op, plan["caller"])}
+
+    return _supersede_op(log, state.project_id, agent_op, caller, reason, guard=still_current)
+
+
+def _round_moved(plan: Mapping[str, Any], current: int) -> Exception:
+    """The refusal of a reopen whose round moved on between its read and its first write (a
+    rejection landed): the one a reopen with no failure in the current round gets."""
+    from aar.hub.writes import WriteError
+
+    return WriteError(
+        "no_upstream_failure",
+        f"round {plan['round']} of step {plan['step']!r} is over (the run is in round {current} "
+        "now): no failure in the current round to reopen it for",
+        "Read recipe_status: a review decision moved the run on; follow its next actions.",
+        step_id=plan["step"],
+        round=current,
+    )
 
 
 def finish_reopen(

@@ -35,7 +35,7 @@ from aar.hub.events import EventLog
 from aar.hub.graph import WorkGraph
 from aar.hub.mcp_server import build_server
 from aar.hub.registry import Registry
-from aar.hub.reviews import ReviewNotOpen, decide, withdraw
+from aar.hub.reviews import ReviewNotOpen, decide, get_review, withdraw
 from aar.hub.writes import WriteError
 from aar.recipes import engine, registry
 from aar.recipes import run as run_mod
@@ -916,8 +916,22 @@ def _ships_on_a_changed_plan(hub: Hub, rn: str, stale_review: str) -> None:
     work(hub)
     assert load_state(hub.log, rn).recipe_status == "done"
     gates = build_report_text(hub.log, rn).split("## Gates\n", 1)[1].split("\n\n", 1)[0]
-    assert gates == f"- g round 1: approve by {HUMAN.kind}:{HUMAN.id} -- ok"
+    lines = gates.splitlines()
+    assert lines[0] == f"- g round 1: approve by {HUMAN.kind}:{HUMAN.id} -- ok"
+    # fix round 3, item 4: a decision the fold ignored is said so in one line, never counted
+    stale = get_review(hub.log, hub.project_id, stale_review)
+    assert lines[1:] == (
+        [_ignored_line(stale.decision.decision, stale_review)] if stale.decision else []
+    )
     assert "- review rounds: used 1 of" in build_report_text(hub.log, rn)
+
+
+def _ignored_line(decision: str, review_id: str) -> str:
+    return (
+        f"- ignored: the {decision} of review {review_id} (gate 'g' round 1 attempt 1, by "
+        f"{HUMAN.kind}:{HUMAN.id}) was ignored: a reopen of 'p' after 'x' failed had already "
+        "superseded that gate; the reopened step gets a new review"
+    )
 
 
 def test_a_reopen_after_a_failure_two_steps_down_supersedes_from_the_agent_step(
@@ -1134,4 +1148,188 @@ def test_round_two_derives_only_from_the_real_rejection_not_the_ignored_one(
     complete(hub, rn, from_real, "p4")
     assert latest(hub, rn, "p").status == "done"
     gates = build_report_text(hub.log, rn).split("## Gates\n", 1)[1].split("\n\n", 1)[0]
-    assert gates == f"- g round 1: reject by {HUMAN.kind}:{HUMAN.id} -- real"
+    assert gates.splitlines() == [
+        f"- g round 1: reject by {HUMAN.kind}:{HUMAN.id} -- real",
+        _ignored_line("reject", stale.review_id),
+    ]
+
+
+# -- fix round 3: a decision recorded before the reopen's first write counts --------------------
+
+
+def _gate_lines(hub: Hub, rn: str) -> list[str]:
+    return build_report_text(hub.log, rn).split("## Gates\n", 1)[1].split("\n\n", 1)[0].splitlines()
+
+
+@pytest.mark.parametrize("rounds", [1, 3])
+def test_a_rejection_between_the_reopens_read_and_its_first_write_stands(
+    hub: Hub, deep_recipe: Any, monkeypatch: pytest.MonkeyPatch, rounds: int
+) -> None:
+    """R3-1: the reopen read its state, then a human rejected the gate before the reopen's first
+    write. The first write re-checks the run inside its transaction: the round moved on (or the
+    rounds are used up), so the reopen is refused and writes nothing; the rejection stands."""
+    rn, _ = _deep_failed(hub, rounds)
+    gate = latest(hub, rn, "g")
+    real = run_mod.begin_reopen
+
+    def human_first(*args: Any) -> bool:
+        decide(hub.log, hub.project_id, gate.review_id, "reject", "genuine: redo", HUMAN)
+        return real(*args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(run_mod, "begin_reopen", human_first)
+        code = refusal(lambda: reopen(hub, rn, key="k1"))
+    assert code == ("recipe_blocked" if rounds == 1 else "no_upstream_failure")
+    state = load_state(hub.log, rn)
+    assert not any(op.reopen is not None for op in state.ops)  # nothing was written
+    advance(hub.log, rn, actor=AGENT)
+    work(hub)
+    state = load_state(hub.log, rn)
+    assert len(live(hub, rn, "p")) <= 1
+    if rounds == 1:
+        assert (state.recipe_status, state.blocked_reason()) == (
+            "blocked",
+            "review_rounds_exhausted",
+        )
+        assert live(hub, rn, "p") == []
+    else:
+        assert (state.current_round(), state.recipe_status) == (2, "active")
+        assert [(op.round, op.attempt) for op in live(hub, rn, "p")] == [(2, 1)]
+    assert _gate_lines(hub, rn) == [
+        f"- g round 1: reject by {HUMAN.kind}:{HUMAN.id} -- genuine: redo"
+    ]
+    assert "ignored_decisions" not in status_view(hub.log, rn)
+
+
+@pytest.mark.parametrize("rounds", [1, 3])
+def test_a_rejection_just_after_the_reopens_first_write_is_ignored_and_said_so(
+    hub: Hub, deep_recipe: Any, monkeypatch: pytest.MonkeyPatch, rounds: int
+) -> None:
+    """The mirror of R3-1: the rejection lands right after the reopen's first write. The reopen
+    had already superseded the gate, so the rejection is ignored, the reopen finishes in round 1,
+    and the status view and REPORT.md say, in one line, that the rejection was ignored and why."""
+    rn, _ = _deep_failed(hub, rounds)
+    gate = latest(hub, rn, "g")
+    real = run_mod.begin_reopen
+
+    def human_after(*args: Any) -> bool:
+        wrote = real(*args)
+        decide(hub.log, hub.project_id, gate.review_id, "reject", "too late", HUMAN)
+        return wrote
+
+    with monkeypatch.context() as patch:
+        patch.setattr(run_mod, "begin_reopen", human_after)
+        assert reopen(hub, rn, key="k1")["ok"] is True
+    state = load_state(hub.log, rn)
+    assert (state.current_round(), state.blocked_reason()) == (1, None)
+    assert [(op.round, op.attempt) for op in live(hub, rn, "p")] == [(1, 2)]
+    view = status_view(hub.log, rn)
+    assert view["ignored_decisions"] == [
+        {
+            "review_id": gate.review_id,
+            "decision": "reject",
+            "what": _ignored_line("reject", gate.review_id).removeprefix("- ignored: "),
+        }
+    ]
+    assert _gate_lines(hub, rn) == [_ignored_line("reject", gate.review_id)]
+    _ships_on_a_changed_plan(hub, rn, gate.review_id)
+
+
+def test_a_rejection_recorded_before_a_reopen_plan_counts_in_the_fold(
+    hub: Hub, deep_recipe: Any
+) -> None:
+    """R3-1, the fold half: a log where a reopen's plan was written after a human rejected a gate
+    it lists (as the code before this fix could write) keeps the rejection: it opens round 2, and
+    the stale plan of round 1 is not finished."""
+    rn, _ = _deep_failed(hub, 3)
+    state = load_state(hub.log, rn)
+    definition = state.recipe_def
+    gate = state.latest_in_round("g", 1)
+    plan = engine.reopen_plan(
+        state, definition, definition.step("p"), state.upstream_failure("p", 1), "k"
+    )
+    decide(hub.log, hub.project_id, gate.review_id, "reject", "genuine", HUMAN)
+    # the first write without the in-transaction check, from the state read before the decision
+    assert engine._supersede_op(
+        hub.log, hub.project_id, state.latest_in_round("p", 1), AGENT, "x", {"reopen": plan}
+    )
+    state = load_state(hub.log, rn)
+    assert state.current_round() == 2
+    assert state.gate_decision(state.op_by_id(gate.op_id)).decision == "reject"
+    assert state.ignored_decisions() == []
+    advance(hub.log, rn, actor=AGENT)
+    work(hub)
+    assert [(op.round, op.attempt) for op in live(hub, rn, "p")] == [(2, 1)]
+    # the rejection's rollback closed round 1: nothing of it is left live
+    assert [op.step_id for op in load_state(hub.log, rn).ops if op.is_live and op.round == 1] == []
+    assert _gate_lines(hub, rn) == [f"- g round 1: reject by {HUMAN.kind}:{HUMAN.id} -- genuine"]
+
+
+def test_an_approval_before_a_reopen_stays_in_the_report_and_does_not_pass_the_new_gate(
+    hub: Hub, deep_recipe: Any
+) -> None:
+    """R3-2: a human approved the gate on plan v1, then ``x`` failed because of the plan and the
+    agent reopened ``p``. REPORT.md keeps that approval as round 1's history; the reopened plan's
+    gate attempt still needs its own approval."""
+    rn, _ = _deep_failed(hub, 3)
+    gate = latest(hub, rn, "g")
+    decide(hub.log, hub.project_id, gate.review_id, "approve", "real approval of v1", HUMAN)
+    advance(hub.log, rn, actor=AGENT)
+    assert latest(hub, rn, "g").status == "done"
+    history = (
+        f"- g round 1: approve by {HUMAN.kind}:{HUMAN.id} -- real approval of v1 "
+        "(attempt 1, decided before a reopen of 'p' superseded it)"
+    )
+    reopen(hub, rn)
+    assert _gate_lines(hub, rn) == [history]
+    node2, _ = submit_variant(hub, rn, AGENT, 2)
+    complete(hub, rn, node2, "p2")
+    work(hub)
+    state = load_state(hub.log, rn)
+    g2 = state.latest_in_round("g", 1)
+    assert (g2.attempt, g2.status) == (2, "active")  # the v1 approval does not pass it
+    assert state.recipe_status == "active"
+    decide(hub.log, hub.project_id, g2.review_id, "approve", "v2", HUMAN)
+    advance(hub.log, rn, actor=AGENT)
+    work(hub)
+    assert load_state(hub.log, rn).recipe_status == "done"
+    assert _gate_lines(hub, rn) == [
+        history,
+        f"- g round 1: approve by {HUMAN.kind}:{HUMAN.id} -- v2",
+    ]
+
+
+@pytest.mark.parametrize("then", ["advance", "same_key", "retry_x", "worker"])
+def test_a_crash_between_the_supersedes_and_the_withdrawal_still_closes_the_review(
+    hub: Hub, deep_recipe: Any, monkeypatch: pytest.MonkeyPatch, then: str
+) -> None:
+    """Mutant V3: the reopen superseded every op it lists (the gate included) and died before it
+    withdrew the gate's review. Whoever finishes the reopen must still withdraw it, though the
+    gate op already shows cancelled."""
+    rn, _ = _deep_failed(hub, 3)
+    gate = latest(hub, rn, "g")
+
+    def crash(*args: Any, **kwargs: Any) -> bool:
+        raise RuntimeError("killed before the withdrawal")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(engine, "_withdraw_superseded_review", crash)
+        with pytest.raises(RuntimeError, match="killed"):
+            reopen(hub, rn, key="k1")
+    state = load_state(hub.log, rn)
+    assert state.op_by_id(gate.op_id).is_cancelled
+    assert get_review(hub.log, hub.project_id, gate.review_id).pending
+    if then == "advance":
+        advance(hub.log, rn, actor=AGENT)
+    elif then == "same_key":
+        assert reopen(hub, rn, key="k1")["ok"] is True
+    elif then == "retry_x":
+        # the retry finishes the reopen first, then finds no failed ``x`` to retry
+        assert refusal(lambda: recipe_retry(hub.log, rn, "x", AGENT, idempotency_key="rx")) == (
+            "step_not_open"
+        )
+    else:
+        work(hub)
+    assert not get_review(hub.log, hub.project_id, gate.review_id).pending
+    assert _review_status(hub, gate.review_id) == "cancelled"
+    assert [(op.round, op.attempt) for op in live(hub, rn, "p")] == [(1, 2)]

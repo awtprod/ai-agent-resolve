@@ -23,7 +23,7 @@ from typing import Any
 from aar.hub.common import parse_ts
 from aar.hub.events import EventLog
 from aar.hub.graph import GRAPH_EVENT_TYPES, WorkGraph
-from aar.hub.reviews import Decision, Review, review_view
+from aar.hub.reviews import EVENT_DECIDED, Decision, Review, review_view
 from aar.hub.writes import RecipeData, typed_recipe
 from aar.recipes import registry
 from aar.recipes.events import (
@@ -109,6 +109,8 @@ class OpAttempt:
     # ``reopen`` is the plan of a reopen, recorded on the runner's supersede of the agent's done op
     reopened_for: dict[str, Any] | None = None
     reopen: dict[str, Any] | None = None
+    # the log position of the reopen's first write (the event carrying ``reopen``)
+    reopen_seq: int | None = None
 
     @property
     def upstream(self) -> bool:
@@ -142,6 +144,9 @@ class RunState:
     ops: list[OpAttempt] = field(default_factory=list)
     reviews: dict[str, Review] = field(default_factory=dict)
     ignored: list[dict[str, Any]] = field(default_factory=list)
+    # S19f: the log position of each review decision (event id -> seq), read only when a reopen
+    # exists, so a decision can be ordered against the reopen's first write
+    decision_seqs: dict[str, int] = field(default_factory=dict)
 
     # -- grouping -----------------------------------------------------------
 
@@ -209,25 +214,83 @@ class RunState:
     def reopen_superseded(self) -> frozenset[str]:
         """The op ids a reopen supersedes (S19f): every op listed in the plan of a reopen whose
         first write landed, whether or not the rest of its writes are made yet."""
-        listed: set[str] = set()
-        for op in self.ops:
-            if op.reopen is not None and plan_shape_ok(op.reopen):
-                listed.update(op.reopen["supersede"])
-        return frozenset(listed)
+        return frozenset(self.reopen_plans())
 
-    def gate_decision(self, op: OpAttempt) -> Decision | None:
-        """The human decision on gate op ``op``'s review, or ``None``. A decision on the review of a
-        gate op a reopen superseded is ignored (S19f): the reopen withdraws that review, but a
-        decision made before the withdrawal landed (in the window, or racing it) must neither open
-        a round nor count as the gate's decision."""
+    def reopen_plans(self) -> dict[str, tuple[int, dict[str, Any]]]:
+        """Each op id a reopen lists (S19f), mapped to the log position of that reopen's first
+        write and its plan (the earliest, if two reopens list the same op)."""
+        listed: dict[str, tuple[int, dict[str, Any]]] = {}
+        for op in self.ops:
+            plan = op.reopen
+            if plan is None or not plan_shape_ok(plan):
+                continue
+            seq = op.reopen_seq if op.reopen_seq is not None else 0
+            for op_id in plan["supersede"]:
+                if op_id not in listed or seq < listed[op_id][0]:
+                    listed[op_id] = (seq, plan)
+        return listed
+
+    def ignored_decision(self, op: OpAttempt) -> tuple[Decision, dict[str, Any]] | None:
+        """The decision on gate op ``op``'s review and the plan of the reopen that superseded the
+        op, when the fold ignores that decision (S19f): it was recorded after the reopen's first
+        write. A decision recorded before it counts as it always did."""
         if op.kind != "gate" or op.review_id is None:
             return None
         review = self.reviews.get(op.review_id)
         if review is None or review.decision is None:
             return None
-        if op.op_id in self.reopen_superseded():
+        listed = self.reopen_plans().get(op.op_id)
+        if listed is None:
+            return None
+        reopen_seq, plan = listed
+        decided_seq = self.decision_seqs.get(review.decision.event_id)
+        if decided_seq is not None and decided_seq < reopen_seq:
+            return None
+        return review.decision, plan
+
+    def gate_decision(self, op: OpAttempt) -> Decision | None:
+        """The human decision on gate op ``op``'s review, or ``None``. A decision recorded after a
+        reopen's first write superseded the gate op is ignored (S19f): the reopen withdraws that
+        review, but a decision made before the withdrawal landed (in the window, or racing it)
+        must neither open a round nor count as the gate's decision. A decision recorded before
+        that write counts (the reopen's first write refuses when it would change the round)."""
+        if op.kind != "gate" or op.review_id is None:
+            return None
+        review = self.reviews.get(op.review_id)
+        if review is None or review.decision is None:
+            return None
+        if self.ignored_decision(op) is not None:
             return None
         return review.decision
+
+    def ignored_decisions(self) -> list[dict[str, Any]]:
+        """One entry per decision the fold ignores (S19f), for the status view and the report: the
+        review, the decision, and the reopen that had already superseded its gate."""
+        out: list[dict[str, Any]] = []
+        for op in self.ops:
+            found = self.ignored_decision(op)
+            if found is None:
+                continue
+            decision, plan = found
+            why = plan.get("reopened_for") or {}
+            out.append(
+                {
+                    "review_id": op.review_id,
+                    "step_id": op.step_id,
+                    "round": op.round,
+                    "attempt": op.attempt,
+                    "decision": decision.decision,
+                    "by": f"{decision.by.kind}:{decision.by.id}",
+                    "what": (
+                        f"the {decision.decision} of review {op.review_id} (gate {op.step_id!r} "
+                        f"round {op.round} attempt {op.attempt}, by {decision.by.kind}:"
+                        f"{decision.by.id}) was ignored: a reopen of {plan.get('step')!r} after "
+                        f"{why.get('step')!r} failed had already superseded that gate; the "
+                        "reopened step gets a new review"
+                    ),
+                }
+            )
+        return out
 
     def _rejected_rounds(self) -> set[int]:
         rejected: set[int] = set()
@@ -409,6 +472,7 @@ def _fold_recipe_events(
             op.cancelled_reason = _str(payload.get("reason"))
             reopen = payload.get("reopen")
             op.reopen = reopen if isinstance(reopen, dict) else None
+            op.reopen_seq = event.seq if op.reopen is not None else None
     for op_id, op in ops.items():
         _apply_lease(op, claims.get(op_id, []), heartbeats.get(op_id, []))
     return started, run_cancelled
@@ -527,6 +591,13 @@ def load_state(log: EventLog, recipe_node: str, *, project_id: str | None = None
                 reviews[rid] = review
     for op in ops.values():
         op.status = _status_of(op, reviews.get(op.review_id) if op.review_id else None)
+    decision_seqs: dict[str, int] = {}
+    if any(op.reopen is not None for op in ops.values()):
+        # read after the reviews, so every decision they carry has its position here
+        decision_seqs = {
+            event.id: event.seq
+            for event in log.read(0, project_id=project_id, types=[EVENT_DECIDED], limit=-1)
+        }
     return RunState(
         project_id=project_id,
         recipe_node=recipe_node,
@@ -538,4 +609,5 @@ def load_state(log: EventLog, recipe_node: str, *, project_id: str | None = None
         ops=sorted(ops.values(), key=lambda op: (op.created or "", op.op_id)),
         reviews=reviews,
         ignored=ignored,
+        decision_seqs=decision_seqs,
     )

@@ -84,14 +84,27 @@ def build_report_text(log: EventLog, recipe_node: str) -> str:
 
     lines.append("## Gates")
     gate_lines = []
+    reopened = state.reopen_plans()
     for step_id in _step_order(state):
         for op in sorted(state.attempts_for(step_id), key=lambda op: (op.round, op.attempt)):
-            d = state.gate_decision(op)  # None on a gate op a reopen superseded (S19f)
+            # S19f: None for a decision recorded after a reopen superseded the gate op (listed
+            # below); an approval recorded before the reopen is that round's history (a rejection
+            # recorded before it ended the round, so the reopen never applied)
+            d = state.gate_decision(op)
             if d is None:
                 continue
+            history = ""
+            if op.op_id in reopened and d.decision == "approve":
+                plan = reopened[op.op_id][1]
+                history = (
+                    f" (attempt {op.attempt}, decided before a reopen of {plan.get('step')!r} "
+                    "superseded it)"
+                )
             gate_lines.append(
                 f"- {step_id} round {op.round}: {d.decision} by {d.by.kind}:{d.by.id} -- {d.reason}"
+                f"{history}"
             )
+    gate_lines.extend(f"- ignored: {entry['what']}" for entry in state.ignored_decisions())
     lines.extend(gate_lines or ["- (no decided gates)"])
     lines.append("")
 
