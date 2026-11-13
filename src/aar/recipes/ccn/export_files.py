@@ -1,16 +1,26 @@
 """Copying the export step's files to the edit PC's share (``AAR_EXPORT_DIR``).
 
 The folder is ``<AAR_EXPORT_DIR>/<project>/<timeline>/`` and the files
-``<timeline>.r<round>.fcpxml`` and ``<timeline>.r<round>.review.mp4``, every name made safe for
-Windows (:func:`safe_name`). The project and timeline come from the stub step's runner-recorded
-outputs (the brief's show and the params' timeline), never from the agent's plan.
+``<timeline>.r<round>.review.mp4``, ``<timeline>.r<round>.notes.txt`` and
+``<timeline>.r<round>.fcpxml``, every name made safe for Windows (:func:`safe_name`). The
+project and timeline come from the stub step's runner-recorded outputs (the brief's show and the
+params' timeline), never from the agent's plan.
+
+Delivery is the step's purpose, so ``AAR_EXPORT_DIR`` must be set (``export_dir_unset``): an
+export that reached nobody is not a success a review can follow.
 
 Nothing is followed or replaced: a folder below ``AAR_EXPORT_DIR`` that is a symlink is refused
 (``export_path_symlink``), and a file name that is taken (a file with other bytes, a symlink,
-even a dangling one, or anything that is not a regular file) moves the pair to ``-2``, ``-3``...
+even a dangling one, or anything that is not a regular file) moves the set to ``-2``, ``-3``...
 (at most :data:`MAX_COPY_SUFFIX`). A name that already holds the same bytes is reused, so a
-repeated export copies nothing twice. Each file is written to a temporary name beside it,
-fsynced, and placed without ever replacing a file.
+repeated export copies nothing twice.
+
+A round is published whole or not at all (:func:`_publish`): every file is first written to a
+temporary name beside its place and fsynced (the slow part, where a full share or a dropped
+mount fails), then each is placed without ever replacing a file, in the caller's order. The
+caller puts the FCPXML last, so a timeline that can be imported is in the share only when the
+review video and the notes it belongs with are already there, even after a crash between two
+placements; a failure also removes what this call had placed.
 """
 
 from __future__ import annotations
@@ -52,17 +62,23 @@ def safe_name(text: str) -> str:
     return name
 
 
-def export_root() -> Path | None:
-    """``AAR_EXPORT_DIR`` when set (an existing absolute directory), else None."""
+def export_root() -> Path:
+    """``AAR_EXPORT_DIR``: an existing absolute directory. Unset or empty is
+    ``export_dir_unset``, never a skipped copy."""
     raw = os.environ.get(EXPORT_DIR_ENV, "").strip()
     if not raw:
-        return None
+        raise StepFailure(
+            "export_dir_unset",
+            f"{EXPORT_DIR_ENV} is not set, so the timeline cannot be delivered to the edit PC",
+            f"set {EXPORT_DIR_ENV} in the worker's environment (hub.env: the media root's "
+            "share/exports), restart the worker, then retry the export (recipe_retry export)",
+        )
     root = Path(raw)
     if not root.is_absolute() or not root.is_dir():
         raise StepFailure(
             "export_dir_unusable",
             f"{EXPORT_DIR_ENV} {raw!r} is not an existing absolute directory",
-            "create it (the media root's share/exports) or unset it",
+            "create it (the media root's share/exports), then retry the export",
         )
     return root
 
@@ -107,31 +123,52 @@ def _targets(folder: Path, stem: str, digests: list[tuple[str, str]]) -> list[Pa
     return None
 
 
-def _place_copy(ctx: StepContext, dest: Path, artifact_id: str) -> None:
+def _stage(ctx: StepContext, tmp: Path, artifact_id: str) -> None:
+    with ctx.store.open(artifact_id) as src, tmp.open("xb") as sink:
+        shutil.copyfileobj(src, sink, 1024 * 1024)
+        sink.flush()
+        os.fsync(sink.fileno())
+    tmp.chmod(0o644)
+
+
+def _publish(ctx: StepContext, pairs: list[tuple[Path, str]]) -> None:
+    """Place every ``(destination, artifact id)`` or none (module docstring): all staged under
+    temporary names first, then placed in order, the ones this call placed removed again when a
+    later one fails. A destination that already holds the bytes is left as it is."""
     from aar.drp.modify.write import _place
 
-    if _holds(dest, artifact_id):
-        return
-    tmp = dest.with_name(f".{dest.name}.aar-copy-{secrets.token_hex(4)}")
+    todo = [(dest, artifact_id) for dest, artifact_id in pairs if not _holds(dest, artifact_id)]
+    staged = [
+        (dest.with_name(f".{dest.name}.aar-copy-{secrets.token_hex(4)}"), dest, artifact_id)
+        for dest, artifact_id in todo
+    ]
+    placed: list[Path] = []
     try:
-        with ctx.store.open(artifact_id) as src, tmp.open("xb") as sink:
-            shutil.copyfileobj(src, sink, 1024 * 1024)
-            sink.flush()
-            os.fsync(sink.fileno())
-        tmp.chmod(0o644)
-        _place(tmp, dest, False)  # FileExistsError when the name was taken meanwhile
+        for tmp, _dest, artifact_id in staged:
+            _stage(ctx, tmp, artifact_id)
+        for tmp, dest, _artifact_id in staged:
+            _place(tmp, dest, False)  # FileExistsError when the name was taken meanwhile
+            placed.append(dest)
+    except BaseException:
+        # Best effort: on a share that went away these fail too, and the first error is the
+        # one to report. What is left then is never the importable file without its set
+        # (it is placed last).
+        for dest in reversed(placed):
+            with contextlib.suppress(OSError):
+                dest.unlink()
+        raise
     finally:
-        tmp.unlink(missing_ok=True)
+        for tmp, _dest, _artifact_id in staged:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
 
 
 def copy_out(
     ctx: StepContext, project: str, timeline: str, round_: int, files: list[tuple[str, str]]
 ) -> dict[str, Any]:
-    """Copy ``files`` (``(suffix, artifact id)``) as ``<timeline>.r<round><suffix>`` (module
-    docstring); the outputs' ``copy`` block."""
+    """Copy ``files`` (``(suffix, artifact id)``) as ``<timeline>.r<round><suffix>``, all or
+    none, placed in the order given (module docstring); the outputs' ``copy`` block."""
     root = export_root()
-    if root is None:
-        return {"copied": False, "reason": f"{EXPORT_DIR_ENV} is not set: nothing was copied"}
     stem = f"{safe_name(timeline)}.r{round_}"
     try:
         folder = _folder(root, [safe_name(project), safe_name(timeline)])
@@ -142,8 +179,7 @@ def copy_out(
                 f"{folder} already holds {MAX_COPY_SUFFIX} other copies named {stem}",
                 "move old exports away",
             )
-        for dest, (_, artifact_id) in zip(targets, files, strict=True):
-            _place_copy(ctx, dest, artifact_id)
+        _publish(ctx, [(dest, sha) for dest, (_, sha) in zip(targets, files, strict=True)])
     except OSError as exc:
         raise StepFailure(
             "export_copy_failed", f"cannot copy into the export share: {exc}", "check the share"

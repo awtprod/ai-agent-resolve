@@ -19,8 +19,10 @@ Conventions (see docs/DESIGN.md, "FCPXML export"):
 * Every clip carries its own linked sound; nothing relies on ``srcEnable`` (Resolve ignores it).
   By the compiler's positional convention V``N`` content sound is plan audio track A``N``; the
   outro's sound rides with its clip, and a different planned track is reported ("move it by
-  hand"). FCPXML has no tracks, so a track's gain is folded into each clip's volume and its mute
-  and bus are reported.
+  hand"). FCPXML has no tracks, so a track's gain is folded into each clip's volume and its bus
+  is reported. A muted track that feeds a bus is exported audible and reported (the CCN
+  topology); a muted track that feeds no bus plays nothing, as in the review render, so its
+  clips are exported at :data:`SILENT_DB` (:func:`muted_without_bus`).
 * Spine clips keep their plan record ranges and abut. A ``transition`` element sits at the edit,
   over the media beyond each clip's in and out (handles): its offset is the cut minus its frames
   before the cut. The alignment comes from the compiler's own rule
@@ -91,6 +93,21 @@ class TransformSpec:
     scale: tuple[float, float]
     rotation: float
     keyframes: tuple[Keyframe, ...] = ()
+
+
+#: The clip volume that stands for silence: FCPXML has no track mute, and -96 dB is where Final
+#: Cut's own fader bottoms out (and the floor of the plan's gain range, DESIGN "audio.gain").
+SILENT_DB = -96.0
+
+
+def muted_without_bus(plan: EditPlan, track: int | None) -> bool:
+    """Whether sound on plan audio track ``track`` (1-based) plays nothing: the track is muted
+    and feeds no bus. A muted track that feeds a bus stays audible (the CCN A1-A4 topology).
+    The one rule the review render and the export both follow, so they agree."""
+    tracks = plan.audio_tracks
+    if track is None or not 1 <= track <= len(tracks):
+        return False
+    return tracks[track - 1].mute and tracks[track - 1].bus is None
 
 
 @dataclass(frozen=True)
@@ -538,6 +555,13 @@ class _Builder:
         tracks = self.plan.audio_tracks
         return tracks[track - 1].gain_db if 1 <= track <= len(tracks) else 0.0
 
+    def _volume(self, track: int, gain_db: float = 0.0) -> float:
+        """A clip's volume on plan audio track ``track``: its own gain plus the track's, or
+        :data:`SILENT_DB` when that track plays nothing (:func:`muted_without_bus`)."""
+        if muted_without_bus(self.plan, track):
+            return SILENT_DB
+        return gain_db + self._track_gain(track)
+
     def _clips(self) -> None:
         sources = self.plan.source_map()
         for index, seg in enumerate(self.plan.segments):
@@ -558,8 +582,8 @@ class _Builder:
                 )
             ref = self.layout.media[source.id]
             record_in, record_out = self.ranges[index]
-            volume = seg.gain_db + self._track_gain(seg.track)
-            if not math.isfinite(volume):
+            volume = self._volume(seg.track, seg.gain_db)
+            if not math.isfinite(seg.gain_db):
                 raise ExportError(
                     "non_finite_value",
                     f"segment {index} gain {seg.gain_db!r} dB is not a finite number",
@@ -693,7 +717,7 @@ class _Builder:
                 ref.src,
                 "all",
                 audio,
-                volume_db=self._track_gain(audio),
+                volume_db=self._volume(audio),
                 name=ref.name,
                 frame_size=frame_size,
                 conform=conform,
@@ -1128,7 +1152,18 @@ class _Builder:
         used = {c.audio_track for c in self.layout.clips if c.audio_track is not None}
         for number, track in enumerate(plan.audio_tracks, start=1):
             location = f"audio_tracks[{number - 1}]"
-            if track.mute:
+            silent = muted_without_bus(plan, number)
+            if silent:
+                self.unexpressible(
+                    "audio_mute",
+                    f"{location}.mute",
+                    f"A{number} {track.name!r} is muted in the plan and feeds no bus, so it "
+                    f"plays nothing: its clips are exported silent (volume {SILENT_DB:g} dB each, "
+                    "as the review render plays them; FCPXML has no track mute)",
+                    f"to hear {track.name!r} in Resolve, raise its clips' volume; to keep it "
+                    "silent, nothing (or mute the track in Fairlight)",
+                )
+            elif track.mute:
                 self.unexpressible(
                     "audio_mute",
                     f"{location}.mute",
@@ -1154,7 +1189,7 @@ class _Builder:
                         "that feed it (FCPXML has no buses)",
                         f"set the gain on {track.bus!r} in Fairlight once the routing is in place",
                     )
-            if track.gain_db != 0.0:
+            if track.gain_db != 0.0 and not silent:
                 self.note(
                     "audio_track_gain",
                     f"{location}.gain_db",

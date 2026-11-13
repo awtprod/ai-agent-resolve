@@ -279,6 +279,26 @@ def test_hostile_item_values_are_typed_not_a_traceback(
     assert diff["segments"][0]["status"] == "removed"
 
 
+def test_an_edit_the_plan_drops_exits_1_with_both_files_written(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review finding 3: an edit the plan does not follow that is no item on the primary track
+    (here the plan's dissolve, taken out in Resolve; ``primary_not_carried`` is 0) was listed as
+    not carried and the import still exited 0."""
+    data = plan_for(CLIPS, transitions=[{"after": 0, "video": "dissolve", "video_frames": 6}])
+    drt, plan = setup(tmp_path, CLIPS, data)
+    status, out, err = call(tmp_path, capsys, drt, plan)
+    diff = json.loads((tmp_path / "edited.diff.json").read_text())
+    assert diff["primary_not_carried"] == 0
+    assert [e["code"] for e in diff["not_carried"]] == ["transition_missing"]
+    assert (status, err) == (1, "")
+    assert out.startswith(
+        "NOT CARRIED: the plan does not follow 1 edit(s) made in the timeline "
+        "(transition_missing x1); "
+    )
+    assert (tmp_path / "edited.plan.json").is_file()
+
+
 def test_an_edited_plan_the_export_refuses_exits_1(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

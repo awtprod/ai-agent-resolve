@@ -31,7 +31,7 @@ from typing import Any
 from aar.hub.common import Clock, iso, parse_ts, utcnow
 from aar.hub.events import Actor, EventLog
 from aar.hub.graph import WorkGraph, allowed_transitions
-from aar.hub.reviews import ReviewNotOpen, get_review, withdraw
+from aar.hub.reviews import MAX_ATTACHMENTS, ReviewNotOpen, get_review, withdraw
 from aar.hub.writes import (
     _append_record,
     _in_transaction,
@@ -1258,6 +1258,7 @@ def _open_gate_reviews(
             renders,
             title=f"gate {step.id} (round {op.round})",
             base=base,
+            attachments=_review_attachments(state, step),
         )
         with _in_transaction(log) as txn:
             txn.append(
@@ -1297,20 +1298,24 @@ def _open_review_node(
     *,
     title: str,
     base: str,
+    attachments: tuple[str, ...] = (),
 ) -> str:
     """Create a ``review`` node (status active) plus its ``reviews`` edge, requested by RUNNER.
 
     The requester is RUNNER, so no agent can withdraw the gate review (F2/F8); a human still can.
     Done without the artifact store (``advance`` has no store): the renders are the subject step's
     already-stored outputs. A human decides it in the console; nothing here can decide a review.
+    ``attachments`` (:func:`_review_attachments`) are shown on the review card beside the renders.
     """
-    data = {
+    data: dict[str, Any] = {
         "subject": subject,
         "renders": list(renders),
         "timeline": None,
         "fps": None,
         "requested_by": _caller_ref(RUNNER),
     }
+    if attachments:  # absent when there are none: such a node is as it was before attachments
+        data["attachments"] = list(attachments)
     graph = WorkGraph(log, project_id)
     node = graph.add_node(
         "review",
@@ -1322,6 +1327,18 @@ def _open_review_node(
     )
     graph.add_edge("reviews", node.id, subject, RUNNER, idempotency_key=f"{base}:edge")
     return node.id
+
+
+def _review_attachments(state: RunState, step: StepDef) -> tuple[str, ...]:
+    """What the gate's reviewer should read before deciding: the artifact ids the steps the gate
+    needs offer under their ``review_attachments`` output (the ccn export's handoff notes: what
+    the reviewed video does not show of the timeline that was delivered), in ``needs`` order."""
+    found: list[str] = []
+    for need in step.needs:
+        offered = state.done_outputs(need).get("review_attachments")
+        if isinstance(offered, list):
+            found += [a for a in offered if isinstance(a, str) and a not in found]
+    return tuple(found[:MAX_ATTACHMENTS])
 
 
 def _review_subject(outputs: dict[str, Any]) -> tuple[str | None, tuple[str, ...]]:

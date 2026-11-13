@@ -316,7 +316,7 @@ def test_an_unedited_timeline_is_still_clean() -> None:
     assert text(result).startswith("timeline ")
 
 
-def test_a_not_carried_item_off_the_primary_track_is_not_counted() -> None:
+def test_a_not_carried_item_off_the_primary_track_is_not_counted_but_needs_attention() -> None:
     plan = plan_of(
         [
             {"source": "A", "src_in": 0, "src_out": 400},
@@ -327,7 +327,48 @@ def test_a_not_carried_item_off_the_primary_track_is_not_counted() -> None:
     broll = next(r for r in rows if r.track == "V2")
     result = run(plan, [replace(r, speed=2.0, sound=None) if r is broll else r for r in rows])
     assert result.diff["segments"][1]["status"] == "kept"
-    assert result.diff["primary_not_carried"] == 0 and not result.needs_attention
+    assert result.diff["primary_not_carried"] == 0
+    # The owner's retime is not in the plan, so the next export would lose it: not clean.
+    assert result.not_carried > 0 and result.needs_attention
+
+
+# -- an edit the plan drops, on any track: never a clean import (review finding 3) ----------------
+
+
+def test_music_added_in_resolve_is_not_a_clean_import() -> None:
+    """The import listed ``audio_only_edit``, left the music out of the plan and still reported
+    success, so a revision loop exported the next round without it."""
+    plan = simple()
+    music = Row("A2", "audio", 0, 300, 0, "E:\\Music\\bed.wav")
+    result = run(plan, [*layout_rows(plan), music])
+    assert [e["code"] for e in result.diff["not_carried"]] == ["audio_only_edit"]
+    assert result.plan == plan  # the plan cannot hold it
+    assert result.diff["primary_not_carried"] == 0 and not result.has_errors
+    assert result.not_carried == 1 and result.needs_attention
+    assert text(result).splitlines()[0] == (
+        "NOT CARRIED: the plan does not follow 1 edit(s) made in the timeline (audio_only_edit "
+        "x1); the next export will not have them unless they are redone in Resolve."
+    )
+
+
+def test_a_linked_sound_removed_in_resolve_is_not_a_clean_import() -> None:
+    plan = simple()
+    rows = layout_rows(plan)
+    second = content(rows)[1]
+    result = run(plan, [replace(r, sound=None) if r is second else r for r in rows])
+    assert [e["code"] for e in result.diff["not_carried"]] == ["audio_only_edit"]
+    assert result.plan == plan  # the plan still plays the sound the owner removed
+    assert result.needs_attention and "NOT CARRIED" in text(result).splitlines()[0]
+
+
+def test_the_primary_line_stays_first_and_the_not_carried_line_follows() -> None:
+    plan = simple()
+    rows = layout_rows(plan)
+    second = content(rows)[1]
+    result = run(plan, [replace(r, speed=0.5, sound=None) if r is second else r for r in rows])
+    first, second_line = text(result).splitlines()[:2]
+    assert first.startswith("The plan could not hold 1 item(s) on V1")
+    assert second_line.startswith("NOT CARRIED: the plan does not follow ")
 
 
 def test_design_states_the_exit_and_no_longer_says_the_plan_loses_nothing() -> None:

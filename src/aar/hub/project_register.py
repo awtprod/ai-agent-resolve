@@ -19,6 +19,11 @@ Rules, all checked before anything is written:
   name or alias that any project already has as its name or an alias is refused with
   ``project_exists`` naming the existing id, after the same retry check. The Resolve source
   is attached later with :func:`add_source`, under the same one-uid-one-project rule.
+- A registration with a source may not take a name or alias a source-less project holds
+  either (``project_exists`` naming it, with the way to attach the source): a second project
+  under the show's name would split its plans, reviews and Resolve jobs between two records.
+  Two projects that both have sources may still share a name; their Resolve ids tell them
+  apart.
 - :func:`rename` and :func:`add_alias` keep that identity: a name or alias a source-less
   project holds is reserved to it, and a source-less project may not take one any other
   project holds (``project_exists``). The library (:class:`Registry`) does not apply this
@@ -208,12 +213,19 @@ def _exists(error: DuplicateResolveProject) -> WriteError:
     )
 
 
-def _name_taken(error: DuplicateProjectName) -> WriteError:
+def _name_taken(error: DuplicateProjectName, *, sourced: bool = False) -> WriteError:
+    hint = f"Use {error.existing_id} (aar hub project show), or register under another name."
+    if sourced:  # the show is already registered, without its Resolve project
+        hint = (
+            f"If this is the Resolve project of {error.existing_id}, attach the source to it "
+            f"(`aar hub project source {error.existing_id}`, or the project_source tool) "
+            "instead of registering a second project; otherwise register under another name."
+        )
     return WriteError(
         "project_exists",
         f"{error.name!r} is already a name or alias of {error.existing_id!r}, and a project "
         "without a source is known by its name",
-        f"Use {error.existing_id} (aar hub project show), or register under another name.",
+        hint,
         existing_id=error.existing_id,
         name=error.name,
     )
@@ -284,12 +296,14 @@ def register_project(
             aliases=alias_list,
             project_id=project_id,
             idempotency_key=key,
-            unique_name=not sources,
+            # Sourced too: it may share a name with another sourced project (the uid tells
+            # them apart) but never take one a source-less show is known by.
+            unique_name=True,
         )
     except DuplicateResolveProject as exc:
         raise _exists(exc) from None
     except DuplicateProjectName as exc:
-        raise _name_taken(exc) from None
+        raise _name_taken(exc, sourced=bool(sources)) from None
     except DuplicateProjectId as exc:
         raise WriteError(
             "project_exists",

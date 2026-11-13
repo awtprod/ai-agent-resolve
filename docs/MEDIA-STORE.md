@@ -92,8 +92,9 @@ the hub's own units write to it.
 ```
 <media root>/models/          Whisper (faster-whisper-medium.en/) and YuNet models, never downloaded
 <media root>/share/incoming/  proxies copied from the edit PC (<show>/Proxy/<clip>.mp4)
-<media root>/share/exports/   results for the edit PC: <project>/<timeline>/<timeline>.r<N>.fcpxml
-                              and .r<N>.review.mp4
+<media root>/share/exports/   results for the edit PC: <project>/<timeline>/<timeline>.r<N>.fcpxml,
+                              .r<N>.review.mp4 and .r<N>.notes.txt (read the notes first: what
+                              to redo in Resolve; the .fcpxml appears last, when the round is whole)
 <media root>/share/timelines/ timelines edited in Resolve, back from the edit PC (S20):
                               <project>/<timeline>/<timeline>.e<N>.drt
 <media root>/work/            step scratch (transcripts, renders), removed after each step

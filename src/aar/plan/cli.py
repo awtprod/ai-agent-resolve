@@ -209,8 +209,9 @@ def register(subparsers: Any) -> None:
         "not stop it being written. Neither output is ever overwritten. A reader problem "
         "anywhere in the file refuses the import, even in a timeline --timeline does not pick. "
         "Exit: 0 written, 1 written but the edited plan has lint errors or the export's layout "
-        "refuses it, or an item on the primary track is not carried (check it by eye), 2 "
-        "refused or unreadable input.",
+        "refuses it, or the timeline holds an edit the plan does not carry (anything under "
+        "not_carried: the next export would not have it; an item on the primary track also "
+        "needs the segments around it checked by eye), 2 refused or unreadable input.",
     )
     imp.add_argument("drt", type=Path, metavar="TIMELINE.drt", help="Timeline exported as .drt.")
     imp.add_argument("--plan", type=Path, required=True, help="The plan the timeline came from.")
@@ -730,6 +731,13 @@ def _import_text(diff: dict[str, Any], out: Path, report: Path) -> str:
         lines.append(
             f"The plan could not hold {held_not} item(s) on {diff['primary_track']} (see not "
             "carried); check the segments around them by eye."
+        )
+    lost = diff["not_carried"]
+    if lost:
+        lines.append(
+            f"NOT CARRIED: the plan does not follow {len(lost)} edit(s) made in the timeline ("
+            + _counted([str(entry["code"]) for entry in lost])
+            + "); the next export will not have them unless they are redone in Resolve."
         )
     lines += [
         f"timeline {tl['name']!r} ({tl['frame_rate']:.3f} fps, {tl['items']} items): "

@@ -55,8 +55,10 @@ open (an op, so it needs the project's id as its target; `aar node locate` does 
 
 A show that the hub already edits from media (registered without a source, see DESIGN "Project
 registry") keeps its `prj_...` id: once the project exists in Resolve, attach it with
-`aar hub project source PRJ --source-kind local_db --host edit-pc --locator '{...}'` instead of
-registering a second project. The same one-uid-one-project rule applies.
+`aar hub project source PRJ --source-kind local_db --host edit-pc --locator '{...}'` (or the
+`project_source` tool) instead of registering a second project. The same one-uid-one-project
+rule applies, and registering the Resolve project under the show's name is refused with
+`project_exists` naming the project to attach it to.
 
 On Windows, with Resolve Studio running and `DaVinciResolveScript` importable:
 

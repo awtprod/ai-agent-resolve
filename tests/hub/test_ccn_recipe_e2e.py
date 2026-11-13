@@ -4,6 +4,7 @@ then approved, and the report. No Resolve, no network, no model (the transcriber
 
 from __future__ import annotations
 
+import json
 import shlex
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ import pytest
 from ccn_recipe_support import PC_ROOT, CcnEnv, agent_cut, latest, make_run, outputs, start, work
 from write_support import HUMAN
 
-from aar.hub.reviews import decide
+from aar.hub.reviews import decide, get_review
 from aar.media import probe
 from aar.plan.export import media_map_from_mapping, verify_plan_fcpxml
 from aar.plan.model import EditPlan
@@ -60,6 +61,7 @@ def test_ccn_longform_runs_end_to_end(ccn_env: CcnEnv, tmp_path: Path) -> None:
     assert not (env.work / "aar-render").exists() or not list((env.work / "aar-render").iterdir())
 
     export = outputs(env, run, "export")
+    export_report = json.loads(env.hub.store.read_bytes(export["export_report"]))
     copy = export["copy"]
     assert copy["copied"] is True and copy["round"] == 1 and copy["dir"] == str(folder)
     assert copy["fcpxml"] == str(folder / "Synthetic Long v1.r1-2.fcpxml")
@@ -68,6 +70,23 @@ def test_ccn_longform_runs_end_to_end(ccn_env: CcnEnv, tmp_path: Path) -> None:
     fcpxml = env.hub.store.read_bytes(export["fcpxml"])
     assert Path(copy["fcpxml"]).read_bytes() == fcpxml
     assert Path(copy["review_mp4"]).read_bytes() == mp4.read_bytes()
+    # The handoff notes travel with the timeline (the taken .fcpxml name moved the whole set).
+    assert copy["handoff_notes"] == str(folder / "Synthetic Long v1.r1-2.notes.txt")
+    notes = Path(copy["handoff_notes"]).read_bytes()
+    assert notes == env.hub.store.read_bytes(export["handoff_notes"])
+    text = notes.decode("utf-8")
+    assert text.startswith("HANDOFF NOTES: Synthetic Long v1, round 1 (project Synthetic Show)")
+    assert "  - E:\\Shows\\cam-a.mov\r\n" in text and "they are NOT checked" in text
+    gain = render["loudness"]["gain_db"]
+    assert f"{abs(gain):g} dB to reach {render['loudness']['target_lufs']:g} LUFS" in text
+    assert "NOT IN THE FCPXML: REDO IN RESOLVE\r\n  Nothing: the FCPXML carries every" in text
+    assert len(export_report["not_expressible"]) == 0  # this plan: nothing to redo
+    assert sorted(p.name for p in folder.iterdir()) == [
+        "Synthetic Long v1.r1-2.fcpxml",
+        "Synthetic Long v1.r1-2.notes.txt",
+        "Synthetic Long v1.r1-2.review.mp4",
+        "Synthetic Long v1.r1.fcpxml",
+    ]
     assert export["assets"] == ["file:///E:/Shows/cam-a.mov"]
     plan_sha = outputs(env, run, "cut")["plan_sha256"]
     plan = EditPlan.model_validate_json(env.hub.store.read_bytes(plan_sha))
@@ -81,8 +100,13 @@ def test_ccn_longform_runs_end_to_end(ccn_env: CcnEnv, tmp_path: Path) -> None:
     assert plan.sources[0].start_timecode == 108000  # 01:00:00:00 from the proxy's tmcd track
     assert 'start="108108000/30000s"' in fcpxml.decode()  # the asset at the file's timecode
 
-    # Round 1 is rejected: the run goes back to the cut, never to the transcript.
+    # The reviewer is shown the notes with the video: the gate's review carries them.
     review1 = _review_id(env, run)
+    shown = get_review(env.hub.log, env.hub.project_id, review1)
+    assert shown is not None and shown.renders == (render["review_mp4"],)
+    assert shown.attachments == (export["handoff_notes"],)
+
+    # Round 1 is rejected: the run goes back to the cut, never to the transcript.
     decide(env.hub.log, env.hub.project_id, review1, "reject", "end on the laugh", HUMAN)
     work(env)
     state = load_state(env.hub.log, run)
@@ -90,8 +114,14 @@ def test_ccn_longform_runs_end_to_end(ccn_env: CcnEnv, tmp_path: Path) -> None:
     keep2 = {"ranges": [{"start_s": 0.9, "end_s": 4.1}, {"start_s": 4.9, "end_s": 8.1}]}
     agent_cut(env, run, keep=keep2, derives_from=review1, key="r2")
     assert work(env) == 2
-    copy2 = outputs(env, run, "export")["copy"]
+    export2 = outputs(env, run, "export")
+    copy2 = export2["copy"]
     assert copy2["round"] == 2
+    # Round 2's review carries round 2's notes, not round 1's.
+    assert export2["handoff_notes"] != export["handoff_notes"]
+    assert b", round 2 (" in env.hub.store.read_bytes(export2["handoff_notes"])
+    shown2 = get_review(env.hub.log, env.hub.project_id, _review_id(env, run))
+    assert shown2 is not None and shown2.attachments == (export2["handoff_notes"],)
     assert copy2["fcpxml"] == str(folder / "Synthetic Long v1.r2.fcpxml")
     assert Path(copy["fcpxml"]).exists()  # round 1's copy stays
 

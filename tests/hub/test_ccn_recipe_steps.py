@@ -319,9 +319,12 @@ def test_a_render_that_fails_qa_names_the_checks(ccn_env: CcnEnv) -> None:
     assert latest(ccn_env, run1, "export") is None
 
 
-def test_without_an_export_dir_the_copy_is_skipped_and_said(
+def test_without_an_export_dir_the_export_fails_and_no_review_opens(
     ccn_env: CcnEnv, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Workflow review finding 6: unset, the copy was skipped, the export succeeded and the
+    review opened on a timeline nobody had been given. Now the step fails (not the cut's fault),
+    no review opens, and a retry with the share configured delivers the round."""
     monkeypatch.delenv("AAR_EXPORT_DIR")
     show = ccn_env.show()
     run1 = make_run(ccn_env, ccn_env.params(show), key="1")
@@ -329,13 +332,20 @@ def test_without_an_export_dir_the_copy_is_skipped_and_said(
     work(ccn_env)
     agent_cut(ccn_env, run1)
     work(ccn_env)
-    export = outputs(ccn_env, run1, "export")
-    assert export["copy"] == {
-        "copied": False,
-        "reason": "AAR_EXPORT_DIR is not set: nothing was copied",
-    }
-    assert ccn_env.hub.store.has(export["fcpxml"])
+    op = latest(ccn_env, run1, "export")
+    assert op.status == "failed" and op.result_error["code"] == "export_dir_unset"
+    assert op.upstream is False and "recipe_retry export" in op.result_error["fix_hint"]
     assert not list(ccn_env.exports.iterdir())
+    assert latest(ccn_env, run1, "review") is None
+    assert latest(ccn_env, run1, "render").status == "done"  # the render is not thrown away
+
+    from aar.recipes.run import recipe_retry
+
+    monkeypatch.setenv("AAR_EXPORT_DIR", str(ccn_env.exports))
+    recipe_retry(ccn_env.hub.log, run1, "export", AGENT, idempotency_key="retry-export")
+    work(ccn_env)
+    copy = outputs(ccn_env, run1, "export")["copy"]
+    assert copy["copied"] is True and Path(copy["fcpxml"]).is_file()
     assert latest(ccn_env, run1, "review").review_id is not None
 
 
