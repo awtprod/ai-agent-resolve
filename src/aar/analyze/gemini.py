@@ -39,33 +39,26 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from aar.analyze.errors import AnalyzeError
+from aar.httpsafe import (
+    MAX_RETRIES,
+    REDACTED,
+    RETRIED_STATUSES,
+    RedirectRefused,
+    Scrubber,
+    base_url_problem,
+    origin,
+    retry_after_s,
+    safe_opener,
+)
 
 KEY_ENV = "AAR_GEMINI_API_KEY"
 _GEMINI_BASE = "https://generativelanguage.googleapis.com"
 MAX_BODY = 8 * 1024 * 1024
-MAX_RETRIES = 2
-RETRY_AFTER_MAX_S = 30.0
 POLL_S = 2.0
-_RETRIED = (429, 503)
-_LOOPBACK = ("127.0.0.1", "::1", "localhost")
 _FILE_NAME = re.compile(r"files/[A-Za-z0-9_-]{1,128}")
 _MODEL_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
 _EXCERPT = 300
-REDACTED = "[redacted]"
 _NOT_JSON = object()
-
-
-class Scrubber:
-    """Removes a secret (raw and URL-encoded) from text."""
-
-    def __init__(self, secret: str) -> None:
-        forms = {secret, urllib.parse.quote(secret, safe=""), urllib.parse.quote_plus(secret)}
-        self._needles = sorted((f for f in forms if f), key=len, reverse=True)
-
-    def __call__(self, text: str) -> str:
-        for needle in self._needles:
-            text = text.replace(needle, REDACTED)
-        return text
 
 
 @dataclass(frozen=True)
@@ -88,20 +81,6 @@ class GeminiTransport(Protocol):
     def delete(self, ref: FileRef) -> None: ...
 
 
-class _Redirect(Exception):
-    def __init__(self, code: int) -> None:
-        super().__init__(code)
-        self.code = code
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Refuse every redirect: following one would send the key to the new location."""
-
-    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
-        # (req, fp, code, msg, headers, newurl): only the status code is kept.
-        raise _Redirect(args[2] if len(args) > 2 else int(kwargs.get("code", 0)))
-
-
 @dataclass
 class _Outcome:
     kind: str  # ok, http, redirect, network, too-large
@@ -110,21 +89,6 @@ class _Outcome:
     body: bytes = b""
     retry_after: str | None = None
     reason: str = ""
-
-
-def _origin(url: str) -> tuple[str, str, int | None]:
-    parts = urllib.parse.urlsplit(url)
-    return parts.scheme, (parts.hostname or "").lower(), parts.port
-
-
-def _retry_after(value: str | None) -> float:
-    try:
-        seconds = float(value) if value is not None else 1.0
-    except ValueError:
-        seconds = 1.0
-    if seconds != seconds:  # NaN
-        seconds = 1.0
-    return max(0.0, min(RETRY_AFTER_MAX_S, seconds))
 
 
 class UrllibGeminiTransport:
@@ -144,20 +108,19 @@ class UrllibGeminiTransport:
         self._key = api_key.strip()
         self.scrub = Scrubber(self._key)
         base = (base_url if base_url is not None else _GEMINI_BASE).rstrip("/")
-        scheme, host, _ = _origin(base)
-        parts = urllib.parse.urlsplit(base)
-        if scheme not in ("https", "http") or not host or parts.query or parts.fragment:
+        problem = base_url_problem(base)
+        if problem == "form":
             raise AnalyzeError("invalid-argument", "the Gemini base URL must be http(s)://host")
-        if scheme != "https" and host not in _LOOPBACK:
+        if problem == "https":
             raise AnalyzeError(
                 "invalid-argument", "a Gemini base URL that is not loopback must use https"
             )
         self.base = base
-        self._origin = _origin(base)
+        self._origin = origin(base)
         self.timeout_s = timeout_s
         self._sleep = sleep or time.sleep
         self._clock = clock or time.monotonic
-        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        self._opener = safe_opener()
 
     def __repr__(self) -> str:
         return f"UrllibGeminiTransport(base_url={self.base!r})"
@@ -175,7 +138,7 @@ class UrllibGeminiTransport:
             with self._opener.open(req, timeout=self.timeout_s) as resp:
                 body = resp.read(MAX_BODY + 1)
                 status, headers = resp.status, resp.headers
-        except _Redirect as redirect:
+        except RedirectRefused as redirect:
             return _Outcome("redirect", status=redirect.code)
         except urllib.error.HTTPError as exc:
             # Only the status, Retry-After and a short excerpt leave this block; the reason
@@ -203,10 +166,10 @@ class UrllibGeminiTransport:
         body: bytes | None = None,
         upload: Path | None = None,
     ) -> _Outcome:
-        if _origin(url) != self._origin:
+        if origin(url) != self._origin:
             raise self._error(
                 "gemini-bad-reply",
-                f"refusing a request to {_origin(url)[1] or 'an unknown host'}: not the API "
+                f"refusing a request to {origin(url)[1] or 'an unknown host'}: not the API "
                 "host (the key is only ever sent to the base URL's host)",
             )
         where = self._where(url)
@@ -227,8 +190,12 @@ class UrllibGeminiTransport:
                     handle.close()
             if outcome.kind == "ok":
                 return outcome
-            if outcome.kind == "http" and outcome.status in _RETRIED and attempt < MAX_RETRIES:
-                self._sleep(_retry_after(outcome.retry_after))
+            if (
+                outcome.kind == "http"
+                and outcome.status in RETRIED_STATUSES
+                and attempt < MAX_RETRIES
+            ):
+                self._sleep(retry_after_s(outcome.retry_after))
                 continue
             break
         raise self._failure(method, where, outcome)
@@ -251,7 +218,7 @@ class UrllibGeminiTransport:
                 hint="check the network; nothing was retried",
             )
         excerpt = " ".join(outcome.body.decode("utf-8", errors="replace").split())[:_EXCERPT]
-        retried = " after 2 retries" if outcome.status in _RETRIED else ""
+        retried = " after 2 retries" if outcome.status in RETRIED_STATUSES else ""
         return self._error(
             "gemini-http", f"{method} {where}: HTTP {outcome.status}{retried}: {excerpt}"
         )
