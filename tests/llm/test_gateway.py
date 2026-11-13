@@ -10,6 +10,7 @@ import http.client
 import json
 import logging
 import os
+import re
 import threading
 import time
 import traceback
@@ -21,7 +22,7 @@ from typing import Any
 import pytest
 from gemini_stub import Stub, carries_key
 
-from aar.httpsafe import NoRedirectHandler, safe_opener
+from aar.httpsafe import REDACTED, NoRedirectHandler, Scrubber, safe_opener
 from aar.hub.lesson_drafts import (
     DEFAULT_LESSONS_MODEL,
     ReviewFeedback,
@@ -45,7 +46,23 @@ from aar.llm.gateway import (
 #: URL-encoding changes ``+``, ``/`` and ``=``, so the raw and the quoted forms differ.
 KEY = "gw-test+key/0000=="
 QUOTED = urllib.parse.quote(KEY, safe="")
-FORMS = (KEY, QUOTED, urllib.parse.quote_plus(KEY))
+
+
+def lower_hex(text: str) -> str:
+    """``text`` with the hex digits of each ``%XX`` escape in lower case."""
+    return re.sub(r"%[0-9A-F]{2}", lambda escape: escape.group().lower(), text)
+
+
+#: Every form the scrubber claims: raw, the three URL encodings Python writes (``quote`` keeps
+#: ``/`` by default), and lower-case hex escapes, which mean the same bytes.
+FORMS = (
+    KEY,
+    QUOTED,
+    urllib.parse.quote_plus(KEY),
+    urllib.parse.quote(KEY),
+    lower_hex(QUOTED),
+    lower_hex(urllib.parse.quote(KEY)),
+)
 CHAT = ("POST", CHAT_PATH)
 MESSAGES = [
     {"role": "system", "content": "Answer in one word."},
@@ -166,8 +183,9 @@ def test_model_and_usage_are_optional(stub):
 
 def test_a_reply_of_exactly_1_mib_is_read_whole(stub):
     data = json.dumps(completion("Big.")).encode()
-    stub.routes[CHAT] = answer((200, data + b" " * (MAX_BODY - len(data)), {}))
+    stub.routes[CHAT] = answer((200, data + b" " * (1024 * 1024 - len(data)), {}))
     assert ask(client(stub)).text == "Big."
+    assert MAX_BODY == 1_048_576
 
 
 def test_an_injected_safe_opener_is_used(stub):
@@ -231,7 +249,17 @@ def test_a_refused_model_list_is_its_status_and_names_the_get(stub):
 
 
 @pytest.mark.parametrize(
-    ("retry_after", "slept"), [("2.5", 2.5), ("100", 30.0), ("soon", 1.0), (None, 1.0), ("-3", 0.0)]
+    ("retry_after", "slept"),
+    [
+        ("2.5", 2.5),
+        ("100", 30.0),
+        ("soon", 1.0),
+        (None, 1.0),
+        ("-3", 0.0),
+        ("nan", 1.0),
+        ("NaN", 1.0),
+        ("inf", 30.0),
+    ],
 )
 def test_a_429_is_retried_after_its_bounded_retry_after(stub, retry_after, slept):
     headers = {} if retry_after is None else {"Retry-After": retry_after}
@@ -281,8 +309,9 @@ def test_a_redirect_is_refused_and_the_key_goes_nowhere_else(stub, status, locat
 
 
 def test_a_reply_over_1_mib_is_refused(stub):
-    stub.routes[CHAT] = answer((200, b"x" * (MAX_BODY + 1), {}))
-    assert failure(client(stub)).code == "too-large"
+    stub.routes[CHAT] = answer((200, b"x" * (1024 * 1024 + 1), {}))
+    error = failure(client(stub))
+    assert error.code == "too-large" and "over 1048576 bytes" in error.message
 
 
 def _deep() -> bytes:
@@ -400,6 +429,10 @@ def test_https_or_a_loopback_base_is_accepted(base):
         "http://127.0.0.1:port",
         f"https://gw.example.invalid/{KEY}",  # the key goes in the header and nowhere else
         f"https://gw.example.invalid/?{QUOTED}",
+        *(f"https://gw.example.invalid/prefix/{form}" for form in FORMS),
+        f"http://127.0.0.1:8317/{urllib.parse.quote(KEY)}",  # quote() keeps "/"
+        f"http://127.0.0.1:8317/{lower_hex(QUOTED)}",
+        "http://127.0.0.1:8317/gw-test%2Bkey%2f0000%3d%3D",  # escapes in mixed case
     ],
 )
 def test_a_refused_base_url_is_an_origin_error(base):
@@ -483,7 +516,7 @@ def echo(status: int) -> Any:
 
     def route(stub: Stub, handler: Any) -> None:
         headers = dict(handler.headers.items())
-        body = {"raw": KEY, "quoted": QUOTED, "echo": headers}
+        body = {"forms": list(FORMS), "echo": headers}
         stub.reply(handler, status, body, reason=f"denied for {headers.get('Authorization')}")
 
     return route
@@ -520,10 +553,59 @@ def test_the_key_never_leaks_from_a_transport_failure_that_quotes_the_request(st
 
 
 def test_the_key_never_leaks_from_a_hostile_reply(stub):
-    stub.routes[CHAT] = answer((200, completion(f"Echo {KEY} {QUOTED}", model=f"m-{KEY}"), {}))
+    stub.routes[CHAT] = answer((200, completion(f"Echo {' '.join(FORMS)}", model=f"m-{KEY}"), {}))
     reply = ask(client(stub))
-    assert reply.text == "Echo [redacted] [redacted]" and reply.model == "m-[redacted]"
+    assert reply.text == "Echo" + f" {REDACTED}" * len(FORMS) and reply.model == "m-[redacted]"
     assert_no_key(repr(reply))
+
+
+@pytest.mark.parametrize("status", [400, 401, 500])
+def test_every_form_of_the_key_in_an_error_body_is_scrubbed(stub, status):
+    stub.routes[CHAT] = answer(
+        (status, {name: form for name, form in enumerate(map(str, FORMS))}, {})
+    )
+    error = failure(client(stub))
+    assert error.message.count(REDACTED) >= len(FORMS)
+    assert_no_key(*exception_texts(error), error.hint)
+
+
+def test_the_scrubber_matches_escapes_in_either_case_and_nothing_else():
+    scrub = Scrubber("Ab+c/=")
+    for form in (
+        "Ab+c/=",
+        "Ab%2Bc%2F%3D",
+        "Ab%2Bc/%3D",
+        "Ab%2bc%2f%3d",
+        "Ab%2Bc%2f%3D",
+        "Ab%2bc/%3d",
+    ):
+        assert scrub(f"<{form}>") == f"<{REDACTED}>", form
+    for other in ("ab+c/=", "AB%2BC%2F%3D", "Ab%2Bc", "Ab+c/"):  # not the key: left alone
+        assert scrub(other) == other
+    assert Scrubber("")("text") == "text"
+
+
+def test_proxy_environment_variables_are_ignored(stub, monkeypatch):
+    """Every proxy variable points at a second stub, which must receive nothing."""
+    proxy = Stub(key=KEY)
+    try:
+        for name in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy"):
+            monkeypatch.setenv(name, proxy.base)
+        monkeypatch.setenv("ALL_PROXY", proxy.base)
+        monkeypatch.delenv("no_proxy", raising=False)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        # The variables do route urllib's own opener through the proxy here.
+        with pytest.raises(urllib.error.HTTPError):
+            urllib.request.build_opener().open(stub.base + "/through-the-proxy", timeout=5)
+        assert [request["path"] for request in proxy.requests] == ["/through-the-proxy"]
+        proxy.requests.clear()
+        stub.routes[MODELS] = answer((200, {"data": [{"id": "test-model"}]}, {}))
+        stub.routes[CHAT] = answer((200, completion(), {}))
+        gateway = gateway_from_env({KEY_ENV: KEY, BASE_ENV: stub.base})
+        assert gateway.models() == ("test-model",) and ask(gateway).text == "Ready."
+        assert proxy.requests == [] and len(stub.requests) == 2
+    finally:
+        proxy.close()
 
 
 @pytest.mark.parametrize("before", [b"x" * 290, b"x" + b" " * 2040])

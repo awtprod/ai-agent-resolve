@@ -10,15 +10,22 @@ can never break a header line.
 
 - The key is sent only in the ``Authorization`` header, and only to the base URL's own scheme,
   host and port. A base that is not loopback must use https. A base may not carry a user name,
-  a query, a fragment or the key.
+  a query, a fragment or the key (in any form the scrubber knows).
 - No redirect is followed (every 3xx is the error ``redirect``), and proxy environment
   variables are ignored. An opener handed in must be as safe as ``httpsafe.safe_opener()``.
-- The key, raw and URL-encoded, is scrubbed from every error message and hint, every log line,
-  the reply's text and model, and the client's repr. Errors are raised outside the ``except``
-  block that caught a transport failure, so no exception chain carries the request.
-- One attempt gets ``timeout_s``: it is the socket timeout, and also a deadline on ``clock`` for
-  the whole reply, which is read one socket read at a time, so a server that trickles bytes
-  cannot hold it open. The reply body is capped at 1 MiB.
+- The key is scrubbed from every error message and hint, every log line, the reply's text and
+  model, and the client's repr: raw, and URL-encoded as ``quote(key, safe="")``, ``quote(key)``
+  and ``quote_plus(key)``, the hex digits of each ``%XX`` in either case (``httpsafe.Scrubber``).
+  Errors are raised outside the ``except`` block that caught a transport failure, so no
+  exception chain carries the request.
+- What ``timeout_s`` bounds, exactly: each socket operation (the connect, each send, each read)
+  waits at most ``timeout_s``; and the reply body (or an error reply's excerpt) is read one
+  socket read at a time against a deadline ``timeout_s`` after the attempt started, on
+  ``clock``, so a server that trickles the body cannot hold an attempt open. The status line
+  and the headers are read by ``http.client`` before that, bounded only per socket read: a
+  server that sends them a byte at a time, each inside ``timeout_s``, can hold an attempt open
+  for as long as it likes. No thread enforces a total; the caller bounds the whole run (the
+  lessons timer's unit has ``TimeoutStartSec``). The reply body is capped at 1 MiB.
 - 429 and 503 are retried at most twice, waiting ``Retry-After`` seconds bounded to 30 (1 s when
   absent or not a number). Nothing else is retried.
 
@@ -55,13 +62,14 @@ from typing import Any
 from aar.httpsafe import (
     MAX_RETRIES,
     RETRIED_STATUSES,
+    Outcome,
     RedirectRefused,
     Scrubber,
     base_url_problem,
     opener_problem,
     origin,
-    retry_after_s,
     safe_opener,
+    send_with_retries,
 )
 
 BASE_ENV = "AAR_LLM_BASE_URL"
@@ -99,15 +107,6 @@ class ChatReply:
     text: str
     model: str | None = None
     usage: Mapping[str, int] = field(default_factory=dict)
-
-
-@dataclass
-class _Outcome:
-    kind: str  # ok, http, redirect, timeout, network, too-large
-    status: int = 0
-    body: bytes = b""
-    retry_after: str | None = None
-    reason: str = ""
 
 
 class GatewayClient:
@@ -221,10 +220,10 @@ class GatewayClient:
     def _error(self, code: str, message: str, hint: str = "") -> GatewayError:
         return GatewayError(code, self.scrub(message), self.scrub(hint))
 
-    def _post(self, url: str, data: bytes) -> _Outcome:
+    def _post(self, url: str, data: bytes) -> Outcome:
         return self._request("POST", url, data)
 
-    def _request(self, method: str, url: str, data: bytes | None) -> _Outcome:
+    def _request(self, method: str, url: str, data: bytes | None) -> Outcome:
         if origin(url) != self._origin:
             raise self._error(
                 "origin",
@@ -232,7 +231,8 @@ class GatewayClient:
                 "ever sent to the gateway's own scheme, host and port",
             )
         path = self.scrub(urllib.parse.urlsplit(url).path)
-        for attempt in range(MAX_RETRIES + 1):
+
+        def attempt() -> Outcome:
             request = urllib.request.Request(url, data=data, method=method)
             request.add_header("Authorization", f"Bearer {self._key}")
             if data is not None:
@@ -248,35 +248,31 @@ class GatewayClient:
                 outcome.status or "none",
                 self._clock() - started,
             )
-            if (
-                outcome.kind == "http"
-                and outcome.status in RETRIED_STATUSES
-                and attempt < MAX_RETRIES
-            ):
-                wait = retry_after_s(outcome.retry_after)
-                _log.warning(
-                    "gateway %s %s: HTTP %d, retry %d of %d in %g s",
-                    method,
-                    path,
-                    outcome.status,
-                    attempt + 1,
-                    MAX_RETRIES,
-                    wait,
-                )
-                self._sleep(wait)
-                continue
-            break
+            return outcome
+
+        def retrying(outcome: Outcome, number: int, wait: float) -> None:
+            _log.warning(
+                "gateway %s %s: HTTP %d, retry %d of %d in %g s",
+                method,
+                path,
+                outcome.status,
+                number,
+                MAX_RETRIES,
+                wait,
+            )
+
+        outcome = send_with_retries(attempt, self._sleep, retrying)
         if outcome.kind != "ok":
             raise self._failure(f"{method} {path}", outcome)
         return outcome
 
-    def _send(self, request: urllib.request.Request, deadline: float) -> _Outcome:
+    def _send(self, request: urllib.request.Request, deadline: float) -> Outcome:
         try:
             with self._opener.open(request, timeout=self.timeout_s) as response:
                 status = response.status
                 body, state = self._read(response, deadline, MAX_BODY)
         except RedirectRefused as redirect:
-            return _Outcome("redirect", status=redirect.code)
+            return Outcome("redirect", status=redirect.code)
         except urllib.error.HTTPError as exc:
             # Only the status, Retry-After and a short excerpt leave this block; the reason
             # phrase and the response object (which a hostile server can fill) do not.
@@ -284,17 +280,17 @@ class GatewayClient:
             retry = exc.headers.get("Retry-After") if exc.headers is not None else None
             exc.close()
             kind = "redirect" if 300 <= exc.code < 400 else "http"
-            return _Outcome(kind, status=exc.code, body=excerpt, retry_after=retry)
+            return Outcome(kind, status=exc.code, body=excerpt, retry_after=retry)
         except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
             reason = getattr(exc, "reason", None)
             late = isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError)
             detail = f"{type(exc).__name__}: {reason or exc}"
-            return _Outcome("timeout" if late else "network", reason=detail)
+            return Outcome("timeout" if late else "network", reason=detail)
         if state == "more":
-            return _Outcome("too-large", status=status)
+            return Outcome("too-large", status=status)
         if state == "late":
-            return _Outcome("timeout", status=status)
-        return _Outcome("ok", status=status, body=body)
+            return Outcome("timeout", status=status)
+        return Outcome("ok", status=status, body=body)
 
     def _read(self, stream: Any, deadline: float, limit: int) -> tuple[bytes, str]:
         """Up to ``limit + 1`` bytes, one socket read at a time, so a server that trickles
@@ -323,7 +319,7 @@ class GatewayClient:
             return b""
         return data if state in ("ok", "more") else b""
 
-    def _failure(self, where: str, outcome: _Outcome) -> GatewayError:
+    def _failure(self, where: str, outcome: Outcome) -> GatewayError:
         if outcome.kind == "redirect":
             return self._error(
                 "redirect",

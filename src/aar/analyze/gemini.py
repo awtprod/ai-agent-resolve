@@ -40,15 +40,15 @@ from typing import Any, Protocol
 
 from aar.analyze.errors import AnalyzeError
 from aar.httpsafe import (
-    MAX_RETRIES,
     REDACTED,
     RETRIED_STATUSES,
+    Outcome,
     RedirectRefused,
     Scrubber,
     base_url_problem,
     origin,
-    retry_after_s,
     safe_opener,
+    send_with_retries,
 )
 
 KEY_ENV = "AAR_GEMINI_API_KEY"
@@ -79,16 +79,6 @@ class GeminiTransport(Protocol):
     ) -> dict[str, Any]: ...
 
     def delete(self, ref: FileRef) -> None: ...
-
-
-@dataclass
-class _Outcome:
-    kind: str  # ok, http, redirect, network, too-large
-    status: int = 0
-    headers: Any = None
-    body: bytes = b""
-    retry_after: str | None = None
-    reason: str = ""
 
 
 class UrllibGeminiTransport:
@@ -133,13 +123,13 @@ class UrllibGeminiTransport:
     def _error(self, kind: str, message: str, hint: str = "") -> AnalyzeError:
         return AnalyzeError(kind, self.scrub(message), hint=self.scrub(hint))
 
-    def _send(self, req: urllib.request.Request) -> _Outcome:
+    def _send(self, req: urllib.request.Request) -> Outcome:
         try:
             with self._opener.open(req, timeout=self.timeout_s) as resp:
                 body = resp.read(MAX_BODY + 1)
                 status, headers = resp.status, resp.headers
         except RedirectRefused as redirect:
-            return _Outcome("redirect", status=redirect.code)
+            return Outcome("redirect", status=redirect.code)
         except urllib.error.HTTPError as exc:
             # Only the status, Retry-After and a short excerpt leave this block; the reason
             # phrase and the response object (which a hostile server can fill) do not.
@@ -149,13 +139,13 @@ class UrllibGeminiTransport:
                 excerpt = b""
             retry = exc.headers.get("Retry-After") if exc.headers is not None else None
             exc.close()
-            return _Outcome("http", status=exc.code, body=excerpt, retry_after=retry)
+            return Outcome("http", status=exc.code, body=excerpt, retry_after=retry)
         except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
             reason = getattr(exc, "reason", None)
-            return _Outcome("network", reason=f"{type(exc).__name__}: {reason or exc}")
+            return Outcome("network", reason=f"{type(exc).__name__}: {reason or exc}")
         if len(body) > MAX_BODY:
-            return _Outcome("too-large", status=status)
-        return _Outcome("ok", status=status, headers=headers, body=body)
+            return Outcome("too-large", status=status)
+        return Outcome("ok", status=status, headers=headers, body=body)
 
     def _request(
         self,
@@ -165,7 +155,7 @@ class UrllibGeminiTransport:
         headers: dict[str, str] | None = None,
         body: bytes | None = None,
         upload: Path | None = None,
-    ) -> _Outcome:
+    ) -> Outcome:
         if origin(url) != self._origin:
             raise self._error(
                 "gemini-bad-reply",
@@ -173,7 +163,8 @@ class UrllibGeminiTransport:
                 "host (the key is only ever sent to the base URL's host)",
             )
         where = self._where(url)
-        for attempt in range(MAX_RETRIES + 1):
+
+        def attempt() -> Outcome:
             data: Any = body
             handle = None
             if upload is not None:
@@ -184,23 +175,17 @@ class UrllibGeminiTransport:
                 req.add_header("x-goog-api-key", self._key)
                 for name, value in (headers or {}).items():
                     req.add_header(name, value)
-                outcome = self._send(req)
+                return self._send(req)
             finally:
                 if handle is not None:
                     handle.close()
-            if outcome.kind == "ok":
-                return outcome
-            if (
-                outcome.kind == "http"
-                and outcome.status in RETRIED_STATUSES
-                and attempt < MAX_RETRIES
-            ):
-                self._sleep(retry_after_s(outcome.retry_after))
-                continue
-            break
+
+        outcome = send_with_retries(attempt, self._sleep)
+        if outcome.kind == "ok":
+            return outcome
         raise self._failure(method, where, outcome)
 
-    def _failure(self, method: str, where: str, outcome: _Outcome) -> AnalyzeError:
+    def _failure(self, method: str, where: str, outcome: Outcome) -> AnalyzeError:
         if outcome.kind == "redirect":
             return self._error(
                 "gemini-redirect",
@@ -223,7 +208,7 @@ class UrllibGeminiTransport:
             "gemini-http", f"{method} {where}: HTTP {outcome.status}{retried}: {excerpt}"
         )
 
-    def _json(self, outcome: _Outcome, what: str) -> dict[str, Any]:
+    def _json(self, outcome: Outcome, what: str) -> dict[str, Any]:
         data: Any = _NOT_JSON
         # Raised below, outside any handler: a JSONDecodeError carries the whole reply text.
         with contextlib.suppress(UnicodeDecodeError, json.JSONDecodeError):
