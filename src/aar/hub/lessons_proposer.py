@@ -530,6 +530,27 @@ def _gateway_stop(
     }
 
 
+def _lock_unavailable(path: str, error: OSError) -> dict[str, Any]:
+    """The stop when the pass lock cannot be taken. When the lock file is there but could not be
+    opened (``os.open`` names the file in its error; a failed ``flock`` names none), the hint
+    points at the file's owner and mode rather than at the folder."""
+    if error.filename is not None and os.path.lexists(path):
+        hint = (
+            f"The lock file {path} exists but this user cannot open it for writing: check its "
+            "owner and mode. It must be a regular file, not a symlink, that the service user "
+            "can write. Nothing was done."
+        )
+    else:
+        hint = "The database's folder must be writable by this user. Nothing was done."
+    return {
+        "reason": "setup",
+        "code": "lock_unavailable",
+        "message": "cannot take the pass lock beside the database: "
+        f"{error.strerror or type(error).__name__}",
+        "hint": hint,
+    }
+
+
 # -- the pass ------------------------------------------------------------------------------------
 
 
@@ -555,13 +576,7 @@ def propose_from_reviews(
     try:
         lock = _PassLock.take(log.path)
     except OSError as error:
-        report.stopped = {
-            "reason": "setup",
-            "code": "lock_unavailable",
-            "message": "cannot take the pass lock beside the database: "
-            f"{error.strerror or type(error).__name__}",
-            "hint": "The database's folder must be writable by this user. Nothing was done.",
-        }
+        report.stopped = _lock_unavailable(log.path + LOCK_SUFFIX, error)
     else:
         with lock:
             if lock.held:

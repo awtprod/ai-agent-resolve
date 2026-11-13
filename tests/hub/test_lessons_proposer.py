@@ -1092,6 +1092,8 @@ def test_a_lock_path_that_is_a_symlink_is_not_followed(hub: Hub, tmp_path: Path)
 
     assert report.stopped is not None and report.stopped["code"] == "lock_unavailable"
     assert not elsewhere.exists()  # nothing was created through the link
+    assert f"The lock file {lock_path(hub)} exists" in report.stopped["hint"]
+    assert "not a symlink" in report.stopped["hint"]
 
 
 def test_without_fcntl_a_pass_runs_without_the_lock(
@@ -1117,6 +1119,38 @@ def test_a_lock_file_that_cannot_be_opened_stops_the_pass(hub: Hub) -> None:
     assert report.failed and report.stopped is not None
     assert (report.stopped["reason"], report.stopped["code"]) == ("setup", "lock_unavailable")
     assert silent.model_reads == 0 and report.reviews == []
+    assert f"The lock file {lock_path(hub)} exists" in report.stopped["hint"]
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="file modes do not bind root"
+)
+@pytest.mark.parametrize("cause", ["the file's mode", "the folder's mode"])
+def test_the_lock_hint_names_the_file_or_the_folder_whichever_is_at_fault(
+    hub: Hub, cause: str
+) -> None:
+    pytest.importorskip("fcntl")
+    review(hub)
+    folder = lock_path(hub).parent
+    mode = stat.S_IMODE(folder.stat().st_mode)
+    if cause == "the file's mode":
+        lock_path(hub).touch(mode=0o400)  # left by another user, say: there, but not writable
+    else:
+        folder.chmod(0o555)  # no lock file yet, and none can be made
+    try:
+        report = run(hub, FakeClient(served=AssertionError("the pass must not ask")))
+    finally:
+        folder.chmod(mode)
+
+    assert report.stopped is not None and report.stopped["code"] == "lock_unavailable"
+    hint = report.stopped["hint"]
+    if cause == "the file's mode":
+        assert hint.startswith(f"The lock file {lock_path(hub)} exists but this user cannot open")
+        assert "check its owner and mode" in hint and "the service user can write" in hint
+        assert "folder" not in hint
+    else:
+        assert hint == "The database's folder must be writable by this user. Nothing was done."
+        assert not lock_path(hub).exists()
 
 
 @pytest.mark.parametrize(
