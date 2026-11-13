@@ -363,9 +363,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     project_rename.add_argument("--idempotency-key", required=True)
     project_rename.set_defaults(func=_project_rename)
 
-    from aar.hub import write_cli
+    from aar.hub import lessons_cli, write_cli
 
     write_cli.register(hub_sub)
+    lessons_cli.register(hub_sub)
 
 
 def _add_db(parser: argparse.ArgumentParser) -> None:

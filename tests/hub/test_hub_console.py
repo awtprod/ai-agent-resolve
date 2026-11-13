@@ -16,10 +16,10 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from aar.cli import main
-from aar.hub import approvals, control, reviews
+from aar.hub import approvals, control, lessons, project_register, reviews
 from aar.hub.artifacts import ArtifactStore
 from aar.hub.common import HumanRequired
-from aar.hub.console import WRITE_ROUTES, ConsoleConfig, CsrfSigner, build_app
+from aar.hub.console import WRITE_ROUTES, ConsoleConfig, CsrfSigner, build_app, esc, url
 from aar.hub.events import Actor, EventLog
 from aar.hub.graph import WorkGraph
 from aar.hub.leaseboard import record_lease_event
@@ -106,11 +106,16 @@ def test_agent_strings_render_escaped_on_every_page(hub: Hub) -> None:
     offset = clock_now.timestamp() - 100.0
     for event in manager_events:
         record_lease_event(hub.log, event, "node-1", wall_offset=offset)
+    # S23a: an agent's lesson text and its why, and an accepted lesson's text.
+    source = (hub.project, hub.xss_review)
+    lessons.propose(hub.log, XSS, "global", AGENT, why=XSS, source=source)
+    lessons.add(hub.log, XSS, f"project:{hub.project}", HUMAN)
 
     client = hub.client()
     pages = [
         "/",
         f"/reviews/{hub.project}/{hub.xss_review}",
+        "/lessons",
         "/leases",
         "/approvals",
         "/control",
@@ -127,6 +132,38 @@ def test_agent_strings_render_escaped_on_every_page(hub: Hub) -> None:
         )
         assert nonce is not None
         assert body.count("<script") == body.count(f'<script nonce="{nonce.group(1)}"') == 1
+
+
+def test_a_project_name_with_a_lone_surrogate_cannot_break_a_page(hub: Hub) -> None:
+    """Validator probe P9 (on dev already for /control, the emergency stop): an agent can register
+    a project whose name holds a lone surrogate (``project_register`` over MCP, or a CLI argument
+    byte that is not UTF-8), and no page holding it could be encoded. Pages show U+FFFD instead."""
+    name = "Synthetic Show \udcff"
+    made = project_register.register_project(hub.log, AGENT, name=name, idempotency_key="sur-1")
+    project_id = made.project_id
+    stored = Registry(hub.log).get(project_id)
+    assert stored is not None and stored.name == name  # stored as sent: fixed where it renders
+    op = WorkGraph(hub.log, project_id).add_node("op", AGENT, title="build").id
+    render = hub.store.put(RENDER, actor=AGENT, mime="video/mp4", project_id=project_id)
+    reviews.request_review(hub.log, hub.store, project_id, op, [render], AGENT, title="cut v1")
+    lessons.add(hub.log, "Hold the wide shot on a laugh.", f"project:{project_id}", HUMAN)
+    shown = "Synthetic Show \ufffd"
+    for client, pages in (
+        (hub.client(), ("/", "/lessons", "/control")),
+        (hub.client(ConsoleConfig(operator=None, csrf_secret=SECRET)), ("/", "/lessons")),
+    ):
+        for path in pages:
+            response = client.get(path)
+            assert response.status_code == 200, path
+            assert shown in response.text, path
+        assert client.get("/control").status_code == 200
+
+
+def test_esc_and_url_replace_a_lone_surrogate() -> None:
+    assert esc('a\ud800"b\udfff') == "a\ufffd&quot;b\ufffd"
+    assert url("reviews", "prj\udcff", "rev_1") == "/reviews/prj%EF%BF%BD/rev_1"
+    assert url("jobs", state="a\udcffb") == "/jobs?state=a%EF%BF%BDb"
+    assert esc("été \U0001f600") == "été \U0001f600"  # a real non-ASCII character stays
 
 
 def test_flash_codes_are_not_reflected(hub: Hub) -> None:
@@ -148,14 +185,18 @@ def test_every_write_route_is_post_only_and_get_is_rejected(hub: Hub) -> None:
     for route in app.routes:
         if isinstance(route, Route) and route.path in posts:
             assert route.methods == {"POST"}
+    lesson = lessons.propose(hub.log, "Keep the setup with its punchline.", "global", AGENT)
     before = hub.log.latest_seq()
     for path in WRITE_ROUTES:
-        concrete = path.format(project_id=hub.project, review_id=hub.plain_review)
+        concrete = path.format(
+            project_id=hub.project, review_id=hub.plain_review, lesson_id=lesson.id
+        )
         response = client.get(concrete, params={"decision": "approve", "reason": "x"})
         assert response.status_code == 405, concrete
         assert "POST" in response.headers["allow"]
     # And no read page writes anything either.
-    for path in ("/", "/leases", "/approvals", "/control", f"/artifacts/{hub.render}"):
+    reads = ("/", "/lessons", "/leases", "/approvals", "/control", f"/artifacts/{hub.render}")
+    for path in reads:
         assert client.get(path).status_code == 200
     assert hub.log.latest_seq() == before
 

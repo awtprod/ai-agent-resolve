@@ -2,7 +2,9 @@
 
 DESIGN R5 gives humans four things: a review queue (render plus timecoded notes),
 approve or reject, a board of who holds what, and an emergency stop. This is that
-console, plus the approval tokens of DESIGN section 5. It is a small Starlette app
+console, plus the approval tokens of DESIGN section 5 and the lessons from reviews
+(S23a: a person accepts, drops, retires and adds the one-line rules later cut guides
+print; agents only propose). It is a small Starlette app
 that renders HTML on the server, with inline CSS and a few lines of inline script
 (seek the player to a note), and works at phone width.
 
@@ -66,7 +68,7 @@ from starlette.responses import (
 from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from aar.hub import approvals, control, jobs, reviews
+from aar.hub import approvals, control, jobs, lessons, reviews
 from aar.hub.artifacts import ArtifactStore, CorruptArtifact
 from aar.hub.common import (
     MAX_SKIPPED_LISTED,
@@ -81,6 +83,8 @@ from aar.hub.common import (
 from aar.hub.events import Actor, EventLog, IdempotencyConflict
 from aar.hub.leaseboard import LeaseBoard, lease_board
 from aar.hub.registry import Registry
+from aar.hub.writes import WriteError
+from aar.plan.profile import builtin_profile_names
 
 logger = logging.getLogger("aar.hub.console")
 
@@ -135,7 +139,21 @@ _FLASH = {
     "revoked": "Token revoked.",
     "stopped": "Emergency stop engaged.",
     "resumed": "Resumed.",
+    "lesson_accepted": "Lesson accepted. Cut guides built from now on include it.",
+    "lesson_dropped": "Proposal dropped.",
+    "lesson_retired": "Lesson retired. Cut guides built from now on leave it out.",
+    "lesson_added": "Lesson added. Cut guides built from now on include it.",
 }
+
+#: The HTTP status of a refused lessons write, by its ``WriteError`` code; any other code is 409.
+_WRITE_ERROR_STATUS = {
+    "unknown_lesson": 404,
+    "invalid_input": 422,
+    "unknown_profile": 422,
+    "unknown_project": 422,
+}
+#: Proposals shown on one lessons page (oldest first); the rest wait for these to be decided.
+MAX_PROPOSALS_SHOWN = 25
 
 
 # -- HTML: escaping is the default ------------------------------------------
@@ -147,11 +165,24 @@ class Html(str):
     __slots__ = ()
 
 
+#: A lone surrogate (U+D800-U+DFFF) cannot be encoded as UTF-8, and stored text can hold one: a
+#: JSON ``\udcff`` escape, or a CLI argument byte that is not UTF-8 (a project name registered
+#: that way made /control and /lessons answer 500). Every value is rendered through :func:`esc`
+#: or :func:`url`, which replace each with U+FFFD, so stored data cannot break a page.
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
+
+
+def _encodable(text: str) -> str:
+    """``text`` with each lone surrogate replaced by U+FFFD (the replacement character)."""
+    return _SURROGATE.sub("\ufffd", text)
+
+
 def esc(value: object) -> Html:
-    """Escape ``value`` for HTML text or a quoted attribute, unless it is already :class:`Html`."""
+    """Escape ``value`` for HTML text or a quoted attribute, unless it is already :class:`Html`.
+    A lone surrogate, which no page could encode, becomes U+FFFD."""
     if isinstance(value, Html):
         return value
-    return Html(html.escape("" if value is None else str(value), quote=True))
+    return Html(_encodable(html.escape("" if value is None else str(value), quote=True)))
 
 
 def fmt(template: str, **values: object) -> Html:
@@ -165,10 +196,13 @@ def join(parts: list[Html] | Iterator[Html]) -> Html:
 
 
 def url(*segments: str, **query: str) -> str:
-    """Build a same-origin path; each segment is percent-encoded so ids cannot add paths."""
-    path = "/" + "/".join(quote(segment, safe="") for segment in segments)
+    """Build a same-origin path; each segment is percent-encoded so ids cannot add paths (and a
+    lone surrogate, which ``quote`` cannot encode, becomes U+FFFD first)."""
+    path = "/" + "/".join(quote(_encodable(segment), safe="") for segment in segments)
     if query:
-        path += "?" + "&".join(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in query.items())
+        path += "?" + "&".join(
+            f"{quote(k, safe='')}={quote(_encodable(v), safe='')}" for k, v in query.items()
+        )
     return path
 
 
@@ -421,6 +455,9 @@ def _map_error(exc: BaseException) -> ConsoleError | None:
         return ConsoleError(
             409, "form_reused", str(exc), "Reload the page and submit the fresh form."
         )
+    if isinstance(exc, WriteError):
+        status = _WRITE_ERROR_STATUS.get(exc.code, 409)
+        return ConsoleError(status, exc.code, exc.message, exc.fix_hint)
     if isinstance(exc, InvalidInput):
         return ConsoleError(422, "invalid_input", str(exc))
     return None
@@ -525,6 +562,16 @@ table.board{width:100%;border-collapse:collapse;font-size:.92rem}
 table.board th,table.board td{text-align:left;padding:.45rem .5rem;
 border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:break-word}
 table.board th{font-size:.78rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+h2.section-title{margin:1.5rem 0 .6rem}
+section.card>h3:first-child{margin:0 0 .2rem;padding-bottom:.45rem;
+border-bottom:1px solid var(--line)}
+.lesson-text{font-weight:600;overflow-wrap:anywhere;margin:.2rem 0 .3rem}
+.why{overflow-wrap:anywhere;margin:.4rem 0}
+ul.lessons{list-style:none;padding:0;margin:.2rem 0 0}
+ul.lessons li{padding:.6rem 0;border-top:1px solid var(--line)}
+ul.lessons li:first-child{border-top:0}
+form.retire{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.45rem}
+form.retire input{flex:1 1 14rem;width:auto}
 @media (prefers-color-scheme:dark){
 :root{--bg:#121316;--fg:#e8e6e1;--muted:#a6a49e;--line:#34363c;--card:#1b1d22;--info:#8ab4ff}
 textarea,input,select{background:#121316;color:var(--fg);border-color:#4a4d55}
@@ -581,7 +628,7 @@ def _when(ts: str | None, *, short: bool = False) -> str:
         return "-"
     try:
         return parse_ts(ts).strftime("%m-%d %H:%M UTC" if short else "%Y-%m-%d %H:%M:%S UTC")
-    except ValueError:
+    except (ValueError, OverflowError):  # an offset can push a valid date past year 1 or 9999
         return ts
 
 
@@ -803,6 +850,7 @@ class Console:
             )
             for key, href, label in (
                 ("reviews", "/", "Reviews"),
+                ("lessons", "/lessons", self.lessons_label()),
                 ("jobs", "/jobs", "Jobs"),
                 ("leases", "/leases", "Leases"),
                 ("approvals", "/approvals", "Approvals"),
@@ -849,6 +897,17 @@ class Console:
         # nosniff, X-Frame-Options, Referrer-Policy and no-store come from
         # SecurityHeaders, which covers every response; a page adds its nonce CSP.
         return HTMLResponse(document, status_code=status, headers={"Content-Security-Policy": csp})
+
+    def lessons_label(self) -> str:
+        """``Lessons``, with the number of proposals waiting for a person when there are any:
+        the nav is how the owner learns that proposals exist."""
+        try:
+            found, _ = lessons.scan_lessons(self.log)
+        except Exception:
+            _log_failure("counting the lesson proposals for the nav")
+            return "Lessons (?)"
+        waiting = sum(1 for lesson in found if lesson.state == "proposed")
+        return f"Lessons ({waiting})" if waiting else "Lessons"
 
     def error_response(self, request: Request, error: ConsoleError) -> Response:
         if _wants_json(request):
@@ -1492,6 +1551,266 @@ class Console:
             inactive=inactive_html,
         )
 
+    # -- lessons -------------------------------------------------------------------
+
+    @staticmethod
+    def scope_label(scope: str, names: dict[str, str]) -> str:
+        """What a lesson scope means, in the words a person reads in a select or a heading. A
+        project always shows its id after its name: two names can look the same (one may hold an
+        invisible character), and the id tells them apart."""
+        kind, _, name = scope.partition(":")
+        if scope == lessons.GLOBAL:
+            return "Global (every show)"
+        if kind == "client":
+            return f"Client: {name} (every show whose brief uses the {name} rule profile)"
+        if kind == "project":
+            if name in names:
+                return f"Project: {names[name]} ({name})"
+            return f"Project: {name} (not registered)"
+        return scope
+
+    def scope_choices(self, names: dict[str, str]) -> list[tuple[str, str]]:
+        """Every scope a lesson can take: global, each built-in rule profile, each project."""
+        scopes = [lessons.GLOBAL]
+        scopes += [f"client:{name}" for name in builtin_profile_names()]
+        scopes += [f"project:{project_id}" for project_id in names]
+        return [(scope, self.scope_label(scope, names)) for scope in scopes]
+
+    @staticmethod
+    def scope_options(choices: list[tuple[str, str]], selected: str) -> Html:
+        """The ``<option>``s with ``selected`` chosen. A suggestion that is no longer one of the
+        choices is kept and marked, so accepting never quietly widens it to the first option."""
+        if selected not in {value for value, _ in choices}:
+            choices = [(selected, f"{selected} (no longer available)"), *choices]
+        return join(
+            fmt(
+                '<option value="{value}"{chosen}>{label}</option>',
+                value=value,
+                label=label,
+                chosen=Html(" selected" if value == selected else ""),
+            )
+            for value, label in choices
+        )
+
+    def lessons_body(self, ctx: _Page) -> Html:
+        names = self.project_names(ctx)
+        found, skipped = lessons.scan_lessons(self.log)
+        ctx.note_skipped(skipped)
+        choices = self.scope_choices(names)
+        proposed = [lesson for lesson in found if lesson.state == "proposed"]
+        accepted = sorted(
+            (lesson for lesson in found if lesson.state == "accepted"),
+            key=lambda lesson: lesson.acceptance.seq if lesson.acceptance else 0,
+        )
+        intro = fmt(
+            '<p class="meta">A lesson is a one-line editing rule. Every cut guide it applies to '
+            "prints it with the house rules, from the next run on. Agents may propose lessons; "
+            "only a person accepts one.</p>{note}",
+            note=self.write_disabled_note(ctx),
+        )
+        return join(
+            [
+                intro,
+                self.proposals_section(ctx, proposed, names, choices),
+                self.accepted_section(ctx, accepted, names),
+                self.add_section(ctx, choices),
+            ]
+        )
+
+    def proposals_section(
+        self,
+        ctx: _Page,
+        proposed: list[lessons.Lesson],
+        names: dict[str, str],
+        choices: list[tuple[str, str]],
+    ) -> Html:
+        shown = proposed[:MAX_PROPOSALS_SHOWN]
+        cards = (
+            join(self.proposal_card(ctx, lesson, names, choices) for lesson in shown)
+            if shown
+            else Html('<p class="empty card">No proposals are waiting.</p>')
+        )
+        more = Html("")
+        if len(proposed) > len(shown):
+            hidden = len(proposed) - len(shown)
+            more = fmt(
+                '<p class="meta">{n} more proposal{s} wait behind these (oldest first): decide '
+                "these, then reload.</p>",
+                n=hidden,
+                s="" if hidden == 1 else "s",
+            )
+        return fmt(
+            '<h2 class="section-title" id="proposed">Proposed ({n})</h2>{cards}{more}',
+            n=len(proposed),
+            cards=cards,
+            more=more,
+        )
+
+    def proposal_card(
+        self,
+        ctx: _Page,
+        lesson: lessons.Lesson,
+        names: dict[str, str],
+        choices: list[tuple[str, str]],
+    ) -> Html:
+        proposal = lesson.proposal
+        if proposal is None:  # pragma: no cover - the fold gives every proposed lesson one
+            return Html("")
+        meta = fmt(
+            '<p class="meta">Proposed by {kind} {who} &middot; {when} &middot; suggested for '
+            "{scope}</p>",
+            kind=_badge(proposal.by.kind),
+            who=proposal.by.id,
+            when=_when(proposal.at),
+            scope=self.scope_label(proposal.scope, names),
+        )
+        why = (
+            fmt('<p class="why"><strong>Why:</strong> {why}</p>', why=proposal.why)
+            if proposal.why
+            else Html('<p class="why empty">No reason was given.</p>')
+        )
+        source = Html('<p class="meta">Not drawn from a review.</p>')
+        if proposal.source is not None:
+            source = fmt(
+                '<p class="meta">From review <a href="{href}"><code>{review}</code></a> in '
+                "{project}</p>",
+                href=url("reviews", proposal.source.project_id, proposal.source.review_id),
+                review=proposal.source.review_id,
+                project=names.get(proposal.source.project_id, proposal.source.project_id),
+            )
+        if ctx.actor is None:
+            return fmt(
+                '<article class="card"><p class="lesson-text">{text}</p>{meta}{why}{source}'
+                "</article>",
+                text=proposal.text,
+                meta=meta,
+                why=why,
+                source=source,
+            )
+        n = ctx.next_player_id()
+        form = fmt(
+            '<form method="post" action="{action}">{hidden}'
+            '<label for="text-{n}">Lesson (one line; edit it before you accept)</label>'
+            '<textarea id="text-{n}" name="text" required maxlength="{tmax}">{text}</textarea>'
+            '<label for="scope-{n}">Applies to</label>'
+            '<select id="scope-{n}" name="scope">{options}</select>'
+            '<label for="reason-{n}">Reason (optional, kept when you drop it)</label>'
+            '<input id="reason-{n}" name="reason" maxlength="{rmax}">'
+            '<div class="actions"><button class="approve" name="decision" value="accept">'
+            "Accept</button>"
+            '<button class="reject" name="decision" value="drop" formnovalidate>Drop</button>'
+            "</div></form>",
+            action=url("lessons", lesson.id, "decide"),
+            hidden=self.hidden(ctx),
+            n=n,
+            tmax=lessons.MAX_TEXT,
+            text=proposal.text,
+            options=self.scope_options(choices, proposal.scope),
+            rmax=lessons.MAX_REASON,
+        )
+        return fmt(
+            '<article class="card">{meta}{why}{source}{form}</article>',
+            meta=meta,
+            why=why,
+            source=source,
+            form=form,
+        )
+
+    def accepted_section(
+        self, ctx: _Page, accepted: list[lessons.Lesson], names: dict[str, str]
+    ) -> Html:
+        groups: dict[str, list[lessons.Lesson]] = {}
+        for lesson in accepted:
+            groups.setdefault(lesson.scope, []).append(lesson)
+        kinds = {"global": 0, "client": 1, "project": 2}
+
+        def rank(scope: str) -> tuple[int, str, str]:
+            kind = scope.partition(":")[0]
+            return kinds.get(kind, 3), self.scope_label(scope, names).casefold(), scope
+
+        body = (
+            join(
+                self.accepted_group(ctx, scope, groups[scope], names)
+                for scope in sorted(groups, key=rank)
+            )
+            if groups
+            else Html('<p class="empty card">No lesson is accepted yet.</p>')
+        )
+        return fmt(
+            '<h2 class="section-title" id="accepted">Accepted ({n})</h2>{body}',
+            n=len(accepted),
+            body=body,
+        )
+
+    def accepted_group(
+        self, ctx: _Page, scope: str, group: list[lessons.Lesson], names: dict[str, str]
+    ) -> Html:
+        cap = lessons.MAX_ACCEPTED_PER_SCOPE
+        shown = group[:cap]  # the ones the guide prints: the first accepted
+        more = Html("")
+        if len(group) > cap:
+            more = fmt(
+                '<p class="meta">{n} more past the limit of {cap}; cut guides print only the '
+                "first {cap}.</p>",
+                n=len(group) - cap,
+                cap=cap,
+            )
+        return fmt(
+            '<section class="card"><h3>{label}</h3><ul class="lessons">{items}</ul>{more}'
+            "</section>",
+            label=self.scope_label(scope, names),
+            items=join(self.accepted_item(ctx, lesson) for lesson in shown),
+            more=more,
+        )
+
+    def accepted_item(self, ctx: _Page, lesson: lessons.Lesson) -> Html:
+        acceptance = lesson.acceptance
+        if acceptance is None:  # pragma: no cover - the fold gives every accepted lesson one
+            return Html("")
+        edited = ""
+        proposal = lesson.proposal
+        if proposal and (proposal.text, proposal.scope) != (acceptance.text, acceptance.scope):
+            edited = " \u00b7 edited from the proposal"
+        retire = Html("")
+        if ctx.actor is not None:
+            retire = fmt(
+                '<form method="post" action="{action}" class="retire">{hidden}'
+                '<input name="reason" maxlength="{rmax}" placeholder="Why retire it? (optional)" '
+                'aria-label="Why retire this lesson (optional)">'
+                '<button class="plain" type="submit">Retire</button></form>',
+                action=url("lessons", lesson.id, "retire"),
+                hidden=self.hidden(ctx),
+                rmax=lessons.MAX_REASON,
+            )
+        return fmt(
+            '<li><div class="lesson-text">{text}</div><div class="meta">{how} by {who} at '
+            "{when}{edited}</div>{retire}</li>",
+            text=acceptance.text,
+            how="Added" if acceptance.via == "add" else "Accepted",
+            who=acceptance.by.id,
+            when=_when(acceptance.at),
+            edited=edited,
+            retire=retire,
+        )
+
+    def add_section(self, ctx: _Page, choices: list[tuple[str, str]]) -> Html:
+        if ctx.actor is None:
+            return Html("")
+        return fmt(
+            '<h2 class="section-title" id="add">Add a lesson</h2>'
+            '<form method="post" action="/lessons/add" class="card">{hidden}'
+            '<p class="meta">Write a rule by hand; it is accepted at once.</p>'
+            '<label for="add-text">Lesson (one line)</label>'
+            '<textarea id="add-text" name="text" required maxlength="{tmax}"></textarea>'
+            '<label for="add-scope">Applies to</label>'
+            '<select id="add-scope" name="scope">{options}</select>'
+            '<div class="actions"><button class="approve" type="submit">Add lesson</button>'
+            "</div></form>",
+            hidden=self.hidden(ctx),
+            tmax=lessons.MAX_TEXT,
+            options=self.scope_options(choices, lessons.GLOBAL),
+        )
+
     # -- control -------------------------------------------------------------------
 
     def panel(self, ctx: _Page, what: str, build: Callable[[_Page], Html]) -> Html:
@@ -1887,6 +2206,51 @@ def build_app(
     async def jobs_page(request: Request) -> Response:
         return await page(request, "Remote jobs", "jobs", console.jobs_body)
 
+    async def lessons_page(request: Request) -> Response:
+        return await page(request, "Lessons from reviews", "lessons", console.lessons_body)
+
+    async def lesson_decide(request: Request) -> Response:
+        lesson_id = request.path_params["lesson_id"]
+
+        def action(actor: Actor, form: FormData, key: str) -> str:
+            decision = _field(form, "decision")
+            if decision == "accept":
+                lessons.accept(
+                    log,
+                    lesson_id,
+                    _field(form, "text"),
+                    _field(form, "scope"),
+                    actor,
+                    idempotency_key=key,
+                )
+                return url("lessons", done="lesson_accepted")
+            if decision == "drop":
+                reason = _field(form, "reason", required=False)
+                lessons.drop(log, lesson_id, actor, reason=reason, idempotency_key=key)
+                return url("lessons", done="lesson_dropped")
+            raise ConsoleError(422, "invalid_input", "decision: must be accept or drop")
+
+        return await write(request, action)
+
+    async def lesson_retire(request: Request) -> Response:
+        lesson_id = request.path_params["lesson_id"]
+
+        def action(actor: Actor, form: FormData, key: str) -> str:
+            reason = _field(form, "reason", required=False)
+            lessons.retire(log, lesson_id, actor, reason=reason, idempotency_key=key)
+            return url("lessons", done="lesson_retired")
+
+        return await write(request, action)
+
+    async def lesson_add(request: Request) -> Response:
+        def action(actor: Actor, form: FormData, key: str) -> str:
+            lessons.add(
+                log, _field(form, "text"), _field(form, "scope"), actor, idempotency_key=key
+            )
+            return url("lessons", done="lesson_added")
+
+        return await write(request, action)
+
     async def approvals_page(request: Request) -> Response:
         return await page(request, "Approvals", "approvals", console.approvals_body)
 
@@ -1983,6 +2347,10 @@ def build_app(
         Route("/reviews/{project_id}/{review_id}", review_detail, methods=["GET"]),
         Route("/reviews/{project_id}/{review_id}/decide", review_decide, methods=["POST"]),
         Route("/reviews/{project_id}/{review_id}/notes", review_note, methods=["POST"]),
+        Route("/lessons", lessons_page, methods=["GET"]),
+        Route("/lessons/add", lesson_add, methods=["POST"]),
+        Route("/lessons/{lesson_id}/decide", lesson_decide, methods=["POST"]),
+        Route("/lessons/{lesson_id}/retire", lesson_retire, methods=["POST"]),
         Route("/artifacts/{artifact_id}", artifact, methods=["GET"]),
         Route("/jobs", jobs_page, methods=["GET"]),
         Route("/leases", leases, methods=["GET"]),
@@ -2004,6 +2372,9 @@ def build_app(
 WRITE_ROUTES = (
     "/reviews/{project_id}/{review_id}/decide",
     "/reviews/{project_id}/{review_id}/notes",
+    "/lessons/add",
+    "/lessons/{lesson_id}/decide",
+    "/lessons/{lesson_id}/retire",
     "/approvals/grant",
     "/approvals/revoke",
     "/control/stop",

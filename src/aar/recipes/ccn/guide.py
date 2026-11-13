@@ -4,7 +4,8 @@ The engine caps an agent step's instruction at 2 KiB, so the instruction only sa
 this guide. The guide has no size pressure: it gives the exact commands with the hub database and
 artifact store the worker itself was started with, the artifact ids of this run's inputs, the
 environment ``aar recipe`` needs, the brief, how to find the review that rejected the last cut,
-the house rules, and worked examples of ``keep.json`` and ``schedule.json``.
+the house rules with the lessons a person accepted from earlier reviews (:mod:`aar.hub.lessons`),
+and worked examples of ``keep.json`` and ``schedule.json``.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import shlex
 from collections.abc import Sequence
 from typing import Any
 
+from aar.hub.lessons import GuideLessons
 from aar.hub.writes import Brief
 
 RECIPES_ENV = "AAR_RECIPES=aar.recipes.ccn"
@@ -45,6 +47,31 @@ def artifact_get(
     )  # fmt: skip
 
 
+#: The paragraph that opens the lessons subsection of section 3.
+LESSONS_INTRO = (
+    "A person accepted these after earlier reviews. Follow them like the house rules. Where two",
+    "disagree, the narrower one wins: this project over the client, the client over global.",
+)
+
+
+def lessons_section(lessons: GuideLessons | None) -> list[str]:
+    """The ``Lessons from past reviews`` lines that end section 3, or none at all when no lesson
+    applies (so a guide without lessons is byte-identical to one built before lessons existed).
+    An empty group is left out."""
+    if lessons is None or lessons.empty:
+        return []
+    lines = ["### Lessons from past reviews", "", *LESSONS_INTRO, ""]
+    groups = (
+        ("Global:", lessons.global_),
+        (f"Client `{lessons.client_name}`:", lessons.client),
+        ("This project:", lessons.project),
+    )
+    for heading, texts in groups:
+        if texts:
+            lines += [heading, *(f"- {text}" for text in texts), ""]
+    return lines
+
+
 def build_guide(
     *,
     db: str,
@@ -60,11 +87,13 @@ def build_guide(
     aar: Sequence[str],
     python: str,
     cut_attempts: int = 3,
+    lessons: GuideLessons | None = None,
 ) -> str:
     """The guide's Markdown text for one run (module docstring). ``aar`` is the argv that runs
     the worker's own ``aar`` and ``python`` its interpreter: every command the guide prints
     names them and quotes every word, so each line runs in ``sh`` exactly as printed.
-    ``cut_attempts`` is the cut step's ``max_attempts`` (its attempts in one round)."""
+    ``cut_attempts`` is the cut step's ``max_attempts`` (its attempts in one round).
+    ``lessons`` (:func:`aar.hub.lessons.lessons_for_guide`) end section 3 when any applies."""
     where = {"db": db, "artifacts": artifacts, "project_id": project_id}
     fetch = [
         ("stub.json", stub["stub"], "the plan stub: sources, frame rate, timecodes"),
@@ -168,6 +197,7 @@ def build_guide(
         "- End the piece on the laugh: the last range ends just after the laugh line.",
         "- With one camera every cut between ranges is a jump cut: prefer few, long ranges.",
         "",
+        *lessons_section(lessons),
         "## 4. Write keep.json",
         "",
         "```json",
@@ -287,4 +317,4 @@ def build_guide(
     return "\n".join(lines)
 
 
-__all__ = ["RECIPES_ENV", "artifact_get", "build_guide", "command"]
+__all__ = ["RECIPES_ENV", "artifact_get", "build_guide", "command", "lessons_section"]
