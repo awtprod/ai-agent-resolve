@@ -10,3 +10,23 @@ Reject buttons, on the queue and on the detail page.
 Made from a throwaway hub: a test-pattern video, and notes built by
 `aar.recipes.ccn.handoff.handoff_notes` from the export report of the `ccn_2997` golden plan
 (`tests/plan/fixtures/export`). No real show, media path or person appears in them.
+
+# Lessons page (S23a)
+
+The console's `/lessons` page, from a throwaway hub with synthetic names only (`Synthetic Show`,
+`Synthetic Special`, `operator-1`, `agent-1`), built through `aar.hub.lessons` and
+`aar.hub.reviews`. Two proposals wait, so the nav reads `Lessons (2)`; each card shows the why,
+the source review (linked), who proposed it and when, and the form: the text (editable),
+"Applies to" preselected to the suggestion, an optional reason, Accept and Drop. Below them, the
+accepted lessons grouped Global, `Client: ccn` and `Project: Synthetic Show`, each with a retire
+form, and the form to add one. The hub also holds a dropped proposal and a retired lesson; the
+page does not show them.
+
+- `lessons-page.png`: 1280 px wide.
+- `lessons-page-narrow.png`: 390 px wide.
+- `lessons-page-after-accept.png`: the same page after the first proposal was accepted with
+  edited text and a wider scope (`Client: ccn`), submitted twice over HTTP: one acceptance, the
+  flash, `Lessons (1)`, and the lesson marked "edited from the proposal".
+
+Served by `aar hub console --operator operator-1` on a loopback port and captured with headless
+Chrome.

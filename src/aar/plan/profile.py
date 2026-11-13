@@ -314,6 +314,18 @@ def parse_profile(data: dict[str, Any], *, origin: str = "profile") -> Profile:
         raise ProfileError(f"{origin}: {exc}") from exc
 
 
+def builtin_profile_names() -> tuple[str, ...]:
+    """The names of the profiles that ship with aar (``aar/plan/profiles/<name>.toml``), sorted:
+    the names :func:`load_profile` loads as built-ins."""
+    folder = resources.files("aar.plan").joinpath("profiles")
+    names = (
+        entry.name.removesuffix(".toml")
+        for entry in folder.iterdir()
+        if entry.is_file() and entry.name.endswith(".toml")
+    )
+    return tuple(sorted(name for name in names if _NAME.fullmatch(name)))
+
+
 def load_profile(name_or_path: str | Path) -> Profile:
     """Load a built-in profile by name (``ccn``) or any profile TOML by path."""
     text = str(name_or_path)

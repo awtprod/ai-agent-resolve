@@ -16,7 +16,7 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from aar.cli import main
-from aar.hub import approvals, control, reviews
+from aar.hub import approvals, control, lessons, reviews
 from aar.hub.artifacts import ArtifactStore
 from aar.hub.common import HumanRequired
 from aar.hub.console import WRITE_ROUTES, ConsoleConfig, CsrfSigner, build_app
@@ -106,11 +106,16 @@ def test_agent_strings_render_escaped_on_every_page(hub: Hub) -> None:
     offset = clock_now.timestamp() - 100.0
     for event in manager_events:
         record_lease_event(hub.log, event, "node-1", wall_offset=offset)
+    # S23a: an agent's lesson text and its why, and an accepted lesson's text.
+    source = (hub.project, hub.xss_review)
+    lessons.propose(hub.log, XSS, "global", AGENT, why=XSS, source=source)
+    lessons.add(hub.log, XSS, f"project:{hub.project}", HUMAN)
 
     client = hub.client()
     pages = [
         "/",
         f"/reviews/{hub.project}/{hub.xss_review}",
+        "/lessons",
         "/leases",
         "/approvals",
         "/control",
@@ -148,14 +153,18 @@ def test_every_write_route_is_post_only_and_get_is_rejected(hub: Hub) -> None:
     for route in app.routes:
         if isinstance(route, Route) and route.path in posts:
             assert route.methods == {"POST"}
+    lesson = lessons.propose(hub.log, "Keep the setup with its punchline.", "global", AGENT)
     before = hub.log.latest_seq()
     for path in WRITE_ROUTES:
-        concrete = path.format(project_id=hub.project, review_id=hub.plain_review)
+        concrete = path.format(
+            project_id=hub.project, review_id=hub.plain_review, lesson_id=lesson.id
+        )
         response = client.get(concrete, params={"decision": "approve", "reason": "x"})
         assert response.status_code == 405, concrete
         assert "POST" in response.headers["allow"]
     # And no read page writes anything either.
-    for path in ("/", "/leases", "/approvals", "/control", f"/artifacts/{hub.render}"):
+    reads = ("/", "/lessons", "/leases", "/approvals", "/control", f"/artifacts/{hub.render}")
+    for path in reads:
         assert client.get(path).status_code == 200
     assert hub.log.latest_seq() == before
 

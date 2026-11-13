@@ -35,6 +35,7 @@ from aar.analyze.common import input_identity, offset_from_plan
 from aar.analyze.errors import AnalyzeError
 from aar.analyze.laughs import LaughSettings, analyse_laughs
 from aar.analyze.sync import SyncSettings, sync_files
+from aar.hub.lessons import lessons_for_guide
 from aar.plan.export import ExportError, export_fcpxml, media_map_from_mapping
 from aar.plan.inputs import LaughMap, Transcript
 from aar.plan.model import EditPlan
@@ -351,11 +352,18 @@ def _cut_attempts(state: Any) -> int:
 
 def guide_step(ctx: StepContext) -> StepOutput:
     """Write the ``cut`` step's full guide (:mod:`aar.recipes.ccn.guide`) as an artifact, with
-    the hub paths this worker runs on and this run's input artifact ids."""
+    the hub paths this worker runs on, this run's input artifact ids, and the lessons a person
+    accepted for every show, this client (the brief's rule profile) and this project. The guide is
+    built once per run, so a lesson accepted while a run is past this step applies from the next."""
     state = load_state(ctx.log, ctx.recipe_node, project_id=ctx.project_id)
     db = os.path.abspath(ctx.log.path)
     artifacts = os.path.abspath(ctx.store.root)
     aar = aar_argv()
+    lessons = lessons_for_guide(
+        ctx.log,
+        project_id=ctx.project_id,
+        client=ctx.brief.rule_profile if ctx.brief else None,
+    )
     text = build_guide(
         db=db,
         artifacts=artifacts,
@@ -370,6 +378,7 @@ def guide_step(ctx: StepContext) -> StepOutput:
         aar=aar,
         python=sys.executable,
         cut_attempts=_cut_attempts(state),
+        lessons=lessons,
     )
     guide_id = ctx.put(text.encode("utf-8"), mime="text/markdown", meta={"role": "cut-guide"})
     read = artifact_get(
