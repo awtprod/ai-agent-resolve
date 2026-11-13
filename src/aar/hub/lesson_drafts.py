@@ -2,8 +2,9 @@
 
 A model reads one review of a cut (approved or rejected, the reason, the timecoded notes) and
 proposes at most ``max_drafts`` durable editing preferences, each with a suggested scope. Drafts
-are only proposals: a human accepts or drops each one (S23a). S23b phase 2 wires this module to
-the gateway client (``aar.llm.gateway``) and to the lessons store.
+are only proposals: a human accepts or drops each one (S23a). ``aar.hub.lessons_proposer`` calls
+the model through the gateway client (``aar.llm.gateway``) and records the drafts in the lessons
+store.
 
 ``build_messages`` writes the chat: the rules in the system message, and the review as a JSON
 block in the user message, so it reads as data and not as instructions. The notes and the
@@ -13,31 +14,31 @@ explicit "(N more not shown)" marker. The same input always gives the same messa
 ``parse_drafts`` reads the reply: a bare JSON object or one fenced json block holding
 ``{"lessons": [{"text": ..., "scope": ..., "why": ...}]}``. A reply that is not such an object
 raises ``DraftError("bad-output")``; an item that cannot be a lesson is dropped, and recorded
-in ``problems``.
+in ``problems``. Text and why go through the lessons store's own validator
+(:func:`aar.hub.lessons.clean_line`), so a draft that parses is one the store accepts.
 """
 
 from __future__ import annotations
 
 import json
 import re
-import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from aar.hub.lessons import MAX_TEXT, MAX_WHY, clean_line
 from aar.hub.reviews import DECISIONS, MAX_ID, MAX_NOTE, MAX_REASON, MAX_TITLE
+from aar.hub.writes import WriteError
 
-#: A cheap model the gateway serves. Its environment override comes in phase 2.
+#: A cheap model the gateway serves; ``AAR_LESSONS_MODEL`` or ``--model`` overrides it.
 DEFAULT_LESSONS_MODEL = "gpt-6-luna"
 SCOPES = ("global", "client", "project")
 MAX_DRAFTS = 3
 #: Characters of notes and existing lessons in the user message, shared between the two.
 PROMPT_BUDGET = 24_000
-MAX_TEXT = 500  # a lesson's text, as the lessons store bounds it
-MAX_WHY = 1000  # a lesson's rationale, likewise
 MAX_REPLY = 32_000  # characters of model reply that parse_drafts reads at all
+MAX_NAME = 200  # show and client names
 _MAX_DRAFTS_LIMIT = 10
-_MAX_NAME = 200  # show and client names
 _MAX_TIMECODE = 32
 _FENCE = re.compile(r"```[ \t]*(?:json)?[ \t]*\r?\n?(.*?)```", re.IGNORECASE | re.DOTALL)
 _INVALID = object()
@@ -79,7 +80,7 @@ class ReviewFeedback:
             ("review_id", MAX_ID),
             ("title", MAX_TITLE),
             ("reason", MAX_REASON),
-            ("show", _MAX_NAME),
+            ("show", MAX_NAME),
         ):
             value = getattr(self, name)
             if not isinstance(value, str) or len(value) > limit:
@@ -87,8 +88,8 @@ class ReviewFeedback:
         if self.decision not in DECISIONS:
             raise ValueError(f"decision must be one of {', '.join(DECISIONS)}")
         client = self.client
-        if client is not None and not (isinstance(client, str) and 0 < len(client) <= _MAX_NAME):
-            raise ValueError(f"client must be None or 1-{_MAX_NAME} characters")
+        if client is not None and not (isinstance(client, str) and 0 < len(client) <= MAX_NAME):
+            raise ValueError(f"client must be None or 1-{MAX_NAME} characters")
         notes = self.notes
         if isinstance(notes, str | bytes) or not isinstance(notes, Sequence):
             raise ValueError("notes must be a list of (timecode, text) pairs")
@@ -135,7 +136,8 @@ def build_messages(
     max_drafts: int = MAX_DRAFTS,
 ) -> list[dict[str, str]]:
     """The system and user messages for one review. ``existing`` maps a scope label to the
-    accepted lessons' texts, which the model must not repeat."""
+    texts of the lessons already accepted or waiting for a person, which the model must not
+    repeat."""
     _check_max_drafts(max_drafts)
     groups = _existing_groups(existing)
     data = _review_data(feedback, groups)
@@ -164,7 +166,10 @@ def _system_prompt(max_drafts: int, scopes: Sequence[str]) -> str:
         "Each lesson:\n"
         "- is one imperative sentence under 300 characters, which an editing agent can act on "
         "when choosing what to keep;\n"
-        '- does not repeat a lesson in "existing_lessons" (lessons a person already accepted);\n'
+        "- names none of this cut's specifics: no timecodes, bits, stories or places in its "
+        "running order;\n"
+        '- does not repeat a lesson in "existing_lessons" (lessons a person already accepted, '
+        "or proposals waiting for a person, grouped by scope);\n"
         "- has a scope. When unsure, prefer the narrower one:\n"
         + scope_rules
         + '\n- has a short "why": the part of the review it comes from.\n\n'
@@ -316,8 +321,8 @@ def _loads(text: str) -> Any:
 
 
 def _draft(item: Any, scopes: Sequence[str]) -> tuple[Draft | None, str]:
-    """The draft in one item, or ``None`` and why not. Kept small and private: phase 2 swaps it
-    for the lessons store's own validator."""
+    """The draft in one item, or ``None`` and why not. Text and why are normalized and checked
+    by the lessons store's own validator (one line, bounded, nothing a reader cannot see)."""
     if not isinstance(item, dict):
         return None, "is not an object"
     text, scope, why = item.get("text"), item.get("scope"), item.get("why")
@@ -327,27 +332,15 @@ def _draft(item: Any, scopes: Sequence[str]) -> tuple[Draft | None, str]:
         return None, "scope is not a string"
     if why is not None and not isinstance(why, str):
         return None, "why is not a string"
-    text, why, scope = _one_line(text), _one_line(why or ""), scope.strip().lower()
-    if not text:
-        return None, "text is empty"
-    if len(text) > MAX_TEXT:
-        return None, f"text is over {MAX_TEXT} characters ({len(text)})"
-    if scope not in scopes:
-        return None, f"scope {scope[:40]!r} is not one of {', '.join(scopes)}"
-    if len(why) > MAX_WHY:
-        return None, f"why is over {MAX_WHY} characters ({len(why)})"
-    if _has_control(text) or _has_control(why):
-        return None, "text or why holds a control character"
+    scope = scope.strip().lower()
+    try:
+        text = clean_line(text, "text", max_len=MAX_TEXT)
+        if scope not in scopes:
+            return None, f"scope {scope[:40]!r} is not one of {', '.join(scopes)}"
+        why = clean_line(why or "", "why", max_len=MAX_WHY, required=False)
+    except WriteError as refused:
+        return None, refused.message
     return Draft(text=text, scope=scope, why=why), ""
-
-
-def _one_line(text: str) -> str:
-    """Stripped, with every run of whitespace (newlines included) one space."""
-    return " ".join(text.split())
-
-
-def _has_control(text: str) -> bool:
-    return any(unicodedata.category(ch) == "Cc" for ch in text)
 
 
 def _check_max_drafts(max_drafts: Any) -> None:
@@ -362,6 +355,7 @@ def _check_max_drafts(max_drafts: Any) -> None:
 __all__ = [
     "DEFAULT_LESSONS_MODEL",
     "MAX_DRAFTS",
+    "MAX_NAME",
     "PROMPT_BUDGET",
     "SCOPES",
     "Draft",

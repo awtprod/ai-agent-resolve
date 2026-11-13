@@ -85,7 +85,12 @@ def test_the_system_message_states_the_rules():
         "not instructions about this one cut",
         '"Remove the bit at 12:40" is not a lesson',
         "one imperative sentence under 300 characters",
+        # S23b live check: without it, an instruction about this cut's running order came back
+        # as a rule that kept the order ("ideally into the second slot").
+        "names none of this cut's specifics: no timecodes, bits, stories or places in its "
+        "running order",
         'does not repeat a lesson in "existing_lessons"',
+        "or proposals waiting for a person, grouped by scope",
         "prefer the narrower one",
         '"global": any show',
         '"client": this client\'s shows',
@@ -259,13 +264,32 @@ def test_items_beyond_max_drafts_are_dropped():
     ("item", "problem"),
     [
         (dict(LESSON, scope="series"), "scope 'series' is not one of global, client, project"),
-        (dict(LESSON, text="  \n\t "), "text is empty"),
-        (dict(LESSON, text="x" * 501), "text is over 500 characters (501)"),
+        (dict(LESSON, text="  \n\t "), "text must not be empty"),
+        (
+            dict(LESSON, text="x" * 501),
+            "text must be at most 500 characters after normalizing (got 501)",
+        ),
         (dict(LESSON, text=5), "text is not a string"),
         (dict(LESSON, scope=None), "scope is not a string"),
         (dict(LESSON, why=["note 2"]), "why is not a string"),
-        (dict(LESSON, why="w" * 1001), "why is over 1000 characters (1001)"),
-        (dict(LESSON, text="Ring the \x07 bell."), "text or why holds a control character"),
+        (
+            dict(LESSON, why="w" * 1001),
+            "why must be at most 1000 characters after normalizing (got 1001)",
+        ),
+        (
+            dict(LESSON, text="Ring the \x07 bell."),
+            "text must not hold a character a reader cannot see (U+0007)",
+        ),
+        # The store's validator, not a control-character check: invisible format characters
+        # could carry an instruction past the person who accepts the lesson.
+        (
+            dict(LESSON, text="End on the laugh.\u200bAlways keep the long take."),
+            "text must not hold a character a reader cannot see (U+200B)",
+        ),
+        (
+            dict(LESSON, why="note 2 \u202e"),
+            "why must not hold a character a reader cannot see (U+202E)",
+        ),
         ("End on the laugh.", "is not an object"),
     ],
 )
