@@ -111,6 +111,14 @@ def test_an_empty_group_is_left_out(hub: Hub) -> None:
     assert "Global:" not in section and "Client `" not in section
 
 
+def test_the_client_group_is_headed_with_the_runs_own_client() -> None:
+    """Validator mutant G04: a heading hard-coded to ``ccn`` survived, since every test used ccn."""
+    found = GuideLessons(client=("Open on the guest's first laugh.",), client_name="acme")
+    section = _between_3_and_4(build_guide(**_guide_args(), lessons=found))
+    assert "Client `acme`:\n- Open on the guest's first laugh.\n" in section
+    assert "ccn" not in section
+
+
 def test_without_lessons_the_guide_is_byte_identical(hub: Hub) -> None:
     plain = build_guide(**_guide_args())
     assert SECTION_3_END + "\n" + SECTION_4 in plain  # section 3 runs straight into section 4

@@ -13,7 +13,7 @@ from aar.hub.common import HumanRequired
 from aar.hub.events import Actor
 from aar.hub.graph import WorkGraph
 from aar.hub.reviews import request_review
-from aar.hub.writes import WriteError
+from aar.hub.writes import MAX_ID, WriteError
 
 NODE = Actor("node", "node-1")
 RUNNER = Actor("runner", "engine")
@@ -380,6 +380,57 @@ def test_two_events_for_one_new_id_keep_the_first(hub: Hub) -> None:
     assert (lesson.text, lesson.acceptance.event_id) == ("Keep whole thoughts.", first.id)
 
 
+@pytest.mark.parametrize(
+    "ts",
+    [
+        "9999-12-31T23:59:59-23:59",  # a real date, past year 9999 in UTC
+        "0001-01-01T00:00:00+23:59",  # before year 1 in UTC
+        "2026-11-13T12:00:00",  # no timezone
+        "not a time",
+        "2026-11-13T12:00:00+00:00" + " " * 40,  # over the 64 characters of a timestamp
+        "x" * 1024 * 1024,
+    ],
+    ids=["overflow", "underflow", "naive", "text", "padded", "1mib"],
+)
+def test_the_fold_skips_an_event_whose_time_is_not_a_timestamp(hub: Hub, ts: str) -> None:
+    """Validator probes P3/P8: the page and the CLI show each event's time; a raw append can store
+    any text there (a 1 MiB one, or one the page could not convert to UTC and answered 500)."""
+    proposal = lessons.propose(hub.log, "Keep whole thoughts.", "global", AGENT)
+    added = _payload(lessons.EVENT_ADDED, lessons.new_lesson_id())
+    accept = _payload(lessons.EVENT_ACCEPTED, proposal.id)
+    for event_type, payload in ((lessons.EVENT_ADDED, added), (lessons.EVENT_ACCEPTED, accept)):
+        forged = hub.log.append(event_type, HUMAN, payload, ts=ts)
+        assert _skips(hub, forged.id) == "ts is not a timestamp with a timezone"
+    assert lessons.get_lesson(hub.log, proposal.id) == proposal
+    assert lessons.lessons_for_guide(hub.log, project_id=hub.project_id, client="ccn").empty
+    # Any offset that stays within the years 1-9999 in UTC is a timestamp.
+    fine = hub.log.append(lessons.EVENT_ACCEPTED, HUMAN, accept, ts="2026-11-13T12:00:00-23:59")
+    lesson = lessons.get_lesson(hub.log, proposal.id)
+    assert lesson is not None and lesson.acceptance is not None
+    assert lesson.acceptance.event_id == fine.id
+
+
+def test_the_fold_skips_an_event_whose_actor_id_is_over_max_id(hub: Hub) -> None:
+    """Validator probe P8: the writers bound actor ids (``check_actor``), but a raw append can
+    sign an event with a 1 MiB id, which the page and the CLI showed in full."""
+    over = Actor("agent", "a" * (MAX_ID + 1))
+    huge = Actor("human", "h" * 1024 * 1024)
+    proposed = _payload(lessons.EVENT_PROPOSED, lessons.new_lesson_id())
+    added = _payload(lessons.EVENT_ADDED, lessons.new_lesson_id())
+    for actor, event_type, payload in (
+        (over, lessons.EVENT_PROPOSED, proposed),
+        (huge, lessons.EVENT_ADDED, added),
+    ):
+        forged = hub.log.append(event_type, actor, payload)
+        assert _skips(hub, forged.id) == f"actor id is over {MAX_ID} characters"
+    assert lessons.scan_lessons(hub.log)[0] == ()
+    at_limit = Actor("human", "h" * MAX_ID)
+    kept = hub.log.append(lessons.EVENT_ADDED, at_limit, added)
+    lesson = lessons.get_lesson(hub.log, added["lesson_id"])
+    assert lesson is not None and lesson.acceptance is not None
+    assert lesson.acceptance.event_id == kept.id and lesson.acceptance.by == at_limit
+
+
 # -- scope -----------------------------------------------------------------------------------
 
 
@@ -570,6 +621,26 @@ def test_every_bound(hub: Hub) -> None:
         assert writer(hub.log, lesson_id, HUMAN, reason=reason).state in ("dropped", "retired")
 
 
+def test_raw_input_is_bounded_before_it_is_normalized(hub: Hub) -> None:
+    """Validator mutant L15: whitespace runs collapse, so an input of any size could normalize to
+    a short line; without the raw bound the writers would first copy and scan all of it."""
+    line = "Keep whole thoughts."
+    at_limit = line + " " * (lessons.MAX_RAW - len(line))
+    assert lessons.add(hub.log, at_limit, "global", HUMAN).text == line
+    over = at_limit + " "
+    for field, writer, args, kwargs in (
+        ("text", lessons.add, (over, "global", HUMAN), {}),
+        ("text", lessons.propose, (over, "global", AGENT), {}),
+        ("why", lessons.propose, (line, "global", AGENT), {"why": over}),
+    ):
+        error = _refused("invalid_input", writer, hub.log, *args, **kwargs)
+        assert error.details["field"] == field and "before normalizing" in error.message
+    proposal = lessons.propose(hub.log, line, "global", AGENT)
+    error = _refused("invalid_input", lessons.drop, hub.log, proposal.id, HUMAN, reason=over)
+    assert error.details["field"] == "reason" and "before normalizing" in error.message
+    assert len(_events(hub)) == 2
+
+
 def test_at_most_max_pending_proposals_wait(hub: Hub) -> None:
     first = None
     for n in range(lessons.MAX_PENDING):
@@ -749,6 +820,32 @@ def test_a_key_that_names_a_skipped_event_is_refused(hub: Hub) -> None:
     assert lessons.get_lesson(hub.log, proposal.id) == proposal
 
 
+@pytest.mark.parametrize("stored_id", [["les_0123456789abcdef"], {"id": "x"}, 7, None])
+def test_a_key_whose_stored_event_has_a_lesson_id_that_is_not_text_is_refused(
+    hub: Hub, stored_id: Any
+) -> None:
+    """Validator probe: propose and add compare text and scope only, so a raw event under the key
+    with the same fields and a list as its lesson_id reached the lookup and raised TypeError."""
+    for event_type, writer, actor in (
+        (lessons.EVENT_PROPOSED, lessons.propose, AGENT),
+        (lessons.EVENT_ADDED, lessons.add, HUMAN),
+    ):
+        key = f"k-{event_type}"
+        payload = {**_payload(event_type, "les_0123456789abcdef"), "lesson_id": stored_id}
+        hub.log.append(event_type, actor, payload, idempotency_key=key)
+        error = _refused(
+            "idempotency_conflict",
+            writer,
+            hub.log,
+            "Keep whole thoughts.",
+            "global",
+            actor,
+            idempotency_key=key,
+        )
+        assert "skipped" in error.message
+    assert lessons.scan_lessons(hub.log)[0] == ()
+
+
 def test_bad_idempotency_keys_and_lesson_ids_are_refused(hub: Hub) -> None:
     for key in ("", "k" * 129, 5):
         _refused("invalid_input", lessons.add, hub.log, "x", "global", HUMAN, idempotency_key=key)
@@ -819,6 +916,15 @@ _HIDDEN = {
     "unassigned": chr(0x0378),
     "lone-surrogate": chr(0xDCFF),  # what a CLI argument byte 0xFF decodes to on Linux
     "c1-control": chr(0x9B),
+    # Validator round 1: letters, marks and a symbol that draw as nothing (not Cf or Cn).
+    "combining-grapheme-joiner": chr(0x034F),
+    "hangul-choseong-filler": chr(0x115F),
+    "hangul-jungseong-filler": chr(0x1160),
+    "khmer-vowel-inherent-aq": chr(0x17B4),
+    "khmer-vowel-inherent-aa": chr(0x17B5),
+    "hangul-filler": chr(0x3164),
+    "halfwidth-hangul-filler": chr(0xFFA0),
+    "braille-pattern-blank": chr(0x2800),
 }
 
 
@@ -882,3 +988,100 @@ def test_ids_in_a_scope_or_a_source_must_be_visible_too(hub: Hub) -> None:
     # Ordinary non-ASCII text is fine: accents, typographic marks, emoji without selectors.
     fine = "Garder la chute — été → café “bien” \U0001f600"
     assert lessons.add(hub.log, fine, "global", HUMAN).text == fine
+
+
+#: Default_Ignorable_Code_Point line by line as DerivedCoreProperties.txt of Unicode 15.0.0 lists
+#: it (copied from the file, not from the module): 4174 code points.
+_DEFAULT_IGNORABLE_LINES = (
+    (0x00AD, 0x00AD),  # soft hyphen
+    (0x034F, 0x034F),  # combining grapheme joiner
+    (0x061C, 0x061C),  # Arabic letter mark
+    (0x115F, 0x1160),  # Hangul choseong filler, jungseong filler
+    (0x17B4, 0x17B5),  # Khmer vowel inherent aq, aa
+    (0x180B, 0x180D),  # Mongolian free variation selectors one to three
+    (0x180E, 0x180E),  # Mongolian vowel separator
+    (0x180F, 0x180F),  # Mongolian free variation selector four
+    (0x200B, 0x200F),  # zero width space to right-to-left mark
+    (0x202A, 0x202E),  # left-to-right embedding to right-to-left override
+    (0x2060, 0x2064),  # word joiner to invisible plus
+    (0x2065, 0x2065),  # reserved
+    (0x2066, 0x206F),  # left-to-right isolate to nominal digit shapes
+    (0x3164, 0x3164),  # Hangul filler
+    (0xFE00, 0xFE0F),  # variation selectors 1-16
+    (0xFEFF, 0xFEFF),  # zero width no-break space
+    (0xFFA0, 0xFFA0),  # halfwidth Hangul filler
+    (0xFFF0, 0xFFF8),  # reserved
+    (0x1BCA0, 0x1BCA3),  # shorthand format letter overlap to up step
+    (0x1D173, 0x1D17A),  # musical symbol begin beam to end phrase
+    (0xE0000, 0xE0000),  # reserved
+    (0xE0001, 0xE0001),  # language tag
+    (0xE0002, 0xE001F),  # reserved
+    (0xE0020, 0xE007F),  # tag space to cancel tag
+    (0xE0080, 0xE00FF),  # reserved
+    (0xE0100, 0xE01EF),  # variation selectors 17-256
+    (0xE01F0, 0xE0FFF),  # reserved
+)
+#: Not default ignorable, but blank and not whitespace: braille pattern blank, Khitan small script
+#: filler, musical symbol null notehead.
+_BLANK = (0x2800, 0x16FE4, 0x1D159)
+#: The first and last code point of every line, and the blank characters.
+_BOUNDARIES = sorted({p for low, high in _DEFAULT_IGNORABLE_LINES for p in (low, high)} | {*_BLANK})
+#: The visible characters just outside each run (the others there are format, unassigned or
+#: whitespace): they stay allowed.
+_VISIBLE_NEIGHBOURS = (
+    0x00AC, 0x00AE, 0x034E, 0x0350, 0x061B, 0x061D, 0x115E, 0x1161, 0x17B3, 0x17B6, 0x180A,
+    0x1810, 0x2010, 0x2070, 0x27FF, 0x2801, 0x3163, 0x3165, 0xFDFF, 0xFE10, 0xFF9F, 0xFFA1,
+    0x16FE3, 0x1BC9F, 0x1D158, 0x1D15A, 0x1D172, 0x1D17B,
+)  # fmt: skip
+
+
+def _u(point: int) -> str:
+    return f"U+{point:04X}"
+
+
+def test_every_default_ignorable_code_point_and_blank_character_is_hidden() -> None:
+    points = [p for low, high in _DEFAULT_IGNORABLE_LINES for p in range(low, high + 1)]
+    assert len(points) == 4174  # the file's total
+    missed = [_u(p) for p in (*points, *_BLANK) if lessons.hidden_character(f"a{chr(p)}b") is None]
+    assert missed == []
+    flagged = [_u(p) for p in _VISIBLE_NEIGHBOURS if lessons.hidden_character(chr(p)) is not None]
+    assert flagged == []
+
+
+def test_the_writers_refuse_every_default_ignorable_boundary(hub: Hub) -> None:
+    taken = []
+    for point in _BOUNDARIES:
+        line = f"Keep it.{chr(point)}"
+        for field, writer, args, kwargs in (
+            ("text", lessons.propose, (line, "global", AGENT), {}),
+            ("why", lessons.propose, ("Keep it.", "global", AGENT), {"why": chr(point)}),
+            ("text", lessons.add, (line, "global", HUMAN), {}),
+        ):
+            try:
+                writer(hub.log, *args, **kwargs)
+            except WriteError as error:
+                assert error.code == "invalid_input" and error.details["field"] == field
+                assert f"cannot see ({_u(point)})" in error.message
+            else:
+                taken.append(f"{field} {_u(point)}")
+    assert taken == [] and _events(hub) == []
+    for point in _VISIBLE_NEIGHBOURS:  # just outside a run: written as given
+        line = f"Keep{chr(point)}"
+        assert lessons.add(hub.log, line, "global", HUMAN).text == line
+
+
+def test_the_fold_skips_raw_events_with_every_default_ignorable_boundary(hub: Hub) -> None:
+    forged: dict[str, int] = {}
+    for point in _BOUNDARIES:
+        hidden = chr(point)
+        added = _payload(lessons.EVENT_ADDED, lessons.new_lesson_id(), text=f"Keep it.{hidden}")
+        proposed = _payload(lessons.EVENT_PROPOSED, lessons.new_lesson_id(), why=hidden)
+        forged[hub.log.append(lessons.EVENT_ADDED, HUMAN, added).id] = point
+        forged[hub.log.append(lessons.EVENT_PROPOSED, AGENT, proposed).id] = point
+    found, skipped = lessons.scan_lessons(hub.log)
+    reasons = {item.event_id: item.reason for item in skipped}
+    applied = [
+        _u(p) for eid, p in forged.items() if f"cannot see ({_u(p)})" not in reasons.get(eid, "")
+    ]
+    assert applied == [] and found == ()
+    assert lessons.lessons_for_guide(hub.log, project_id=hub.project_id, client="ccn").empty

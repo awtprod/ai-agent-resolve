@@ -27,7 +27,8 @@ event                 written by                     from            to
 be able to write instructions into future guides. The writers refuse every other actor
 (:func:`~aar.hub.common.require_human`), and the fold checks it again: an event that breaks a rule
 (a human-only event by a non-human, a ``project_id``, a bad transition, a duplicate id, a payload
-that fails validation) is skipped and listed, never applied. There is no CLI or MCP write path;
+that fails validation, a ``ts`` that is not a timestamp, an actor id over ``MAX_ID`` characters)
+is skipped and listed, never applied. There is no CLI or MCP write path;
 a person writes in the console.
 
 **Bounds.** Text is one line (stripped, every whitespace run one space), 1-500 characters, with
@@ -50,12 +51,13 @@ from __future__ import annotations
 import re
 import secrets
 import unicodedata
+from bisect import bisect_right
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import Any
 
 from aar.hub import reviews
-from aar.hub.common import SkippedEvent, actor_dict, is_text, require_human
+from aar.hub.common import SkippedEvent, actor_dict, is_text, is_ts, require_human
 from aar.hub.events import (
     Actor,
     Event,
@@ -103,8 +105,37 @@ _SPACE_RUN = re.compile(r"\s+")
 #: and tag characters, the soft hyphen, the byte order mark), surrogate (Cs, which no page can
 #: encode), private use (Co) and unassigned (Cn).
 _HIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
-#: Variation selectors (category Mn) show nothing themselves, and can carry bytes like tags can.
-_VARIATION_SELECTORS = ((0x180B, 0x180F), (0xFE00, 0xFE0F), (0xE0100, 0xE01EF))
+#: Unicode's Default_Ignorable_Code_Point property, from DerivedCoreProperties.txt of Unicode
+#: 15.0.0 (the version of Python 3.12's ``unicodedata``, which has no lookup for the property):
+#: code points a renderer draws as nothing. Each pair is the first and last code point of a run,
+#: the file's lines merged where they touch. Most are format (Cf) or unassigned (Cn) too, but the
+#: combining grapheme joiner, the Hangul fillers, the Khmer inherent vowels and the variation
+#: selectors are letters and marks, and the categories alone let them through.
+_DEFAULT_IGNORABLE = (
+    (0x00AD, 0x00AD),  # soft hyphen
+    (0x034F, 0x034F),  # combining grapheme joiner
+    (0x061C, 0x061C),  # Arabic letter mark
+    (0x115F, 0x1160),  # Hangul choseong and jungseong fillers
+    (0x17B4, 0x17B5),  # Khmer vowels inherent aq and aa
+    (0x180B, 0x180F),  # Mongolian free variation selectors and vowel separator
+    (0x200B, 0x200F),  # zero-width space, non-joiner and joiner; left-to-right, right-to-left marks
+    (0x202A, 0x202E),  # bidirectional embeddings, pop and overrides
+    (0x2060, 0x206F),  # word joiner, invisible operators, bidirectional isolates (2065 reserved)
+    (0x3164, 0x3164),  # Hangul filler
+    (0xFE00, 0xFE0F),  # variation selectors 1-16
+    (0xFEFF, 0xFEFF),  # zero-width no-break space (the byte order mark)
+    (0xFFA0, 0xFFA0),  # halfwidth Hangul filler
+    (0xFFF0, 0xFFF8),  # reserved
+    (0x1BCA0, 0x1BCA3),  # shorthand format controls
+    (0x1D173, 0x1D17A),  # musical symbols begin beam to end phrase
+    (0xE0000, 0xE0FFF),  # tags, variation selectors 17-256, reserved
+)
+#: Characters outside that property that still draw as blank space and are not whitespace
+#: (which the writers collapse to one space instead): the braille pattern blank, the Khitan small
+#: script filler and the musical null notehead.
+_BLANK = ((0x2800, 0x2800), (0x16FE4, 0x16FE4), (0x1D159, 0x1D159))
+_INVISIBLE = tuple(sorted(_DEFAULT_IGNORABLE + _BLANK))
+_INVISIBLE_STARTS = tuple(low for low, _ in _INVISIBLE)
 _SCOPE_HINT = "Use 'global', 'client:<rule profile>' (such as 'client:ccn') or 'project:<prj_id>'."
 
 
@@ -117,17 +148,22 @@ def _invalid(field: str, message: str, hint: str) -> WriteError:
     return WriteError("invalid_input", f"{field} {message}", hint, field=field)
 
 
+def _invisible(point: int) -> bool:
+    """Whether the code point is default ignorable or another blank character (``_INVISIBLE``)."""
+    run = bisect_right(_INVISIBLE_STARTS, point) - 1
+    return run >= 0 and point <= _INVISIBLE[run][1]
+
+
 def hidden_character(text: str) -> str | None:
     """The first character of ``text`` a reader cannot see, or ``None``.
 
-    Control, format, surrogate, private-use and unassigned code points, and variation selectors.
-    A lesson is shown to a person before it reaches a guide, so it must say only what they see.
+    Control, format, surrogate, private-use and unassigned code points, every default-ignorable
+    code point (variation selectors and fillers among them) and the other characters that draw
+    as blank space without being whitespace. A lesson is shown to a person before it reaches a
+    guide, so it must say only what they see. The writers and the fold both check with this.
     """
     for char in text:
-        point = ord(char)
-        if unicodedata.category(char) in _HIDDEN_CATEGORIES or any(
-            low <= point <= high for low, high in _VARIATION_SELECTORS
-        ):
+        if unicodedata.category(char) in _HIDDEN_CATEGORIES or _invisible(ord(char)):
             return char
     return None
 
@@ -137,8 +173,8 @@ def _unseen(char: str) -> str:
 
 
 _VISIBLE_HINT = (
-    "Write plain visible text: control, zero-width, bidirectional, tag, private-use and other "
-    "invisible characters are refused."
+    "Write plain visible text: control, zero-width, bidirectional, tag, filler, blank, "
+    "private-use and other invisible characters are refused."
 )
 
 
@@ -455,6 +491,17 @@ def _payload_problem(event_type: str, payload: Any) -> str | None:
     return None
 
 
+def _envelope_problem(event: Event) -> str | None:
+    """Why the event's own time or actor cannot be shown, or ``None``. A writer's come from the
+    log's clock and :func:`~aar.hub.writes.check_actor`, but a raw append can store anything, and
+    the page, the CLI and ``to_dict`` show both: unbounded, they would make the page unbounded."""
+    if len(event.actor.id) > MAX_ID:
+        return f"actor id is over {MAX_ID} characters"
+    if not is_ts(event.ts):
+        return "ts is not a timestamp with a timezone"
+    return None
+
+
 def _actor_problem(event_type: str, actor: Actor) -> str | None:
     who = f"{actor.kind}:{actor.id}"
     if event_type in HUMAN_ONLY_EVENTS and actor.kind != "human":
@@ -505,7 +552,9 @@ class _Fold:
 
     def apply(self, event: Event) -> Lesson | None:
         """Fold one event; a bad one is skipped and listed. Returns the lesson it changed."""
-        problem = self.problem(event.type, event.actor, event.project_id, event.payload)
+        problem = _envelope_problem(event) or self.problem(
+            event.type, event.actor, event.project_id, event.payload
+        )
         if problem is not None:
             self.skipped.append(SkippedEvent.of(event, problem))
             return None
@@ -643,7 +692,10 @@ def _replay(
         match_or_conflict(existing, event_type, request, request.keys(), actor=actor)
     except IdempotencyConflict:
         raise _conflict(idempotency_key, "the request differs") from None
-    lesson = fold.lessons.get(existing.payload.get("lesson_id"))
+    # match_or_conflict checked that the payload is an object; its lesson_id may still be a list
+    # (unhashable) or anything else a raw append stored, which the fold skipped.
+    lesson_id = existing.payload.get("lesson_id")
+    lesson = fold.lessons.get(lesson_id) if isinstance(lesson_id, str) else None
     if lesson is None or existing.id not in fold.applied:
         raise _conflict(idempotency_key, "it names an event the lessons fold skipped")
     return lesson
