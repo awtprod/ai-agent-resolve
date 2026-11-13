@@ -168,6 +168,55 @@ def test_v2_and_v3_are_connected_lanes_over_a_v1_gap() -> None:
     assert v2 is not None and v2.get("lane") == "1" and v2.get("offset") == "10010/24000s"
 
 
+def test_a_muted_track_with_no_bus_is_exported_silent_as_the_render_plays_it() -> None:
+    """Review finding 1: the review render dropped this sound and the export played it."""
+    from test_render_graph import fake_hub
+
+    from aar.plan.export.layout import SILENT_DB
+    from aar.plan.render import render_layout
+    from aar.plan.render.timeline import build_timeline
+
+    plan = _plan(
+        segments=[seg(1, a=0, b=24, gain_db=-3.0), seg(2, a=0, b=24, record_in=0)],
+        audio_tracks=[
+            {"name": "A1", "gain_db": 1.5},
+            {"name": "A2", "gain_db": -2.0, "mute": True},
+        ],
+    )
+    result = export(plan)
+    spine = _spine(ET.fromstring(result.fcpxml))
+    assert spine[0].find("adjust-volume").get("amount") == "-1.5dB"  # type: ignore[union-attr]
+    assert spine[0].find("asset-clip/adjust-volume").get("amount") == "-96dB"  # type: ignore[union-attr]
+    by_track = {c.audio_track: c.volume_db for c in result.layout.clips}
+    assert by_track == {1: -1.5, 2: SILENT_DB}
+    [mute] = [i for i in result.report["not_expressible"] if i["feature"] == "audio_mute"]
+    assert mute["location"] == "audio_tracks[1].mute"
+    assert "exported silent (volume -96 dB each" in mute["detail"]
+    notes = {(i["feature"], i["location"]) for i in result.report["notes"]}
+    assert ("audio_track_gain", "audio_tracks[0].gain_db") in notes
+    assert ("audio_track_gain", "audio_tracks[1].gain_db") not in notes  # no gain was folded in
+    # The same clips are the ones the review render plays nothing for: the two agree.
+    hub = fake_hub(plan)
+    timeline = build_timeline(render_layout(plan, hub, permissive()), hub)
+    silent = {where for code, where, _ in timeline.silent if code == "audio_mute"}
+    assert silent == {c.location for c in result.layout.clips if c.volume_db == SILENT_DB}
+    assert {s.location for s in timeline.sounds} == {"segments[0]"}
+
+
+def test_a_muted_outro_track_with_no_bus_is_exported_silent() -> None:
+    from aar.plan.export.layout import SILENT_DB
+
+    data = plan_data(
+        sources=[source(frame_size=[1920, 1080]), source("outro", duration=48)],
+        segments=[seg(1, a=0, b=24)],
+        audio_tracks=[{"name": "A1"}, {"name": "A5", "gain_db": -1.0, "mute": True}],
+    )
+    data["outro"] = {"source": "outro", "audio_track": "A5"}
+    layout = export(EditPlan.model_validate(data)).layout
+    volumes = {c.location: c.volume_db for c in layout.clips}
+    assert volumes == {"segments[0]": 0.0, "outro": SILENT_DB}
+
+
 def test_track_gain_is_folded_into_clip_volume_and_mute_is_kept_audible() -> None:
     plan = _plan(
         segments=[seg(1, a=0, b=24, gain_db=-3.0), seg(2, a=0, b=24, record_in=0)],

@@ -100,6 +100,10 @@ _JOBS_PAGE_SIZE = 25
 _JOB_FILTERS = ("state", "node", "project", "kind")
 _JOB_QUERY_KEYS = frozenset({"page", *_JOB_FILTERS})
 
+#: A review attachment is shown on the card as escaped text only when it is ``text/plain`` and
+#: at most this many bytes; anything else is a download link.
+MAX_ATTACHMENT_BYTES = 64 * 1024
+
 # Media types the console will hand to the browser as themselves. Anything else is
 # served as a download, so an agent cannot get HTML or SVG rendered as this origin.
 _INLINE_MIME = frozenset(
@@ -455,6 +459,13 @@ code{white-space:nowrap}
 video,img.render{display:block;width:100%;max-height:62vh;background:#000;border-radius:6px;
 margin:.6rem 0}
 .renders{display:flex;flex-wrap:wrap;gap:.5rem;font-size:.85rem}
+.attach{border:1px solid var(--line);border-left:4px solid #b7791f;border-radius:6px;
+margin:.6rem 0;background:#fffdf5}
+.attach summary{cursor:pointer;font-weight:600;font-size:.9rem;padding:.55rem .7rem}
+.attach pre{margin:0;padding:.6rem .7rem;border-top:1px solid var(--line);max-height:24rem;
+overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;
+font:.8rem/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.attach-missing{font-size:.9rem}
 .review-body{display:grid;gap:.25rem 1.25rem;align-items:start}
 .review-body h3:first-child{margin-top:.6rem}
 .subform{border-top:1px solid var(--line);margin-top:1rem;padding-top:.25rem}
@@ -895,6 +906,41 @@ class Console:
             ), None
         return fmt('<p><a href="{src}">Download {label}</a></p>', src=href, label=label), None
 
+    def attachment(self, artifact_id: str) -> Html:
+        """One review attachment: a small plain-text artifact as escaped text, open, so the
+        reviewer reads it before deciding (a recipe gate's handoff notes: what the video does
+        not show). Anything else, or one that cannot be read, is a download link that says so."""
+        meta = self.store.get_meta(artifact_id)
+        role = meta.meta.get("role") if meta else None
+        label = role.replace("-", " ") if isinstance(role, str) and role else "attachment"
+        href = url("artifacts", artifact_id)
+        problem = "not plain text, or too long to show here"
+        if meta and meta.mime == "text/plain" and meta.size <= MAX_ATTACHMENT_BYTES:
+            data: bytes | None = None
+            try:
+                # Then the file's own size: any writer can claim a record, so the recorded
+                # size only spares opening an honest large artifact.
+                with self.store.open(artifact_id) as handle:
+                    if os.fstat(handle.fileno()).st_size <= MAX_ATTACHMENT_BYTES:
+                        data = handle.read(MAX_ATTACHMENT_BYTES)
+            except (OSError, CorruptArtifact) as exc:
+                logger.error("review attachment %s cannot be read: %s", artifact_id, exc)
+                problem = "it could not be read from the store"
+            if data:
+                return fmt(
+                    '<details class="attach" open><summary>Read before deciding: {label}'
+                    "</summary><pre>{text}</pre></details>",
+                    label=label,
+                    text=data.decode("utf-8", errors="replace").replace("\r\n", "\n"),
+                )
+        return fmt(
+            '<p class="attach-missing">Read before deciding: <a href="{href}">download the '
+            "{label}</a> ({problem}).</p>",
+            href=href,
+            label=label,
+            problem=problem,
+        )
+
     def review_card(
         self, ctx: _Page, review: reviews.Review, names: dict[str, str], *, detail: bool
     ) -> Html:
@@ -936,14 +982,17 @@ class Console:
         decision = self.decision_block(ctx, review, return_to="detail" if detail else "queue")
         open_for_notes = detail and review.pending and review.decision is None
         note_form = self.note_form(ctx, review, first_player) if open_for_notes else Html("")
+        # On the queue too: a review can be decided from either page.
+        attached = join([self.attachment(artifact_id) for artifact_id in review.attachments])
         return fmt(
             '<article class="card">{title}{meta}<div class="review-body"><div class="media">'
-            '{players}{extra}</div><div class="side"><h3>Notes</h3>{notes}{decision}</div>'
-            "{note_form}</div></article>",
+            '{players}{extra}{attached}</div><div class="side"><h3>Notes</h3>{notes}{decision}'
+            "</div>{note_form}</div></article>",
             title=title,
             meta=meta,
             players=join(players),
             extra=extra,
+            attached=attached,
             notes=notes,
             note_form=note_form,
             decision=decision,

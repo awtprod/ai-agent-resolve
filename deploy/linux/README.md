@@ -26,7 +26,9 @@ mode 0700.
 (the recipe modules: `recipe_create` on the MCP server accepts `ccn-longform` only when it is
 loaded), `AAR_MEDIA_ROOT` (recipe params must name files under it), `AAR_MODEL_DIR` and
 `AAR_YUNET_MODEL` (models, never downloaded), `AAR_WORK_DIR` (step scratch) and
-`AAR_EXPORT_DIR` (the edit PC's share). The media root layout is in `docs/MEDIA-STORE.md`.
+`AAR_EXPORT_DIR` (the edit PC's share; required: without it the `ccn-longform` export step
+fails `export_dir_unset` instead of finishing with nothing delivered). The media root layout is
+in `docs/MEDIA-STORE.md`.
 
 ## The worker (`aar-hub-worker`)
 

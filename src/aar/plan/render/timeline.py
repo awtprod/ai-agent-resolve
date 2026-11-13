@@ -18,7 +18,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from aar.plan.export.layout import ClipSpec, Layout, TitleSpec, TransitionSpec
+from aar.plan.export.layout import (
+    ClipSpec,
+    Layout,
+    TitleSpec,
+    TransitionSpec,
+    muted_without_bus,
+)
 from aar.plan.model import EditPlan, Segment
 from aar.plan.render.errors import RenderError
 from aar.plan.render.framing import Framing, framing_for
@@ -130,13 +136,6 @@ def _sound_range(layout: Layout, clip: ClipSpec) -> tuple[int, int, int, int]:
     return start, end, fade_in, fade_out
 
 
-def _muted_without_bus(plan: EditPlan, track: int | None) -> bool:
-    tracks = plan.audio_tracks
-    if track is None or not 1 <= track <= len(tracks):
-        return False
-    return tracks[track - 1].mute and tracks[track - 1].bus is None
-
-
 def build_timeline(layout: Layout, hub: dict[str, HubSource]) -> Timeline:
     """Pictures, sounds, dissolves and titles for the layout, or ``segment_past_media_end`` when
     a clip (handles included) plays past the last frame of its file's video stream."""
@@ -184,7 +183,7 @@ def build_timeline(layout: Layout, hub: dict[str, HubSource]) -> Timeline:
         )
         start, end, fade_in, fade_out = _sound_range(layout, clip)
         src_start = clip.src_in - (clip.record_in - start)
-        if _muted_without_bus(plan, clip.audio_track):
+        if muted_without_bus(plan, clip.audio_track):
             name = plan.audio_tracks[(clip.audio_track or 1) - 1].name
             tl.silent.append(
                 (

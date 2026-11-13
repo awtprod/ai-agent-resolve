@@ -55,6 +55,7 @@ WRITE_TOOL_NAMES = (
     "job_submit",
     "job_cancel",
     "project_register",
+    "project_source",
 )
 READ_TOOL_NAMES = ("facts_get", "brief_get", "plan_get")
 
@@ -282,7 +283,9 @@ def register_write_tools(
             "registered without a source (omit source_kind, locator and host): its name is "
             "then its identity, so a name or alias any project already has is refused with "
             "project_exists and details.existing_id; the Resolve source is attached later "
-            "with `aar hub project source` (a human or an agent on the hub). "
+            "with project_source. A registration with a source may not take a name or alias "
+            "such a project holds either (project_exists naming it): attach the source to "
+            "that project with project_source instead of registering the show twice. "
             + _IDENTITY
             + "name is the display name (1-500 characters). source_kind is cloud_library | "
             "local_db | drp_file | drt_file. locator is an object; for cloud_library and "
@@ -318,6 +321,45 @@ def register_write_tools(
                 host=host,
                 aliases=aliases,
                 project_id=project_id,
+                idempotency_key=idempotency_key,
+            )
+        )
+
+    @server.tool(
+        name="project_source",
+        description=(
+            "Attach a Resolve source to a project the hub already holds: the way to connect a "
+            "show registered without a source (project_register with no source_kind) to its "
+            "Resolve project, keeping its one registry id. One Resolve unique id maps to one "
+            "registry project: a uid another project holds is refused with project_exists and "
+            "details.existing_id. " + _IDENTITY + "project_id is the registry id (prj_..., "
+            "see projects_list). source_kind is cloud_library | local_db | drp_file | "
+            "drt_file. locator is an object; for cloud_library and local_db it must be "
+            "exactly {project_id: the Resolve unique id (Project.GetUniqueId()), name: the "
+            "Resolve project name, folder_path: [Project Manager folder names from the root; "
+            "[] is the root]}. host is optional text. A node cannot do this. Example: "
+            "project_id 'prj_1a2b', source_kind 'local_db', locator {project_id: 'a1b2', "
+            "name: 'Show', folder_path: ['Shows']}. Returns {ok: true, op: 'project.source', "
+            "replayed, project_id, project: {id, name, sources, aliases, created}}. " + _ERRORS
+        ),
+        annotations=_WRITE,
+    )
+    def project_source_tool(
+        agent_id: str,
+        idempotency_key: str,
+        project_id: str,
+        source_kind: str,
+        locator: dict[str, Any],
+        host: str | None = None,
+    ) -> CallToolResult:
+        return run(
+            lambda: project_register.add_source(
+                log,
+                _agent(agent_id),
+                project_id,
+                source_kind=source_kind,
+                locator=locator,
+                host=host,
                 idempotency_key=idempotency_key,
             )
         )

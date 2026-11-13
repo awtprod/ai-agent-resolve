@@ -286,8 +286,8 @@ class Registry:
         the original create (a genuine retry), which returns the existing project.
 
         ``unique_name`` (off by default; the agent-facing registration in
-        :mod:`aar.hub.project_register` sets it for a project without sources, whose name is
-        its identity) applies the reserved-name rule of :meth:`_refuse_taken_name`, raising
+        :mod:`aar.hub.project_register` sets it: a project without sources is known by its
+        name) applies the reserved-name rule of :meth:`_refuse_taken_name`, raising
         :class:`DuplicateProjectName`. It is checked inside the write transaction, after the
         retry check, so a retry replays and two racing creates yield one project.
         """

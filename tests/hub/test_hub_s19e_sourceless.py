@@ -126,11 +126,46 @@ def test_a_sourced_registration_keeps_its_name_rules(hub: Hub) -> None:
     assert out["project"]["name"] == " Fakes " and out["project"]["aliases"] == ["x\u200by"]
 
 
-def test_a_sourced_registration_is_still_identified_by_its_uid_only(hub: Hub) -> None:
-    """Unchanged S17 behaviour, pinned: a sourced project may share a source-less one's name."""
-    loose = _register(hub)["project_id"]
-    sourced = _register(hub, key="s", source_kind="local_db", locator=dict(LOC))["project_id"]
-    assert sourced != loose
+def test_a_sourced_registration_cannot_take_a_sourceless_shows_name(hub: Hub) -> None:
+    """S19e-f MED (review finding 8): registering the show's Resolve project under its name
+    made a second project, splitting plans, reviews and Resolve jobs between two ids."""
+    loose = _register(hub, aliases=["Fakes 5-23"])["project_id"]
+    for n, name in enumerate(["Fakes", "Fakes 5-23"]):
+        error = _refused(
+            hub, "project_exists", key=f"s{n}", name=name, source_kind="local_db", locator=LOC
+        )
+        assert error.details == {"existing_id": loose, "name": name}
+        assert f"`aar hub project source {loose}`" in error.fix_hint
+        assert "project_source" in error.fix_hint
+    error = _refused(  # an alias of the new project collides too
+        hub, "project_exists", key="s2", name="X", aliases=["Fakes"], source_kind="local_db",
+        locator=LOC,
+    )  # fmt: skip
+    assert error.details["existing_id"] == loose
+    # the way through: attach the source to the show, which keeps its one id
+    attached = project_register.add_source(
+        hub.log, AGENT, loose, source_kind="local_db", locator=dict(LOC), idempotency_key="a1"
+    )
+    assert attached.project_id == loose
+    assert [p.id for p in Registry(hub.log).list() if p.name == "Fakes"] == [loose]
+
+
+def test_a_sourced_registration_retry_replays_after_a_sourceless_show_took_its_name(
+    hub: Hub,
+) -> None:
+    """The name check runs after the retry check, as for a source-less registration."""
+    first = _register(hub, key="s", source_kind="local_db", locator=dict(LOC))
+    Registry(hub.log).create_project("Fakes", HUMAN)  # a library caller may still share it
+    again = _register(hub, key="s", source_kind="local_db", locator=dict(LOC))
+    assert again["replayed"] is True and again["project_id"] == first["project_id"]
+
+
+def test_two_sourced_projects_may_still_share_a_name(hub: Hub) -> None:
+    """Unchanged S17 behaviour: sourced projects are told apart by their Resolve ids."""
+    first = _register(hub, key="s1", source_kind="local_db", locator=dict(LOC))["project_id"]
+    other = {**LOC, "project_id": "uid-2"}
+    second = _register(hub, key="s2", source_kind="local_db", locator=other)["project_id"]
+    assert first != second
 
 
 def test_the_registry_refuses_a_twin_only_when_asked(hub: Hub) -> None:
@@ -488,6 +523,39 @@ def test_project_register_tool_without_a_source_and_the_read_tools(hub: Hub) -> 
     assert pid in [p["id"] for p in listed["projects"]]
     board = _call(hub, "project_board", {"project_id": pid})
     assert board.is_error is False and board.structured_content["leases"] == []
+
+
+def test_project_source_tool_attaches_the_source_a_sourced_register_is_pointed_to(
+    hub: Hub,
+) -> None:
+    """An MCP-only agent had no way to attach a source, so it registered the show twice."""
+    base = {"agent_id": "agent-1", "name": "Fakes"}
+    pid = _call(hub, "project_register", {**base, "idempotency_key": "m1"}).structured_content[
+        "project_id"
+    ]
+    source = {"source_kind": "local_db", "locator": LOC}
+    twin = _call(hub, "project_register", {**base, **source, "idempotency_key": "m2"})
+    error = twin.structured_content["error"]
+    assert twin.is_error is True and error["code"] == "project_exists"
+    assert error["details"]["existing_id"] == pid and "project_source" in error["fix_hint"]
+
+    args = {"agent_id": "agent-1", "idempotency_key": "m3", "project_id": pid, **source}
+    ok = _call(hub, "project_source", args)
+    assert ok.is_error is False, ok.content
+    assert ok.structured_content["op"] == "project.source"
+    assert ok.structured_content["project"]["sources"] == [
+        {"kind": "local_db", "locator": LOC, "host": None}
+    ]
+    assert _call(hub, "project_source", args).structured_content["replayed"] is True
+    assert [p.id for p in Registry(hub.log).list() if p.name == "Fakes"] == [pid]
+
+    other = _call(hub, "project_source", {**args, "idempotency_key": "m4", "project_id": "prj_x"})
+    assert other.structured_content["error"]["code"] == "unknown_project"
+    taken = _call(
+        hub, "project_source", {**args, "idempotency_key": "m5", "project_id": hub.project_id}
+    )
+    assert taken.structured_content["error"]["code"] == "project_exists"
+    assert taken.structured_content["error"]["details"]["existing_id"] == pid
 
 
 # -- rename and alias keep a source-less project's name its own (probe p1) ---------------------

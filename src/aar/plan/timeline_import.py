@@ -440,10 +440,19 @@ class ImportResult:
         return int(self.diff.get("primary_not_carried") or 0)
 
     @property
+    def not_carried(self) -> int:
+        """Edits the timeline holds, or lacks, that the plan does not follow (the diff's
+        ``not_carried``): an export of the edited plan differs from the owner's timeline at
+        each one, so the owner's edit would be lost there."""
+        return len(self.diff.get("not_carried") or [])
+
+    @property
     def needs_attention(self) -> bool:
-        """Exit 1 in the CLI: lint or export errors, or items on the primary track the plan
-        could not hold."""
-        return self.has_errors or self.primary_not_carried > 0
+        """Exit 1 in the CLI: lint or export errors, or anything not carried, on any track (a
+        sound added or removed on its own, a retime, a title or a transition added in Resolve,
+        an item on the primary track the plan could not hold). A plan that drops one of the
+        owner's edits is never returned as a clean import."""
+        return self.has_errors or self.primary_not_carried > 0 or self.not_carried > 0
 
 
 @dataclass

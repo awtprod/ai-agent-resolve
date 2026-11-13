@@ -82,6 +82,8 @@ MAX_NOTE = 4000
 MAX_REASON = 2000
 MAX_TIMELINE = 200
 MAX_RENDERS = 16
+#: Text artifacts a review shows its reviewer beside the renders (a recipe gate's handoff notes).
+MAX_ATTACHMENTS = 8
 MAX_FRAME = 10**9
 MAX_FPS = 1000.0
 
@@ -225,6 +227,8 @@ class Review:
     notes: tuple[Note, ...]
     decision: Decision | None
     withdrawal: Withdrawal | None = None
+    #: Artifacts to read before deciding (not renders): what the reviewed video does not show.
+    attachments: tuple[str, ...] = ()
 
     @property
     def pending(self) -> bool:
@@ -240,6 +244,7 @@ class Review:
             "pending": self.pending,
             "subject": self.subject,
             "renders": list(self.renders),
+            "attachments": list(self.attachments),
             "timeline": self.timeline,
             "fps": self.fps,
             "requested_by": self.requested_by,
@@ -397,16 +402,20 @@ def _withdrawal_from_event(event: Event) -> Withdrawal:
     )
 
 
-def _renders_from(data: dict[str, Any]) -> tuple[str, ...]:
-    """Return the well-formed render ids in a review node's data.
+def _artifact_ids_from(data: dict[str, Any], key: str) -> tuple[str, ...]:
+    """Return the well-formed artifact ids under ``key`` in a review node's data.
 
     Review nodes made with the generic graph API carry arbitrary data, so only ids
     that look like artifact ids are kept; nothing else is ever served.
     """
-    renders = data.get("renders")
-    if not isinstance(renders, list):
+    ids = data.get(key)
+    if not isinstance(ids, list):
         return ()
-    return tuple(r for r in renders if isinstance(r, str) and _ARTIFACT_RE.fullmatch(r))
+    return tuple(r for r in ids if isinstance(r, str) and _ARTIFACT_RE.fullmatch(r))
+
+
+def _renders_from(data: dict[str, Any]) -> tuple[str, ...]:
+    return _artifact_ids_from(data, "renders")
 
 
 def _optional_str(data: dict[str, Any], key: str, max_len: int = MAX_TITLE) -> str | None:
@@ -443,6 +452,7 @@ def _build_review(
         decision=decision,
         # A withdrawal is shown only when the graph agrees the review was cancelled.
         withdrawal=withdrawal if node.status == "cancelled" else None,
+        attachments=_artifact_ids_from(data, "attachments")[:MAX_ATTACHMENTS],
     )
 
 

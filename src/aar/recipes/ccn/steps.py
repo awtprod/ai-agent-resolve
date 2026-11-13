@@ -43,9 +43,10 @@ from aar.plan.render import RenderError, RenderTerminated, render_plan
 from aar.plan.stub import StubError, StubSource, build_stub
 from aar.qa.report import QAReport
 from aar.recipes.ccn import transcript as transcript_mod
-from aar.recipes.ccn.export_files import copy_out, safe_name
+from aar.recipes.ccn.export_files import copy_out, export_root, safe_name
 from aar.recipes.ccn.faults import qa_failure_upstream, upstream_failure
 from aar.recipes.ccn.guide import artifact_get, build_guide
+from aar.recipes.ccn.handoff import NOTES_MIME, NOTES_SUFFIX, handoff_notes
 from aar.recipes.ccn.params import CcnLongformParams, check_hub_file
 from aar.recipes.ccn.scratch import drop_scratch, op_scratch
 from aar.recipes.ccn.transcript import (
@@ -538,9 +539,11 @@ def render_step(ctx: StepContext) -> StepOutput:
 
 
 def export_step(ctx: StepContext) -> StepOutput:
-    """Export the submitted plan as FCPXML with the params' media map, store it and its report,
-    and copy the FCPXML and the review MP4 to ``AAR_EXPORT_DIR/<project>/<timeline>/``, named
-    from the stub step's runner-recorded outputs."""
+    """Export the submitted plan as FCPXML with the params' media map, store it, its report and
+    the handoff notes (:mod:`.handoff`), and copy the review MP4, the notes and the FCPXML to
+    ``AAR_EXPORT_DIR/<project>/<timeline>/``, named from the stub step's runner-recorded outputs.
+    The copy is the step's purpose: an unset ``AAR_EXPORT_DIR`` fails it before any work."""
+    export_root()
     params = _params(ctx)
     profile = _profile(ctx)
     _plan_node, plan = check_plan(ctx)
@@ -561,23 +564,38 @@ def export_step(ctx: StepContext) -> StepOutput:
     )
     report_id = _json_artifact(ctx, result.report, "export-report")
     review_mp4 = _need(ctx, "render", "review_mp4")
+    project, timeline = _need(ctx, "stub", "project"), _need(ctx, "stub", "timeline")
+    round_ = _round(ctx)
+    loudness = ctx.needs.get("render", {}).get("loudness")
+    notes = handoff_notes(
+        project=project,
+        timeline=timeline,
+        round_=round_,
+        report=result.report,
+        report_id=report_id,
+        loudness=loudness if isinstance(loudness, dict) else None,
+    )
+    notes_id = ctx.put(notes.encode("utf-8"), mime=NOTES_MIME, meta={"role": "handoff-notes"})
+    # The FCPXML last: it is in the share only once the video and the notes are (export_files).
     copy = copy_out(
         ctx,
-        _need(ctx, "stub", "project"),
-        _need(ctx, "stub", "timeline"),
-        _round(ctx),
-        [(".fcpxml", fcpxml_id), (".review.mp4", review_mp4)],
+        project,
+        timeline,
+        round_,
+        [(".review.mp4", review_mp4), (NOTES_SUFFIX, notes_id), (".fcpxml", fcpxml_id)],
     )
-    if copy.get("copied"):
-        copy["fcpxml"], copy["review_mp4"] = copy.pop("files")
+    copy["review_mp4"], copy["handoff_notes"], copy["fcpxml"] = copy.pop("files")
     return StepOutput(
         outputs={
             "fcpxml": fcpxml_id,
             "export_report": report_id,
+            "handoff_notes": notes_id,
+            # Shown to the reviewer on the gate's review card (the engine's review_attachments).
+            "review_attachments": [notes_id],
             "assets": [m.get("src") for m in result.report.get("media", [])][:16],
             "copy": copy,
         },
-        artifact_ids=(fcpxml_id, report_id),
+        artifact_ids=(fcpxml_id, report_id, notes_id),
     )
 
 
