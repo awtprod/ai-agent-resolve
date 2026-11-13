@@ -1,5 +1,6 @@
-"""``aar media``: ingest and resolve Linux-resident source media, and read a file's start
-timecode (``aar media timecode FILE``, S18a) so an operator can fill a plan stub by hand."""
+"""``aar media``: ingest and resolve Linux-resident source media, read a file's start timecode
+(``aar media timecode FILE``, S18a) so an operator can fill a plan stub by hand, and shrink a
+camera proxy into a small working copy (``aar media shrink``, S19b, :mod:`aar.media.shrink`)."""
 
 from __future__ import annotations
 
@@ -76,6 +77,16 @@ def register(subparsers: Any) -> None:
     )
     timecode.add_argument("file", type=Path, help="Linux-local media file.")
     timecode.set_defaults(func=_cmd_timecode)
+
+    from aar.media import shrink
+
+    shrink.add_arguments(
+        commands.add_parser(
+            "shrink",
+            help="Make a small working copy of a camera proxy (same frames, lossless audio).",
+            description=shrink.DESCRIPTION,
+        )
+    )
 
 
 def _add_hub(parser: argparse.ArgumentParser) -> None:
