@@ -365,3 +365,27 @@ def test_an_accepted_group_shows_at_most_what_the_guide_prints(hub: Hub) -> None
     assert page.count('class="retire"') == cap
     assert "Rule 0." in page and f"Rule {cap - 1}." in page and f"Rule {cap}." not in page
     assert f"3 more past the limit of {cap}; cut guides print only the first {cap}." in page
+
+
+def test_a_forged_event_with_a_lone_surrogate_cannot_break_the_page(hub: Hub) -> None:
+    """Review finding: a lone surrogate (JSON-escaped in the payload) made /lessons answer 500,
+    which blocked deciding every proposal. The fold skips such events, so the page renders."""
+    surrogate = chr(0xDCFF)
+    waiting = lessons.propose(hub.log, "Keep whole thoughts.", "global", AGENT)
+
+    def proposal(**changes: Any) -> dict[str, Any]:
+        base = {"lesson_id": lessons.new_lesson_id(), "text": "A rule.", "scope": "global"}
+        return {**base, "why": "", "source": None, **changes}
+
+    forged = [
+        proposal(text="Keep the punchline." + surrogate),
+        proposal(why=surrogate),
+        proposal(scope=f"project:{hub.project}{surrogate}"),
+        proposal(source={"project_id": hub.project + surrogate, "review_id": hub.plain_review}),
+    ]
+    for payload in forged:
+        hub.log.append(lessons.EVENT_PROPOSED, AGENT, payload)
+    response = hub.client().get("/lessons")
+    assert response.status_code == 200
+    assert "4 malformed events ignored" in response.text
+    assert f"/lessons/{waiting.id}/decide" in response.text  # the real proposal can be decided

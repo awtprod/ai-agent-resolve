@@ -30,8 +30,10 @@ be able to write instructions into future guides. The writers refuse every other
 that fails validation) is skipped and listed, never applied. There is no CLI or MCP write path;
 a person writes in the console.
 
-**Bounds.** Text is one line (stripped, every whitespace run one space), 1-500 characters; a
-proposal's ``why`` 0-1000 and a drop or retire reason 0-500, normalized the same way. At most
+**Bounds.** Text is one line (stripped, every whitespace run one space), 1-500 characters, with
+no character a reader cannot see (:func:`hidden_character`: such a character could carry an
+instruction past the person who accepts the lesson); a proposal's ``why`` 0-1000 and a drop or
+retire reason 0-500, normalized and checked the same way. At most
 :data:`MAX_PENDING` proposals wait at once, and a scope holds at most
 :data:`MAX_ACCEPTED_PER_SCOPE` accepted lessons; the guide reads at most that many per scope too.
 
@@ -47,6 +49,7 @@ from __future__ import annotations
 
 import re
 import secrets
+import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import Any
@@ -96,9 +99,12 @@ GLOBAL = "global"
 LESSON_ID_RE = re.compile(r"^les_[0-9a-f]{16}$")
 _PROFILE_NAME = re.compile(NAME_RE)  # the hub's rule-profile name pattern: never a path
 _SPACE_RUN = re.compile(r"\s+")
-# Checked after whitespace runs are collapsed: every other control character (C0, DEL, C1) and
-# the Unicode bidirectional controls, which can make a line display as something it does not say.
-_FORBIDDEN = re.compile(r"[\x00-\x1f\x7f-\x9f؜‎‏‪-‮⁦-⁩]")
+#: Unicode categories a reader cannot see: control (Cc), format (Cf: zero-width, bidirectional
+#: and tag characters, the soft hyphen, the byte order mark), surrogate (Cs, which no page can
+#: encode), private use (Co) and unassigned (Cn).
+_HIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
+#: Variation selectors (category Mn) show nothing themselves, and can carry bytes like tags can.
+_VARIATION_SELECTORS = ((0x180B, 0x180F), (0xFE00, 0xFE0F), (0xE0100, 0xE01EF))
 _SCOPE_HINT = "Use 'global', 'client:<rule profile>' (such as 'client:ccn') or 'project:<prj_id>'."
 
 
@@ -109,6 +115,31 @@ def new_lesson_id() -> str:
 
 def _invalid(field: str, message: str, hint: str) -> WriteError:
     return WriteError("invalid_input", f"{field} {message}", hint, field=field)
+
+
+def hidden_character(text: str) -> str | None:
+    """The first character of ``text`` a reader cannot see, or ``None``.
+
+    Control, format, surrogate, private-use and unassigned code points, and variation selectors.
+    A lesson is shown to a person before it reaches a guide, so it must say only what they see.
+    """
+    for char in text:
+        point = ord(char)
+        if unicodedata.category(char) in _HIDDEN_CATEGORIES or any(
+            low <= point <= high for low, high in _VARIATION_SELECTORS
+        ):
+            return char
+    return None
+
+
+def _unseen(char: str) -> str:
+    return f"a character a reader cannot see (U+{ord(char):04X})"
+
+
+_VISIBLE_HINT = (
+    "Write plain visible text: control, zero-width, bidirectional, tag, private-use and other "
+    "invisible characters are refused."
+)
 
 
 # -- scope -------------------------------------------------------------------------------------
@@ -146,7 +177,10 @@ def parse_scope(value: Any) -> LessonScope:
             )
         return LessonScope("client", name)
     if sep and kind == "project":
-        return LessonScope("project", check_id(name, "scope"))
+        hidden = hidden_character(check_id(name, "scope"))
+        if hidden is not None:
+            raise _invalid("scope", f"names a project id with {_unseen(hidden)}", _VISIBLE_HINT)
+        return LessonScope("project", name)
     raise _invalid(
         "scope",
         f"must be 'global', 'client:<name>' or 'project:<id>', got {value!r:.80}",
@@ -183,10 +217,11 @@ def _line_problem(value: Any, field: str, max_len: int, *, required: bool) -> st
     the writers' own before they append."""
     if not isinstance(value, str):
         return f"{field} is not text"
-    if _FORBIDDEN.search(value):
-        return f"{field} contains a control character"
     if len(value) > max_len:
         return f"{field} is over {max_len} characters"
+    hidden = hidden_character(value)
+    if hidden is not None:
+        return f"{field} holds {_unseen(hidden)}"
     if required and not value:
         return f"{field} is empty"
     if _one_line(value) != value:
@@ -197,8 +232,9 @@ def _line_problem(value: Any, field: str, max_len: int, *, required: bool) -> st
 def clean_line(value: Any, field: str, *, max_len: int, required: bool = True) -> str:
     """``value`` as one line: stripped, every whitespace run (newlines included) one space.
 
-    Refuses anything but text, any other control character, empty text when ``required``, and
-    more than ``max_len`` characters after normalizing (``invalid_input``).
+    Refuses anything but text, more than ``max_len`` characters after normalizing, any character
+    a reader cannot see (:func:`hidden_character`) and empty text when ``required``
+    (``invalid_input``).
     """
     hint = f"Write {field} as one line of at most {max_len} characters."
     if not isinstance(value, str):
@@ -206,14 +242,15 @@ def clean_line(value: Any, field: str, *, max_len: int, required: bool = True) -
     if len(value) > MAX_RAW:
         raise _invalid(field, f"is {len(value)} characters before normalizing", hint)
     text = _one_line(value)
-    if _FORBIDDEN.search(text):
-        raise _invalid(field, "must not contain control characters", hint)
-    if required and not text:
-        raise _invalid(field, "must not be empty", hint)
     if len(text) > max_len:
         raise _invalid(
             field, f"must be at most {max_len} characters after normalizing (got {len(text)})", hint
         )
+    hidden = hidden_character(text)
+    if hidden is not None:
+        raise _invalid(field, f"must not hold {_unseen(hidden)}", _VISIBLE_HINT)
+    if required and not text:
+        raise _invalid(field, "must not be empty", hint)
     return text
 
 
@@ -250,10 +287,15 @@ def _check_source(source: Any) -> dict[str, str] | None:
             "Name the review the lesson was drawn from, or leave source out.",
         )
     project_id, review_id = source
-    return {
+    checked = {
         "project_id": check_id(project_id, "source.project_id"),
         "review_id": check_id(review_id, "source.review_id"),
     }
+    for key, value in checked.items():
+        hidden = hidden_character(value)
+        if hidden is not None:
+            raise _invalid(f"source.{key}", f"holds {_unseen(hidden)}", _VISIBLE_HINT)
+    return checked
 
 
 # -- the lesson ----------------------------------------------------------------------------------
@@ -383,8 +425,12 @@ def _source_problem(value: Any) -> str | None:
     if not isinstance(value, dict):
         return "source is not an object or null"
     for key in ("project_id", "review_id"):
-        if not is_text(value.get(key), MAX_ID):
+        ident = value.get(key)
+        if not is_text(ident, MAX_ID):
             return f"source.{key} is not an id"
+        hidden = hidden_character(ident)
+        if hidden is not None:
+            return f"source.{key} holds {_unseen(hidden)}"
     return None
 
 
@@ -860,6 +906,7 @@ __all__ = [
     "clean_line",
     "drop",
     "get_lesson",
+    "hidden_character",
     "lessons_for_guide",
     "parse_scope",
     "propose",
