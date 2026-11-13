@@ -950,7 +950,11 @@ def test_a_second_pass_while_a_chat_runs_is_busy(hub: Hub) -> None:
 
 def test_the_lock_is_a_private_file_beside_the_database_and_stays(hub: Hub) -> None:
     pytest.importorskip("fcntl")
-    run(hub, FakeClient())
+    umask = os.umask(0o022)  # a umask that lets group and others read: the mode must not
+    try:
+        run(hub, FakeClient())
+    finally:
+        os.umask(umask)
     assert lock_path(hub).is_file() and lock_path(hub).parent == Path(hub.log.path).parent
     assert stat.S_IMODE(lock_path(hub).stat().st_mode) == 0o600
 
