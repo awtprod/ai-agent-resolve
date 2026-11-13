@@ -11,7 +11,13 @@ from apply_builders import plan_data, seg, source
 from export_support import FIXTURES, ccn, export, load_plan, permissive
 
 from aar.plan.apply.errors import CompileError
-from aar.plan.export import EXPORT_CODES, ExportError, build_layout, export_fcpxml
+from aar.plan.export import (
+    EXPORT_CODES,
+    ExportError,
+    build_layout,
+    export_fcpxml,
+    media_map_from_mapping,
+)
 from aar.plan.export.fcpxml import number
 from aar.plan.export.layout import transform_spec
 from aar.plan.model import EditPlan, Segment
@@ -57,6 +63,7 @@ def test_export_codes_are_stable() -> None:
             "unknown_source",
             "zero_length_segment",
             "media_not_on_edit_pc",
+            "media_collides_on_edit_pc",
             "source_size_required",
             "conflicting_source_durations",
             "conflicting_source_start_timecodes",
@@ -569,6 +576,48 @@ def test_media_refusals() -> None:
     _refused(_plan(sources=[source(media="/srv/media/a.mov")]), "media_not_on_edit_pc")
     error = _refused(_plan(sources=[source(media="Ep1 Multicam")]), "pool_source_not_exportable")
     assert "camera file" in error.fix_hint
+
+
+def _two(first: str, second: str, **kwargs: Any) -> EditPlan:
+    sized = {"frame_size": [1920, 1080], **kwargs}
+    return _plan(
+        sources=[source("a", first, **sized), source("b", second, **sized)],
+        segments=[seg(src="a"), seg(src="b")],
+    )
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("/srv/media/A.mov", "/srv/media/a.mov"),
+        ("/srv/media/Day1/a.mov", "/srv/media/day1/a.mov"),
+        ("/srv/media/A.mov", "file:///srv/media/a.mov"),
+        ("/srv/media/\u00c9t\u00e9.mov", "/srv/media/\u00e9t\u00e9.mov"),
+        # nested map roots: two hub files at the very same edit-PC path
+        ("/srv/media/sub/a.mov", "/srv/other/a.mov"),
+    ],
+)
+def test_two_hub_files_that_are_one_file_on_windows_are_refused(first: str, second: str) -> None:
+    """The hub tells ``A.mov`` from ``a.mov``; Windows does not, so only one of them can be on
+    the edit PC and both clips would play it."""
+    media_map = media_map_from_mapping({"/srv/media": "E:\\Media", "/srv/other": "E:\\Media\\sub"})
+    error = _refused(_two(first, second), "media_collides_on_edit_pc", media_map=media_map)
+    assert error.details["sources"] == ["a", "b"]
+    assert "one file on the edit PC" in error.message
+    assert "rename" in error.fix_hint
+
+
+def test_what_windows_keeps_apart_is_not_a_collision() -> None:
+    media_map = media_map_from_mapping({"/srv/media": "E:\\Media"})
+    # one hub file named by two sources (and by two spellings) is still one asset
+    for second in ("/srv/media/A.mov", "file:///srv/media/A.mov"):
+        root = _xml(_two("/srv/media/A.mov", second), media_map=media_map)
+        assert len(list(root.iter("asset"))) == 1
+    # eszett has no one-letter capital: NTFS keeps these two names apart
+    root = _xml(_two("/srv/media/stra\u00dfe.mov", "/srv/media/strasse.mov"), media_map=media_map)
+    assert len(list(root.iter("asset"))) == 2
+    # edit-PC paths given directly name the PC's own files: two spellings are one file there
+    assert _xml(_two("E:/Media/A.mov", "e:\\media\\a.mov")) is not None
 
 
 @pytest.mark.parametrize(

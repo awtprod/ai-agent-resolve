@@ -58,7 +58,13 @@ from aar.plan.apply.compile import (
     transition_alignment,
 )
 from aar.plan.export.errors import ExportError
-from aar.plan.export.media import MediaMap, MediaRef, media_ref
+from aar.plan.export.media import (
+    MediaMap,
+    MediaRef,
+    collision_text,
+    media_ref,
+    windows_collision,
+)
 from aar.plan.export.timebase import Timebase
 from aar.plan.model import EditPlan, ReframeKey, Segment, Source, Transform
 
@@ -504,8 +510,27 @@ class _Builder:
         for source in self.plan.sources:
             if source.id in used and source.id not in self.layout.media:
                 self.layout.media[source.id] = self.resolve_media(source)
+        self._check_windows_collisions()
         self._check_shared_durations()
         self._check_shared_start_timecodes()
+
+    def _check_windows_collisions(self) -> None:
+        """Two different hub files may not be one file on the edit PC (Windows ignores case):
+        only one of them can exist there, so one of the two clips would play the wrong media."""
+        clash = windows_collision(self.layout.media.values())
+        if clash is None:
+            return
+        first, second = clash
+        raise ExportError(
+            "media_collides_on_edit_pc",
+            f"sources {first.source_id!r} and {second.source_id!r}: "
+            f"{collision_text(first, second)}",
+            "rename one of the files (or its folder) on the hub so the names differ by more "
+            "than case, stage it again, and give the new path",
+            sources=[first.source_id, second.source_id],
+            hub_paths=[first.hub_path, second.hub_path],
+            media=[first.windows_path, second.windows_path],
+        )
 
     def _check_shared_durations(self) -> None:
         """Sources that share one media file may not disagree about its length (one asset)."""

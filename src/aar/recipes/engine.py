@@ -28,10 +28,17 @@ from collections.abc import Callable, Mapping
 from datetime import timedelta
 from typing import Any
 
-from aar.hub.common import Clock, iso, parse_ts, utcnow
+from aar.hub.common import Clock, is_text, iso, parse_ts, utcnow
 from aar.hub.events import Actor, EventLog
 from aar.hub.graph import WorkGraph, allowed_transitions
-from aar.hub.reviews import MAX_ATTACHMENTS, ReviewNotOpen, get_review, withdraw
+from aar.hub.reviews import (
+    MAX_ATTACHMENTS,
+    MAX_FPS,
+    MAX_TIMELINE,
+    ReviewNotOpen,
+    get_review,
+    withdraw,
+)
 from aar.hub.writes import (
     _append_record,
     _in_transaction,
@@ -1251,6 +1258,7 @@ def _open_gate_reviews(
         base = f"aar.recipe.review/{op.op_id}"
         if log.get_by_idempotency_key(base + "#link") is not None:
             continue
+        timeline, fps = _review_context(subject_outputs)
         review_id = _open_review_node(
             log,
             state.project_id,
@@ -1259,6 +1267,8 @@ def _open_gate_reviews(
             title=f"gate {step.id} (round {op.round})",
             base=base,
             attachments=_review_attachments(state, step),
+            timeline=timeline,
+            fps=fps,
         )
         with _in_transaction(log) as txn:
             txn.append(
@@ -1299,19 +1309,22 @@ def _open_review_node(
     title: str,
     base: str,
     attachments: tuple[str, ...] = (),
+    timeline: str | None = None,
+    fps: float | None = None,
 ) -> str:
     """Create a ``review`` node (status active) plus its ``reviews`` edge, requested by RUNNER.
 
     The requester is RUNNER, so no agent can withdraw the gate review (F2/F8); a human still can.
     Done without the artifact store (``advance`` has no store): the renders are the subject step's
     already-stored outputs. A human decides it in the console; nothing here can decide a review.
-    ``attachments`` (:func:`_review_attachments`) are shown on the review card beside the renders.
+    ``attachments`` (:func:`_review_attachments`) are shown on the review card beside the renders;
+    ``timeline`` and ``fps`` (:func:`_review_context`) say what the render is of and at what rate.
     """
     data: dict[str, Any] = {
         "subject": subject,
         "renders": list(renders),
-        "timeline": None,
-        "fps": None,
+        "timeline": timeline,
+        "fps": fps,
         "requested_by": _caller_ref(RUNNER),
     }
     if attachments:  # absent when there are none: such a node is as it was before attachments
@@ -1339,6 +1352,20 @@ def _review_attachments(state: RunState, step: StepDef) -> tuple[str, ...]:
         if isinstance(offered, list):
             found += [a for a in offered if isinstance(a, str) and a not in found]
     return tuple(found[:MAX_ATTACHMENTS])
+
+
+def _review_context(outputs: dict[str, Any]) -> tuple[str | None, float | None]:
+    """The timeline name and frame rate of the reviewed render, which the subject step offers
+    under ``review_timeline`` and ``review_fps`` (the ccn render does). With a rate the console
+    takes a note's frame from the player and derives its timecode; without one the reviewer
+    types both. A value a review could not hold is left out, never written."""
+    timeline = outputs.get("review_timeline")
+    fps = outputs.get("review_fps")
+    usable = isinstance(fps, (int, float)) and not isinstance(fps, bool) and 0 < fps <= MAX_FPS
+    return (
+        timeline if is_text(timeline, MAX_TIMELINE) else None,
+        float(fps) if usable else None,
+    )
 
 
 def _review_subject(outputs: dict[str, Any]) -> tuple[str | None, tuple[str, ...]]:

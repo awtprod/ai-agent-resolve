@@ -515,6 +515,10 @@ def render_step(ctx: StepContext) -> StepOutput:
         outputs={
             "subject_node": plan_node,
             "artifact_ids": [mp4_id],
+            # what the gate's review is of: with the rate, the console takes a note's frame
+            # from the player (the render plays the timeline frame for frame from 0)
+            "review_timeline": _need(ctx, "stub", "timeline"),
+            "review_fps": plan.fps.num / plan.fps.den,
             "review_mp4": mp4_id,
             "render_report": report_id,
             "sha256": report["sha256"],

@@ -18,6 +18,9 @@ PC can open, or the export is refused.
   a media path that is a map root (a directory, not a file); a name ending in a space or a dot
   (Windows cannot open it); a relative name (a producer stub's
   media must be absolute edit-PC paths, or hub paths with ``--media-map``).
+* Two different hub files the map puts at one edit-PC file are refused as
+  ``media_collides_on_edit_pc`` (:func:`windows_collision`): the hub tells ``A.mov`` from
+  ``a.mov``, Windows does not, so only one of them can exist there and both clips would play it.
 
 Nothing here touches the network or a file other than the media map itself.
 """
@@ -26,12 +29,13 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, unquote, urlsplit
 
-from aar.drp.modify.paths import MapResult
+from aar.drp.modify.paths import MapResult, ntfs_upper
 from aar.host.errors import ConfigError
 from aar.host.pathmap import HostPathMap
 from aar.plan.apply.inputs import classify_media, is_edit_path
@@ -66,7 +70,8 @@ class MediaMap:
 
 @dataclass(frozen=True)
 class MediaRef:
-    """Where one source's media is for FCPXML: the ``src`` URL and which rule produced it."""
+    """Where one source's media is for FCPXML: the ``src`` URL and which rule produced it.
+    ``hub_path`` is the hub file a ``media-map`` ref was mapped from."""
 
     source_id: str
     plan_media: str
@@ -74,6 +79,7 @@ class MediaRef:
     rule: MediaRuleName
     windows_path: str
     name: str
+    hub_path: str | None = None
 
     def as_dict(self) -> dict[str, str]:
         return {
@@ -208,6 +214,47 @@ def _from_linux(source: Source, linux_path: str, media_map: MediaMap | None) -> 
         "media-map",
         mapped.new,
         _basename(mapped.new),
+        linux_path,
+    )
+
+
+def windows_key(path: str) -> str:
+    """An edit-PC path as Windows compares it: either separator, and no case
+    (:func:`aar.drp.modify.paths.ntfs_upper`, which folds a few non-ASCII pairs NTFS keeps
+    apart, never the other way round). Two paths with one key are taken as one file there."""
+    return ntfs_upper(path.replace("/", "\\"))
+
+
+def windows_collision(refs: Iterable[MediaRef]) -> tuple[MediaRef, MediaRef] | None:
+    """The first two refs that are different hub files but one file on the edit PC, or None.
+
+    Only ``media-map`` refs are compared: for those the hub names both files, so they are known
+    to be two. The usual case is names that differ only in case (``A.mov`` and ``a.mov``, or a
+    folder above them); nested map roots can also put two hub files at the very same path. Two
+    spellings of one edit-PC path given directly are one file by definition and are left alone.
+    """
+    seen: dict[str, MediaRef] = {}
+    for ref in refs:
+        if ref.rule != "media-map":
+            continue
+        first = seen.setdefault(windows_key(ref.windows_path), ref)
+        if first.hub_path != ref.hub_path:
+            return first, ref
+    return None
+
+
+def collision_text(first: MediaRef, second: MediaRef) -> str:
+    """What :func:`windows_collision` found, for a message: the hub files and where they land."""
+    if first.windows_path == second.windows_path:
+        where = f"both map to {first.windows_path}"
+    else:
+        where = (
+            f"map to {first.windows_path} and {second.windows_path}, which Windows reads as one "
+            "name (it ignores case)"
+        )
+    return (
+        f"{first.hub_path} and {second.hub_path} are different files on the hub but one file "
+        f"on the edit PC: they {where}"
     )
 
 

@@ -101,6 +101,26 @@ def test_unedited_timeline_round_trips(tmp_path: Path, capsys: pytest.CaptureFix
     assert diff["timeline"]["file"] == str(drt) and len(diff["timeline"]["sha256"]) == 64
 
 
+def test_the_summary_says_what_the_reader_cannot_see_even_with_no_changes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ "no changes" covers only what the reader sees: a clip the owner disabled reads as playing
+    and title text is not read, so the summary an agent acts on says the plan is partial."""
+    drt, plan = setup(tmp_path)
+    code, out, _ = call(tmp_path, capsys, drt, plan)
+    assert code == 0 and "no changes" in out
+    line = next(text for text in out.splitlines() if text.startswith("NOT READ"))
+    diff = json.loads((tmp_path / "edited.diff.json").read_text())
+    assert [limit.partition(":")[0] for limit in diff["limits"]] == [
+        "enabled_state",
+        "audio_transitions",
+        "titles",
+        "not_read",
+    ]
+    assert line.startswith("NOT READ (enabled_state, audio_transitions, titles, not_read): ")
+    assert "partial reconstruction" in line and "disabled in Resolve is imported as playing" in line
+
+
 def test_a_head_trim_through_the_cli(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     edited = [
         CLIPS[0],

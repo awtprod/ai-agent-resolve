@@ -3,7 +3,9 @@
 Every hub path must be absolute, name an existing regular file, and lie under ``AAR_MEDIA_ROOT``
 when that is set (resolved with ``realpath``, so a symlink cannot lead out of it). The media map
 (hub root -> edit-PC root, the FCPXML export's own) must parse as the export parses it and must
-cover every source, so a run never finds out at the export step that the PC cannot link a clip.
+cover every source, so a run never finds out at the export step that the PC cannot link a clip;
+for the same reason two sources that would be one file on the PC (names that differ only in
+case) are refused here.
 """
 
 from __future__ import annotations
@@ -15,7 +17,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from aar.hub.writes import SEGMENT_RE, TitleText
 from aar.plan.export.errors import ExportError
-from aar.plan.export.media import media_map_from_mapping, media_ref
+from aar.plan.export.media import (
+    collision_text,
+    media_map_from_mapping,
+    media_ref,
+    windows_collision,
+)
 from aar.plan.model import ShotSize, Source
 from aar.plan.stub import first_duplicate
 
@@ -111,14 +118,24 @@ class CcnLongformParams(BaseModel):
     @model_validator(mode="after")
     def _covered(self) -> CcnLongformParams:
         mapping = media_map_from_mapping(self.media_map)
+        refs = []
         for n, source in enumerate(self.sources):
             try:
-                media_ref(Source(id=source.id or f"source-{n}", media=source.path), mapping)
+                refs.append(
+                    media_ref(Source(id=source.id or f"source-{n}", media=source.path), mapping)
+                )
             except ExportError as exc:
                 raise ValueError(
                     f"sources[{n}] {source.path!r}: the media map does not give the edit PC's "
                     f"path for it ({exc.message})"
                 ) from None
+        clash = windows_collision(refs)
+        if clash is not None:
+            a, b = (next(n for n, ref in enumerate(refs) if ref is found) for found in clash)
+            raise ValueError(
+                f"sources[{a}] and sources[{b}]: {collision_text(*clash)}; rename one of them "
+                "on the hub so the names differ by more than case"
+            )
         return self
 
     def pause_trim_on(self) -> bool:

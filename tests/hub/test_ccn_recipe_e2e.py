@@ -105,6 +105,9 @@ def test_ccn_longform_runs_end_to_end(ccn_env: CcnEnv, tmp_path: Path) -> None:
     shown = get_review(env.hub.log, env.hub.project_id, review1)
     assert shown is not None and shown.renders == (render["review_mp4"],)
     assert shown.attachments == (export["handoff_notes"],)
+    # ... and knows what it is of and at what rate, so a note's frame comes from the player
+    assert shown.timeline == "Synthetic Long v1"
+    assert shown.fps == plan.fps.num / plan.fps.den == 30000 / 1001
 
     # Round 1 is rejected: the run goes back to the cut, never to the transcript.
     decide(env.hub.log, env.hub.project_id, review1, "reject", "end on the laugh", HUMAN)
