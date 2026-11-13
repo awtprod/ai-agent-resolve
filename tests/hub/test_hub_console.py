@@ -16,10 +16,10 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from aar.cli import main
-from aar.hub import approvals, control, lessons, reviews
+from aar.hub import approvals, control, lessons, project_register, reviews
 from aar.hub.artifacts import ArtifactStore
 from aar.hub.common import HumanRequired
-from aar.hub.console import WRITE_ROUTES, ConsoleConfig, CsrfSigner, build_app
+from aar.hub.console import WRITE_ROUTES, ConsoleConfig, CsrfSigner, build_app, esc, url
 from aar.hub.events import Actor, EventLog
 from aar.hub.graph import WorkGraph
 from aar.hub.leaseboard import record_lease_event
@@ -132,6 +132,38 @@ def test_agent_strings_render_escaped_on_every_page(hub: Hub) -> None:
         )
         assert nonce is not None
         assert body.count("<script") == body.count(f'<script nonce="{nonce.group(1)}"') == 1
+
+
+def test_a_project_name_with_a_lone_surrogate_cannot_break_a_page(hub: Hub) -> None:
+    """Validator probe P9 (on dev already for /control, the emergency stop): an agent can register
+    a project whose name holds a lone surrogate (``project_register`` over MCP, or a CLI argument
+    byte that is not UTF-8), and no page holding it could be encoded. Pages show U+FFFD instead."""
+    name = "Synthetic Show \udcff"
+    made = project_register.register_project(hub.log, AGENT, name=name, idempotency_key="sur-1")
+    project_id = made.project_id
+    stored = Registry(hub.log).get(project_id)
+    assert stored is not None and stored.name == name  # stored as sent: fixed where it renders
+    op = WorkGraph(hub.log, project_id).add_node("op", AGENT, title="build").id
+    render = hub.store.put(RENDER, actor=AGENT, mime="video/mp4", project_id=project_id)
+    reviews.request_review(hub.log, hub.store, project_id, op, [render], AGENT, title="cut v1")
+    lessons.add(hub.log, "Hold the wide shot on a laugh.", f"project:{project_id}", HUMAN)
+    shown = "Synthetic Show \ufffd"
+    for client, pages in (
+        (hub.client(), ("/", "/lessons", "/control")),
+        (hub.client(ConsoleConfig(operator=None, csrf_secret=SECRET)), ("/", "/lessons")),
+    ):
+        for path in pages:
+            response = client.get(path)
+            assert response.status_code == 200, path
+            assert shown in response.text, path
+        assert client.get("/control").status_code == 200
+
+
+def test_esc_and_url_replace_a_lone_surrogate() -> None:
+    assert esc('a\ud800"b\udfff') == "a\ufffd&quot;b\ufffd"
+    assert url("reviews", "prj\udcff", "rev_1") == "/reviews/prj%EF%BF%BD/rev_1"
+    assert url("jobs", state="a\udcffb") == "/jobs?state=a%EF%BF%BDb"
+    assert esc("été \U0001f600") == "été \U0001f600"  # a real non-ASCII character stays
 
 
 def test_flash_codes_are_not_reflected(hub: Hub) -> None:

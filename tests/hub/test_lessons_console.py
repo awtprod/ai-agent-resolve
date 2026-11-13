@@ -10,8 +10,9 @@ from typing import Any
 import pytest
 from test_hub_console import AGENT, HUMAN, ORIGIN, SECRET, Hub, _form
 
-from aar.hub import console, lessons
+from aar.hub import console, lessons, project_register
 from aar.hub.console import ConsoleConfig, CsrfSigner
+from aar.hub.events import Actor
 from aar.hub.registry import Registry
 
 JSON = {**ORIGIN, "Accept": "application/json"}
@@ -64,7 +65,8 @@ def test_the_page_renders_each_section(hub: Hub) -> None:
     assert "Round 1 cut the punchline." in page and "No reason was given." in page
     assert f'href="/reviews/{hub.project}/{hub.plain_review}"' in page
     assert "Not drawn from a review." in page
-    assert "agent-1" in page and "suggested for Project: demo-show (this project only)" in page
+    demo = f"Project: demo-show ({hub.project})"  # a project always shows its id
+    assert "agent-1" in page and f"suggested for {demo}" in page
     decide = f"/lessons/{proposal.id}/decide"
     assert _textarea(page, decide) == "Keep the setup with its punchline."
     assert _selected(page, decide) == [project]
@@ -76,7 +78,7 @@ def test_the_page_renders_each_section(hub: Hub) -> None:
     for label in (
         "Global (every show)",
         "Client: ccn (every show whose brief uses the ccn rule profile)",
-        "Project: demo-show (this project only)",
+        demo,
     ):
         assert f">{label}</option>" in form, label
 
@@ -86,7 +88,7 @@ def test_the_page_renders_each_section(hub: Hub) -> None:
     assert headings == [
         "Global (every show)",
         "Client: ccn (every show whose brief uses the ccn rule profile)",
-        "Project: demo-show (this project only)",
+        demo,
     ]
     assert accepted.count('class="retire"') == 3
     assert accepted.index("End on the laugh.") < accepted.index("Prefer few, long ranges.")
@@ -352,8 +354,8 @@ def test_two_projects_with_one_name_are_told_apart(hub: Hub) -> None:
     twin = Registry(hub.log).create_project("demo-show", HUMAN).id
     lessons.add(hub.log, "A rule for the twin.", f"project:{twin}", HUMAN)
     page = hub.client().get("/lessons").text
-    assert f">Project: demo-show [{hub.project}] (this project only)</option>" in page
-    assert f"<h3>Project: demo-show [{twin}] (this project only)</h3>" in page
+    assert f">Project: demo-show ({hub.project})</option>" in page
+    assert f"<h3>Project: demo-show ({twin})</h3>" in page
 
 
 def test_an_accepted_group_shows_at_most_what_the_guide_prints(hub: Hub) -> None:
@@ -389,3 +391,59 @@ def test_a_forged_event_with_a_lone_surrogate_cannot_break_the_page(hub: Hub) ->
     assert response.status_code == 200
     assert "4 malformed events ignored" in response.text
     assert f"/lessons/{waiting.id}/decide" in response.text  # the real proposal can be decided
+
+
+def test_a_project_always_shows_its_id_so_look_alike_names_differ(hub: Hub) -> None:
+    """Validator probe P5: the agent-facing registration accepts a name that differs from another
+    only by an invisible character (here a Hangul filler), and the two options looked the same."""
+    twin = project_register.register_project(
+        hub.log, AGENT, name="demo-show\u3164", idempotency_key="look-alike"
+    ).project_id
+    hub.log.append(  # a project the registry does not know (the writer checks it; the fold cannot)
+        lessons.EVENT_ADDED,
+        HUMAN,
+        {"lesson_id": lessons.new_lesson_id(), "text": "A rule.", "scope": "project:prj_gone"},
+    )
+    page = hub.client().get("/lessons").text
+    start = page.index('action="/lessons/add"')
+    form = page[start : page.index("</form>", start)]
+    labels = {
+        value: html.unescape(label)
+        for value, label in re.findall(r'<option value="([^"]*)"[^>]*>([^<]*)</option>', form)
+    }
+    assert labels[f"project:{hub.project}"] == f"Project: demo-show ({hub.project})"
+    assert labels[f"project:{twin}"] == f"Project: demo-show\u3164 ({twin})"
+    seen = [label.replace("\u3164", "") for label in labels.values()]
+    assert len(seen) == len(set(seen)), seen
+    assert "<h3>Project: prj_gone (not registered)</h3>" in page
+
+
+def test_a_raw_event_cannot_grow_the_page_or_break_its_times(hub: Hub) -> None:
+    """Validator probes P3/P8: a raw proposal signed with a 1 MiB actor id was shown in full (25 of
+    them made a 26 MB page), and one whose time overflowed when converted to UTC answered 500."""
+    huge = "a" * 1024 * 1024
+
+    def proposal() -> dict[str, Any]:
+        return {
+            "lesson_id": lessons.new_lesson_id(),
+            "text": "A rule.",
+            "scope": "global",
+            "why": "",
+            "source": None,
+        }
+
+    for _ in range(3):
+        hub.log.append(lessons.EVENT_PROPOSED, Actor("agent", huge), proposal())
+    for ts in (huge, "9999-12-31T23:59:59-23:59", "0001-01-01T00:00:00+23:59"):
+        hub.log.append(lessons.EVENT_PROPOSED, AGENT, proposal(), ts=ts)
+    response = hub.client().get("/lessons")
+    assert response.status_code == 200
+    assert "6 malformed events ignored" in response.text
+    assert "Proposed (0)" in response.text and huge[:200] not in response.text
+    assert len(response.content) < 100_000
+
+
+@pytest.mark.parametrize("ts", ["9999-12-31T23:59:59-23:59", "0001-01-01T00:00:00+23:59"])
+def test_a_time_out_of_range_in_utc_is_shown_as_written(ts: str) -> None:
+    """Every page formats times with ``_when``, which raised OverflowError (a 500) for these."""
+    assert console._when(ts) == ts and console._when(ts, short=True) == ts

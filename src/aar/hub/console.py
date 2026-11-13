@@ -47,7 +47,6 @@ import os
 import re
 import secrets
 import time
-from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import BinaryIO
@@ -166,11 +165,24 @@ class Html(str):
     __slots__ = ()
 
 
+#: A lone surrogate (U+D800-U+DFFF) cannot be encoded as UTF-8, and stored text can hold one: a
+#: JSON ``\udcff`` escape, or a CLI argument byte that is not UTF-8 (a project name registered
+#: that way made /control and /lessons answer 500). Every value is rendered through :func:`esc`
+#: or :func:`url`, which replace each with U+FFFD, so stored data cannot break a page.
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
+
+
+def _encodable(text: str) -> str:
+    """``text`` with each lone surrogate replaced by U+FFFD (the replacement character)."""
+    return _SURROGATE.sub("\ufffd", text)
+
+
 def esc(value: object) -> Html:
-    """Escape ``value`` for HTML text or a quoted attribute, unless it is already :class:`Html`."""
+    """Escape ``value`` for HTML text or a quoted attribute, unless it is already :class:`Html`.
+    A lone surrogate, which no page could encode, becomes U+FFFD."""
     if isinstance(value, Html):
         return value
-    return Html(html.escape("" if value is None else str(value), quote=True))
+    return Html(_encodable(html.escape("" if value is None else str(value), quote=True)))
 
 
 def fmt(template: str, **values: object) -> Html:
@@ -184,10 +196,13 @@ def join(parts: list[Html] | Iterator[Html]) -> Html:
 
 
 def url(*segments: str, **query: str) -> str:
-    """Build a same-origin path; each segment is percent-encoded so ids cannot add paths."""
-    path = "/" + "/".join(quote(segment, safe="") for segment in segments)
+    """Build a same-origin path; each segment is percent-encoded so ids cannot add paths (and a
+    lone surrogate, which ``quote`` cannot encode, becomes U+FFFD first)."""
+    path = "/" + "/".join(quote(_encodable(segment), safe="") for segment in segments)
     if query:
-        path += "?" + "&".join(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in query.items())
+        path += "?" + "&".join(
+            f"{quote(k, safe='')}={quote(_encodable(v), safe='')}" for k, v in query.items()
+        )
     return path
 
 
@@ -613,7 +628,7 @@ def _when(ts: str | None, *, short: bool = False) -> str:
         return "-"
     try:
         return parse_ts(ts).strftime("%m-%d %H:%M UTC" if short else "%Y-%m-%d %H:%M:%S UTC")
-    except ValueError:
+    except (ValueError, OverflowError):  # an offset can push a valid date past year 1 or 9999
         return ts
 
 
@@ -1539,32 +1554,27 @@ class Console:
     # -- lessons -------------------------------------------------------------------
 
     @staticmethod
-    def project_labels(names: dict[str, str]) -> dict[str, str]:
-        """Each project's name for lesson scopes; a name two projects share also gives the id."""
-        counts = Counter(names.values())
-        return {
-            project_id: name if counts[name] == 1 else f"{name} [{project_id}]"
-            for project_id, name in names.items()
-        }
-
-    @staticmethod
-    def scope_label(scope: str, labels: dict[str, str]) -> str:
-        """What a lesson scope means, in the words a person reads in a select or a heading."""
+    def scope_label(scope: str, names: dict[str, str]) -> str:
+        """What a lesson scope means, in the words a person reads in a select or a heading. A
+        project always shows its id after its name: two names can look the same (one may hold an
+        invisible character), and the id tells them apart."""
         kind, _, name = scope.partition(":")
         if scope == lessons.GLOBAL:
             return "Global (every show)"
         if kind == "client":
             return f"Client: {name} (every show whose brief uses the {name} rule profile)"
         if kind == "project":
-            return f"Project: {labels.get(name, name)} (this project only)"
+            if name in names:
+                return f"Project: {names[name]} ({name})"
+            return f"Project: {name} (not registered)"
         return scope
 
-    def scope_choices(self, labels: dict[str, str]) -> list[tuple[str, str]]:
+    def scope_choices(self, names: dict[str, str]) -> list[tuple[str, str]]:
         """Every scope a lesson can take: global, each built-in rule profile, each project."""
         scopes = [lessons.GLOBAL]
         scopes += [f"client:{name}" for name in builtin_profile_names()]
-        scopes += [f"project:{project_id}" for project_id in labels]
-        return [(scope, self.scope_label(scope, labels)) for scope in scopes]
+        scopes += [f"project:{project_id}" for project_id in names]
+        return [(scope, self.scope_label(scope, names)) for scope in scopes]
 
     @staticmethod
     def scope_options(choices: list[tuple[str, str]], selected: str) -> Html:
@@ -1583,7 +1593,7 @@ class Console:
         )
 
     def lessons_body(self, ctx: _Page) -> Html:
-        names = self.project_labels(self.project_names(ctx))
+        names = self.project_names(ctx)
         found, skipped = lessons.scan_lessons(self.log)
         ctx.note_skipped(skipped)
         choices = self.scope_choices(names)
