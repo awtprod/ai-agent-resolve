@@ -548,11 +548,13 @@ table.board th,table.board td{text-align:left;padding:.45rem .5rem;
 border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:break-word}
 table.board th{font-size:.78rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
 h2.section-title{margin:1.5rem 0 .6rem}
+section.card>h3:first-child{margin:0 0 .2rem;padding-bottom:.45rem;
+border-bottom:1px solid var(--line)}
 .lesson-text{font-weight:600;overflow-wrap:anywhere;margin:.2rem 0 .3rem}
 .why{overflow-wrap:anywhere;margin:.4rem 0}
 ul.lessons{list-style:none;padding:0;margin:.2rem 0 0}
 ul.lessons li{padding:.6rem 0;border-top:1px solid var(--line)}
-ul.lessons li:first-child{border-top:0;padding-top:.2rem}
+ul.lessons li:first-child{border-top:0}
 form.retire{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.45rem}
 form.retire input{flex:1 1 14rem;width:auto}
 @media (prefers-color-scheme:dark){
@@ -1628,7 +1630,7 @@ class Console:
                 s="" if hidden == 1 else "s",
             )
         return fmt(
-            '<h2 class="section-title">Proposed ({n})</h2>{cards}{more}',
+            '<h2 class="section-title" id="proposed">Proposed ({n})</h2>{cards}{more}',
             n=len(proposed),
             cards=cards,
             more=more,
@@ -1725,7 +1727,9 @@ class Console:
             else Html('<p class="empty card">No lesson is accepted yet.</p>')
         )
         return fmt(
-            '<h2 class="section-title">Accepted ({n})</h2>{body}', n=len(accepted), body=body
+            '<h2 class="section-title" id="accepted">Accepted ({n})</h2>{body}',
+            n=len(accepted),
+            body=body,
         )
 
     def accepted_group(
@@ -1783,7 +1787,7 @@ class Console:
         if ctx.actor is None:
             return Html("")
         return fmt(
-            '<h2 class="section-title">Add a lesson</h2>'
+            '<h2 class="section-title" id="add">Add a lesson</h2>'
             '<form method="post" action="/lessons/add" class="card">{hidden}'
             '<p class="meta">Write a rule by hand; it is accepted at once.</p>'
             '<label for="add-text">Lesson (one line)</label>'
