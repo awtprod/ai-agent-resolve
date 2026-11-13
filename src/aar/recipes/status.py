@@ -21,6 +21,7 @@ from aar.hub.common import Clock, utcnow
 from aar.hub.events import EventLog
 from aar.recipes.models import StepDef
 from aar.recipes.ports import HOT_STATES
+from aar.recipes.reopen import in_progress_action, reopen_offer, reopening
 from aar.recipes.state import OpAttempt, RunState, load_state
 
 MAX_OUTPUTS_KEYS = 32
@@ -28,6 +29,9 @@ MAX_STEP_OUTPUTS_BYTES = 8 * 1024
 MAX_STEP_ERROR_BYTES = 4 * 1024
 MAX_VIEW_BYTES = 64 * 1024
 MAX_ACTION_WHAT_BYTES = 256
+#: The state of a step while an unfinished reopen will still supersede its op or create its
+#: attempt (S19f): the worker acts next (``in_progress_action``), not a human or an agent.
+REOPENING_STATE = "waiting:reopen"
 
 
 def status_view(
@@ -43,12 +47,19 @@ def status_view(
     registered = state.recipe_def is not None
     step_defs: list[StepDef] = list(state.recipe_def.steps) if registered else []
     truncated = False
+    # S19f: while a reopen is unfinished, the ops it will supersede and the step it will create
+    # get its in-progress action instead of a retry or a run (MED-1 of the validation).
+    held_steps, held_ops = reopening(state)
     for step in step_defs:
         op = state.latest_in_round(step.id, current)
         # F17: a step done in an earlier round carries forward as done here.
         if op is None and state.is_step_done(step.id):
             op = state.done_op(step.id)
         step_state, action = _step_state(state, step, op, current, dispatcher)
+        held = held_ops.get(op.op_id) if op is not None else held_steps.get(step.id)
+        if held is not None and step_state != "done":
+            # the state agrees with the action: the worker finishes the reopen, nobody else acts
+            step_state, action = REOPENING_STATE, in_progress_action(held)
         outputs, out_trunc = _summary(op.result_outputs) if op is not None else (None, False)
         error, err_trunc = _error(op.result_error) if op is not None else (None, False)
         truncated = truncated or out_trunc or err_trunc
@@ -62,6 +73,11 @@ def status_view(
             "outputs": outputs,
             "error": error,
         }
+        if op is not None and op.reopened_for is not None:
+            # S19f: why this agent attempt exists (the failure its last output caused)
+            reopened, re_trunc = _reopened(op.reopened_for)
+            entry["reopened_for"] = reopened
+            truncated = truncated or re_trunc
         steps_out.append(entry)
         if action is not None:
             actions.append({"step_id": step.id, **action})
@@ -88,6 +104,14 @@ def status_view(
         "diagnostics": _diagnostics(log, state.project_id, recipe_node),
         "truncated": truncated,
     }
+    ignored_decisions = state.ignored_decisions()
+    if ignored_decisions:
+        # S19f: a human decision the fold ignores (recorded after a reopen superseded its gate),
+        # one line each, so whoever decided is not left guessing
+        view["ignored_decisions"] = [
+            {"review_id": d["review_id"], "decision": d["decision"], "what": d["what"]}
+            for d in ignored_decisions
+        ]
     return _enforce_total_bound(view)
 
 
@@ -182,15 +206,41 @@ def _summary(outputs: dict[str, Any] | None) -> tuple[dict[str, Any] | None, boo
     return {"truncated": True, "key_count": len(outputs), "bytes": size}, True
 
 
+def _reopened(reopened_for: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    keys = ("step", "attempt", "code", "message", "fix_hint", "op_node")
+    out = {k: reopened_for.get(k) for k in keys}
+    cut = False
+    for k in ("message", "fix_hint"):
+        text = out.get(k)
+        if isinstance(text, str) and len(text.encode("utf-8")) > MAX_STEP_ERROR_BYTES:
+            out[k] = text.encode("utf-8")[:MAX_STEP_ERROR_BYTES].decode("utf-8", "ignore")
+            cut = True
+    return out, cut
+
+
 def _error(error: dict[str, Any] | None) -> tuple[dict[str, Any] | None, bool]:
     if not error:
         return None, False
     out = {k: error.get(k) for k in ("code", "message", "fix_hint") if k in error}
+    if error.get("upstream") is True:
+        out["upstream"] = True  # S19f: the on_fail step's output caused it
     msg = out.get("message")
     if isinstance(msg, str) and len(msg.encode("utf-8")) > MAX_STEP_ERROR_BYTES:
         out["message"] = msg.encode("utf-8")[:MAX_STEP_ERROR_BYTES].decode("utf-8", "ignore")
         return out, True
     return out, False
+
+
+def _reopened_note(op: OpAttempt) -> str:
+    """`` (attempt N, reopened because ...)`` for a reopened agent attempt (S19f), else empty."""
+    why = op.reopened_for
+    if why is None:
+        return ""
+    return (
+        f" (attempt {op.attempt}, reopened because step {why.get('step')!r} attempt "
+        f"{why.get('attempt')} failed {why.get('code')}: see this step's reopened_for; submit a "
+        "changed result)"
+    )
 
 
 def _retry_action(recipe_node: str, step: StepDef) -> dict[str, Any]:
@@ -219,6 +269,9 @@ def _step_state(
             if code == "review_withdrawn":
                 return "failed", _retry_action(state.recipe_node, step)
             return "failed", {"who": "human", "what": f"gate {step.id!r}: {code}; cancel to exit"}
+        offer = reopen_offer(state, step)
+        if offer is not None:  # S19f: retrying it unchanged would fail the same way
+            return "failed", offer
         if attempts < step.max_attempts:
             return "failed", _retry_action(state.recipe_node, step)
         return "failed", {"who": "human", "what": f"step {step.id!r} is out of attempts"}
@@ -232,7 +285,7 @@ def _step_state(
     if step.kind == "agent":
         return "needs_agent", {
             "who": "agent",
-            "what": f"complete agent step {step.id!r}: {step.instruction}",
+            "what": f"complete agent step {step.id!r}{_reopened_note(op)}: {step.instruction}",
             "tool": "step_complete",
             "args": {
                 "recipe_node": state.recipe_node,

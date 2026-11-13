@@ -296,9 +296,16 @@ def test_a_render_that_fails_qa_names_the_checks(ccn_env: CcnEnv) -> None:
     op = latest(ccn_env, run1, "render")
     assert op.status == "failed" and op.result_error["code"] == "qa_failed"
     assert "loudness (fail)" in op.result_error["message"]
-    assert "a new run reuses the transcript" in op.result_error["fix_hint"]
-    # A retry renders the same plan again and fails the same way: the run cannot go back to the
-    # cut from here (only a gate's rejection does), so the hint says to start a new run.
+    # S19f: the failure is the cut's (marked upstream), so the hint and the status view name the
+    # reopen of the cut instead of a new run.
+    assert op.upstream is True and op.result_error["upstream"] is True
+    assert "recipe_reopen cut" in op.result_error["fix_hint"]
+    from aar.recipes.status import status_view
+
+    actions = status_view(ccn_env.hub.log, run1)["next_actions"]
+    assert [a.get("tool") for a in actions if a["step_id"] == "render"] == ["recipe_reopen"]
+    # A retry renders the same plan again and fails the same way (which is why the reopen exists:
+    # tests/hub/test_ccn_recipe_reopen.py).
     from aar.recipes.run import recipe_retry
 
     recipe_retry(ccn_env.hub.log, run1, "render", AGENT, idempotency_key="retry-render")

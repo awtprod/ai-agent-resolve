@@ -14,9 +14,11 @@ the recipe and its cold callables. The steps, on the S13g2 engine:
    hub's own paths, this run's artifact ids, the brief, the house rules, later rounds).
 6. ``cut`` (agent): the agent reads the guide, writes the keep list, runs ``aar plan produce``
    and ``aar plan lint`` itself, and submits the plan; the plan gate refuses lint errors.
-7. ``render`` (cold, idempotent): the plan checked against the stub, the review render on the
-   hub and its QA gate.
-8. ``export`` (cold, idempotent): FCPXML with the media map, stored and copied to the PC's share.
+7. ``render`` (cold, idempotent, ``on_fail="cut"``): the plan checked against the stub, the
+   review render on the hub and its QA gate. A failure the cut caused (:mod:`.faults`) is marked
+   upstream, and ``recipe_reopen cut`` opens the cut's next attempt in the same round.
+8. ``export`` (cold, idempotent, ``on_fail="cut"``): FCPXML with the media map, stored and
+   copied to the PC's share.
 9. ``review`` (gate): a human reviews the render; a rejection goes back to ``cut``.
 10. ``report``: the built-in ``recipe.report``.
 """
@@ -110,6 +112,7 @@ CCN_LONGFORM = RecipeDef(
             callable_id="ccn.render",
             idempotent=True,
             needs=("stub", "cut", "transcript", "laughs"),
+            on_fail="cut",  # a failure the cut caused is marked upstream: recipe_reopen cut
             timeout_s=4 * HOUR,
         ),
         StepDef(
@@ -118,6 +121,7 @@ CCN_LONGFORM = RecipeDef(
             callable_id="ccn.export",
             idempotent=True,
             needs=("stub", "cut", "render", "transcript", "laughs"),
+            on_fail="cut",
             timeout_s=HOUR,
         ),
         StepDef(

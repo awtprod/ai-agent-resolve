@@ -1,9 +1,9 @@
 """The ``aar recipe`` subcommand group: a thin JSON wrapper over :mod:`aar.recipes.run`.
 
-``aar recipe {list,show,start,status,complete,retry,cancel,worker}``. JSON in, JSON out. A refusal
-prints ``{"error": {code, message, fix_hint, details}}`` on stderr and exits 2, as the other ``aar``
-write surfaces do. Recipes are registered by modules named with ``--recipes`` (repeatable) or the
-``AAR_RECIPES`` env, loaded before the command runs.
+``aar recipe {list,show,start,status,complete,retry,reopen,cancel,worker}``. JSON in, JSON out.
+A refusal prints ``{"error": {code, message, fix_hint, details}}`` on stderr and exits 2, as the
+other ``aar`` write surfaces do. Recipes are registered by modules named with ``--recipes``
+(repeatable) or the ``AAR_RECIPES`` env, loaded before the command runs.
 """
 
 from __future__ import annotations
@@ -75,6 +75,18 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     retry.add_argument("--recipe", required=True, help="The recipe node id.")
     retry.add_argument("--step", required=True, help="The failed step id.")
     retry.set_defaults(func=_retry)
+
+    reopen = sub.add_parser(
+        "reopen",
+        help="Reopen an agent step whose output made a later step fail (same round).",
+    )
+    _add_db(reopen)
+    _add_recipes(reopen)
+    _add_actor(reopen)
+    _add_key(reopen)
+    reopen.add_argument("recipe_node", help="The recipe node id.")
+    reopen.add_argument("step", help="The agent step to reopen (the failed step's on_fail).")
+    reopen.set_defaults(func=_reopen)
 
     cancel = sub.add_parser("cancel", help="Cancel a run (cancel live ops, withdraw reviews).")
     _add_db(cancel)
@@ -249,6 +261,20 @@ def _retry(args: argparse.Namespace) -> int:
         actor = _parse_actor(args.actor)
         return _print(
             recipe_retry(log, args.recipe, args.step, actor, idempotency_key=args.idempotency_key)
+        )
+
+    return _with_db(args, run)
+
+
+def _reopen(args: argparse.Namespace) -> int:
+    from aar.recipes.run import recipe_reopen
+
+    def run(log: Any) -> int:
+        actor = _parse_actor(args.actor)
+        return _print(
+            recipe_reopen(
+                log, args.recipe_node, args.step, actor, idempotency_key=args.idempotency_key
+            )
         )
 
     return _with_db(args, run)

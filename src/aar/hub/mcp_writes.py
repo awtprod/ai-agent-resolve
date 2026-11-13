@@ -50,6 +50,7 @@ WRITE_TOOL_NAMES = (
     "recipe_start",
     "step_complete",
     "recipe_retry",
+    "recipe_reopen",
     "recipe_cancel",
     "job_submit",
     "job_cancel",
@@ -606,6 +607,33 @@ def register_write_tools(
     ) -> CallToolResult:
         return run_dict(
             lambda: recipe_run.recipe_retry(
+                log, recipe_node, step_id, _agent(agent_id), idempotency_key=idempotency_key
+            )
+        )
+
+    @server.tool(
+        name="recipe_reopen",
+        description=(
+            "Reopen an agent step whose output made a later step fail: when recipe_status shows "
+            "the next action recipe_reopen <step> (a cold step that declares on_fail = that step "
+            "failed because of its output, e.g. a render that failed QA), this supersedes the "
+            "step's done attempt and everything after it in the same round and opens the step's "
+            "next attempt, with reopened_for saying why. It is not a review round. "
+            + _IDENTITY
+            + "recipe_node and step_id name the agent step. Only the recipe's creator or a human "
+            "may reopen. Refused (recipe_not_open, recipe_blocked, not_agent_step, step_not_done, "
+            "no_upstream_failure, no_attempts_left, already_reopened) when it does not apply. "
+            "Then complete the step again with a changed result (an unchanged plan is refused "
+            "plan_unchanged). Example: recipe_node 'nd_0123456789abcdef', step_id 'cut'. "
+            "Returns {ok: true, op: 'recipe.reopen', ...status view}. " + _ERRORS
+        ),
+        annotations=_WRITE,
+    )
+    def recipe_reopen(
+        agent_id: str, idempotency_key: str, recipe_node: str, step_id: str
+    ) -> CallToolResult:
+        return run_dict(
+            lambda: recipe_run.recipe_reopen(
                 log, recipe_node, step_id, _agent(agent_id), idempotency_key=idempotency_key
             )
         )

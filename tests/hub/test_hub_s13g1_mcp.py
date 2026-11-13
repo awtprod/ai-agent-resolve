@@ -48,6 +48,7 @@ WRITE_TOOLS = {
     "recipe_start",
     "step_complete",
     "recipe_retry",
+    "recipe_reopen",
     "recipe_cancel",
     "job_submit",
     "job_cancel",

@@ -160,6 +160,13 @@ ERROR_CODES = frozenset(
         "step_not_open",
         "no_attempts_left",
         "rounds_exhausted",
+        # recipe_reopen's refusals (S19f)
+        "recipe_not_open",
+        "recipe_blocked",
+        "not_agent_step",
+        "step_not_done",
+        "no_upstream_failure",
+        "already_reopened",
         "outputs_too_large",
         "outputs_invalid",
         "review_withdrawn",

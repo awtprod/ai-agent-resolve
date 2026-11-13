@@ -44,6 +44,7 @@ from aar.plan.stub import StubError, StubSource, build_stub
 from aar.qa.report import QAReport
 from aar.recipes.ccn import transcript as transcript_mod
 from aar.recipes.ccn.export_files import copy_out, safe_name
+from aar.recipes.ccn.faults import qa_failure_upstream, upstream_failure
 from aar.recipes.ccn.guide import artifact_get, build_guide
 from aar.recipes.ccn.params import CcnLongformParams, check_hub_file
 from aar.recipes.ccn.scratch import drop_scratch, op_scratch
@@ -142,6 +143,17 @@ def _laughs(ctx: StepContext) -> LaughMap | None:
 def _analyze_failure(step: str, exc: AnalyzeError) -> StepFailure:
     """A typed step failure from an analysis error (``transcript_model-missing``...)."""
     return StepFailure(f"{step}_{exc.type}", str(exc), exc.hint)
+
+
+def _library_failure(step: str, exc: RenderError | ExportError) -> StepFailure:
+    """The step failure for a render or export refusal: ``<step>_<code>``, marked upstream when
+    :func:`~aar.recipes.ccn.faults.upstream_failure` says the cut caused it."""
+    code = f"{step}_{exc.code}"
+    upstream = upstream_failure(code, exc.details)
+    hint = exc.fix_hint
+    if upstream:
+        hint = f"{hint}; in the plan: reopen the cut (recipe_reopen cut) and submit a changed one"
+    return StepFailure(code, exc.message, hint, upstream=upstream)
 
 
 def _round(ctx: StepContext) -> int:
@@ -331,6 +343,11 @@ def aar_argv() -> list[str]:
     return [str(script)] if script.is_file() else [sys.executable, "-m", "aar"]
 
 
+def _cut_attempts(state: Any) -> int:
+    definition = state.recipe_def
+    return definition.step("cut").max_attempts if definition is not None else 3
+
+
 def guide_step(ctx: StepContext) -> StepOutput:
     """Write the ``cut`` step's full guide (:mod:`aar.recipes.ccn.guide`) as an artifact, with
     the hub paths this worker runs on and this run's input artifact ids."""
@@ -351,6 +368,7 @@ def guide_step(ctx: StepContext) -> StepOutput:
         laughs=dict(ctx.needs["laughs"]),
         aar=aar,
         python=sys.executable,
+        cut_attempts=_cut_attempts(state),
     )
     guide_id = ctx.put(text.encode("utf-8"), mime="text/markdown", meta={"role": "cut-guide"})
     read = artifact_get(
@@ -401,7 +419,9 @@ def check_plan(ctx: StepContext) -> tuple[str, EditPlan]:
         raise StepFailure(
             "plan_not_from_stub",
             "the submitted plan does not match this run's stub: " + "; ".join(diffs[:10]),
-            "make the plan with aar plan produce from the stub.json the guide fetches, unedited",
+            "make the plan with aar plan produce from the stub.json the guide fetches, unedited; "
+            "reopen the cut (recipe_reopen cut) and submit it",
+            upstream=upstream_failure("plan_not_from_stub"),
         )
     _check_media_unchanged(ctx, plan)
     return plan_node, plan
@@ -454,7 +474,7 @@ def render_step(ctx: StepContext) -> StepOutput:
                 plan, profile, out=out, preset="review", transcript=transcript, laughs=laughs
             )
         except RenderError as exc:
-            raise StepFailure(f"render_{exc.code}", exc.message, exc.fix_hint) from None
+            raise _library_failure("render", exc) from None
         except RenderTerminated as exc:
             # The render's SIGTERM handler killed ffmpeg and removed its work dir; the worker's
             # handler is back now: hand it the signal (it stops claiming) and leave the claim to
@@ -469,12 +489,25 @@ def render_step(ctx: StepContext) -> StepOutput:
     qa = QAReport.model_validate(report["qa"])
     gate = review_qa_gate(qa)
     if not gate.passed:
-        failing = [f"{r.name} ({r.detail})" for r in gate.reasons if not r.passed]
+        failed = [r for r in gate.reasons if not r.passed]
+        failing = [f"{r.name} ({r.detail})" for r in failed]
+        stored = f"the render and its report are stored (artifacts {mp4_id}, {report_id})"
+        # S19f: the cut's only when every failing check ran on the content and judged it; a
+        # check that could not run (a timeout, a MediaError, incomplete) is not the plan's.
+        if qa_failure_upstream(qa, [r.name for r in failed]):
+            raise StepFailure(
+                "qa_failed",
+                "the review render failed QA: " + "; ".join(failing),
+                f"{stored}; reopen the cut (recipe_reopen cut: recipe_status shows it) and "
+                "submit a changed plan",
+                upstream=True,
+            )
         raise StepFailure(
             "qa_failed",
             "the review render failed QA: " + "; ".join(failing),
-            f"the render and its report are stored (artifacts {mp4_id}, {report_id}); fix the "
-            "cut and run the recipe again (cancel this run; a new run reuses the transcript)",
+            f"{stored}; a QA check could not run or could not check everything (the report "
+            "says which and why), so the failure is not put on the cut: retry the render "
+            "(recipe_retry render) once the cause is fixed",
         )
     loudness = report.get("loudness") or {}
     return StepOutput(
@@ -522,7 +555,7 @@ def export_step(ctx: StepContext) -> StepOutput:
             allow_unknown_timecode=params.allow_unknown_timecode,
         )
     except ExportError as exc:
-        raise StepFailure(f"export_{exc.code}", exc.message, exc.fix_hint) from None
+        raise _library_failure("export", exc) from None
     fcpxml_id = ctx.put(
         result.fcpxml.encode("utf-8"), mime="application/xml", meta={"role": "fcpxml"}
     )

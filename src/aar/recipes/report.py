@@ -77,21 +77,34 @@ def build_report_text(log: EventLog, recipe_node: str) -> str:
             lines.append(
                 f"- round {op.round} attempt {op.attempt}: {outcome}{code} {_duration(op)}{flag}"
             )
+        fixes = _fix_attempts(attempts)
+        if fixes:
+            lines.append(f"- fix attempts: {fixes}")
         lines.append("")
 
     lines.append("## Gates")
     gate_lines = []
+    reopened = state.reopen_plans()
     for step_id in _step_order(state):
         for op in sorted(state.attempts_for(step_id), key=lambda op: (op.round, op.attempt)):
-            if op.kind != "gate" or op.review_id is None:
+            # S19f: None for a decision recorded after a reopen superseded the gate op (listed
+            # below); an approval recorded before the reopen is that round's history (a rejection
+            # recorded before it ended the round, so the reopen never applied)
+            d = state.gate_decision(op)
+            if d is None:
                 continue
-            review = state.reviews.get(op.review_id)
-            if review is None or review.decision is None:
-                continue
-            d = review.decision
+            history = ""
+            if op.op_id in reopened and d.decision == "approve":
+                plan = reopened[op.op_id][1]
+                history = (
+                    f" (attempt {op.attempt}, decided before a reopen of {plan.get('step')!r} "
+                    "superseded it)"
+                )
             gate_lines.append(
                 f"- {step_id} round {op.round}: {d.decision} by {d.by.kind}:{d.by.id} -- {d.reason}"
+                f"{history}"
             )
+    gate_lines.extend(f"- ignored: {entry['what']}" for entry in state.ignored_decisions())
     lines.extend(gate_lines or ["- (no decided gates)"])
     lines.append("")
 
@@ -134,6 +147,19 @@ def build_report_text(log: EventLog, recipe_node: str) -> str:
     lines.extend(art_lines or ["- (no artifacts)"])
     lines.append("")
     return "\n".join(lines)
+
+
+def _fix_attempts(attempts: list[OpAttempt]) -> str:
+    """For an agent step that any round gave more than one attempt (a reopen, S19f): the
+    attempts per round (``round 1: 2, round 2: 1``); else empty."""
+    if not attempts or attempts[0].kind != "agent":
+        return ""
+    per_round: dict[int, int] = {}
+    for op in attempts:
+        per_round[op.round] = per_round.get(op.round, 0) + 1
+    if max(per_round.values()) < 2:
+        return ""
+    return ", ".join(f"round {r}: {n}" for r, n in sorted(per_round.items()))
 
 
 def _canonical_value(value: object) -> str:
