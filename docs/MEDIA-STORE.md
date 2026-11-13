@@ -108,5 +108,61 @@ of the same file: the recipe's `media_map` (`{"<hub folder>": "<PC folder>"}`, t
 and each asset starts at the proxy's own start timecode, which is how Resolve links a clip to
 its file. For example `{"<media root>/share/incoming/Show_1": "E:\\Show_1"}` turns
 `<media root>/share/incoming/Show_1/Proxy/A001.mp4` into `file:///E:/Show_1/Proxy/A001.mp4`.
-The map must cover every source (the params refuse one it does not), and the PC's copy must be
-byte-identical to the hub's, so its timecode and frames are the same.
+The map must cover every source (the params refuse one it does not), and the PC's copy must
+describe the same frames as the hub's, with the same start timecode: byte-identical, or the hub's
+copy a shrink of the PC's (below).
+
+## Shrinking proxies before they reach the hub (S19b)
+
+A 90-minute camera proxy is about 5.5 GB and the hub's media disk holds about one, so a multicam
+show does not fit. `aar media shrink` makes a working copy of about a quarter of the size that
+describes the same frames: the same frame size, frame count, constant frame rate and start
+timecode, H.264 at a much lower bitrate with a keyframe at least every two seconds, and every
+audio stream kept lossless (FLAC in `.mp4`, ALAC in `.mov`). The hub transcribes, syncs, finds
+faces and renders the review copy from it; the exported timeline still links the PC's own
+full-size proxy through the media map. Each copy is verified against its source before it gets
+its name (docs/DESIGN.md "Shrunk working copies" lists the checks and the settings).
+
+**On the edit PC, before copying to the hub.** The PC has Python and ffmpeg/ffprobe on PATH but
+no `aar` installed; the command needs only the standard library, so run it from a copy of this
+repository's `src` folder, folder to folder, straight into the mapped share:
+
+```console
+> set PYTHONPATH=C:\aar\src
+> python -m aar.media.shrink E:\Show_1\Proxy --out Z:\incoming\Show_1\Proxy --report shrink.json
+```
+
+It takes the `.mp4`, `.m4v` and `.mov` files directly in the folder (at most 64, in name order)
+to the same names in `--out` (created if missing), prints one JSON line per file and exits 0 when
+every file was shrunk or already done, 2 otherwise. It never overwrites: a file already in `--out`
+that verifies as a shrink of its source is skipped, so rerunning after an interruption resumes the
+batch; one that does not verify is refused and left alone. A failed file does not stop the batch.
+Before each file it needs half the source's size free on the destination. A single file works
+too: `python -m aar.media.shrink A001.mp4 --out Z:\incoming\Show_1\Proxy\A001.mp4`.
+
+**A full-size copy already on the hub.** `--replace` writes the copy beside the file, verifies it,
+and atomically renames it over the original (the only mode that removes anything):
+
+```console
+aar media shrink <media root>/share/incoming/Show_1/Proxy/A001.mp4 --replace
+aar media shrink <media root>/share/incoming/Show_1/Proxy --replace
+```
+
+A file already marked as shrunk is never shrunk again (named alone it is refused, in a folder it
+is reported as `skipped`). `--replace` refuses a symbolic link (`symlink`: run it on the file the
+link points to); on a file with several hard links it replaces only the name given, so the other
+names keep the full-size file. Run `--replace` before a show's run starts: a run records each
+source's size and modification time at its stub step and refuses (`media_changed`) a file
+replaced since. Errors are JSON with a `code` (`unreadable`, `vfr`, `odd_size`,
+`negative_start`, `audio_unsupported`, `already_shrunk`, `symlink`, `destination_exists`,
+`not_writable`, `low_space`, `timeout`, `encode_failed`, `verify_failed`, `source_changed`,
+`interrupted`, ...) and a `fix_hint`.
+
+**Stopping a run.** Ctrl-C, `kill`, closing the terminal (Linux) or Ctrl-Break (Windows) stops
+ffmpeg, removes the partial copy, prints the file's line with the code `interrupted`, writes the
+report and exits 2, also when a second signal follows or the signal lands while the report is
+written; rerunning resumes (files already done are verified and skipped). A signal that lands
+just after a copy got its name says so (`placed`): that copy is complete. A run killed
+outright (`kill -9`, Task Manager) or a closed console window on Windows cannot clean up: it can
+leave a hidden `.<name>.aar-shrink-<random>.part` file (after `kill -9` ffmpeg finishes it in
+the background, full size), which is safe to delete.
