@@ -19,7 +19,7 @@ from aar.recipes.ccn import export_files
 from aar.recipes.ccn.export_files import copy_out
 from aar.recipes.ccn.handoff import MAX_LISTED, handoff_notes
 from aar.recipes.context import StepFailure
-from aar.recipes.engine import _open_review_node
+from aar.recipes.engine import _open_review_node, _review_context
 
 REPORT: dict[str, Any] = {
     "import": ["In Resolve use File > Import > Timeline and pick the .fcpxml."],
@@ -297,7 +297,7 @@ SECRET = b"0123456789abcdef0123456789abcdef"
 XSS = 'HANDOFF NOTES: <script>alert("x")</script>\r\nNOT IN THE FCPXML: captions'
 
 
-def _review(hub: Hub, attachments: tuple[str, ...]) -> str:
+def _review(hub: Hub, attachments: tuple[str, ...], **context: Any) -> str:
     render = hub.store.put(b"\x00" * 64, actor=AGENT, mime="video/mp4", project_id=hub.project_id)
     from aar.hub.graph import WorkGraph
 
@@ -310,6 +310,7 @@ def _review(hub: Hub, attachments: tuple[str, ...]) -> str:
         title="gate review (round 1)",
         base=f"test/{len(attachments)}/{subject}",
         attachments=attachments,
+        **context,
     )
 
 
@@ -373,6 +374,35 @@ def test_a_review_without_attachments_is_as_it_was(hub: Hub) -> None:
     node = next(e for e in hub.log.read() if e.payload.get("node_id") == review_id)
     assert "attachments" not in node.payload["data"]
     assert 'class="attach' not in _pages(hub, review_id)[1]
+
+
+def test_a_gate_review_knows_its_timeline_and_rate_so_notes_come_from_the_player(
+    hub: Hub,
+) -> None:
+    """A recipe's review had neither, so the reviewer typed every note's frame and timecode."""
+    timeline, fps = _review_context({"review_timeline": "Show v1", "review_fps": 30000 / 1001})
+    review_id = _review(hub, (), timeline=timeline, fps=fps)
+    review = reviews.get_review(hub.log, hub.project_id, review_id)
+    assert review is not None and (review.timeline, review.fps) == ("Show v1", 30000 / 1001)
+    page = _pages(hub, review_id)[1]
+    assert "Show v1 \u00b7 29.97 fps" in page
+    # the exact rate: at a rounded 29.97 the frame under a paused player reads as the one before
+    assert 'data-fps="29.97002997002997">Use player position</button>' in page
+    assert 'name="timecode"' not in page  # derived from the frame, not typed
+    note = reviews.add_note(hub.log, hub.project_id, review_id, 45, "tighten", HUMAN)
+    assert note.timecode == "00:00:01:15"
+
+    bare = _pages(hub, _review(hub, (), timeline=None, fps=None))[1]
+    assert "Use player position" not in bare and 'name="timecode"' in bare
+
+
+def test_a_review_takes_only_a_timeline_and_rate_it_can_hold() -> None:
+    assert _review_context({}) == (None, None)
+    assert _review_context({"review_timeline": "T", "review_fps": 25}) == ("T", 25.0)
+    for bad in (True, 0, -24, 1000.5, float("nan"), float("inf"), 10**400, "24", [24], None):
+        assert _review_context({"review_fps": bad})[1] is None, bad
+    for bad in ("", "x" * (reviews.MAX_TIMELINE + 1), 7, ["T"], None):
+        assert _review_context({"review_timeline": bad})[0] is None, bad
 
 
 def test_only_well_formed_ids_are_attachments_and_at_most_eight(hub: Hub) -> None:

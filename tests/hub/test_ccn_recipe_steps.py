@@ -94,6 +94,18 @@ def test_params_are_validated_at_the_boundary(ccn_env: CcnEnv, tmp_path: Path) -
     assert forced.pause_trim_on() is True
 
 
+def test_params_refuse_two_sources_that_are_one_file_on_the_edit_pc(ccn_env: CcnEnv) -> None:
+    """Names that differ only in case are two files on the hub and one on Windows: refused at
+    the start of the run, not hours later at the export."""
+    upper, lower = ccn_env.media / "Cam.mov", ccn_env.media / "cam.mov"
+    upper.write_bytes(b"a")
+    lower.write_bytes(b"b")
+    problems = _problems(ccn_env, ccn_env.params(upper, lower))
+    assert any(
+        "sources[0] and sources[1]" in p and "one file on the edit PC" in p for p in problems
+    ), problems
+
+
 def test_cold_steps_one_camera_then_the_transcript_is_reused(ccn_env: CcnEnv) -> None:
     show = ccn_env.show()
     run1 = make_run(ccn_env, ccn_env.params(show), key="1")

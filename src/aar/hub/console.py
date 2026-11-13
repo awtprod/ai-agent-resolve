@@ -1088,7 +1088,8 @@ class Console:
                 'data-fps="{fps}">Use player position</button>',
                 pid=player,
                 fid=frame_id,
-                fps=f"{review.fps:g}",
+                # every digit: at 29.97 for 30000/1001 a paused frame reads as the one before
+                fps=repr(review.fps),
             )
         timecode = Html("")
         if review.fps is None:

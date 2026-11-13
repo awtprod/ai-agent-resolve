@@ -22,6 +22,7 @@ EXPORT_CODES = frozenset(
         "unknown_source",
         "zero_length_segment",
         "media_not_on_edit_pc",
+        "media_collides_on_edit_pc",
         "source_size_required",
         "conflicting_source_durations",
         "conflicting_source_start_timecodes",

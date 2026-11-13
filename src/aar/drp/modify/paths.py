@@ -123,7 +123,9 @@ def ntfs_upper(name: str) -> str:
     and Adlam (9.0). The Unicode 1.1 ones predate every NTFS table, so "code points added after
     the volume was formatted" does not excuse them.
 
-    ``ntfs_upper`` is used only to match ``path_map`` table prefixes (:class:`PathMapper`); it
+    ``ntfs_upper`` is used to match ``path_map`` table prefixes (:class:`PathMapper`) and, in
+    the FCPXML export, to refuse two hub files that would be one file on the edit PC (there an
+    over-fold refuses a pair NTFS would keep apart, with a hint to rename one). It
     does not decide output placement (the OS's own case rules do) and aar never writes to a media
     file. An over-fold is therefore not a media overwrite, but it is NOT harmless: a table prefix
     can match a path under a *different* directory that NTFS considers distinct, mapping it to the

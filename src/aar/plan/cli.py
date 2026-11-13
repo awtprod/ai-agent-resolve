@@ -882,6 +882,16 @@ def _import_text(diff: dict[str, Any], out: Path, report: Path) -> str:
             f"reader warnings ({warnings['count']}): "
             + _counted([w["code"] for w in warnings["listed"]])
         )
+    limits = [str(limit).partition(":")[0] for limit in diff["limits"]]
+    if limits:
+        # said even for "no changes": that verdict covers only what the reader can see
+        lines.append(
+            f"NOT READ ({', '.join(limits)}): this plan is a partial reconstruction of the "
+            "timeline. A clip disabled in Resolve is imported as playing, and title text, "
+            "markers, grades, Fusion and Fairlight work are not read at all (the diff's "
+            '"limits" has each one): ask whoever edited the timeline about those before the '
+            "next export."
+        )
     lint_report = diff["lint"]
     if lint_report is not None:
         c = lint_report["counts"]

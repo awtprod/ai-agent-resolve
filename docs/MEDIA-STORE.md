@@ -111,9 +111,10 @@ of the same file: the recipe's `media_map` (`{"<hub folder>": "<PC folder>"}`, t
 and each asset starts at the proxy's own start timecode, which is how Resolve links a clip to
 its file. For example `{"<media root>/share/incoming/Show_1": "E:\\Show_1"}` turns
 `<media root>/share/incoming/Show_1/Proxy/A001.mp4` into `file:///E:/Show_1/Proxy/A001.mp4`.
-The map must cover every source (the params refuse one it does not), and the PC's copy must
-describe the same frames as the hub's, with the same start timecode: byte-identical, or the hub's
-copy a shrink of the PC's (below).
+The map must cover every source (the params refuse one it does not), no two sources may land
+on one PC file (Windows ignores case, so `A001.mp4` and `a001.mp4` are refused), and the PC's
+copy must describe the same frames as the hub's, with the same start timecode: byte-identical,
+or the hub's copy a shrink of the PC's (below).
 
 ## Shrinking proxies before they reach the hub (S19b)
 
