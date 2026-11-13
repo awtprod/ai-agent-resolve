@@ -97,17 +97,24 @@ After a person decides a review in the console, `aar hub lessons propose` asks a
 through the local model gateway (OpenAI-compatible, default `http://127.0.0.1:8317`), for at
 most three lessons from that review's reason and notes, and records them as proposals. A person
 accepts, rescopes or drops each one on the console's `/lessons` page; nothing a model writes
-reaches a cut guide without that. Each pass drafts at most 5 reviews (`--limit 5`), each review
-once, and stops early when the store's 200 waiting proposals have no room for 3 more. The timer
-runs a pass 10 minutes after boot and 10 minutes after each pass ends.
+reaches a cut guide without that. Each pass makes at most 5 model calls (`--limit 5`), and stops
+early when the store's 200 waiting proposals have no room for 3 more. A review is drafted once,
+with at most 3 charged attempts per review (and at most 144 uncharged strikes, below). Only one
+pass runs at a time: a pass holds a lock file beside the database (`hub.db.lessons-propose.lock`),
+and a second one that finds it held does nothing and exits 0. The timer runs a pass 10 minutes
+after boot and 10 minutes after each pass ends; the unit's `TimeoutStartSec=30min` is the outer
+bound on one pass.
 
 The gateway's key is NOT in `hub.env` (the console, the MCP server and the worker do not need
-it). It goes in `<root>/lessons.env`, which only this unit reads, mode 0640, owned by
-`root:<group>`. Create the file empty, then edit it, so the key never lands in a command line or
-a shell history:
+it). It goes in `<root>/lessons.env`, mode 0600, owned by `root:root`. systemd reads an
+`EnvironmentFile` as root before it starts the unit as the service user, so the pass gets the key
+although the service user cannot read the file; the agent-facing units (the MCP server, the
+worker) run as that same service user, so a file it could read would put the key within an
+agent's reach. Create the file empty, then edit it, so the key never lands in a command line or a
+shell history:
 
 ```
-sudo install -m 0640 -o root -g aar /dev/null /var/lib/aar/lessons.env
+sudo install -m 0600 -o root -g root /dev/null /var/lib/aar/lessons.env
 sudoedit /var/lib/aar/lessons.env
 ```
 
@@ -130,11 +137,16 @@ systemctl list-timers aar-hub-lessons.timer
 ```
 
 Each pass prints a JSON report (the reviews drafted, the proposals, the model calls and their
-token counts). Exit status 0 is a pass that ran, even with nothing to do or a full backlog.
-Without `lessons.env` (or with no key in it) every run exits 2 with `not_configured` and the
-unit shows as failed; the timer keeps trying every 10 minutes, and nothing is recorded. A
-gateway that fails (down, a wrong key, a model it does not serve) exits 1 and records nothing
-against any review: the next pass retries the same review.
+token counts, and each failure's charged attempts and strikes). Exit status 0 is a pass that
+ran, even with nothing to do, another pass running, or a full backlog. Without `lessons.env` (or
+with no key in it) every run exits 2 with `not_configured` and the unit shows as failed; the
+timer keeps trying every 10 minutes, and nothing is recorded. A setup failure (the gateway
+down, a wrong key, a model it does not serve) exits 1 and charges no review: the next pass
+retries the same review. A failure that may be one review's own (a timeout, a 5xx, a 400, a
+reply that is not the lessons JSON) moves the pass on to the next review, and two in a row stop
+it. Such a failure is charged to its review only when a later review of the same pass is
+drafted; otherwise it is a strike and the pass exits 1. So a gateway that refuses every chat
+shows as a failed unit at every run, and gives no review up for a day.
 
 ## Console over the tailnet
 
