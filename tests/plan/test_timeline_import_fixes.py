@@ -379,10 +379,12 @@ SEED_CASES: dict[int, dict[str, Any]] = {
 }
 
 #: Seeds whose every tagged item lands in its own original (or an identical twin).
-SEEDS_RESOLVED = (345, 459, 638, 785, 938, 974, 2053)
+#: (968 since fix round 3: the retimed copy claims its original by its in point before the
+#: overlap matching, so the trimmed piece lands in the identical twin.)
+SEEDS_RESOLVED = (345, 459, 638, 785, 938, 968, 974, 2053)
 #: Seeds where overlap cannot tell (an extended small segment, a copy of another's range): the
 #: item lands elsewhere and the diff says which other original it also overlaps.
-SEEDS_REPORTED = (968, 2062, 2699, 2817, 3268)
+SEEDS_REPORTED = (2062, 2699, 2817, 3268)
 
 
 def seed_plan(case: dict[str, Any]) -> EditPlan:
@@ -499,8 +501,8 @@ def test_a_trimmed_recap_keeps_its_own_fields() -> None:
     assert [k.zoom for k in result.plan.segments[2].reframe] == [2.0]
     # the recap item overlapped the main take too: the diff says so
     assert result.diff["uncertain_matches"] == [
-        {"index": 0, "assigned_to": 0, "why": "overlap", "also_overlaps": [2]},
-        {"index": 2, "assigned_to": 2, "why": "overlap", "also_overlaps": [0]},
+        {"index": 0, "assigned_to": 0, "why": "overlap", "also_overlaps": [2], "contested_by": []},
+        {"index": 2, "assigned_to": 2, "why": "overlap", "also_overlaps": [0], "contested_by": []},
     ]
 
 

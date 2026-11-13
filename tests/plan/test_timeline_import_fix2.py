@@ -85,7 +85,13 @@ def test_a_ripple_deleted_teaser_leaves_the_main_take_and_says_it_chose() -> Non
     assert statuses(result) == ["removed", "moved", "moved"]
     assert [(s.label, s.reframe) for s in result.plan.segments] == [("b", []), ("main", [])]
     assert result.diff["uncertain_matches"] == [
-        {"index": 1, "assigned_to": 2, "why": "same_source_range", "also_overlaps": [0]}
+        {
+            "index": 1,
+            "assigned_to": 2,
+            "why": "same_source_range",
+            "also_overlaps": [0],
+            "contested_by": [],
+        }
     ]
     assert "uncertain matches (1), check them: [1] -> segments[2] (same source range as 0)" in (
         text(result)
@@ -568,6 +574,12 @@ def test_a_lone_stand_in_whose_in_point_is_elsewhere_is_listed() -> None:
     result = run(plan, ripple(rows, [c[0], c[2], c[3], stray]))
     assert statuses(result)[1] == "kept"
     assert result.diff["uncertain_matches"] == [
-        {"index": 3, "assigned_to": 1, "why": "not_carried_item", "also_overlaps": []}
+        {
+            "index": 3,
+            "assigned_to": 1,
+            "why": "not_carried_item",
+            "also_overlaps": [],
+            "contested_by": [],
+        }
     ]
     assert "[3] -> segments[1] (a not-carried item kept as it without evidence)" in text(result)

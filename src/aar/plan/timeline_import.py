@@ -430,8 +430,20 @@ class ImportResult:
 
     @property
     def has_errors(self) -> bool:
-        """Exit 1 in the CLI: the plan is written but lint or the export's layout refuses it."""
+        """The plan is written but lint or the export's layout refuses it."""
         return self.lint_errors or self.export_errors
+
+    @property
+    def primary_not_carried(self) -> int:
+        """Items on the primary track the plan could not hold (the plan keeps its own version or
+        loses the item): never a clean import."""
+        return int(self.diff.get("primary_not_carried") or 0)
+
+    @property
+    def needs_attention(self) -> bool:
+        """Exit 1 in the CLI: lint or export errors, or items on the primary track the plan
+        could not hold."""
+        return self.has_errors or self.primary_not_carried > 0
 
 
 @dataclass
@@ -536,6 +548,24 @@ def assign_items(
        order. An item that overlaps nothing it can take is unassigned (added). Listed with it:
        the originals it overlaps equally, or that cover at least half of it, or that it covers
        at least half of (a sliver of overlap is not a contender)."""
+    assigned, also, _ = _assign(items, originals, same)
+    return assigned, also
+
+
+def _assign(
+    items: Sequence[tuple[str, int, int, int]],
+    originals: Sequence[tuple[int, str, int, int, int]],
+    same: Callable[[int, int], bool] | None = None,
+    claims: Sequence[tuple[str, int | None, int]] = (),
+) -> tuple[dict[int, int], dict[int, list[int]], dict[int, int]]:
+    """:func:`assign_items` with stand-in claims. ``claims`` are ``(source, in_point,
+    record_in)`` of not-carried items (``in_point`` None when unreadable). After the exact
+    matches (rules 1 and 2) and before the overlap matching (rule 3), each claim in turn takes
+    an original of its source no exact item took and no earlier claim took, by evidence: its in
+    point inside the original's source range, or, with no in point, the item at the original's
+    own record position; the nearer original record position, then plan order, among several.
+    A claimed original is not given to an item by overlap. Returns also claim position ->
+    claimed original."""
     differ = (lambda a, b: a != b) if same is None else (lambda a, b: a != b and not same(a, b))
     assigned: dict[int, int] = {}
     exact: set[int] = set()
@@ -579,6 +609,18 @@ def assign_items(
         others = [i for i, _ in group if differ(i, index)]
         if others:
             also[pos] = others
+    claimed: dict[int, int] = {}
+    for c, (source, point, record_in) in enumerate(claims):
+        fits = [
+            (index, old)
+            for index, o_in, o_out, old in by_source.get(source, [])
+            if index not in exact
+            and index not in claimed.values()
+            and (o_in <= point < o_out if point is not None else old == record_in)
+        ]
+        if fits:
+            claimed[c] = min(fits, key=lambda f: (abs(f[1] - record_in), f[0]))[0]
+    taken = exact | set(claimed.values())
     contenders: dict[int, list[int]] = {}
     ties: list[tuple[int, list[int]]] = []
     for pos, (source, src_in, src_out, _) in enumerate(items):
@@ -588,7 +630,7 @@ def assign_items(
         overlaps = {
             index: min(o_out, src_out) - max(o_in, src_in)
             for index, o_in, o_out, _ in by_source.get(source, [])
-            if index not in exact
+            if index not in taken
         }
         overlaps = {i: o for i, o in overlaps.items() if o > 0}
         if not overlaps:
@@ -617,7 +659,7 @@ def assign_items(
         listed = [i for i in others if differ(i, assigned[pos])]
         if listed:
             also[pos] = listed
-    return assigned, also
+    return assigned, also, claimed
 
 
 class _Importer:
@@ -1032,6 +1074,9 @@ class _Importer:
         self.assigned: dict[str, dict[int, int]] = {}
         self.alternatives: dict[int, list[int]] = {}  # id(_Item) -> originals in contention
         self.guessed: set[int] = set()  # id(_Item) of stand-ins chosen without evidence
+        #: id(_Item) of the item that took an original -> the other items (a stand-in and a
+        #: carried item) that were candidates for it (``uncertain_matches``, ``contested_by``)
+        self.contested: dict[int, list[_Item]] = {}
         fields = [s.model_dump(exclude={"record_in"}) for s in segs]
 
         def same(a: int, b: int) -> bool:
@@ -1063,10 +1108,14 @@ class _Importer:
             for e in content:
                 assert e.source is not None and e.src_in is not None and e.src_out is not None
                 items.append((e.source, e.src_in, e.src_out, e.record_in))
-            assigned, alternatives = assign_items(items, originals, same)
+            waiting = self._waiting(label)
+            claims = [(e.source or "", self._in_point(e), e.record_in) for e in waiting]
+            assigned, alternatives, claimed = _assign(items, originals, same, claims)
             for pos, others in alternatives.items():
                 self.alternatives[id(content[pos])] = others
-            stand_ins = self._stand_ins(label, originals, content, assigned, same)
+            reserved = {id(waiting[c]): index for c, index in claimed.items()}
+            self._contests(originals, content, items, assigned, waiting, claims, claimed)
+            stand_ins = self._stand_ins(waiting, originals, content, assigned, same, reserved)
             merged = sorted(content + stand_ins, key=lambda e: (e.record_in, e.track, e.number))
             pos_of = {id(e): p for p, e in enumerate(content)}
             self.content[label] = merged
@@ -1077,33 +1126,10 @@ class _Importer:
                 elif pos_of[id(e)] in assigned:
                     self.assigned[label][p] = assigned[pos_of[id(e)]]
 
-    def _stand_ins(
-        self,
-        label: str,
-        originals: list[tuple[int, str, int, int, int]],
-        content: list[_Item],
-        assigned: dict[int, int],
-        same: Callable[[int, int], bool],
-    ) -> list[_Item]:
-        """Not-carried picture items on ``label`` (retimed, sub-frame, still) of a known source,
-        each standing in for an original of that source no item took. Chosen by evidence: the
-        item's in point inside the original's source range (a retimed item keeps its ``<In>``;
-        a still's in point is not a plan frame, so stills have none), then context (the carried
-        items before and after it are the original's neighbours in the plan), then the nearer
-        original record position, then plan order. Listed with it (``uncertain_matches``,
-        ``why: not_carried_item``): the other originals of that source that no carried item took
-        for certain (another stand-in's choice, or an uncertain match, may be wrong) with as
-        much source evidence, that differ in any field. A choice without evidence (a readable
-        in point outside the original's range; or no in point, no context and not at the
-        original's own position) is still kept, so the plan loses nothing, and always listed."""
-        held = set(assigned.values())
-        certain = {i for p, i in assigned.items() if id(content[p]) not in self.alternatives}
-        in_order = [o[0] for o in sorted(originals, key=lambda o: (o[4], o[0]))]
-        after = dict(itertools.pairwise(in_order))
-        before = {b: a for a, b in after.items()}
-        placed = [(e.record_in, assigned[p]) for p, e in enumerate(content) if p in assigned]
-        out: list[_Item] = []
-        waiting = sorted(
+    def _waiting(self, label: str) -> list[_Item]:
+        """The not-carried picture items on ``label`` (:data:`KEPT_CODES`) of a known source, in
+        record order: each may stand in for an original."""
+        return sorted(
             (
                 e
                 for e in self.items
@@ -1116,12 +1142,83 @@ class _Importer:
             ),
             key=lambda e: (e.record_in, e.number),
         )
+
+    @staticmethod
+    def _in_point(entry: _Item) -> int | None:
+        """A stand-in's source in point as evidence (a still's is not a plan frame)."""
+        return None if entry.reason == "still_image" else source_frame(entry.item)
+
+    def _contests(
+        self,
+        originals: list[tuple[int, str, int, int, int]],
+        content: list[_Item],
+        items: list[tuple[str, int, int, int]],
+        assigned: dict[int, int],
+        waiting: list[_Item],
+        claims: list[tuple[str, int | None, int]],
+        claimed: dict[int, int],
+    ) -> None:
+        """Where a stand-in with evidence for an original and a carried item are both candidates
+        for it, whichever took it: the stand-in's claimed original that a carried item overlaps,
+        and an original the stand-in's evidence points to that an exact item took."""
+        by_index = {o[0]: o for o in originals}
+        holder = {index: pos for pos, index in assigned.items()}
+        for c, entry in enumerate(waiting):
+            if c in claimed:
+                _, source, o_in, o_out, _ = by_index[claimed[c]]
+                rivals = [
+                    content[p]
+                    for p, (s, a, b, _) in enumerate(items)
+                    if s == source and min(b, o_out) - max(a, o_in) > 0
+                ]
+                if rivals:
+                    self.contested.setdefault(id(entry), []).extend(rivals)
+                continue
+            source, point, record_in = claims[c]
+            for index, o_source, o_in, o_out, old in originals:
+                fits = o_in <= point < o_out if point is not None else old == record_in
+                if o_source == source and fits and index in holder:
+                    winner = content[holder[index]]
+                    self.contested.setdefault(id(winner), []).append(entry)
+
+    def _stand_ins(
+        self,
+        waiting: list[_Item],
+        originals: list[tuple[int, str, int, int, int]],
+        content: list[_Item],
+        assigned: dict[int, int],
+        same: Callable[[int, int], bool],
+        reserved: dict[int, int],
+    ) -> list[_Item]:
+        """Not-carried picture items on ``label`` (retimed, sub-frame, still) of a known source,
+        each standing in for an original of that source no item took. Chosen by evidence: the
+        item's in point inside the original's source range (a retimed item keeps its ``<In>``;
+        a still's in point is not a plan frame, so stills have none), then context (the carried
+        items before and after it are the original's neighbours in the plan), then the nearer
+        original record position, then plan order. Listed with it (``uncertain_matches``,
+        ``why: not_carried_item``): the other originals of that source that no carried item took
+        for certain (another stand-in's choice, or an uncertain match, may be wrong) with as
+        much source evidence, that differ in any field. A choice without evidence (a readable
+        in point outside the original's range; or no in point, no context and not at the
+        original's own position) is still kept and always listed. ``reserved`` (id(_Item) ->
+        original): the original a stand-in claimed by evidence before the overlap matching
+        (:func:`_assign`); it takes that one."""
+        held = set(assigned.values()) | set(reserved.values())
+        certain = {i for p, i in assigned.items() if id(content[p]) not in self.alternatives}
+        in_order = [o[0] for o in sorted(originals, key=lambda o: (o[4], o[0]))]
+        after = dict(itertools.pairwise(in_order))
+        before = {b: a for a, b in after.items()}
+        placed = [(e.record_in, assigned[p]) for p, e in enumerate(content) if p in assigned]
+        out: list[_Item] = []
         for entry in waiting:
             pool = [o for o in originals if o[0] not in certain and o[1] == entry.source]
-            free = [o for o in pool if o[0] not in held]
+            if id(entry) in reserved:
+                free = [o for o in originals if o[0] == reserved[id(entry)]]
+            else:
+                free = [o for o in pool if o[0] not in held]
             if not free:
                 continue
-            src_in = None if entry.reason == "still_image" else source_frame(entry.item)
+            src_in = self._in_point(entry)
             span = entry.record_out - entry.record_in if entry.reason == "sub_frame" else 1
             prev = [i for rin, i in placed if rin < entry.record_in]
             nxt = [i for rin, i in placed if rin > entry.record_in]
@@ -1800,7 +1897,24 @@ class _Importer:
                 )
         added.sort(key=lambda a: a["index"])
 
+        contested_of = {
+            self.content_index[i]: [
+                {
+                    "index": self.content_index.get(id(e)),
+                    "track": e.track,
+                    "record_in": e.record_in,
+                    "record_out": e.record_out,
+                    "carried": not e.excluded,
+                }
+                for e in others
+            ]
+            for i, others in self.contested.items()
+            if i in self.content_index
+        }
+
         def why(k: int, i: int) -> str:
+            if k in contested_of and not also_of.get(k) and k not in guessed:
+                return "contested"
             if k in kept_by:
                 return "not_carried_item"
             key = (segs[i].source, segs[i].src_in, segs[i].src_out)
@@ -1815,12 +1929,46 @@ class _Importer:
                     "assigned_to": i,
                     "why": why(k, i),
                     "also_overlaps": also_of.get(k, []),
+                    "contested_by": contested_of.get(k, []),
                 }
                 for i, ks in self.pieces.items()
                 for k in ks
-                if also_of.get(k) or k in guessed
+                if also_of.get(k) or k in guessed or k in contested_of
             ),
             key=lambda u: u["index"],
+        )
+        other_length = []
+        for content in self.content.values():
+            for e in content:
+                if e.stands_for is None:
+                    continue
+                k = self.content_index[id(e)]
+                plan_frames = edited.segments[k].length
+                timeline_frames = e.record_out - e.record_in
+                if plan_frames == timeline_frames:
+                    continue
+                gap = timeline_frames - plan_frames
+                other_length.append(
+                    {
+                        "location": f"segments[{e.stands_for}]",
+                        "index": k,
+                        "track": e.track,
+                        "record_in": e.record_in,
+                        "timeline_frames": timeline_frames,
+                        "plan_frames": plan_frames,
+                        "detail": f"the plan keeps its own {plan_frames}-frame version where the "
+                        f"timeline's item runs {timeline_frames} frames; what follows keeps its "
+                        "timeline position, so the plan has "
+                        + (
+                            f"a {gap}-frame gap after it"
+                            if gap > 0
+                            else f"{-gap} frame(s) of overlap"
+                        ),
+                    }
+                )
+        other_length.sort(key=lambda x: x["index"])
+        primary_not_carried = sum(
+            1 for e in self.items if e.excluded and e.is_picture and e.track == self.primary
         )
         by_name = [
             {**e.where(), "source": e.source}
@@ -1852,12 +2000,14 @@ class _Importer:
                 "items": len(self.items),
             },
             "primary_track": self.primary,
+            "primary_not_carried": primary_not_carried,
             "media_matched_by": matches,
             "matched_by_file_name": by_name,
             "segments": rows,
             "uncertain_matches": uncertain,
             "uncertain_titles": self.uncertain_titles,
             "track_mismatch": self.track_mismatch,
+            "kept_other_length": other_length,
             "added": added,
             "outro": outro,
             "repositioned": self.repositioned,

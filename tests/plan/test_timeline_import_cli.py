@@ -267,10 +267,12 @@ def test_a_damaged_timeline_is_refused_with_its_problems(
 def test_hostile_item_values_are_typed_not_a_traceback(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], clip: DrtClip, code: str
 ) -> None:
-    """Validator M1: these gave a pydantic traceback and exit 1 with nothing written."""
+    """Validator M1: these gave a pydantic traceback and exit 1 with nothing written. Since fix
+    round 3 an item on the primary track the plan cannot hold exits 1 (written, check it)."""
     drt, plan = setup(tmp_path, [clip, *CLIPS[1:]])
     status, out, err = call(tmp_path, capsys, drt, plan)
-    assert (status, err) == (0, "")
+    assert (status, err) == (1, "")
+    assert out.startswith("The plan could not hold 1 item(s) on V1")
     assert f"not carried (1): {code} x1 (V1 x1)" in out
     diff = json.loads((tmp_path / "edited.diff.json").read_text())
     assert [e["code"] for e in diff["not_carried"]] == [code]

@@ -209,7 +209,8 @@ def register(subparsers: Any) -> None:
         "not stop it being written. Neither output is ever overwritten. A reader problem "
         "anywhere in the file refuses the import, even in a timeline --timeline does not pick. "
         "Exit: 0 written, 1 written but the edited plan has lint errors or the export's layout "
-        "refuses it, 2 refused or unreadable input.",
+        "refuses it, or an item on the primary track is not carried (check it by eye), 2 "
+        "refused or unreadable input.",
     )
     imp.add_argument("drt", type=Path, metavar="TIMELINE.drt", help="Timeline exported as .drt.")
     imp.add_argument("--plan", type=Path, required=True, help="The plan the timeline came from.")
@@ -723,7 +724,14 @@ def _import_text(diff: dict[str, Any], out: Path, report: Path) -> str:
     for row in rows:
         counts[row["status"]] = counts.get(row["status"], 0) + 1
     tl = diff["timeline"]
-    lines = [
+    lines = []
+    held_not = diff["primary_not_carried"]
+    if held_not:
+        lines.append(
+            f"The plan could not hold {held_not} item(s) on {diff['primary_track']} (see not "
+            "carried); check the segments around them by eye."
+        )
+    lines += [
         f"timeline {tl['name']!r} ({tl['frame_rate']:.3f} fps, {tl['items']} items): "
         + ("no changes" if diff["unchanged"] else "edited"),
         "segments: "
@@ -765,21 +773,50 @@ def _import_text(diff: dict[str, Any], out: Path, report: Path) -> str:
             f"TRACK ASSUMPTION FAILED ({len(mismatch)}), kept in the plan, check the tracks: "
             f"{shown}{more}"
         )
+    lengths = diff["kept_other_length"]
+    if lengths:
+        shown = "; ".join(
+            f"{x['location']} {x['timeline_frames']} frames on the timeline, {x['plan_frames']} "
+            "in the plan ("
+            + (
+                f"a {x['timeline_frames'] - x['plan_frames']}-frame gap after it"
+                if x["timeline_frames"] > x["plan_frames"]
+                else f"{x['plan_frames'] - x['timeline_frames']} frame(s) of overlap"
+            )
+            + ")"
+            for x in lengths[:_TEXT_ENTRIES]
+        )
+        more = f"; ... {len(lengths) - _TEXT_ENTRIES} more" if len(lengths) > _TEXT_ENTRIES else ""
+        lines.append(f"kept at another length ({len(lengths)}): {shown}{more}")
     uncertain = diff["uncertain_matches"]
     why_text = {
         "same_source_range": "same source range as",
         "overlap": "also overlaps",
         "not_carried_item": "same source, also",
     }
+
+    def rivals(u: dict[str, Any]) -> str:
+        return ", ".join(
+            ("carried " if c["carried"] else "not-carried ")
+            + f"{c['track']} {c['record_in']}..{c['record_out']}"
+            for c in u["contested_by"]
+        )
+
+    def reason(u: dict[str, Any]) -> str:
+        if u["why"] == "contested":
+            return f"also a candidate: {rivals(u)}"
+        text = (
+            f"{why_text[u['why']]} " + ", ".join(str(i) for i in u["also_overlaps"])
+            if u["also_overlaps"]
+            else "a not-carried item kept as it without evidence"
+        )
+        if u["contested_by"]:
+            text += f"; also a candidate: {rivals(u)}"
+        return text
+
     if uncertain:
         shown = "; ".join(
-            f"[{u['index']}] -> segments[{u['assigned_to']}] ("
-            + (
-                f"{why_text[u['why']]} " + ", ".join(str(i) for i in u["also_overlaps"])
-                if u["also_overlaps"]
-                else "a not-carried item kept as it without evidence"
-            )
-            + ")"
+            f"[{u['index']}] -> segments[{u['assigned_to']}] ({reason(u)})"
             for u in uncertain[:_TEXT_ENTRIES]
         )
         more = (
@@ -922,4 +959,4 @@ def _cmd_import_timeline(args: argparse.Namespace) -> int:
     written = cli_io.emit(_PROG, text)
     if written != EXIT_OK:
         return written
-    return EXIT_ERRORS if result.has_errors else EXIT_OK
+    return EXIT_ERRORS if result.needs_attention else EXIT_OK
