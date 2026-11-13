@@ -1,10 +1,11 @@
 """``aar plan`` commands: print the EditPlan JSON Schema, lint, compile (apply), produce, export
-and render plans."""
+and render plans, and import a timeline edited in Resolve back as a plan."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ from aar.plan.produce import cli as produce_cli
 from aar.plan.profile import ProfileError, load_profile
 from aar.plan.render import RUNTIME_CODES as RENDER_RUNTIME_CODES
 from aar.plan.render import RenderError, RenderTerminated, render_plan
+from aar.plan.timeline_import import TimelineImportError, import_timeline, read_timeline
 
 _PROG = "aar plan"
 EXIT_OK = 0
@@ -191,6 +193,40 @@ def register(subparsers: Any) -> None:
     )
     render.add_argument("--json", action="store_true", help="Print the report as JSON.")
     render.set_defaults(func=_cmd_render)
+
+    imp = sub.add_parser(
+        "import-timeline",
+        help="Bring a timeline edited in Resolve (.drt) back as an EditPlan and a diff.",
+        description="Reads the timeline exported from Resolve (File > Export > Timeline, .drt), "
+        "matches its items to the plan it was exported from (the same --media-map as the "
+        "export), and writes the edited plan (the picture items on each track that holds planned "
+        "segments, in record order, become that track's segments; titles take their items' "
+        "places) and a JSON diff: per original segment unchanged, trimmed, moved, removed, "
+        "split, joined or kept (its item is not carried, so the plan keeps its own version); "
+        "uncertain matches and titles; elements found on another track than predicted "
+        "(track_mismatch); added segments; foreign items; and what the plan cannot hold "
+        "(not_carried). The edited plan is linted and laid out by the export; errors there do "
+        "not stop it being written. Neither output is ever overwritten. A reader problem "
+        "anywhere in the file refuses the import, even in a timeline --timeline does not pick. "
+        "Exit: 0 written, 1 written but the edited plan has lint errors or the export's layout "
+        "refuses it, or an item on the primary track is not carried (check it by eye), 2 "
+        "refused or unreadable input.",
+    )
+    imp.add_argument("drt", type=Path, metavar="TIMELINE.drt", help="Timeline exported as .drt.")
+    imp.add_argument("--plan", type=Path, required=True, help="The plan the timeline came from.")
+    imp.add_argument(
+        "--media-map",
+        type=Path,
+        help="The export's JSON object of linux_root -> windows_root, read back the other way.",
+    )
+    imp.add_argument("--out", type=Path, required=True, help="Edited plan JSON to write.")
+    imp.add_argument("--report", type=Path, required=True, help="Diff JSON to write.")
+    imp.add_argument("--timeline", help="Timeline name, when the file holds several.")
+    imp.add_argument(
+        "--profile", help="Profile name or .toml path for the lint (default: the plan's)."
+    )
+    imp.add_argument("--json", action="store_true", help="Print the diff as JSON.")
+    imp.set_defaults(func=_cmd_import_timeline)
 
 
 def _memory_mb(text: str) -> int:
@@ -662,3 +698,265 @@ def _cmd_render(args: argparse.Namespace) -> int:
     if written != EXIT_OK:
         return written
     return EXIT_OK if result.qa_ok else EXIT_ERRORS
+
+
+# -- import-timeline (S20) ----------------------------------------------------------------------
+
+
+#: Bounds on the stdout summary; the diff file keeps every entry.
+_TEXT_ROWS = 12
+_TEXT_PIECES = 3
+_TEXT_ENTRIES = 5
+
+
+def _counted(values: list[str]) -> str:
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return ", ".join(f"{v} x{n}" for v, n in counts.items())
+
+
+def _import_text(diff: dict[str, Any], out: Path, report: Path) -> str:
+    """A bounded summary an agent can act on (repeated entries grouped); the diff file has
+    everything."""
+    rows = diff["segments"]
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    tl = diff["timeline"]
+    lines = []
+    held_not = diff["primary_not_carried"]
+    if held_not:
+        lines.append(
+            f"The plan could not hold {held_not} item(s) on {diff['primary_track']} (see not "
+            "carried); check the segments around them by eye."
+        )
+    lines += [
+        f"timeline {tl['name']!r} ({tl['frame_rate']:.3f} fps, {tl['items']} items): "
+        + ("no changes" if diff["unchanged"] else "edited"),
+        "segments: "
+        + (", ".join(f"{n} {status}" for status, n in sorted(counts.items())) or "none")
+        + f"; {len(diff['added'])} added; {len(diff['foreign'])} foreign",
+    ]
+    changed = [r for r in rows if r["status"] != "unchanged"]
+    for row in changed[:_TEXT_ROWS]:
+        pieces = row["new"]
+        new = ", ".join(
+            f"[{n['index']}] {n['record_in']}..{n['record_out']}" for n in pieces[:_TEXT_PIECES]
+        )
+        if len(pieces) > _TEXT_PIECES:
+            new += f", ... {len(pieces)} pieces in all"
+        extra = ""
+        if row["kept_because"] is not None:
+            extra = f" ({row['kept_because']}: the plan keeps its own version)"
+        if row["head_frames"] is not None:
+            extra = f" head {row['head_frames']:+d} tail {row['tail_frames']:+d}"
+        if row["joined"] is not None:
+            members = ", ".join(str(i) for i in row["joined"]["segments"])
+            extra += f" (joined {members}; fields of segments[{row['joined']['fields_from']}])"
+        lines.append(
+            f"  segments[{row['index']}] {row['status']}{extra}: "
+            f"{row['old']['record_in']}..{row['old']['record_out']} -> {new or 'gone'}"
+        )
+    if len(changed) > _TEXT_ROWS:
+        lines.append(f"  ... {len(changed) - _TEXT_ROWS} more in the diff")
+    mismatch = diff["track_mismatch"]
+    if mismatch:
+        shown = "; ".join(
+            f"{m['location']} on {m['found_track']} (expected {m['expected_track']})"
+            for m in mismatch[:_TEXT_ENTRIES]
+        )
+        more = (
+            f"; ... {len(mismatch) - _TEXT_ENTRIES} more" if len(mismatch) > _TEXT_ENTRIES else ""
+        )
+        lines.append(
+            f"TRACK ASSUMPTION FAILED ({len(mismatch)}), kept in the plan, check the tracks: "
+            f"{shown}{more}"
+        )
+    lengths = diff["kept_other_length"]
+    if lengths:
+        shown = "; ".join(
+            f"{x['location']} {x['timeline_frames']} frames on the timeline, {x['plan_frames']} "
+            "in the plan ("
+            + (
+                f"a {x['timeline_frames'] - x['plan_frames']}-frame gap after it"
+                if x["timeline_frames"] > x["plan_frames"]
+                else f"{x['plan_frames'] - x['timeline_frames']} frame(s) of overlap"
+            )
+            + ")"
+            for x in lengths[:_TEXT_ENTRIES]
+        )
+        more = f"; ... {len(lengths) - _TEXT_ENTRIES} more" if len(lengths) > _TEXT_ENTRIES else ""
+        lines.append(f"kept at another length ({len(lengths)}): {shown}{more}")
+    uncertain = diff["uncertain_matches"]
+    why_text = {
+        "same_source_range": "same source range as",
+        "overlap": "also overlaps",
+        "not_carried_item": "same source, also",
+    }
+
+    def rivals(u: dict[str, Any]) -> str:
+        return ", ".join(
+            ("carried " if c["carried"] else "not-carried ")
+            + f"{c['track']} {c['record_in']}..{c['record_out']}"
+            for c in u["contested_by"]
+        )
+
+    def reason(u: dict[str, Any]) -> str:
+        if u["why"] == "contested":
+            return f"also a candidate: {rivals(u)}"
+        text = (
+            f"{why_text[u['why']]} " + ", ".join(str(i) for i in u["also_overlaps"])
+            if u["also_overlaps"]
+            else "a not-carried item kept as it without evidence"
+        )
+        if u["contested_by"]:
+            text += f"; also a candidate: {rivals(u)}"
+        return text
+
+    if uncertain:
+        shown = "; ".join(
+            f"[{u['index']}] -> segments[{u['assigned_to']}] ({reason(u)})"
+            for u in uncertain[:_TEXT_ENTRIES]
+        )
+        more = (
+            f"; ... {len(uncertain) - _TEXT_ENTRIES} more" if len(uncertain) > _TEXT_ENTRIES else ""
+        )
+        lines.append(f"uncertain matches ({len(uncertain)}), check them: {shown}{more}")
+    titles = diff["uncertain_titles"]
+    if titles:
+        shown = "; ".join(
+            f"{t['location']} -> {t['track']} {t['new']['record_in']}..{t['new']['record_out']}"
+            for t in titles[:_TEXT_ENTRIES]
+        )
+        more = f"; ... {len(titles) - _TEXT_ENTRIES} more" if len(titles) > _TEXT_ENTRIES else ""
+        lines.append(
+            f"uncertain titles ({len(titles)}), paired by order only (text not read), check "
+            f"them: {shown}{more}"
+        )
+    by_name = diff["matched_by_file_name"]
+    if by_name:
+        shown = "; ".join(
+            f"{e['track']} {e['record_in']} {e['media']} -> {e['source']}"
+            for e in by_name[:_TEXT_ENTRIES]
+        )
+        more = f"; ... {len(by_name) - _TEXT_ENTRIES} more" if len(by_name) > _TEXT_ENTRIES else ""
+        lines.append(f"matched by file name only ({len(by_name)}): {shown}{more}")
+    if diff["foreign"]:
+        lines.append(
+            f"foreign ({len(diff['foreign'])}): "
+            + _counted([str(f.get("reason")) for f in diff["foreign"]])
+        )
+    if diff["outro"] is not None and diff["outro"]["status"] != "unchanged":
+        lines.append(f"outro: {diff['outro']['status']}")
+    if diff["repositioned"]:
+        lines.append(
+            f"repositioned ({len(diff['repositioned'])}): "
+            + _counted(
+                [f"{e['location'].split('[')[0]} by {e['by']}" for e in diff["repositioned"]]
+            )
+        )
+    for key, title in (("not_carried", "not carried"), ("dropped", "dropped from the plan")):
+        entries = diff[key]
+        if not entries:
+            continue
+        groups: dict[str, list[str]] = {}
+        for entry in entries:
+            groups.setdefault(entry["code"], []).append(str(entry.get("track") or "-"))
+        parts = []
+        for code, tracks in groups.items():
+            where = f" ({_counted(tracks)})" if key == "not_carried" else ""
+            parts.append(f"{code} x{len(tracks)}{where}")
+        lines.append(f"{title} ({len(entries)}): " + ", ".join(parts))
+    warnings = diff["reader_warnings"]
+    if warnings["count"]:
+        lines.append(
+            f"reader warnings ({warnings['count']}): "
+            + _counted([w["code"] for w in warnings["listed"]])
+        )
+    lint_report = diff["lint"]
+    if lint_report is not None:
+        c = lint_report["counts"]
+        state = "ERRORS" if diff["lint_errors"] else "ok"
+        lines.append(f"lint: {state} ({c['error']} error, {c['warn']} warn, {c['info']} info)")
+    check = diff["export_check"]
+    if check["ok"]:
+        lines.append("export check: ok")
+    else:
+        error = check["error"]
+        lines.append(f"export check: REFUSED ({error['code']}): {error['message']}")
+    lines.append(f"wrote {out} and {report}")
+    return "\n".join(lines) + "\n"
+
+
+def _cmd_import_timeline(args: argparse.Namespace) -> int:
+    as_json: bool = args.json
+    try:
+        plan = EditPlan.model_validate_json(args.plan.read_text(encoding="utf-8"))
+        profile = load_profile(args.profile or plan.profile)
+        media_map = load_media_map(args.media_map) if args.media_map else None
+    except ValidationError as exc:
+        return _input_error(
+            "invalid-input", "input failed validation", _validation_details(exc), as_json
+        )
+    except ExportError as exc:
+        return _export_refusal(exc, as_json)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ProfileError) as exc:
+        return _input_error(type(exc).__name__, str(exc), [], as_json)
+    out: Path = args.out
+    report_file: Path = args.report
+    try:
+        for path in (out, report_file):
+            if os.path.lexists(path):
+                raise TimelineImportError(
+                    "output_exists",
+                    f"{path} exists; import-timeline never overwrites",
+                    "choose new --out and --report paths",
+                    path=str(path),
+                )
+        for path in (out, report_file):
+            folder = path.parent
+            if not folder.is_dir():
+                raise TimelineImportError(
+                    "output_folder_missing",
+                    f"the folder {str(folder)!r} for {path} does not exist",
+                    "create the folder first, or choose --out and --report in an existing one",
+                    path=str(path),
+                    folder=str(folder),
+                )
+        if out.resolve() == report_file.resolve():
+            raise TimelineImportError(
+                "output_exists",
+                f"--out and --report are the same file ({out})",
+                "give the plan and the diff different paths",
+                path=str(out),
+            )
+        timeline = read_timeline(args.drt, args.timeline)
+        result = import_timeline(
+            plan,
+            timeline.timeline,
+            timeline.media,
+            media_map=media_map,
+            profile=profile,
+            reader_warnings=timeline.warnings,
+        )
+    except CompileError as exc:  # TimelineImportError, or the export's own refusals
+        return _export_refusal(exc, as_json)  # type: ignore[arg-type]
+    diff = result.diff
+    diff["timeline"] = {**diff["timeline"], "file": timeline.path, "sha256": timeline.sha256}
+    plan_text = result.plan.model_dump_json(indent=2, exclude_none=True) + "\n"
+    body = json.dumps(diff, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+    try:
+        write_pair(
+            [(out, plan_text.encode("utf-8")), (report_file, body.encode("utf-8"))],
+            overwrite=False,
+        )
+    except ExportError as exc:
+        return _export_refusal(exc, as_json)
+    except OSError as exc:
+        return _input_error(type(exc).__name__, str(exc), [], as_json)
+    text = body if as_json else _import_text(diff, out, report_file)
+    written = cli_io.emit(_PROG, text)
+    if written != EXIT_OK:
+        return written
+    return EXIT_ERRORS if result.needs_attention else EXIT_OK

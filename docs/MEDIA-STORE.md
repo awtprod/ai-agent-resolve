@@ -94,6 +94,8 @@ the hub's own units write to it.
 <media root>/share/incoming/  proxies copied from the edit PC (<show>/Proxy/<clip>.mp4)
 <media root>/share/exports/   results for the edit PC: <project>/<timeline>/<timeline>.r<N>.fcpxml
                               and .r<N>.review.mp4
+<media root>/share/timelines/ timelines edited in Resolve, back from the edit PC (S20):
+                              <project>/<timeline>/<timeline>.e<N>.drt
 <media root>/work/            step scratch (transcripts, renders), removed after each step
 ```
 
@@ -166,3 +168,14 @@ just after a copy got its name says so (`placed`): that copy is complete. A run 
 outright (`kill -9`, Task Manager) or a closed console window on Windows cannot clean up: it can
 leave a hidden `.<name>.aar-shrink-<random>.part` file (after `kill -9` ffmpeg finishes it in
 the background, full size), which is safe to delete.
+
+## Timelines edited on the PC (S20)
+
+After the owner edits an imported timeline in Resolve, File > Export > Timeline saves it as a
+`.drt` into `<media root>/share/timelines/<project>/<timeline>/` on the mapped drive, one file
+per round (`<timeline>.e1.drt`, `.e2.drt`, ...; a file is never overwritten). The hub reads it
+with `aar plan import-timeline FILE.drt --plan PLAN.json --media-map MAP.json --out
+PLAN2.json --report DIFF.json`, using the same media map as the export: an item's media path is
+the PC path the FCPXML named, so the map's hub root -> PC root pairs tie it back to the plan's
+hub path (DESIGN "Timeline import (S20)"). The folder is not yet named in `hub.env` or used by
+the `ccn-longform` recipe; that wiring is a later slice.
