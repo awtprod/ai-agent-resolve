@@ -144,9 +144,18 @@ timer keeps trying every 10 minutes, and nothing is recorded. A setup failure (t
 down, a wrong key, a model it does not serve) exits 1 and charges no review: the next pass
 retries the same review. A failure that may be one review's own (a timeout, a 5xx, a 400, a
 reply that is not the lessons JSON) moves the pass on to the next review, and two in a row stop
-it. Such a failure is charged to its review only when a later review of the same pass is
-drafted; otherwise it is a strike and the pass exits 1. So a gateway that refuses every chat
-shows as a failed unit at every run, and gives no review up for a day.
+it. Such a failure is charged to its review when any review of the same pass, before or after
+it, is drafted; otherwise it is a strike and the pass exits 1. A pass takes the reviews with the
+fewest strikes first, then the fewest charged attempts, then the oldest decision, so reviews
+that keep failing go behind the others and cannot hold them back.
+
+So a gateway or model outage that fails every chat (the gateway's upstream down, every chat
+answered HTTP 400) shows as a failed unit at every run and charges no review, but each run gives
+two of the waiting reviews a strike. An outage lasting about 144 passes (a day at 10 minutes)
+gives up the reviews waiting through it: with one or two waiting, after those 144 passes; with
+more, the strikes spread over them, and giving them all up takes about 72 passes per waiting
+review. Nothing reopens a given-up review yet, so its lessons are never drafted. A gateway that
+cannot be reached at all, a wrong key or a rate limit records nothing and gives nothing up.
 
 ## Console over the tailnet
 
