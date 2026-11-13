@@ -69,8 +69,9 @@ def register(hub_sub: argparse._SubParsersAction) -> None:
         help="Draft lessons from decided reviews with a model (one bounded pass).",
         description=(
             "Ask a model, through the local model gateway, for at most 3 lessons from each "
-            "decided review not drafted yet, oldest decision first, and record them as "
-            "proposals a person accepts or drops in the console. The gateway is "
+            "decided review not drafted yet (the fewest strikes first, then the fewest "
+            "charged attempts, then the oldest decision), and record them as proposals a person "
+            "accepts or drops in the console. The gateway is "
             "AAR_LLM_BASE_URL (default http://127.0.0.1:8317) and its key AAR_LLM_API_KEY. "
             "Exit 0 when the pass ran (also with nothing to do, another pass running, or a "
             "full backlog), 1 when it failed: a setup failure or failures in a row stopped "

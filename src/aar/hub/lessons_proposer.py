@@ -7,7 +7,9 @@ editing lessons drawn from that feedback and records each one as a **proposal**
 person accepts, rescopes or drops each proposal on ``/lessons`` (S23a), and guides print only
 accepted lessons.
 
-**One pass** takes the decided reviews of every project, oldest decision first. They are found
+**One pass** takes the decided reviews of every project that are neither done nor given up: the
+fewest strikes first, then the fewest charged attempts, then the oldest decision, so a review
+that keeps failing moves behind the others instead of holding them back. They are found
 through the ``review.decided`` events and each is confirmed with
 :func:`aar.hub.reviews.get_review`; an open review, a withdrawn one, a decision the reviews fold
 rejects and a review of an unregistered project are skipped. For each review the model gets
@@ -51,14 +53,15 @@ back, the other reviews:
   (``bad-output``). The pass carries on with the next review, and stops after
   :data:`MAX_IN_A_ROW` in a row. An ambiguous failure is **charged** to its review
   (``lessons.draft_failed`` ``{project_id, review_id, code, attempt}``, key
-  ``lessons:draft-failed:<project_id>:<review_id>:<attempt>``) only when a later review of the
-  same pass is then drafted by the model (the pass has one model): that shows the setup works.
-  Otherwise it is an uncharged **strike** (``lessons.draft_strike`` ``{project_id, review_id,
-  code, strike}``, key ``lessons:draft-strike:<project_id>:<review_id>:<strike>``).
+  ``lessons:draft-failed:<project_id>:<review_id>:<attempt>``) when any review of the same pass,
+  before or after it, is drafted by the model (the pass has one model): a success anywhere in
+  the pass shows the setup works. Otherwise it is an uncharged **strike**
+  (``lessons.draft_strike`` ``{project_id, review_id, code, strike}``, key
+  ``lessons:draft-strike:<project_id>:<review_id>:<strike>``).
 - A review is given up once it has :data:`MAX_ATTEMPTS` charged attempts or
   :data:`MAX_STRIKES` strikes (about a day of passes 10 minutes apart: a review that fails
   alone, with no other review to show whose fault it is, cannot retry forever). Every later
-  report counts it, with both counts.
+  report counts it, with both counts. Nothing reopens a given-up review yet.
 
 The marker, the attempts and the strikes are counted by their idempotency keys, whatever event
 holds them, from 1 up to the first free key. So no event (malformed, forged or from a concurrent
@@ -115,7 +118,7 @@ DEFAULT_ACTOR = Actor("agent", "lessons-proposer")
 MODEL_ENV = "AAR_LESSONS_MODEL"
 DEFAULT_LIMIT = 5
 MAX_LIMIT = 50
-#: Charged attempts per review: failures a later review of the same pass showed to be its own.
+#: Charged attempts per review: failures a review drafted in the same pass showed to be its own.
 MAX_ATTEMPTS = 3
 #: Uncharged strikes per review: about a day of passes 10 minutes apart.
 MAX_STRIKES = 144
@@ -244,7 +247,8 @@ class ProposeReport:
 
     @property
     def struck(self) -> list[ReviewOutcome]:
-        """This pass's failures that are strikes: no later review showed them to be their own."""
+        """This pass's failures that are strikes: no review of the pass was drafted, so none
+        showed them to be their own."""
         return [o for o in self.reviews if o.outcome == "failed" and not o.charged]
 
     @property
@@ -265,7 +269,7 @@ class ProposeReport:
             "reason": "strike",
             "code": last.code,
             "message": last.message,
-            "hint": "No review was drafted after it in this pass, so it may be the setup's "
+            "hint": "No review was drafted in this pass, so it may be the setup's "
             f"failure and was not charged to the review (strike {last.strikes} of "
             f"{MAX_STRIKES}). The next pass retries it.",
             "project_id": last.project_id,
@@ -538,10 +542,11 @@ def propose_from_reviews(
     limit: int = DEFAULT_LIMIT,
     clock: Clock = utcnow,
 ) -> ProposeReport:
-    """One bounded pass: draft lessons from the decided reviews not drafted yet, oldest decision
-    first, with at most ``limit`` model calls (see the module doc). Raises ``WriteError`` for an
-    actor that is not an agent and ``ValueError`` for a bad model id or limit, before anything is
-    read or sent; every other failure is in the report."""
+    """One bounded pass: draft lessons from the decided reviews not drafted yet, the fewest
+    strikes, then charged attempts, then the oldest decision first, with at most ``limit`` model
+    calls (see the module doc). Raises ``WriteError`` for an actor that is not an agent and
+    ``ValueError`` for a bad model id or limit, before anything is read or sent; every other
+    failure is in the report."""
     actor = check_proposer(actor)
     if not is_model_id(model):
         raise ValueError("model must be 1-128 printable ASCII characters without spaces")
@@ -580,12 +585,13 @@ class _Pass:
         self.registry = Registry(log)
         self.clients: dict[str, str | None] = {}
         self.model_checked = False
+        self.proven = False  # the model drafted a review in this pass: the setup works
         self.unproven: list[ReviewOutcome] = []  # ambiguous failures not charged yet
         self.in_a_row = 0  # ambiguous failures since the last review the model drafted
 
     def run(self) -> None:
-        candidates = _decided_reviews(self.log)
-        for index, (project_id, review_id) in enumerate(candidates):
+        live: list[tuple[int, int, int, str, str]] = []
+        for order, (project_id, review_id) in enumerate(_decided_reviews(self.log)):
             if _drafted(self.log, project_id, review_id):
                 continue
             standing = _Standing.read(self.log, project_id, review_id)
@@ -593,11 +599,17 @@ class _Pass:
                 self.report.given_up.append(
                     GivenUp(project_id, review_id, standing.attempts, standing.strikes)
                 )
-                continue
+            else:
+                live.append((standing.strikes, standing.attempts, order, project_id, review_id))
+        # The fewest strikes, then the fewest charged attempts, then the oldest decision first
+        # (``order`` is unique, so the ids never decide): a review that keeps failing moves
+        # behind the others instead of holding them back.
+        candidates = [(project_id, review_id) for *_, project_id, review_id in sorted(live)]
+        for index, (project_id, review_id) in enumerate(candidates):
             if not self.review(project_id, review_id):
                 self.count_rest(candidates[index:])
                 break
-        for outcome in self.unproven:  # no review was drafted after these: strikes
+        for outcome in self.unproven:  # no review of this pass was drafted: strikes
             self.tally(outcome, charged=False)
         self.unproven.clear()
 
@@ -700,8 +712,9 @@ class _Pass:
             drafts = parse_drafts(reply.text, scopes=scopes_for(feedback))
         except DraftError as error:
             return self.ambiguous(project_id, review_id, error.code, error.message)
-        # The model drafted for this review, so the setup works: the failures before it in this
-        # pass were their reviews' own.
+        # The model drafted for this review, so the setup works: every ambiguous failure of this
+        # pass, before this review or after it, is its review's own.
+        self.proven = True
         for outcome in self.unproven:
             self.tally(outcome, charged=True)
         self.unproven.clear()
@@ -710,21 +723,35 @@ class _Pass:
         return True
 
     def ambiguous(self, project_id: str, review_id: str, code: str, message: str) -> bool:
-        """A failure that may be the review's or the setup's: held until the pass shows which.
-        ``False`` (stop) after :data:`MAX_IN_A_ROW` in a row."""
+        """A failure that may be the review's or the setup's: charged at once when the model
+        already drafted a review in this pass, else held until the pass shows which. ``False``
+        (stop) after :data:`MAX_IN_A_ROW` in a row."""
         outcome = ReviewOutcome(project_id, review_id, "failed", code=code, message=message)
         self.report.reviews.append(outcome)
-        self.unproven.append(outcome)
+        if self.proven:
+            self.tally(outcome, charged=True)
+        else:
+            self.unproven.append(outcome)
         self.in_a_row += 1
         if self.in_a_row < MAX_IN_A_ROW:
             return True
+        if self.proven:
+            hint = (
+                f"{MAX_IN_A_ROW} reviews in a row failed after a review was drafted in this "
+                "pass, so the setup works and each failure is charged to its review; a review "
+                f"is given up after {MAX_ATTEMPTS} charged attempts."
+            )
+        else:
+            hint = (
+                f"{MAX_IN_A_ROW} reviews in a row failed and no review was drafted in this pass, "
+                "which may be the setup's fault, so none is charged: each gets a strike. The "
+                "next pass retries them."
+            )
         self.report.stopped = {
             "reason": "failures_in_a_row",
             "code": code,
             "message": message,
-            "hint": f"{MAX_IN_A_ROW} reviews in a row failed with no review drafted after them, "
-            "which may be the setup's fault, so none is charged: each gets a strike. The next "
-            "pass retries them.",
+            "hint": hint,
             "project_id": project_id,
             "review_id": review_id,
         }

@@ -124,6 +124,29 @@ def block(call: dict[str, Any]) -> dict[str, Any]:
     return json.loads(match.group(1))
 
 
+class ByReview(FakeClient):
+    """Replies by the review a chat is about: ``replies[review_id]`` (text, or an exception to
+    raise), else one lesson drafted for that review. Every call is recorded."""
+
+    def __init__(self, replies: dict[str, Any]) -> None:
+        super().__init__()
+        self.by_review = replies
+
+    def chat(
+        self, model: str, messages: Any, *, max_tokens: int, temperature: float | None = None
+    ) -> ChatReply:
+        self.calls.append({"model": model, "messages": messages, "max_tokens": max_tokens})
+        review_id = block(self.calls[-1])["review_id"]
+        reply = self.by_review.get(review_id, drafts(item(f"Lesson from {review_id}.")))
+        if isinstance(reply, Exception):
+            raise reply
+        return ChatReply(text=reply, model=model, usage=USAGE)
+
+    def tried(self) -> list[str]:
+        """The review of each call, in order."""
+        return [block(call)["review_id"] for call in self.calls]
+
+
 def proposals(hub: Hub) -> list[lessons.Lesson]:
     found, skipped = lessons.scan_lessons(hub.log)
     assert skipped == ()
@@ -194,6 +217,32 @@ def test_the_oldest_decision_goes_first_and_the_limit_is_honoured(hub: Hub) -> N
     later = FakeClient(drafts(item("Three.")))
     report = run(hub, later, limit=2)
     assert [o.review_id for o in report.reviews] == [second] and report.waiting == 0
+
+
+def test_the_fewest_strikes_go_first_then_the_fewest_attempts_then_the_oldest_decision(
+    hub: Hub,
+) -> None:
+    oldest, older, old, new, newest = (review(hub) for _ in range(5))
+
+    def held(key: Callable[[str, str, int], str], review_id: str, count: int) -> None:
+        for number in range(1, count + 1):  # the keys count, whatever event holds them
+            hub.log.append(
+                "test.earlier", AGENT, {}, idempotency_key=key(hub.project_id, review_id, number)
+            )
+
+    held(proposer.strike_key, oldest, 2)
+    held(proposer.strike_key, older, 1)
+    held(proposer.failed_key, older, 1)
+    held(proposer.strike_key, old, 1)
+    held(proposer.failed_key, new, 2)
+    client = ByReview({})
+
+    report = run(hub, client)
+
+    # (strikes, attempts): newest (0, 0), new (0, 2), old (1, 0), older (1, 1), oldest (2, 0)
+    assert client.tried() == [newest, new, old, older, oldest]
+    assert [o.review_id for o in report.reviews] == client.tried()
+    assert report.waiting == 0 and report.stopped is None
 
 
 def test_a_second_pass_calls_no_model_and_writes_nothing(hub: Hub) -> None:
@@ -335,7 +384,7 @@ def test_an_attempt_or_strike_key_taken_meanwhile_still_counts(
 ) -> None:
     bad = review(hub)
     if charged:
-        review(hub)  # drafted after the bad one, so its failure is charged
+        review(hub)  # drafted in the same pass, so the bad one's failure is charged
     kind = "attempt" if charged else "strike"
     key = (proposer.failed_key if charged else proposer.strike_key)(hub.project_id, bad, 1)
     real = hub.log.append
@@ -646,7 +695,7 @@ AMBIGUOUS_FAILURES = [
 
 
 @pytest.mark.parametrize(("failure", "code"), AMBIGUOUS_FAILURES)
-def test_an_ambiguous_failure_moves_on_and_is_charged_once_a_later_review_is_drafted(
+def test_an_ambiguous_failure_moves_on_and_is_charged_once_a_review_of_the_pass_is_drafted(
     hub: Hub, failure: Any, code: str
 ) -> None:
     bad, good = review(hub), review(hub)
@@ -695,9 +744,7 @@ def test_two_ambiguous_failures_in_a_row_stop_the_pass_and_each_is_a_strike(hub:
     ]
 
 
-def test_a_failure_no_review_is_drafted_after_is_a_strike_even_after_one_drafted_before(
-    hub: Hub,
-) -> None:
+def test_a_failure_after_a_review_drafted_in_the_same_pass_is_charged_too(hub: Hub) -> None:
     good, bad = review(hub), review(hub)
 
     report = run(hub, FakeClient(drafts(item("One.")), "not json"))
@@ -706,13 +753,13 @@ def test_a_failure_no_review_is_drafted_after_is_a_strike_even_after_one_drafted
         (good, "drafted"),
         (bad, "failed"),
     ]
-    assert (report.reviews[1].charged, report.reviews[1].strikes) == (False, 1)
-    assert report.stopped is None and report.failed
-    error = report.error()
-    assert error is not None
-    assert (error["reason"], error["code"], error["review_id"]) == ("strike", "bad-output", bad)
-    assert "strike 1 of 144" in error["hint"]
-    assert payloads(hub, proposer.EVENT_DRAFT_FAILED) == []
+    failed = report.reviews[1]
+    assert (failed.charged, failed.attempts, failed.strikes) == (True, 1, 0)
+    assert report.stopped is None and not report.failed and report.error() is None
+    assert payloads(hub, proposer.EVENT_DRAFT_FAILED) == [
+        {"project_id": hub.project_id, "review_id": bad, "code": "bad-output", "attempt": 1}
+    ]
+    assert payloads(hub, proposer.EVENT_DRAFT_STRIKE) == []
 
 
 def test_an_ambiguous_failure_then_a_setup_failure_is_a_strike(hub: Hub) -> None:
@@ -742,14 +789,15 @@ def test_an_ambiguous_failure_then_a_setup_failure_is_a_strike(hub: Hub) -> None
 def test_three_charged_attempts_give_a_review_up(hub: Hub, failure: Any, code: str) -> None:
     bad = review(hub)
     for attempt in (1, 2, 3):
-        good = review(hub)  # decided after the bad one, so drafted after it
-        report = run(hub, FakeClient(failure, drafts(item(f"Lesson {attempt}."))))
+        good = review(hub)  # decided after the bad one: drafted in the same pass
+        report = run(hub, ByReview({bad: failure}))
+        failed = (bad, "failed", True, attempt, attempt == 3)
+        drafted = (good, "drafted", False, 0, False)
+        # Equal standing at first, so the older decision goes first; after one charged attempt
+        # the bad review goes behind a review that has none.
         assert [
             (o.review_id, o.outcome, o.charged, o.attempts, o.final) for o in report.reviews
-        ] == [
-            (bad, "failed", True, attempt, attempt == 3),
-            (good, "drafted", False, 0, False),
-        ]
+        ] == ([failed, drafted] if attempt == 1 else [drafted, failed])
     silent = FakeClient()
 
     report = run(hub, silent)
@@ -776,6 +824,10 @@ def test_a_review_that_fails_alone_is_given_up_after_144_strikes(hub: Hub) -> No
         [outcome] = report.reviews
         assert (outcome.charged, outcome.attempts, outcome.strikes) == (False, 0, strike)
         assert outcome.final is (strike == 144) and report.failed
+        error = report.error()
+        assert error is not None and report.stopped is None
+        assert (error["reason"], error["code"], error["review_id"]) == ("strike", "http-400", alone)
+        assert f"strike {strike} of 144" in error["hint"]
     silent = FakeClient()
 
     report = run(hub, silent)
@@ -787,20 +839,90 @@ def test_a_review_that_fails_alone_is_given_up_after_144_strikes(hub: Hub) -> No
     assert keys == [proposer.strike_key(hub.project_id, alone, n) for n in range(1, 145)]
 
 
-def test_a_model_wide_400_gives_up_no_review_and_every_pass_fails(hub: Hub) -> None:
-    """The validator's scenario: the gateway lists the model, but it answers every chat with
-    HTTP 400 (a parameter the model does not take, say). That is the setup's fault, and no
-    review may be given up for it."""
-    first, second, *_rest = (review(hub) for _ in range(5))
-    for _ in range(10):
-        refused = GatewayError("http-400", "HTTP 400: Unsupported parameter: max_tokens")
-        report = run(hub, FakeClient(refused, refused))
+@pytest.mark.parametrize(
+    "refused",
+    [
+        GatewayError("http-400", "HTTP 400: Unsupported parameter: max_tokens"),
+        GatewayError("http-503", "HTTP 503: upstream unavailable"),
+    ],
+    ids=["model-wide-400", "gateway-503"],
+)
+def test_an_outage_over_many_passes_charges_nothing_and_strikes_accumulate(
+    hub: Hub, refused: GatewayError
+) -> None:
+    """The validator's scenario: the gateway lists the model, but every chat fails (HTTP 400 for
+    a parameter the model does not take, say, or the gateway's upstream down). That is the
+    setup's fault: no review is charged, every pass fails, and each gives two reviews a strike,
+    the ones with the fewest first, so the strikes spread over the reviews waiting."""
+    waiting = [review(hub) for _ in range(5)]
+    for number in range(1, 11):
+        report = run(hub, ByReview(dict.fromkeys(waiting, refused)))
         assert report.failed and report.calls == 2 and report.given_up == []
         assert report.stopped is not None and report.stopped["reason"] == "failures_in_a_row"
-        assert report.waiting == 3
+        assert "none is charged" in report.stopped["hint"] and report.waiting == 3
+        assert [o.charged for o in report.reviews] == [False, False]
+        if number == 5:  # 10 strikes over 5 reviews, the fewest first: 2 each
+            strikes = Counter(p["review_id"] for p in payloads(hub, proposer.EVENT_DRAFT_STRIKE))
+            assert strikes == dict.fromkeys(waiting, 2)
     assert payloads(hub, proposer.EVENT_DRAFT_FAILED) == []
     strikes = Counter(p["review_id"] for p in payloads(hub, proposer.EVENT_DRAFT_STRIKE))
-    assert strikes == {first: 10, second: 10}
+    assert strikes == dict.fromkeys(waiting, 4)
+
+
+def test_two_stuck_reviews_hold_no_healthy_one_back_and_are_given_up_after_3_attempts(
+    hub: Hub,
+) -> None:
+    """The fix-check's scenario: A and B fail with HTTP 500 every time, C is healthy, decided
+    in that order. Two failures in a row end the first pass before C, and give A and B a strike;
+    from then on they go behind every review with fewer strikes, so C is drafted in the second
+    pass, and A and B are charged an attempt in each pass that drafts a review. Once C is done,
+    only a review decided later can show that the setup works: one is decided before each later
+    pass, as reviews go on being decided."""
+    stuck = GatewayError("http-500", f"POST {CHAT_PATH}: HTTP 500: upstream failed")
+    a, b, c = review(hub), review(hub), review(hub)
+    client = ByReview({a: stuck, b: stuck})
+
+    first = run(hub, client)
+
+    assert [(o.review_id, o.charged, o.attempts, o.strikes) for o in first.reviews] == [
+        (a, False, 0, 1),
+        (b, False, 0, 1),
+    ]
+    assert first.stopped is not None and first.stopped["reason"] == "failures_in_a_row"
+    assert first.waiting == 1  # C
+
+    second = run(hub, client)
+
+    assert [(o.review_id, o.outcome, o.charged, o.attempts, o.strikes) for o in second.reviews] == [
+        (c, "drafted", False, 0, 0),
+        (a, "failed", True, 1, 1),
+        (b, "failed", True, 1, 1),
+    ]
+    assert second.stopped is not None and "each failure is charged" in second.stopped["hint"]
+    for attempt in (2, 3):
+        newer = review(hub)
+        report = run(hub, client)
+        assert [
+            (o.review_id, o.outcome, o.charged, o.attempts, o.final) for o in report.reviews
+        ] == [
+            (newer, "drafted", False, 0, False),
+            (a, "failed", True, attempt, attempt == 3),
+            (b, "failed", True, attempt, attempt == 3),
+        ]
+    newest = review(hub)
+    tried = len(client.calls)
+
+    report = run(hub, client)
+
+    assert client.tried()[tried:] == [newest] and not report.failed
+    assert report.given_up == [
+        proposer.GivenUp(hub.project_id, a, 3, 1),
+        proposer.GivenUp(hub.project_id, b, 3, 1),
+    ]
+    assert Counter(client.tried())[a] == Counter(client.tried())[b] == 4
+    assert [(p["review_id"], p["attempt"]) for p in payloads(hub, proposer.EVENT_DRAFT_FAILED)] == [
+        (review_id, attempt) for attempt in (1, 2, 3) for review_id in (a, b)
+    ]
 
 
 def test_an_attempt_key_held_by_another_event_counts_as_used(hub: Hub) -> None:
@@ -809,10 +931,11 @@ def test_an_attempt_key_held_by_another_event_counts_as_used(hub: Hub) -> None:
         "test.other", AGENT, {}, idempotency_key=proposer.failed_key(hub.project_id, bad, 2)
     )
     seen = []
-    for n in (1, 2):
-        review(hub)
-        report = run(hub, FakeClient("not json", drafts(item(f"Lesson {n}."))))
-        seen.append((report.reviews[0].attempts, report.reviews[0].final))
+    for _ in (1, 2):
+        review(hub)  # drafted in the same pass, so the bad review's failure is charged
+        report = run(hub, ByReview({bad: "not json"}))
+        [failed] = [o for o in report.reviews if o.review_id == bad]
+        seen.append((failed.attempts, failed.final))
     assert seen == [(2, False), (3, True)]  # keys 1 and 2, then 3: all taken
     silent = FakeClient()
     report = run(hub, silent)
@@ -828,9 +951,9 @@ def test_the_limit_counts_every_call_failed_ones_too(hub: Hub) -> None:
 
     assert len(client.calls) == report.calls == 3 and report.waiting == 3
     assert [(o.outcome, o.charged) for o in report.reviews] == [
-        ("failed", True),
+        ("failed", True),  # a review of the pass was drafted, before or after: both charged
         ("drafted", False),
-        ("failed", False),
+        ("failed", True),
     ]
     assert report.stopped is None  # a drafted review between two failures: not in a row
 
