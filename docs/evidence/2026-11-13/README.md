@@ -38,4 +38,7 @@ Chrome.
   (`Synthetic Show`, `Synthetic Special`, `operator-1`): two proposals by the agent
   `lessons-proposer`, each with the model's why, its source review and the suggested scope,
   waiting for a person to accept or drop them. The rejected review's instructions about that one
-  cut were not drafted, and the accepted global lesson was not repeated.
+  cut were not drafted, and the accepted global lesson was not repeated. Retaken in S23b fix
+  round 1 from the same hub (a copy of it), so that a project reads with its id, as S23a's fix
+  made the console show it: "Project: Synthetic Special (prj_...)" in the suggestion and in
+  "Applies to".
