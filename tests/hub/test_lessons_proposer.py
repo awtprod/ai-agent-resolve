@@ -151,6 +151,12 @@ def test_approved_and_rejected_reviews_are_drafted_and_no_others(hub: Hub) -> No
     hub.log.append(
         reviews.EVENT_DECIDED, HUMAN, {"review_id": withdrawn, **forged}, project_id=hub.project_id
     )
+    # A review node an agent made already closed: no decision the fold accepts, not withdrawn.
+    graph = WorkGraph(hub.log, hub.project_id)
+    closed = graph.add_node("review", AGENT, title="made closed", status="done", data={}).id
+    hub.log.append(
+        reviews.EVENT_DECIDED, HUMAN, {"review_id": closed, **forged}, project_id=hub.project_id
+    )
     client = FakeClient(drafts(item("End on the laugh.")), drafts(item("Open on the first joke.")))
 
     report = run(hub, client)
@@ -163,7 +169,7 @@ def test_approved_and_rejected_reviews_are_drafted_and_no_others(hub: Hub) -> No
         (approved, "approve"),
         (rejected, "reject"),
     ]
-    assert report.not_decided == 2 and report.calls == 2 and report.stopped is None
+    assert report.not_decided == 3 and report.calls == 2 and report.stopped is None
     assert client.model_reads == 1  # the model list is read once per pass, before the first chat
     assert [m["review_id"] for m in payloads(hub, proposer.EVENT_DRAFTED)] == [approved, rejected]
     assert [lesson.text for lesson in proposals(hub)] == [
