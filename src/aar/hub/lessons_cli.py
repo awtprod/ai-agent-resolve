@@ -83,7 +83,8 @@ def register(hub_sub: argparse._SubParsersAction) -> None:
     propose.add_argument(
         "--limit",
         type=int,
-        help="At most this many model calls in the pass (1-50, default 5).",
+        default=5,  # lessons_proposer.DEFAULT_LIMIT, which this module does not import
+        help="At most this many model calls in the pass (1-50, default %(default)s).",
     )
     propose.add_argument(
         "--model",
@@ -161,7 +162,7 @@ def _propose(args: argparse.Namespace) -> int:
     from aar.llm.gateway import GatewayError, gateway_from_env
 
     try:
-        limit = proposer.check_limit(proposer.DEFAULT_LIMIT if args.limit is None else args.limit)
+        limit = proposer.check_limit(args.limit)
         model = proposer.lessons_model(args.model, os.environ)
     except ValueError as exc:
         return _error("invalid_input", str(exc), "See `aar hub lessons propose --help`.")

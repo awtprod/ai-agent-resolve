@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 from write_support import AGENT, HUMAN, Crash, Hub, brief_data, crash_after_appends
 
-from aar.cli import main
+from aar.cli import build_parser, main
 from aar.hub import lessons, reviews
 from aar.hub import lessons_proposer as proposer
 from aar.hub.events import Actor, EventLog
@@ -1323,6 +1323,14 @@ def test_the_default_limit_is_5_model_calls(
     assert (code, err) == (0, None)
     assert (report["limit"], report["calls"], report["waiting"]) == (5, 5, 2)
     assert gateway.calls().count(f"POST {CHAT_PATH}") == 5
+
+
+def test_the_limit_flag_defaults_to_5_in_the_parser() -> None:
+    """Without ``--limit`` the pass gets the parser's default: 5, the library's default too."""
+    args = build_parser().parse_args(["hub", "lessons", "propose", "--db", "hub.db"])
+    assert args.limit == 5 and proposer.DEFAULT_LIMIT == 5
+    given = build_parser().parse_args(["hub", "lessons", "propose", "--db", "x", "--limit", "7"])
+    assert given.limit == 7
 
 
 def test_a_model_wide_400_exits_1_every_pass_and_gives_up_no_review(
