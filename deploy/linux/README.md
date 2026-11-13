@@ -98,8 +98,8 @@ through the local model gateway (OpenAI-compatible, default `http://127.0.0.1:83
 most three lessons from that review's reason and notes, and records them as proposals. A person
 accepts, rescopes or drops each one on the console's `/lessons` page; nothing a model writes
 reaches a cut guide without that. Each pass drafts at most 5 reviews (`--limit 5`), each review
-once, and stops early when 200 proposals are already waiting. The timer runs a pass 10 minutes
-after boot and 10 minutes after each pass ends.
+once, and stops early when the store's 200 waiting proposals have no room for 3 more. The timer
+runs a pass 10 minutes after boot and 10 minutes after each pass ends.
 
 The gateway's key is NOT in `hub.env` (the console, the MCP server and the worker do not need
 it). It goes in `<root>/lessons.env`, which only this unit reads, mode 0640, owned by
