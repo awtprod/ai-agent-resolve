@@ -196,6 +196,11 @@ ERROR_CODES = frozenset(
         "project_exists",
         "actor_not_allowed",
         "not_a_resolve_project",
+        # aar.hub.lessons (S23a)
+        "unknown_lesson",
+        "unknown_review",
+        "too_many_proposals",
+        "too_many_lessons",
     }
 )
 
