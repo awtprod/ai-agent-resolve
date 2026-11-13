@@ -32,44 +32,61 @@ event ``{project_id, review_id, proposed, model, recovered}`` with idempotency k
 ``lessons:drafted:<project_id>:<review_id>``. A later pass skips it without calling the model.
 The marker is written after the proposals, so a crash between the two leaves proposals and no
 marker. The next pass finds proposals whose source is the review, writes the marker
-(``recovered`` true, ``model`` null) and does not call the model.
+(``recovered`` true, ``model`` null) and does not call the model. When the store refused every
+draft of a reply only because its backlog filled while the model answered
+(``too_many_proposals``), no marker is written: the review is ``deferred`` and stays a
+candidate.
 
-**Failures** are classified so that a broken setup cannot use up the reviews' attempts:
+**Failures** are classified so that neither a broken setup nor one review can use up, or hold
+back, the other reviews:
 
-- A setup or transport failure stops the pass at once and records nothing against the review,
-  so the next pass retries it. This covers every :class:`~aar.llm.gateway.GatewayError` except
-  ``bad-response`` and ``http-400`` (so ``not_configured``, ``origin``, ``redirect``,
-  ``network``, ``timeout``, ``too-large``, and ``http-401``, ``403``, ``404``, ``429`` and
-  ``5xx`` once the client has given up retrying). It also covers a model the gateway does not
-  list (``unknown_model``): before its first chat a pass reads ``GET /v1/models``, because the
-  gateway answers a chat for an unknown model with HTTP 400, which would otherwise count
-  against every review.
-- A failure of the review's own request or reply records ``lessons.draft_failed``
-  (``{project_id, review_id, code, attempt}``, key
-  ``lessons:draft-failed:<project_id>:<review_id>:<attempt>``): a reply that is not the lessons
-  JSON (``bad-output``), one the client refuses (``bad-response``), or ``http-400``. After
-  :data:`MAX_ATTEMPTS` attempts the review is given up for good, and every later report counts
-  it.
+- A *setup failure* stops the pass at once and charges nothing: ``not_configured``, ``origin``,
+  ``redirect``, ``network`` (the gateway cannot be reached), HTTP 401, 403, 404 and 429 (once
+  the client has given up retrying), and a model the gateway does not serve
+  (``unknown_model``: before its first chat a pass reads ``GET /v1/models``, because the
+  gateway answers a chat for an unknown model with HTTP 400).
+- Every other failure of a review's chat is *ambiguous*, the review's own or the setup's: any
+  other gateway error (``timeout``, ``too-large``, ``bad-response``, HTTP 5xx once retried, and
+  any other 4xx such as 400, 408, 413 or 422) and a reply that is not the lessons JSON
+  (``bad-output``). The pass carries on with the next review, and stops after
+  :data:`MAX_IN_A_ROW` in a row. An ambiguous failure is **charged** to its review
+  (``lessons.draft_failed`` ``{project_id, review_id, code, attempt}``, key
+  ``lessons:draft-failed:<project_id>:<review_id>:<attempt>``) only when a later review of the
+  same pass is then drafted by the model (the pass has one model): that shows the setup works.
+  Otherwise it is an uncharged **strike** (``lessons.draft_strike`` ``{project_id, review_id,
+  code, strike}``, key ``lessons:draft-strike:<project_id>:<review_id>:<strike>``).
+- A review is given up once it has :data:`MAX_ATTEMPTS` charged attempts or
+  :data:`MAX_STRIKES` strikes (about a day of passes 10 minutes apart: a review that fails
+  alone, with no other review to show whose fault it is, cannot retry forever). Every later
+  report counts it, with both counts.
 
-The marker and the attempts are counted by their idempotency keys, whatever event holds them. So
-no event (malformed, forged or from a concurrent pass) can make a review retry forever: each
-failed attempt takes a key, and three keys end it. The marker and the failure event are
-bookkeeping, not lesson events: the lessons fold never reads them.
+The marker, the attempts and the strikes are counted by their idempotency keys, whatever event
+holds them, from 1 up to the first free key. So no event (malformed, forged or from a concurrent
+pass) can make a review retry forever: each attempt or strike takes a key, and the last key ends
+it. The three event types are bookkeeping, not lesson events: the lessons fold never reads them.
+
+**One pass at a time.** A pass holds a non-blocking ``fcntl.flock`` on a file beside the
+database (``<db>`` + :data:`LOCK_SUFFIX`, left in place after) from start to end. A pass that
+finds it held does nothing and reports ``busy``, which is not a failure. Without ``fcntl``
+(Windows) a pass runs without the lock. Right before recording a reply, the pass checks the
+review's marker and proposals again: a review recorded meanwhile is ``recovered``, and the
+reply is not recorded.
 
 **Bounds.** At most ``limit`` chats per pass (1 to :data:`MAX_LIMIT`, default
-:data:`DEFAULT_LIMIT`). Each reply is at most :data:`MAX_TOKENS` tokens, and the prompt is
-bounded by ``lesson_drafts.PROMPT_BUDGET``. At most 3 drafts per review. Before each chat the
-pass stops if ``pending + 3`` would go past the store's :data:`~aar.hub.lessons.MAX_PENDING`;
-a full backlog is reported, not an error.
+:data:`DEFAULT_LIMIT`), failed ones included. Each reply is at most :data:`MAX_TOKENS` tokens,
+and the prompt is bounded by ``lesson_drafts.PROMPT_BUDGET``. At most 3 drafts per review.
+Before each chat the pass stops if ``pending + 3`` would go past the store's
+:data:`~aar.hub.lessons.MAX_PENDING`; a full backlog is reported, not an error.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 from aar.hub import lessons, reviews
 from aar.hub.common import Clock, actor_dict, is_text, iso, utcnow
@@ -93,17 +110,39 @@ from aar.plan.profile import builtin_profile_names
 
 EVENT_DRAFTED = "lessons.drafted"
 EVENT_DRAFT_FAILED = "lessons.draft_failed"
+EVENT_DRAFT_STRIKE = "lessons.draft_strike"
 DEFAULT_ACTOR = Actor("agent", "lessons-proposer")
 MODEL_ENV = "AAR_LESSONS_MODEL"
 DEFAULT_LIMIT = 5
 MAX_LIMIT = 50
+#: Charged attempts per review: failures a later review of the same pass showed to be its own.
 MAX_ATTEMPTS = 3
+#: Uncharged strikes per review: about a day of passes 10 minutes apart.
+MAX_STRIKES = 144
+#: Ambiguous failures in a row that stop a pass.
+MAX_IN_A_ROW = 2
 #: Reply tokens a chat may use: three one-line lessons need a few hundred.
 MAX_TOKENS = 4000
-#: Failures of one review's own request or reply. Every other gateway error stops the pass.
-REVIEW_FAILURES = frozenset({"bad-output", "bad-response", "http-400"})
+#: Gateway failures of the setup, never of one review: each stops the pass and charges nothing.
+#: Every other failure of a chat is ambiguous (see the module doc).
+SETUP_FAILURES = frozenset(
+    {
+        "not_configured",
+        "origin",
+        "redirect",
+        "network",
+        "http-401",
+        "http-403",
+        "http-404",
+        "http-429",
+    }
+)
+#: The pass lock: a file beside the database, held for a whole pass.
+LOCK_SUFFIX = ".lessons-propose.lock"
 #: Given-up reviews listed in a report (all are counted).
 MAX_LISTED = 20
+#: Stops that are not failures: the pass ran.
+_NOT_FAILURES = ("backlog_full", "busy")
 
 
 class ChatClient(Protocol):
@@ -126,7 +165,8 @@ class ChatClient(Protocol):
 
 @dataclass
 class ReviewOutcome:
-    """What one pass did with one review: ``drafted``, ``recovered`` or ``failed``."""
+    """What one pass did with one review: ``drafted``, ``recovered``, ``deferred`` (the store had
+    no room for any draft: no marker, so the review stays a candidate) or ``failed``."""
 
     project_id: str
     review_id: str
@@ -134,11 +174,13 @@ class ReviewOutcome:
     lessons: list[dict[str, str]] = field(default_factory=list)  # drafted: {id, text, scope}
     problems: list[str] = field(default_factory=list)  # drafts dropped or refused, bookkeeping
     proposed: int = 0  # recovered: the proposals found
-    reply_model: str | None = None  # drafted: the model the gateway says answered
+    reply_model: str | None = None  # drafted, deferred: the model the gateway says answered
     code: str | None = None  # failed
     message: str = ""  # failed
-    attempt: int | None = None  # failed
-    final: bool = False  # failed: no attempt left
+    charged: bool = False  # failed: charged as an attempt; otherwise it is a strike
+    attempts: int = 0  # failed: the review's charged attempts after this pass
+    strikes: int = 0  # failed: the review's strikes after this pass
+    final: bool = False  # failed: no attempt or strike left, so the review is given up
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -154,10 +196,28 @@ class ReviewOutcome:
             )
         elif self.outcome == "recovered":
             out["proposed"] = self.proposed
+        elif self.outcome == "deferred":
+            out["reply_model"] = self.reply_model
         else:
-            out.update(code=self.code, message=self.message, attempt=self.attempt, final=self.final)
+            out.update(
+                code=self.code,
+                message=self.message,
+                charged=self.charged,
+                attempts=self.attempts,
+                strikes=self.strikes,
+                final=self.final,
+            )
         out["problems"] = list(self.problems)
         return out
+
+
+class GivenUp(NamedTuple):
+    """A review this pass skipped because its attempts or its strikes are used up."""
+
+    project_id: str
+    review_id: str
+    attempts: int
+    strikes: int
 
 
 @dataclass
@@ -172,7 +232,7 @@ class ProposeReport:
     calls: int = 0
     usage: Counter[str] = field(default_factory=Counter)
     reviews: list[ReviewOutcome] = field(default_factory=list)
-    given_up: list[tuple[str, str]] = field(default_factory=list)
+    given_up: list[GivenUp] = field(default_factory=list)
     not_decided: int = 0  # decided by event, but not a decided review once confirmed
     waiting: int = 0  # reviews left for a later pass
     stopped: dict[str, Any] | None = None
@@ -183,9 +243,34 @@ class ProposeReport:
         return sum(len(outcome.lessons) for outcome in self.reviews)
 
     @property
+    def struck(self) -> list[ReviewOutcome]:
+        """This pass's failures that are strikes: no later review showed them to be their own."""
+        return [o for o in self.reviews if o.outcome == "failed" and not o.charged]
+
+    @property
     def failed(self) -> bool:
-        """Whether a setup or transport failure stopped the pass (a full backlog is not one)."""
-        return self.stopped is not None and self.stopped["reason"] != "backlog_full"
+        """Whether the pass ends in failure: a setup failure or failures in a row stopped it, or
+        it recorded a strike. A full backlog and another pass holding the lock are not."""
+        return self.error() is not None
+
+    def error(self) -> dict[str, Any] | None:
+        """The pass's failure (``reason``, ``code``, ``message``, ``hint``): why it stopped, else
+        its last strike; ``None`` when it did not fail."""
+        if self.stopped is not None and self.stopped["reason"] not in _NOT_FAILURES:
+            return self.stopped
+        if not self.struck:
+            return None
+        last = self.struck[-1]
+        return {
+            "reason": "strike",
+            "code": last.code,
+            "message": last.message,
+            "hint": "No review was drafted after it in this pass, so it may be the setup's "
+            f"failure and was not charged to the review (strike {last.strikes} of "
+            f"{MAX_STRIKES}). The next pass retries it.",
+            "project_id": last.project_id,
+            "review_id": last.review_id,
+        }
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -200,10 +285,7 @@ class ProposeReport:
             "reviews": [outcome.to_dict() for outcome in self.reviews],
             "given_up": {
                 "count": len(self.given_up),
-                "reviews": [
-                    {"project_id": project_id, "review_id": review_id}
-                    for project_id, review_id in self.given_up[:MAX_LISTED]
-                ],
+                "reviews": [entry._asdict() for entry in self.given_up[:MAX_LISTED]],
             },
             "not_decided": self.not_decided,
             "waiting": self.waiting,
@@ -260,8 +342,14 @@ def drafted_key(project_id: str, review_id: str) -> str:
 
 
 def failed_key(project_id: str, review_id: str, attempt: int) -> str:
-    """The idempotency key of a review's ``attempt``-th failure (1 to :data:`MAX_ATTEMPTS`)."""
+    """The idempotency key of a review's ``attempt``-th charged failure (1 to
+    :data:`MAX_ATTEMPTS`)."""
     return f"lessons:draft-failed:{project_id}:{review_id}:{attempt}"
+
+
+def strike_key(project_id: str, review_id: str, strike: int) -> str:
+    """The idempotency key of a review's ``strike``-th strike (1 to :data:`MAX_STRIKES`)."""
+    return f"lessons:draft-strike:{project_id}:{review_id}:{strike}"
 
 
 def proposal_key(project_id: str, review_id: str, index: int) -> str:
@@ -278,12 +366,72 @@ def _drafted(log: EventLog, project_id: str, review_id: str) -> bool:
     return log.get_by_idempotency_key(drafted_key(project_id, review_id)) is not None
 
 
-def _next_attempt(log: EventLog, project_id: str, review_id: str) -> int | None:
-    """The first attempt whose key is free, or ``None`` when all are used (given up)."""
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        if log.get_by_idempotency_key(failed_key(project_id, review_id, attempt)) is None:
-            return attempt
-    return None
+def _used(log: EventLog, key: Callable[[int], str], cap: int) -> int:
+    """How many of a review's numbered keys are used: those taken from 1 up to the first free
+    one, or ``cap`` when all are taken."""
+    for number in range(1, cap + 1):
+        if log.get_by_idempotency_key(key(number)) is None:
+            return number - 1
+    return cap
+
+
+@dataclass(frozen=True)
+class _Standing:
+    """A review's charged attempts and strikes so far."""
+
+    attempts: int
+    strikes: int
+
+    @classmethod
+    def read(cls, log: EventLog, project_id: str, review_id: str) -> _Standing:
+        return cls(
+            _used(log, lambda n: failed_key(project_id, review_id, n), MAX_ATTEMPTS),
+            _used(log, lambda n: strike_key(project_id, review_id, n), MAX_STRIKES),
+        )
+
+    @property
+    def given_up(self) -> bool:
+        return self.attempts >= MAX_ATTEMPTS or self.strikes >= MAX_STRIKES
+
+
+# -- the pass lock -------------------------------------------------------------------------------
+
+
+class _PassLock:
+    """A non-blocking exclusive ``flock`` on a file beside the database, for one pass. ``held``
+    is false when another pass holds it. Closing the descriptor releases it."""
+
+    def __init__(self, fd: int | None, held: bool) -> None:
+        self.fd = fd
+        self.held = held
+
+    @classmethod
+    def take(cls, db_path: str) -> _PassLock:
+        """The lock for ``db_path``. ``OSError`` when its file cannot be opened or locked."""
+        try:
+            import fcntl
+        except ImportError:  # Windows: no flock, so passes there run without the lock
+            return cls(None, True)
+        if db_path in ("", ":memory:"):  # no file, so no other process shares the database
+            return cls(None, True)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(db_path + LOCK_SUFFIX, flags, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return cls(fd, False)
+        except BaseException:
+            os.close(fd)
+            raise
+        return cls(fd, True)
+
+    def __enter__(self) -> _PassLock:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
 
 
 # -- reading the hub -----------------------------------------------------------------------------
@@ -399,7 +547,27 @@ def propose_from_reviews(
         raise ValueError("model must be 1-128 printable ASCII characters without spaces")
     report = ProposeReport(model=model, actor=actor, limit=check_limit(limit), started="")
     report.started = iso(clock())
-    _Pass(log, client, report).run()
+    try:
+        lock = _PassLock.take(log.path)
+    except OSError as error:
+        report.stopped = {
+            "reason": "setup",
+            "code": "lock_unavailable",
+            "message": "cannot take the pass lock beside the database: "
+            f"{error.strerror or type(error).__name__}",
+            "hint": "The database's folder must be writable by this user. Nothing was done.",
+        }
+    else:
+        with lock:
+            if lock.held:
+                _Pass(log, client, report).run()
+            else:
+                report.stopped = {
+                    "reason": "busy",
+                    "code": "busy",
+                    "message": "another pass holds this database's lessons lock",
+                    "hint": "Nothing was done; that pass drafts the reviews.",
+                }
     report.finished = iso(clock())
     return report
 
@@ -412,27 +580,38 @@ class _Pass:
         self.registry = Registry(log)
         self.clients: dict[str, str | None] = {}
         self.model_checked = False
+        self.unproven: list[ReviewOutcome] = []  # ambiguous failures not charged yet
+        self.in_a_row = 0  # ambiguous failures since the last review the model drafted
 
     def run(self) -> None:
         candidates = _decided_reviews(self.log)
         for index, (project_id, review_id) in enumerate(candidates):
             if _drafted(self.log, project_id, review_id):
                 continue
-            attempt = _next_attempt(self.log, project_id, review_id)
-            if attempt is None:
-                self.report.given_up.append((project_id, review_id))
+            standing = _Standing.read(self.log, project_id, review_id)
+            if standing.given_up:
+                self.report.given_up.append(
+                    GivenUp(project_id, review_id, standing.attempts, standing.strikes)
+                )
                 continue
-            if not self.review(project_id, review_id, attempt):
+            if not self.review(project_id, review_id):
                 self.count_rest(candidates[index:])
-                return
+                break
+        for outcome in self.unproven:  # no review was drafted after these: strikes
+            self.tally(outcome, charged=False)
+        self.unproven.clear()
 
     def count_rest(self, rest: Sequence[tuple[str, str]]) -> None:
         """After a stop: the reviews left, waiting or given up (cheap key lookups only)."""
+        handled = {(outcome.project_id, outcome.review_id) for outcome in self.report.reviews}
         for project_id, review_id in rest:
-            if _drafted(self.log, project_id, review_id):
+            if (project_id, review_id) in handled or _drafted(self.log, project_id, review_id):
                 continue
-            if _next_attempt(self.log, project_id, review_id) is None:
-                self.report.given_up.append((project_id, review_id))
+            standing = _Standing.read(self.log, project_id, review_id)
+            if standing.given_up:
+                self.report.given_up.append(
+                    GivenUp(project_id, review_id, standing.attempts, standing.strikes)
+                )
             else:
                 self.report.waiting += 1
 
@@ -451,7 +630,7 @@ class _Pass:
 
     def model_served(self) -> bool:
         """Before the pass's first chat: does the gateway serve the model? A model it does not
-        serve would be answered with HTTP 400, a review-specific failure, for every review."""
+        serve would be answered with HTTP 400 for every review."""
         if self.model_checked:
             return True
         try:
@@ -471,7 +650,7 @@ class _Pass:
         self.model_checked = True
         return True
 
-    def review(self, project_id: str, review_id: str, attempt: int) -> bool:
+    def review(self, project_id: str, review_id: str) -> bool:
         """Handle one review not drafted yet; ``False`` stops the pass."""
         review = reviews.get_review(self.log, project_id, review_id)
         project = self.registry.get(project_id)
@@ -512,21 +691,76 @@ class _Pass:
         try:
             reply = self.client.chat(self.report.model, messages, max_tokens=MAX_TOKENS)
         except GatewayError as error:
-            if error.code not in REVIEW_FAILURES:
+            if error.code in SETUP_FAILURES:
                 self.report.stopped = _gateway_stop(error, project_id, review_id)
                 return False
-            failure = (error.code, error.message)
-        else:
-            self.report.usage.update(reply.usage)
-            try:
-                drafts = parse_drafts(reply.text, scopes=scopes_for(feedback))
-            except DraftError as error:
-                failure = (error.code, error.message)
-            else:
-                self.record(project_id, review_id, client, drafts, reply)
-                return True
-        self.fail(project_id, review_id, attempt, *failure)
+            return self.ambiguous(project_id, review_id, error.code, error.message)
+        self.report.usage.update(reply.usage)
+        try:
+            drafts = parse_drafts(reply.text, scopes=scopes_for(feedback))
+        except DraftError as error:
+            return self.ambiguous(project_id, review_id, error.code, error.message)
+        # The model drafted for this review, so the setup works: the failures before it in this
+        # pass were their reviews' own.
+        for outcome in self.unproven:
+            self.tally(outcome, charged=True)
+        self.unproven.clear()
+        self.in_a_row = 0
+        self.record(project_id, review_id, client, drafts, reply)
         return True
+
+    def ambiguous(self, project_id: str, review_id: str, code: str, message: str) -> bool:
+        """A failure that may be the review's or the setup's: held until the pass shows which.
+        ``False`` (stop) after :data:`MAX_IN_A_ROW` in a row."""
+        outcome = ReviewOutcome(project_id, review_id, "failed", code=code, message=message)
+        self.report.reviews.append(outcome)
+        self.unproven.append(outcome)
+        self.in_a_row += 1
+        if self.in_a_row < MAX_IN_A_ROW:
+            return True
+        self.report.stopped = {
+            "reason": "failures_in_a_row",
+            "code": code,
+            "message": message,
+            "hint": f"{MAX_IN_A_ROW} reviews in a row failed with no review drafted after them, "
+            "which may be the setup's fault, so none is charged: each gets a strike. The next "
+            "pass retries them.",
+            "project_id": project_id,
+            "review_id": review_id,
+        }
+        return False
+
+    def tally(self, outcome: ReviewOutcome, *, charged: bool) -> None:
+        """Record an ambiguous failure as a charged attempt or a strike, under the review's next
+        free key, and note both counts in the outcome."""
+        project_id, review_id = outcome.project_id, outcome.review_id
+        before = _Standing.read(self.log, project_id, review_id)
+        if charged:
+            kind, used, cap = "attempt", before.attempts, MAX_ATTEMPTS
+            event_type, key = EVENT_DRAFT_FAILED, failed_key(project_id, review_id, used + 1)
+        else:
+            kind, used, cap = "strike", before.strikes, MAX_STRIKES
+            event_type, key = EVENT_DRAFT_STRIKE, strike_key(project_id, review_id, used + 1)
+        outcome.charged = charged
+        if used < cap:
+            payload = {
+                "project_id": project_id,
+                "review_id": review_id,
+                "code": outcome.code,
+                kind: used + 1,
+            }
+            try:
+                self.log.append(event_type, self.report.actor, payload, idempotency_key=key)
+            except IdempotencyConflict:
+                outcome.problems.append(
+                    f"another event already holds {kind} {used + 1}'s key; the {kind} counts"
+                )
+        after = _Standing.read(self.log, project_id, review_id)
+        outcome.attempts, outcome.strikes, outcome.final = (
+            after.attempts,
+            after.strikes,
+            after.given_up,
+        )
 
     def record(
         self,
@@ -536,7 +770,21 @@ class _Pass:
         drafts: DraftResult,
         reply: ChatReply,
     ) -> None:
-        """Propose each draft through the store, then write the marker."""
+        """Propose each draft through the store, then write the marker. A review that another
+        pass recorded while the model answered is left as it is."""
+        marked = _drafted(self.log, project_id, review_id)
+        found = _LessonState.read(self.log).sourced.get((project_id, review_id), 0)
+        if marked or found:
+            outcome = ReviewOutcome(project_id, review_id, "recovered", proposed=found)
+            outcome.problems.append(
+                "another pass recorded this review while the model answered; this reply is "
+                "not recorded"
+            )
+            if marked:
+                self.report.reviews.append(outcome)
+            else:
+                self.mark(outcome, model=None)
+            return
         outcome = ReviewOutcome(
             project_id,
             review_id,
@@ -544,6 +792,7 @@ class _Pass:
             problems=list(drafts.problems),
             reply_model=reply.model,
         )
+        refused_for: list[str] = []
         for index, draft in enumerate(drafts.drafts):
             try:
                 lesson = lessons.propose(
@@ -556,12 +805,21 @@ class _Pass:
                     idempotency_key=proposal_key(project_id, review_id, index),
                 )
             except WriteError as refused:
+                refused_for.append(refused.code)
                 outcome.problems.append(
                     f"draft {index + 1}: the lessons store refused it ({refused.code}): "
                     f"{refused.message}"
                 )
                 continue
             outcome.lessons.append({"id": lesson.id, "text": lesson.text, "scope": lesson.scope})
+        if refused_for and not outcome.lessons and set(refused_for) == {"too_many_proposals"}:
+            outcome.outcome = "deferred"
+            outcome.problems.append(
+                "the store's backlog filled while the model answered, so no draft was recorded "
+                "and no marker written: a later pass drafts this review again"
+            )
+            self.report.reviews.append(outcome)
+            return
         self.mark(outcome, model=self.report.model)
 
     def mark(self, outcome: ReviewOutcome, *, model: str | None) -> None:
@@ -583,39 +841,23 @@ class _Pass:
             )
         self.report.reviews.append(outcome)
 
-    def fail(self, project_id: str, review_id: str, attempt: int, code: str, message: str) -> None:
-        """Record a failure of this review's own request or reply (one attempt used)."""
-        outcome = ReviewOutcome(
-            project_id, review_id, "failed", code=code, message=message, attempt=attempt
-        )
-        payload = {
-            "project_id": project_id,
-            "review_id": review_id,
-            "code": code,
-            "attempt": attempt,
-        }
-        key = failed_key(project_id, review_id, attempt)
-        try:
-            self.log.append(EVENT_DRAFT_FAILED, self.report.actor, payload, idempotency_key=key)
-        except IdempotencyConflict:
-            outcome.problems.append(
-                f"another event already holds attempt {attempt}'s key; the attempt counts"
-            )
-        outcome.final = _next_attempt(self.log, project_id, review_id) is None
-        self.report.reviews.append(outcome)
-
 
 __all__ = [
     "DEFAULT_ACTOR",
     "DEFAULT_LIMIT",
     "EVENT_DRAFTED",
     "EVENT_DRAFT_FAILED",
+    "EVENT_DRAFT_STRIKE",
+    "LOCK_SUFFIX",
     "MAX_ATTEMPTS",
+    "MAX_IN_A_ROW",
     "MAX_LIMIT",
+    "MAX_STRIKES",
     "MAX_TOKENS",
     "MODEL_ENV",
-    "REVIEW_FAILURES",
+    "SETUP_FAILURES",
     "ChatClient",
+    "GivenUp",
     "ProposeReport",
     "ReviewOutcome",
     "check_limit",
@@ -625,4 +867,5 @@ __all__ = [
     "lessons_model",
     "proposal_key",
     "propose_from_reviews",
+    "strike_key",
 ]

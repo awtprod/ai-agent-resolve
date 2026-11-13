@@ -12,9 +12,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections import Counter
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +26,7 @@ from write_support import AGENT, HUMAN, Crash, Hub, brief_data, crash_after_appe
 from aar.cli import main
 from aar.hub import lessons, reviews
 from aar.hub import lessons_proposer as proposer
-from aar.hub.events import Actor
+from aar.hub.events import Actor, EventLog
 from aar.hub.graph import WorkGraph
 from aar.hub.lesson_drafts import DEFAULT_LESSONS_MODEL
 from aar.hub.registry import Registry
@@ -248,44 +250,112 @@ def test_proposals_left_without_a_marker_get_one_and_no_model_call(
 
 
 class RacingClient(FakeClient):
-    """A client during whose chat another pass writes an event under ``key`` (``payload``)."""
+    """A client during whose chat ``during()`` runs: another writer, such as another pass."""
 
-    def __init__(self, hub: Hub, key: str, *replies: Any) -> None:
+    def __init__(self, during: Callable[[], None], *replies: Any) -> None:
         super().__init__(*replies)
-        self.hub, self.key = hub, key
+        self.during = during
 
     def chat(self, model: str, messages: Any, **options: Any) -> ChatReply:
-        self.hub.log.append(
-            "test.other_pass", AGENT, {"by": "the other pass"}, idempotency_key=self.key
-        )
+        self.during()
         return super().chat(model, messages, **options)
 
 
-def test_a_marker_or_attempt_another_pass_wrote_meanwhile_is_kept_and_this_pass_goes_on(
-    hub: Hub,
+@pytest.mark.parametrize("meanwhile", ["marker", "proposal"])
+def test_a_review_another_pass_recorded_during_the_chat_is_not_recorded_again(
+    hub: Hub, meanwhile: str
 ) -> None:
-    first, second = review(hub), review(hub)
-    racing = RacingClient(
-        hub, proposer.drafted_key(hub.project_id, first), drafts(item("One.")), "not json"
-    )
+    drafted = review(hub)
+    marker_key = proposer.drafted_key(hub.project_id, drafted)
 
-    report = run(hub, racing, limit=1)
+    def other_pass() -> None:
+        if meanwhile == "marker":
+            hub.log.append(
+                proposer.EVENT_DRAFTED, AGENT, {"by": "the other pass"}, idempotency_key=marker_key
+            )
+        else:  # it died after its proposal, before its marker
+            lessons.propose(hub.log, "Theirs.", "global", AGENT, source=(hub.project_id, drafted))
+
+    report = run(hub, RacingClient(other_pass, drafts(item("Ours."), item("Also ours."))))
 
     [outcome] = report.reviews
-    assert (outcome.outcome, len(outcome.lessons)) == ("drafted", 1)
+    assert (outcome.review_id, outcome.outcome) == (drafted, "recovered")
+    assert outcome.problems == [
+        "another pass recorded this review while the model answered; this reply is not recorded"
+    ]
+    assert [lesson.text for lesson in proposals(hub)] == (
+        [] if meanwhile == "marker" else ["Theirs."]
+    )
+    assert payloads(hub, proposer.EVENT_DRAFTED) == (
+        [{"by": "the other pass"}]
+        if meanwhile == "marker"
+        else [
+            {
+                "project_id": hub.project_id,
+                "review_id": drafted,
+                "proposed": 1,
+                "model": None,
+                "recovered": True,
+            }
+        ]
+    )
+    assert not report.failed and report.calls == 1
+
+
+def test_a_marker_key_taken_after_the_last_check_still_counts_as_drafted(
+    hub: Hub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    drafted = review(hub)
+    marker_key = proposer.drafted_key(hub.project_id, drafted)
+    real = lessons.propose
+
+    def propose_while_another_marks(*args: Any, **options: Any) -> lessons.Lesson:
+        lesson = real(*args, **options)
+        if hub.log.get_by_idempotency_key(marker_key) is None:
+            hub.log.append("test.other_pass", AGENT, {}, idempotency_key=marker_key)
+        return lesson
+
+    monkeypatch.setattr(lessons, "propose", propose_while_another_marks)
+
+    report = run(hub, FakeClient(drafts(item("One."))))
+
+    [outcome] = report.reviews
+    assert (outcome.outcome, [entry["text"] for entry in outcome.lessons]) == ("drafted", ["One."])
     assert outcome.problems == [
         "another event already holds this review's marker key; it counts as drafted"
     ]
-    assert payloads(hub, proposer.EVENT_DRAFTED) == []  # the other pass's event stands
-    racing = RacingClient(hub, proposer.failed_key(hub.project_id, second, 1), "not json")
-    report = run(hub, racing)
-    [outcome] = report.reviews
-    assert (outcome.review_id, outcome.outcome, outcome.attempt) == (second, "failed", 1)
-    assert outcome.problems == ["another event already holds attempt 1's key; the attempt counts"]
-    assert proposer.failed_key(hub.project_id, second, 1) not in {
-        e.idempotency_key for e in hub.log.iter_events(types=[proposer.EVENT_DRAFT_FAILED])
-    }
-    assert run(hub, FakeClient("not json")).reviews[0].attempt == 2  # the next key, not 1 again
+    assert payloads(hub, proposer.EVENT_DRAFTED) == []  # the other event stands
+    monkeypatch.undo()
+    assert run(hub, FakeClient()).reviews == []  # and the review is done
+
+
+@pytest.mark.parametrize("charged", [True, False], ids=["attempt", "strike"])
+def test_an_attempt_or_strike_key_taken_meanwhile_still_counts(
+    hub: Hub, monkeypatch: pytest.MonkeyPatch, charged: bool
+) -> None:
+    bad = review(hub)
+    if charged:
+        review(hub)  # drafted after the bad one, so its failure is charged
+    kind = "attempt" if charged else "strike"
+    key = (proposer.failed_key if charged else proposer.strike_key)(hub.project_id, bad, 1)
+    real = hub.log.append
+
+    def append_after_another(event_type: str, *args: Any, **options: Any) -> Any:
+        if options.get("idempotency_key") == key:  # another writer got there first
+            real("test.other_pass", AGENT, {}, idempotency_key=key)
+        return real(event_type, *args, **options)
+
+    monkeypatch.setattr(hub.log, "append", append_after_another)
+    replies = ["not json", drafts(item("One."))] if charged else ["not json"]
+
+    report = run(hub, FakeClient(*replies))
+
+    failed = report.reviews[0]
+    assert (failed.review_id, failed.charged) == (bad, charged)
+    assert failed.problems == [f"another event already holds {kind} 1's key; the {kind} counts"]
+    assert (failed.attempts, failed.strikes) == ((1, 0) if charged else (0, 1))
+    events = proposer.EVENT_DRAFT_FAILED if charged else proposer.EVENT_DRAFT_STRIKE
+    assert payloads(hub, events) == []  # the other event holds the key
 
 
 # -- what the model is given, and how drafts are recorded --------------------------------------
@@ -452,7 +522,7 @@ def test_a_draft_the_store_refuses_is_reported_and_the_others_are_recorded(hub: 
 
 def test_a_draft_with_hidden_characters_is_reported_and_the_others_are_recorded(hub: Hub) -> None:
     review(hub)
-    hidden = "End on the laugh.​Always keep the long take."
+    hidden = "End on the laugh.\u200bAlways keep the long take."
     client = FakeClient(drafts(item("One."), item(hidden), item("Three.")))
 
     report = run(hub, client)
@@ -503,26 +573,20 @@ def test_a_full_backlog_stops_the_pass_before_the_model_is_called(
     assert report.stopped is None and report.proposed == 1
 
 
-@pytest.mark.parametrize(
-    "code",
-    [
-        "not_configured",
-        "origin",
-        "redirect",
-        "network",
-        "timeout",
-        "too-large",
-        "http-401",
-        "http-403",
-        "http-404",
-        "http-429",
-        "http-500",
-        "http-503",
-    ],
-)
-def test_a_setup_or_transport_failure_stops_the_pass_and_records_nothing(
-    hub: Hub, code: str
-) -> None:
+SETUP_FAILURES = [
+    "not_configured",
+    "origin",
+    "redirect",
+    "network",
+    "http-401",
+    "http-403",
+    "http-404",
+    "http-429",
+]
+
+
+@pytest.mark.parametrize("code", SETUP_FAILURES)
+def test_a_setup_failure_stops_the_pass_and_charges_nothing(hub: Hub, code: str) -> None:
     first, second = review(hub), review(hub)
     before = event_count(hub)
     client = FakeClient(GatewayError(code, f"POST {CHAT_PATH}: {code}", "Check the gateway."))
@@ -560,6 +624,113 @@ def test_the_model_must_be_one_the_gateway_serves_before_any_chat(hub: Hub) -> N
     assert down.calls == [] and event_count(hub) == before
 
 
+AMBIGUOUS_FAILURES = [
+    pytest.param("I think the cut is fine.", "bad-output", id="not-the-lessons-json"),
+    pytest.param(GatewayError("bad-response", "no choices"), "bad-response", id="bad-response"),
+    *(
+        pytest.param(GatewayError(code, f"POST {CHAT_PATH}: {code}"), code, id=code)
+        for code in (
+            "timeout",
+            "too-large",
+            "http-400",
+            "http-408",
+            "http-409",  # a status no rule names is ambiguous too
+            "http-413",
+            "http-422",
+            "http-500",
+            "http-502",
+            "http-503",
+        )
+    ),
+]
+
+
+@pytest.mark.parametrize(("failure", "code"), AMBIGUOUS_FAILURES)
+def test_an_ambiguous_failure_moves_on_and_is_charged_once_a_later_review_is_drafted(
+    hub: Hub, failure: Any, code: str
+) -> None:
+    bad, good = review(hub), review(hub)
+    client = FakeClient(failure, drafts(item("End on the laugh.")))
+
+    report = run(hub, client)
+
+    assert [(o.review_id, o.outcome) for o in report.reviews] == [
+        (bad, "failed"),
+        (good, "drafted"),
+    ]
+    failed = report.reviews[0].to_dict()
+    assert {name: failed[name] for name in ("code", "charged", "attempts", "strikes", "final")} == {
+        "code": code,
+        "charged": True,
+        "attempts": 1,
+        "strikes": 0,
+        "final": False,
+    }
+    assert payloads(hub, proposer.EVENT_DRAFT_FAILED) == [
+        {"project_id": hub.project_id, "review_id": bad, "code": code, "attempt": 1}
+    ]
+    assert payloads(hub, proposer.EVENT_DRAFT_STRIKE) == []
+    assert report.calls == 2 and report.stopped is None and not report.failed
+
+
+def test_two_ambiguous_failures_in_a_row_stop_the_pass_and_each_is_a_strike(hub: Hub) -> None:
+    first, second, _third = review(hub), review(hub), review(hub)
+    error = GatewayError("http-500", f"POST {CHAT_PATH}: HTTP 500: upstream failed")
+    client = FakeClient(error, error)
+
+    report = run(hub, client)
+
+    assert len(client.calls) == report.calls == 2  # the third review was not tried
+    assert [(o.review_id, o.charged, o.attempts, o.strikes) for o in report.reviews] == [
+        (first, False, 0, 1),
+        (second, False, 0, 1),
+    ]
+    assert report.stopped is not None and report.failed and report.waiting == 1
+    assert (report.stopped["reason"], report.stopped["code"]) == ("failures_in_a_row", "http-500")
+    assert report.stopped["review_id"] == second
+    assert payloads(hub, proposer.EVENT_DRAFT_FAILED) == []
+    assert payloads(hub, proposer.EVENT_DRAFT_STRIKE) == [
+        {"project_id": hub.project_id, "review_id": review_id, "code": "http-500", "strike": 1}
+        for review_id in (first, second)
+    ]
+
+
+def test_a_failure_no_review_is_drafted_after_is_a_strike_even_after_one_drafted_before(
+    hub: Hub,
+) -> None:
+    good, bad = review(hub), review(hub)
+
+    report = run(hub, FakeClient(drafts(item("One.")), "not json"))
+
+    assert [(o.review_id, o.outcome) for o in report.reviews] == [
+        (good, "drafted"),
+        (bad, "failed"),
+    ]
+    assert (report.reviews[1].charged, report.reviews[1].strikes) == (False, 1)
+    assert report.stopped is None and report.failed
+    error = report.error()
+    assert error is not None
+    assert (error["reason"], error["code"], error["review_id"]) == ("strike", "bad-output", bad)
+    assert "strike 1 of 144" in error["hint"]
+    assert payloads(hub, proposer.EVENT_DRAFT_FAILED) == []
+
+
+def test_an_ambiguous_failure_then_a_setup_failure_is_a_strike(hub: Hub) -> None:
+    first, _second = review(hub), review(hub)
+    client = FakeClient(
+        GatewayError("timeout", "POST /v1/chat/completions: no complete reply within 60 s"),
+        GatewayError("http-401", "POST /v1/chat/completions: HTTP 401: ", "check AAR_LLM_API_KEY"),
+    )
+
+    report = run(hub, client)
+
+    assert report.failed and report.stopped is not None and report.stopped["code"] == "http-401"
+    assert [(o.review_id, o.charged, o.strikes) for o in report.reviews] == [(first, False, 1)]
+    assert payloads(hub, proposer.EVENT_DRAFT_FAILED) == []
+    assert len(payloads(hub, proposer.EVENT_DRAFT_STRIKE)) == 1
+    assert report.waiting == 1  # nothing recorded against the second review
+
+
 @pytest.mark.parametrize(
     ("failure", "code"),
     [
@@ -568,28 +739,25 @@ def test_the_model_must_be_one_the_gateway_serves_before_any_chat(hub: Hub) -> N
         pytest.param(GatewayError("http-400", "HTTP 400: too long"), "http-400", id="http-400"),
     ],
 )
-def test_a_bad_reply_uses_one_attempt_and_the_third_ends_them(
-    hub: Hub, failure: Any, code: str
-) -> None:
-    bad, good = review(hub), review(hub)
-    report = run(hub, FakeClient(failure, drafts(item("End on the laugh."))))
-    assert [(o.review_id, o.outcome, o.code, o.attempt, o.final) for o in report.reviews] == [
-        (bad, "failed", code, 1, False),
-        (good, "drafted", None, None, False),
-    ]
-    for attempt in (2, 3):
-        report = run(hub, FakeClient(failure))
-        assert [(o.review_id, o.attempt, o.final) for o in report.reviews] == [
-            (bad, attempt, attempt == 3)
+def test_three_charged_attempts_give_a_review_up(hub: Hub, failure: Any, code: str) -> None:
+    bad = review(hub)
+    for attempt in (1, 2, 3):
+        good = review(hub)  # decided after the bad one, so drafted after it
+        report = run(hub, FakeClient(failure, drafts(item(f"Lesson {attempt}."))))
+        assert [
+            (o.review_id, o.outcome, o.charged, o.attempts, o.final) for o in report.reviews
+        ] == [
+            (bad, "failed", True, attempt, attempt == 3),
+            (good, "drafted", False, 0, False),
         ]
     silent = FakeClient()
 
     report = run(hub, silent)
 
-    assert silent.calls == [] and report.reviews == []
+    assert silent.calls == [] and report.reviews == [] and not report.failed
     assert report.to_dict()["given_up"] == {
         "count": 1,
-        "reviews": [{"project_id": hub.project_id, "review_id": bad}],
+        "reviews": [{"project_id": hub.project_id, "review_id": bad, "attempts": 3, "strikes": 0}],
     }
     assert payloads(hub, proposer.EVENT_DRAFT_FAILED) == [
         {"project_id": hub.project_id, "review_id": bad, "code": code, "attempt": n}
@@ -597,21 +765,231 @@ def test_a_bad_reply_uses_one_attempt_and_the_third_ends_them(
     ]
     keys = [e.idempotency_key for e in hub.log.iter_events(types=[proposer.EVENT_DRAFT_FAILED])]
     assert keys == [proposer.failed_key(hub.project_id, bad, n) for n in (1, 2, 3)]
-    assert [m["review_id"] for m in payloads(hub, proposer.EVENT_DRAFTED)] == [good]
     # Bookkeeping, not lessons: the lessons fold neither reads nor skips these events.
     assert lessons.scan_lessons(hub.log)[1] == ()
 
 
-def test_an_attempt_key_held_by_another_event_still_ends_the_attempts(hub: Hub) -> None:
+def test_a_review_that_fails_alone_is_given_up_after_144_strikes(hub: Hub) -> None:
+    alone = review(hub)
+    for strike in range(1, 145):
+        report = run(hub, FakeClient(GatewayError("http-400", "HTTP 400: refused")))
+        [outcome] = report.reviews
+        assert (outcome.charged, outcome.attempts, outcome.strikes) == (False, 0, strike)
+        assert outcome.final is (strike == 144) and report.failed
+    silent = FakeClient()
+
+    report = run(hub, silent)
+
+    assert silent.calls == [] and report.reviews == [] and not report.failed
+    assert report.given_up == [proposer.GivenUp(hub.project_id, alone, 0, 144)]
+    assert payloads(hub, proposer.EVENT_DRAFT_FAILED) == []
+    keys = [e.idempotency_key for e in hub.log.iter_events(types=[proposer.EVENT_DRAFT_STRIKE])]
+    assert keys == [proposer.strike_key(hub.project_id, alone, n) for n in range(1, 145)]
+
+
+def test_a_model_wide_400_gives_up_no_review_and_every_pass_fails(hub: Hub) -> None:
+    """The validator's scenario: the gateway lists the model, but it answers every chat with
+    HTTP 400 (a parameter the model does not take, say). That is the setup's fault, and no
+    review may be given up for it."""
+    first, second, *_rest = (review(hub) for _ in range(5))
+    for _ in range(10):
+        refused = GatewayError("http-400", "HTTP 400: Unsupported parameter: max_tokens")
+        report = run(hub, FakeClient(refused, refused))
+        assert report.failed and report.calls == 2 and report.given_up == []
+        assert report.stopped is not None and report.stopped["reason"] == "failures_in_a_row"
+        assert report.waiting == 3
+    assert payloads(hub, proposer.EVENT_DRAFT_FAILED) == []
+    strikes = Counter(p["review_id"] for p in payloads(hub, proposer.EVENT_DRAFT_STRIKE))
+    assert strikes == {first: 10, second: 10}
+
+
+def test_an_attempt_key_held_by_another_event_counts_as_used(hub: Hub) -> None:
     bad = review(hub)
     hub.log.append(
         "test.other", AGENT, {}, idempotency_key=proposer.failed_key(hub.project_id, bad, 2)
     )
-    attempts = [run(hub, FakeClient("not json")).reviews[0] for _ in range(2)]
-    assert [(o.attempt, o.final) for o in attempts] == [(1, False), (3, True)]
+    seen = []
+    for n in (1, 2):
+        review(hub)
+        report = run(hub, FakeClient("not json", drafts(item(f"Lesson {n}."))))
+        seen.append((report.reviews[0].attempts, report.reviews[0].final))
+    assert seen == [(2, False), (3, True)]  # keys 1 and 2, then 3: all taken
     silent = FakeClient()
     report = run(hub, silent)
-    assert silent.calls == [] and report.given_up == [(hub.project_id, bad)]
+    assert silent.calls == [] and report.given_up == [proposer.GivenUp(hub.project_id, bad, 3, 0)]
+
+
+def test_the_limit_counts_every_call_failed_ones_too(hub: Hub) -> None:
+    for _ in range(6):
+        review(hub)
+    client = FakeClient("not json", drafts(item("One.")), "not json")
+
+    report = run(hub, client, limit=3)
+
+    assert len(client.calls) == report.calls == 3 and report.waiting == 3
+    assert [(o.outcome, o.charged) for o in report.reviews] == [
+        ("failed", True),
+        ("drafted", False),
+        ("failed", False),
+    ]
+    assert report.stopped is None  # a drafted review between two failures: not in a row
+
+
+def test_a_reply_the_store_has_no_room_for_is_deferred_and_drafted_again_later(
+    hub: Hub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lessons, "MAX_PENDING", 4)
+    deferred = review(hub)
+
+    def fill_the_backlog() -> None:  # another writer, while the model answers
+        for n in range(4):
+            lessons.propose(hub.log, f"Waiting {n}.", "global", AGENT)
+
+    report = run(hub, RacingClient(fill_the_backlog, drafts(item("One."), item("Two."))))
+
+    [outcome] = report.reviews
+    assert (outcome.review_id, outcome.outcome, outcome.lessons) == (deferred, "deferred", [])
+    assert [problem[:58] for problem in outcome.problems[:2]] == [
+        f"draft {n}: the lessons store refused it (too_many_proposals)" for n in (1, 2)
+    ]
+    assert outcome.to_dict()["reply_model"] == MODEL
+    assert payloads(hub, proposer.EVENT_DRAFTED) == [] and not report.failed
+    for lesson in proposals(hub):  # a person clears the backlog
+        lessons.drop(hub.log, lesson.id, HUMAN)
+    again = FakeClient(drafts(item("One.")))
+    report = run(hub, again)
+    assert len(again.calls) == 1
+    assert [(o.review_id, o.outcome) for o in report.reviews] == [(deferred, "drafted")]
+
+
+def test_a_reply_the_store_takes_in_part_is_drafted_and_marked(
+    hub: Hub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lessons, "MAX_PENDING", 4)
+    drafted = review(hub)
+
+    def leave_room_for_one() -> None:
+        for n in range(3):
+            lessons.propose(hub.log, f"Waiting {n}.", "global", AGENT)
+
+    report = run(hub, RacingClient(leave_room_for_one, drafts(item("One."), item("Two."))))
+
+    [outcome] = report.reviews
+    assert (outcome.outcome, [entry["text"] for entry in outcome.lessons]) == ("drafted", ["One."])
+    assert [m["review_id"] for m in payloads(hub, proposer.EVENT_DRAFTED)] == [drafted]
+
+
+def test_a_reply_the_store_refuses_for_another_reason_is_still_marked(hub: Hub) -> None:
+    drafted = review(hub)
+    for index in range(2):  # other proposals already hold both drafts' keys
+        lessons.propose(
+            hub.log,
+            f"Some other lesson {index}.",
+            "global",
+            AGENT,
+            idempotency_key=proposer.proposal_key(hub.project_id, drafted, index),
+        )
+
+    report = run(hub, FakeClient(drafts(item("One."), item("Two."))))
+
+    [outcome] = report.reviews
+    assert (outcome.outcome, outcome.lessons) == ("drafted", [])
+    assert payloads(hub, proposer.EVENT_DRAFTED)[0]["proposed"] == 0  # done: not drafted again
+
+
+# -- one pass at a time ----------------------------------------------------------------------------
+
+
+def lock_path(hub: Hub) -> Path:
+    return Path(hub.log.path + proposer.LOCK_SUFFIX)
+
+
+def test_a_pass_that_finds_the_lock_held_does_nothing_and_is_not_a_failure(hub: Hub) -> None:
+    fcntl = pytest.importorskip("fcntl")
+    review(hub)
+    before = event_count(hub)
+    silent = FakeClient(served=AssertionError("a busy pass must not ask for the models"))
+    fd = os.open(lock_path(hub), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # another pass holds it
+        report = run(hub, silent)
+    finally:
+        os.close(fd)
+
+    assert report.stopped is not None and (report.stopped["reason"], report.stopped["code"]) == (
+        "busy",
+        "busy",
+    )
+    assert not report.failed and report.error() is None
+    assert silent.calls == [] and silent.model_reads == 0
+    assert report.reviews == [] and event_count(hub) == before
+    assert run(hub, FakeClient(drafts(item("One.")))).proposed == 1  # released: a pass runs
+
+
+def test_a_second_pass_while_a_chat_runs_is_busy(hub: Hub) -> None:
+    pytest.importorskip("fcntl")
+    review(hub)
+    second: list[proposer.ProposeReport] = []
+    other = FakeClient(served=AssertionError("the busy pass must not ask for the models"))
+
+    def start_a_second_pass() -> None:  # on its own connection, as another process would
+        log = EventLog(hub.log.path)
+        try:
+            second.append(
+                proposer.propose_from_reviews(log, other, model=MODEL, actor=proposer.DEFAULT_ACTOR)
+            )
+        finally:
+            log.close()
+
+    report = run(hub, RacingClient(start_a_second_pass, drafts(item("Once."))))
+
+    [busy] = second
+    assert busy.stopped is not None and busy.stopped["reason"] == "busy" and other.calls == []
+    assert [lesson.text for lesson in proposals(hub)] == ["Once."] and report.proposed == 1
+
+
+def test_the_lock_is_a_private_file_beside_the_database_and_stays(hub: Hub) -> None:
+    pytest.importorskip("fcntl")
+    run(hub, FakeClient())
+    assert lock_path(hub).is_file() and lock_path(hub).parent == Path(hub.log.path).parent
+    assert stat.S_IMODE(lock_path(hub).stat().st_mode) == 0o600
+
+
+def test_a_lock_path_that_is_a_symlink_is_not_followed(hub: Hub, tmp_path: Path) -> None:
+    pytest.importorskip("fcntl")
+    review(hub)
+    elsewhere = tmp_path / "not-the-lock"
+    lock_path(hub).symlink_to(elsewhere)
+
+    report = run(hub, FakeClient(served=AssertionError("the pass must not ask for the models")))
+
+    assert report.stopped is not None and report.stopped["code"] == "lock_unavailable"
+    assert not elsewhere.exists()  # nothing was created through the link
+
+
+def test_without_fcntl_a_pass_runs_without_the_lock(
+    hub: Hub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(sys.modules, "fcntl", None)  # as on Windows: importing it fails
+    review(hub)
+
+    report = run(hub, FakeClient(drafts(item("One."))))
+
+    assert report.proposed == 1 and report.stopped is None
+    assert not lock_path(hub).exists()
+
+
+def test_a_lock_file_that_cannot_be_opened_stops_the_pass(hub: Hub) -> None:
+    pytest.importorskip("fcntl")
+    review(hub)
+    lock_path(hub).mkdir()  # a folder where the lock file goes
+    silent = FakeClient(served=AssertionError("the pass must not ask for the models"))
+
+    report = run(hub, silent)
+
+    assert report.failed and report.stopped is not None
+    assert (report.stopped["reason"], report.stopped["code"]) == ("setup", "lock_unavailable")
+    assert silent.model_reads == 0 and report.reviews == []
 
 
 @pytest.mark.parametrize(
@@ -769,6 +1147,72 @@ def test_a_full_backlog_is_a_pass_that_ran(
     code, report, err = cli(capsys, "--db", str(hub.root / "hub.db"))
 
     assert (code, err) == (0, None) and report["stopped"]["reason"] == "backlog_full"
+    assert gateway.requests == []
+
+
+def test_the_default_limit_is_5_model_calls(
+    hub: Hub, gateway: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for _ in range(7):
+        review(hub)
+    gateway.routes[("POST", CHAT_PATH)] = chat_reply(drafts(item("End on the laugh.")))
+
+    code, report, err = cli(capsys, "--db", str(hub.root / "hub.db"))
+
+    assert (code, err) == (0, None)
+    assert (report["limit"], report["calls"], report["waiting"]) == (5, 5, 2)
+    assert gateway.calls().count(f"POST {CHAT_PATH}") == 5
+
+
+def test_a_model_wide_400_exits_1_every_pass_and_gives_up_no_review(
+    hub: Hub, gateway: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for _ in range(3):
+        review(hub)
+    refused = {"error": {"message": "Unsupported parameter: 'max_tokens'"}}
+    gateway.routes[("POST", CHAT_PATH)] = lambda s, h: s.reply(h, 400, refused)
+    seen = []
+    for _ in range(4):
+        code, report, err = cli(capsys, "--db", str(hub.root / "hub.db"))
+        seen.append((code, report["calls"], report["given_up"]["count"], err["error"]["code"]))
+        assert err["error"]["details"] == {"reason": "failures_in_a_row"}
+    assert seen == [(1, 2, 0, "http-400")] * 4
+    assert payloads(hub, proposer.EVENT_DRAFT_FAILED) == []
+
+
+def test_a_strike_exits_1_with_its_failure(
+    hub: Hub, gateway: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    struck = review(hub)
+    gateway.routes[("POST", CHAT_PATH)] = lambda s, h: s.reply(h, 502, {"error": "upstream"})
+
+    code, report, err = cli(capsys, "--db", str(hub.root / "hub.db"))
+
+    assert code == 1 and report["stopped"] is None
+    [failed] = report["reviews"]
+    assert (failed["review_id"], failed["charged"], failed["attempts"], failed["strikes"]) == (
+        struck,
+        False,
+        0,
+        1,
+    )
+    assert (err["error"]["code"], err["error"]["details"]) == ("http-502", {"reason": "strike"})
+    assert "strike 1 of 144" in err["error"]["fix_hint"]
+
+
+def test_a_pass_that_finds_the_lock_held_exits_0(
+    hub: Hub, gateway: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fcntl = pytest.importorskip("fcntl")
+    review(hub)
+    fd = os.open(lock_path(hub), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        code, report, err = cli(capsys, "--db", str(hub.root / "hub.db"))
+    finally:
+        os.close(fd)
+
+    assert (code, err, report["stopped"]["reason"], report["calls"]) == (0, None, "busy", 0)
     assert gateway.requests == []
 
 

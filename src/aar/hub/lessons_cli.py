@@ -15,10 +15,12 @@ gateway is ``AAR_LLM_BASE_URL`` (default ``http://127.0.0.1:8317``) with the key
 Output is JSON on stdout (``list``: ``{"lessons": [...], "skipped": {count, events}}``; ``show``:
 the lesson; ``propose``: the pass's report). A refusal prints ``{"error": {code, message,
 fix_hint, details}}`` on stderr and exits 2; ``show`` of a well-formed id that names no lesson
-exits 1 (``unknown_lesson``). ``propose`` exits 0 when the pass ran (with nothing to do, or
-stopped by a full backlog, too), 1 when a gateway failure or a model the gateway does not serve
-stopped it (the report on stdout, the error on stderr), and 2 when it could not start: no key
-(``not_configured``), a refused gateway URL (``origin``), a bad argument or a missing database.
+exits 1 (``unknown_lesson``). ``propose`` exits 0 when the pass ran (with nothing to do, with
+another pass holding the lock (``busy``), or stopped by a full backlog, too); 1 when it failed:
+a setup failure stopped it (the gateway, its key, a model it does not serve, the lock file),
+ambiguous failures in a row stopped it, or it recorded a strike (the report on stdout, the
+error on stderr); and 2 when it could not start: no key (``not_configured``), a refused gateway
+URL (``origin``), a bad argument or a missing database.
 """
 
 from __future__ import annotations
@@ -70,9 +72,10 @@ def register(hub_sub: argparse._SubParsersAction) -> None:
             "decided review not drafted yet, oldest decision first, and record them as "
             "proposals a person accepts or drops in the console. The gateway is "
             "AAR_LLM_BASE_URL (default http://127.0.0.1:8317) and its key AAR_LLM_API_KEY. "
-            "Exit 0 when the pass ran (also with nothing to do or a full backlog), 1 when a "
-            "gateway failure stopped it (report on stdout, error on stderr), 2 when it could "
-            "not start (JSON error on stderr)."
+            "Exit 0 when the pass ran (also with nothing to do, another pass running, or a "
+            "full backlog), 1 when it failed: a setup failure or failures in a row stopped "
+            "it, or a review's failure could not be charged to it (report on stdout, error on "
+            "stderr), 2 when it could not start (JSON error on stderr)."
         ),
     )
     propose.add_argument("--db", required=True, help="Path to the SQLite event-log database.")
@@ -182,13 +185,13 @@ def _propose(args: argparse.Namespace) -> int:
     finally:
         log.close()
     written = _print(report.to_dict())
-    if written != 0 or not report.failed or report.stopped is None:
+    failure = report.error()
+    if written != 0 or failure is None:
         return written
-    stopped = report.stopped
     return _error(
-        stopped["code"],
-        stopped["message"],
-        stopped["hint"],
+        failure["code"],
+        failure["message"],
+        failure["hint"],
         exit_status=1,
-        details={"reason": stopped["reason"]},
+        details={"reason": failure["reason"]},
     )
