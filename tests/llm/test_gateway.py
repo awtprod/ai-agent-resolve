@@ -35,6 +35,7 @@ from aar.llm.gateway import (
     DEFAULT_BASE_URL,
     KEY_ENV,
     MAX_BODY,
+    MODELS_PATH,
     ChatReply,
     GatewayClient,
     GatewayError,
@@ -182,6 +183,48 @@ def test_an_injected_safe_opener_is_used(stub):
     stub.routes[CHAT] = answer((200, completion(), {}))
     assert ask(client(stub, opener=opener)).text == "Ready."
     assert seen == [stub.base + CHAT_PATH]
+
+
+# ---------------------------------------------------------------- the model list
+
+MODELS = ("GET", MODELS_PATH)
+
+
+def test_models_lists_the_ids_the_gateway_serves(stub):
+    listed = [
+        {"id": "gpt-6-luna", "object": "model"},
+        {"id": "two words"},  # not a model id: ignored
+        {"object": "model"},
+        "gpt-6-sol",
+        {"id": 7},
+        {"id": "gpt-6-sol"},
+    ]
+    stub.routes[MODELS] = answer((200, {"object": "list", "data": listed}, {}))
+    assert client(stub).models() == ("gpt-6-luna", "gpt-6-sol")
+    [request] = stub.requests
+    assert (request["method"], request["path"], request["body"]) == ("GET", MODELS_PATH, b"")
+    assert request["headers"]["authorization"] == f"Bearer {KEY}"
+    assert "content-type" not in request["headers"]
+
+
+@pytest.mark.parametrize(
+    "body", [b"not json", [], {"data": {"id": "gpt-6-luna"}}, {"models": []}], ids=repr
+)
+def test_a_model_list_without_a_data_list_is_a_bad_response(stub, body):
+    stub.routes[MODELS] = answer((200, body, {}))
+    with pytest.raises(GatewayError) as error:
+        client(stub).models()
+    assert error.value.code == "bad-response"
+    assert error.value.message.startswith(f"GET {MODELS_PATH}: ")
+
+
+def test_a_refused_model_list_is_its_status_and_names_the_get(stub):
+    stub.routes[MODELS] = answer((401, {"error": "bad key"}, {}))
+    with pytest.raises(GatewayError) as error:
+        client(stub).models()
+    assert error.value.code == "http-401"
+    assert error.value.message.startswith(f"GET {MODELS_PATH}: HTTP 401")
+    assert len(stub.requests) == 1
 
 
 # ---------------------------------------------------------------- retries

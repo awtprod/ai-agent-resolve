@@ -1,5 +1,5 @@
 """A small chat client for the local model gateway (CLIProxyAPI): OpenAI-compatible
-``POST /v1/chat/completions`` with ``Authorization: Bearer <key>``.
+``POST /v1/chat/completions`` and ``GET /v1/models`` with ``Authorization: Bearer <key>``.
 
 **Configuration.** ``gateway_from_env`` reads ``AAR_LLM_BASE_URL`` (default
 ``http://127.0.0.1:8317``) and ``AAR_LLM_API_KEY`` (required; there is no flag for the key). The
@@ -25,7 +25,10 @@ can never break a header line.
 **The reply** is checked here: a JSON object whose ``choices[0].message.content`` is a string
 with more than whitespace in it. ``model`` (a string) and ``usage`` (an object whose
 ``prompt_tokens``, ``completion_tokens`` and ``total_tokens``, when present, are whole numbers)
-are optional; ``null`` counts as absent. Anything else is ``bad-response``.
+are optional; ``null`` counts as absent. Anything else is ``bad-response``. ``models()`` lists
+the model ids the gateway serves (``{"data": [{"id": ...}, ...]}``; an entry without a valid id
+is ignored). The gateway answers a chat for a model it does not serve with HTTP 400, so a caller
+that must tell a bad model id from a bad request asks ``models()`` first.
 
 **Errors** are ``GatewayError(code, message, hint)``. The codes are stable: ``not_configured``,
 ``http-<status>``, ``timeout``, ``network``, ``redirect``, ``too-large``, ``bad-response`` and
@@ -65,6 +68,7 @@ BASE_ENV = "AAR_LLM_BASE_URL"
 KEY_ENV = "AAR_LLM_API_KEY"
 DEFAULT_BASE_URL = "http://127.0.0.1:8317"
 CHAT_PATH = "/v1/chat/completions"
+MODELS_PATH = "/v1/models"
 DEFAULT_TIMEOUT_S = 60.0
 MAX_BODY = 1024 * 1024
 USAGE_COUNTS = ("prompt_tokens", "completion_tokens", "total_tokens")
@@ -73,6 +77,7 @@ _ERROR_READ = 2048
 _EXCERPT = 300
 _TOKEN = re.compile(r"[A-Za-z0-9._~+/-]+=*")  # RFC 6750 b64token
 _MODEL_ID = re.compile(r"[!-~]{1,128}")  # printable ASCII, no spaces
+_MAX_MODELS = 10_000
 _NOT_JSON = object()
 _log = logging.getLogger(__name__)
 
@@ -185,7 +190,7 @@ class GatewayClient:
         temperature: float | None = None,
     ) -> ChatReply:
         """One chat completion. Raises ``GatewayError``; a bad argument raises ``ValueError``."""
-        if not isinstance(model, str) or not _MODEL_ID.fullmatch(model):
+        if not is_model_id(model):
             raise ValueError("model must be 1-128 printable ASCII characters without spaces")
         if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
             raise ValueError("max_tokens must be a whole number of at least 1")
@@ -201,12 +206,25 @@ class GatewayClient:
         reply = self._post(self.base_url + CHAT_PATH, json.dumps(body).encode("utf-8"))
         return self._reply(reply.body)
 
+    def models(self) -> tuple[str, ...]:
+        """The ids of the models the gateway serves, in its order. Raises ``GatewayError``."""
+        reply = self._request("GET", self.base_url + MODELS_PATH, None)
+        data = _loads(reply.body)
+        listed = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(listed, list):
+            raise self._bad("the reply is not a JSON object with a data list", f"GET {MODELS_PATH}")
+        ids = (entry.get("id") for entry in listed[:_MAX_MODELS] if isinstance(entry, dict))
+        return tuple(self.scrub(model) for model in ids if is_model_id(model))
+
     # ------------------------------------------------------------ transport
 
     def _error(self, code: str, message: str, hint: str = "") -> GatewayError:
         return GatewayError(code, self.scrub(message), self.scrub(hint))
 
     def _post(self, url: str, data: bytes) -> _Outcome:
+        return self._request("POST", url, data)
+
+    def _request(self, method: str, url: str, data: bytes | None) -> _Outcome:
         if origin(url) != self._origin:
             raise self._error(
                 "origin",
@@ -215,14 +233,16 @@ class GatewayClient:
             )
         path = self.scrub(urllib.parse.urlsplit(url).path)
         for attempt in range(MAX_RETRIES + 1):
-            request = urllib.request.Request(url, data=data, method="POST")
+            request = urllib.request.Request(url, data=data, method=method)
             request.add_header("Authorization", f"Bearer {self._key}")
-            request.add_header("Content-Type", "application/json")
+            if data is not None:
+                request.add_header("Content-Type", "application/json")
             request.add_header("Accept", "application/json")
             started = self._clock()
             outcome = self._send(request, started + self.timeout_s)
             _log.debug(
-                "gateway POST %s: %s (HTTP %s) in %.2f s",
+                "gateway %s %s: %s (HTTP %s) in %.2f s",
+                method,
                 path,
                 outcome.kind,
                 outcome.status or "none",
@@ -235,7 +255,8 @@ class GatewayClient:
             ):
                 wait = retry_after_s(outcome.retry_after)
                 _log.warning(
-                    "gateway POST %s: HTTP %d, retry %d of %d in %g s",
+                    "gateway %s %s: HTTP %d, retry %d of %d in %g s",
+                    method,
                     path,
                     outcome.status,
                     attempt + 1,
@@ -246,7 +267,7 @@ class GatewayClient:
                 continue
             break
         if outcome.kind != "ok":
-            raise self._failure(path, outcome)
+            raise self._failure(f"{method} {path}", outcome)
         return outcome
 
     def _send(self, request: urllib.request.Request, deadline: float) -> _Outcome:
@@ -302,8 +323,7 @@ class GatewayClient:
             return b""
         return data if state in ("ok", "more") else b""
 
-    def _failure(self, path: str, outcome: _Outcome) -> GatewayError:
-        where = f"POST {path}"
+    def _failure(self, where: str, outcome: _Outcome) -> GatewayError:
         if outcome.kind == "redirect":
             return self._error(
                 "redirect",
@@ -339,11 +359,7 @@ class GatewayClient:
     # ------------------------------------------------------------ the reply
 
     def _reply(self, body: bytes) -> ChatReply:
-        data: Any = _NOT_JSON
-        # Raised below, outside any handler; ValueError covers bad UTF-8, bad JSON and an
-        # integer over Python's digit limit, RecursionError a reply nested too deeply.
-        with contextlib.suppress(ValueError, RecursionError):
-            data = json.loads(body.decode("utf-8"))
+        data = _loads(body)
         if data is _NOT_JSON:
             raise self._bad("the reply is not JSON")
         if not isinstance(data, dict):
@@ -379,12 +395,26 @@ class GatewayClient:
             usage=counts,
         )
 
-    def _bad(self, message: str) -> GatewayError:
+    def _bad(self, message: str, where: str = f"POST {CHAT_PATH}") -> GatewayError:
         return self._error(
             "bad-response",
-            f"POST {CHAT_PATH}: {message}",
+            f"{where}: {message}",
             f"is {self.base_url} an OpenAI-compatible gateway?",
         )
+
+
+def is_model_id(value: Any) -> bool:
+    """Whether ``value`` can be a model id: 1-128 printable ASCII characters, no spaces."""
+    return isinstance(value, str) and _MODEL_ID.fullmatch(value) is not None
+
+
+def _loads(body: bytes) -> Any:
+    """The JSON in ``body``, or ``_NOT_JSON``. ValueError covers bad UTF-8, bad JSON and an
+    integer over Python's digit limit, RecursionError a reply nested too deeply; the caller
+    raises outside any handler."""
+    with contextlib.suppress(ValueError, RecursionError):
+        return json.loads(body.decode("utf-8"))
+    return _NOT_JSON
 
 
 def _is_number(value: Any) -> bool:
@@ -426,8 +456,10 @@ __all__ = [
     "DEFAULT_BASE_URL",
     "KEY_ENV",
     "MAX_BODY",
+    "MODELS_PATH",
     "ChatReply",
     "GatewayClient",
     "GatewayError",
     "gateway_from_env",
+    "is_model_id",
 ]
