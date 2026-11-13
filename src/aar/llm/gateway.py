@@ -222,9 +222,10 @@ class GatewayClient:
             started = self._clock()
             outcome = self._send(request, started + self.timeout_s)
             _log.debug(
-                "gateway POST %s: %s in %.2f s",
+                "gateway POST %s: %s (HTTP %s) in %.2f s",
                 path,
-                outcome.status or outcome.kind,
+                outcome.kind,
+                outcome.status or "none",
                 self._clock() - started,
             )
             if (

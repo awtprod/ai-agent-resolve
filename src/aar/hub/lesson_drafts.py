@@ -139,7 +139,7 @@ def build_messages(
     _check_max_drafts(max_drafts)
     groups = _existing_groups(existing)
     data = _review_data(feedback, groups)
-    # A JSON string may hold backticks; as \\u0060 escapes no note can close the fence early.
+    # Backticks occur only inside JSON strings; escaped as ` they cannot close the fence.
     block = json.dumps(data, ensure_ascii=False, indent=2).replace("`", "\\u0060")
     return [
         {"role": "system", "content": _system_prompt(max_drafts, scopes_for(feedback))},
@@ -149,9 +149,9 @@ def build_messages(
 
 def _system_prompt(max_drafts: int, scopes: Sequence[str]) -> str:
     preference = "preference" if max_drafts == 1 else "preferences"
-    no_client = "" if "client" in scopes else (
-        "  This show has no client, so do not use the client scope.\n"
-    )  # fmt: skip
+    scope_rules = "\n".join(_SCOPE_LINES[scope] for scope in scopes)
+    if "client" not in scopes:
+        scope_rules += "\n  This show has no client, so do not use the client scope."
     return (
         "You are reading one review of a video cut. A person watched the cut, approved or "
         "rejected it, and wrote a reason and notes pinned to timecodes. The review is the JSON "
@@ -166,10 +166,8 @@ def _system_prompt(max_drafts: int, scopes: Sequence[str]) -> str:
         "when choosing what to keep;\n"
         '- does not repeat a lesson in "existing_lessons" (lessons a person already accepted);\n'
         "- has a scope. When unsure, prefer the narrower one:\n"
-        + "\n".join(_SCOPE_LINES[scope] for scope in scopes)
-        + "\n"
-        + no_client
-        + '- has a short "why": the part of the review it comes from.\n\n'
+        + scope_rules
+        + '\n- has a short "why": the part of the review it comes from.\n\n'
         'If nothing generalizes, return {"lessons": []}.\n\n'
         "Output only JSON, with nothing before or after it:\n"
         f'{{"lessons": [{{"text": "...", "scope": "{"|".join(scopes)}", "why": "..."}}]}}'
