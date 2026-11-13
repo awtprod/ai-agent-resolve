@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from aar.hub import lesson_drafts
 from aar.hub.lesson_drafts import (
     MAX_REPLY,
     PROMPT_BUDGET,
@@ -125,14 +126,100 @@ def test_notes_and_lessons_over_the_budget_are_cut_with_a_marker():
     shown_notes, marker = data["notes"][:-1], data["notes"][-1]
     assert shown_notes == [{"timecode": tc, "text": text} for tc, text in notes[: len(shown_notes)]]
     assert marker == f"({len(notes) - len(shown_notes)} more not shown)"
-    used = sum(size(note) for note in shown_notes)
     for label, texts in existing.items():
         *shown, marker = data["existing_lessons"][label]
         assert shown == texts[: len(shown)]
         assert marker == f"({len(texts) - len(shown)} more not shown)"
-        used += sum(size(text) for text in shown)
-    assert PROMPT_BUDGET * 0.9 < used <= PROMPT_BUDGET
-    assert len(messages[1]["content"]) < PROMPT_BUDGET + 3000  # the whole message stays bounded
+    # The whole user message as sent is the budget, and the cut leaves little of it unused.
+    assert PROMPT_BUDGET * 0.9 < len(messages[1]["content"]) <= PROMPT_BUDGET
+
+
+def _within_budget(messages: list[dict[str, str]]) -> dict[str, Any]:
+    """The user message is within the budget as sent, and its block still reads back."""
+    assert len(messages[1]["content"]) <= PROMPT_BUDGET
+    return review_block(messages)
+
+
+def test_backtick_heavy_notes_fit_the_budget_as_sent():
+    """Each backtick is sent as six characters: a budget counted before escaping let the
+    validator's prompt (1000 notes of 4000 backticks) through at 5.6 times the budget."""
+    notes = [(f"00:00:{i % 60:02d}:00", "`" * 4000) for i in range(1000)]
+    probe = feedback(notes=notes, reason="`" * 2000, title="`" * 200)
+    assert _within_budget(build_messages(probe, {}))["notes"] == ["(1000 more not shown)"]
+    notes = [(f"00:00:{i % 60:02d}:00", "`" * 1000) for i in range(100)]
+    *shown, marker = _within_budget(build_messages(feedback(notes=notes), {}))["notes"]
+    assert len(shown) == 3 and {note["text"] for note in shown} == {"`" * 1000}
+    assert marker == "(97 more not shown)"
+
+
+def test_backtick_heavy_pending_lessons_fit_the_budget_as_sent():
+    existing = {scope: ["`" * 500 for _ in range(250)] for scope in ("global", "client", "project")}
+    data = _within_budget(build_messages(feedback(notes=[]), existing))
+    for texts in data["existing_lessons"].values():
+        *shown, marker = texts
+        assert shown and set(shown) == {"`" * 500}
+        assert marker == f"({250 - len(shown)} more not shown)"
+
+
+def test_5000_one_character_notes_fit_the_budget_as_sent():
+    """Indentation is counted too: a short note takes several times its own size."""
+    notes = [(f"00:00:{i % 60:02d}:00", "x") for i in range(5000)]
+    messages = build_messages(feedback(notes=notes), {})
+    data = _within_budget(messages)
+    *shown, marker = data["notes"]
+    assert marker == f"({5000 - len(shown)} more not shown)"
+    assert len(messages[1]["content"]) > PROMPT_BUDGET * 0.95
+
+
+def test_a_review_at_its_bounds_always_fits_with_room_for_markers():
+    """Every field at its limit, written in backticks: the review's own fields still fit."""
+    worst = feedback(
+        title="`" * 200,
+        reason="`" * 2000,
+        show="`" * 200,
+        client="`" * 200,
+        project_id="`" * 128,
+        review_id="`" * 128,
+        notes=[("`" * 32, "`" * 4000)] * 50,
+    )
+    existing = {scope: ["`" * 500] * 50 for scope in ("global", "client", "project")}
+    data = _within_budget(build_messages(worst, existing))
+    assert data["reason"] == "`" * 2000 and data["notes"][-1].endswith("more not shown)")
+
+
+def test_the_budget_holds_even_when_an_item_takes_more_than_its_cost_says(monkeypatch):
+    """The last check measures the message itself, so a wrong per-item cost cannot pass it."""
+    monkeypatch.setattr(lesson_drafts, "_cost", lambda value, *, depth: 1)
+    notes = [(f"00:00:{i % 60:02d}:00", "n" * 1000) for i in range(100)]
+    existing = {"global": ["g" * 400] * 100}
+    data = _within_budget(build_messages(feedback(notes=notes), existing))
+    assert data["notes"][-1].endswith("more not shown)")
+
+
+@pytest.mark.parametrize(
+    ("value", "depth"),
+    [
+        ({"timecode": "00:00:01:00", "text": 'Cut "the" `bit`, é and 中.'}, 2),
+        ('A `pending` lesson with \\ and "quotes".', 3),
+    ],
+)
+def test_an_item_s_cost_is_what_it_adds_to_the_block(value, depth):
+    """One more item in a list at ``depth`` lengthens the sent block by exactly its cost."""
+    nested: Any = [value]
+    for _ in range(depth - 1):
+        nested = {"k": nested}
+    one = json.dumps(nested, ensure_ascii=False, indent=2).replace("`", "\\u0060")
+    deepest = nested
+    while isinstance(deepest, dict):
+        deepest = deepest["k"]
+    deepest.append(value)
+    two = json.dumps(nested, ensure_ascii=False, indent=2).replace("`", "\\u0060")
+    assert len(two) - len(one) == lesson_drafts._cost(value, depth=depth)
+
+
+def test_labels_that_alone_are_over_the_budget_are_refused():
+    with pytest.raises(ValueError, match="over the prompt budget"):
+        build_messages(feedback(), {"x" * PROMPT_BUDGET: ["A lesson."]})
 
 
 def test_a_share_one_side_does_not_need_goes_to_the_other():

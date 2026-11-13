@@ -7,9 +7,11 @@ the model through the gateway client (``aar.llm.gateway``) and records the draft
 store.
 
 ``build_messages`` writes the chat: the rules in the system message, and the review as a JSON
-block in the user message, so it reads as data and not as instructions. The notes and the
-existing lessons share ``PROMPT_BUDGET`` characters; what does not fit is replaced by an
-explicit "(N more not shown)" marker. The same input always gives the same messages.
+block in the user message, so it reads as data and not as instructions. The user message is at
+most ``PROMPT_BUDGET`` characters, measured as sent (JSON-escaped and indented, each backtick
+written as the six characters ``\\u0060``): the review's own fields always fit, and the notes and
+the existing lessons share the rest; what does not fit is replaced by an explicit "(N more not
+shown)" marker. The same input always gives the same messages.
 
 ``parse_drafts`` reads the reply: a bare JSON object or one fenced json block holding
 ``{"lessons": [{"text": ..., "scope": ..., "why": ...}]}``. A reply that is not such an object
@@ -34,7 +36,8 @@ from aar.hub.writes import WriteError
 DEFAULT_LESSONS_MODEL = "gpt-6-luna"
 SCOPES = ("global", "client", "project")
 MAX_DRAFTS = 3
-#: Characters of notes and existing lessons in the user message, shared between the two.
+#: Characters of the user message, as sent. The notes and the existing lessons share what the
+#: review's own fields leave.
 PROMPT_BUDGET = 24_000
 MAX_REPLY = 32_000  # characters of model reply that parse_drafts reads at all
 MAX_NAME = 200  # show and client names
@@ -42,6 +45,8 @@ _MAX_DRAFTS_LIMIT = 10
 _MAX_TIMECODE = 32
 _FENCE = re.compile(r"```[ \t]*(?:json)?[ \t]*\r?\n?(.*?)```", re.IGNORECASE | re.DOTALL)
 _INVALID = object()
+_INDENT = 2  # the JSON block's indent: a note sits 2 levels deep, an existing lesson 3
+_BACKTICK = "\\u0060"  # a backtick in the block, written so that no string can close the fence
 
 _SCOPE_LINES = {
     "global": '  - "global": any show;',
@@ -137,15 +142,14 @@ def build_messages(
 ) -> list[dict[str, str]]:
     """The system and user messages for one review. ``existing`` maps a scope label to the
     texts of the lessons already accepted or waiting for a person, which the model must not
-    repeat."""
+    repeat. The user message is at most ``PROMPT_BUDGET`` characters; ``ValueError`` when the
+    review's own fields and the labels alone would not fit, which a review within its bounds
+    and the three scope labels never reach."""
     _check_max_drafts(max_drafts)
     groups = _existing_groups(existing)
-    data = _review_data(feedback, groups)
-    # Backticks occur only inside JSON strings; escaped as ` they cannot close the fence.
-    block = json.dumps(data, ensure_ascii=False, indent=2).replace("`", "\\u0060")
     return [
         {"role": "system", "content": _system_prompt(max_drafts, scopes_for(feedback))},
-        {"role": "user", "content": f"{_USER_INTRO}\n\n```json\n{block}\n```"},
+        {"role": "user", "content": _user_message(feedback, groups)},
     ]
 
 
@@ -198,34 +202,60 @@ def _existing_groups(existing: Any) -> list[tuple[str, list[str]]]:
     return sorted(groups, key=lambda group: (rank.get(group[0], len(SCOPES)), group[0]))
 
 
-def _review_data(feedback: ReviewFeedback, groups: list[tuple[str, list[str]]]) -> dict[str, Any]:
-    notes: list[Any] = [{"timecode": tc, "text": text} for tc, text in feedback.notes]
-    note_sizes = [_size(note) for note in notes]
-    lesson_sizes = [[_size(text) for text in texts] for _, texts in groups]
-    notes_share, lessons_share = _shares(
-        PROMPT_BUDGET, [sum(note_sizes), sum(sum(sizes) for sizes in lesson_sizes)]
-    )
-    group_shares = _shares(lessons_share, [sum(sizes) for sizes in lesson_sizes])
-    existing = {}
-    for (label, texts), sizes, share in zip(groups, lesson_sizes, group_shares, strict=True):
-        if texts:
-            existing[label] = _shown(texts, sizes, share)
-    return {
-        "show": feedback.show,
-        "client": feedback.client,
-        "project_id": feedback.project_id,
-        "review_id": feedback.review_id,
-        "title": feedback.title,
-        "decision": feedback.decision,
-        "reason": feedback.reason,
-        "notes": _shown(notes, note_sizes, notes_share),
-        "existing_lessons": existing,
-    }
+def _user_message(feedback: ReviewFeedback, groups: list[tuple[str, list[str]]]) -> str:
+    """The user message: as many notes and existing lessons as fit in ``PROMPT_BUDGET``
+    characters as sent, each pool cut at its end behind a "(N more not shown)" marker."""
+    notes = [{"timecode": tc, "text": text} for tc, text in feedback.notes]
+    note_costs = [_cost(note, depth=2) for note in notes]
+    lesson_costs = [[_cost(text, depth=3) for text in texts] for _, texts in groups]
+
+    def render(shown_notes: int, shown_lessons: Sequence[int]) -> str:
+        existing = {
+            label: _shown(texts, count)
+            for (label, texts), count in zip(groups, shown_lessons, strict=True)
+            if texts
+        }
+        data = {
+            "show": feedback.show,
+            "client": feedback.client,
+            "project_id": feedback.project_id,
+            "review_id": feedback.review_id,
+            "title": feedback.title,
+            "decision": feedback.decision,
+            "reason": feedback.reason,
+            "notes": _shown(notes, shown_notes),
+            "existing_lessons": existing,
+        }
+        # Backticks occur only inside JSON strings, so escaping them there changes no value.
+        block = json.dumps(data, ensure_ascii=False, indent=_INDENT).replace("`", _BACKTICK)
+        return f"{_USER_INTRO}\n\n```json\n{block}\n```"
+
+    # Every note and lesson behind its marker: the most the rest of the message ever takes.
+    room = PROMPT_BUDGET - len(render(0, [0] * len(groups)))
+    if room < 0:
+        raise ValueError("the review's own fields and the lesson labels are over the prompt budget")
+    while True:
+        notes_share, lessons_share = _shares(
+            room, [sum(note_costs), sum(sum(costs) for costs in lesson_costs)]
+        )
+        group_shares = _shares(lessons_share, [sum(costs) for costs in lesson_costs])
+        message = render(
+            _fits(note_costs, notes_share),
+            [_fits(costs, share) for costs, share in zip(lesson_costs, group_shares, strict=True)],
+        )
+        over = len(message) - PROMPT_BUDGET
+        if over <= 0:
+            return message
+        room -= over  # an item took more than its cost said: fit again in less room
 
 
-def _size(value: Any) -> int:
-    """Characters ``value`` takes in the JSON block."""
-    return len(json.dumps(value, ensure_ascii=False))
+def _cost(value: Any, *, depth: int) -> int:
+    """Characters one more item takes in a list at ``depth`` of the block (the root object is
+    0): the comma and the line break with its indent before it, its own lines indented to
+    ``depth``, and 5 more for each backtick written as ``\\u0060``."""
+    text = json.dumps(value, ensure_ascii=False, indent=_INDENT)
+    indent = _INDENT * depth
+    return 2 + indent + len(text) + indent * text.count("\n") + 5 * text.count("`")
 
 
 def _shares(budget: int, needs: Sequence[int]) -> list[int]:
@@ -248,17 +278,21 @@ def _shares(budget: int, needs: Sequence[int]) -> list[int]:
     return shares
 
 
-def _shown(items: list[Any], sizes: list[int], share: int) -> list[Any]:
-    """The items that fit in ``share``, from the first on, then a "(N more not shown)" marker
-    when some do not."""
+def _fits(costs: Sequence[int], share: int) -> int:
+    """How many items, from the first on, fit in ``share``."""
     used = count = 0
-    for size in sizes:
-        if used + size > share:
+    for cost in costs:
+        if used + cost > share:
             break
-        used += size
+        used += cost
         count += 1
+    return count
+
+
+def _shown(items: Sequence[Any], count: int) -> list[Any]:
+    """The first ``count`` items, then a "(N more not shown)" marker when some are left out."""
     hidden = len(items) - count
-    return items[:count] + ([f"({hidden} more not shown)"] if hidden else [])
+    return list(items[:count]) + ([f"({hidden} more not shown)"] if hidden else [])
 
 
 # ---------------------------------------------------------------- the reply
