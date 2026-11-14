@@ -610,11 +610,32 @@ def test_proxy_environment_variables_are_ignored(stub, monkeypatch):
 
 @pytest.mark.parametrize("before", [b"x" * 290, b"x" + b" " * 2040])
 def test_no_part_of_a_key_cut_off_by_the_excerpt_shows(stub, before):
-    """The key straddles the 300-character excerpt; or it straddles the 2048-byte read, with
-    whitespace before it that collapsing would pull into view."""
+    """The key straddles the 300-character excerpt; or it straddles the 2048-byte read (a body
+    that long shows nothing), with whitespace before it that collapsing would pull into view."""
     stub.routes[CHAT] = answer((400, before + KEY.encode() + b" end", {}))
     error = failure(client(stub))
     assert error.code == "http-400" and KEY[:6] not in error.message
+
+
+def test_a_long_key_echoed_at_the_start_of_a_long_error_body_does_not_show(stub):
+    """A 3,000-character key at the start of a body over 2048 bytes: the read holds only a
+    prefix of the key, which the scrubber cannot match, so no excerpt may show at all."""
+    key = ("Ab1" * 1000)[:3000]
+    stub.routes[CHAT] = answer((400, key.encode() + b" tail words " + b"y" * 200, {}))
+    error = failure(GatewayClient(stub.base, key))
+    assert error.code == "http-400"
+    assert key[:6] not in error.message
+    assert all(key[i : i + 20] not in error.message for i in range(len(key) - 19))
+    assert "tail" not in error.message and "yyyy" not in error.message
+
+
+def test_a_whole_error_body_within_the_read_still_shows_its_scrubbed_excerpt(stub):
+    body = b"bad request: " + KEY.encode() + b" and " + b"z" * (2048 - 13 - len(KEY) - 5)
+    assert len(body) == 2048
+    stub.routes[CHAT] = answer((400, body, {}))
+    error = failure(client(stub))
+    assert error.code == "http-400" and "bad request:" in error.message
+    assert REDACTED in error.message and KEY[:6] not in error.message
 
 
 def test_an_error_body_cut_short_by_the_deadline_is_not_shown(stub):

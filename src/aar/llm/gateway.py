@@ -309,15 +309,14 @@ class GatewayClient:
         return b"".join(chunks), "more"
 
     def _excerpt(self, error: urllib.error.HTTPError, deadline: float) -> bytes:
-        """The start of an error reply, or nothing when the read stopped short of the end or
-        of ``_ERROR_READ`` bytes: a read cut short may end inside the key, where the scrubber
-        cannot see it. (Past ``_ERROR_READ`` bytes a cut is far beyond what ``_failure``
-        shows.)"""
+        """An error reply's text, kept only when the whole reply fit in ``_ERROR_READ`` bytes.
+        A read cut off for size or deadline may end inside the key (a key can be longer than
+        what ``_failure`` shows), where the scrubber cannot see it, so it shows nothing."""
         try:
             data, state = self._read(error, deadline, _ERROR_READ)
         except (OSError, ValueError, http.client.HTTPException):
             return b""
-        return data if state in ("ok", "more") else b""
+        return data if state == "ok" else b""
 
     def _failure(self, where: str, outcome: Outcome) -> GatewayError:
         if outcome.kind == "redirect":
@@ -343,7 +342,8 @@ class GatewayClient:
                 f"is the gateway running at {self.base_url}? nothing was retried",
             )
         # Scrubbed, then cut, then whitespace collapsed: a key that straddles the cut is already
-        # gone, and collapsing cannot pull a key cut off at _ERROR_READ bytes into the excerpt.
+        # gone, and collapsing cannot pull a cut-off key into the excerpt (a body that did not fit
+        # whole in _ERROR_READ bytes never gets here).
         text = self.scrub(outcome.body.decode("utf-8", errors="replace"))
         excerpt = " ".join(text[:_EXCERPT].split())
         retried = f" after {MAX_RETRIES} retries" if outcome.status in RETRIED_STATUSES else ""
