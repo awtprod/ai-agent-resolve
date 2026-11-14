@@ -490,6 +490,7 @@ h3{font-size:1rem;margin:1rem 0 .4rem}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:1rem;
 margin:0 0 1rem}
 .meta{color:var(--muted);font-size:.85rem;overflow-wrap:anywhere}
+.count.over{color:var(--bad);font-weight:600}
 .mono,code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85em}
 .mono{overflow-wrap:anywhere}
 code{white-space:nowrap}
@@ -619,6 +620,25 @@ document.addEventListener('click', function (event) {
       input.value = Math.floor(video.currentTime * parseFloat(grab.dataset.fps) + 1e-6);
     }
   }
+});
+// A maxlength attribute drops the end of a long paste without a word. Keep the whole text in
+// the box, count it as the server does (trimmed, by code point) and refuse to send it too long.
+document.querySelectorAll('textarea[data-max]').forEach(function (area) {
+  var max = parseInt(area.dataset.max, 10);
+  var count = document.createElement('p');
+  count.className = 'meta count';
+  count.setAttribute('aria-live', 'polite');
+  area.insertAdjacentElement('afterend', count);
+  function update() {
+    var length = Array.from(area.value.trim()).length;
+    var over = length - max;
+    count.textContent = length + ' / ' + max + ' characters' +
+      (over > 0 ? ': ' + over + ' too many. Nothing is cut off; shorten it to send.' : '');
+    count.classList.toggle('over', over > 0);
+    area.setCustomValidity(over > 0 ? over + ' characters over the limit of ' + max + '.' : '');
+  }
+  area.addEventListener('input', update);
+  update();
 });
 """
 
@@ -1125,7 +1145,7 @@ class Console:
             '<form method="post" action="{action}">{hidden}'
             '<input type="hidden" name="return_to" value="{ret}">'
             '<label for="{rid}">Reason (required, the agent reads this)</label>'
-            '<textarea id="{rid}" name="reason" required maxlength="{max}"></textarea>'
+            '<textarea id="{rid}" name="reason" required data-max="{max}"></textarea>'
             '<div class="actions"><button class="approve" name="decision" value="approve">'
             "Approve</button>"
             '<button class="reject" name="decision" value="reject">Reject</button></div></form>',
@@ -1164,7 +1184,7 @@ class Console:
             '<input id="{fid}" name="frame" inputmode="numeric" pattern="[0-9]+" required></div>'
             "{timecode}</div>"
             '<label for="note-text">Note</label>'
-            '<textarea id="note-text" name="text" required maxlength="{max}"></textarea>'
+            '<textarea id="note-text" name="text" required data-max="{max}"></textarea>'
             '<div class="actions"><button class="plain" type="submit">Add note</button>{grab}'
             "</div></form>",
             action=url("reviews", review.project_id, review.id, "notes"),

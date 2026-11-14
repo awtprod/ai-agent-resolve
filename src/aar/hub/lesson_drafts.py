@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from aar.hub.lessons import MAX_TEXT, MAX_WHY, clean_line
-from aar.hub.reviews import DECISIONS, MAX_ID, MAX_NOTE, MAX_REASON, MAX_TITLE
+from aar.hub.reviews import DECISIONS, MAX_ID, MAX_NOTE, MAX_TITLE
 from aar.hub.writes import WriteError
 
 #: A cheap model the gateway serves; ``AAR_LESSONS_MODEL`` or ``--model`` overrides it.
@@ -41,6 +41,10 @@ MAX_DRAFTS = 3
 PROMPT_BUDGET = 24_000
 MAX_REPLY = 32_000  # characters of model reply that parse_drafts reads at all
 MAX_NAME = 200  # show and client names
+#: Characters of a review's reason the model reads. The store takes longer ones
+#: (``reviews.MAX_REASON``); the caller cuts them to this, so the review's own fields always
+#: fit in ``PROMPT_BUDGET``.
+MAX_PROMPT_REASON = 2000
 _MAX_DRAFTS_LIMIT = 10
 _MAX_TIMECODE = 32
 _FENCE = re.compile(r"```[ \t]*(?:json)?[ \t]*\r?\n?(.*?)```", re.IGNORECASE | re.DOTALL)
@@ -84,7 +88,7 @@ class ReviewFeedback:
             ("project_id", MAX_ID),
             ("review_id", MAX_ID),
             ("title", MAX_TITLE),
-            ("reason", MAX_REASON),
+            ("reason", MAX_PROMPT_REASON),
             ("show", MAX_NAME),
         ):
             value = getattr(self, name)
@@ -390,6 +394,7 @@ __all__ = [
     "DEFAULT_LESSONS_MODEL",
     "MAX_DRAFTS",
     "MAX_NAME",
+    "MAX_PROMPT_REASON",
     "PROMPT_BUDGET",
     "SCOPES",
     "Draft",
