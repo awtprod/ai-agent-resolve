@@ -531,10 +531,16 @@ def _gateway_stop(
 
 
 def _lock_unavailable(path: str, error: OSError) -> dict[str, Any]:
-    """The stop when the pass lock cannot be taken. When the lock file is there but could not be
-    opened (``os.open`` names the file in its error; a failed ``flock`` names none), the hint
-    points at the file's owner and mode rather than at the folder."""
-    if error.filename is not None and os.path.lexists(path):
+    """The stop when the pass lock cannot be taken, with a hint at what is at fault: the file
+    system (the file opened but ``flock`` failed, whose error names no file), the lock file (it
+    is there but could not be opened: its owner or mode) or the folder (no lock file, and none
+    could be made)."""
+    if error.filename is None:
+        hint = (
+            f"The lock file {path} opened but could not be locked: the database's file system "
+            "must support flock. Nothing was done."
+        )
+    elif os.path.lexists(path):
         hint = (
             f"The lock file {path} exists but this user cannot open it for writing: check its "
             "owner and mode. It must be a regular file, not a symlink, that the service user "

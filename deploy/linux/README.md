@@ -101,9 +101,11 @@ reaches a cut guide without that. Each pass makes at most 5 model calls (`--limi
 early when the store's 200 waiting proposals have no room for 3 more. A review is drafted once,
 with at most 3 charged attempts per review (and at most 144 uncharged strikes, below). Only one
 pass runs at a time: a pass holds a lock file beside the database (`hub.db.lessons-propose.lock`),
-and a second one that finds it held does nothing and exits 0. The timer runs a pass 10 minutes
-after boot and 10 minutes after each pass ends; the unit's `TimeoutStartSec=30min` is the outer
-bound on one pass.
+and a second one that finds it held does nothing and exits 0. A lock file the service user
+cannot write (left by another user, or with the wrong mode) makes every pass exit 1 with
+`lock_unavailable`, and the hint names the file: fix its owner or mode. The timer runs a pass 10
+minutes after boot and 10 minutes after each pass ends; the unit's `TimeoutStartSec=30min` is
+the outer bound on one pass.
 
 The gateway's key is NOT in `hub.env` (the console, the MCP server and the worker do not need
 it). It goes in `<root>/lessons.env`, mode 0600, owned by `root:root`. systemd reads an

@@ -9,6 +9,7 @@ real gateway client from the environment, so its tests point it at the loopback 
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -1151,6 +1152,27 @@ def test_the_lock_hint_names_the_file_or_the_folder_whichever_is_at_fault(
     else:
         assert hint == "The database's folder must be writable by this user. Nothing was done."
         assert not lock_path(hub).exists()
+
+
+def test_a_lock_the_file_system_refuses_is_not_blamed_on_the_file_or_the_folder(
+    hub: Hub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fcntl = pytest.importorskip("fcntl")
+    review(hub)
+
+    def refuse(fd: int, operation: int) -> None:  # as on a file system without locks
+        raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+
+    monkeypatch.setattr(fcntl, "flock", refuse)
+
+    report = run(hub, FakeClient(served=AssertionError("the pass must not ask for the models")))
+
+    assert report.stopped is not None and report.stopped["code"] == "lock_unavailable"
+    assert report.stopped["message"].endswith(os.strerror(errno.ENOLCK))
+    assert report.stopped["hint"] == (
+        f"The lock file {lock_path(hub)} opened but could not be locked: the database's file "
+        "system must support flock. Nothing was done."
+    )
 
 
 @pytest.mark.parametrize(
