@@ -352,6 +352,44 @@ def test_double_submit_approves_once(hub: Hub) -> None:
     assert conflict.json()["error"]["code"] == "already_decided"
 
 
+def test_a_long_reason_is_stored_whole_and_the_page_never_trims_a_paste(hub: Hub) -> None:
+    client = hub.client()
+    page = client.get(f"/reviews/{hub.project}/{hub.plain_review}").text
+    # maxlength drops the end of a long paste without a word; the page counts and refuses instead
+    assert (
+        "maxlength"
+        not in page[page.index('name="reason"') - 200 : page.index('name="reason"') + 200]
+    )
+    assert f'name="reason" required data-max="{reviews.MAX_REASON}"' in page
+    assert f'name="text" required data-max="{reviews.MAX_NOTE}"' in page
+    assert "textarea[data-max]" in page
+
+    form = _form(page, hub.decide_path(hub.plain_review))
+    reason = "Hold the tight shot through the punchline.\r\n" * 200  # 8800 characters, pasted
+    data = {**form, "decision": "reject", "reason": reason, "return_to": "queue"}
+    assert (
+        client.post(hub.decide_path(hub.plain_review), data=data, headers=ORIGIN).status_code == 303
+    )
+    decision = reviews.get_review(hub.log, hub.project, hub.plain_review).decision
+    assert decision is not None
+    assert decision.reason == reason.replace("\r\n", "\n").strip()
+    assert len(decision.reason) > 8000
+
+
+def test_a_reason_over_the_limit_is_refused_not_cut(hub: Hub) -> None:
+    client = hub.client()
+    form = _decide_form(client, hub, hub.plain_review)
+    data = {**form, "decision": "reject", "reason": "x" * (reviews.MAX_REASON + 1)}
+    response = client.post(
+        hub.decide_path(hub.plain_review),
+        data=data,
+        headers={**ORIGIN, "accept": "application/json"},
+    )
+    assert response.status_code == 422
+    assert str(reviews.MAX_REASON) in response.json()["error"]["message"]
+    assert hub.count(reviews.EVENT_DECIDED) == 0
+
+
 def test_queue_shows_pending_reviews_with_render_and_notes(hub: Hub) -> None:
     body = hub.client().get("/").text
     assert "2 waiting for a human" in body

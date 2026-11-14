@@ -79,7 +79,9 @@ OPEN_STATUSES = frozenset({"pending", "active", "blocked"})
 MAX_ID = 128
 MAX_TITLE = 200
 MAX_NOTE = 4000
-MAX_REASON = 2000
+#: A person pastes whole paragraphs of feedback into a decision: room for about 2000 words.
+#: A typical one this long is well inside the console's 64 KiB form.
+MAX_REASON = 12_000
 MAX_TIMELINE = 200
 MAX_RENDERS = 16
 #: Text artifacts a review shows its reviewer beside the renders (a recipe gate's handoff notes).

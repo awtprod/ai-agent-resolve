@@ -29,7 +29,7 @@ from aar.hub import lessons, reviews
 from aar.hub import lessons_proposer as proposer
 from aar.hub.events import Actor, EventLog
 from aar.hub.graph import WorkGraph
-from aar.hub.lesson_drafts import DEFAULT_LESSONS_MODEL
+from aar.hub.lesson_drafts import DEFAULT_LESSONS_MODEL, MAX_PROMPT_REASON
 from aar.hub.registry import Registry
 from aar.hub.writes import WriteError, create_brief
 from aar.llm.gateway import CHAT_PATH, MODELS_PATH, ChatReply, GatewayError
@@ -547,6 +547,23 @@ def test_the_model_reads_the_review_and_only_the_notes_a_person_wrote(hub: Hub) 
         {"timecode": "00:00:02:00", "text": "Keep this laugh."},
         {"timecode": "00:00:10:00", "text": "Cut the parking bit."},
     ]
+
+
+def test_a_reason_longer_than_the_prompt_takes_is_cut_for_the_model_only(hub: Hub) -> None:
+    # A person may paste pages of feedback (reviews.MAX_REASON); the model reads the start.
+    long_reason = "Hold the tight shot. " + "x" * reviews.MAX_REASON
+    long_reason = long_reason[: reviews.MAX_REASON]
+    made = review(hub, "reject", long_reason)
+    client = FakeClient(drafts(item("Hold the tight shot through the punchline.")))
+
+    report = run(hub, client)
+
+    given = block(client.calls[0])["reason"]
+    assert len(given) == MAX_PROMPT_REASON
+    assert given == long_reason[: MAX_PROMPT_REASON - 1] + "\u2026"
+    assert [entry.outcome for entry in report.reviews] == ["drafted"]
+    stored = reviews.get_review(hub.log, hub.project_id, made).decision
+    assert stored is not None and stored.reason == long_reason
 
 
 def test_a_draft_the_store_refuses_is_reported_and_the_others_are_recorded(hub: Hub) -> None:
