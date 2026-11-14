@@ -1,4 +1,5 @@
-"""The Linux unit templates render with every placeholder filled (S19a adds the worker)."""
+"""The Linux unit templates render with every placeholder filled (S19a adds the worker, S23b
+the lessons service and its timer)."""
 
 from __future__ import annotations
 
@@ -26,6 +27,8 @@ def test_install_units_renders_the_worker_and_the_env_file(tmp_path: Path) -> No
     names = sorted(p.name for p in out.iterdir())
     assert names == [
         "aar-hub-console.service",
+        "aar-hub-lessons.service",
+        "aar-hub-lessons.timer",
         "aar-hub-mcp.service",
         "aar-hub-nodeapi.service",
         "aar-hub-worker.service",
@@ -92,3 +95,53 @@ def test_values_systemd_would_misread_are_refused(tmp_path: Path) -> None:
     ):
         run = _render(tmp_path, **{name: value})
         assert run.returncode == 2 and name in run.stderr, (name, run.stderr)
+
+
+def _settings(text: str) -> dict[str, list[str]]:
+    """``key -> values`` of a unit file (a key may repeat), comments and sections left out."""
+    found: dict[str, list[str]] = {}
+    for line in text.splitlines():
+        if line and not line.startswith(("#", "[")):
+            key, _, value = line.partition("=")
+            found.setdefault(key, []).append(value)
+    return found
+
+
+def test_the_lessons_timer_runs_a_hardened_oneshot_pass_with_the_key_outside_hub_env(
+    tmp_path: Path,
+) -> None:
+    run = _render(tmp_path)
+    assert run.returncode == 0, run.stderr
+    out = tmp_path / "out"
+    service = _settings((out / "aar-hub-lessons.service").read_text(encoding="utf-8"))
+    console = _settings((out / "aar-hub-console.service").read_text(encoding="utf-8"))
+    assert service["Type"] == ["oneshot"]
+    assert service["ExecStart"] == [
+        "/var/lib/aar/venv/bin/aar hub lessons propose --db /var/lib/aar/data/hub.db --limit 5"
+    ]
+    # hub.env first, then the optional lessons.env with the gateway key ("-": may be missing).
+    assert service["EnvironmentFile"] == ["/var/lib/aar/hub.env", "-/var/lib/aar/lessons.env"]
+    for key in (
+        "User",
+        "Group",
+        "WorkingDirectory",
+        "NoNewPrivileges",
+        "ProtectSystem",
+        "ProtectHome",
+        "PrivateTmp",
+        "PrivateDevices",
+        "ReadWritePaths",
+        "RestrictAddressFamilies",
+    ):
+        assert service[key] == console[key], key
+    assert service["UMask"] == ["0077"]
+    assert service["TimeoutStartSec"] == ["30min"]
+    assert "Restart" not in service  # the timer starts the next pass
+    timer_text = (out / "aar-hub-lessons.timer").read_text(encoding="utf-8")
+    assert "[Timer]" in timer_text.splitlines() and "[Install]" in timer_text.splitlines()
+    timer = _settings(timer_text)
+    assert timer["OnBootSec"] == ["10min"] and timer["OnUnitInactiveSec"] == ["10min"]
+    assert timer["WantedBy"] == ["timers.target"]
+    # No key in any rendered file: it lives only in lessons.env, which nothing here writes.
+    for path in out.iterdir():
+        assert "AAR_LLM_API_KEY=" not in path.read_text(encoding="utf-8"), path.name

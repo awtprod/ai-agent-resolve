@@ -258,6 +258,7 @@ def test_unit_templates_use_only_known_placeholders() -> None:
     units = sorted((DEPLOY / "linux").glob("*.service.in"))
     assert [u.name for u in units] == [
         "aar-hub-console.service.in",
+        "aar-hub-lessons.service.in",  # S23b, started by aar-hub-lessons.timer
         "aar-hub-mcp.service.in",
         "aar-hub-nodeapi.service.in",
         "aar-hub-worker.service.in",
@@ -266,6 +267,10 @@ def test_unit_templates_use_only_known_placeholders() -> None:
         text = unit.read_text(encoding="utf-8")
         assert set(re.findall(r"@([A-Z_]+)@", text)) <= known
         assert "ReadWritePaths=@AAR_ROOT@/data" in text and "NoNewPrivileges=true" in text
+    timers = sorted((DEPLOY / "linux").glob("*.timer.in"))
+    assert [t.name for t in timers] == ["aar-hub-lessons.timer.in"]
+    for timer in timers:
+        assert set(re.findall(r"@([A-Z_]+)@", timer.read_text(encoding="utf-8"))) <= known
     console = (DEPLOY / "linux" / "aar-hub-console.service.in").read_text(encoding="utf-8")
     assert "--host 127.0.0.1" in console and "--allowed-host @CONSOLE_HOSTNAME@" in console
     nodeapi = (DEPLOY / "linux" / "aar-hub-nodeapi.service.in").read_text(encoding="utf-8")

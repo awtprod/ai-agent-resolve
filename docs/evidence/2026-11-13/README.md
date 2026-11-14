@@ -30,3 +30,15 @@ page does not show them.
 
 Served by `aar hub console --operator operator-1` on a loopback port and captured with headless
 Chrome.
+
+# Lessons drafted by the proposer (S23b)
+
+- `lessons-drafted.png`: `/lessons` at 1280 px after one live `aar hub lessons propose` pass
+  (`gpt-6-luna` through the local model gateway) over a throwaway hub with synthetic names only
+  (`Synthetic Show`, `Synthetic Special`, `operator-1`): two proposals by the agent
+  `lessons-proposer`, each with the model's why, its source review and the suggested scope,
+  waiting for a person to accept or drop them. The rejected review's instructions about that one
+  cut were not drafted, and the accepted global lesson was not repeated. Retaken in S23b fix
+  round 1 from the same hub (a copy of it), so that a project reads with its id, as S23a's fix
+  made the console show it: "Project: Synthetic Special (prj_...)" in the suggestion and in
+  "Applies to".

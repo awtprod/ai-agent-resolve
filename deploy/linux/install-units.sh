@@ -7,7 +7,9 @@
 #   AAR_WORK_DIR=/srv/aar-media/work AAR_EXPORT_DIR=/srv/aar-media/share/exports \
 #   ./install-units.sh [outdir]
 #
-# It also renders hub.env (the units' EnvironmentFile): copy it to $AAR_ROOT/hub.env.
+# It also renders hub.env (the units' EnvironmentFile): copy it to $AAR_ROOT/hub.env. The
+# lessons timer (aar-hub-lessons.timer) is rendered with its service; the model gateway's key
+# goes in $AAR_ROOT/lessons.env, which you write yourself (see README.md): no key is rendered.
 # The media, work and export paths may hold spaces and any of | & / (they are quoted in the
 # units and in hub.env); a value with a double quote, a backslash, % or $ is refused, because
 # systemd would read those as quoting, specifiers or variables. AAR_ROOT, the user, the group,
@@ -36,7 +38,7 @@ esc() { printf '%s' "$1" | sed -e 's/[\\|&]/\\&/g'; }
 here=$(cd "$(dirname "$0")" && pwd)
 out=${1:-./rendered}
 mkdir -p "$out"
-for t in "$here"/*.service.in "$here"/*.env.in; do
+for t in "$here"/*.service.in "$here"/*.timer.in "$here"/*.env.in; do
   name=$(basename "$t" .in)
   sed -e "s|@AAR_ROOT@|$(esc "$AAR_ROOT")|g" -e "s|@AAR_USER@|$(esc "$AAR_USER")|g" \
       -e "s|@AAR_GROUP@|$(esc "$AAR_GROUP")|g" -e "s|@TAILNET_IP@|$(esc "$TAILNET_IP")|g" \

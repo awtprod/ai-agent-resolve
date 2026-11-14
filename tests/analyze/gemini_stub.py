@@ -5,6 +5,9 @@ probe (``is_host_probe``), and plays the happy path by default: resumable upload
 finalize, PROCESSING then ACTIVE, a generateContent reply holding ``items`` as JSON text, and
 delete. ``routes`` overrides any step: a function of ``(stub, handler)`` keyed by
 ``(method, path)`` (path without the query).
+
+``tests/llm`` serves the model gateway's API from it through ``routes`` alone, with its own
+``key``: a request carrying that key is never taken for a probe.
 """
 
 from __future__ import annotations
@@ -71,7 +74,8 @@ def is_host_probe(request: dict[str, Any], key: str = KEY) -> bool:
 
 
 class Stub:
-    def __init__(self) -> None:
+    def __init__(self, key: str = KEY) -> None:
+        self.key = key  # the key the client under test holds
         self.requests: list[dict[str, Any]] = []
         self.items: Any = []
         self.states = ["PROCESSING", "ACTIVE"]
@@ -106,7 +110,7 @@ class Stub:
                     "headers": {k.lower(): v for k, v in self.headers.items()},
                     "body": body,
                 }
-                if is_host_probe(request):  # answered, never recorded
+                if is_host_probe(request, stub.key):  # answered, never recorded
                     stub.reply(self, 404, {"error": "not a Gemini path"})
                     return
                 self.recorded = True

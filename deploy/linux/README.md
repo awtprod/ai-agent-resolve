@@ -4,8 +4,10 @@ Four units run the hub: `aar-hub-mcp` (agent MCP server, loopback :8787, agent w
 `aar-hub-console` (human console, loopback :8788), `aar-hub-nodeapi` (node API for the
 Windows Resolve node, tailnet IP :8789 only) and `aar-hub-worker` (the cold recipe worker: it
 runs the `ccn-longform` recipe's transcript, render and export steps on the hub, with the edit
-PC off). The files here are templates (`*.service.in`, `hub.env.in`) with `@PLACEHOLDER@`
-fields; nothing in this kit writes to `/etc` or starts a service.
+PC off). A fifth, `aar-hub-lessons`, is a one-shot pass that its timer runs every 10 minutes:
+it drafts lessons from decided reviews with a model (see below). The files here are templates
+(`*.service.in`, `*.timer.in`, `hub.env.in`) with `@PLACEHOLDER@` fields; nothing in this kit
+writes to `/etc` or starts a service.
 
 ## Layout
 
@@ -79,13 +81,83 @@ AAR_MEDIA_ROOT=/srv/aar-media AAR_WORK_DIR=/srv/aar-media/work \
 AAR_EXPORT_DIR=/srv/aar-media/share/exports \
   deploy/linux/install-units.sh ./rendered
 sudo install -m 0640 -o root -g aar rendered/hub.env /var/lib/aar/hub.env
-sudo cp rendered/*.service /etc/systemd/system/
+sudo cp rendered/*.service rendered/*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now aar-hub-mcp aar-hub-console aar-hub-nodeapi aar-hub-worker
 ```
 
+The lessons timer is enabled separately, once its key is in place (next section).
+
 `TAILNET_IP` is the hub's own tailnet address; the node API binds to it alone (not
 `0.0.0.0`), so `Wants=tailscaled.service` orders it after tailscale.
+
+## Lessons from reviews (`aar-hub-lessons`)
+
+After a person decides a review in the console, `aar hub lessons propose` asks a cheap model,
+through the local model gateway (OpenAI-compatible, default `http://127.0.0.1:8317`), for at
+most three lessons from that review's reason and notes, and records them as proposals. A person
+accepts, rescopes or drops each one on the console's `/lessons` page; nothing a model writes
+reaches a cut guide without that. Each pass makes at most 5 model calls (`--limit 5`), and stops
+early when the store's 200 waiting proposals have no room for 3 more. A review is drafted once,
+with at most 3 charged attempts per review (and at most 144 uncharged strikes, below). Only one
+pass runs at a time: a pass holds a lock file beside the database (`hub.db.lessons-propose.lock`),
+and a second one that finds it held does nothing and exits 0. A lock file the service user
+cannot write (left by another user, or with the wrong mode) makes every pass exit 1 with
+`lock_unavailable`, and the hint names the file: fix its owner or mode. The timer runs a pass 10
+minutes after boot and 10 minutes after each pass ends; the unit's `TimeoutStartSec=30min` is
+the outer bound on one pass.
+
+The gateway's key is NOT in `hub.env` (the console, the MCP server and the worker do not need
+it). It goes in `<root>/lessons.env`, mode 0600, owned by `root:root`. systemd reads an
+`EnvironmentFile` as root before it starts the unit as the service user, so the pass gets the key
+although the service user cannot read the file; the agent-facing units (the MCP server, the
+worker) run as that same service user, so a file it could read would put the key within an
+agent's reach. Create the file empty, then edit it, so the key never lands in a command line or a
+shell history:
+
+```
+sudo install -m 0600 -o root -g root /dev/null /var/lib/aar/lessons.env
+sudoedit /var/lib/aar/lessons.env
+```
+
+It holds one required line and two optional ones:
+
+```
+AAR_LLM_API_KEY=<the gateway key>
+# Optional: the model (default gpt-6-luna) and the gateway (http only on a loopback address).
+AAR_LESSONS_MODEL=gpt-6-luna
+AAR_LLM_BASE_URL=http://127.0.0.1:8317
+```
+
+Then enable the timer, and run one pass now to check it:
+
+```
+sudo systemctl enable --now aar-hub-lessons.timer
+sudo systemctl start aar-hub-lessons.service
+journalctl -u aar-hub-lessons.service -n 40 --no-pager
+systemctl list-timers aar-hub-lessons.timer
+```
+
+Each pass prints a JSON report (the reviews drafted, the proposals, the model calls and their
+token counts, and each failure's charged attempts and strikes). Exit status 0 is a pass that
+ran, even with nothing to do, another pass running, or a full backlog. Without `lessons.env` (or
+with no key in it) every run exits 2 with `not_configured` and the unit shows as failed; the
+timer keeps trying every 10 minutes, and nothing is recorded. A setup failure (the gateway
+down, a wrong key, a model it does not serve) exits 1 and charges no review: the next pass
+retries the same review. A failure that may be one review's own (a timeout, a 5xx, a 400, a
+reply that is not the lessons JSON) moves the pass on to the next review, and two in a row stop
+it. Such a failure is charged to its review when any review of the same pass, before or after
+it, is drafted; otherwise it is a strike and the pass exits 1. A pass takes the reviews with the
+fewest strikes first, then the fewest charged attempts, then the oldest decision, so reviews
+that keep failing go behind the others and cannot hold them back.
+
+So a gateway or model outage that fails every chat (the gateway's upstream down, every chat
+answered HTTP 400) shows as a failed unit at every run and charges no review, but each run gives
+two of the waiting reviews a strike. An outage lasting about 144 passes (a day at 10 minutes)
+gives up the reviews waiting through it: with one or two waiting, after those 144 passes; with
+more, the strikes spread over them, and giving them all up takes about 72 passes per waiting
+review. Nothing reopens a given-up review yet, so its lessons are never drafted. A gateway that
+cannot be reached at all, a wrong key or a rate limit records nothing and gives nothing up.
 
 ## Console over the tailnet
 
