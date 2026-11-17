@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -10,7 +11,8 @@ import pytest
 from write_support import AGENT, make_hub
 
 from aar.plan.model import EditPlan
-from aar.recipes.desktop_returns import receive_one, returned_edits
+from aar.recipes.desktop_returns import _return_directory, returned_edits
+from aar.recipes.desktop_returns import receive_one as _receive_one
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "plan"))
 from timeline_import_support import DrtClip, drt_members
@@ -19,6 +21,13 @@ from timeline_import_support import DrtClip, drt_members
 @pytest.fixture(autouse=True)
 def scratch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AAR_WORK_DIR", str(tmp_path / "work"))
+
+
+def receive_one(log, store, project_id, request, path, actor):
+    with _return_directory(path.parent, path.parent) as directory_fd:
+        return _receive_one(
+            log, store, project_id, request, Path(path.name), actor, directory_fd=directory_fd
+        )
 
 
 def packet(tmp_path: Path):
@@ -193,3 +202,99 @@ def test_cancel_during_import_does_not_publish_return(ccn_env, monkeypatch) -> N
     monkeypatch.setattr(env.hub.store, "put", cancel_then_put)
     desktop_returns.scan_returns(env.hub.log, env.hub.store, AGENT)
     assert not returned_edits(env.hub.log, env.hub.project_id, run)
+
+
+@pytest.mark.parametrize("swap_ancestor", [False, True])
+def test_directory_swap_cannot_import_outside_bytes(tmp_path, monkeypatch, swap_ancestor):
+    from aar.recipes import desktop_returns
+    from aar.recipes.events import EVENT_RESULT, RUNNER
+
+    hub, request, source = packet(tmp_path)
+    try:
+        root = tmp_path / "exports"
+        folder = root / "returns" / "recipe" / "r1" / "attempt"
+        folder.mkdir(parents=True)
+        path = folder / source.name
+        source.rename(path)
+        expected = hashlib.sha256(path.read_bytes()).hexdigest()
+        victim = root / "returns" if swap_ancestor else folder
+        outside = tmp_path / "private"
+        secret_path = outside / path.relative_to(victim)
+        secret_path.parent.mkdir(parents=True)
+        secret = b"another project's private timeline"
+        secret_path.write_bytes(secret)
+        os.utime(secret_path, (1, 1))
+        monkeypatch.setenv("AAR_EXPORT_DIR", str(root))
+        hub.log.append(
+            EVENT_RESULT,
+            RUNNER,
+            {
+                "outcome": "done",
+                "outputs": {"desktop_return": {"directory": str(folder), "request": request}},
+            },
+            project_id=hub.project_id,
+        )
+        original = desktop_returns.receive_one
+        swapped = False
+
+        def swap_then_receive(*args, **kwargs):
+            nonlocal swapped
+            victim.rename(tmp_path / "held")
+            victim.symlink_to(outside, target_is_directory=True)
+            swapped = True
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(desktop_returns, "receive_one", swap_then_receive)
+        desktop_returns.scan_returns(hub.log, hub.store, AGENT)
+        assert swapped
+        assert not hub.store.has(hashlib.sha256(secret).hexdigest())
+        assert hub.store.has(expected)
+    finally:
+        hub.log.close()
+
+
+def test_symlink_directory_is_refused_and_open_handles_close(tmp_path, monkeypatch):
+    root = tmp_path / "exports"
+    parent = root / "returns"
+    parent.mkdir(parents=True)
+    outside = tmp_path / "private"
+    outside.mkdir()
+    (parent / "attempt").symlink_to(outside, target_is_directory=True)
+    original = os.open
+    opened = []
+
+    def track_open(*args, **kwargs):
+        fd = original(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(os, "open", track_open)
+    with pytest.raises(OSError), _return_directory(root, parent / "attempt"):
+        pytest.fail("a symlink directory was opened")
+    assert len(opened) == 2
+    for fd in opened:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+def test_descriptor_return_rejects_paths_outside_open_directory(tmp_path):
+    hub, request, path = packet(tmp_path)
+    try:
+        folder = tmp_path / "returns"
+        folder.mkdir()
+        with _return_directory(folder, folder) as directory_fd:
+            for outside in (path, Path("..") / path.name):
+                with pytest.raises(ValueError, match="single file name"):
+                    _receive_one(
+                        hub.log,
+                        hub.store,
+                        hub.project_id,
+                        request,
+                        outside,
+                        AGENT,
+                        directory_fd=directory_fd,
+                    )
+        assert not hub.store.has(hashlib.sha256(path.read_bytes()).hexdigest())
+        assert not list((tmp_path / "work").glob("aar-return-*"))
+    finally:
+        hub.log.close()

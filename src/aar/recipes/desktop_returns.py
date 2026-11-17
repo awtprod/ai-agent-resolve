@@ -6,10 +6,10 @@ reader limits, never replacements for the active plan or approvals of a review.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
-import stat
 import tempfile
 import time
 from collections import deque
@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from aar.hub.artifacts import ArtifactStore
 from aar.hub.events import Actor, Event, EventLog
-from aar.media.receipt import open_regular
+from aar.media.receipt import _stat_identity, open_regular
 from aar.plan.export.errors import ExportError
 from aar.plan.export.media import media_map_from_mapping
 from aar.plan.model import EditPlan
@@ -69,37 +69,31 @@ def receive_one(
     request: dict[str, Any],
     path: Path,
     actor: Actor,
+    *,
+    directory_fd: int,
 ) -> dict[str, Any] | None:
     """Snapshot one settled regular DRT, import it, and journal once per round + content."""
     req = ReturnRequest.model_validate(request)
     mapping = media_map_from_mapping(req.media_map)
-    before = path.lstat()
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-        raise ValueError("returned timeline must be a regular file, never a symlink")
-    if before.st_size > MAX_DRT_BYTES:
-        raise ValueError("returned timeline exceeds 64 MiB")
-    if time.time() - before.st_mtime < SETTLE_SECONDS:
-        return None
     fd, temporary = tempfile.mkstemp(prefix="aar-return-", suffix=".drt", dir=work_root())
     snapshot = Path(temporary)
     try:
         digest = hashlib.sha256()
         size = 0
-        with os.fdopen(fd, "wb") as target, open_regular(path) as source:
+        with os.fdopen(fd, "wb") as target, open_regular(path, dir_fd=directory_fd) as source:
+            before = os.fstat(source.fileno())
+            if before.st_size > MAX_DRT_BYTES:
+                raise ValueError("returned timeline exceeds 64 MiB")
+            if time.time() - before.st_mtime < SETTLE_SECONDS:
+                return None
             while block := source.read(1024 * 1024):
                 size += len(block)
                 if size > MAX_DRT_BYTES:
                     raise ValueError("returned timeline grew past 64 MiB")
                 digest.update(block)
                 target.write(block)
-        after = path.lstat()
-        if (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        ):
-            return None  # another save/copy is in progress; next sweep takes a fresh snapshot
+            if _stat_identity(before) != _stat_identity(os.fstat(source.fileno())):
+                return None  # another save/copy is in progress; retry with a fresh snapshot
         key = (
             f"desktop-return:{project_id}:{req.recipe_node}:{req.round}:"
             f"{req.plan_sha256}:{digest.hexdigest()}"
@@ -191,27 +185,35 @@ def _scan_error(
         )
 
 
-def _return_paths(root: Path, folder: Path) -> list[Path]:
+@contextlib.contextmanager
+def _return_directory(root: Path, folder: Path) -> Iterator[int]:
+    """Pin every directory from the trusted export root without following share symlinks."""
     try:
-        folder.relative_to(root)
+        parts = folder.relative_to(root).parts
     except ValueError:
         raise ValueError("return folder is outside the export share") from None
-    if any(part in (".", "..") for part in folder.parts):
+    if any(part in (".", "..") for part in parts):
         raise ValueError("return folder contains a traversal")
-    current = folder
-    while current != root:
-        if current.is_symlink():
-            raise ValueError("return folder contains a symlink")
-        current = current.parent
-    if not folder.exists():
-        return []
-    with os.scandir(folder) as entries:
+    if os.name != "posix" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise ValueError("desktop return pickup requires POSIX no-follow directory descriptors")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with contextlib.ExitStack() as stack:
+        fd = os.open(root, flags)
+        stack.callback(os.close, fd)
+        for part in parts:
+            fd = os.open(part, flags, dir_fd=fd)
+            stack.callback(os.close, fd)
+        yield fd
+
+
+def _return_paths(directory_fd: int) -> list[Path]:
+    with os.scandir(directory_fd) as entries:
         paths = []
         for n, entry in enumerate(entries):
             if n >= MAX_FILES:
                 raise ValueError("return folder exceeds 100 entries; archive older returns")
             if entry.name.lower().endswith(".drt"):
-                paths.append(Path(entry.path))
+                paths.append(Path(entry.name))
     return sorted(paths)
 
 
@@ -235,14 +237,23 @@ def scan_returns(log: EventLog, store: ArtifactStore, actor: Actor) -> int:
             continue
         folder = Path(packet["directory"])
         try:
-            paths = _return_paths(root, folder)
+            with _return_directory(root, folder) as directory_fd:
+                for path in _return_paths(directory_fd):
+                    try:
+                        result = receive_one(
+                            log,
+                            store,
+                            event.project_id,
+                            packet["request"],
+                            path,
+                            actor,
+                            directory_fd=directory_fd,
+                        )
+                        count += result is not None
+                    except (OSError, ValueError) as exc:
+                        _scan_error(log, event, request, path, exc)
+        except FileNotFoundError:
+            continue  # return folder removed; there is nothing to collect
         except (OSError, ValueError) as exc:
             _scan_error(log, event, request, folder, exc)
-            continue
-        for path in paths:
-            try:
-                result = receive_one(log, store, event.project_id, packet["request"], path, actor)
-                count += result is not None
-            except (OSError, ValueError) as exc:
-                _scan_error(log, event, request, path, exc)
     return count

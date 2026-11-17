@@ -64,5 +64,23 @@ file's identity, size and modification time. It still refuses a replaced or chan
 Two new regression tests failed before the correction. The expanded tests also reject
 changed descriptor identity, size and modification time. After the correction, Ruff lint
 and formatting passed, and the focused receipt, return-pickup and recipe end-to-end run
-passed **27 tests in 63.99s**. The fresh Windows CI run remains required; no local Windows
-or live Resolve validation is claimed.
+passed **27 tests in 63.99s**. [Windows CI passed at `b017142`](https://github.com/awtprod/ai-agent-resolve/actions/runs/44130274584/job/134205119620).
+No local Windows or live Resolve validation is claimed.
+
+## Prism directory-swap finding
+
+Prism's HIGH finding on `b017142` was reproduced twice: replacing either the return folder
+or its ancestor with a symlink after enumeration stored bytes from an outside file under
+the receiving project. Both regression tests failed before the correction.
+
+Pickup now opens each directory relative to its already-open parent with `O_DIRECTORY`
+and `O_NOFOLLOW`. Enumeration and file opens use the retained directory descriptor;
+`receive_one` requires that descriptor and only accepts a single file name. Snapshot
+metadata checks use the same opened file, and all directory handles close on failure too.
+There is no pathname fallback on platforms lacking the required POSIX handles.
+
+After the correction, the receipt, return-pickup and recipe end-to-end tests passed
+**31 tests in 58.81s**, with Ruff lint/format checks clean. Tests prove neither directory-swap
+variant stores the outside bytes, while the originally enumerated DRT is still collected;
+they also cover pre-existing symlink refusal, descriptor cleanup, and absolute/parent-path
+rejection with temporary-file cleanup. Fresh CI and Prism review remain required.

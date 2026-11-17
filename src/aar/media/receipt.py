@@ -44,9 +44,17 @@ def _identity(path: Path) -> tuple[int, int, int, int, int]:
 
 
 @contextlib.contextmanager
-def open_regular(path: Path) -> Iterator[BinaryIO]:
+def open_regular(path: Path, *, dir_fd: int | None = None) -> Iterator[BinaryIO]:
     """Open regular evidence without blocking on a FIFO or following its final symlink."""
-    before = path.lstat()
+    if dir_fd is not None and (len(path.parts) != 1 or path.name in ("", ".", "..")):
+        raise ReceiptError("descriptor-relative evidence must be a single file name")
+
+    def path_stat() -> os.stat_result:
+        if dir_fd is None:
+            return path.lstat()
+        return os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+
+    before = path_stat()
     if not stat.S_ISREG(before.st_mode):
         raise ReceiptError(f"evidence must be a regular file, never a symlink: {path}")
     fd = os.open(
@@ -55,6 +63,7 @@ def open_regular(path: Path) -> Iterator[BinaryIO]:
         | getattr(os, "O_BINARY", 0)
         | getattr(os, "O_NONBLOCK", 0)
         | getattr(os, "O_NOFOLLOW", 0),
+        **({"dir_fd": dir_fd} if dir_fd is not None else {}),
     )
     try:
         opened = os.fstat(fd)
@@ -64,7 +73,7 @@ def open_regular(path: Path) -> Iterator[BinaryIO]:
         # through fstat (python/cpython#157671). Compare ctime through the same
         # API, while still binding the opened descriptor's identity, size and mtime.
         if (
-            _stat_identity(before) != _stat_identity(path.lstat())
+            _stat_identity(before) != _stat_identity(path_stat())
             or _stat_identity(before)[:4] != _stat_identity(opened)[:4]
         ):
             raise ReceiptError(f"evidence changed while opening: {path}")
