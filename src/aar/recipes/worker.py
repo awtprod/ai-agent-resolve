@@ -269,6 +269,7 @@ def run_worker(
     if install_signals:
         _install_signals(stop)
     ran = 0
+    next_returns = 0.0
     while not stop.is_set():
         progressed = _tick(
             log,
@@ -282,6 +283,14 @@ def run_worker(
         )
         if progressed:
             ran += 1
+        if not stop.is_set() and time.monotonic() >= next_returns:
+            from aar.recipes.desktop_returns import scan_returns
+
+            try:
+                scan_returns(log, store, actor)
+            except Exception as exc:
+                _LOG.warning("Desktop return pickup failed: %s", safe_str(exc)[:2000])
+            next_returns = time.monotonic() + 60.0
         if once:
             break
         if not progressed and not stop.wait(poll_s):

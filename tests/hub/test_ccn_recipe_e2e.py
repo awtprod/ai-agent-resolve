@@ -76,7 +76,10 @@ def test_ccn_longform_runs_end_to_end(ccn_env: CcnEnv, tmp_path: Path) -> None:
     assert notes == env.hub.store.read_bytes(export["handoff_notes"])
     text = notes.decode("utf-8")
     assert text.startswith("HANDOFF NOTES: Synthetic Long v1, round 1 (project Synthetic Show)")
-    assert "  - E:\\Shows\\cam-a.mov\r\n" in text and "they are NOT checked" in text
+    assert "  - E:\\Shows\\cam-a.mov\r\n" in text and "PC source and hub copy verified" in text
+    assert export_report["media_evidence"]["status"] == "verified_snapshot"
+    assert "SEND YOUR EDITS BACK" in text
+    assert Path(export["desktop_return"]["directory"]).is_dir()
     gain = render["loudness"]["gain_db"]
     assert f"{abs(gain):g} dB to reach {render['loudness']['target_lufs']:g} LUFS" in text
     assert "NOT IN THE FCPXML: REDO IN RESOLVE\r\n  Nothing: the FCPXML carries every" in text

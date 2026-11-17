@@ -1,0 +1,112 @@
+{
+  "date": "2026-11-17",
+  "machine": "JVL3RP2",
+  "resolve_version": "21.1.0.17",
+  "native_handoff_head": "04e16bf18b7313ce0cb5212dfabff69d46e28ba5",
+  "corrected_importer_sha256": "ccf13a5fdf7cfecb1e0d6f0c2eb70c1d82c248297eb91b54582525630f8d1b17",
+  "environment": "Real Resolve and SMB share; isolated hub/worker; synthetic media and transcript; no deployment",
+  "media_receipt": "verified_snapshot",
+  "media_sha256": "7a76d7b4da609e11657292ecac117d59e93bd242e331783bdc2daca841970402",
+  "imported_video_frames": 160,
+  "edited_video_frames": 95,
+  "edited_audio_frames": 96,
+  "native_render": [
+    {
+      "codec_name": "h264",
+      "codec_type": "video",
+      "width": 640,
+      "height": 360,
+      "avg_frame_rate": "30000/1001",
+      "duration": "3.203200",
+      "nb_frames": "96"
+    },
+    {
+      "codec_name": "aac",
+      "codec_type": "audio",
+      "sample_rate": "48000",
+      "channels": 2,
+      "avg_frame_rate": "0/0",
+      "duration": "3.221333",
+      "nb_frames": "151"
+    },
+    {
+      "codec_type": "data",
+      "avg_frame_rate": "30000/1001",
+      "duration": "3.203200",
+      "nb_frames": "1"
+    }
+  ],
+  "native_render_decode_exit": 0,
+  "audio_levels_db": {
+    "mean_volume": -22.8,
+    "max_volume": -11.2
+  },
+  "native_drt": {
+    "bytes": 30900,
+    "sha256": "933bda23a9cdb9dc375e83109819449675e96b87a30c723ba984030b5a429753"
+  },
+  "native_drp": {
+    "bytes": 44301,
+    "sha256": "031ca19763a38958dccfd19ecebd290c5d62990ea448b71055d4af146b279af7",
+    "reimport_tested": false
+  },
+  "native_remainders": [
+    {
+      "kind": "video",
+      "fractions": {
+        "source_in": 2.7675639557855902e-12
+      }
+    },
+    {
+      "kind": "audio",
+      "fractions": {
+        "duration": 0.9999999999977263,
+        "source_in": 2.7675639557855902e-12
+      }
+    }
+  ],
+  "automatic_pickup": {
+    "recipe": "nd_48c1e2aec757d5a4",
+    "event_time": "2026-11-17T18:02:26.570803+00:00",
+    "status": "needs_review",
+    "partial_reconstruction": true,
+    "segment_status": [
+      "unchanged",
+      "removed"
+    ],
+    "not_carried": [
+      {
+        "code": "audio_only_edit",
+        "track": "A2",
+        "record_in": 0,
+        "record_out": 96
+      },
+      {
+        "code": "audio_only_edit",
+        "track": "V1",
+        "record_in": 0,
+        "record_out": 95
+      }
+    ],
+    "original_plan_unchanged": true,
+    "repeat_sweep_added_events": 0,
+    "original_and_replay_fcpxml_identical": true
+  },
+  "restoration": {
+    "context_restored": true,
+    "page": "edit",
+    "timeline_count": 32,
+    "scratch_project_deleted": true
+  },
+  "validation": {
+    "focused_tests": 356,
+    "seconds": 62.37,
+    "independent_review": "No findings",
+    "remaining_limits": [
+      "enabled_state: the reader cannot see whether an item is enabled; a disabled clip is imported as if it plays",
+      "audio_transitions: transition items on audio tracks are not compared",
+      "titles: a title item's text is not read (a Resolve title's item name is its template, such as 'Fusion Title'; the text sits in a Fusion comp the reader does not interpret), so plan titles are paired with title items by position: the same range, else the range their content moved to, else by order on their track, which is listed as uncertain",
+      "not_read: markers, grades, Fusion and Fairlight work in the .drt are not read into the plan"
+    ]
+  }
+}

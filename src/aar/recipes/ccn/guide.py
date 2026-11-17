@@ -95,6 +95,14 @@ def build_guide(
     ``cut_attempts`` is the cut step's ``max_attempts`` (its attempts in one round).
     ``lessons`` (:func:`aar.hub.lessons.lessons_for_guide`) end section 3 when any applies."""
     where = {"db": db, "artifacts": artifacts, "project_id": project_id}
+    # This guide is stored once; status is live and may gain owner edits after export.
+    return_guidance = (
+        "\n## Edits returned from Resolve\n\n"
+        "Before every cut, read recipe_status and check returned_edits. Fetch its plan and diff "
+        "artifacts with the same hub artifact get command used below. Preserve the owner's "
+        "changes; review not_carried and reader limits with the owner before proceeding. "
+        "The reconstructed plan is partial, never an automatic replacement.\n"
+    )
     fetch = [
         ("stub.json", stub["stub"], "the plan stub: sources, frame rate, timecodes"),
         ("transcript.json", transcript["transcript"], "every word with start_s and end_s"),
@@ -314,7 +322,7 @@ def build_guide(
         "`recipe_status` says what to do (usually `recipe_retry`).",
         "",
     ]
-    return "\n".join(lines)
+    return "\n".join(lines) + return_guidance
 
 
 __all__ = ["RECIPES_ENV", "artifact_get", "build_guide", "command", "lessons_section"]

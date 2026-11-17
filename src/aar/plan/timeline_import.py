@@ -45,7 +45,7 @@ from __future__ import annotations
 import itertools
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import unquote, urlsplit
@@ -68,6 +68,9 @@ FORMAT = "aar.timeline-import/2"
 MAX_ITEMS = 20_000
 #: A timeline or media rate (a float in the file) matches the plan's rational fps within this.
 FPS_TOLERANCE = 1e-3
+#: Resolve 21.1 writes whole frames with ~1e-12 remainders, including 1 minus that noise.
+#: Snap only within a billionth of a frame; retain the forensic reader's original values.
+FRAME_ROUNDOFF = 1e-9
 #: Reader issues listed in a refusal or in ``reader_warnings`` (the rest are counted).
 MAX_LISTED_ISSUES = 50
 
@@ -247,6 +250,35 @@ def source_frame(item: TimelineItem) -> int | None:
     """Assumption ``source_frames``: a moving-picture item's ``<In>`` is the plan's ``src_in``
     (frames from the file's first frame). Stills never reach here (:func:`is_still`)."""
     return item.source_in
+
+
+def _whole_frame_item(item: TimelineItem) -> TimelineItem:
+    """Remove serialization roundoff, carrying a remainder near one into the integer part."""
+    values = {key: getattr(item, key) for key in ("record_start", "duration", "source_in")}
+    fractions = dict(item.fractions)
+    for key, value in values.items():
+        remainder = fractions.get(key)
+        if value is None or remainder is None:
+            continue
+        if 0 <= remainder <= FRAME_ROUNDOFF:
+            del fractions[key]
+        elif 1 - FRAME_ROUNDOFF <= remainder < 1:
+            values[key] = value + 1
+            del fractions[key]
+    if fractions == item.fractions:
+        return item
+    start, duration, source_in = (values[k] for k in ("record_start", "duration", "source_in"))
+    return replace(
+        item,
+        **values,
+        record_end=start + duration if start is not None and duration is not None else None,
+        source_out=(
+            source_in + duration
+            if item.source_out is not None and source_in is not None and duration is not None
+            else None
+        ),
+        fractions=fractions,
+    )
 
 
 def media_key(path: str) -> str:
@@ -821,7 +853,7 @@ class _Importer:
                 continue
             label = track.label
             ordered = sorted(
-                track.items,
+                (_whole_frame_item(item) for item in track.items),
                 key=lambda i: (i.record_start is None, i.record_start or 0, i.id),
             )
             for item in ordered:

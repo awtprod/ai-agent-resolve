@@ -1425,6 +1425,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help="Write beside the source, verify, then put the small file in its place.",
     )
     parser.add_argument("--report", type=Path, help="Also write a JSON report of the run here.")
+    parser.add_argument(
+        "--receipt",
+        action="store_true",
+        help="Write a verified PC/source receipt beside each shared copy.",
+    )
     parser.set_defaults(func=run_command)
 
 
@@ -1456,12 +1461,27 @@ def run_args(args: argparse.Namespace, *, ending: bool = False) -> int:
     line and the report, exit 2; so does one that arrives while the results are written (it is
     noted, not raised, from the moment the files are done). ``ending``: the process ends with
     this run (see :func:`stop_signals`)."""
+    if getattr(args, "receipt", False) and args.replace:
+        _print("--receipt requires --out: keep the PC original", sys.stderr)
+        return EXIT_FAILED
     failed = False
     results: list[FileResult] = []
     interrupted: ShrinkError | None = None
 
     def emit(result: FileResult) -> None:
         nonlocal failed
+        if getattr(args, "receipt", False) and result.ok:
+            from aar.media.receipt import write_receipt
+
+            try:
+                write_receipt(Path(result.source), Path(result.destination))
+            except (OSError, ValueError, ShrinkError) as exc:
+                result.status = "failed"
+                result.error = ShrinkError(
+                    "verify_failed",
+                    f"Media copy exists but receipt failed: {exc}",
+                    "Rerun with --receipt; already verified copies are reused.",
+                )
         failed = failed or not result.ok
         results.append(result)
         _print(json.dumps(result.to_dict(), sort_keys=True), sys.stdout)

@@ -104,6 +104,19 @@ def status_view(
         "diagnostics": _diagnostics(log, state.project_id, recipe_node),
         "truncated": truncated,
     }
+    from aar.recipes.desktop_returns import returned_edits
+
+    edits = returned_edits(log, state.project_id, recipe_node)
+    if edits:
+        view["returned_edits"] = edits
+        actions.append(
+            {
+                "step_id": None,
+                "who": "agent",
+                "what": "Review returned_edits artifacts and reader limits before continuing. "
+                "These are proposals; the active plan and review decision are unchanged.",
+            }
+        )
     ignored_decisions = state.ignored_decisions()
     if ignored_decisions:
         # S19f: a human decision the fold ignores (recorded after a reopen superseded its gate),

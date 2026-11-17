@@ -1,0 +1,9 @@
+Command: AAR_LIVE=0 make check
+Exit status: 0
+.venv/bin/ruff check .
+All checks passed!
+.venv/bin/ruff format --check .
+560 files already formatted
+.venv/bin/pytest -q
+[pytest progress lines omitted]
+8872 passed, 134 skipped in 1232.92s (0:20:32)
