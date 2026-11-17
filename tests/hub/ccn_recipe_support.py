@@ -72,6 +72,29 @@ class CcnEnv:
             "media_map": {str(self.media): PC_ROOT},
         }
         data.update(changes)
+        from aar.media.receipt import receipt_path, write_receipt
+        from aar.plan.export.errors import ExportError
+        from aar.plan.export.media import media_map_from_mapping, media_ref
+        from aar.plan.model import Source
+
+        # The synthetic fixture stands in for byte-identical copies on PC and hub.
+        try:
+            mapping = media_map_from_mapping(data["media_map"])
+        except ExportError:
+            return data  # deliberate malformed-input fixture; the test validates it
+        for index, path in enumerate(paths):
+            if not path.is_relative_to(self.media) or path.is_symlink() or not path.is_file():
+                continue  # no evidence for deliberate missing/out-of-root/symlink inputs
+            try:
+                pc_path = media_ref(
+                    Source(id=f"source-{index}", media=str(path)), mapping
+                ).windows_path
+            except ExportError:
+                continue  # deliberately uncovered by the test's media map
+            write_receipt(path, path)
+            receipt = json.loads(receipt_path(path).read_text())
+            receipt["source"] = pc_path
+            receipt_path(path).write_text(json.dumps(receipt))
         return data
 
 

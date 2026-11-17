@@ -179,5 +179,10 @@ per round (`<timeline>.e1.drt`, `.e2.drt`, ...; a file is never overwritten). Th
 with `aar plan import-timeline FILE.drt --plan PLAN.json --media-map MAP.json --out
 PLAN2.json --report DIFF.json`, using the same media map as the export: an item's media path is
 the PC path the FCPXML named, so the map's hub root -> PC root pairs tie it back to the plan's
-hub path (DESIGN "Timeline import (S20)"). The folder is not yet named in `hub.env` or used by
-the `ccn-longform` recipe; that wiring is a later slice.
+hub path (DESIGN "Timeline import (S20)"). For automatic pickup use the round-specific return folder printed in the handoff notes
+instead; see [Desktop handoff](DESKTOP-HANDOFF.md). The standalone command remains available.
+
+## Verified desktop handoff
+
+See [Desktop handoff](DESKTOP-HANDOFF.md) for `shrink --receipt`, verification of both
+media copies before export, and automatic pickup of returned `.drt` files by the hub worker.

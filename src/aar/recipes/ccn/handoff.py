@@ -142,10 +142,15 @@ def handoff_notes(
     lines += _section(
         "MEDIA ON THE EDIT PC",
         [
-            "  The timeline links these files. The hub cannot see them, so they are NOT "
-            "checked: after the import, make sure no clip shows Media Offline and that a clip "
-            "shows the same frame as the review video at the same timecode. A missing file, or "
-            "a different file under the same name, shows up only there.",
+            (
+                "  PC source and hub copy verified at ingestion (receipts checked against the "
+                "hub bytes and mapped PC paths). This is a snapshot: if you moved or changed "
+                "the PC files afterwards, regenerate their receipts. After import check for "
+                "Media Offline."
+                if report.get("media_evidence", {}).get("status") == "verified_snapshot"
+                else "  The timeline links these files; they are NOT checked. "
+                "Verify receipts before import."
+            ),
             *[f"  - {path}" for path in paths[:MAX_LISTED]],
         ],
         len(paths),
@@ -154,6 +159,18 @@ def handoff_notes(
 
     steps = [s for s in report.get("import") or [] if isinstance(s, str)]
     lines += _section("IMPORT", [f"  {n}. {_line(s)}" for n, s in enumerate(steps, start=1)], 0, "")
+
+    if report.get("return_directory"):
+        lines += [
+            "",
+            "SEND YOUR EDITS BACK",
+            "  In Resolve use File > Export > Timeline and choose DaVinci Resolve Timeline (.drt).",
+            f"  Save a new file in the export share's {_line(report['return_directory'])} folder.",
+            "  The hub worker picks it up automatically (normally within a minute while idle).",
+            "  Recipe status will show the returned plan and diff. Grades, Fusion, Fairlight",
+            "  and enabled/disabled clip state are not fully reconstructed; review the limits",
+            "  before asking the agent to continue. The active plan is never replaced silently.",
+        ]
 
     notes = _rows(report.get("notes"))
     if notes:

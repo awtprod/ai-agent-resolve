@@ -572,14 +572,24 @@ def export_step(ctx: StepContext) -> StepOutput:
         )
     except ExportError as exc:
         raise _library_failure("export", exc) from None
+    from aar.recipes.ccn.media_check import media_evidence
+
+    result.report["media_evidence"] = media_evidence(result.report["media"])
     fcpxml_id = ctx.put(
         result.fcpxml.encode("utf-8"), mime="application/xml", meta={"role": "fcpxml"}
     )
-    report_id = _json_artifact(ctx, result.report, "export-report")
     review_mp4 = _need(ctx, "render", "review_mp4")
     project, timeline = _need(ctx, "stub", "project"), _need(ctx, "stub", "timeline")
     round_ = _round(ctx)
     loudness = ctx.needs.get("render", {}).get("loudness")
+    from aar.recipes.ccn.export_files import _folder
+
+    return_dir = _folder(
+        export_root().resolve(),
+        ["returns", safe_name(ctx.recipe_node), f"r{round_}", safe_name(ctx.op_node)],
+    )
+    result.report["return_directory"] = str(return_dir.relative_to(export_root().resolve()))
+    report_id = _json_artifact(ctx, result.report, "export-report")
     notes = handoff_notes(
         project=project,
         timeline=timeline,
@@ -600,6 +610,16 @@ def export_step(ctx: StepContext) -> StepOutput:
     copy["review_mp4"], copy["handoff_notes"], copy["fcpxml"] = copy.pop("files")
     return StepOutput(
         outputs={
+            "desktop_return": {
+                "directory": str(return_dir),
+                "request": {
+                    "recipe_node": ctx.recipe_node,
+                    "round": round_,
+                    "plan_sha256": _need(ctx, "cut", "plan_sha256"),
+                    "media_map": params.media_map,
+                    "timeline": timeline,
+                },
+            },
             "fcpxml": fcpxml_id,
             "export_report": report_id,
             "handoff_notes": notes_id,
