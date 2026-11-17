@@ -16,7 +16,7 @@ Resolve process, direct database connection, or approval bypass was added.
   **13 passed in 9.88s**.
 - `PYTHONPATH=src python3 -S -m aar.media.receipt --help` exits 0: standalone helper needs
   only Python's standard library (ffmpeg/ffprobe are external tools for shrink verification).
-- `AAR_LIVE=0 make check`: exit 0; Ruff lint and formatting passed (560 files);
+- `AAR_LIVE=0 make check` at `f6e92e9`: exit 0; Ruff lint and formatting passed (560 files);
   **8,872 passed, 134 skipped in 1232.92s (20m32s)**.
   Captured command output: [local-checks.txt](local-checks.txt).
 
@@ -52,3 +52,17 @@ receipts stop at export with a recovery instruction. Originals/masters remain on
 proxies remain on both machines. Importing the delivered FCPXML and exporting a DRT remain
 explicit Resolve actions; pickup from the shared return folder is automatic while the worker
 runs. No currently running service was restarted.
+
+## Windows CI follow-up
+
+The first Windows/Python 3.12 CI run rejected unchanged files because `lstat().st_ctime_ns`
+and `fstat().st_ctime_ns` can mean birth time and change time respectively
+([CPython issue #157671](https://github.com/python/cpython/issues/157671)). The guard now
+compares change timestamps through the same path API, and separately checks the opened
+file's identity, size and modification time. It still refuses a replaced or changed file.
+
+Two new regression tests failed before the correction. The expanded tests also reject
+changed descriptor identity, size and modification time. After the correction, Ruff lint
+and formatting passed, and the focused receipt, return-pickup and recipe end-to-end run
+passed **27 tests in 63.99s**. The fresh Windows CI run remains required; no local Windows
+or live Resolve validation is claimed.

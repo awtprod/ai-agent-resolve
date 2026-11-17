@@ -9,6 +9,71 @@ import pytest
 from aar.media.receipt import ReceiptError, check_receipt, receipt_path, write_receipt
 
 
+@pytest.mark.parametrize("changed_field", [None, "st_ino", "st_size", "st_mtime_ns"])
+def test_open_regular_accepts_different_path_and_descriptor_ctime(
+    tmp_path, monkeypatch, changed_field
+):
+    from types import SimpleNamespace
+
+    from aar.media import receipt
+
+    path = tmp_path / "proxy.mp4"
+    path.write_bytes(b"unchanged")
+    original = receipt.os.fstat
+
+    def windows_fstat(fd):
+        value = original(fd)
+        fields = {
+            name: getattr(value, name)
+            for name in ("st_mode", "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        }
+        # CPython on Windows can report birth time by path and change time by fd.
+        fields["st_ctime_ns"] += 1_000_000
+        if changed_field is not None:
+            fields[changed_field] += 1
+        return SimpleNamespace(**fields)
+
+    monkeypatch.setattr(receipt.os, "fstat", windows_fstat)
+    if changed_field is None:
+        with receipt.open_regular(path) as stream:
+            assert stream.read() == b"unchanged"
+    else:
+        with (
+            pytest.raises(ReceiptError, match="changed while opening"),
+            receipt.open_regular(path),
+        ):
+            pass
+
+
+def test_open_regular_rechecks_path_metadata_after_open(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from aar.media import receipt
+
+    path = tmp_path / "proxy.mp4"
+    path.write_bytes(b"media")
+    original = Path.lstat
+    calls = 0
+
+    def changed_lstat(self, *args, **kwargs):
+        nonlocal calls
+        value = original(self, *args, **kwargs)
+        if self != path:
+            return value
+        calls += 1
+        fields = {
+            name: getattr(value, name)
+            for name in ("st_mode", "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        }
+        if calls > 1:
+            fields["st_ctime_ns"] += 1_000_000
+        return SimpleNamespace(**fields)
+
+    monkeypatch.setattr(Path, "lstat", changed_lstat)
+    with pytest.raises(ReceiptError, match="changed while opening"), receipt.open_regular(path):
+        pass
+
+
 def test_receipt_binds_both_files_and_rejects_changed_copy(tmp_path: Path) -> None:
     source, copy = tmp_path / "source.mp4", tmp_path / "copy.mp4"
     source.write_bytes(b"original audio and video\r\n\x1a\x00")

@@ -57,9 +57,16 @@ def open_regular(path: Path) -> Iterator[BinaryIO]:
         | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
             raise ReceiptError(f"evidence must be a regular file: {path}")
-        if _stat_identity(before) != _stat_identity(os.fstat(fd)):
+        # Windows CPython may report birth time through lstat, but change time
+        # through fstat (python/cpython#157671). Compare ctime through the same
+        # API, while still binding the opened descriptor's identity, size and mtime.
+        if (
+            _stat_identity(before) != _stat_identity(path.lstat())
+            or _stat_identity(before)[:4] != _stat_identity(opened)[:4]
+        ):
             raise ReceiptError(f"evidence changed while opening: {path}")
         stream = os.fdopen(fd, "rb")
     except BaseException:
