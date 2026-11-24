@@ -1,6 +1,7 @@
 """``produce``: inputs to an EditPlan v2 that lints clean, through the five transforms.
 
-Order: keep list (edges moved out of words) -> camera schedule -> pause trim -> sliver fold ->
+Order: keep list (edges moved out of words) -> camera schedule (a camera of several files split
+at its file edges, a range across a gap between them cut there) -> pause trim -> sliver fold ->
 end on the laugh -> sliver fold -> joins in quiet (with a fold after each pass) -> framing ->
 the two invariants -> the plan -> ``aar.plan.lint`` under the profile. A plan with a lint error
 is never returned (``LintGateError``); warnings are allowed and listed, next to the producer's

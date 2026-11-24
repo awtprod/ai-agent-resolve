@@ -219,9 +219,7 @@ def test_a_later_part_with_other_bytes_is_its_own_key(ccn_env: CcnEnv) -> None:
 
 
 @needs_ffmpeg
-def test_the_plan_check_pins_each_parts_place_and_sync_leaves_parts_alone(
-    ccn_env: CcnEnv,
-) -> None:
+def test_sync_leaves_the_parts_alone_and_the_guide_lays_them_out(ccn_env: CcnEnv) -> None:
     env = ccn_env
     files = make_parts(env.media, [12], seconds=4.0)
     run = _parts_run(env, files, "1")
@@ -279,3 +277,17 @@ def test_the_guide_counts_cameras_not_files() -> None:
     one = _guide_args()
     one["stub"].update(cameras=1, camera_labels=["A"], sources=args["stub"]["sources"][:2])
     assert "--schedule" not in build_guide(**one)
+
+
+@needs_ffmpeg
+def test_the_plan_check_pins_each_parts_place_on_the_clock(ccn_env: CcnEnv) -> None:
+    from test_ccn_recipe_r2 import _submit_edited_stub
+
+    env = ccn_env
+    files = make_parts(env.media, [12])
+    run = _parts_run(env, files, "1")
+    _submit_edited_stub(env, run, lambda d: d["sources"][1].update(recording_origin=999), "p1")
+    work(env)
+    op = latest(env, run, "render")
+    assert op.result_error["code"] == "plan_not_from_stub"
+    assert "source 'cam-a-p2' recording_origin is 999, the stub's 372" in op.result_error["message"]

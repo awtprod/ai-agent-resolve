@@ -4,11 +4,13 @@ Loading this module (``AAR_RECIPES=aar.recipes.ccn`` or ``--recipes aar.recipes.
 the recipe and its cold callables. The steps, on the S13g2 engine:
 
 1. ``stub`` (cold, idempotent): the plan stub from the params' sources (``aar.plan.stub``).
-2. ``sync`` (cold, idempotent): ``aar.analyze.sync`` of each other source against the first; a
-   pair that is not ``ok`` fails the step. One source: nothing to sync.
-3. ``transcript`` (cold, idempotent): the first source transcribed (Whisper, normalised audio by
-   default), its readable text and report stored; reused through a ``transcript.<key>`` fact
-   keyed on the file's sha256, the model and the settings.
+2. ``sync`` (cold, idempotent): ``aar.analyze.sync`` of each other camera against the first
+   source; a pair that is not ``ok`` fails the step. One camera: nothing to sync (the parts of a
+   reference camera of several files are placed by the stub, S24a).
+3. ``transcript`` (cold, idempotent): the reference camera transcribed (Whisper, normalised audio
+   by default; every file of a camera of several files at its own offset, merged), its readable
+   text and report stored; reused through a ``transcript.<key>`` fact per file keyed on the
+   file's sha256, the model and the settings.
 4. ``laughs`` (cold, idempotent): ``aar.analyze.laughs`` only when the params ask (a paid API).
 5. ``guide`` (cold, idempotent): the cut step's full guide as an artifact (exact commands with the
    hub's own paths, this run's artifact ids, the brief, the house rules, later rounds).

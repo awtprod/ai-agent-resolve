@@ -325,14 +325,17 @@ class Source(_Model):
         "rate (25 for a 25 fps file at 01:00:00:00 = 90000). Unset means the plan's fps. The "
         "FCPXML export converts the timecode to time with it.",
     )
+    # Left out of a dump when unset, so a plan without parts hashes and exports as before S24a.
     part: int | None = Field(
         default=None,
         ge=1,
+        exclude_if=lambda value: value is None,
         description="Version 2. This file is part N (from 1) of its camera's consecutive files: "
         "one camera label, one recording, several files one after another (S24a).",
     )
     part_placement: PartPlacement | None = Field(
         default=None,
+        exclude_if=lambda value: value is None,
         description="Version 2. How the stub set this part's recording_origin: 'timecode' (its "
         "start timecode less the first part's) or 'contiguous' (where the previous part ends). "
         "A sync report never moves such a source.",
