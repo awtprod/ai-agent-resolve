@@ -70,11 +70,17 @@ def describe(drp: DrpFile, *, max_items: int = DEFAULT_MAX_ITEMS) -> str:
     out = lines.append
     v = drp.versions
     stamp = f"Resolve {v.app_version or '?'} (DbPrjVer {v.project_version})" if v else "no version"
-    out(
-        f"{drp.kind.upper()} file ({drp.kind_source}): {stamp}; {drp.size} bytes; "
-        f"{sum(1 for m in drp.members if m.role != 'directory')} members"
-    )
-    if not drp.is_zip:
+    if drp.kind == "library":
+        out(
+            f"LIBRARY project (Resolve disk library, SQLite Project.db): project version "
+            f"{v.project_version if v else '?'}; {drp.size} bytes; read from a settled snapshot"
+        )
+    else:
+        out(
+            f"{drp.kind.upper()} file ({drp.kind_source}): {stamp}; {drp.size} bytes; "
+            f"{sum(1 for m in drp.members if m.role != 'directory')} members"
+        )
+    if not drp.is_zip and drp.kind != "library":
         out(f"not a zip archive; leading bytes {drp.head_hex} ({drp.signature or 'unknown'})")
     if drp.project is not None:
         p = drp.project

@@ -1,9 +1,11 @@
-"""``aar drp`` subcommands: ``inspect`` and ``describe``."""
+"""``aar drp`` subcommands: ``inspect``, ``describe`` and ``library`` (``diff`` and ``modify``
+live in their own modules)."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from typing import TextIO
@@ -11,6 +13,7 @@ from typing import TextIO
 from aar.drp import diff_cli
 from aar.drp.describe import DEFAULT_MAX_ITEMS, describe, printable
 from aar.drp.errors import DrpError
+from aar.drp.library import LibraryError, LibraryOptions, list_library
 from aar.drp.model import DrpFile
 from aar.drp.reader import read_drp
 
@@ -31,12 +34,24 @@ exit status:
 """
 
 
+LIBRARY_WAIT_SECONDS = 5.0
+LIBRARY_EXIT_STATUS_HELP = """\
+exit status:
+  0    every project in the library was read
+  1    the folder is not a library or holds no project, or a project was refused (it is
+       listed with the refusal's code, message and fix hint)
+  2    usage error
+  74   the output could not be written (stdout closed, disk full, I/O error)
+  141  the output pipe was closed early (for example by `head`)
+"""
+
+
 def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     """Add the ``drp`` command group to the top-level parser."""
     fmt = argparse.RawDescriptionHelpFormatter
     drp = subparsers.add_parser(
         "drp",
-        help="Read .drp, .drt and .drb files offline.",
+        help="Read .drp, .drt and .drb files, and Resolve disk library projects, offline.",
         epilog=EXIT_STATUS_HELP,
         formatter_class=fmt,
     )
@@ -48,7 +63,7 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         epilog=EXIT_STATUS_HELP,
         formatter_class=fmt,
     )
-    inspect.add_argument("file", help="path to a .drp, .drt or .drb file")
+    inspect.add_argument("file", help="path to a .drp, .drt or .drb file, or a library Project.db")
     inspect.add_argument("--json", action="store_true", help="print the full model as JSON")
     inspect.add_argument(
         "--blobs", action="store_true", help="fully decode every hex blob and report statistics"
@@ -61,7 +76,7 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         epilog=EXIT_STATUS_HELP,
         formatter_class=fmt,
     )
-    desc.add_argument("file", help="path to a .drp, .drt or .drb file")
+    desc.add_argument("file", help="path to a .drp, .drt or .drb file, or a library Project.db")
     desc.add_argument(
         "--max-items",
         type=int,
@@ -69,6 +84,30 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         help=f"media clips and items per track to list (default {DEFAULT_MAX_ITEMS}, 0 = all)",
     )
     desc.set_defaults(func=_describe)
+
+    lib = sub.add_parser(
+        "library",
+        help="list the projects of a Resolve disk library (each Project.db read)",
+        description=(
+            "List every project saved in a Resolve disk project library: its folder, "
+            "ProjectName, project id, project version, last-modified time and timeline names. "
+            "Each Project.db is read from a settled private snapshot; a project that is being "
+            "saved, damaged or not readable is listed with its refusal, never skipped."
+        ),
+        epilog=LIBRARY_EXIT_STATUS_HELP,
+        formatter_class=fmt,
+    )
+    lib.add_argument("folder", help="the library's folder (the one holding 'Resolve Projects')")
+    lib.add_argument("--json", action="store_true", help="print the listing as JSON")
+    lib.add_argument(
+        "--wait",
+        type=float,
+        default=LIBRARY_WAIT_SECONDS,
+        metavar="SECONDS",
+        help="how long to wait for a project being saved before listing it as busy "
+        f"(default {LIBRARY_WAIT_SECONDS:g})",
+    )
+    lib.set_defaults(func=_library)
 
     diff_cli.register(sub)
     # Imported here: aar.drp.modify.cli reuses this module's output helpers.
@@ -198,3 +237,43 @@ def _describe(args: argparse.Namespace) -> int:
     if drp is None:
         return EXIT_NOTHING_READ
     return _status(drp, _emit(describe(drp, max_items=args.max_items)))
+
+
+def _library(args: argparse.Namespace) -> int:
+    if not math.isfinite(args.wait) or args.wait < 0:
+        _warn("aar drp library: --wait must be a number of seconds, 0 or more")
+        return 2
+    options = LibraryOptions(deadline_seconds=args.wait)
+    try:
+        listing = list_library(args.folder, options=options)
+    except LibraryError as exc:
+        _warn(f"aar drp library: {exc}")
+        return EXIT_NOTHING_READ
+    refused = sum(1 for p in listing.projects if p.refusal is not None)
+    if args.json:
+        text = json.dumps(listing.to_dict(), indent=1, ensure_ascii=True, allow_nan=False) + "\n"
+    else:
+        lines = [
+            f"library: {listing.root}",
+            f"projects: {len(listing.projects)}"
+            + (f" ({refused} refused)" if refused else "")
+            + (" (list cut short: too many entries)" if listing.truncated else ""),
+        ]
+        for p in listing.projects:
+            where = f"  {p.user}/{p.folder}"
+            if p.refusal is not None:
+                r = p.refusal
+                lines.append(f"{where}: REFUSED {r['code']}: {r['message']}; {r['hint']}")
+                continue
+            names = ", ".join(f'"{n}"' for n in p.timelines) or "none"
+            lines.append(
+                f'{where}: "{p.name or "?"}" version {p.project_version}, id {p.id}, '
+                f"modified {p.last_modified or '?'}, timelines: {names}"
+            )
+            if p.warnings:
+                lines.append(f"    read with warnings: {', '.join(p.warnings)}")
+        text = "\n".join(printable(line) for line in lines) + "\n"
+    written = _emit(text)
+    if written != EXIT_OK:
+        return written
+    return EXIT_NOTHING_READ if refused or not listing.projects else EXIT_OK

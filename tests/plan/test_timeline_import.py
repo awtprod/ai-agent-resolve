@@ -534,6 +534,7 @@ def test_a_source_range_past_the_source_is_refused() -> None:
 def test_codes_are_stable() -> None:
     assert {
         "unreadable_timeline",
+        "library_busy",
         "no_timeline",
         "several_timelines",
         "timeline_not_found",
