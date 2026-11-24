@@ -582,3 +582,81 @@ def test_title_place_setting_identity_distinct_paths_and_unrelated_comp() -> Non
         == "Still Comp1"
     )
     assert unrelated_macro.GetInput("Input1") == "UNRELATED"
+
+
+def test_title_place_setting_durability_activation_and_posix_case() -> None:
+    """Setting identity requires durable SetData/GetData read-back, multi-comp items require
+    LoadFusionCompByName activation to succeed, and POSIX paths stay case-sensitive.
+    """
+    from aar.fusion.apply import _norm_setting_path
+
+    # Windows paths fold case; POSIX paths keep case sensitivity.
+    assert _norm_setting_path("D:\\PackA\\LowerThird.setting") == _norm_setting_path(
+        "d:/packa/lowerthird.setting"
+    )
+    assert _norm_setting_path("/mnt/Templates/LowerThird.setting") != _norm_setting_path(
+        "/mnt/Templates/lowerthird.setting"
+    )
+
+    # 1. If SetData does not persist (GetData read-back fails), title.place must fail loudly.
+    show1, tpl1 = _macro_show()
+    show1.fake.faults.add("ImportFusionComp:append")
+    show1.fake.faults.add("SetData:no-op")
+    err_data = show1.fails(
+        "title.place",
+        {
+            "timeline": show1.ref("Main"),
+            "titles": [
+                {
+                    "template": {"unique_id": tpl1},
+                    "track": 2,
+                    "record_in": 0,
+                    "record_out": 24,
+                    "setting": "D:\\Templates\\LowerThird.setting",
+                    "inputs": {"Input1": "Alice"},
+                }
+            ],
+        },
+    )
+    assert err_data.code == "title_setting_not_loaded"
+
+    # 2. If LoadFusionCompByName fails on a multi-comp item (initial load or retry), fail loudly.
+    show2, tpl2 = _macro_show()
+    show2.fake.faults.add("ImportFusionComp:append")
+    show2.fake.faults.add("LoadFusionCompByName:fail")
+    params = {
+        "timeline": show2.ref("Main"),
+        "titles": [
+            {
+                "template": {"unique_id": tpl2},
+                "track": 2,
+                "record_in": 0,
+                "record_out": 24,
+                "setting": "D:\\Templates\\LowerThird.setting",
+                "inputs": {"Input1": "Alice"},
+            }
+        ],
+    }
+    err_act_initial = show2.fails("title.place", params)
+    assert err_act_initial.code == "title_setting_not_loaded"
+
+    # On retry of a previously loaded multi-comp item, activation failure also surfaces an error.
+    show3, tpl3 = _macro_show()
+    show3.fake.faults.add("ImportFusionComp:append")
+    params3 = {
+        "timeline": show3.ref("Main"),
+        "titles": [
+            {
+                "template": {"unique_id": tpl3},
+                "track": 2,
+                "record_in": 0,
+                "record_out": 24,
+                "setting": "D:\\Templates\\LowerThird.setting",
+                "inputs": {"Input1": "Alice"},
+            }
+        ],
+    }
+    assert show3.ok("title.place", params3).titles[0].status == "placed"
+    show3.fake.faults.add("LoadFusionCompByName:fail")
+    err_act_retry = show3.fails("title.place", params3)
+    assert err_act_retry.code == "title_setting_not_loaded"

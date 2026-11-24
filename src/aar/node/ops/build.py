@@ -44,6 +44,7 @@ from aar.fusion.apply import (
     resolve_tool_input_id,
     values_match,
 )
+from aar.fusion.errors import FusionError
 from aar.node.ops import raw
 from aar.node.ops.framework import (
     ItemRef,
@@ -1484,14 +1485,25 @@ def _select_title_comp(item: Any, spec: TitleSpec, *, uid: str, reused: bool) ->
     if reused:
         existing = find_loaded_setting_comp(item, spec.setting)
         if existing is not None:
-            activate_fusion_comp(item, existing)
+            try:
+                activate_fusion_comp(item, existing)
+            except FusionError as exc:
+                raise OpError(
+                    "title_setting_not_loaded",
+                    f"title item {uid} could not activate Fusion setting {spec.setting!r}: "
+                    f"{exc.message}",
+                    "verify the composition is active in Resolve's Fusion page or remove extra "
+                    "compositions on the item",
+                    item_id=uid,
+                    setting=spec.setting,
+                ) from None
             return existing, False
 
     comp: Any = None
     loaded_setting = False
     import_comp = getattr(item, "ImportFusionComp", None)
     if callable(import_comp):
-        imported = import_comp(spec.setting)
+        imported = import_comp(spec.setting)  # [I] ImportFusionComp return value varies by build
         if imported is not None and not isinstance(imported, bool):
             comp = imported
             loaded_setting = True
@@ -1538,8 +1550,19 @@ def _select_title_comp(item: Any, spec: TitleSpec, *, uid: str, reused: bool) ->
             item_id=uid,
             setting=spec.setting,
         )
-    record_loaded_setting(comp, spec.setting)
-    activate_fusion_comp(item, comp)
+    try:
+        # [I] Verify SetData/GetData durability and multi-comp activation via LoadFusionCompByName.
+        record_loaded_setting(comp, spec.setting)
+        activate_fusion_comp(item, comp)
+    except FusionError as exc:
+        raise OpError(
+            "title_setting_not_loaded",
+            f"title item {uid} loaded {spec.setting!r} but could not persist/activate it: "
+            f"{exc.message}",
+            "verify Fusion SetData/GetData persistence and LoadFusionCompByName on Resolve",
+            item_id=uid,
+            setting=spec.setting,
+        ) from None
     return comp, True
 
 

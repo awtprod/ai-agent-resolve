@@ -226,30 +226,65 @@ def resolve_tool_input_id(tool: Any, key: str) -> str:
 _SETTING_DATA_KEY = "aar.setting"
 
 
+def _is_windows_path(path_str: str) -> bool:
+    stripped = path_str.strip()
+    return (
+        "\\" in stripped
+        or stripped.startswith("//")
+        or (len(stripped) >= 2 and stripped[1] == ":" and stripped[0].isalpha())
+    )
+
+
 def _norm_setting_path(path_str: str) -> str:
-    """Canonicalize a Windows or POSIX setting path for exact identity comparison."""
-    raw = path_str.replace("\\", "/").strip()
-    if not raw:
+    """Canonicalize a Windows or POSIX setting path for exact identity comparison.
+
+    Case-folds Windows drive/UNC paths only; preserves case sensitivity on POSIX paths.
+    """
+    stripped = path_str.strip()
+    if not stripped:
         return ""
+    is_win = _is_windows_path(stripped)
+    raw = stripped.replace("\\", "/")
     unc = raw.startswith("//")
     body = raw[2:] if unc else raw
     norm = posixpath.normpath(body)
     if unc:
         norm = "//" + norm.lstrip("/")
-    return norm.casefold()
+    return norm.casefold() if is_win else norm
 
 
 def record_loaded_setting(comp: Any, setting_path: str) -> None:
-    """Persist the canonical ``setting_path`` identity on a Fusion ``comp``."""
+    """Persist the canonical ``setting_path`` identity on ``comp`` and verify ``GetData``
+    read-back.
+
+    [I] Relies on Fusion ``Composition:SetData`` / ``GetData`` persisting custom string keys on a
+    timeline item's Fusion composition across calls. Raises :class:`FusionError` (``apply_failed``)
+    if ``SetData``/``GetData`` are unavailable or fail read-back so retries never lose setting
+    identity silently.
+    """
     norm = _norm_setting_path(setting_path)
     if not norm:
-        return
+        raise FusionError("apply_failed", f"cannot persist empty setting path {setting_path!r}")
     set_data = getattr(comp, "SetData", None)
-    if callable(set_data):
-        with contextlib.suppress(Exception):
-            set_data(_SETTING_DATA_KEY, norm)
-    with contextlib.suppress(AttributeError, TypeError):
-        comp._aar_setting_path = norm
+    get_data = getattr(comp, "GetData", None)
+    if not callable(set_data) or not callable(get_data):
+        raise FusionError(
+            "apply_failed",
+            "Fusion composition does not support SetData/GetData to persist setting identity",
+        )
+    try:
+        set_data(_SETTING_DATA_KEY, norm)
+        after = get_data(_SETTING_DATA_KEY)
+    except Exception as exc:
+        raise FusionError(
+            "apply_failed",
+            f"failed to persist setting identity {setting_path!r} via SetData/GetData: {exc}",
+        ) from exc
+    if not isinstance(after, str) or _norm_setting_path(after) != norm:
+        raise FusionError(
+            "apply_failed",
+            f"SetData({_SETTING_DATA_KEY!r}) read back {after!r}, expected {norm!r}",
+        )
 
 
 def _comp_active_setting(comp: Any) -> str | None:
@@ -260,9 +295,6 @@ def _comp_active_setting(comp: Any) -> str | None:
             val = get_data(_SETTING_DATA_KEY)
             if isinstance(val, str) and val.strip():
                 return _norm_setting_path(val)
-    recorded_attr = getattr(comp, "_aar_setting_path", None)
-    if isinstance(recorded_attr, str) and recorded_attr.strip():
-        return _norm_setting_path(recorded_attr)
     single = getattr(comp, "setting_path", None)
     if isinstance(single, str) and single.strip():
         return _norm_setting_path(single)
@@ -305,13 +337,28 @@ def _listed_comp_names(item: Any) -> dict[int, str]:
 
 
 def activate_fusion_comp(item: Any, comp: Any) -> None:
-    """Activate ``comp`` on ``item`` via ``LoadFusionCompByName`` when available and unambiguous."""
-    load_by_name = getattr(item, "LoadFusionCompByName", None)
-    if not callable(load_by_name):
-        return
-    listed = _listed_comp_names(item)
+    """Activate ``comp`` on ``item`` via ``LoadFusionCompByName``.
+
+    [I] When ``item`` carries multiple Fusion compositions, ``LoadFusionCompByName`` must succeed
+    (return a truthy handle without raising) so Resolve plays the edited composition rather than
+    leaving another composition visible. Raises :class:`FusionError` (``apply_failed``) if
+    activation cannot be confirmed on a multi-comp item.
+    """
     comp_count_fn = getattr(item, "GetFusionCompCount", None)
     comp_count = int(comp_count_fn()) if callable(comp_count_fn) else 0
+    multi = comp_count > 1
+
+    load_by_name = getattr(item, "LoadFusionCompByName", None)
+    if not callable(load_by_name):
+        if multi:
+            raise FusionError(
+                "apply_failed",
+                "timeline item has multiple Fusion compositions but does not support "
+                "LoadFusionCompByName",
+            )
+        return
+
+    listed = _listed_comp_names(item)
     cname = ""
     for idx in range(1, comp_count + 1):
         if item.GetFusionCompByIndex(idx) is comp:
@@ -320,11 +367,35 @@ def activate_fusion_comp(item: Any, comp: Any) -> None:
     if not cname:
         cname = _comp_name(comp)
     if not cname:
+        if multi:
+            raise FusionError(
+                "apply_failed",
+                "cannot activate Fusion composition on multi-comp item: composition has no name",
+            )
         return
     if listed and list(listed.values()).count(cname) > 1:
+        if multi:
+            raise FusionError(
+                "apply_failed",
+                f"cannot activate Fusion composition {cname!r}: duplicate composition name",
+            )
         return
-    with contextlib.suppress(Exception):
-        load_by_name(cname)
+
+    try:
+        activated = load_by_name(cname)
+    except Exception as exc:
+        if multi:
+            raise FusionError(
+                "apply_failed",
+                f"LoadFusionCompByName({cname!r}) failed: {exc}",
+            ) from exc
+        return
+    if multi and not activated:
+        raise FusionError(
+            "apply_failed",
+            f"LoadFusionCompByName({cname!r}) returned {activated!r}; composition could not be "
+            "activated",
+        )
 
 
 def find_loaded_setting_comp(item: Any, setting_path: str) -> Any | None:

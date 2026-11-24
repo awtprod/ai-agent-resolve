@@ -639,6 +639,8 @@ class FakeFusionComp:
         return self.data.get(key)
 
     def SetData(self, key: str, value: Any) -> bool:
+        if "SetData:no-op" in self._app.faults:
+            return False
         self.data[key] = value
         return True
 
@@ -892,6 +894,8 @@ class FakeTimelineItem:
 
     def LoadFusionCompByName(self, compName: str) -> FakeFusionComp | None:
         self._app.calls.append(("LoadFusionCompByName", self._uid, compName))
+        if "LoadFusionCompByName:fail" in self._app.faults:
+            return None
         for comp in self.comps:
             if comp.Name == compName:
                 self.active_comp_name = compName
