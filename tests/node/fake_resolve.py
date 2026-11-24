@@ -245,13 +245,16 @@ class FakeMediaPoolItem:
         file_path: str | None = None,
         title_text: str | None = None,
         title_tool: str = "TextPlus",
+        title_inputs: dict[str, Any] | None = None,
     ) -> None:
         if kind not in _KIND_TYPE:
             raise ValueError(f"unknown clip kind {kind!r}")
         # A Fusion title template: timeline items placed from it carry a Fusion comp whose
-        # ``title_tool`` tool (a Text+ by default) holds ``title_text`` as its StyledText.
+        # ``title_tool`` tool (a Text+ by default, or MacroOperator when ``title_inputs`` is given)
+        # holds ``title_text`` as its StyledText or ``title_inputs`` as named inputs.
         self.title_text = title_text
         self.title_tool = title_tool
+        self.title_inputs = dict(title_inputs) if title_inputs is not None else None
         self._app = app
         self._name = name
         self._uid = f"mpi-{next(app.ids)}"
@@ -557,14 +560,46 @@ class FakeGraph:
 # -- Fusion ---------------------------------------------------------------------------------
 
 
+class FakeFusionInput:
+    """One input descriptor returned by ``FakeFusionTool.GetInputList``."""
+
+    def __init__(self, inp_id: str, name: str) -> None:
+        self.ID = inp_id
+        self.Name = name
+
+    def GetAttrs(self) -> dict[str, Any]:
+        return {"INPS_ID": self.ID, "INPS_Name": self.Name}
+
+
 class FakeFusionTool:
     """A Fusion tool (``Operator``): ``GetInput`` / ``SetInput`` on named inputs."""
 
-    def __init__(self, app: FakeResolve, owner: str, tool_id: str, inputs: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        app: FakeResolve,
+        owner: str,
+        tool_id: str,
+        inputs: dict[str, Any],
+        name: str | None = None,
+        input_names: dict[str, str] | None = None,
+    ) -> None:
         self._app = app
         self._owner = owner
         self.tool_id = tool_id
+        self.Name = name or tool_id
+        self.ID = tool_id
         self.inputs = dict(inputs)
+        # Optional map of INPS_ID -> INPS_Name display labels.
+        self.input_names = dict(input_names) if input_names else {}
+
+    def GetAttrs(self) -> dict[str, Any]:
+        return {"TOOLS_RegID": self.tool_id, "TOOLS_Name": self.Name}
+
+    def GetInputList(self) -> dict[int, FakeFusionInput]:
+        return {
+            i: FakeFusionInput(inp_id, self.input_names.get(inp_id, inp_id))
+            for i, inp_id in enumerate(self.inputs, start=1)
+        }
 
     def GetInput(self, id: str, time: float | None = None) -> Any:
         return self.inputs.get(id)
@@ -580,19 +615,60 @@ class FakeFusionTool:
 class FakeFusionComp:
     """A Fusion composition on a timeline item."""
 
-    def __init__(self, app: FakeResolve, owner: str, tools: list[FakeFusionTool]) -> None:
+    def __init__(
+        self,
+        app: FakeResolve,
+        owner: str,
+        tools: list[FakeFusionTool],
+        name: str = "Composition 1",
+        data: dict[str, Any] | None = None,
+    ) -> None:
         self._app = app
         self._owner = owner
         self.tools = tools
+        self.Name = name
+        self.loaded_settings: list[str] = []
+        self.data: dict[str, Any] = dict(data) if data else {}
+
+    def GetAttrs(self) -> dict[str, Any]:
+        return {"COMPS_Name": self.Name}
+
+    def GetData(self, key: str | None = None) -> Any:
+        if "GetData:raise" in self._app.faults:
+            raise RuntimeError("GetData failed")
+        if key is None:
+            return dict(self.data)
+        return self.data.get(key)
+
+    def SetData(self, key: str, value: Any) -> bool:
+        if "SetData:no-op" in self._app.faults:
+            return False
+        self.data[key] = value
+        return True
 
     def FindToolByID(self, id: str) -> FakeFusionTool | None:
         return next((t for t in self.tools if t.tool_id == id), None)
+
+    def GetToolList(self, selected: bool = False) -> dict[int, FakeFusionTool]:
+        return {i: t for i, t in enumerate(self.tools, start=1)}
+
+    def LoadSettings(self, path: str) -> bool:
+        self._app.calls.append(("LoadSettings", self._owner, path))
+        if "LoadSettings:false" in self._app.faults:
+            return False
+        self.loaded_settings.append(path)
+        return True
 
     def clone(self, owner: str) -> FakeFusionComp:
         return FakeFusionComp(
             self._app,
             owner,
-            [FakeFusionTool(self._app, owner, t.tool_id, t.inputs) for t in self.tools],
+            [
+                FakeFusionTool(self._app, owner, t.tool_id, t.inputs, t.Name, t.input_names)
+                for t in self.tools
+            ],
+            name=self.Name,
+            data=self.data,
         )
 
 
@@ -630,9 +706,15 @@ class FakeTimelineItem:
         self.item_type: str | None = None  # "transition" for a transition item
         self.transition_name: str | None = None  # the type AddTransition was given
         self.comps: list[FakeFusionComp] = []
-        if mpi is not None and mpi.title_text is not None and track_type == "video":
-            tool = FakeFusionTool(app, self._uid, mpi.title_tool, {"StyledText": mpi.title_text})
-            self.comps = [FakeFusionComp(app, self._uid, [tool])]
+        if mpi is not None and track_type == "video":
+            if mpi.title_inputs is not None:
+                tool = FakeFusionTool(app, self._uid, mpi.title_tool, dict(mpi.title_inputs))
+                self.comps = [FakeFusionComp(app, self._uid, [tool])]
+            elif mpi.title_text is not None:
+                tool = FakeFusionTool(
+                    app, self._uid, mpi.title_tool, {"StyledText": mpi.title_text}
+                )
+                self.comps = [FakeFusionComp(app, self._uid, [tool])]
 
     def clone(self, timeline: FakeTimeline) -> FakeTimelineItem:
         twin = FakeTimelineItem(
@@ -808,6 +890,44 @@ class FakeTimelineItem:
 
     def GetFusionCompByIndex(self, compIndex: int) -> FakeFusionComp | None:
         return self.comps[compIndex - 1] if 1 <= compIndex <= len(self.comps) else None
+
+    def GetFusionCompNameList(self) -> list[str]:
+        return [c.Name for c in self.comps]
+
+    def LoadFusionCompByName(self, compName: str) -> FakeFusionComp | None:
+        self._app.calls.append(("LoadFusionCompByName", self._uid, compName))
+        if "LoadFusionCompByName:fail" in self._app.faults:
+            return None
+        for comp in self.comps:
+            if comp.Name == compName:
+                self.active_comp_name = compName
+                return comp
+        return None
+
+    def ImportFusionComp(self, path: str) -> FakeFusionComp | None:
+        self._app.calls.append(("ImportFusionComp", self._uid, path))
+        if "ImportFusionComp:append" not in self._app.faults:
+            return None
+        stem = (
+            re.split(r"[\\/]", path)[-1].rsplit(".", 1)[0] or f"Composition {len(self.comps) + 1}"
+        )
+        existing_names = {c.Name for c in self.comps}
+        comp_name = stem
+        suffix = 1
+        while comp_name in existing_names:
+            comp_name = f"{stem} {suffix}"
+            suffix += 1
+        # Append a distinct composition whose macro inputs are independent of comp 1.
+        base_inputs = (
+            dict(self.mpi.title_inputs)
+            if self.mpi is not None and self.mpi.title_inputs is not None
+            else {"Input1": "IMPORTED_1", "Input2": "IMPORTED_2", "Input3": 0.0}
+        )
+        tool = FakeFusionTool(self._app, self._uid, "MacroOperator", base_inputs, name=stem)
+        comp = FakeFusionComp(self._app, self._uid, [tool], name=comp_name)
+        comp.loaded_settings.append(path)
+        self.comps.append(comp)
+        return comp
 
     def CopyGrades(self, tgtTimelineItems: list[FakeTimelineItem]) -> bool:
         self._app.calls.append(("CopyGrades", self._uid, [t._uid for t in tgtTimelineItems]))

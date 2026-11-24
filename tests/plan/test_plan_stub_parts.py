@@ -221,3 +221,24 @@ def test_cli_takes_parts_and_a_placement(
     stub = json.loads(out.read_text())
     assert [s["part"] for s in stub["sources"]] == [1, 2]
     assert main([*argv, "--force", "--placement", "A=sideways"]) == 2
+
+
+@needs_ffmpeg
+def test_parts_and_extra_sources_compose(tmp_path: Path) -> None:
+    """S24 graphics overlays (extra sources) beside a reference camera of several files: the
+    parts come first and are placed; the overlay is never a part, has no recording and is not a
+    camera."""
+    files = make_parts(tmp_path, [24], seconds=2.0)
+    frames = frame_count(files[0][0])
+    gfx = make_show(tmp_path / "gfx.mov", seconds=2.0, audio=False, timecode="00:00:00:00")
+    sources = _parts(files)
+    result = _stub([sources[1], sources[0]], extra_sources=[StubSource(gfx, id="gfx-1")])
+    plan = result.plan
+    assert [(s.id, s.part, s.recording_id, s.recording_origin) for s in plan.sources] == [
+        ("cam-a-p1", 1, "show-1", 0),
+        ("cam-a-p2", 2, "show-1", frames + 24),
+        ("gfx-1", None, None, 0),
+    ]
+    assert result.report["cameras"] == ["A"] and len(result.report["parts"]) == 2
+    error = _code(sources, extra_sources=[StubSource(gfx, id="gfx-1", part=3)])
+    assert error.code == "bad_parts"

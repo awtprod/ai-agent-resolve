@@ -44,10 +44,11 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import Literal
+from pathlib import Path
+from typing import Any, Literal
 
 from aar.plan.apply.compile import (
     _audio_index,
@@ -180,6 +181,19 @@ class TitleSpec:
     lines: tuple[str, ...]
     template: str | None
     name: str
+    setting: str | None = None
+    inputs: tuple[tuple[str, Any], ...] = ()
+
+    @property
+    def inputs_dict(self) -> dict[str, Any]:
+        return {k: list(v) if isinstance(v, tuple) else v for k, v in self.inputs}
+
+    @property
+    def placeholder_lines(self) -> tuple[str, ...]:
+        if self.lines:
+            return self.lines
+        str_vals = tuple(v for _, v in self.inputs if isinstance(v, str) and v.strip())
+        return str_vals or (self.name,)
 
 
 @dataclass(frozen=True)
@@ -1017,8 +1031,19 @@ class _Builder:
             )
 
     def _titles(self) -> None:
-        entries: list[tuple[str, str, int, int, list[str], str | None]] = [
-            (f"titles[{i}]", t.kind, t.record_in, t.record_out, t.lines, t.template)
+        entries: list[
+            tuple[str, str, int, int, list[str], str | None, str | None, Mapping[str, Any]]
+        ] = [
+            (
+                f"titles[{i}]",
+                t.kind,
+                t.record_in,
+                t.record_out,
+                t.lines,
+                t.template,
+                t.setting,
+                t.inputs,
+            )
             for i, t in enumerate(self.plan.titles)
         ]
         outro = self.plan.outro
@@ -1026,16 +1051,27 @@ class _Builder:
             start = self.plan.content_frames() + outro.sting.start
             sting = outro.sting
             entries.append(
-                ("outro.sting", "sting", start, start + sting.frames, sting.lines, sting.template)
+                (
+                    "outro.sting",
+                    "sting",
+                    start,
+                    start + sting.frames,
+                    sting.lines,
+                    sting.template,
+                    sting.setting,
+                    sting.inputs,
+                )
             )
-        for location, _, record_in, record_out, _, _ in entries:
+        for location, _, record_in, record_out, _, _, _, _ in entries:
             self._inside(location, record_in, record_out)
         # Resolve trims items that overlap on one track: overlapping titles get their own lanes.
         lanes = stack_lanes([(e[2], e[3]) for e in entries], self.layout.title_lane)
-        for (location, kind, record_in, record_out, lines, template), lane in zip(
+        for (location, kind, record_in, record_out, lines, template, setting, inputs), lane in zip(
             entries, lanes, strict=True
         ):
-            self._add_title(location, kind, record_in, record_out, lines, template, lane)
+            self._add_title(
+                location, kind, record_in, record_out, lines, template, lane, setting, inputs
+            )
 
     def _add_title(
         self,
@@ -1046,7 +1082,22 @@ class _Builder:
         lines: list[str],
         template: str | None,
         lane: int,
+        setting: str | None = None,
+        inputs: Mapping[str, Any] = (),
     ) -> None:
+        frozen_inputs = tuple(
+            (k, tuple(v) if isinstance(v, list) else v)
+            for k, v in (inputs.items() if isinstance(inputs, Mapping) else ())
+        )
+        if lines:
+            name = " / ".join(lines)
+        else:
+            str_vals = [v for _, v in frozen_inputs if isinstance(v, str) and v.strip()]
+            name = (
+                " / ".join(str_vals)
+                if str_vals
+                else (template or (Path(setting).stem if setting else "Fusion Graphic"))
+            )
         self.layout.titles.append(
             TitleSpec(
                 location,
@@ -1056,12 +1107,17 @@ class _Builder:
                 record_out,
                 tuple(lines),
                 template,
-                " / ".join(lines),
+                name,
+                setting=setting,
+                inputs=frozen_inputs,
             )
         )
-        action = (
-            f"replace it with template {template!r}" if template else "replace it with a template"
-        )
+        if setting:
+            action = f"apply Fusion setting {setting!r} (see .fusion.json manifest)"
+        elif template:
+            action = f"replace it with template {template!r}"
+        else:
+            action = "replace it with a template"
         self.unexpressible(
             "title_template",
             location,

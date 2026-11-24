@@ -48,7 +48,7 @@ from aar.recipes.ccn.export_files import copy_out, export_root, safe_name
 from aar.recipes.ccn.faults import qa_failure_upstream, upstream_failure
 from aar.recipes.ccn.guide import artifact_get, build_guide
 from aar.recipes.ccn.handoff import NOTES_MIME, NOTES_SUFFIX, handoff_notes
-from aar.recipes.ccn.params import CcnLongformParams, check_hub_file
+from aar.recipes.ccn.params import CcnLongformParams, check_hub_file, media_root
 from aar.recipes.ccn.scratch import drop_scratch, op_scratch
 from aar.recipes.ccn.transcript import (
     StepInterrupted,
@@ -195,8 +195,14 @@ def stub_step(ctx: StepContext) -> StepOutput:
         StubSource(s.path, camera=s.camera, shot_size=s.shot_size, id=s.id, part=s.part)
         for s in params.sources
     ]
+    extra_sources = [
+        StubSource(s.path, camera=s.camera, shot_size=s.shot_size, id=s.id)
+        for s in params.extra_sources
+    ]
     try:  # before the probes: a file replaced while they run differs at the render
-        identities = [input_identity(Path(s.path)) for s in params.sources]
+        identities = [
+            input_identity(Path(s.path)) for s in [*params.sources, *params.extra_sources]
+        ]
     except OSError as exc:
         raise StepFailure(
             "stub_unreadable", f"cannot stat a source: {exc}", "check the file"
@@ -211,6 +217,7 @@ def stub_step(ctx: StepContext) -> StepOutput:
             profile=brief.rule_profile,
             allow_unknown_timecode=params.allow_unknown_timecode,
             placement=params.part_placement,
+            extra_sources=extra_sources,
         )
     except StubError as exc:
         raise StepFailure(f"stub_{exc.code}", exc.message, exc.hint) from None
@@ -219,7 +226,8 @@ def stub_step(ctx: StepContext) -> StepOutput:
     trim = params.pause_trim_on()
     report = result.report
     # the stub lists the reference camera's parts first: identities go by path, not position
-    by_path = {s.path: identity for s, identity in zip(params.sources, identities, strict=True)}
+    every = [*params.sources, *params.extra_sources]
+    by_path = {s.path: identity for s, identity in zip(every, identities, strict=True)}
     fps = result.plan.fps
 
     def sec(frames: int) -> float:
@@ -236,43 +244,43 @@ def stub_step(ctx: StepContext) -> StepOutput:
         }
         for part in report["parts"]
     ]
-    return StepOutput(
-        outputs={
-            "stub": stub_id,
-            "project": result.plan.project,
-            "timeline": result.plan.timeline,
-            "fps": report["fps"],
-            "resolution": report["resolution"],
-            "recording_id": params.recording_id,
-            "reference": result.plan.sources[0].id,
-            "cameras": len(report["cameras"]),
-            "camera_labels": report["cameras"],
-            "sources": [
-                {
-                    "id": s["id"],
-                    "camera": s["camera"],
-                    "duration": s["duration"],
-                    "start_timecode": (s["start_timecode"] or {}).get("timecode"),
-                    **({"part": s["part"]} if s["part"] is not None else {}),
-                    **by_path[_param_path(params, s["media"])],
-                }
-                for s in report["sources"]
-            ],
-            # the reference camera's files, in recording seconds (none for one file)
-            "parts": parts,
-            "part_placement": report["part_placement"],
-            "unknown_timecode": report["unknown_timecode"],
-            "pause_trim": "on" if trim else "off",
-            "pause_trim_flag": "--pause-trim" if trim else "--no-pause-trim",
-            "warnings": [w["code"] for w in report["warnings"]][:20],
-        },
-        artifact_ids=(stub_id,),
-    )
+    outputs: dict[str, Any] = {
+        "stub": stub_id,
+        "project": result.plan.project,
+        "timeline": result.plan.timeline,
+        "fps": report["fps"],
+        "resolution": report["resolution"],
+        "recording_id": params.recording_id,
+        "reference": result.plan.sources[0].id,
+        "cameras": len(report["cameras"]),
+        "camera_labels": report["cameras"],
+        "sources": [
+            {
+                "id": s["id"],
+                "camera": s["camera"],
+                "duration": s["duration"],
+                "start_timecode": (s["start_timecode"] or {}).get("timecode"),
+                **({"part": s["part"]} if s["part"] is not None else {}),
+                **by_path[_param_path(params, s["media"])],
+            }
+            for s in report["sources"]
+        ],
+        # the reference camera's files, in recording seconds (none for one file)
+        "parts": parts,
+        "part_placement": report["part_placement"],
+        "unknown_timecode": report["unknown_timecode"],
+        "pause_trim": "on" if trim else "off",
+        "pause_trim_flag": "--pause-trim" if trim else "--no-pause-trim",
+        "warnings": [w["code"] for w in report["warnings"]][:20],
+    }
+    if params.fusion_templates:
+        outputs["fusion_templates"] = list(params.fusion_templates)
+    return StepOutput(outputs=outputs, artifact_ids=(stub_id,))
 
 
 def _param_path(params: CcnLongformParams, media: str) -> str:
     """The params path a stub source's (absolute) media path came from."""
-    for source in params.sources:
+    for source in [*params.sources, *params.extra_sources]:
         if source.path == media or os.path.abspath(source.path) == media:
             return source.path
     raise StepFailure("stub_invalid_stub", f"the stub names a file not in the params: {media}", "")
@@ -528,17 +536,27 @@ def render_step(ctx: StepContext) -> StepOutput:
     """Render the submitted plan with the review preset on the hub, store the MP4 and its report,
     and gate the render's QA (failing checks named). Idempotent: a re-claimed op starts from an
     emptied scratch folder and stores content-addressed artifacts."""
+    params = _params(ctx)
     profile = _profile(ctx)
     plan_node, plan = check_plan(ctx)
     transcript = _transcript(ctx)
     laughs = _laughs(ctx)
     check_cancelled(ctx)
+    allowed_templates = [Path(p) for p in params.fusion_templates]
+    root = media_root()
     folder = op_scratch(ctx, "aar-render")
     try:
         out = folder / f"{safe_name(_need(ctx, 'stub', 'timeline'))}.review.mp4"
         try:
             result = render_plan(
-                plan, profile, out=out, preset="review", transcript=transcript, laughs=laughs
+                plan,
+                profile,
+                out=out,
+                preset="review",
+                media_root=Path(root) if root is not None else None,
+                fusion_templates=allowed_templates,
+                transcript=transcript,
+                laughs=laughs,
             )
         except RenderError as exc:
             raise _library_failure("render", exc) from None
@@ -656,37 +674,62 @@ def export_step(ctx: StepContext) -> StepOutput:
         loudness=loudness if isinstance(loudness, dict) else None,
     )
     notes_id = ctx.put(notes.encode("utf-8"), mime=NOTES_MIME, meta={"role": "handoff-notes"})
+    fusion_id: str | None = None
+    if "fusion" in result.report:
+        fusion_id = _json_artifact(ctx, result.report["fusion"], "fusion-manifest")
     # The FCPXML last: it is in the share only once the video and the notes are (export_files).
-    copy = copy_out(
-        ctx,
-        project,
-        timeline,
-        round_,
-        [(".review.mp4", review_mp4), (NOTES_SUFFIX, notes_id), (".fcpxml", fcpxml_id)],
-    )
-    copy["review_mp4"], copy["handoff_notes"], copy["fcpxml"] = copy.pop("files")
-    return StepOutput(
-        outputs={
-            "desktop_return": {
-                "directory": str(return_dir),
-                "request": {
-                    "recipe_node": ctx.recipe_node,
-                    "round": round_,
-                    "plan_sha256": _need(ctx, "cut", "plan_sha256"),
-                    "media_map": params.media_map,
-                    "timeline": timeline,
-                },
+    if fusion_id is not None:
+        copy = copy_out(
+            ctx,
+            project,
+            timeline,
+            round_,
+            [
+                (".review.mp4", review_mp4),
+                (NOTES_SUFFIX, notes_id),
+                (".fusion.json", fusion_id),
+                (".fcpxml", fcpxml_id),
+            ],
+        )
+        (
+            copy["review_mp4"],
+            copy["handoff_notes"],
+            copy["fusion_manifest"],
+            copy["fcpxml"],
+        ) = copy.pop("files")
+    else:
+        copy = copy_out(
+            ctx,
+            project,
+            timeline,
+            round_,
+            [(".review.mp4", review_mp4), (NOTES_SUFFIX, notes_id), (".fcpxml", fcpxml_id)],
+        )
+        copy["review_mp4"], copy["handoff_notes"], copy["fcpxml"] = copy.pop("files")
+    outputs: dict[str, Any] = {
+        "desktop_return": {
+            "directory": str(return_dir),
+            "request": {
+                "recipe_node": ctx.recipe_node,
+                "round": round_,
+                "plan_sha256": _need(ctx, "cut", "plan_sha256"),
+                "media_map": params.media_map,
+                "timeline": timeline,
             },
-            "fcpxml": fcpxml_id,
-            "export_report": report_id,
-            "handoff_notes": notes_id,
-            # Shown to the reviewer on the gate's review card (the engine's review_attachments).
-            "review_attachments": [notes_id],
-            "assets": [m.get("src") for m in result.report.get("media", [])][:16],
-            "copy": copy,
         },
-        artifact_ids=(fcpxml_id, report_id, notes_id),
-    )
+        "fcpxml": fcpxml_id,
+        "export_report": report_id,
+        "handoff_notes": notes_id,
+        # Shown to the reviewer on the gate's review card (the engine's review_attachments).
+        "review_attachments": [notes_id],
+        "assets": [m.get("src") for m in result.report.get("media", [])][:16],
+        "copy": copy,
+    }
+    artifacts: tuple[str, ...] = (fcpxml_id, report_id, notes_id)
+    if fusion_id is not None:
+        outputs["fusion_manifest"] = fusion_id
+        artifacts = (fcpxml_id, report_id, notes_id, fusion_id)
+    return StepOutput(outputs=outputs, artifact_ids=artifacts)
 
 
 __all__ = [

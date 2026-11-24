@@ -72,6 +72,17 @@ SCAN_STDOUT_LIMIT = 64 * 1024 * 1024
 TIMING_TIMEOUT_S = 30.0
 
 
+def pix_fmt_has_alpha(pix_fmt: str | None) -> bool:
+    """Whether an ffmpeg pixel format carries an alpha channel."""
+    if not pix_fmt:
+        return False
+    p = pix_fmt.lower()
+    return (
+        p.startswith(("yuva", "rgba", "bgra", "argb", "abgr", "gbrap", "ya8", "ya16", "ayuv"))
+        or p == "pal8"
+    )
+
+
 @dataclass(frozen=True)
 class HubSource:
     """One source's hub file and what ffprobe says about it."""
@@ -100,6 +111,8 @@ class HubSource:
     sample_rate: int | None = None
     #: The video stream's time base: a picture is cut by timestamps in these ticks.
     video_time_base: Fraction | None = None
+    #: Whether the source video stream carries an alpha channel (e.g. ProRes 4444, qtrle, PNG).
+    has_alpha: bool = False
 
     @property
     def video_offset_s(self) -> Fraction:
@@ -551,6 +564,7 @@ def resolve_source(
         audio_start_s=timing.audio_start_s,
         sample_rate=timing.sample_rate or (None if audio is None else audio.sample_rate),
         video_time_base=timing.time_base,
+        has_alpha=pix_fmt_has_alpha(video.pix_fmt),
     )
 
 

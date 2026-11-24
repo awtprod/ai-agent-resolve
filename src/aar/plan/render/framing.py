@@ -328,11 +328,15 @@ def _centred(exact: float, frame: int) -> int:
     return min((n for n in options if (frame - n) % 2 == 0), key=lambda n: (abs(n - exact), n))
 
 
-def picture_filters(framing: Framing, resolution: Resolution) -> list[str]:
+def picture_filters(
+    framing: Framing, resolution: Resolution, *, preserve_alpha: bool = False
+) -> list[str]:
     """The filters that turn the clip's decoded (display-size) picture into a timeline frame."""
     width, height = resolution.width, resolution.height
     if framing.mode == "scale":
         return [f"scale={width}:{height}"]
+    fmt = "yuva444p" if preserve_alpha else "yuv444p"
+    pad_color = "black@0" if preserve_alpha else "black"
     if framing.mode == "fit":
         assert framing.fitted is not None
         fw, fh = framing.fitted
@@ -341,14 +345,14 @@ def picture_filters(framing: Framing, resolution: Resolution) -> list[str]:
         # an even pixel for the chroma (round 3: 187, not 186).
         return [
             f"scale={fw}:{fh}",
-            "format=yuv444p",
-            f"pad={width}:{height}:{(width - fw) // 2}:{(height - fh) // 2}:black",
+            f"format={fmt}",
+            f"pad={width}:{height}:{(width - fw) // 2}:{(height - fh) // 2}:{pad_color}",
         ]
     plan = framing.window
     assert plan is not None
-    filters = ["format=yuv444p"]
+    filters = [f"format={fmt}"]
     if plan.pad:
-        filters.append(f"pad=iw+{2 * plan.pad}:ih+{2 * plan.pad}:{plan.pad}:{plan.pad}:black")
+        filters.append(f"pad=iw+{2 * plan.pad}:ih+{2 * plan.pad}:{plan.pad}:{plan.pad}:{pad_color}")
     x, y, w, h = plan.box
     filters.append(f"crop={w}:{h}:{x}:{y}:exact=1")
     names = ("x0", "y0", "x1", "y1", "x2", "y2", "x3", "y3")

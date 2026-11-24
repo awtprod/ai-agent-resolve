@@ -8,6 +8,7 @@ from aar import __version__, cli_io
 from aar.analyze import cli as analyze_cli
 from aar.deliver import cli as deliver_cli
 from aar.drp import cli as drp_cli
+from aar.fusion import cli as fusion_cli
 from aar.host import cli as host_cli
 from aar.hub import cli as hub_cli
 from aar.node import cli as node_cli
@@ -29,6 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     groups = parser.add_subparsers(dest="group", metavar="GROUP")
     plan_cli.register(groups)
     drp_cli.register(groups)
+    fusion_cli.register(groups)
     hub_cli.register(groups)
     node_cli.register(groups)
     qa_cli.register(groups)

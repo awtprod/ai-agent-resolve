@@ -27,6 +27,7 @@ import itertools
 import math
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
+from pathlib import Path
 from typing import Any
 
 from aar.plan.export.fcpxml import (
@@ -479,7 +480,14 @@ class _Check:
             for t in self.dec.titles
         )
         want_titles = sorted(
-            (t.lane, t.record_in, t.record_out, "\n".join(t.lines), t.name, BASIC_TITLE)
+            (
+                t.lane,
+                t.record_in,
+                t.record_out,
+                "\n".join(t.placeholder_lines),
+                t.name,
+                BASIC_TITLE,
+            )
             for t in self.layout.titles
         )
         self.want(got_titles == want_titles, f"titles {got_titles} != {want_titles}")
@@ -553,14 +561,42 @@ class _Check:
                 f"the asset for {asset.src} starts at frame {asset.start}, not its media's start "
                 f"timecode {start} (Source.start_timecode)",
             )
+
+        def _expected_title_lines(
+            lines: list[str],
+            inputs: dict[str, Any],
+            template: str | None,
+            setting: str | None,
+        ) -> tuple[str, ...]:
+            if lines:
+                return tuple(lines)
+            str_vals = tuple(v for v in inputs.values() if isinstance(v, str) and v.strip())
+            if str_vals:
+                return str_vals
+            fallback = template or (Path(setting).stem if setting else "Fusion Graphic")
+            return (fallback,)
+
         got = {(t.record_in, t.record_in + t.frames, "\n".join(t.lines)) for t in self.dec.titles}
         wanted = [
-            (f"titles[{i}]", t.record_in, t.record_out, t.lines) for i, t in enumerate(plan.titles)
+            (
+                f"titles[{i}]",
+                t.record_in,
+                t.record_out,
+                _expected_title_lines(t.lines, t.inputs, t.template, t.setting),
+            )
+            for i, t in enumerate(plan.titles)
         ]
         if plan.outro is not None and plan.outro.sting is not None:
             sting = plan.outro.sting
             start = plan.content_frames() + sting.start
-            wanted.append(("outro.sting", start, start + sting.frames, sting.lines))
+            wanted.append(
+                (
+                    "outro.sting",
+                    start,
+                    start + sting.frames,
+                    _expected_title_lines(sting.lines, sting.inputs, sting.template, sting.setting),
+                )
+            )
         for location, record_in, record_out, lines in wanted:
             self.want(
                 (record_in, record_out, "\n".join(lines)) in got,

@@ -34,8 +34,8 @@ def _problems(env: CcnEnv, params: dict[str, Any]) -> list[str]:
     ]
 
 
-def _files(env: CcnEnv, count: int) -> list[Path]:
-    paths = [env.media / f"cam-a_C{n + 1:03d}.mov" for n in range(count)]
+def _files(env: CcnEnv, count: int, name: str = "cam-a") -> list[Path]:
+    paths = [env.media / f"{name}_C{n + 1:03d}.mov" for n in range(count)]
     for path in paths:
         path.write_bytes(b"x")
     return paths
@@ -88,6 +88,22 @@ def test_params_take_a_reference_camera_of_parts_and_count_cameras(ccn_env: CcnE
     for case, expected in cases:
         problems = _problems(env, case)
         assert problems and any(expected in p for p in problems), (expected, problems)
+
+
+def test_extra_sources_are_never_parts_and_share_the_cap(ccn_env: CcnEnv) -> None:
+    env = ccn_env
+    a1, a2, gfx = _files(env, 3)
+    params = _labelled(env, [a1, a2], [("A", 1), ("A", 2)])
+    params["extra_sources"] = [{"path": str(gfx), "id": "gfx-1"}]
+    assert _problems(env, params) == []
+    parsed = CcnLongformParams.model_validate(params)
+    assert parsed.cameras() == 1 and parsed.reference_parts() == 2
+    params["extra_sources"][0]["part"] = 3
+    assert any("only a camera's files" in p for p in _problems(env, params))
+    many = _files(env, MAX_SOURCES, "big")
+    params = _labelled(env, many[:40], [("A", n + 1) for n in range(40)])
+    params["extra_sources"] = [{"path": str(p)} for p in many[40:]] + [{"path": str(gfx)}]
+    assert any("at most 48 files" in p for p in _problems(env, params))
 
 
 def test_the_source_cap_fits_three_cameras_of_fifteen_files(ccn_env: CcnEnv) -> None:

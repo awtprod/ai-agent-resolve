@@ -43,6 +43,7 @@ CODES = frozenset(
         "title_template_missing",
         "title_template_ambiguous",
         "media_not_on_edit_pc",
+        "setting_not_on_edit_pc",
         "outro_audio_track_missing",
         "end_fade_without_audio",
         "unknown_op",
