@@ -634,6 +634,8 @@ class FakeFusionComp:
         return {"COMPS_Name": self.Name}
 
     def GetData(self, key: str | None = None) -> Any:
+        if "GetData:raise" in self._app.faults:
+            raise RuntimeError("GetData failed")
         if key is None:
             return dict(self.data)
         return self.data.get(key)

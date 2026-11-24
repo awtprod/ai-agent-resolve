@@ -660,3 +660,72 @@ def test_title_place_setting_durability_activation_and_posix_case() -> None:
     show3.fake.faults.add("LoadFusionCompByName:fail")
     err_act_retry = show3.fails("title.place", params3)
     assert err_act_retry.code == "title_setting_not_loaded"
+
+
+def test_title_place_setting_retry_getdata_failure_does_not_import_duplicate() -> None:
+    """A transient GetData exception during retry must surface title_setting_not_loaded without
+    calling ImportFusionComp or appending a duplicate composition.
+    """
+    show, tpl = _macro_show()
+    show.fake.faults.add("ImportFusionComp:append")
+    params = {
+        "timeline": show.ref("Main"),
+        "titles": [
+            {
+                "template": {"unique_id": tpl},
+                "track": 2,
+                "record_in": 0,
+                "record_out": 24,
+                "setting": "D:\\Templates\\LowerThird.setting",
+                "inputs": {"Input1": "Alice"},
+            }
+        ],
+    }
+
+    first = show.ok("title.place", params)
+    assert first.titles[0].status == "placed"
+    item = show.main.GetItemListInTrack("video", 2)[0]
+    assert item.GetFusionCompCount() == 2
+    imports_before = sum(1 for c in show.fake.calls if c[0] == "ImportFusionComp")
+    assert imports_before == 1
+
+    show.fake.faults.add("GetData:raise")
+    err = show.fails("title.place", params)
+    assert err.code == "title_setting_not_loaded"
+    assert item.GetFusionCompCount() == 2
+    assert sum(1 for c in show.fake.calls if c[0] == "ImportFusionComp") == imports_before
+
+
+def test_activate_fusion_comp_uses_comp_index_for_fresh_proxy_handles() -> None:
+    """When comp_index is supplied, activation resolves the name from GetFusionCompNameList at that
+    index even if GetFusionCompByIndex returns a new wrapper object each call.
+    """
+    from aar.fusion.apply import activate_fusion_comp
+
+    class _ProxyComp:
+        def __init__(self, name: str) -> None:
+            self.Name = name
+
+    class _FreshProxyItem:
+        def __init__(self) -> None:
+            self.loaded: list[str] = []
+
+        def GetFusionCompCount(self) -> int:
+            return 2
+
+        def GetFusionCompByIndex(self, idx: int) -> _ProxyComp:
+            # Return a brand-new wrapper proxy each time so `is` identity never matches.
+            return _ProxyComp(f"InternalComp{idx}")
+
+        def GetFusionCompNameList(self) -> list[str]:
+            return ["Composition 1", "Listed LowerThird"]
+
+        def LoadFusionCompByName(self, name: str) -> _ProxyComp | None:
+            if name == "Listed LowerThird":
+                self.loaded.append(name)
+                return _ProxyComp("InternalComp2")
+            return None
+
+    item = _FreshProxyItem()
+    activate_fusion_comp(item, _ProxyComp("InternalComp2"), comp_index=2)
+    assert item.loaded == ["Listed LowerThird"]

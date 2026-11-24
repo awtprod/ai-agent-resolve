@@ -38,7 +38,7 @@ from pydantic import AfterValidator, Field, model_validator
 
 from aar.fusion.apply import (
     activate_fusion_comp,
-    find_loaded_setting_comp,
+    find_loaded_setting_comp_with_index,
     find_tool_by_name,
     record_loaded_setting,
     resolve_tool_input_id,
@@ -1483,10 +1483,21 @@ def _select_title_comp(item: Any, spec: TitleSpec, *, uid: str, reused: bool) ->
         return comp, False
 
     if reused:
-        existing = find_loaded_setting_comp(item, spec.setting)
-        if existing is not None:
+        try:
+            found = find_loaded_setting_comp_with_index(item, spec.setting)
+        except FusionError as exc:
+            raise OpError(
+                "title_setting_not_loaded",
+                f"title item {uid} could not inspect loaded Fusion setting {spec.setting!r}: "
+                f"{exc.message}",
+                "verify the composition's Fusion data is readable in Resolve before retrying",
+                item_id=uid,
+                setting=spec.setting,
+            ) from None
+        if found is not None:
+            existing, existing_idx = found
             try:
-                activate_fusion_comp(item, existing)
+                activate_fusion_comp(item, existing, comp_index=existing_idx)
             except FusionError as exc:
                 raise OpError(
                     "title_setting_not_loaded",
@@ -1500,6 +1511,7 @@ def _select_title_comp(item: Any, spec: TitleSpec, *, uid: str, reused: bool) ->
             return existing, False
 
     comp: Any = None
+    comp_index: int | None = None
     loaded_setting = False
     import_comp = getattr(item, "ImportFusionComp", None)
     if callable(import_comp):
@@ -1507,11 +1519,16 @@ def _select_title_comp(item: Any, spec: TitleSpec, *, uid: str, reused: bool) ->
         if imported is not None and not isinstance(imported, bool):
             comp = imported
             loaded_setting = True
+            after_count = int(comp_count_fn()) if callable(comp_count_fn) else comp_count
+            if after_count > comp_count:
+                comp_index = after_count
+            comp_count = after_count
         elif imported is True:
             after_count = int(comp_count_fn()) if callable(comp_count_fn) else comp_count
             if after_count > comp_count:
                 comp = item.GetFusionCompByIndex(after_count)
                 if comp is not None:
+                    comp_index = after_count
                     loaded_setting = True
             comp_count = after_count
 
@@ -1529,6 +1546,8 @@ def _select_title_comp(item: Any, spec: TitleSpec, *, uid: str, reused: bool) ->
                     comp_count=comp_count,
                 )
             comp = item.GetFusionCompByIndex(1)
+            if comp is not None:
+                comp_index = 1
         if comp is None:
             raise OpError(
                 "title_has_no_comp",
@@ -1553,7 +1572,7 @@ def _select_title_comp(item: Any, spec: TitleSpec, *, uid: str, reused: bool) ->
     try:
         # [I] Verify SetData/GetData durability and multi-comp activation via LoadFusionCompByName.
         record_loaded_setting(comp, spec.setting)
-        activate_fusion_comp(item, comp)
+        activate_fusion_comp(item, comp, comp_index=comp_index)
     except FusionError as exc:
         raise OpError(
             "title_setting_not_loaded",

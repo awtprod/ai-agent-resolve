@@ -10,7 +10,6 @@ programmatic callers).
 
 from __future__ import annotations
 
-import contextlib
 import json
 import posixpath
 from collections.abc import Mapping, Sequence
@@ -27,6 +26,7 @@ __all__ = [
     "activate_fusion_comp",
     "apply_fusion_inputs_to_item",
     "find_loaded_setting_comp",
+    "find_loaded_setting_comp_with_index",
     "find_tool_by_name",
     "iter_comp_tools",
     "load_fusion_manifest",
@@ -288,13 +288,22 @@ def record_loaded_setting(comp: Any, setting_path: str) -> None:
 
 
 def _comp_active_setting(comp: Any) -> str | None:
-    """Return the active canonical setting path recorded on ``comp``, if any."""
+    """Return the active canonical setting path recorded on ``comp``, if any.
+
+    Raises :class:`FusionError` (``apply_failed``) if ``GetData`` raises so callers abort instead
+    of treating a transient lookup failure as a cache miss and importing a duplicate composition.
+    """
     get_data = getattr(comp, "GetData", None)
     if callable(get_data):
-        with contextlib.suppress(Exception):
+        try:
             val = get_data(_SETTING_DATA_KEY)
-            if isinstance(val, str) and val.strip():
-                return _norm_setting_path(val)
+        except Exception as exc:
+            raise FusionError(
+                "apply_failed",
+                f"failed to read setting identity via GetData({_SETTING_DATA_KEY!r}): {exc}",
+            ) from exc
+        if isinstance(val, str) and val.strip():
+            return _norm_setting_path(val)
     single = getattr(comp, "setting_path", None)
     if isinstance(single, str) and single.strip():
         return _norm_setting_path(single)
@@ -336,8 +345,12 @@ def _listed_comp_names(item: Any) -> dict[int, str]:
     return listed_names
 
 
-def activate_fusion_comp(item: Any, comp: Any) -> None:
+def activate_fusion_comp(item: Any, comp: Any, *, comp_index: int | None = None) -> None:
     """Activate ``comp`` on ``item`` via ``LoadFusionCompByName``.
+
+    When ``comp_index`` (1-based) is supplied, its listed name from ``GetFusionCompNameList`` is
+    preferred over Python object identity matching (``GetFusionCompByIndex(idx) is comp``), which
+    may fail when Resolve's Python API returns fresh wrapper proxies per call.
 
     [I] When ``item`` carries multiple Fusion compositions, ``LoadFusionCompByName`` must succeed
     (return a truthy handle without raising) so Resolve plays the edited composition rather than
@@ -360,10 +373,13 @@ def activate_fusion_comp(item: Any, comp: Any) -> None:
 
     listed = _listed_comp_names(item)
     cname = ""
-    for idx in range(1, comp_count + 1):
-        if item.GetFusionCompByIndex(idx) is comp:
-            cname = _comp_name(comp, listed.get(idx))
-            break
+    if comp_index is not None and comp_index in listed:
+        cname = _comp_name(comp, listed.get(comp_index))
+    if not cname:
+        for idx in range(1, comp_count + 1):
+            if item.GetFusionCompByIndex(idx) is comp:
+                cname = _comp_name(comp, listed.get(idx))
+                break
     if not cname:
         cname = _comp_name(comp)
     if not cname:
@@ -398,9 +414,12 @@ def activate_fusion_comp(item: Any, comp: Any) -> None:
         )
 
 
-def find_loaded_setting_comp(item: Any, setting_path: str) -> Any | None:
-    """Return an existing Fusion comp on ``item`` whose recorded canonical setting path equals
-    ``setting_path``, or ``None`` if no comp carries that exact identity.
+def find_loaded_setting_comp_with_index(item: Any, setting_path: str) -> tuple[Any, int] | None:
+    """Return ``(comp, comp_index)`` (1-based) for an existing Fusion comp on ``item`` whose
+    recorded canonical setting path equals ``setting_path``, or ``None`` if no comp matches.
+
+    Propagates :class:`FusionError` (``apply_failed``) if ``GetData`` fails while inspecting a
+    composition.
     """
     comp_count_fn = getattr(item, "GetFusionCompCount", None)
     comp_count = int(comp_count_fn()) if callable(comp_count_fn) else 0
@@ -416,8 +435,16 @@ def find_loaded_setting_comp(item: Any, setting_path: str) -> Any | None:
             continue
         active = _comp_active_setting(comp)
         if active is not None and active == target_norm:
-            return comp
+            return comp, idx
     return None
+
+
+def find_loaded_setting_comp(item: Any, setting_path: str) -> Any | None:
+    """Return an existing Fusion comp on ``item`` whose recorded canonical setting path equals
+    ``setting_path``, or ``None`` if no comp carries that exact identity.
+    """
+    found = find_loaded_setting_comp_with_index(item, setting_path)
+    return found[0] if found is not None else None
 
 
 def _set_and_verify(tool: Any, key: str, value: Any) -> Any:
@@ -463,6 +490,7 @@ def apply_fusion_inputs_to_item(
     """
     loaded_setting: str | None = None
     comp: Any = None
+    comp_index: int | None = None
     comp_count_fn = getattr(item, "GetFusionCompCount", None)
     comp_count = int(comp_count_fn()) if callable(comp_count_fn) else 0
 
@@ -475,21 +503,30 @@ def apply_fusion_inputs_to_item(
             if imported is not None and not isinstance(imported, bool):
                 comp = imported
                 loaded_setting = str(setting_path)
+                after_count = int(comp_count_fn()) if callable(comp_count_fn) else comp_count
+                if after_count > comp_count:
+                    comp_index = after_count
+                comp_count = after_count
             elif imported is True:
                 after_count = int(comp_count_fn()) if callable(comp_count_fn) else comp_count
                 if after_count > comp_count:
                     comp = item.GetFusionCompByIndex(after_count)
                     if comp is not None:
+                        comp_index = after_count
                         loaded_setting = str(setting_path)
                 comp_count = after_count
 
         if loaded_setting is None:
             if comp is None and comp_count == 1:
                 comp = item.GetFusionCompByIndex(1)
+                if comp is not None:
+                    comp_index = 1
             elif comp is None and comp_count == 0:
                 add_comp = getattr(item, "AddFusionComp", None)
                 if callable(add_comp):
                     comp = add_comp()
+                    if comp is not None:
+                        comp_index = 1
             if comp is not None:
                 load_settings = getattr(comp, "LoadSettings", None)
                 if callable(load_settings) and load_settings(str(setting_path)):
@@ -501,7 +538,7 @@ def apply_fusion_inputs_to_item(
                 f"could not load Fusion .setting {setting_path} onto timeline item",
             )
         record_loaded_setting(comp, loaded_setting)
-        activate_fusion_comp(item, comp)
+        activate_fusion_comp(item, comp, comp_index=comp_index)
     else:
         if comp_count < 1:
             raise FusionError("apply_failed", "timeline item has no Fusion composition")
