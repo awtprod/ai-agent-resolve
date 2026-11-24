@@ -22,13 +22,29 @@ opt-out), ``timecode_ambiguous`` (the media's timecode rate cannot be told),
 ``duplicate_source_id``, ``duplicate_media`` (one file twice, directly or through a symlink),
 ``resolution_required`` (a short with no resolution), ``bad_base`` and
 ``invalid_stub``.
+
+**A camera of several files (S24a).** Sources that share a camera label and give ``part`` 1..n
+are one camera's consecutive files (a camera that splits its recording, or an operator who
+stopped and started). The reference camera (the camera of the first source) may have parts:
+they go first in the stub, in part order, with ids ``cam-<label>-p<n>``, and each part's
+``recording_origin`` is placed on the recording clock by ``placement``: ``timecode`` (the default
+when every part's start timecode was read: the part's start timecode less the first part's, a
+midnight wrap counted as the next day) or ``contiguous`` (each part starts where the previous
+one ends; the default without timecodes). Refusals: ``bad_parts`` (a part without a camera
+label, a label repeated without parts, part numbers that are not 1..n), ``parts_unsupported``
+(another camera of several files: S24b), ``parts_overlap`` (a part starts more than
+:data:`PART_OVERLAP_FRAMES` before the previous one ends), ``parts_out_of_order`` (a part's
+timecode is before the previous part's, and not a midnight wrap) and ``parts_rate`` (a
+timecode counted at another rate than the plan's). Each part's origin, duration, gap to the
+previous part and placement are in the report's ``parts``.
 """
 
 from __future__ import annotations
 
 import contextlib
+import math
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -37,7 +53,8 @@ from typing import Any
 from pydantic import ValidationError
 
 from aar.media import MediaError, probe
-from aar.plan.model import EditPlan, Fps, ShotSize, Source, TargetKind
+from aar.media.probe import DROP_FRAME_RATES
+from aar.plan.model import EditPlan, Fps, PartPlacement, ShotSize, Source, TargetKind
 from aar.plan.produce.build import (
     Probed,
     media_timecode_rate,
@@ -45,13 +62,20 @@ from aar.plan.produce.build import (
     source_start_timecodes,
 )
 from aar.plan.produce.errors import ProduceInputError
+from aar.plan.produce.report import PlannerWarning
 from aar.plan.render.errors import RenderError
 from aar.plan.render.media import resolve_source
 
 #: The keys of a base JSON that pass through into the stub.
 BASE_KEYS = ("template", "head", "outro", "audio_tracks")
-#: At most this many media files in one stub.
-MAX_SOURCES = 16
+#: At most this many media files in one stub (three cameras of about 15 files each).
+MAX_SOURCES = 48
+#: A part may start this many frames before the previous part ends (timecode rounding); more is
+#: an overlap and refused.
+PART_OVERLAP_FRAMES = 2
+#: A part whose timecode is before the previous part's is a midnight wrap when the wrapped gap
+#: is at most this long; otherwise it is out of order.
+WRAP_MAX_GAP_S = 12 * 3600
 
 CODES = frozenset(
     {
@@ -67,6 +91,11 @@ CODES = frozenset(
         "resolution_required",
         "bad_base",
         "invalid_stub",
+        "bad_parts",
+        "parts_unsupported",
+        "parts_overlap",
+        "parts_out_of_order",
+        "parts_rate",
     }
 )
 
@@ -100,6 +129,7 @@ class StubSource:
     camera: str | None = None
     shot_size: ShotSize = "unknown"
     id: str | None = None
+    part: int | None = None
 
 
 @dataclass(frozen=True)
@@ -120,13 +150,18 @@ def _cameras(sources: Sequence[StubSource]) -> list[str]:
     return [source.camera or chr(ord("A") + n) for n, source in enumerate(sources)]
 
 
-def _source_ids(sources: Sequence[StubSource], cameras: Sequence[str]) -> list[str]:
+def _source_ids(
+    sources: Sequence[StubSource], cameras: Sequence[str], parted: Collection[str] = ()
+) -> list[str]:
+    """Each source's id: its own, else ``cam-<label>``, with ``-p<n>`` for a part of a camera of
+    several files (``parted``)."""
     ids: list[str] = []
     for source, camera in zip(sources, cameras, strict=True):
         if source.id:
             ids.append(source.id)
         else:
-            ids.append("cam-" + "".join(c if c.isalnum() else "-" for c in camera.lower()))
+            sid = "cam-" + "".join(c if c.isalnum() else "-" for c in camera.lower())
+            ids.append(f"{sid}-p{source.part}" if camera in parted else sid)
     seen: set[str] = set()
     for sid in ids:
         if sid in seen:
@@ -280,6 +315,138 @@ def _base_parts(base: Mapping[str, Any] | None) -> tuple[dict[str, Any], list[An
     return kept, extra, ignored
 
 
+def _parts(sources: Sequence[StubSource], cameras: Sequence[str]) -> dict[str, list[int]]:
+    """The cameras of several files (labels with ``part`` 1..n), each with its sources' indexes
+    in part order; a :class:`StubError` for parts that are not well formed (module docstring)."""
+    groups: dict[str, list[int]] = {}
+    for n, (source, camera) in enumerate(zip(sources, cameras, strict=True)):
+        if source.part is not None and not source.camera:
+            raise StubError(
+                "bad_parts",
+                f"media file {n} gives part {source.part} but no camera label",
+                "give every part its camera's label, the same for all of that camera's files",
+            )
+        groups.setdefault(camera, []).append(n)
+    parted: dict[str, list[int]] = {}
+    for camera, members in groups.items():
+        numbers = [sources[n].part for n in members]
+        if all(number is None for number in numbers):
+            if len(members) > 1:
+                raise StubError(
+                    "bad_parts",
+                    f"camera {camera!r} is given {len(members)} times without part numbers",
+                    "give each file of one camera its part (1, 2, ...), or each camera its own "
+                    "label",
+                    camera=camera,
+                )
+            continue
+        if any(number is None for number in numbers) or sorted(numbers) != list(  # type: ignore[type-var]
+            range(1, len(members) + 1)
+        ):
+            raise StubError(
+                "bad_parts",
+                f"camera {camera!r} has parts {numbers}; its files must be parts 1 to "
+                f"{len(members)}, each once",
+                "number a camera's files 1, 2, ... in the order the camera wrote them",
+                camera=camera,
+            )
+        if len(members) > 1:
+            parted[camera] = sorted(members, key=lambda n: sources[n].part or 0)
+    reference = cameras[0]
+    others = sorted(set(parted) - {reference})
+    if others:
+        raise StubError(
+            "parts_unsupported",
+            f"camera {others[0]!r} is several files; only the reference camera (the first "
+            f"source's, {reference!r}) may be several files for now",
+            "give that camera as one file, or leave it out (other cameras of several files, "
+            "placed by audio sync, are slice S24b)",
+            camera=others[0],
+        )
+    return parted
+
+
+def _day_frames(rate: Fraction, drop_frame: bool) -> int:
+    """The frames between two midnights at ``rate``: the timecode labels of one day."""
+    nominal = round(rate)
+    if drop_frame and rate in DROP_FRAME_RATES:
+        skip = nominal // 15
+        return 86400 * nominal - skip * (1440 - 144)
+    return 86400 * nominal
+
+
+def place_parts(
+    parts: Sequence[dict[str, Any]],
+    timecodes: Mapping[str, Any],
+    fps: Fraction,
+    method: PartPlacement,
+) -> list[dict[str, Any]]:
+    """Set each part's ``recording_origin`` (frames; the first part at 0) in the stub source
+    entries ``parts`` (in part order) by ``method``, and return what was placed per part: its
+    origin, duration, gap to the previous part (frames, negative for a small overlap) and the
+    method. ``timecodes`` maps a source id to its :class:`StartTimecode`."""
+    placed: list[dict[str, Any]] = []
+    first: int | None = None
+    day = wraps = 0
+    start = end = 0  # where the previous part starts and ends, in recording frames
+    wrap_max = math.ceil(WRAP_MAX_GAP_S * fps)
+    for number, entry in enumerate(parts):
+        sid = entry["id"]
+        prev = parts[number - 1]["id"] if number else None
+        if method == "contiguous":
+            origin = end
+        else:
+            found = timecodes[sid]
+            rate = found.rate or fps
+            if rate != fps:
+                raise StubError(
+                    "parts_rate",
+                    f"part {sid!r}: its start timecode counts at {_rate_text(rate)} fps, the "
+                    f"plan runs at {_rate_text(fps)}; its place cannot be read from it",
+                    "give the camera's placement as contiguous",
+                    source=sid,
+                )
+            if first is None:
+                first, day = found.frames, _day_frames(rate, bool(found.drop_frame))
+            origin = found.frames - first + wraps * day
+            if number and origin < start:  # the timecode went back: midnight, or misordered
+                if origin + day - end > wrap_max:
+                    raise StubError(
+                        "parts_out_of_order",
+                        f"part {sid!r} starts at timecode frame {found.frames}, before part "
+                        f"{prev!r} (frame {timecodes[prev].frames})",
+                        "number the parts in the order the camera wrote them (their timecodes "
+                        "rise), or give the placement as contiguous",
+                        sources=[prev, sid],
+                    )
+                wraps += 1
+                origin += day
+            if number and origin < end - PART_OVERLAP_FRAMES:
+                raise StubError(
+                    "parts_overlap",
+                    f"part {sid!r} starts {end - origin} frame(s) before part {prev!r} ends: "
+                    "by their timecodes the two files overlap",
+                    "check the files are one camera's consecutive parts; or give the "
+                    "placement as contiguous",
+                    sources=[prev, sid],
+                    overlap_frames=end - origin,
+                )
+        entry["recording_origin"] = origin
+        entry["part_placement"] = method
+        placed.append(
+            {
+                "id": sid,
+                "part": entry["part"],
+                "recording_origin": origin,
+                "duration": entry["duration"],
+                "gap_frames": origin - end if number else 0,
+                "placement": method,
+            }
+        )
+        start, end = origin, origin + entry["duration"]
+    return placed
+
+
 def build_stub(
     sources: Sequence[StubSource],
     *,
@@ -291,15 +458,19 @@ def build_stub(
     resolution: tuple[int, int] | None = None,
     base: Mapping[str, Any] | None = None,
     allow_unknown_timecode: bool = False,
+    placement: Mapping[str, PartPlacement] | None = None,
     extra_sources: Sequence[StubSource] = (),
 ) -> StubResult:
     """Build a plan stub from hub media files (module docstring); a :class:`StubError` on refusal.
 
     Every source in ``sources`` belongs to ``recording_id`` at origin 0 (``aar analyze sync`` sets
-    the others' origins in ``aar plan produce --sync``). A source without a camera label gets A,
-    B, C... by position, and without an id ``cam-<label>``. Optional ``extra_sources`` (intros,
-    outros, alpha graphic ``.mov`` overlays) are probed at the same frame rate, may omit audio,
-    and have no ``recording_id`` (so audio sync skips them). The plan runs at the first source's
+    the others' origins in ``aar plan produce --sync``), except the parts of a reference camera
+    of several files, which are placed by ``placement`` (camera label -> ``timecode`` or
+    ``contiguous``; module docstring). A source without a camera label gets A, B, C... by
+    position, and without an id ``cam-<label>`` (``cam-<label>-p<n>`` for a part). Optional
+    ``extra_sources`` (intros, outros, alpha graphic ``.mov`` overlays) are probed at the same
+    frame rate, may omit audio, have no ``recording_id`` (so audio sync skips them) and are never
+    parts. The plan runs at the first source's
     rate; the resolution defaults to its display size for a long-form."""
     if not sources:
         raise StubError("invalid_stub", "give at least one media file", "pass a media path")
@@ -311,7 +482,27 @@ def build_stub(
             "split the show",
         )
     cameras = _cameras(sources)
-    cam_ids = _source_ids(sources, cameras)
+    parted = _parts(sources, cameras)
+    for camera in placement or {}:
+        if camera not in parted:
+            raise StubError(
+                "bad_parts",
+                f"a placement is given for camera {camera!r}, which is not several files",
+                "give a placement only for a camera whose files have parts",
+                camera=camera,
+            )
+    ref_parts = parted.get(cameras[0], [])
+    order = [*ref_parts, *(n for n in range(len(sources)) if n not in ref_parts)]
+    sources = [sources[n] for n in order]
+    cameras = [cameras[n] for n in order]
+    for n, source in enumerate(extra_sources):
+        if source.part is not None:
+            raise StubError(
+                "bad_parts",
+                f"extra source {n} gives part {source.part}; only a camera's files have parts",
+                "leave part out of extra sources (graphics, intros, outros)",
+            )
+    cam_ids = _source_ids(sources, cameras, parted)
     extra_ids: list[str] = []
     seen_ids = set(cam_ids)
     for n, source in enumerate(extra_sources):
@@ -426,13 +617,44 @@ def build_stub(
             "export's --allow-unknown-timecode)",
             sources=missing,
         )
-    report_sources = []
     for entry in stub_sources:
         found = timecodes.get(entry["id"])
         if found is not None:
             rate = found.rate or fps
             entry["start_timecode"] = found.frames
             entry["start_timecode_rate"] = {"num": rate.numerator, "den": rate.denominator}
+    parts: list[dict[str, Any]] = []
+    method: PartPlacement | None = None
+    if ref_parts:
+        entries = stub_sources[: len(ref_parts)]
+        unread = [e["id"] for e in entries if e["id"] not in timecodes]
+        method = (placement or {}).get(cameras[0])
+        if method == "timecode" and unread:
+            raise StubError(
+                "timecode_unknown",
+                f"camera {cameras[0]!r} is placed by timecode, but no start timecode could be "
+                "read for " + ", ".join(repr(s) for s in unread),
+                "give the camera's placement as contiguous",
+                sources=unread,
+            )
+        if method is None:
+            method = "contiguous" if unread else "timecode"
+            if unread:
+                warnings.append(
+                    PlannerWarning(
+                        code="parts-contiguous",
+                        message=f"camera {cameras[0]!r}: no start timecode for "
+                        + ", ".join(repr(s) for s in unread)
+                        + ", so its parts are placed one after another, with no gaps",
+                        hint="check the files with aar media timecode FILE",
+                    )
+                )
+        for entry, source in zip(entries, sources, strict=False):
+            entry["part"] = source.part
+        parts = place_parts(entries, timecodes, fps, method)
+    report_sources = []
+    for entry in stub_sources:
+        found = timecodes.get(entry["id"])
         report_sources.append(
             {
                 "id": entry["id"],
@@ -441,6 +663,8 @@ def build_stub(
                 "duration": entry["duration"],
                 "frame_size": entry["frame_size"],
                 "start_timecode": None if found is None else found.to_dict(fps),
+                "part": entry.get("part"),
+                "recording_origin": entry.get("recording_origin", 0),
             }
         )
     plan = _validated(data)
@@ -449,6 +673,10 @@ def build_stub(
         "resolution": f"{resolution[0]}x{resolution[1]}",
         "recording_id": recording_id,
         "sources": report_sources,
+        "cameras": list(dict.fromkeys(cameras)),
+        "reference_camera": cameras[0],
+        "parts": parts,
+        "part_placement": method,
         "unknown_timecode": missing,
         "base_keys": sorted(kept),
         "base_ignored": ignored,
@@ -475,9 +703,12 @@ def _validated(data: dict[str, Any]) -> EditPlan:
 __all__ = [
     "BASE_KEYS",
     "CODES",
+    "MAX_SOURCES",
+    "PART_OVERLAP_FRAMES",
     "StubError",
     "StubResult",
     "StubSource",
     "build_stub",
     "first_duplicate",
+    "place_parts",
 ]

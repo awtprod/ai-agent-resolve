@@ -86,7 +86,17 @@ QA_NOT_REQUIRED = {
     "caption-coverage": "a long-form plan has no captions",
 }
 #: The plan source fields that must equal the stub's (produce copies them from the stub).
-SOURCE_FIELDS = ("media", "recording_id", "frame_size", "start_timecode", "start_timecode_rate")
+SOURCE_FIELDS = (
+    "media",
+    "recording_id",
+    "frame_size",
+    "start_timecode",
+    "start_timecode_rate",
+    "part",
+    "part_placement",
+)
+#: And, for a part the stub placed (``part_placement``), where it lies on the recording clock.
+PART_FIELDS = ("recording_origin", "duration")
 PLAN_FIELDS = ("fps", "resolution", "kind", "project", "timeline")
 
 LaughsRunner = Callable[..., dict[str, Any]]
@@ -182,7 +192,8 @@ def stub_step(ctx: StepContext) -> StepOutput:
         )
     check_cancelled(ctx)
     sources = [
-        StubSource(s.path, camera=s.camera, shot_size=s.shot_size, id=s.id) for s in params.sources
+        StubSource(s.path, camera=s.camera, shot_size=s.shot_size, id=s.id, part=s.part)
+        for s in params.sources
     ]
     extra_sources = [
         StubSource(s.path, camera=s.camera, shot_size=s.shot_size, id=s.id)
@@ -205,6 +216,7 @@ def stub_step(ctx: StepContext) -> StepOutput:
             kind=params.kind,
             profile=brief.rule_profile,
             allow_unknown_timecode=params.allow_unknown_timecode,
+            placement=params.part_placement,
             extra_sources=extra_sources,
         )
     except StubError as exc:
@@ -213,6 +225,25 @@ def stub_step(ctx: StepContext) -> StepOutput:
     stub_id = ctx.put(text.encode("utf-8"), mime="application/json", meta={"role": "stub"})
     trim = params.pause_trim_on()
     report = result.report
+    # the stub lists the reference camera's parts first: identities go by path, not position
+    every = [*params.sources, *params.extra_sources]
+    by_path = {s.path: identity for s, identity in zip(every, identities, strict=True)}
+    fps = result.plan.fps
+
+    def sec(frames: int) -> float:
+        return round(fps.seconds(frames), 3)
+
+    parts = [
+        {
+            "id": part["id"],
+            "part": part["part"],
+            "start_s": sec(part["recording_origin"]),
+            "end_s": sec(part["recording_origin"] + part["duration"]),
+            "gap_s": sec(part["gap_frames"]),
+            "placement": part["placement"],
+        }
+        for part in report["parts"]
+    ]
     outputs: dict[str, Any] = {
         "stub": stub_id,
         "project": result.plan.project,
@@ -221,17 +252,22 @@ def stub_step(ctx: StepContext) -> StepOutput:
         "resolution": report["resolution"],
         "recording_id": params.recording_id,
         "reference": result.plan.sources[0].id,
-        "cameras": len(params.sources),
+        "cameras": len(report["cameras"]),
+        "camera_labels": report["cameras"],
         "sources": [
             {
                 "id": s["id"],
                 "camera": s["camera"],
                 "duration": s["duration"],
                 "start_timecode": (s["start_timecode"] or {}).get("timecode"),
-                **identity,
+                **({"part": s["part"]} if s["part"] is not None else {}),
+                **by_path[_param_path(params, s["media"])],
             }
-            for s, identity in zip(report["sources"], identities, strict=True)
+            for s in report["sources"]
         ],
+        # the reference camera's files, in recording seconds (none for one file)
+        "parts": parts,
+        "part_placement": report["part_placement"],
         "unknown_timecode": report["unknown_timecode"],
         "pause_trim": "on" if trim else "off",
         "pause_trim_flag": "--pause-trim" if trim else "--no-pause-trim",
@@ -240,6 +276,14 @@ def stub_step(ctx: StepContext) -> StepOutput:
     if params.fusion_templates:
         outputs["fusion_templates"] = list(params.fusion_templates)
     return StepOutput(outputs=outputs, artifact_ids=(stub_id,))
+
+
+def _param_path(params: CcnLongformParams, media: str) -> str:
+    """The params path a stub source's (absolute) media path came from."""
+    for source in [*params.sources, *params.extra_sources]:
+        if source.path == media or os.path.abspath(source.path) == media:
+            return source.path
+    raise StepFailure("stub_invalid_stub", f"the stub names a file not in the params: {media}", "")
 
 
 # -- 2. sync ----------------------------------------------------------------------------------
@@ -253,13 +297,26 @@ def sync_step(ctx: StepContext) -> StepOutput:
         return StepOutput(
             outputs={"synced": False, "report": None, "reason": "one source: nothing to sync"}
         )
+    # The reference camera's other parts are placed by the stub, never synced (S24a): each other
+    # camera syncs against the reference's first file. Several-file other cameras are S24b.
+    reference = media[0]
+    others = [s for s in media[1:] if reference.part is None or s.camera != reference.camera]
+    if not others:
+        return StepOutput(
+            outputs={
+                "synced": False,
+                "report": None,
+                "reason": "one camera: its files are placed by the stub, nothing to sync",
+            }
+        )
     check_cancelled(ctx)
     fps = Fraction(stub.fps.num, stub.fps.den)
-    longest = max((media_seconds(stub, i) or 0.0) for i in range(len(media))) or None
+    index = {s.id: i for i, s in enumerate(stub.sources)}
+    longest = max((media_seconds(stub, index[s.id]) or 0.0) for s in (reference, *others)) or None
     try:
         report = sync_files(
-            media[0].media,
-            [s.media for s in media[1:]],
+            reference.media,
+            [s.media for s in others],
             fps=fps,
             ref_origin=0,
             settings=SyncSettings(timeout_s=library_timeout(ctx, longest)),
@@ -421,7 +478,8 @@ def check_plan(ctx: StepContext) -> tuple[str, EditPlan]:
         if mine is None:
             diffs.append(f"source {source.id!r} is not one of the stub's ({', '.join(known)})")
             continue
-        for name in SOURCE_FIELDS:
+        fields = SOURCE_FIELDS + (PART_FIELDS if mine.part_placement is not None else ())
+        for name in fields:
             got, want = _dump(getattr(source, name)), _dump(getattr(mine, name))
             if got != want:
                 diffs.append(f"source {source.id!r} {name} is {got!r}, the stub's {want!r}")

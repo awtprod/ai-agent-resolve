@@ -32,14 +32,15 @@ from aar.plan.rules.cuts import same_camera
 
 
 def framing_levels(pieces: Sequence[Piece], sources: dict[str, Source], levels: int) -> list[int]:
-    """The framing level of each piece: the next level across a same-camera cut, else 0."""
+    """The framing level of each piece: the next level across a same-camera cut, the same level
+    where one file of a camera ends and its next begins (one shot, S24a), else 0."""
     out: list[int] = []
     for index, piece in enumerate(pieces):
         level = 0
         if index:
             prev = pieces[index - 1]
-            if is_cut(prev, piece) and same_camera(sources[prev.source], sources[piece.source]):
-                level = (out[-1] + 1) % levels
+            if same_camera(sources[prev.source], sources[piece.source]):
+                level = (out[-1] + 1) % levels if is_cut(prev, piece) else out[-1]
         out.append(level)
     return out
 

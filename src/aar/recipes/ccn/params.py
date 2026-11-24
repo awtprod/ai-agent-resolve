@@ -6,6 +6,15 @@ when that is set (resolved with ``realpath``, so a symlink cannot lead out of it
 cover every source, so a run never finds out at the export step that the PC cannot link a clip;
 for the same reason two sources that would be one file on the PC (names that differ only in
 case) are refused here.
+
+**A camera of several files (S24a).** Sources that share a ``camera`` label and give ``part``
+1..n are that camera's consecutive files. Only the reference camera (the first source's) may be
+several files for now: another camera of several files is refused (placing those by audio sync
+against the reference timeline is S24b). ``part_placement`` picks how the reference camera's
+parts are placed on the recording clock (``timecode``, the default when every part's start
+timecode is read, or ``contiguous``); see :mod:`aar.plan.stub`. ``laughs`` is refused for a
+reference camera of several files: the laughs analysis is one paid call per file and its maps
+are not merged yet.
 """
 
 from __future__ import annotations
@@ -23,11 +32,13 @@ from aar.plan.export.media import (
     media_ref,
     windows_collision,
 )
-from aar.plan.model import ShotSize, Source
+from aar.plan.model import PartPlacement, ShotSize, Source
+from aar.plan.stub import MAX_SOURCES as STUB_MAX_SOURCES
 from aar.plan.stub import first_duplicate
 
 MEDIA_ROOT_ENV = "AAR_MEDIA_ROOT"
-MAX_SOURCES = 8
+#: Three cameras of about 15 files each (the stub's own bound).
+MAX_SOURCES = STUB_MAX_SOURCES
 MAX_MAP_ENTRIES = 16
 MAX_PATH = 1024
 
@@ -70,6 +81,8 @@ class SourceParam(BaseModel):
     camera: Camera | None = None
     shot_size: ShotSize = "unknown"
     id: Segment | None = None
+    #: Part N (from 1) of this camera's consecutive files (module docstring).
+    part: int | None = Field(default=None, ge=1, le=MAX_SOURCES)
 
     @field_validator("path")
     @classmethod
@@ -96,6 +109,8 @@ class CcnLongformParams(BaseModel):
     pause_trim: PauseTrim = "auto"
     laughs: bool = False
     allow_unknown_timecode: bool = False
+    #: Camera label -> how its parts are placed; unset: by timecode when every part has one.
+    part_placement: dict[Camera, PartPlacement] = Field(default_factory=dict, max_length=1)
 
     @field_validator("fusion_templates")
     @classmethod
@@ -135,6 +150,70 @@ class CcnLongformParams(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _parts(self) -> CcnLongformParams:
+        total = len(self.sources) + len(self.extra_sources)
+        if total > STUB_MAX_SOURCES:
+            raise ValueError(
+                f"{total} sources and extra_sources; a run holds at most {STUB_MAX_SOURCES} files"
+            )
+        for n, source in enumerate(self.extra_sources):
+            if source.part is not None:
+                raise ValueError(
+                    f"extra_sources[{n}] gives part {source.part}; only a camera's files (in "
+                    "sources) have parts"
+                )
+        groups: dict[str, list[int]] = {}
+        for n, source in enumerate(self.sources):
+            if source.part is not None and source.camera is None:
+                raise ValueError(f"sources[{n}] gives part {source.part} but no camera label")
+            if source.camera is not None:
+                groups.setdefault(source.camera, []).append(n)
+        reference = self.sources[0].camera
+        for camera, members in groups.items():
+            parts = [self.sources[n].part for n in members]
+            if len(members) > 1 and None in parts:
+                raise ValueError(
+                    f"camera {camera!r} is given {len(members)} times (sources {members}); "
+                    "give each file of one camera its part (1, 2, ...), or each camera its own "
+                    "label"
+                )
+            if None not in parts and sorted(parts) != list(range(1, len(members) + 1)):  # type: ignore[type-var]
+                raise ValueError(
+                    f"camera {camera!r} has parts {parts}; its files must be parts 1 to "
+                    f"{len(members)}, each once"
+                )
+            if len(members) > 1 and camera != reference:
+                raise ValueError(
+                    f"camera {camera!r} is several files; only the reference camera (the first "
+                    f"source's, {reference!r}) may be several files for now: give that camera "
+                    "as one file, or leave it out (other cameras of several files, placed by "
+                    "audio sync, are slice S24b)"
+                )
+        for camera in self.part_placement:
+            if len(groups.get(camera, [])) < 2:
+                raise ValueError(
+                    f"part_placement names camera {camera!r}, which is not several files"
+                )
+        if self.laughs and self.reference_parts() > 1:
+            raise ValueError(
+                "laughs is not supported yet for a reference camera of several files (one paid "
+                "analysis per file, and the maps are not merged): set laughs to false"
+            )
+        return self
+
+    def reference_parts(self) -> int:
+        """How many files the reference camera (the first source's) is."""
+        camera = self.sources[0].camera
+        if camera is None:
+            return 1
+        return sum(1 for source in self.sources if source.camera == camera)
+
+    def cameras(self) -> int:
+        """How many cameras the sources are: a camera of several files counts once, and an
+        unlabelled source is a camera of its own."""
+        return len({source.camera or f"#{n}" for n, source in enumerate(self.sources)})
+
+    @model_validator(mode="after")
     def _covered(self) -> CcnLongformParams:
         mapping = media_map_from_mapping(self.media_map)
         all_sources = [*self.sources, *self.extra_sources]
@@ -161,7 +240,8 @@ class CcnLongformParams(BaseModel):
 
     def pause_trim_on(self) -> bool:
         """``auto`` is off for one camera (room audio: trims cut real material, the S19 pilot)
-        and on for several (a board feed)."""
+        and on for several (a board feed). Cameras are counted, not files: one camera of several
+        files is still one camera's room audio."""
         if self.pause_trim == "auto":
-            return len(self.sources) > 1
+            return self.cameras() > 1
         return self.pause_trim == "on"

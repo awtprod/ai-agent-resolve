@@ -14,7 +14,8 @@ Two clocks appear in a plan:
 Versions: a plan says which format it uses in ``version``. Version 2 (the default for a plan
 that does not say) adds the build-from-template fields: ``template``, ``head``, ``outro``,
 ``audio_tracks``, ``end_fade_frames``, ``Source.color``, ``Source.frame_size``,
-``Source.start_timecode``, ``Source.start_timecode_rate`` and ``Segment.transform``.
+``Source.start_timecode``, ``Source.start_timecode_rate``, ``Source.part``,
+``Source.part_placement`` and ``Segment.transform``.
 Everything
 else is the same in both, so every valid version 1 plan is also valid as version 2. A plan that
 says ``"version": 1`` may not use a version 2 field: giving one a value is a validation error
@@ -73,11 +74,21 @@ PlanVersion = Annotated[Literal[1, 2], BeforeValidator(_whole_number_version)]
 
 #: Fields only a version 2 plan may use, per model.
 V2_PLAN_FIELDS = ("template", "head", "outro", "audio_tracks", "end_fade_frames")
-V2_SOURCE_FIELDS = ("color", "frame_size", "start_timecode", "start_timecode_rate")
+V2_SOURCE_FIELDS = (
+    "color",
+    "frame_size",
+    "start_timecode",
+    "start_timecode_rate",
+    "part",
+    "part_placement",
+)
 V2_SEGMENT_FIELDS = ("transform",)
 V2_TITLE_FIELDS = ("setting", "inputs")
 
 ShotSize = Literal["close", "medium", "wide", "unknown"]
+#: How the stub placed a camera's consecutive files (parts) on the recording clock: by each
+#: file's start timecode, or each file starting where the previous one ends.
+PartPlacement = Literal["timecode", "contiguous"]
 TargetKind = Literal["longform", "short"]
 VideoTransitionType = Literal["cut", "dissolve", "dip", "wipe", "push", "other"]
 TitleKind = Literal["title", "lower-third", "graphic"]
@@ -315,6 +326,21 @@ class Source(_Model):
         description="Version 2. The frame rate start_timecode is counted at: the media's own "
         "rate (25 for a 25 fps file at 01:00:00:00 = 90000). Unset means the plan's fps. The "
         "FCPXML export converts the timecode to time with it.",
+    )
+    # Left out of a dump when unset, so a plan without parts hashes and exports as before S24a.
+    part: int | None = Field(
+        default=None,
+        ge=1,
+        exclude_if=lambda value: value is None,
+        description="Version 2. This file is part N (from 1) of its camera's consecutive files: "
+        "one camera label, one recording, several files one after another (S24a).",
+    )
+    part_placement: PartPlacement | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Version 2. How the stub set this part's recording_origin: 'timecode' (its "
+        "start timecode less the first part's) or 'contiguous' (where the previous part ends). "
+        "A sync report never moves such a source.",
     )
 
 
