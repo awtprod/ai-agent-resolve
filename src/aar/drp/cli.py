@@ -11,16 +11,32 @@ import sys
 from typing import TextIO
 
 from aar.drp import diff_cli
-from aar.drp.describe import DEFAULT_MAX_ITEMS, describe, printable
+from aar.drp.describe import DEFAULT_MAX_ITEMS, describe, printable, quote
 from aar.drp.errors import DrpError
-from aar.drp.library import LibraryError, LibraryOptions, list_library
+from aar.drp.library import (
+    CUT_REASONS,
+    DEFAULT_LISTING_SECONDS,
+    SKIP_REASONS,
+    LibraryError,
+    LibraryListing,
+    LibraryOptions,
+    list_library,
+)
 from aar.drp.model import DrpFile
 from aar.drp.reader import read_drp
 
-__all__ = ["EXIT_NOTHING_READ", "EXIT_OK", "EXIT_OUTPUT_ERROR", "EXIT_PIPE_CLOSED", "register"]
+__all__ = [
+    "EXIT_INCOMPLETE",
+    "EXIT_NOTHING_READ",
+    "EXIT_OK",
+    "EXIT_OUTPUT_ERROR",
+    "EXIT_PIPE_CLOSED",
+    "register",
+]
 
 EXIT_OK = 0
 EXIT_NOTHING_READ = 1
+EXIT_INCOMPLETE = 3  # aar drp library: something was skipped, not read, or the search cut short
 EXIT_OUTPUT_ERROR = 74  # EX_IOERR from sysexits.h: stdout is closed, full or failing
 EXIT_PIPE_CLOSED = 141  # 128 + SIGPIPE, what a shell reports for a reader that went away
 
@@ -37,10 +53,13 @@ exit status:
 LIBRARY_WAIT_SECONDS = 5.0
 LIBRARY_EXIT_STATUS_HELP = """\
 exit status:
-  0    every project in the library was read
+  0    every folder was searched and every project in the library was read
   1    the folder is not a library or holds no project, or a project was refused (it is
        listed with the refusal's code, message and fix hint)
   2    usage error
+  3    the listing is incomplete: an entry was skipped (a link, an unreadable folder, a folder
+       too deep), the search was cut short (too many projects or entries, the deadline), or a
+       project was not read (the deadline or the byte budget ran out first); each is listed
   74   the output could not be written (stdout closed, disk full, I/O error)
   141  the output pipe was closed early (for example by `head`)
 """
@@ -92,7 +111,8 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
             "List every project saved in a Resolve disk project library: its folder, "
             "ProjectName, project id, project version, last-modified time and timeline names. "
             "Each Project.db is read from a settled private snapshot; a project that is being "
-            "saved, damaged or not readable is listed with its refusal, never skipped."
+            "saved, damaged or not readable is listed with its refusal, never skipped; every "
+            "folder entry skipped and every project not read is listed with the reason."
         ),
         epilog=LIBRARY_EXIT_STATUS_HELP,
         formatter_class=fmt,
@@ -106,6 +126,14 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         metavar="SECONDS",
         help="how long to wait for a project being saved before listing it as busy "
         f"(default {LIBRARY_WAIT_SECONDS:g})",
+    )
+    lib.add_argument(
+        "--deadline",
+        type=float,
+        default=DEFAULT_LISTING_SECONDS,
+        metavar="SECONDS",
+        help="time limit of the whole listing; projects not reached in time are listed as not "
+        f"read (default {DEFAULT_LISTING_SECONDS:g})",
     )
     lib.set_defaults(func=_library)
 
@@ -240,12 +268,13 @@ def _describe(args: argparse.Namespace) -> int:
 
 
 def _library(args: argparse.Namespace) -> int:
-    if not math.isfinite(args.wait) or args.wait < 0:
-        _warn("aar drp library: --wait must be a number of seconds, 0 or more")
-        return 2
+    for flag, value in (("--wait", args.wait), ("--deadline", args.deadline)):
+        if not math.isfinite(value) or value < 0:
+            _warn(f"aar drp library: {flag} must be a number of seconds, 0 or more")
+            return 2
     options = LibraryOptions(deadline_seconds=args.wait)
     try:
-        listing = list_library(args.folder, options=options)
+        listing = list_library(args.folder, options=options, deadline_seconds=args.deadline)
     except LibraryError as exc:
         _warn(f"aar drp library: {exc}")
         return EXIT_NOTHING_READ
@@ -253,27 +282,51 @@ def _library(args: argparse.Namespace) -> int:
     if args.json:
         text = json.dumps(listing.to_dict(), indent=1, ensure_ascii=True, allow_nan=False) + "\n"
     else:
-        lines = [
-            f"library: {listing.root}",
-            f"projects: {len(listing.projects)}"
-            + (f" ({refused} refused)" if refused else "")
-            + (" (list cut short: too many entries)" if listing.truncated else ""),
-        ]
-        for p in listing.projects:
-            where = f"  {p.user}/{p.folder}"
-            if p.refusal is not None:
-                r = p.refusal
-                lines.append(f"{where}: REFUSED {r['code']}: {r['message']}; {r['hint']}")
-                continue
-            names = ", ".join(f'"{n}"' for n in p.timelines) or "none"
-            lines.append(
-                f'{where}: "{p.name or "?"}" version {p.project_version}, id {p.id}, '
-                f"modified {p.last_modified or '?'}, timelines: {names}"
-            )
-            if p.warnings:
-                lines.append(f"    read with warnings: {', '.join(p.warnings)}")
-        text = "\n".join(printable(line) for line in lines) + "\n"
+        text = "\n".join(printable(line) for line in _library_lines(listing, refused)) + "\n"
     written = _emit(text)
     if written != EXIT_OK:
         return written
+    if not listing.complete:
+        return EXIT_INCOMPLETE
     return EXIT_NOTHING_READ if refused or not listing.projects else EXIT_OK
+
+
+def _library_lines(listing: LibraryListing, refused: int) -> list[str]:
+    """The text listing. Every name from the library is quoted (:func:`quote`), so a name
+    holding quotes cannot make one line read as several fields."""
+    counts = [f"{refused} refused"] if refused else []
+    if listing.not_read:
+        counts.append(f"{listing.not_read} not read")
+    lines = [
+        f"library: {listing.root}",
+        f"projects: {len(listing.projects)}" + (f" ({', '.join(counts)})" if counts else ""),
+    ]
+    if not listing.complete:
+        lines.append("INCOMPLETE: this listing leaves projects out (see below)")
+    for code in listing.cut_short:
+        lines.append(f"search cut short: {CUT_REASONS[code]}")
+    for reason, skipped in listing.skipped.items():
+        shown = ", ".join(quote(name) for name in skipped.first)
+        more = (
+            f" and {skipped.count - len(skipped.first)} more"
+            if skipped.count > len(skipped.first)
+            else ""
+        )
+        lines.append(f"skipped {skipped.count} {SKIP_REASONS[reason]}: {shown}{more}")
+    for p in listing.projects:
+        where = "  " + quote(f"{p.user}/{p.folder}")
+        if p.not_read is not None:
+            lines.append(f"{where}: NOT READ: {p.not_read}")
+            continue
+        if p.refusal is not None:
+            r = p.refusal
+            lines.append(f"{where}: REFUSED {r['code']}: {r['message']}; {r['hint']}")
+            continue
+        names = ", ".join(quote(n) for n in p.timelines) or "none"
+        lines.append(
+            f"{where}: {quote(p.name or None)} version {p.project_version}, id {quote(p.id)}, "
+            f"modified {p.last_modified or '?'}, timelines: {names}"
+        )
+        if p.warnings:
+            lines.append(f"    read with warnings: {', '.join(p.warnings)}")
+    return lines

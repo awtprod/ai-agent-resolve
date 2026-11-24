@@ -143,7 +143,7 @@ def read_drp(
     A file :func:`aar.drp.library.is_library_path` accepts (a ``.db``, or SQLite content
     under any other suffix than ``.drp``/``.drt``/``.drb``) is a project saved in a Resolve
     disk library: :func:`aar.drp.library.open_library` snapshots and lays out its rows (with
-    ``library_options``, and ``max_member_bytes`` as its per-value limit), this same reader
+    ``library_options``' budgets, and no value over ``max_member_bytes``), this same reader
     builds the model, and :func:`aar.drp.library.finish` points its provenance at rows. A
     refused ``Project.db`` raises :class:`aar.drp.library.LibraryError` (a ``ContainerError``).
     """

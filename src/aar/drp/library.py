@@ -21,6 +21,11 @@ private snapshot outside the library once it has settled (``aar.media.settle``) 
 ``-journal`` or ``-wal`` file is beside it, and the snapshot is checked with SQLite's own
 ``integrity_check`` and then read through an immutable, read-only connection, so no journal,
 WAL or shm file is created next to either file. The snapshot is deleted on every path.
+
+Memory is bounded while the rows are fetched, not afterwards: every row and every byte fetched is
+charged against ``max_rows`` and ``max_load_bytes`` as it arrives, and SQLite itself refuses a
+single value over ``max_value_bytes``. A link the reader would not consume (an unknown
+``DbPropertyName``, or an owner that is not read) is reported, never dropped silently.
 """
 
 from __future__ import annotations
@@ -29,15 +34,16 @@ import bisect
 import os
 import re
 import sqlite3
+import stat
 import tempfile
 import time
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import Any, ClassVar
 
 from aar.drp.container import DEFAULT_MAX_MEMBER_BYTES, MemberInfo
 from aar.drp.errors import ContainerError
@@ -53,6 +59,7 @@ __all__ = [
     "LibraryOptions",
     "LibraryProject",
     "LibraryView",
+    "Skipped",
     "finish",
     "is_library_path",
     "list_library",
@@ -67,14 +74,24 @@ SUPPORTED_PROJECT_VERSIONS = frozenset({15, 17})
 DEFAULT_SETTLE_SECONDS = 2.0
 DEFAULT_DEADLINE_SECONDS = 30.0
 DEFAULT_POLL_SECONDS = 0.25
-DEFAULT_MAX_DB_BYTES = 1024 * 1024 * 1024
-DEFAULT_MAX_ROWS = 2_000_000
+#: Budgets of one read. The largest real save seen is about 30 MB with under 1,000 timeline
+#: items; the largest real sample has 2,614 rows in the tables read, 0.6 MB of values in them and
+#: no value over 29 KB. Each budget leaves that at least ten times over, and together they keep
+#: the peak memory of a hostile file to a few hundred MB (DESIGN "Shared project library").
+DEFAULT_MAX_DB_BYTES = 256 * 1024 * 1024
+DEFAULT_MAX_ROWS = 50_000
+DEFAULT_MAX_LOAD_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_VALUE_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_QUERY_SECONDS = 120.0
+#: Budgets of one listing (:func:`list_library`).
+DEFAULT_LISTING_SECONDS = 120.0
+DEFAULT_LISTING_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_ISSUES_PER_CODE = 100
 _MAX_BIN_DEPTH = 256
 _MAX_LISTED_PROJECTS = 500
 _MAX_SCANNED_ENTRIES = 20_000
 _MAX_FOLDER_DEPTH = 8
+_MAX_SHOWN_SKIPPED = 10
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_:.\-]*\Z")
 _LIBRARY_SUFFIXES = (".drp", ".drt", ".drb")
 
@@ -158,6 +175,16 @@ _BLOB_COLUMNS = frozenset(
     }
 )
 _TRACK_VECTORS = ("VideoTrackVec", "AudioTrackVec", "SubtitleTrackVec")
+#: The ``DbPropertyName`` values the reader consumes, per join table: the vectors of a ``.drp``'s
+#: XML that the layout below rebuilds. A link under any other property, or from an owner that is
+#: not laid out, is reported as ``library-unread-link`` and not laid out.
+_READ_PROPERTIES: dict[str, tuple[str, ...]] = {
+    "SM_Project_Sm2Timeline": ("TimelineHandleVec",),
+    "Sm2MpFolder_Sm2MpMedia": ("MediaVec",),
+    "BtAudioInfo_Sm2MpMedia": ("EmbeddedAudioVec",),
+    "Sm2SequenceContainer_Sm2TiTrack": _TRACK_VECTORS,
+    "Sm2TiItem_Sm2TiTrack": ("Items",),
+}
 _ITEM_FIELDS = (
     "PrettyType",
     "Name",
@@ -186,11 +213,13 @@ class LibraryError(ContainerError):
     ``Users`` folder).
     """
 
-    def __init__(self, code: str, message: str, hint: str) -> None:
+    def __init__(self, code: str, message: str, hint: str, *, timed_out: bool = False) -> None:
         super().__init__(f"{message} [{code}]; {hint}")
         self.code = code
         self.message = message
         self.hint = hint
+        #: The refusal is the ``max_query_seconds`` time budget running out.
+        self.timed_out = timed_out
 
     def to_dict(self) -> dict[str, str]:
         return {"code": self.code, "message": self.message, "hint": self.hint}
@@ -204,7 +233,12 @@ class LibraryOptions:
     deadline_seconds: float = DEFAULT_DEADLINE_SECONDS
     poll_seconds: float = DEFAULT_POLL_SECONDS
     max_db_bytes: int = DEFAULT_MAX_DB_BYTES
+    #: Rows fetched from the tables read, in total.
     max_rows: int = DEFAULT_MAX_ROWS
+    #: Bytes of text and blob values fetched, in total (charged as each row arrives).
+    max_load_bytes: int = DEFAULT_MAX_LOAD_BYTES
+    #: One value at most (SQLite's own length limit; also never more than ``max_member_bytes``).
+    max_value_bytes: int = DEFAULT_MAX_VALUE_BYTES
     max_query_seconds: float = DEFAULT_MAX_QUERY_SECONDS
     #: Where the private snapshot is written (default: the system temporary folder). Never the
     #: project's own folder or a folder inside it.
@@ -323,20 +357,42 @@ def _snapshot_dir(path: Path, opts: LibraryOptions) -> Path:
     return folder
 
 
-def _take_snapshot(path: Path, opts: LibraryOptions) -> tuple[Path, Copied]:
-    """Copy ``path`` to a new private file; the caller deletes it. Nothing is left on error."""
+_KINDS = (
+    (stat.S_ISDIR, "a folder"),
+    (stat.S_ISLNK, "a symbolic link"),
+    (stat.S_ISFIFO, "a named pipe (FIFO)"),
+    (stat.S_ISSOCK, "a socket"),
+    (stat.S_ISCHR, "a character device"),
+    (stat.S_ISBLK, "a block device"),
+)
+
+
+def _check_kind(path: Path) -> None:
+    """Refuse anything but a regular file, saying what it is (never opened, so never blocks)."""
     try:
-        size = os.stat(path).st_size
+        mode = os.lstat(path).st_mode
     except OSError as exc:
         raise LibraryError(
             "unreadable", f"cannot read {path}: {exc}", "check the path and permissions"
         ) from None
-    if size > opts.max_db_bytes:
-        raise LibraryError(
-            "too_large",
-            f"{path} is {size} bytes, over the {opts.max_db_bytes}-byte limit",
-            "raise max_db_bytes if this really is one project",
-        )
+    if stat.S_ISREG(mode):
+        return
+    what = next((name for test, name in _KINDS if test(mode)), "not a regular file")
+    hint = (
+        "give the path of the Project.db file itself, not a link to it"
+        if stat.S_ISLNK(mode)
+        else "give the path of a regular Project.db file (a project folder holds one)"
+    )
+    raise LibraryError("unreadable", f"{path} is {what}, not a regular file", hint)
+
+
+def _take_snapshot(path: Path, opts: LibraryOptions) -> tuple[Path, Copied]:
+    """Copy ``path`` to a new private file; the caller deletes it. Nothing is left on error.
+
+    The size limit is :func:`aar.media.settle.copy_settled`'s, checked on the opened file and
+    again on every block copied.
+    """
+    _check_kind(path)
     fd, name = tempfile.mkstemp(prefix=".aar-library-", suffix=".db", dir=_snapshot_dir(path, opts))
     snapshot = Path(name)
     try:
@@ -378,14 +434,15 @@ def _sql_error(path: Path, exc: sqlite3.Error, opts: LibraryOptions) -> LibraryE
     if isinstance(exc, sqlite3.DataError) or "too big" in text:
         return LibraryError(
             "too_large",
-            f"{path}: a value is larger than the reader's per-value limit ({text})",
-            "raise max_member_bytes if this really is one project",
+            f"{path}: a value is larger than the per-value limit ({text})",
+            "raise max_value_bytes (and max_member_bytes) if this really is one project",
         )
     if "interrupted" in text:
         return LibraryError(
             "too_large",
             f"{path}: reading it took longer than {opts.max_query_seconds:g} s",
             "raise max_query_seconds if this really is one project",
+            timed_out=True,
         )
     return LibraryError(
         "damaged",
@@ -435,27 +492,84 @@ def _int_value(value: object) -> int | None:
     return None
 
 
-def _load(
-    conn: sqlite3.Connection, path: Path, opts: LibraryOptions
-) -> dict[str, list[dict[str, Any]]]:
-    rows = 0
+class _Row(tuple):  # type: ignore[type-arg]
+    """One fetched row: a tuple (no per-row dict) whose values are also found by column name."""
+
+    __slots__ = ()
+    index: ClassVar[dict[str, int]] = {}
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, str):
+            return tuple.__getitem__(self, self.index[key])
+        return tuple.__getitem__(self, key)
+
+
+def _row_type(table: str, columns: tuple[str, ...]) -> type[_Row]:
+    index = {c: i for i, c in enumerate(columns)}
+    return type(f"_Row_{table.replace(':', '_')}", (_Row,), {"__slots__": (), "index": index})
+
+
+_ROW_TYPES = {table: _row_type(table, columns) for table, columns in COLUMNS.items()}
+#: What one fetched value costs beyond its bytes (the Python object and its slot), charged
+#: against ``max_load_bytes`` so that many small values count too.
+_VALUE_COST = 16
+
+Rows = dict[str, list[_Row]]
+
+
+def _load(conn: sqlite3.Connection, path: Path, opts: LibraryOptions) -> Rows:
+    """Fetch the columns read, one row at a time, charging every row and byte as it arrives.
+
+    The row count is checked first (SQLite counts without loading anything), and again while
+    fetching; ``max_load_bytes`` is charged with each value's size, so a refusal comes before
+    the budget's worth of memory is held, whatever the file's size says (a generated column
+    can make values out of nothing).
+    """
+    total = 0
     for table in COLUMNS:
         (count,) = conn.execute(f"SELECT count(*) FROM {_q(table)}").fetchone()
-        rows += int(count)
-    if rows > opts.max_rows:
-        raise LibraryError(
-            "too_large",
-            f"{path} has {rows} rows in the tables read, over the {opts.max_rows} limit",
-            "raise max_rows if this really is one project",
-        )
-    tables: dict[str, list[dict[str, Any]]] = {}
+        total += int(count)
+    if total > opts.max_rows:
+        raise _too_many_rows(path, opts, total)
+    rows_left = opts.max_rows
+    bytes_left = opts.max_load_bytes
+    tables: Rows = {}
     for table, columns in COLUMNS.items():
+        make = _ROW_TYPES[table]
+        out: list[_Row] = []
         sql = f"SELECT {', '.join(_q(c) for c in columns)} FROM {_q(table)}"
-        tables[table] = [dict(zip(columns, row, strict=True)) for row in conn.execute(sql)]
+        for values in conn.execute(sql):  # one row per step, never a batch
+            rows_left -= 1
+            if rows_left < 0:
+                raise _too_many_rows(path, opts, None)
+            for value in values:
+                bytes_left -= _VALUE_COST + (len(value) if isinstance(value, bytes) else 0)
+            if bytes_left < 0:
+                raise LibraryError(
+                    "too_large",
+                    f"{path}: the values read come to more than the {_size(opts.max_load_bytes)} "
+                    f"load budget (at {table})",
+                    "raise max_load_bytes if this really is one project",
+                )
+            out.append(make(values))
+        tables[table] = out
     return tables
 
 
-def _check_project(path: Path, tables: dict[str, list[dict[str, Any]]]) -> int:
+def _too_many_rows(path: Path, opts: LibraryOptions, counted: int | None) -> LibraryError:
+    rows = f"{counted} rows" if counted is not None else f"more than {opts.max_rows} rows"
+    return LibraryError(
+        "too_large",
+        f"{path} has {rows} in the tables read, over the {opts.max_rows}-row limit",
+        "raise max_rows if this really is one project",
+    )
+
+
+def _size(n: int) -> str:
+    return f"{n // (1024 * 1024)} MiB" if n % (1024 * 1024) == 0 else f"{n}-byte"
+
+
+def _check_project(path: Path, tables: Rows) -> int:
     projects = tables["SM_Project"]
     if not projects:
         raise LibraryError(
@@ -545,46 +659,57 @@ class _Budget:
             )
 
 
+#: Where an element came from: its byte span in the member, the row (``<table>/<id>``, or a
+#: join row's ``<join table>/<owner>/<property>/<DbIndex>``) and the column, if it is a value.
+#: The row text is shared by every value of the row, so a span costs a tuple, not a string.
+Span = tuple[int, int, str, str | None]
+
+
 class _Doc:
     """One synthesized member, with the row and column behind every element it holds."""
 
     def __init__(self, name: str, budget: _Budget) -> None:
         self.name = name
         self.budget = budget
-        self.parts: list[bytes] = []
-        self.pos = 0
+        self.buf = bytearray()
         self.stack: list[tuple[bytes, int, str | None]] = []
-        self.spans: list[tuple[int, int, str]] = []
+        self.spans: list[Span] = []
         self._write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
 
-    def _write(self, data: bytes) -> None:
-        self.budget.charge(len(data))
-        self.parts.append(data)
-        self.pos += len(data)
+    def _write(self, *parts: bytes) -> None:
+        self.budget.charge(sum(len(part) for part in parts))
+        for part in parts:
+            self.buf += part
 
     def open(self, tag: str, ref: str | None = None, dbid: str | None = None) -> None:
-        start = self.pos
-        attr = b"" if dbid is None else b' DbId="' + _escape(_raw(dbid), attribute=True) + b'"'
-        self._write(b"<" + tag.encode() + attr + b">")
-        self.stack.append((tag.encode(), start, ref))
+        start = len(self.buf)
+        name = tag.encode()
+        if dbid is None:
+            self._write(b"<", name, b">")
+        else:
+            self._write(b"<", name, b' DbId="', _escape(_raw(dbid), attribute=True), b'">')
+        self.stack.append((name, start, ref))
 
     def close(self) -> None:
-        tag, start, ref = self.stack.pop()
-        self._write(b"</" + tag + b">")
+        name, start, ref = self.stack.pop()
+        self._write(b"</", name, b">")
         if ref is not None:
-            self.spans.append((start, self.pos, ref))
+            self.spans.append((start, len(self.buf), ref, None))
 
-    def leaf(self, tag: str, content: bytes | None, ref: str) -> None:
-        start = self.pos
+    def leaf(self, tag: str, content: bytes | None, row: str, column: str | None) -> None:
+        start = len(self.buf)
         name = tag.encode()
         if content:
-            self._write(b"<" + name + b">" + _escape(content) + b"</" + name + b">")
+            self._write(b"<", name, b">", _escape(content), b"</", name, b">")
         else:
-            self._write(b"<" + name + b"/>")
-        self.spans.append((start, self.pos, ref))
+            self._write(b"<", name, b"/>")
+        self.spans.append((start, len(self.buf), row, column))
 
-    def data(self) -> bytes:
-        return b"".join(self.parts)
+    def take(self) -> bytes:
+        """The member's bytes; the buffer is released."""
+        data = bytes(self.buf)
+        self.buf = bytearray()
+        return data
 
 
 @dataclass(slots=True)
@@ -599,16 +724,14 @@ class _Link:
 class _Builder:
     """Lay the rows out as the members of a ``.drp``, and report what does not fit."""
 
-    def __init__(
-        self, path: Path, tables: dict[str, list[dict[str, Any]]], budget: _Budget
-    ) -> None:
+    def __init__(self, path: Path, tables: Rows, budget: _Budget) -> None:
         self.path = path
         self.budget = budget
         self.issues: list[Issue] = []
         self.counts: Counter[str] = Counter()
         self.docs: list[_Doc] = []
         self.member_rows: dict[str, str] = {}
-        self.rows: dict[str, dict[str, dict[str, Any]]] = {}
+        self.rows: dict[str, dict[str, _Row]] = {}
         self.joins: dict[str, dict[str, dict[str, list[_Link]]]] = {}
         for table, rows in tables.items():
             if COLUMNS[table] == _JOIN:
@@ -616,6 +739,8 @@ class _Builder:
             else:
                 self.rows[table] = self._index(table, rows)
         self.placed: dict[str, set[str]] = defaultdict(set)
+        #: (owner, property) of every link group that was laid out, per join table.
+        self.consumed: dict[str, set[tuple[str, str]]] = defaultdict(set)
 
     # ------------------------------------------------------------------ issues
 
@@ -635,8 +760,8 @@ class _Builder:
 
     # ------------------------------------------------------------------ rows and links
 
-    def _index(self, table: str, rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-        out: dict[str, dict[str, Any]] = {}
+    def _index(self, table: str, rows: list[_Row]) -> dict[str, _Row]:
+        out: dict[str, _Row] = {}
         id_column = f"{table}_id"
         for row in rows:
             rid = _key(row[id_column])
@@ -653,7 +778,7 @@ class _Builder:
             out[rid] = row
         return out
 
-    def _links(self, table: str, rows: list[dict[str, Any]]) -> dict[str, dict[str, list[_Link]]]:
+    def _links(self, table: str, rows: list[_Row]) -> dict[str, dict[str, list[_Link]]]:
         out: dict[str, dict[str, list[_Link]]] = defaultdict(lambda: defaultdict(list))
         for row in rows:
             owner = _key(row["DbOwner"])
@@ -687,12 +812,18 @@ class _Builder:
                 )
         return out
 
-    def _props(self, join: str, owner: str, first: Iterable[str]) -> list[tuple[str, list[_Link]]]:
+    def _props(self, join: str, owner: str) -> list[tuple[str, list[_Link]]]:
+        """The link groups of ``owner`` the reader consumes, in the reader's order; each one
+        returned is recorded as laid out. Any other group is left for :meth:`unread_links`."""
         props = self.joins[join].get(owner, {})
-        order = [p for p in first if p in props] + sorted(p for p in props if p not in first)
-        return [(p, props[p]) for p in order]
+        out = [(p, props[p]) for p in _READ_PROPERTIES[join] if p in props]
+        self.consumed[join].update((owner, p) for p, _links in out)
+        return out
 
-    def _child(self, table: str, link: _Link, join: str) -> dict[str, Any] | None:
+    def _vector(self, join: str, owner: str, prop: str) -> list[_Link]:
+        return dict(self._props(join, owner)).get(prop, [])
+
+    def _child(self, table: str, link: _Link, join: str) -> _Row | None:
         row = self.rows[table].get(link.child or "")
         if row is None:
             self.issue(
@@ -749,11 +880,10 @@ class _Builder:
         self.member_rows[unique] = row_ref
         return doc
 
-    def leaves(
-        self, doc: _Doc, table: str, rid: str, row: dict[str, Any], cols: Iterable[str]
-    ) -> None:
+    def leaves(self, doc: _Doc, table: str, rid: str, row: _Row, cols: tuple[str, ...]) -> None:
+        ref = f"{table}/{rid}"
         for col in cols:
-            doc.leaf(col, _content(col, row[col]), f"{table}/{rid}/{col}")
+            doc.leaf(col, _content(col, row[col]), ref, col)
 
     # ------------------------------------------------------------------ members
 
@@ -764,6 +894,7 @@ class _Builder:
         self.unlinked("Sm2TiItem", "Sm2TiTrack_id")
         self.unlinked("Sm2TiTrack", "Sm2SequenceContainer_id")
         self.unlinked("Sm2MpMedia", "Sm2MpFolder_id")
+        self.unread_links()
         self.summaries()
 
     def project(self) -> None:
@@ -779,8 +910,8 @@ class _Builder:
             ("ProjectName", "ProjectVersion", "LastModTimeInSecs", "CurrentTimelineIndex"),
         )
         doc.open("TimelineHandleVec")
-        for link in self.joins["SM_Project_Sm2Timeline"].get(pid, {}).get("TimelineHandleVec", []):
-            doc.leaf("Element", _raw(link.child) if link.child else None, link.ref)
+        for link in self._vector("SM_Project_Sm2Timeline", pid, "TimelineHandleVec"):
+            doc.leaf("Element", _raw(link.child) if link.child else None, link.ref, None)
         doc.close()
         config_id = _key(row["CommonConfig"])
         if config_id is not None:
@@ -831,7 +962,7 @@ class _Builder:
             doc.open("Sm2MpFolder", ref, fid)
             self.leaves(doc, "Sm2MpFolder", fid, row, ("Name", "MpFolder"))
             doc.open("MediaVec")
-            for link in self.joins["Sm2MpFolder_Sm2MpMedia"].get(fid, {}).get("MediaVec", []):
+            for link in self._vector("Sm2MpFolder_Sm2MpMedia", fid, "MediaVec"):
                 media = self._child("Sm2MpMedia", link, "Sm2MpFolder_Sm2MpMedia")
                 if media is None or link.child is None:
                     continue
@@ -883,7 +1014,7 @@ class _Builder:
         doc.close()
         doc.close()
 
-    def media(self, doc: _Doc, mid: str, row: dict[str, Any]) -> None:
+    def media(self, doc: _Doc, mid: str, row: _Row) -> None:
         ref = f"Sm2MpMedia/{mid}"
         tag = self._type("Sm2MpMedia", mid, row["DbType"])
         if tag is None:
@@ -893,14 +1024,7 @@ class _Builder:
         info = _key(row["Video"])
         if info is not None:
             self._info(doc, "Video", info, f"{ref}/Video")
-        for prop, links in self._props("BtAudioInfo_Sm2MpMedia", mid, ("EmbeddedAudioVec",)):
-            if not _NAME.match(prop):
-                self.issue(
-                    "library-bad-type",
-                    f"BtAudioInfo_Sm2MpMedia property {prop!r} is not an element name",
-                    links[0].ref,
-                )
-                continue
+        for prop, links in self._props("BtAudioInfo_Sm2MpMedia", mid):
             doc.open(prop)
             for link in links:
                 audio = self._child("BtAudioInfo", link, "BtAudioInfo_Sm2MpMedia")
@@ -945,14 +1069,7 @@ class _Builder:
             ref = f"Sm2SequenceContainer/{cid}"
             doc = self._doc(f"SeqContainer/{_member_part(cid)}.xml", ref)
             doc.open("Sm2SequenceContainer", ref, cid)
-            for prop, links in self._props("Sm2SequenceContainer_Sm2TiTrack", cid, _TRACK_VECTORS):
-                if not _NAME.match(prop):
-                    self.issue(
-                        "library-bad-type",
-                        f"track vector {prop!r} is not an element name",
-                        links[0].ref,
-                    )
-                    continue
+            for prop, links in self._props("Sm2SequenceContainer_Sm2TiTrack", cid):
                 doc.open(prop)
                 for link in links:
                     track = self._child("Sm2TiTrack", link, "Sm2SequenceContainer_Sm2TiTrack")
@@ -966,7 +1083,7 @@ class _Builder:
                 doc.close()
             doc.close()
 
-    def track(self, doc: _Doc, tid: str, row: dict[str, Any]) -> None:
+    def track(self, doc: _Doc, tid: str, row: _Row) -> None:
         tag = self._type("Sm2TiTrack", tid, row["DbType"], "Sm2TiTrack")
         if tag is None:
             return
@@ -974,14 +1091,7 @@ class _Builder:
         self.leaves(
             doc, "Sm2TiTrack", tid, row, ("Type", "SubType", "Flags", "Sequence", "UserDefinedName")
         )
-        for prop, links in self._props("Sm2TiItem_Sm2TiTrack", tid, ("Items",)):
-            if not _NAME.match(prop):
-                self.issue(
-                    "library-bad-type",
-                    f"track item vector {prop!r} is not an element name",
-                    links[0].ref,
-                )
-                continue
+        for prop, links in self._props("Sm2TiItem_Sm2TiTrack", tid):
             doc.open(prop)
             for link in links:
                 item = self._child("Sm2TiItem", link, "Sm2TiItem_Sm2TiTrack")
@@ -993,7 +1103,7 @@ class _Builder:
             doc.close()
         doc.close()
 
-    def item(self, doc: _Doc, iid: str, row: dict[str, Any]) -> None:
+    def item(self, doc: _Doc, iid: str, row: _Row) -> None:
         tag = self._type("Sm2TiItem", iid, row["DbType"])
         if tag is None:
             return
@@ -1007,18 +1117,41 @@ class _Builder:
         doc.close()
 
     def unlinked(self, table: str, owner_column: str) -> None:
-        missed = [
-            rid
-            for rid, row in self.rows[table].items()
-            if rid not in self.placed[table] and _key(row[owner_column]) is not None
-        ]
+        """Report the rows of ``table`` no link placed: they are not read (none on real saves)."""
+        missed = [rid for rid in self.rows[table] if rid not in self.placed[table]]
         if missed:
+            owned = sum(1 for rid in missed if _key(self.rows[table][rid][owner_column]))
             self.issue(
                 "library-unlinked-row",
-                f"{len(missed)} {table} row(s) name an owner in {owner_column} but no link "
-                "places them, so they are not read",
+                f"{len(missed)} {table} row(s) are placed by no link ({owned} of them name an "
+                f"owner in {owner_column}), so they are not read",
                 f"{table}/{missed[0]}",
             )
+
+    def unread_links(self) -> None:
+        """Report every link group that was not laid out, so no row it links disappears silently.
+
+        A group is left out when its ``DbPropertyName`` is not one the reader consumes (an item
+        under ``Other``, a track under ``Whatever``) or when its owner is never laid out (a
+        missing row, a track whose type is not read, a media row no folder places).
+        """
+        for join, owners in self.joins.items():
+            for owner, props in owners.items():
+                for prop, links in props.items():
+                    if (owner, prop) in self.consumed[join]:
+                        continue
+                    read = _READ_PROPERTIES[join]
+                    why = (
+                        f"the reader reads only {', '.join(read)} there"
+                        if prop not in read
+                        else f"{owner} is not read"
+                    )
+                    self.issue(
+                        "library-unread-link",
+                        f"{join}: {len(links)} link(s) of {owner} under {prop!r} are not read "
+                        f"({why}), so the rows they link are not read through them",
+                        links[0].ref,
+                    )
 
 
 @dataclass(eq=False)
@@ -1039,7 +1172,7 @@ class LibraryView:
     fixed_versions: VersionInfo
     issues: list[Issue]
     member_rows: dict[str, str]
-    spans: dict[str, list[tuple[int, int, str]]]
+    spans: dict[str, list[Span]]
     _data: dict[str, bytes] = field(repr=False)
     kind: str = LIBRARY_KIND
     kind_source: str = "sqlite"
@@ -1107,7 +1240,7 @@ def open_library(
                 "give the Project.db of a project in a Resolve disk library",
             )
         try:
-            conn = _connect(snapshot, opts, max_member_bytes)
+            conn = _connect(snapshot, opts, min(max_member_bytes, opts.max_value_bytes))
         except sqlite3.Error as exc:
             raise _sql_error(p, exc, opts) from None
         try:
@@ -1131,9 +1264,17 @@ def open_library(
         snapshot.unlink(missing_ok=True)
     version = _check_project(p, tables)
     builder = _Builder(p, tables, _Budget(max_total_xml_bytes, p))
+    del tables
     builder.build()
     [pid] = builder.rows["SM_Project"]
-    data = {doc.name: doc.data() for doc in builder.docs}
+    builder.rows.clear()  # the rows are laid out: release them before the members are made
+    builder.joins.clear()
+    data: dict[str, bytes] = {}
+    spans: dict[str, list[Span]] = {}
+    for doc in builder.docs:
+        data[doc.name] = doc.take()
+        doc.spans.sort()
+        spans[doc.name] = doc.spans
     return LibraryView(
         path=p,
         size=copied.size,
@@ -1148,7 +1289,7 @@ def open_library(
         ),
         issues=builder.issues,
         member_rows=builder.member_rows,
-        spans={doc.name: sorted(doc.spans) for doc in builder.docs},
+        spans=spans,
         _data=data,
     )
 
@@ -1167,9 +1308,9 @@ class _Relabel:
             return self.view.member_rows.get(member)
         i = bisect.bisect_right(self.starts[member], offset) - 1
         while i >= 0:
-            start, end, ref = spans[i]
+            start, end, row, column = spans[i]
             if start <= offset < end:
-                return ref
+                return row if column is None else f"{row}/{column}"
             i -= 1
         return self.view.member_rows.get(member)
 
@@ -1238,7 +1379,7 @@ def finish(drp: DrpFile, view: LibraryView) -> DrpFile:
 
 @dataclass(slots=True)
 class LibraryProject:
-    """One project folder of a library, read or refused."""
+    """One project folder of a library: read, refused, or not read at all (``not_read``)."""
 
     user: str
     folder: str
@@ -1252,20 +1393,69 @@ class LibraryProject:
     timelines: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     refusal: dict[str, str] | None = None
+    #: Why the project was not read: the listing's deadline or byte budget ran out first.
+    not_read: str | None = None
+
+
+#: What each kind of skipped entry is, as the listing says it.
+SKIP_REASONS = {
+    "symlink": "symbolic link(s), never followed",
+    "unreadable": "folder(s) that could not be listed",
+    "too_deep": f"folder(s) more than {_MAX_FOLDER_DEPTH} levels down, not looked into",
+}
+#: Why the search for projects stopped before it had looked everywhere.
+CUT_REASONS = {
+    "projects": f"more than {_MAX_LISTED_PROJECTS} projects",
+    "entries": f"more than {_MAX_SCANNED_ENTRIES} folder entries",
+    "deadline": "the listing's deadline passed while folders were searched",
+}
+
+
+@dataclass(slots=True)
+class Skipped:
+    """How many entries were skipped for one reason, and the first few (relative to ``Users``)."""
+
+    count: int = 0
+    first: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
 class LibraryListing:
-    """Every ``Project.db`` found under a library's ``Users/<user>/Projects`` folders."""
+    """Every ``Project.db`` found under a library's ``Users/<user>/Projects`` folders.
+
+    ``complete`` is true only when every folder was searched (nothing ``skipped``, the search
+    not ``cut_short``) and every project found was read or refused (none ``not_read``).
+    """
 
     root: str
     projects: list[LibraryProject]
-    truncated: bool = False
+    cut_short: list[str] = field(default_factory=list)
+    skipped: dict[str, Skipped] = field(default_factory=dict)
+    deadline_seconds: float = DEFAULT_LISTING_SECONDS
+    max_bytes: int = DEFAULT_LISTING_BYTES
+    bytes_read: int = 0
+
+    @property
+    def not_read(self) -> int:
+        return sum(1 for p in self.projects if p.not_read is not None)
+
+    @property
+    def complete(self) -> bool:
+        return not self.cut_short and not self.skipped and not self.not_read
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "root": self.root,
-            "truncated": self.truncated,
+            "complete": self.complete,
+            "cut_short": [{"code": c, "message": CUT_REASONS[c]} for c in self.cut_short],
+            "skipped": {
+                reason: {"count": s.count, "first": s.first, "what": SKIP_REASONS[reason]}
+                for reason, s in self.skipped.items()
+            },
+            "not_read": self.not_read,
+            "deadline_seconds": self.deadline_seconds,
+            "max_bytes": self.max_bytes,
+            "bytes_read": self.bytes_read,
             "projects": [
                 {f: getattr(p, f) for f in LibraryProject.__slots__}  # type: ignore[attr-defined]
                 for p in self.projects
@@ -1282,29 +1472,114 @@ def _iso(seconds: float | None) -> str | None:
         return None
 
 
-def _project_files(projects_dir: Path, budget: list[int]) -> Iterator[Path]:
-    """Folders holding a ``Project.db`` under ``projects_dir`` (no links followed, bounded)."""
-    stack: list[tuple[Path, int]] = [(projects_dir, 0)]
-    while stack:
-        folder, depth = stack.pop()
+class _Scan:
+    """Find the project folders under ``Users`` within the entry, depth, project and time
+    limits, following no link, and record everything it skips and why it stopped."""
+
+    def __init__(self, users: Path, deadline: float, clock: Callable[[], float]) -> None:
+        self.users = users
+        self.deadline = deadline
+        self.clock = clock
+        self.entries_left = _MAX_SCANNED_ENTRIES
+        self.skipped: dict[str, Skipped] = {}
+        self.cut_short: list[str] = []
+        self.found: list[tuple[str, Path, Path]] = []
+
+    @property
+    def stopped(self) -> bool:
+        return bool(self.cut_short)
+
+    def skip(self, reason: str, path: Path, detail: str | None = None) -> None:
+        record = self.skipped.setdefault(reason, Skipped())
+        record.count += 1
+        if len(record.first) < _MAX_SHOWN_SKIPPED:
+            try:
+                name = path.relative_to(self.users).as_posix()
+            except ValueError:
+                name = str(path)
+            record.first.append(f"{name} ({detail})" if detail else name)
+
+    def cut(self, reason: str) -> None:
+        if reason not in self.cut_short:
+            self.cut_short.append(reason)
+
+    def listdir(self, folder: Path) -> list[os.DirEntry[str]]:
+        """The entries of ``folder``, each charged to the entry budget (raises ``OSError``)."""
+        out: list[os.DirEntry[str]] = []
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if self.entries_left <= 0:
+                    self.cut("entries")
+                    break
+                self.entries_left -= 1
+                out.append(entry)
+        return out
+
+    def entries(self, folder: Path) -> list[os.DirEntry[str]]:
+        if self.clock() > self.deadline:
+            self.cut("deadline")
+            return []
         try:
-            with os.scandir(folder) as entries:
-                listed = []
-                for entry in entries:
-                    budget[0] -= 1
-                    if budget[0] < 0:
-                        return
-                    listed.append(entry)
-        except OSError:
-            continue
-        names = {e.name for e in listed}
-        if "Project.db" in names and folder != projects_dir:
-            yield folder / "Project.db"
-            continue
-        if depth >= _MAX_FOLDER_DEPTH:
-            continue
-        for entry in sorted(listed, key=lambda e: e.name, reverse=True):
-            if entry.is_dir(follow_symlinks=False):
+            return self.listdir(folder)
+        except OSError as exc:
+            self.skip("unreadable", folder, exc.strerror or type(exc).__name__)
+            return []
+
+    def kind(self, entry: os.DirEntry[str]) -> str | None:
+        """``"link"``, ``"folder"`` or None (a file), recording an entry that cannot be told."""
+        try:
+            if entry.is_symlink():
+                return "link"
+            return "folder" if entry.is_dir(follow_symlinks=False) else None
+        except OSError as exc:
+            self.skip("unreadable", Path(entry.path), exc.strerror or type(exc).__name__)
+            return None
+
+    def run(self, user_entries: list[os.DirEntry[str]]) -> None:
+        for user in sorted(user_entries, key=lambda e: e.name):
+            if self.stopped:
+                return
+            kind = self.kind(user)
+            if kind == "link":
+                self.skip("symlink", Path(user.path))
+            elif kind == "folder":
+                self.projects(user.name, Path(user.path) / "Projects")
+
+    def projects(self, user: str, projects_dir: Path) -> None:
+        try:
+            mode = os.lstat(projects_dir).st_mode
+        except OSError as exc:
+            self.skip("unreadable", projects_dir, exc.strerror or type(exc).__name__)
+            return
+        if stat.S_ISLNK(mode):
+            self.skip("symlink", projects_dir)
+            return
+        if not stat.S_ISDIR(mode):
+            self.skip("unreadable", projects_dir, "not a folder")
+            return
+        stack: list[tuple[Path, int]] = [(projects_dir, 0)]
+        while stack and not self.stopped:
+            folder, depth = stack.pop()
+            listed = self.entries(folder)
+            if self.stopped:
+                return
+            if folder != projects_dir and any(e.name == "Project.db" for e in listed):
+                if len(self.found) >= _MAX_LISTED_PROJECTS:
+                    self.cut("projects")
+                    return
+                self.found.append((user, projects_dir, folder / "Project.db"))
+                continue
+            children: list[os.DirEntry[str]] = []
+            for entry in listed:
+                kind = self.kind(entry)
+                if kind == "link":
+                    self.skip("symlink", Path(entry.path))
+                elif kind == "folder":
+                    if depth >= _MAX_FOLDER_DEPTH:
+                        self.skip("too_deep", Path(entry.path))
+                    else:
+                        children.append(entry)
+            for entry in sorted(children, key=lambda e: e.name, reverse=True):
                 stack.append((Path(entry.path), depth + 1))
 
 
@@ -1312,15 +1587,24 @@ def list_library(
     root: str | Path,
     *,
     options: LibraryOptions | None = None,
-    read: Callable[[Path], DrpFile] | None = None,
+    read: Callable[[Path, LibraryOptions], DrpFile] | None = None,
+    deadline_seconds: float = DEFAULT_LISTING_SECONDS,
+    max_bytes: int = DEFAULT_LISTING_BYTES,
 ) -> LibraryListing:
     """List every project of the library at ``root`` (or its ``Resolve Projects`` folder).
 
-    Each project is read in full (``read``, by default :func:`aar.drp.read_drp`); a project
-    that is refused (busy, damaged, ...) is listed with its refusal, never skipped. At most 500
-    projects and 20,000 folder entries are looked at (``truncated`` says when that cut the list
-    short), at most 8 folders deep, and no link is followed.
+    Each project is read in full (``read``, by default :func:`aar.drp.read_drp` with
+    ``options``); a project that is refused (busy, damaged, ...) is listed with its refusal.
+    The whole listing has one deadline (``deadline_seconds``, on ``options.clock``) and one
+    byte budget (``max_bytes``, the sizes of the files read): a project's wait for a save and
+    its query time are cut to what is left, and a project not reached in time or within the
+    budget is listed with ``not_read`` saying why. At most 500 projects and 20,000 folder
+    entries (the ``Users`` folder's included) are looked at, at most 8 folders deep, and no
+    link is followed; every entry skipped is counted in ``skipped`` and the search stopping
+    early is in ``cut_short``, so ``complete`` says whether anything was left out.
     """
+    opts = options or LibraryOptions()
+    deadline = opts.clock() + deadline_seconds
     base = Path(root)
     if (base / "Resolve Projects").is_dir():
         base = base / "Resolve Projects"
@@ -1335,57 +1619,81 @@ def list_library(
     if read is None:
         from aar.drp.reader import read_drp
 
-        def read(p: Path) -> DrpFile:
-            return read_drp(p, library_options=options)
+        def read(p: Path, o: LibraryOptions) -> DrpFile:
+            return read_drp(p, library_options=o)
 
-    budget = [_MAX_SCANNED_ENTRIES]
-    found: list[tuple[str, Path, Path]] = []
-    truncated = False
+    scan = _Scan(users, deadline, opts.clock)
     try:
-        user_dirs = sorted(
-            (e for e in os.scandir(users) if e.is_dir(follow_symlinks=False)), key=lambda e: e.name
-        )
+        user_entries = scan.listdir(users)
     except OSError as exc:
         raise LibraryError(
             "unreadable", f"cannot list {users}: {exc}", "check the path and permissions"
         ) from None
-    for user in user_dirs:
-        projects_dir = Path(user.path) / "Projects"
-        for db in _project_files(projects_dir, budget):
-            if len(found) >= _MAX_LISTED_PROJECTS:
-                truncated = True
-                break
-            found.append((user.name, projects_dir, db))
-        if budget[0] < 0:
-            truncated = True
-    listing = LibraryListing(str(root), [], truncated)
-    for user_name, projects_dir, db in found:
+    scan.run(user_entries)
+    listing = LibraryListing(
+        str(root),
+        [],
+        cut_short=scan.cut_short,
+        skipped=scan.skipped,
+        deadline_seconds=deadline_seconds,
+        max_bytes=max_bytes,
+    )
+    for user_name, projects_dir, db in scan.found:
         try:
-            mtime: float | None = db.stat().st_mtime
+            st = os.lstat(db)
+            mtime: float | None = st.st_mtime
+            size = st.st_size
         except OSError:
-            mtime = None
+            mtime, size = None, 0
         entry = LibraryProject(
             user=user_name,
             folder=db.parent.relative_to(projects_dir).as_posix(),
             path=str(db),
             file_modified=_iso(mtime),
         )
-        try:
-            drp = read(db)
-        except LibraryError as exc:
-            entry.refusal = exc.to_dict()
-        except ContainerError as exc:
-            entry.refusal = {"code": "unreadable", "message": str(exc), "hint": "check the file"}
-        else:
-            p = drp.project
-            if p is not None:
-                entry.name, entry.id = p.name, p.id
-                entry.last_modified_secs = p.last_modified_secs
-                entry.last_modified = _iso(p.last_modified_secs)
-            entry.project_version = drp.versions.project_version if drp.versions else None
-            entry.timelines = [t.name or "" for t in drp.timelines if t.kind == "timeline"]
-            entry.warnings = sorted(
-                {i.code for i in drp.issues if i.severity in ("warning", "error")}
-            )
         listing.projects.append(entry)
+        left = deadline - opts.clock()
+        if left <= 0:
+            entry.not_read = (
+                f"the listing's {deadline_seconds:g} s deadline passed before it was reached"
+            )
+            continue
+        if listing.bytes_read + size > max_bytes:
+            entry.not_read = (
+                f"it is {size} bytes, past what is left of the listing's {max_bytes}-byte "
+                f"budget ({listing.bytes_read} bytes read)"
+            )
+            continue
+        each = replace(
+            opts,
+            deadline_seconds=min(opts.deadline_seconds, left),
+            max_query_seconds=min(opts.max_query_seconds, left),
+        )
+        try:
+            drp = read(db, each)
+        except LibraryError as exc:
+            listing.bytes_read += size
+            cut_wait = exc.code == "busy" and each.deadline_seconds < opts.deadline_seconds
+            cut_query = exc.timed_out and each.max_query_seconds < opts.max_query_seconds
+            if cut_wait or cut_query:
+                entry.not_read = (
+                    f"the listing's {deadline_seconds:g} s deadline passed while it was "
+                    f"{'waited for' if cut_wait else 'read'} ({exc.message})"
+                )
+            else:
+                entry.refusal = exc.to_dict()
+            continue
+        except ContainerError as exc:
+            listing.bytes_read += size
+            entry.refusal = {"code": "unreadable", "message": str(exc), "hint": "check the file"}
+            continue
+        listing.bytes_read += max(size, drp.size or 0)
+        p = drp.project
+        if p is not None:
+            entry.name, entry.id = p.name, p.id
+            entry.last_modified_secs = p.last_modified_secs
+            entry.last_modified = _iso(p.last_modified_secs)
+        entry.project_version = drp.versions.project_version if drp.versions else None
+        entry.timelines = [t.name or "" for t in drp.timelines if t.kind == "timeline"]
+        entry.warnings = sorted({i.code for i in drp.issues if i.severity in ("warning", "error")})
     return listing

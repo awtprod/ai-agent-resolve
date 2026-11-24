@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 from aar.drp.model import DrpFile, Marker, MediaClip, Timeline, TimelineItem
 
-__all__ = ["describe", "frames_to_timecode", "printable"]
+__all__ = ["describe", "frames_to_timecode", "printable", "quote"]
 
 DEFAULT_MAX_ITEMS = 200
 _MAX_ISSUES = 25
@@ -37,6 +37,14 @@ def printable(text: str) -> str:
                 else f"\\U{code:08x}"
             )
     return "".join(out)
+
+
+def quote(text: str | None, missing: str = "?") -> str:
+    """``text`` in double quotes, with ``\\`` and ``"`` escaped, so a name from the file can
+    never close its quotes early and read as more fields of the line (``missing`` if None)."""
+    if text is None:
+        text = missing
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def frames_to_timecode(frame: int, fps: float | None) -> str:
@@ -85,7 +93,7 @@ def describe(drp: DrpFile, *, max_items: int = DEFAULT_MAX_ITEMS) -> str:
     if drp.project is not None:
         p = drp.project
         hint = f"; project frame rate {p.frame_rate_hint} (inferred)" if p.frame_rate_hint else ""
-        out(f'project "{p.name or "?"}"{hint}; project settings blob not decoded')
+        out(f"project {quote(p.name or None)}{hint}; project settings blob not decoded")
 
     media = drp.media_by_id()
     file_clips = [m for m in drp.media if m.type in ("video", "audio", "still", "other")]
@@ -148,7 +156,10 @@ def _timeline_lines(tl: Timeline, media: dict[str, MediaClip], max_items: int) -
     def tc(frame: int) -> str:
         return frames_to_timecode(frame, fps)
 
-    head = f'{tl.kind.capitalize()} "{tl.name or "?"}": {_fmt_rate(fps)}, {_fmt_res(tl.resolution)}'
+    head = (
+        f"{tl.kind.capitalize()} {quote(tl.name or None)}: "
+        f"{_fmt_rate(fps)}, {_fmt_res(tl.resolution)}"
+    )
     if tl.start_frame is not None:
         head += f", start {tc(tl.start_frame)} (frame {tl.start_frame})"
     if tl.start_frame is not None and tl.end_frame is not None:
@@ -160,7 +171,7 @@ def _timeline_lines(tl: Timeline, media: dict[str, MediaClip], max_items: int) -
     if not tl.tracks:
         lines.append("  no tracks" + ("" if tl.member else " (no SeqContainer member)"))
     for track in tl.tracks:
-        name = f' "{track.name}"' if track.name else ""
+        name = f" {quote(track.name)}" if track.name else ""
         lines.append(f"  {track.label}{name}: {len(track.items)} item(s)")
         shown = track.items if max_items <= 0 else track.items[:max_items]
         for item in shown:

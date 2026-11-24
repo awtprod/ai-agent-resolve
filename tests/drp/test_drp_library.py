@@ -987,8 +987,8 @@ def test_library_listing_lists_every_project_and_every_refusal(
     }
     assert main(["drp", "library", str(root / "Resolve Projects"), "--wait", "0"]) == 1
     text = capsys.readouterr().out
-    assert "projects: 4 (2 refused)" in text and 'guest/Rich: "Rich <one>" version 15' in text
-    assert "guest/Busy: REFUSED busy:" in text
+    assert "projects: 4 (2 refused)" in text and '"guest/Rich": "Rich <one>" version 15' in text
+    assert '"guest/Busy": REFUSED busy:' in text and "INCOMPLETE" not in text
 
 
 def test_a_library_of_readable_projects_exits_0_and_a_non_library_exits_1(
