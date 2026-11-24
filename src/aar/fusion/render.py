@@ -13,8 +13,11 @@ import functools
 import io
 import math
 import os
+import secrets
 import shutil
 import subprocess
+import threading
+import time
 import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -25,27 +28,55 @@ from aar.fusion.customize import apply_inputs_to_ast
 from aar.fusion.errors import FusionError
 from aar.fusion.expr import ExprContext, Point2D, evaluate_expression, expression_references
 from aar.fusion.parse import (
+    MAX_ASSET_BYTES,
     FusionTemplate,
     LuaTable,
     load_template,
+    read_zip_member_bounded,
     resolve_asset_path,
     unwrap_value,
 )
 
 __all__ = [
     "ENV_FONTS_DIR",
+    "MAX_CANVAS_DIM",
+    "MAX_CANVAS_PIXELS",
     "FusionRenderResult",
     "render_fusion_clip",
     "render_fusion_frame",
 ]
 
 ENV_FONTS_DIR = "AAR_FONTS_DIR"
+MAX_CANVAS_DIM = 8192
+MAX_CANVAS_PIXELS = 40_000_000  # ~8K UHD; prevents OOM from hostile template sizes/scales
+_MAX_STDERR_BYTES = 65536
 
 _CODEC_ARGS: dict[str, list[str]] = {
     "qtrle": ["-c:v", "qtrle", "-pix_fmt", "argb"],
     "prores4444": ["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le"],
     "png": ["-c:v", "png", "-pix_fmt", "rgba"],
 }
+
+
+def _check_image_size(width: int, height: int, context: str) -> tuple[int, int]:
+    """Validate an image allocation against dimension and total pixel budgets."""
+    if width < 1 or height < 1:
+        raise FusionError(
+            "invalid_setting",
+            f"{context}: invalid dimensions {width}x{height} (must be positive)",
+        )
+    if width > MAX_CANVAS_DIM or height > MAX_CANVAS_DIM:
+        raise FusionError(
+            "invalid_setting",
+            f"{context}: dimensions {width}x{height} exceed maximum side length {MAX_CANVAS_DIM}",
+        )
+    if width * height > MAX_CANVAS_PIXELS:
+        raise FusionError(
+            "invalid_setting",
+            f"{context}: pixel count {width * height} ({width}x{height}) exceeds budget "
+            f"of {MAX_CANVAS_PIXELS} pixels",
+        )
+    return width, height
 
 
 def _require_pil() -> tuple[Any, Any, Any, Any, Any]:
@@ -113,7 +144,7 @@ def _find_font_file(
 
     for base in _font_search_dirs(extra_dirs):
         for ext in ("*.ttf", "*.otf", "*.ttc"):
-            for fp in base.rglob(ext):
+            for fp in sorted(base.rglob(ext)):
                 stem_norm = _norm_font_token(fp.stem)
                 if fam_norm and fam_norm not in stem_norm:
                     continue
@@ -261,7 +292,7 @@ def _eval_bezier_spline(tool: LuaTable, time: float) -> float:
 
 def _detect_native_size(tools: dict[str, LuaTable], fallback: tuple[int, int]) -> tuple[int, int]:
     """Infer the template's native design resolution from Background tools, if specified."""
-    for tool in tools.values():
+    for tool_name, tool in tools.items():
         if tool.constructor != "Background":
             continue
         inputs = tool.get("Inputs")
@@ -275,9 +306,14 @@ def _detect_native_size(tools: dict[str, LuaTable], fallback: tuple[int, int]) -
         w_val = unwrap_value(w_inp.get("Value")) if isinstance(w_inp, LuaTable) else None
         h_val = unwrap_value(h_inp.get("Value")) if isinstance(h_inp, LuaTable) else None
         if isinstance(w_val, (int, float)) and isinstance(h_val, (int, float)):
+            if not (math.isfinite(float(w_val)) and math.isfinite(float(h_val))):
+                raise FusionError(
+                    "invalid_setting",
+                    f"Background {tool_name!r} has non-finite Width/Height ({w_val!r}, {h_val!r})",
+                )
             w_i, h_i = round(w_val), round(h_val)
             if w_i > 0 and h_i > 0:
-                return w_i, h_i
+                return _check_image_size(w_i, h_i, f"Background {tool_name!r}")
     return fallback
 
 
@@ -310,7 +346,9 @@ class _FusionGraphEvaluator:
         render_start: float,
         render_end: float,
         asset_dirs: Sequence[Path],
+        confined_roots: Sequence[Path] | None = None,
     ) -> None:
+        _check_image_size(comp_size[0], comp_size[1], f"template {template.name!r} composition")
         self._template = template
         self._tools = tools
         self._output_tool = output_tool
@@ -318,6 +356,7 @@ class _FusionGraphEvaluator:
         self._render_start = render_start
         self._render_end = render_end
         self._asset_dirs = list(asset_dirs)
+        self._confined_roots = list(confined_roots) if confined_roots is not None else None
         self._archive_members: list[str] = []
         if template.path.suffix.lower() == ".drfx":
             with zipfile.ZipFile(template.path, "r") as zf:
@@ -851,6 +890,8 @@ class _FusionGraphEvaluator:
         if tool_name in self._loader_cache:
             return self._loader_cache[tool_name]
         Image, _, _, _, _ = _require_pil()
+        from PIL import UnidentifiedImageError
+
         clips = tool.get("Clips")
         filename: str | None = None
         if isinstance(clips, LuaTable):
@@ -868,19 +909,46 @@ class _FusionGraphEvaluator:
             template_path=self._template.path,
             asset_dirs=self._asset_dirs,
             archive_members=self._archive_members,
+            confined_roots=self._confined_roots,
         )
-        if resolved_path is not None:
-            img = Image.open(resolved_path).convert("RGBA")
-        elif archive_member is not None:
-            with zipfile.ZipFile(self._template.path, "r") as zf:
-                raw = zf.read(archive_member)
-            img = Image.open(io.BytesIO(raw)).convert("RGBA")
-        else:
+        try:
+            if resolved_path is not None:
+                size = resolved_path.stat().st_size
+                if size > MAX_ASSET_BYTES:
+                    raise FusionError(
+                        "invalid_setting",
+                        f"Loader {tool_name!r} asset {resolved_path.name!r} ({size} bytes) "
+                        f"exceeds limit of {MAX_ASSET_BYTES} bytes",
+                    )
+                with Image.open(resolved_path) as opened:
+                    _check_image_size(opened.width, opened.height, f"Loader {tool_name!r}")
+                    img = opened.convert("RGBA")
+            elif archive_member is not None:
+                with zipfile.ZipFile(self._template.path, "r") as zf:
+                    raw = read_zip_member_bounded(zf, archive_member, MAX_ASSET_BYTES)
+                with Image.open(io.BytesIO(raw)) as opened:
+                    _check_image_size(opened.width, opened.height, f"Loader {tool_name!r}")
+                    img = opened.convert("RGBA")
+            else:
+                raise FusionError(
+                    "missing_asset",
+                    f"Loader {tool_name!r} asset not found: {filename!r}",
+                    {"tool": tool_name, "filename": filename},
+                )
+        except FusionError:
+            raise
+        except (
+            UnidentifiedImageError,
+            Image.DecompressionBombError,
+            OSError,
+            ValueError,
+            zipfile.BadZipFile,
+        ) as exc:
             raise FusionError(
-                "missing_asset",
-                f"Loader {tool_name!r} asset not found: {filename!r}",
+                "render_failed",
+                f"Loader {tool_name!r} could not decode asset {filename!r}: {exc}",
                 {"tool": tool_name, "filename": filename},
-            )
+            ) from exc
         self._loader_cache[tool_name] = img
         return img
 
@@ -914,6 +982,10 @@ class _FusionGraphEvaluator:
         flip_h = bool(self._eval_input(tool_name, "FlipHoriz", time, frame_cache, eval_stack, 0))
         flip_v = bool(self._eval_input(tool_name, "FlipVert", time, frame_cache, eval_stack, 0))
 
+        if not (math.isfinite(size) and math.isfinite(angle) and math.isfinite(blend)):
+            raise FusionError(
+                "invalid_setting", f"Merge {tool_name!r} has non-finite transform parameter"
+            )
         if blend <= 0.0 or size <= 0.0:
             return bg
 
@@ -926,9 +998,20 @@ class _FusionGraphEvaluator:
         if abs(size - 1.0) > 1e-5:
             new_w = max(1, round(fg_work.width * size))
             new_h = max(1, round(fg_work.height * size))
+            _check_image_size(new_w, new_h, f"Merge {tool_name!r} scaled foreground")
             fg_work = fg_work.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
         if abs(angle) > 1e-4:
+            rad = math.radians(angle)
+            rot_w = math.ceil(
+                abs(fg_work.width * math.cos(rad)) + abs(fg_work.height * math.sin(rad))
+            )
+            rot_h = math.ceil(
+                abs(fg_work.width * math.sin(rad)) + abs(fg_work.height * math.cos(rad))
+            )
+            _check_image_size(
+                max(1, rot_w), max(1, rot_h), f"Merge {tool_name!r} rotated foreground"
+            )
             fg_work = fg_work.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True)
 
         # Place fg_work onto a bg-sized transparent layer centered at (center.x, 1-center.y)
@@ -995,15 +1078,31 @@ class _FusionGraphEvaluator:
         angle = float(self._eval_input(tool_name, "Angle", time, frame_cache, eval_stack, 0.0))
         blend = float(self._eval_input(tool_name, "Blend", time, frame_cache, eval_stack, 1.0))
 
+        if not (
+            math.isfinite(size)
+            and math.isfinite(aspect)
+            and math.isfinite(angle)
+            and math.isfinite(blend)
+        ):
+            raise FusionError(
+                "invalid_setting", f"Transform {tool_name!r} has non-finite transform parameter"
+            )
+
         work = src
         sx = max(1e-4, size)
         sy = max(1e-4, size / max(1e-4, aspect))
         if abs(sx - 1.0) > 1e-5 or abs(sy - 1.0) > 1e-5:
-            work = work.resize(
-                (max(1, round(work.width * sx)), max(1, round(work.height * sy))),
-                Image.Resampling.LANCZOS,
-            )
+            new_w = max(1, round(work.width * sx))
+            new_h = max(1, round(work.height * sy))
+            _check_image_size(new_w, new_h, f"Transform {tool_name!r} scaled image")
+            work = work.resize((new_w, new_h), Image.Resampling.LANCZOS)
         if abs(angle) > 1e-4:
+            rad = math.radians(angle)
+            rot_w = math.ceil(abs(work.width * math.cos(rad)) + abs(work.height * math.sin(rad)))
+            rot_h = math.ceil(abs(work.width * math.sin(rad)) + abs(work.height * math.cos(rad)))
+            _check_image_size(
+                max(1, rot_w), max(1, rot_h), f"Transform {tool_name!r} rotated image"
+            )
             work = work.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True)
 
         out = Image.new("RGBA", (self._comp_w, self._comp_h), (0, 0, 0, 0))
@@ -1066,7 +1165,9 @@ def _build_evaluator(
     render_start: float,
     render_end: float,
     asset_dirs: Sequence[Path],
+    confined_roots: Sequence[Path] | None = None,
 ) -> tuple[_FusionGraphEvaluator, tuple[int, int]]:
+    _check_image_size(resolution[0], resolution[1], "target resolution")
     ast = apply_inputs_to_ast(template, inputs=inputs, lines=lines)
     tools = _extract_tools_from_ast(ast, template)
     if not template.output_tool or template.output_tool not in tools:
@@ -1090,8 +1191,39 @@ def _build_evaluator(
         render_start=render_start,
         render_end=render_end,
         asset_dirs=asset_dirs,
+        confined_roots=confined_roots,
     )
     return evaluator, comp_size
+
+
+def _drain_stream_bounded(stream: Any, out: bytearray, limit: int) -> None:
+    """Drain ``stream`` to EOF on a helper thread, retaining at most the last ``limit`` bytes."""
+    try:
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                break
+            out.extend(chunk)
+            if len(out) > limit:
+                del out[: len(out) - limit]
+    except OSError:
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            stream.close()
+
+
+def _terminate_and_reap(proc: subprocess.Popen[bytes]) -> None:
+    if proc.poll() is None:
+        with contextlib.suppress(OSError):
+            proc.terminate()
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                proc.wait(timeout=2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1134,6 +1266,7 @@ def render_fusion_frame(
     time: float = 0.0,
     render_end: float = 149.0,
     asset_dirs: Sequence[Path] = (),
+    confined_roots: Sequence[Path] | None = None,
     output: Path | None = None,
 ) -> Any:
     """Render a single RGBA frame of a Fusion template and return the ``PIL.Image.Image``.
@@ -1141,10 +1274,11 @@ def render_fusion_frame(
     If ``output`` is provided, saves the RGBA PNG to that path as well.
     """
     Image, _, _, _, _ = _require_pil()
+    _check_image_size(resolution[0], resolution[1], "target resolution")
     tpl = (
         template
         if isinstance(template, FusionTemplate)
-        else load_template(template, asset_dirs=asset_dirs)
+        else load_template(template, asset_dirs=asset_dirs, confined_roots=confined_roots)
     )
     evaluator, comp_size = _build_evaluator(
         tpl,
@@ -1154,6 +1288,7 @@ def render_fusion_frame(
         render_start=0.0,
         render_end=render_end,
         asset_dirs=asset_dirs,
+        confined_roots=confined_roots,
     )
     img = evaluator.render_frame(time)
     if comp_size != resolution:
@@ -1174,15 +1309,20 @@ def render_fusion_clip(
     inputs: Mapping[str, Any] | None = None,
     lines: Sequence[str] = (),
     asset_dirs: Sequence[Path] = (),
+    confined_roots: Sequence[Path] | None = None,
     codec: str = "qtrle",
     ffmpeg_bin: str = "ffmpeg",
+    timeout_s: float | None = None,
 ) -> FusionRenderResult:
     """Render an animated or static Fusion template to an alpha-preserving ``.mov``."""
     Image, _, _, _, _ = _require_pil()
-    if duration_s <= 0:
+    if duration_s <= 0 or not math.isfinite(duration_s):
         raise FusionError("invalid_input_value", f"duration_s must be > 0, got {duration_s}")
-    if fps <= 0:
+    if fps <= 0 or not math.isfinite(fps):
         raise FusionError("invalid_input_value", f"fps must be > 0, got {fps}")
+    if timeout_s is not None and (timeout_s <= 0 or not math.isfinite(timeout_s)):
+        raise FusionError("invalid_input_value", f"timeout_s must be > 0, got {timeout_s}")
+    _check_image_size(resolution[0], resolution[1], "target resolution")
     if codec not in _CODEC_ARGS:
         raise FusionError(
             "invalid_input_value",
@@ -1191,10 +1331,19 @@ def render_fusion_clip(
     if shutil.which(ffmpeg_bin) is None and not Path(ffmpeg_bin).is_file():
         raise FusionError("render_failed", f"ffmpeg binary not found: {ffmpeg_bin!r}")
 
+    deadline = (time.monotonic() + timeout_s) if timeout_s is not None else None
+
+    def _check_deadline(stage: str) -> None:
+        if deadline is not None and time.monotonic() > deadline:
+            raise FusionError(
+                "render_timeout",
+                f"Fusion render timed out after {timeout_s:g}s while {stage}",
+            )
+
     tpl = (
         template
         if isinstance(template, FusionTemplate)
-        else load_template(template, asset_dirs=asset_dirs)
+        else load_template(template, asset_dirs=asset_dirs, confined_roots=confined_roots)
     )
 
     num_frames = max(1, math.ceil(duration_s * fps))
@@ -1207,10 +1356,15 @@ def render_fusion_clip(
         render_start=0.0,
         render_end=render_end,
         asset_dirs=asset_dirs,
+        confined_roots=confined_roots,
     )
 
     out_path = Path(output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    suffix = out_path.suffix or ".mov"
+    tmp_path = (
+        out_path.parent / f".{out_path.stem}.{os.getpid()}.{secrets.token_hex(4)}.tmp{suffix}"
+    )
 
     width, height = resolution
     tc_args: list[str] = []
@@ -1236,7 +1390,7 @@ def render_fusion_clip(
         *tc_args,
         "-movflags",
         "+faststart",
-        str(out_path),
+        str(tmp_path),
     ]
 
     try:
@@ -1252,36 +1406,79 @@ def render_fusion_clip(
     assert proc.stdin is not None
     assert proc.stderr is not None
 
+    stderr_buf = bytearray()
+    stderr_thread = threading.Thread(
+        target=_drain_stream_bounded,
+        args=(proc.stderr, stderr_buf, _MAX_STDERR_BYTES),
+        daemon=True,
+    )
+    stderr_thread.start()
+
     animated = evaluator.is_animated
-    stderr_bytes = b""
+    timed_out = False
     try:
         if not animated:
+            _check_deadline(f"rendering {tpl.name!r}")
             img = evaluator.render_frame(0.0)
             if comp_size != resolution:
                 img = img.resize(resolution, Image.Resampling.LANCZOS)
             raw = img.tobytes()
             for _ in range(num_frames):
+                _check_deadline(f"encoding {tpl.name!r}")
                 proc.stdin.write(raw)
         else:
             for f in range(num_frames):
+                _check_deadline(f"rendering frame {f} of {tpl.name!r}")
                 img = evaluator.render_frame(float(f))
                 if comp_size != resolution:
                     img = img.resize(resolution, Image.Resampling.LANCZOS)
                 proc.stdin.write(img.tobytes())
     except BrokenPipeError:
         pass
+    except FusionError as exc:
+        if exc.code == "render_timeout":
+            timed_out = True
+        _terminate_and_reap(proc)
+        with contextlib.suppress(OSError):
+            proc.stdin.close()
+        stderr_thread.join(timeout=2.0)
+        tmp_path.unlink(missing_ok=True)
+        raise
+    except BaseException:
+        _terminate_and_reap(proc)
+        with contextlib.suppress(OSError):
+            proc.stdin.close()
+        stderr_thread.join(timeout=2.0)
+        tmp_path.unlink(missing_ok=True)
+        raise
     finally:
         with contextlib.suppress(OSError):
             proc.stdin.close()
-        stderr_bytes = proc.stderr.read()
-        proc.wait()
+
+    if not timed_out:
+        try:
+            remaining = None if deadline is None else max(0.05, deadline - time.monotonic())
+            proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            _terminate_and_reap(proc)
+            stderr_thread.join(timeout=2.0)
+            tmp_path.unlink(missing_ok=True)
+            raise FusionError(
+                "render_timeout",
+                f"ffmpeg timed out after {timeout_s:g}s while finishing {tpl.name!r}",
+            ) from None
+
+    stderr_thread.join(timeout=2.0)
 
     if proc.returncode != 0:
-        msg = stderr_bytes.decode("utf-8", errors="replace").strip()
+        tmp_path.unlink(missing_ok=True)
+        msg = bytes(stderr_buf).decode("utf-8", errors="replace").strip()
         raise FusionError(
             "render_failed",
             f"ffmpeg exited {proc.returncode} while rendering {tpl.name!r}: {msg}",
         )
+
+    os.replace(tmp_path, out_path)
 
     return FusionRenderResult(
         output=out_path,

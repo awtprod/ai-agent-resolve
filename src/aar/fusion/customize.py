@@ -20,7 +20,11 @@ __all__ = ["apply_inputs_to_ast", "customize_setting"]
 def _to_lua_value(value: Any, existing: Any) -> Any:
     """Convert a Python override into the appropriate Lua AST node matching ``existing``."""
     if isinstance(value, bool):
-        return 1 if isinstance(existing, (int, float)) and not isinstance(existing, bool) else value
+        return (
+            int(value)
+            if isinstance(existing, (int, float)) and not isinstance(existing, bool)
+            else value
+        )
     if isinstance(value, (int, float)):
         return value
     if isinstance(value, str):
@@ -29,7 +33,12 @@ def _to_lua_value(value: Any, existing: Any) -> Any:
         return value
     if isinstance(value, (list, tuple)) and len(value) == 2:
         x, y = value
-        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+        if (
+            isinstance(x, bool)
+            or isinstance(y, bool)
+            or not isinstance(x, (int, float))
+            or not isinstance(y, (int, float))
+        ):
             raise FusionError(
                 "invalid_input_value",
                 f"point input must contain two numbers, got {value!r}",
@@ -50,6 +59,10 @@ def _set_tool_input(tool: LuaTable, source: str, value: Any) -> None:
     inp = inputs_tbl.get(source)
     if isinstance(inp, LuaTable):
         existing = inp.get("Value")
+        # Constant override replaces any competing expression or spline connection on this input.
+        inp.remove("Expression")
+        inp.remove("SourceOp")
+        inp.remove("Source")
         inp.set("Value", _to_lua_value(value, existing))
     else:
         inputs_tbl.set(

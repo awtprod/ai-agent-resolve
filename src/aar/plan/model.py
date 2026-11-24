@@ -674,6 +674,20 @@ class EditPlan(_Model):
                 loc=loc,
                 input=_plain(value),
             )
+        for index, title in enumerate(self.titles):
+            if title.kind == "graphic":
+                loc = ("titles", index, "kind")
+                field = _dotted(loc)
+                yield InitErrorDetails(
+                    type=PydanticCustomError(
+                        "plan_version",
+                        "{field} value 'graphic' is a version 2 feature, but this plan says "
+                        'version 1: set "version": 2 or use "title" / "lower-third"',
+                        {"field": field},
+                    ),
+                    loc=loc,
+                    input=title.kind,
+                )
 
     def _outro_problems(self) -> Iterable[InitErrorDetails]:
         """Cross-references of the outro: its source, range, audio track and sting."""

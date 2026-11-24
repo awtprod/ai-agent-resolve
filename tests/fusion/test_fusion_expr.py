@@ -101,3 +101,30 @@ def test_invalid_expression_raises_fusion_error() -> None:
 
     # Guard against NaN / Infinity
     assert math.isfinite(float(evaluate_expression("1 / 4", ctx)))
+
+
+def test_short_circuit_and_lua_truthiness() -> None:
+    # Short-circuit prevents division by zero on the untaken branch
+    assert evaluate_expression("time ~= 0 and 1 / time", _ctx(time=0.0)) is False
+    assert evaluate_expression("time ~= 0 and 1 / time", _ctx(time=2.0)) == pytest.approx(0.5)
+    assert evaluate_expression("true or 1 / 0", _ctx()) is True
+    assert evaluate_expression("false or 42", _ctx()) == pytest.approx(42.0)
+
+    # Lua truthiness: 0 is truthy in `and`/`or`, while iif() keeps Fusion checkbox semantics
+    assert evaluate_expression("0 and 5", _ctx()) == pytest.approx(5.0)
+    assert evaluate_expression("0 or 5", _ctx()) == pytest.approx(0.0)
+    assert evaluate_expression("iif(0, 10, 20)", _ctx()) == pytest.approx(20.0)
+    assert evaluate_expression("iif(1, 10, 20)", _ctx()) == pytest.approx(10.0)
+
+
+def test_expression_math_errors_and_depth_limit() -> None:
+    ctx = _ctx()
+    for bad in ("2 ^ 10000", "math.sqrt(-1)", "math.log(0)", "math.exp(10000)", "1 / 0"):
+        with pytest.raises(FusionError) as exc:
+            evaluate_expression(bad, ctx)
+        assert exc.value.code == "expression_error", f"expected expression_error for {bad!r}"
+
+    deep = "(" * 200 + "1" + ")" * 200
+    with pytest.raises(FusionError) as exc_depth:
+        evaluate_expression(deep, ctx)
+    assert exc_depth.value.code == "expression_error"

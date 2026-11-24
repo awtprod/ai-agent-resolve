@@ -42,6 +42,7 @@ from aar.plan.apply.inputs import (
     import_bin,
     import_owners,
     import_step,
+    is_edit_path,
     plan_hash,
     title_templates,
     validate_assemble,
@@ -1103,7 +1104,16 @@ class _Finish:
         setting: str | None = None,
         inputs: dict[str, Any] | None = None,
     ) -> None:
-        if template is None:
+        if setting is not None and not is_edit_path(setting):
+            raise CompileError(
+                "setting_not_on_edit_pc",
+                f"{label}: Fusion setting {setting!r} is not an absolute edit-PC path",
+                "give an absolute Windows or UNC path on the edit PC "
+                "(e.g. C:/Templates/LowerThird.setting)",
+                location=label,
+                setting=setting,
+            )
+        if template is None and setting is None and not inputs:
             self.notes.append(f"{label} has no template name; cannot place it")
             return
         if len(lines) > 4:
@@ -1114,17 +1124,24 @@ class _Finish:
                 "split the title into at most 4 lines",
                 lines=len(lines),
             )
-        media = self.titles.get(template)
-        if media is not None:
-            ref: Any = media.model_dump(mode="json")
-        else:
-            # A template not (yet) in the prepare result is Unresolved, so submit refuses rather
-            # than dropping the title (R8, W29).
-            ref = unresolved(
+        if template is None:
+            ref: Any = unresolved(
                 "title_template",
-                f"pool id of title template {template!r}; run phase 'prepare' and pass "
-                "--prepare-result",
+                f"{label} specifies Fusion setting/inputs without a Resolve media-pool template; "
+                "set 'template' to a Fusion title/composition template in the media pool",
             )
+        else:
+            media = self.titles.get(template)
+            if media is not None:
+                ref = media.model_dump(mode="json")
+            else:
+                # A template not (yet) in the prepare result is Unresolved, so submit refuses rather
+                # than dropping the title (R8, W29).
+                ref = unresolved(
+                    "title_template",
+                    f"pool id of title template {template!r}; run phase 'prepare' and pass "
+                    "--prepare-result",
+                )
         payload: dict[str, Any] = {
             "template": ref,
             "track": track,
@@ -1141,6 +1158,7 @@ class _Finish:
             if lines
             else (", ".join(f"{k}={v}" for k, v in (inputs or {}).items()) or (setting or ""))
         )
+        summary_head = f"template {template!r}" if template is not None else f"setting {setting!r}"
         self._emit(
             "title.place",
             payload,
@@ -1148,7 +1166,7 @@ class _Finish:
                 kind=kind,
                 op="title.place",
                 target=f"{label} on video track {track} (record {record_in}..{record_out})",
-                summary=f"template {template!r}: {detail}",
+                summary=f"{summary_head}: {detail}",
                 resolved=self._resolved(ref),
             ),
         )

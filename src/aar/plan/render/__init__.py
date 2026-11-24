@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from aar.fusion.errors import FusionError
-from aar.fusion.parse import resolve_template_path
+from aar.fusion.parse import ENV_TEMPLATES_DIR, resolve_template_path
 from aar.fusion.render import render_fusion_clip
 from aar.host.transport import sha256_file
 from aar.media import (
@@ -682,7 +682,11 @@ def _join(
 
 
 def _fusion_search_dirs(
-    profile: Profile, media_root: Path | None, extra_dirs: Sequence[Path] | None = None
+    profile: Profile,
+    media_root: Path | None,
+    extra_dirs: Sequence[Path] | None = None,
+    *,
+    include_media_root: bool = True,
 ) -> list[Path]:
     dirs: list[Path] = []
     if extra_dirs:
@@ -695,7 +699,12 @@ def _fusion_search_dirs(
             cand = media_root / cand
         if cand.is_dir() and cand not in dirs:
             dirs.append(cand)
-    if media_root is not None and media_root.is_dir() and media_root not in dirs:
+    if (
+        include_media_root
+        and media_root is not None
+        and media_root.is_dir()
+        and media_root not in dirs
+    ):
         dirs.append(media_root)
     return dirs
 
@@ -705,33 +714,58 @@ def _resolve_fusion_titles(
     profile: Profile,
     media_root: Path | None,
     extra_dirs: Sequence[Path] | None = None,
-) -> tuple[dict[str, Path], list[Path]]:
+    allowed_templates: Sequence[Path] | None = None,
+) -> tuple[dict[str, Path], list[Path], dict[str, list[Path]]]:
     search_dirs = _fusion_search_dirs(profile, media_root, extra_dirs)
+    env_dirs = [
+        Path(p)
+        for p in os.environ.get(ENV_TEMPLATES_DIR, "").strip().split(os.pathsep)
+        if p.strip()
+    ]
+    configured_roots = [*search_dirs, *env_dirs]
+    allow_direct = allowed_templates is None and not configured_roots
     resolved: dict[str, Path] = {}
+    confined_by_loc: dict[str, list[Path]] = {}
     for title in tl.titles:
-        if title.setting:
-            found = resolve_template_path(title.setting, search_dirs=search_dirs)
-            if found is None:
-                raise RenderError(
-                    "fusion_template_missing",
-                    f"{title.location}: Fusion setting {title.setting!r} could not be found",
-                    "give an existing .setting/.drfx path, set [render] fusion_templates_dir, "
-                    "or set AAR_FUSION_TEMPLATES_DIR",
-                    location=title.location,
-                    setting=title.setting,
-                )
-            resolved[title.location] = found
-        elif title.template:
-            found = resolve_template_path(title.template, search_dirs=search_dirs)
-            if found is not None:
-                resolved[title.location] = found
-    return resolved, search_dirs
+        if not title.setting:
+            continue
+        found = resolve_template_path(
+            title.setting,
+            search_dirs=search_dirs,
+            allow_direct=allow_direct,
+            allowed_files=allowed_templates,
+        )
+        if found is None:
+            raise RenderError(
+                "fusion_template_missing",
+                f"{title.location}: Fusion setting {title.setting!r} could not be found",
+                "give an existing .setting/.drfx path, set [render] fusion_templates_dir, "
+                "or set AAR_FUSION_TEMPLATES_DIR",
+                location=title.location,
+                setting=title.setting,
+            )
+        resolved[title.location] = found
+        if allowed_templates is not None:
+            explicit_dirs = _fusion_search_dirs(
+                profile, media_root, extra_dirs, include_media_root=False
+            )
+            roots: list[Path] = [found.parent]
+            for d in explicit_dirs:
+                if d not in roots:
+                    roots.append(d)
+            confined_by_loc[title.location] = roots
+        elif configured_roots:
+            confined_by_loc[title.location] = list(configured_roots)
+        else:
+            confined_by_loc[title.location] = [found.parent]
+    return resolved, search_dirs, confined_by_loc
 
 
 def _prerender_fusion_titles(
     tl: Timeline,
     fusion_templates: dict[str, Path],
-    search_dirs: list[Path],
+    fusion_confined_roots: dict[str, list[Path]],
+    settings: Any,
     work: Path,
 ) -> tuple[dict[str, Path], dict[str, str]]:
     if not fusion_templates:
@@ -747,7 +781,9 @@ def _prerender_fusion_titles(
         if tpl_path is None:
             continue
         out_mov = work / f"fusion_{index:03d}.mov"
-        duration_s = float(Fraction((title.record_out - title.record_in) * fps.den, fps.num))
+        dur_frac = Fraction((title.record_out - title.record_in) * fps.den, fps.num)
+        duration_s = float(dur_frac)
+        roots = fusion_confined_roots.get(title.location, [tpl_path.parent])
         try:
             render_fusion_clip(
                 tpl_path,
@@ -757,11 +793,23 @@ def _prerender_fusion_titles(
                 resolution=res,
                 inputs=title.inputs_dict or None,
                 lines=title.lines,
-                asset_dirs=search_dirs,
+                asset_dirs=roots,
+                confined_roots=roots,
                 codec="qtrle",
                 ffmpeg_bin=ffmpeg_bin,
+                timeout_s=_timeout(settings, [dur_frac]),
             )
         except FusionError as exc:
+            if exc.code == "render_timeout":
+                raise RenderError(
+                    "render_timeout",
+                    f"{title.location}: timed out rendering Fusion graphic {tpl_path.name!r}: "
+                    f"{exc.message}",
+                    "simplify the Fusion template or raise [render] timeout_base_s",
+                    location=title.location,
+                    fusion_code=exc.code,
+                    template=str(tpl_path),
+                ) from None
             raise RenderError(
                 "fusion_render_failed",
                 f"{title.location}: failed to render Fusion graphic {tpl_path.name!r}: "
@@ -786,6 +834,7 @@ def render_plan(
     media_map: MediaMap | None = None,
     media_root: Path | None = None,
     fusion_dirs: Sequence[Path] | None = None,
+    fusion_templates: Sequence[Path] | None = None,
     transcript: Transcript | None = None,
     laughs: LaughMap | None = None,
     overwrite: bool = False,
@@ -843,8 +892,10 @@ def render_plan(
     tl = build_timeline(layout, hub)
     font = find_font(profile.render.font)
     luts = _luts(plan, used, media_root)
-    fusion_templates, resolved_fusion_dirs = _resolve_fusion_titles(
-        tl, profile, media_root, fusion_dirs
+    resolved_fusion_templates, _resolved_fusion_dirs, fusion_confined_roots = (
+        _resolve_fusion_titles(
+            tl, profile, media_root, fusion_dirs, allowed_templates=fusion_templates
+        )
     )
     codec = _codec_args(preset, profile, container)
     if memory_budget_mb is None:
@@ -864,8 +915,8 @@ def render_plan(
                 hub,
                 font,
                 luts,
-                fusion_templates=fusion_templates,
-                fusion_dirs=resolved_fusion_dirs,
+                fusion_templates=resolved_fusion_templates,
+                fusion_confined_roots=fusion_confined_roots,
                 work=work,
                 out=out,
                 report_file=report_file,
@@ -892,7 +943,7 @@ def _render(
     luts: dict[str, Path],
     *,
     fusion_templates: dict[str, Path],
-    fusion_dirs: list[Path],
+    fusion_confined_roots: dict[str, list[Path]],
     work: Path,
     out: Path,
     report_file: Path,
@@ -916,8 +967,10 @@ def _render(
     for n, (sid, path) in enumerate(sorted(luts.items())):
         lut_names[sid] = f"lut{n}{path.suffix.lower()}"
         shutil.copyfile(path, work / lut_names[sid])
-    fusion_clips, fusion_names = _prerender_fusion_titles(tl, fusion_templates, fusion_dirs, work)
     settings = profile.render
+    fusion_clips, fusion_names = _prerender_fusion_titles(
+        tl, fusion_templates, fusion_confined_roots, settings, work
+    )
     samples = sample_at(plan.fps, tl.total_frames)
     mix_passes = _mix(tl, hub, per_pass, settings, work)
     timeline_s = Fraction(tl.total_frames * plan.fps.den, plan.fps.num)

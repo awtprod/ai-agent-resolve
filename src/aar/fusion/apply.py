@@ -4,8 +4,8 @@ Resolve's FCPXML importer cannot instantiate Fusion ``.setting`` macros directly
 ``<effect uid>``. Instead, ``aar plan export`` emits a companion ``.fusion.json`` manifest
 (plus optional customized ``.setting`` files) describing every Fusion placement on the timeline.
 This module defines that manifest schema and provides shared helpers to apply Fusion macro
-inputs or ``.setting`` files to a Resolve ``TimelineItem`` (used both by ``aar.node.ops.build``
-and ``aar fusion apply``).
+inputs or ``.setting`` files to a Resolve ``TimelineItem`` (used by ``aar.node.ops.build`` and
+programmatic callers).
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from aar.fusion.errors import FusionError
 
@@ -23,7 +23,12 @@ __all__ = [
     "FusionManifest",
     "FusionPlacement",
     "apply_fusion_inputs_to_item",
+    "find_loaded_setting_comp",
+    "find_tool_by_name",
+    "iter_comp_tools",
     "load_fusion_manifest",
+    "resolve_tool_input_id",
+    "values_match",
     "write_fusion_manifest",
 ]
 
@@ -65,7 +70,10 @@ def load_fusion_manifest(path: Path) -> FusionManifest:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise FusionError("invalid_setting", f"cannot read Fusion manifest {path}: {exc}") from exc
-    return FusionManifest.model_validate(raw)
+    try:
+        return FusionManifest.model_validate(raw)
+    except ValidationError as exc:
+        raise FusionError("invalid_setting", f"invalid Fusion manifest {path}: {exc}") from exc
 
 
 def write_fusion_manifest(manifest: FusionManifest, path: Path) -> Path:
@@ -78,15 +86,14 @@ def write_fusion_manifest(manifest: FusionManifest, path: Path) -> Path:
     return path
 
 
-def _iter_comp_tools(comp: Any) -> list[Any]:
+def iter_comp_tools(comp: Any) -> list[Any]:
     get_tools = getattr(comp, "GetToolList", None)
-    if get_tools is None:
-        return []
-    raw = get_tools(False)
-    if isinstance(raw, dict):
-        return list(raw.values())
-    if isinstance(raw, list):
-        return raw
+    if callable(get_tools):
+        raw = get_tools(False)
+        if isinstance(raw, dict):
+            return list(raw.values())
+        if isinstance(raw, list):
+            return raw
     return []
 
 
@@ -99,47 +106,223 @@ def _tool_id(tool: Any) -> str:
     return str(getattr(tool, "ID", "") or "")
 
 
-def _values_match(actual: Any, expected: Any) -> bool:
-    if actual == expected:
-        return True
-    if isinstance(actual, str) and isinstance(expected, str):
-        return actual == expected
+def _tool_name(tool: Any) -> str:
+    name = getattr(tool, "Name", None)
+    if isinstance(name, str) and name:
+        return name
+    attrs = getattr(tool, "GetAttrs", None)
+    if callable(attrs):
+        a = attrs()
+        if isinstance(a, dict) and isinstance(a.get("TOOLS_Name"), str):
+            return a["TOOLS_Name"]
+    return ""
+
+
+def _point_dict_to_seq(actual: Mapping[Any, Any], expected_len: int) -> list[Any] | None:
+    """Extract a 1-based Resolve Point table ``{1: x, 2: y[, 3: z]}`` as a sequence."""
+    # Accept integer or float 1-based keys (Lua tables in Resolve Python API).
+    indexed: dict[int, Any] = {}
+    for k, v in actual.items():
+        if isinstance(k, bool):
+            return None
+        if isinstance(k, int):
+            indexed[k] = v
+        elif isinstance(k, float) and k.is_integer():
+            indexed[int(k)] = v
+        else:
+            return None
+    keys = set(indexed)
+    wanted = set(range(1, expected_len + 1))
+    if keys == wanted or (expected_len == 2 and keys == {1, 2, 3}):
+        return [indexed[i] for i in range(1, expected_len + 1)]
+    return None
+
+
+def values_match(actual: Any, expected: Any) -> bool:
+    """Compare a Fusion ``GetInput`` read-back value against an expected Python value.
+
+    Handles bool/checkbox semantics (Resolve may return ``0``/``1`` for bools, while a bool
+    read-back never matches a numeric expectation), float tolerance, and Resolve's 1-based
+    Point table dicts ``{1: x, 2: y[, 3: z]}``.
+    """
+    if isinstance(expected, bool):
+        if isinstance(actual, bool):
+            return actual is expected
+        if isinstance(actual, (int, float)):
+            return float(actual) == (1.0 if expected else 0.0)
+        return False
+    if isinstance(actual, bool):
+        return False
     if isinstance(actual, (int, float)) and isinstance(expected, (int, float)):
         return abs(float(actual) - float(expected)) <= 1e-4
-    if (
-        isinstance(actual, (list, tuple))
-        and isinstance(expected, (list, tuple))
-        and len(actual) == len(expected)
-    ):
-        return all(_values_match(a, e) for a, e in zip(actual, expected, strict=True))
-    return False
-
-
-def _set_and_verify(tool: Any, key: str, value: Any) -> bool:
-    """Call ``tool.SetInput(key, value)`` and verify read-back via ``GetInput(key)``."""
-    set_input = getattr(tool, "SetInput", None)
-    if not callable(set_input):
+    if isinstance(expected, (list, tuple)):
+        if isinstance(actual, Mapping):
+            seq = _point_dict_to_seq(actual, len(expected))
+            if seq is None:
+                return False
+            actual = seq
+        if isinstance(actual, (list, tuple)) and len(actual) == len(expected):
+            return all(values_match(a, e) for a, e in zip(actual, expected, strict=True))
         return False
-    set_input(key, value)
-    get_input = getattr(tool, "GetInput", None)
-    if callable(get_input):
-        after = get_input(key)
-        if after is not None and not _values_match(after, value):
-            return False
-    return True
+    return bool(actual == expected)
 
 
-def _find_tool_by_name(tools: list[Any], name: str) -> Any | None:
+def find_tool_by_name(tools_or_comp: Any, name: str) -> Any | None:
+    tools = tools_or_comp if isinstance(tools_or_comp, list) else iter_comp_tools(tools_or_comp)
     for tool in tools:
-        tname = getattr(tool, "Name", None)
-        if tname == name:
+        if _tool_name(tool) == name:
             return tool
-        attrs = getattr(tool, "GetAttrs", None)
-        if callable(attrs):
-            a = attrs()
-            if isinstance(a, dict) and a.get("TOOLS_Name") == name:
-                return tool
     return None
+
+
+def resolve_tool_input_id(tool: Any, key: str) -> str:
+    """Resolve a published Fusion input display name (``INPS_Name``) to its ``INPS_ID``.
+
+    Returns ``key`` unchanged when it already matches an ``INPS_ID`` or when the tool does not
+    expose ``GetInputList()``.
+    """
+    get_inputs = getattr(tool, "GetInputList", None)
+    if not callable(get_inputs):
+        return key
+    raw = get_inputs()
+    items = (
+        list(raw.values())
+        if isinstance(raw, Mapping)
+        else (list(raw) if isinstance(raw, list) else [])
+    )
+    by_name: str | None = None
+    for inp in items:
+        inp_id: str | None = None
+        inp_name: str | None = None
+        attrs_fn = getattr(inp, "GetAttrs", None)
+        if callable(attrs_fn):
+            attrs = attrs_fn()
+            if isinstance(attrs, Mapping):
+                raw_id = attrs.get("INPS_ID")
+                raw_name = attrs.get("INPS_Name")
+                if isinstance(raw_id, str) and raw_id:
+                    inp_id = raw_id
+                if isinstance(raw_name, str) and raw_name:
+                    inp_name = raw_name
+        if inp_id is None:
+            raw_id = getattr(inp, "ID", None)
+            if isinstance(raw_id, str) and raw_id:
+                inp_id = raw_id
+        if inp_name is None:
+            raw_name = getattr(inp, "Name", None)
+            if isinstance(raw_name, str) and raw_name:
+                inp_name = raw_name
+        if inp_id == key:
+            return key
+        if inp_name == key and inp_id is not None and by_name is None:
+            by_name = inp_id
+    return by_name if by_name is not None else key
+
+
+def _norm_setting_key(path_str: str) -> tuple[str, str]:
+    norm = path_str.replace("\\", "/").strip()
+    stem = Path(norm).stem.casefold()
+    return norm.casefold(), stem
+
+
+def _comp_recorded_settings(obj: Any) -> list[str]:
+    out: list[str] = []
+    single = getattr(obj, "setting_path", None)
+    if isinstance(single, str) and single:
+        out.append(single)
+    many = getattr(obj, "loaded_settings", None)
+    if isinstance(many, (list, tuple, set)):
+        out.extend(s for s in many if isinstance(s, str) and s)
+    return out
+
+
+def _comp_name(comp: Any, listed_name: str | None = None) -> str:
+    if isinstance(listed_name, str) and listed_name:
+        return listed_name
+    name = getattr(comp, "Name", None)
+    if isinstance(name, str) and name:
+        return name
+    attrs_fn = getattr(comp, "GetAttrs", None)
+    if callable(attrs_fn):
+        attrs = attrs_fn()
+        if isinstance(attrs, Mapping) and isinstance(attrs.get("COMPS_Name"), str):
+            return attrs["COMPS_Name"]
+    return ""
+
+
+def find_loaded_setting_comp(item: Any, setting_path: str) -> Any | None:
+    """Return an existing Fusion comp on ``item`` that already matches ``setting_path``, if any."""
+    comp_count_fn = getattr(item, "GetFusionCompCount", None)
+    comp_count = int(comp_count_fn()) if callable(comp_count_fn) else 0
+    if comp_count < 1:
+        return None
+    target_norm, target_stem = _norm_setting_key(setting_path)
+
+    name_list_fn = getattr(item, "GetFusionCompNameList", None)
+    listed_names: dict[int, str] = {}
+    if callable(name_list_fn):
+        raw_names = name_list_fn()
+        if isinstance(raw_names, list):
+            for idx, nm in enumerate(raw_names, start=1):
+                if isinstance(nm, str):
+                    listed_names[idx] = nm
+        elif isinstance(raw_names, Mapping):
+            for k, nm in raw_names.items():
+                if isinstance(nm, str) and isinstance(k, int):
+                    listed_names[k] = nm
+
+    generic_extra: Any | None = None
+    for idx in range(comp_count, 0, -1):
+        comp = item.GetFusionCompByIndex(idx)
+        if comp is None:
+            continue
+        recorded = _comp_recorded_settings(comp)
+        for rec in recorded:
+            rec_norm, rec_stem = _norm_setting_key(rec)
+            if rec_norm == target_norm or (target_stem and rec_stem == target_stem):
+                return comp
+        cname = _comp_name(comp, listed_names.get(idx))
+        if cname and target_stem and Path(cname.replace("\\", "/")).stem.casefold() == target_stem:
+            return comp
+        tools = iter_comp_tools(comp)
+        has_macro = False
+        for tool in tools:
+            if _tool_id(tool) in ("MacroOperator", "GroupOperator"):
+                has_macro = True
+                if target_stem and _tool_name(tool).casefold() == target_stem:
+                    return comp
+        # If an earlier ImportFusionComp appended an unnamed/generic comp (e.g. "Composition 2")
+        # with a macro and no conflicting recorded setting path, recognize it as the extra comp.
+        if (
+            idx > 1
+            and generic_extra is None
+            and has_macro
+            and not recorded
+            and (not cname or cname.casefold().startswith("composition "))
+        ):
+            generic_extra = comp
+
+    return generic_extra
+
+
+def _set_and_verify(tool: Any, key: str, value: Any) -> Any:
+    """Call ``tool.SetInput(key, value)`` and verify read-back via ``GetInput(key)``.
+
+    Returns the read-back value on success; raises :class:`FusionError` (``apply_failed``) if
+    ``SetInput``/``GetInput`` is missing or the read-back is ``None`` or does not match.
+    """
+    set_input = getattr(tool, "SetInput", None)
+    get_input = getattr(tool, "GetInput", None)
+    if not callable(set_input) or not callable(get_input):
+        raise FusionError("apply_failed", f"tool does not support SetInput/GetInput for {key!r}")
+    set_input(key, value)
+    after = get_input(key)
+    if after is None or not values_match(after, value):
+        raise FusionError(
+            "apply_failed",
+            f"SetInput({key!r}) read back {after!r}, expected {value!r}",
+        )
+    return after
 
 
 def apply_fusion_inputs_to_item(
@@ -153,16 +336,18 @@ def apply_fusion_inputs_to_item(
 
     Supports:
     1. Importing a ``.setting`` file via ``item.ImportFusionComp`` / ``comp.LoadSettings`` when
-       ``setting_path`` is supplied and the item does not already contain the requested macro.
-    2. Setting named inputs on a ``MacroOperator`` / ``GroupOperator`` (or ``Tool.Param`` direct
-       targets), with ``GetInput`` read-back verification.
-    3. Falling back to ``TextPlus`` ``StyledText`` when setting plain ``lines`` on a standard
-       Text+ template.
+       ``setting_path`` is supplied, targeting the imported composition (and failing if loading
+       produces no positive evidence).
+    2. Setting named inputs on a ``MacroOperator`` / ``GroupOperator`` (resolving display names via
+       ``GetInputList``) or ``Tool.Param`` direct targets, with ``GetInput`` read-back verification.
+    3. Applying positional ``lines`` alongside ``inputs`` with explicit ``inputs`` taking
+       precedence.
 
     Returns a summary dict ``{"applied": {...}, "tool_id": ..., "loaded_setting": ...}``.
     Raises :class:`FusionError` (``apply_failed``) if a Fusion comp is missing or read-back fails.
     """
     loaded_setting: str | None = None
+    comp: Any = None
     comp_count_fn = getattr(item, "GetFusionCompCount", None)
     comp_count = int(comp_count_fn()) if callable(comp_count_fn) else 0
 
@@ -171,91 +356,106 @@ def apply_fusion_inputs_to_item(
             raise FusionError("template_not_found", f"Fusion .setting not found: {setting_path}")
         import_comp = getattr(item, "ImportFusionComp", None)
         if callable(import_comp):
-            comp = import_comp(str(setting_path))
-            if comp is not None:
+            imported = import_comp(str(setting_path))
+            if imported is not None and not isinstance(imported, bool):
+                comp = imported
                 loaded_setting = str(setting_path)
-                comp_count = max(comp_count, 1)
+            elif imported is True:
+                after_count = int(comp_count_fn()) if callable(comp_count_fn) else comp_count
+                if after_count > comp_count:
+                    comp = item.GetFusionCompByIndex(after_count)
+                    if comp is not None:
+                        loaded_setting = str(setting_path)
+                comp_count = after_count
 
-    if comp_count < 1:
-        add_comp = getattr(item, "AddFusionComp", None)
-        if setting_path is not None and callable(add_comp):
-            comp = add_comp()
+        if loaded_setting is None:
+            if comp is None and comp_count >= 1:
+                comp = item.GetFusionCompByIndex(comp_count)
+            if comp is None:
+                add_comp = getattr(item, "AddFusionComp", None)
+                if callable(add_comp):
+                    comp = add_comp()
             if comp is not None:
                 load_settings = getattr(comp, "LoadSettings", None)
-                if callable(load_settings):
-                    load_settings(str(setting_path))
+                if callable(load_settings) and load_settings(str(setting_path)):
                     loaded_setting = str(setting_path)
-                    comp_count = 1
 
-    if comp_count < 1:
-        raise FusionError("apply_failed", "timeline item has no Fusion composition")
+        if loaded_setting is None:
+            raise FusionError(
+                "apply_failed",
+                f"could not load Fusion .setting {setting_path} onto timeline item",
+            )
+    else:
+        if comp_count < 1:
+            raise FusionError("apply_failed", "timeline item has no Fusion composition")
+        comp = item.GetFusionCompByIndex(comp_count)
 
-    comp = item.GetFusionCompByIndex(1)
     if comp is None:
-        raise FusionError("apply_failed", "GetFusionCompByIndex(1) returned None")
+        raise FusionError("apply_failed", "timeline item Fusion composition is None")
 
-    tools = _iter_comp_tools(comp)
+    tools = iter_comp_tools(comp)
     macros = [t for t in tools if _tool_id(t) in ("MacroOperator", "GroupOperator")]
     text_tools = [t for t in tools if _tool_id(t) == "TextPlus"]
 
     applied: dict[str, Any] = {}
     target_tool_id: str | None = None
-
-    if inputs:
-        primary = macros[0] if macros else (text_tools[0] if text_tools else None)
-        if primary is None:
-            raise FusionError(
-                "apply_failed",
-                "Fusion comp has neither a MacroOperator/GroupOperator nor a TextPlus tool",
-            )
+    primary = macros[0] if macros else (text_tools[0] if text_tools else None)
+    if primary is not None:
         target_tool_id = _tool_id(primary)
+
+    # Track explicit input targets so explicit `inputs` win over positional `lines`.
+    explicit_targets: set[tuple[int, str]] = set()
+    resolved_inputs: list[tuple[str, Any, str, Any]] = []
+    if inputs:
         for key, value in inputs.items():
             if "." in key:
                 tool_name, param = key.split(".", 1)
-                sub_tool = _find_tool_by_name(tools, tool_name)
+                sub_tool = find_tool_by_name(tools, tool_name)
                 if sub_tool is None:
                     raise FusionError(
                         "apply_failed",
                         f"tool {tool_name!r} not found in Fusion comp for input {key!r}",
                     )
-                if not _set_and_verify(sub_tool, param, value):
-                    raise FusionError(
-                        "apply_failed",
-                        f"SetInput({param!r}) on {tool_name!r} did not take effect",
-                    )
-                applied[key] = value
+                param_id = resolve_tool_input_id(sub_tool, param)
+                resolved_inputs.append((key, sub_tool, param_id, value))
+                explicit_targets.add((id(sub_tool), param_id))
             else:
-                if not _set_and_verify(primary, key, value):
+                if primary is None:
                     raise FusionError(
                         "apply_failed",
-                        f"SetInput({key!r}) on {target_tool_id or 'tool'} did not take effect",
+                        "Fusion comp has neither a MacroOperator/GroupOperator nor a TextPlus tool",
                     )
-                applied[key] = value
+                param_id = resolve_tool_input_id(primary, key)
+                resolved_inputs.append((key, primary, param_id, value))
+                explicit_targets.add((id(primary), param_id))
 
-    elif lines:
+    if lines:
         if text_tools:
             target = text_tools[0]
-            target_tool_id = "TextPlus"
-            joined = "\n".join(lines)
-            if not _set_and_verify(target, "StyledText", joined):
-                raise FusionError("apply_failed", "TextPlus StyledText did not take effect")
-            applied["StyledText"] = joined
+            if target_tool_id is None:
+                target_tool_id = "TextPlus"
+            if (id(target), "StyledText") not in explicit_targets:
+                joined = "\n".join(lines)
+                after = _set_and_verify(target, "StyledText", joined)
+                applied["StyledText"] = after
         elif macros:
             target = macros[0]
-            target_tool_id = _tool_id(target)
+            if target_tool_id is None:
+                target_tool_id = _tool_id(target)
             for idx, line in enumerate(lines, start=1):
                 key = f"Input{idx}"
-                if not _set_and_verify(target, key, line):
-                    raise FusionError(
-                        "apply_failed",
-                        f"SetInput({key!r}) on {target_tool_id} did not take effect",
-                    )
-                applied[key] = line
+                if (id(target), key) not in explicit_targets:
+                    after = _set_and_verify(target, key, line)
+                    applied[key] = after
         else:
             raise FusionError(
                 "apply_failed",
                 "Fusion comp has no TextPlus or MacroOperator tool to receive lines",
             )
+
+    for orig_key, target, param_id, value in resolved_inputs:
+        after = _set_and_verify(target, param_id, value)
+        applied[orig_key] = after
 
     return {
         "applied": applied,

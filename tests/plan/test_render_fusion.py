@@ -493,3 +493,177 @@ def test_render_plan_refuses_missing_fusion_setting(tmp_path: Path) -> None:
     with pytest.raises(RenderError) as exc:
         render_plan(plan, load_profile("ccn"), out=tmp_path / "missing.mp4")
     assert exc.value.code == "fusion_template_missing"
+
+
+def test_v1_plan_rejects_graphic_title_kind_without_setting_or_inputs() -> None:
+    from pydantic import ValidationError
+
+    raw = _base_plan_dict(
+        "X:/show/a.mp4",
+        titles=[
+            {
+                "kind": "graphic",
+                "lines": ["Just text"],
+                "record_in": 0,
+                "record_out": 24,
+            }
+        ],
+    )
+    raw["version"] = 1
+    with pytest.raises(ValidationError, match="graphic"):
+        EditPlan.model_validate(raw)
+
+
+def test_plain_title_template_not_hijacked_by_matching_setting(tmp_path: Path) -> None:
+    """A plain title with ``template`` and no ``setting`` must NOT switch to Fusion rendering."""
+    blue_mp4 = _make_solid_clip(tmp_path / "blue.mp4", color="blue", seconds=2.0)
+    # Place a .setting with an unsupported node whose stem matches title.template!
+    # If plain titles still resolved by template stem, this would fail with fusion_render_failed.
+    unsupported = """{
+\tTools = ordered() {
+\t\tPlainName = MacroOperator {
+\t\t\tInputs = ordered() { },
+\t\t\tOutputs = { MainOutput1 = InstanceOutput { SourceOp = "Blur1", Source = "Output", }, },
+\t\t\tTools = ordered() {
+\t\t\t\tBlur1 = Blur { Inputs = { }, },
+\t\t\t},
+\t\t},
+\t},
+}
+"""
+    (tmp_path / "PlainName.setting").write_text(unsupported, encoding="utf-8")
+
+    plan = EditPlan.model_validate(
+        _base_plan_dict(
+            str(blue_mp4),
+            titles=[
+                {
+                    "kind": "lower-third",
+                    "template": "PlainName",
+                    "lines": ["Hello World"],
+                    "record_in": 0,
+                    "record_out": 24,
+                }
+            ],
+        )
+    )
+    out = tmp_path / "plain_title.mp4"
+    res = render_plan(
+        plan,
+        load_profile("ccn"),
+        out=out,
+        media_root=tmp_path,
+        fusion_dirs=[tmp_path],
+    )
+    assert out.is_file()
+    assert "fusion_template" not in res.report["rendered"]["titles"][0]
+
+
+def test_render_plan_confines_fusion_templates_to_allowlist(tmp_path: Path) -> None:
+    blue_mp4 = _make_solid_clip(tmp_path / "blue.mp4", color="blue", seconds=2.0)
+    tpl_allowed = tmp_path / "Allowed.setting"
+    tpl_sibling = tmp_path / "Sibling.setting"
+    tpl_allowed.write_text(GREEN_BOX_MACRO, encoding="utf-8")
+    tpl_sibling.write_text(GREEN_BOX_MACRO, encoding="utf-8")
+
+    plan = EditPlan.model_validate(
+        _base_plan_dict(
+            str(blue_mp4),
+            titles=[
+                {
+                    "kind": "graphic",
+                    "record_in": 0,
+                    "record_out": 24,
+                    "setting": "Sibling.setting",
+                }
+            ],
+        )
+    )
+    with pytest.raises(RenderError) as exc:
+        render_plan(
+            plan,
+            load_profile("ccn"),
+            out=tmp_path / "blocked.mp4",
+            media_root=tmp_path,
+            fusion_templates=[tpl_allowed],
+        )
+    assert exc.value.code == "fusion_template_missing"
+
+
+def test_video_graph_composites_fusion_and_plain_titles_in_lane_order(tmp_path: Path) -> None:
+    from aar.plan.render import build_timeline, render_layout
+    from aar.plan.render.graph import video_graph
+    from aar.plan.render.media import resolve_source
+
+    blue_mp4 = _make_solid_clip(tmp_path / "blue.mp4", color="blue", seconds=2.0)
+    profile = load_profile("ccn")
+    # Overlapping plain title (title 0 -> lane 1) and Fusion graphic (title 1 -> lane 2)
+    plan_plain_below = EditPlan.model_validate(
+        _base_plan_dict(
+            str(blue_mp4),
+            titles=[
+                {
+                    "kind": "lower-third",
+                    "lines": ["Below"],
+                    "record_in": 0,
+                    "record_out": 24,
+                },
+                {
+                    "kind": "graphic",
+                    "setting": "GreenBadge.setting",
+                    "record_in": 0,
+                    "record_out": 24,
+                },
+            ],
+        )
+    )
+    hub = {
+        s.id: resolve_source(s, plan_plain_below.fps, media_map=None, media_root=None)
+        for s in plan_plain_below.sources
+    }
+    tl = build_timeline(render_layout(plan_plain_below, hub, profile), hub)
+    assert tl.titles[0].lane < tl.titles[1].lane
+    fake_mov = tmp_path / "f.mov"
+    g1 = video_graph(
+        tl,
+        hub,
+        span=(0, 24),
+        font="font.ttf",
+        luts={},
+        out_pix_fmt="yuv420p",
+        fusion_clips={tl.titles[1].location: fake_mov},
+    )
+    assert g1.text.index("drawtext=") < g1.text.index("[flane1]overlay=")
+
+    # Reverse: Fusion graphic on lower lane, plain title on higher lane
+    plan_fusion_below = EditPlan.model_validate(
+        _base_plan_dict(
+            str(blue_mp4),
+            titles=[
+                {
+                    "kind": "graphic",
+                    "setting": "GreenBadge.setting",
+                    "record_in": 0,
+                    "record_out": 24,
+                },
+                {
+                    "kind": "lower-third",
+                    "lines": ["Above"],
+                    "record_in": 0,
+                    "record_out": 24,
+                },
+            ],
+        )
+    )
+    tl2 = build_timeline(render_layout(plan_fusion_below, hub, profile), hub)
+    assert tl2.titles[0].lane < tl2.titles[1].lane
+    g2 = video_graph(
+        tl2,
+        hub,
+        span=(0, 24),
+        font="font.ttf",
+        luts={},
+        out_pix_fmt="yuv420p",
+        fusion_clips={tl2.titles[0].location: fake_mov},
+    )
+    assert g2.text.index("[flane0]overlay=") < g2.text.index("drawtext=")

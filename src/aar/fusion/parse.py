@@ -18,6 +18,9 @@ from aar.fusion.errors import FusionError
 
 __all__ = [
     "ENV_TEMPLATES_DIR",
+    "MAX_ASSET_BYTES",
+    "MAX_PARSE_DEPTH",
+    "MAX_SETTING_BYTES",
     "FusionAssetRef",
     "FusionInputSpec",
     "FusionTemplate",
@@ -27,12 +30,16 @@ __all__ = [
     "load_template",
     "map_lines_to_inputs",
     "parse_setting",
+    "read_zip_member_bounded",
     "resolve_asset_path",
     "resolve_template_path",
     "unwrap_value",
 ]
 
 ENV_TEMPLATES_DIR = "AAR_FUSION_TEMPLATES_DIR"
+MAX_PARSE_DEPTH = 128
+MAX_SETTING_BYTES = 16 * 1024 * 1024  # 16 MiB
+MAX_ASSET_BYTES = 64 * 1024 * 1024  # 64 MiB
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LUA_KEYWORDS = frozenset(
@@ -61,6 +68,35 @@ _LUA_KEYWORDS = frozenset(
         "while",
     }
 )
+
+
+def read_zip_member_bounded(zf: zipfile.ZipFile, member: str, max_bytes: int) -> bytes:
+    """Read ``member`` from ``zf`` while capping expanded bytes to ``max_bytes``."""
+    try:
+        info = zf.getinfo(member)
+    except KeyError as exc:
+        raise FusionError("template_not_found", f"archive member not found: {member!r}") from exc
+    if info.file_size > max_bytes:
+        raise FusionError(
+            "invalid_setting",
+            f"archive member {member!r} uncompressed size ({info.file_size} bytes) "
+            f"exceeds limit of {max_bytes} bytes",
+        )
+    chunks: list[bytes] = []
+    total = 0
+    with zf.open(info, "r") as stream:
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise FusionError(
+                    "invalid_setting",
+                    f"archive member {member!r} expanded beyond limit of {max_bytes} bytes",
+                )
+            chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @dataclass
@@ -112,6 +148,11 @@ class LuaTable:
             else (not isinstance(key, str) or not _IDENT_RE.match(key) or key in _LUA_KEYWORDS)
         )
         self.entries.append(LuaEntry(key=key, value=value, bracketed=is_bracketed))
+
+    def remove(self, key: str | int | float) -> bool:
+        before = len(self.entries)
+        self.entries = [entry for entry in self.entries if entry.key != key]
+        return len(self.entries) < before
 
     def positional(self) -> list[Any]:
         return [entry.value for entry in self.entries if entry.key is None]
@@ -256,10 +297,21 @@ def _tokenize(text: str) -> list[_Token]:
                 i += 1
             if text[i : i + 2] in ("0x", "0X"):
                 i += 2
+                hex_start = i
                 while i < n and text[i] in "0123456789abcdefABCDEF":
                     i += 1
                 raw = text[start:i]
-                tokens.append(_Token("NUMBER", int(raw, 16), start))
+                if i == hex_start:
+                    raise FusionError(
+                        "invalid_setting", f"invalid hex literal {raw!r} at offset {start}"
+                    )
+                try:
+                    hex_val = int(raw, 16)
+                except ValueError as exc:
+                    raise FusionError(
+                        "invalid_setting", f"invalid hex literal {raw!r} at offset {start}"
+                    ) from exc
+                tokens.append(_Token("NUMBER", hex_val, start))
                 continue
             is_float = False
             while i < n and text[i].isdigit():
@@ -319,6 +371,18 @@ class _Parser:
     def __init__(self, tokens: list[_Token]) -> None:
         self._tokens = tokens
         self._pos = 0
+        self._depth = 0
+
+    def _enter(self) -> None:
+        self._depth += 1
+        if self._depth > MAX_PARSE_DEPTH:
+            raise FusionError(
+                "invalid_setting",
+                f".setting table nesting exceeds maximum depth of {MAX_PARSE_DEPTH}",
+            )
+
+    def _leave(self) -> None:
+        self._depth -= 1
 
     def _peek(self, offset: int = 0) -> _Token:
         idx = self._pos + offset
@@ -389,12 +453,16 @@ class _Parser:
             # Constructor() { ... } or Constructor(args)
             if self._peek().kind == "(":
                 self._advance()
-                args: list[Any] = []
-                while self._peek().kind != ")":
-                    args.append(self.parse_value())
-                    if self._peek().kind in (",", ";"):
-                        self._advance()
-                self._expect(")")
+                self._enter()
+                try:
+                    args: list[Any] = []
+                    while self._peek().kind != ")":
+                        args.append(self.parse_value())
+                        if self._peek().kind in (",", ";"):
+                            self._advance()
+                    self._expect(")")
+                finally:
+                    self._leave()
                 if self._peek().kind == "{":
                     return self.parse_table(constructor=ident, ordered=False)
                 tbl = LuaTable(constructor=ident, ordered=False)
@@ -410,42 +478,46 @@ class _Parser:
 
     def parse_table(self, *, constructor: str | None, ordered: bool) -> LuaTable:
         self._expect("{")
-        table = LuaTable(constructor=constructor, ordered=ordered)
-        while self._peek().kind != "}":
-            tok = self._peek()
-            if tok.kind == "[":
-                self._advance()
-                key_tok = self._peek()
-                if key_tok.kind in ("STRING", "NUMBER"):
+        self._enter()
+        try:
+            table = LuaTable(constructor=constructor, ordered=ordered)
+            while self._peek().kind != "}":
+                tok = self._peek()
+                if tok.kind == "[":
+                    self._advance()
+                    key_tok = self._peek()
+                    if key_tok.kind in ("STRING", "NUMBER"):
+                        key = self._advance().value
+                    else:
+                        raise FusionError(
+                            "invalid_setting",
+                            f"expected string or number key inside [...] at offset {key_tok.pos}",
+                        )
+                    self._expect("]")
+                    self._expect("=")
+                    value = self.parse_value()
+                    table.entries.append(LuaEntry(key=key, value=value, bracketed=True))
+                elif tok.kind == "IDENT" and self._peek(1).kind == "=":
                     key = self._advance().value
+                    self._advance()  # '='
+                    value = self.parse_value()
+                    table.entries.append(LuaEntry(key=key, value=value, bracketed=False))
                 else:
+                    value = self.parse_value()
+                    table.entries.append(LuaEntry(key=None, value=value, bracketed=False))
+
+                if self._peek().kind in (",", ";"):
+                    self._advance()
+                elif self._peek().kind != "}":
+                    nxt = self._peek()
                     raise FusionError(
                         "invalid_setting",
-                        f"expected string or number key inside [...] at offset {key_tok.pos}",
+                        f"expected ',' or '}}' in table at offset {nxt.pos}, found {nxt.kind!r}",
                     )
-                self._expect("]")
-                self._expect("=")
-                value = self.parse_value()
-                table.entries.append(LuaEntry(key=key, value=value, bracketed=True))
-            elif tok.kind == "IDENT" and self._peek(1).kind == "=":
-                key = self._advance().value
-                self._advance()  # '='
-                value = self.parse_value()
-                table.entries.append(LuaEntry(key=key, value=value, bracketed=False))
-            else:
-                value = self.parse_value()
-                table.entries.append(LuaEntry(key=None, value=value, bracketed=False))
-
-            if self._peek().kind in (",", ";"):
-                self._advance()
-            elif self._peek().kind != "}":
-                nxt = self._peek()
-                raise FusionError(
-                    "invalid_setting",
-                    f"expected ',' or '}}' in table at offset {nxt.pos}, found {nxt.kind!r}",
-                )
-        self._expect("}")
-        return table
+            self._expect("}")
+            return table
+        finally:
+            self._leave()
 
 
 def parse_setting(text: str) -> LuaTable:
@@ -675,31 +747,80 @@ def _env_template_dirs() -> list[Path]:
     return [Path(p) for p in raw.split(os.pathsep) if p.strip()]
 
 
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(root.resolve())
+    except OSError:
+        return False
+
+
+def _has_parent_traversal(raw: str) -> bool:
+    return any(part == ".." for part in re.split(r"[\\/]", raw))
+
+
+def _is_windows_drive_path(raw: str) -> bool:
+    return len(raw) >= 2 and raw[1] == ":" and raw[0].isalpha()
+
+
 def resolve_template_path(
     ref: str | Path,
     *,
     search_dirs: Sequence[Path] = (),
+    allow_direct: bool = True,
+    allowed_files: Sequence[Path] | None = None,
 ) -> Path | None:
     """Resolve a template path or name to an existing ``.setting`` or ``.drfx`` file.
 
-    Checks direct file paths first, then ``search_dirs`` and ``AAR_FUSION_TEMPLATES_DIR``
-    (exact relative path, ``<ref>.setting``, ``<ref>.drfx``, and recursive stem matches).
+    When ``allowed_files`` is supplied, resolution is strictly restricted to that exact file list
+    (no directory traversal or scanning). When ``allow_direct=False``, candidates (including
+    symlink targets) must resolve inside ``search_dirs`` / ``AAR_FUSION_TEMPLATES_DIR``.
     """
     raw = str(ref).strip()
-    if not raw:
+    if not raw or "\x00" in raw:
+        return None
+    if _has_parent_traversal(raw):
         return None
 
-    direct = Path(raw)
-    if direct.is_file() and direct.suffix.lower() in (".setting", ".drfx"):
-        return direct.resolve()
+    if allowed_files is not None:
+        approved: list[Path] = []
+        seen_files: set[Path] = set()
+        for f in allowed_files:
+            rf = Path(f).expanduser().resolve()
+            if rf.is_file() and rf.suffix.lower() in (".setting", ".drfx") and rf not in seen_files:
+                seen_files.add(rf)
+                approved.append(rf)
+        raw_path = Path(raw)
+        raw_lower = raw.lower()
+        has_sep = "/" in raw or "\\" in raw
+        for rf in approved:
+            if has_sep and raw_path.is_absolute():
+                try:
+                    if raw_path.resolve() == rf:
+                        return rf
+                except OSError:
+                    continue
+            if rf.name.lower() == raw_lower:
+                return rf
+            if not has_sep and rf.stem.lower() == Path(raw).stem.lower():
+                return rf
+        return None
 
     dirs: list[Path] = []
     seen: set[Path] = set()
     for d in (*search_dirs, *_env_template_dirs()):
-        resolved = d.expanduser()
+        resolved = d.expanduser().resolve()
         if resolved.is_dir() and resolved not in seen:
             seen.add(resolved)
             dirs.append(resolved)
+
+    direct = Path(raw)
+    if direct.is_file() and direct.suffix.lower() in (".setting", ".drfx"):
+        if allow_direct or any(_is_within(direct, base) for base in dirs):
+            return direct.resolve()
+        return None
+
+    if direct.is_absolute() or _is_windows_drive_path(raw):
+        return None
 
     rel = Path(raw)
     candidates_rel = [rel]
@@ -710,15 +831,18 @@ def resolve_template_path(
     for base in dirs:
         for cand in candidates_rel:
             p = base / cand
-            if p.is_file() and p.suffix.lower() in (".setting", ".drfx"):
+            if p.is_file() and p.suffix.lower() in (".setting", ".drfx") and _is_within(p, base):
                 return p.resolve()
 
     # Stem lookup inside search_dirs (common Resolve layout: Edit/Titles/<Pack>/<Name>.setting)
     target_stem = Path(raw).stem.lower()
+    raw_lower = raw.lower()
     for base in dirs:
         for ext in ("*.setting", "*.drfx"):
             for match in sorted(base.rglob(ext)):
-                if match.stem.lower() == target_stem or match.name.lower() == raw.lower():
+                if (
+                    match.stem.lower() == target_stem or match.name.lower() == raw_lower
+                ) and _is_within(match, base):
                     return match.resolve()
     return None
 
@@ -729,20 +853,27 @@ def resolve_asset_path(
     template_path: Path,
     asset_dirs: Sequence[Path] = (),
     archive_members: Sequence[str] = (),
+    confined_roots: Sequence[Path] | None = None,
 ) -> tuple[Path | None, str | None]:
     """Resolve a Fusion ``Loader`` ``Filename`` (including ``Templates:...`` paths).
 
     Returns ``(filesystem_path, archive_member)`` — at most one is non-``None``.
+    Filesystem resolutions (including symlink targets) are confined to approved roots and reject
+    ``..`` traversal segments.
     """
     cleaned = filename.replace("\\", "/").strip()
-    if not cleaned:
+    if not cleaned or "\x00" in cleaned:
         return None, None
 
     # Strip Fusion path-map prefix like "Templates:" or "Setting:"
+    has_prefix = ":" in cleaned and not _is_windows_drive_path(cleaned)
     rel_part = cleaned
-    if ":" in cleaned and not (len(cleaned) >= 2 and cleaned[1] == ":" and cleaned[0].isalpha()):
+    if has_prefix:
         _, rel_part = cleaned.split(":", 1)
         rel_part = rel_part.lstrip("/")
+
+    if _has_parent_traversal(cleaned) or _has_parent_traversal(rel_part):
+        return None, None
 
     basename = Path(rel_part).name
 
@@ -752,36 +883,62 @@ def resolve_asset_path(
         if rel_part in norm_members:
             return None, norm_members[rel_part]
         for norm, orig in norm_members.items():
-            if norm.endswith(f"/{rel_part}") or Path(norm).name == basename:
+            if norm.endswith(f"/{rel_part}"):
+                return None, orig
+        for norm, orig in norm_members.items():
+            if basename and Path(norm).name == basename:
                 return None, orig
 
-    # 2. Direct filesystem path
-    direct = Path(cleaned)
-    if direct.is_file():
-        return direct.resolve(), None
-
-    # 3. Search template directory, parent template roots, asset_dirs, and env template dirs
-    roots: list[Path] = [template_path.parent]
-    # Walk up to 4 parents to handle Templates:Edit/Titles/... relative to a Templates root
-    cur = template_path.parent
-    for _ in range(4):
-        if cur.parent == cur:
-            break
-        cur = cur.parent
-        roots.append(cur)
-    roots.extend(asset_dirs)
-    roots.extend(_env_template_dirs())
-
+    # 2. Compute approved roots (strictly confined; never climb arbitrary parent directories)
+    approved_roots: list[Path] = []
     seen: set[Path] = set()
-    for root in roots:
-        if not root.is_dir():
-            continue
-        r = root.resolve()
-        if r in seen:
-            continue
-        seen.add(r)
-        for candidate in (r / rel_part, r / basename):
-            if candidate.is_file():
+
+    def _add_root(candidate_root: Path) -> None:
+        resolved = candidate_root.expanduser().resolve()
+        if resolved.is_dir() and resolved not in seen:
+            seen.add(resolved)
+            approved_roots.append(resolved)
+
+    if confined_roots is not None:
+        bound_roots = [r.expanduser().resolve() for r in confined_roots if r.expanduser().is_dir()]
+        if not bound_roots:
+            return None, None
+        tpl_parent = template_path.expanduser().resolve().parent
+        if any(_is_within(tpl_parent, b) for b in bound_roots):
+            _add_root(tpl_parent)
+        for d in asset_dirs:
+            rd = d.expanduser().resolve()
+            if rd.is_dir() and any(_is_within(rd, b) for b in bound_roots):
+                _add_root(rd)
+        for b in bound_roots:
+            _add_root(b)
+    else:
+        _add_root(template_path.parent)
+        for d in asset_dirs:
+            _add_root(d)
+        for d in _env_template_dirs():
+            _add_root(d)
+
+    if not approved_roots:
+        return None, None
+
+    # 3. Direct filesystem path ONLY if it resolves within an approved root
+    direct = Path(cleaned)
+    if (direct.is_absolute() or _is_windows_drive_path(cleaned)) and direct.is_file():
+        if any(_is_within(direct, root) for root in approved_roots):
+            return direct.resolve(), None
+        return None, None
+
+    # 4. Relative resolution inside approved roots (rejecting symlink escapes)
+    if Path(rel_part).is_absolute() or _is_windows_drive_path(rel_part):
+        return None, None
+
+    for root in approved_roots:
+        candidates = [root / rel_part]
+        if basename and basename not in (".", ".."):
+            candidates.append(root / basename)
+        for candidate in candidates:
+            if candidate.is_file() and _is_within(candidate, root):
                 return candidate.resolve(), None
 
     return None, None
@@ -913,6 +1070,7 @@ def _extract_assets_and_fonts(
     template_path: Path,
     asset_dirs: Sequence[Path],
     archive_members: Sequence[str],
+    confined_roots: Sequence[Path] | None = None,
 ) -> tuple[list[FusionAssetRef], list[tuple[str, str]]]:
     assets: list[FusionAssetRef] = []
     fonts: list[tuple[str, str]] = []
@@ -932,6 +1090,7 @@ def _extract_assets_and_fonts(
                                 template_path=template_path,
                                 asset_dirs=asset_dirs,
                                 archive_members=archive_members,
+                                confined_roots=confined_roots,
                             )
                             assets.append(
                                 FusionAssetRef(
@@ -959,6 +1118,7 @@ def load_template(
     *,
     member: str | None = None,
     asset_dirs: Sequence[Path] = (),
+    confined_roots: Sequence[Path] | None = None,
 ) -> FusionTemplate:
     """Load and parse a Fusion ``.setting`` file or ``.drfx`` zip archive."""
     tpl_path = Path(path)
@@ -996,17 +1156,34 @@ def load_template(
                     chosen_member = matches[0]
                 else:
                     chosen_member = sorted(setting_members)[0]
-                text = zf.read(chosen_member).decode("utf-8-sig")
+                raw_bytes = read_zip_member_bounded(zf, chosen_member, MAX_SETTING_BYTES)
+                try:
+                    text = raw_bytes.decode("utf-8-sig")
+                except UnicodeDecodeError as exc:
+                    raise FusionError(
+                        "invalid_setting", f"cannot decode {chosen_member!r} as UTF-8: {exc}"
+                    ) from exc
         except zipfile.BadZipFile as exc:
             raise FusionError(
                 "invalid_setting", f"corrupt .drfx archive {tpl_path}: {exc}"
             ) from exc
     else:
         try:
+            size = tpl_path.stat().st_size
+            if size > MAX_SETTING_BYTES:
+                raise FusionError(
+                    "invalid_setting",
+                    f"Fusion template {tpl_path} ({size} bytes) exceeds limit of "
+                    f"{MAX_SETTING_BYTES} bytes",
+                )
             text = tpl_path.read_text(encoding="utf-8-sig")
         except OSError as exc:
             raise FusionError(
                 "template_not_found", f"cannot read Fusion template {tpl_path}: {exc}"
+            ) from exc
+        except UnicodeDecodeError as exc:
+            raise FusionError(
+                "invalid_setting", f"cannot decode Fusion template {tpl_path} as UTF-8: {exc}"
             ) from exc
 
     ast = parse_setting(text)
@@ -1018,6 +1195,7 @@ def load_template(
         template_path=tpl_path,
         asset_dirs=asset_dirs,
         archive_members=archive_members,
+        confined_roots=confined_roots,
     )
 
     return FusionTemplate(
@@ -1061,7 +1239,8 @@ def map_lines_to_inputs(
 
     Returns a mapping ``{spec.name: value}`` validated against ``template.inputs``.
     Raises :class:`FusionError` (``unknown_input``) when an explicit input key does not match any
-    published input (or ``Tool.Param``) on the template.
+    published input (or ``Tool.Param``) on the template, or ``invalid_input_value`` when more
+    positional ``lines`` are supplied than the template's published text inputs.
     """
     resolved: dict[str, Any] = {}
 
@@ -1069,8 +1248,26 @@ def map_lines_to_inputs(
         string_specs = [
             s for s in template.inputs if s.value_type == "string" or s.source == "StyledText"
         ]
-        for line, spec in zip(lines, string_specs, strict=False):
-            resolved[spec.name] = line
+        if len(lines) > len(string_specs):
+            if (
+                len(string_specs) == 1
+                and template.operator_type not in ("MacroOperator", "GroupOperator")
+                and string_specs[0].source == "StyledText"
+            ):
+                resolved[string_specs[0].name] = "\n".join(lines)
+            else:
+                raise FusionError(
+                    "invalid_input_value",
+                    f"template {template.name!r} has {len(string_specs)} text input(s), "
+                    f"but {len(lines)} line(s) were supplied",
+                    {
+                        "available_text_inputs": [s.name for s in string_specs],
+                        "lines": len(lines),
+                    },
+                )
+        else:
+            for line, spec in zip(lines, string_specs, strict=False):
+                resolved[spec.name] = line
 
     if inputs:
         for raw_key, val in inputs.items():

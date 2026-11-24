@@ -337,56 +337,66 @@ def video_graph(
         )
         lines.append(f"[{acc}][{label}]overlay=0:0:shortest=1[o{lane}]")
         acc = f"o{lane}"
-    # Native Fusion title/graphic overlays: pre-rendered RGBA .mov clips composited with alpha.
+    # Titles & native Fusion graphics: composite in ascending (lane, index) order so higher
+    # lanes draw on top regardless of whether a title is a pre-rendered Fusion RGBA .mov or
+    # a plain drawtext filter. Consecutive drawtext filters stay batched and any trailing batch
+    # remains in ``tail`` so zero-Fusion plans produce identical filtergraphs.
     fusion_map = fusion_clips or {}
-    for number, title in enumerate(tl.titles):
-        if title.location not in fusion_map:
-            continue
-        if title.record_out <= b0 or title.record_in >= b1:
-            continue
-        ov_start = max(title.record_in, b0)
-        ov_end = min(title.record_out, b1)
-        clip_in = ov_start - title.record_in
-        clip_out = ov_end - title.record_in
-        in_idx = len(uses)
-        uses.append(
-            Use(
-                fusion_map[title.location],
-                0,
-                None,
-                Fraction((title.record_out - title.record_in) * fps.den, fps.num),
-            )
-        )
-        fclip = f"fclip{number}"
-        lines.append(
-            f"[{in_idx}:0]trim=start_frame={clip_in}:end_frame={clip_out},"
-            f"scale={res.width}:{res.height},setsar=1,format={LANE_PIX_FMT},"
-            f"settb={_tb(fps)},setpts=N[{fclip}]"
-        )
-        f_members: list[str] = []
-        if ov_start > b0:
-            lines.append(_gap(f"g{gaps}", ov_start - b0, fps, res, clear=True))
-            f_members.append(f"g{gaps}")
-            gaps += 1
-        f_members.append(fclip)
-        if ov_end < b1:
-            lines.append(_gap(f"g{gaps}", b1 - ov_end, fps, res, clear=True))
-            f_members.append(f"g{gaps}")
-            gaps += 1
-        flane = f"flane{number}"
-        lines.append(
-            _join(f_members, flane, fps) if len(f_members) > 1 else f"[{f_members[0]}]null[{flane}]"
-        )
-        lines.append(f"[{acc}][{flane}]overlay=0:0:shortest=1[of{number}]")
-        acc = f"of{number}"
     titles: list[TitleText] = []
     drawn: list[str] = []
-    if font is not None:
-        for number, title in enumerate(tl.titles):
-            if title.location in fusion_map:
-                continue
-            if title.record_out <= b0 or title.record_in >= b1:
-                continue
+    dt_flushes = 0
+    active_titles = [
+        (number, title)
+        for number, title in enumerate(tl.titles)
+        if title.record_out > b0 and title.record_in < b1
+    ]
+    active_titles.sort(key=lambda item: (item[1].lane, item[0]))
+    for number, title in active_titles:
+        if title.location in fusion_map:
+            if drawn:
+                dt_label = f"dt{dt_flushes}"
+                lines.append(f"[{acc}]{','.join(drawn)}[{dt_label}]")
+                acc = dt_label
+                dt_flushes += 1
+                drawn = []
+            ov_start = max(title.record_in, b0)
+            ov_end = min(title.record_out, b1)
+            clip_in = ov_start - title.record_in
+            clip_out = ov_end - title.record_in
+            in_idx = len(uses)
+            uses.append(
+                Use(
+                    fusion_map[title.location],
+                    0,
+                    None,
+                    Fraction((title.record_out - title.record_in) * fps.den, fps.num),
+                )
+            )
+            fclip = f"fclip{number}"
+            lines.append(
+                f"[{in_idx}:0]trim=start_frame={clip_in}:end_frame={clip_out},"
+                f"scale={res.width}:{res.height},setsar=1,format={LANE_PIX_FMT},"
+                f"settb={_tb(fps)},setpts=N[{fclip}]"
+            )
+            f_members: list[str] = []
+            if ov_start > b0:
+                lines.append(_gap(f"g{gaps}", ov_start - b0, fps, res, clear=True))
+                f_members.append(f"g{gaps}")
+                gaps += 1
+            f_members.append(fclip)
+            if ov_end < b1:
+                lines.append(_gap(f"g{gaps}", b1 - ov_end, fps, res, clear=True))
+                f_members.append(f"g{gaps}")
+                gaps += 1
+            flane = f"flane{number}"
+            lines.append(
+                _join(f_members, flane, fps)
+                if len(f_members) > 1
+                else f"[{f_members[0]}]null[{flane}]"
+            )
+            lines.append(f"[{acc}][{flane}]overlay=0:0:shortest=1[of{number}]")
+            acc = f"of{number}"
+        elif font is not None:
             filters, texts = _title_filters(title, number, res, font, (b0, b1))
             drawn += filters
             titles += texts

@@ -48,7 +48,7 @@ from aar.recipes.ccn.export_files import copy_out, export_root, safe_name
 from aar.recipes.ccn.faults import qa_failure_upstream, upstream_failure
 from aar.recipes.ccn.guide import artifact_get, build_guide
 from aar.recipes.ccn.handoff import NOTES_MIME, NOTES_SUFFIX, handoff_notes
-from aar.recipes.ccn.params import CcnLongformParams, check_hub_file
+from aar.recipes.ccn.params import CcnLongformParams, check_hub_file, media_root
 from aar.recipes.ccn.scratch import drop_scratch, op_scratch
 from aar.recipes.ccn.transcript import (
     StepInterrupted,
@@ -484,7 +484,8 @@ def render_step(ctx: StepContext) -> StepOutput:
     transcript = _transcript(ctx)
     laughs = _laughs(ctx)
     check_cancelled(ctx)
-    fusion_dirs = sorted({Path(p).parent for p in params.fusion_templates}) or None
+    allowed_templates = [Path(p) for p in params.fusion_templates]
+    root = media_root()
     folder = op_scratch(ctx, "aar-render")
     try:
         out = folder / f"{safe_name(_need(ctx, 'stub', 'timeline'))}.review.mp4"
@@ -494,7 +495,8 @@ def render_step(ctx: StepContext) -> StepOutput:
                 profile,
                 out=out,
                 preset="review",
-                fusion_dirs=fusion_dirs,
+                media_root=Path(root) if root is not None else None,
+                fusion_templates=allowed_templates,
                 transcript=transcript,
                 laughs=laughs,
             )

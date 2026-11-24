@@ -36,6 +36,12 @@ from typing import Annotated, Any, Literal
 
 from pydantic import AfterValidator, Field, model_validator
 
+from aar.fusion.apply import (
+    find_loaded_setting_comp,
+    find_tool_by_name,
+    resolve_tool_input_id,
+    values_match,
+)
 from aar.node.ops import raw
 from aar.node.ops.framework import (
     ItemRef,
@@ -1402,7 +1408,7 @@ class TitleSpec(OpModel):
         default_factory=dict,
         description="Named Fusion MacroOperator / Tool.Param inputs to set and read back.",
     )
-    setting: str | None = Field(
+    setting: EditPath | None = Field(
         default=None,
         description="Optional Fusion .setting file path on the edit PC to load into the comp.",
     )
@@ -1451,79 +1457,103 @@ class TitleResult(OpModel):
     titles: list[TitlePlaced]
 
 
-def _fusion_values_equal(have: Any, want: Any) -> bool:
-    if have == want:
-        return True
-    if (
-        isinstance(have, (int, float))
-        and not isinstance(have, bool)
-        and isinstance(want, (int, float))
-        and not isinstance(want, bool)
-    ):
-        return abs(float(have) - float(want)) <= 1e-4
-    if isinstance(have, (list, tuple)) and isinstance(want, (list, tuple)):
-        return len(have) == len(want) and all(
-            _fusion_values_equal(a, b) for a, b in zip(have, want, strict=True)
+def _select_title_comp(item: Any, spec: TitleSpec, *, uid: str, reused: bool) -> tuple[Any, bool]:
+    """Select (and if needed load ``spec.setting`` into) the target Fusion composition.
+
+    Returns ``(comp, loaded_setting)``. Never falls back silently when ``spec.setting`` cannot be
+    loaded, and recognizes an already-loaded setting when ``reused=True`` so retries stay
+    idempotent.
+    """
+    comp_count_fn = getattr(item, "GetFusionCompCount", None)
+    comp_count = int(comp_count_fn()) if callable(comp_count_fn) else 0
+
+    if spec.setting is None:
+        comp = (
+            item.GetFusionCompByIndex(comp_count)
+            if comp_count >= 1
+            else item.GetFusionCompByIndex(1)
         )
-    return False
+        if comp is None:
+            raise OpError(
+                "title_has_no_comp",
+                f"title item {uid} has no Fusion composition",
+                "use a Fusion title template (a Fusion composition clip holding "
+                "a Text+ or MacroOperator)",
+                item_id=uid,
+            )
+        return comp, False
 
+    if reused:
+        existing = find_loaded_setting_comp(item, spec.setting)
+        if existing is not None:
+            return existing, False
 
-def _comp_tools(comp: Any) -> list[Any]:
-    get_tools = getattr(comp, "GetToolList", None)
-    if callable(get_tools):
-        raw = get_tools(False)
-        if isinstance(raw, dict):
-            return list(raw.values())
-        if isinstance(raw, list):
-            return raw
-    return []
-
-
-def _find_tool_by_name(comp: Any, name: str) -> Any | None:
-    for tool in _comp_tools(comp):
-        if getattr(tool, "Name", None) == name:
-            return tool
-        attrs = getattr(tool, "GetAttrs", None)
-        if callable(attrs):
-            a = attrs()
-            if isinstance(a, dict) and a.get("TOOLS_Name") == name:
-                return tool
-    return None
-
-
-def _title_apply(item: Any, spec: TitleSpec) -> tuple[bool, str, dict[str, Any]]:
-    """Apply Text+ lines and/or Fusion macro inputs (and optional ``.setting``) to ``item``."""
-    uid = str(item.GetUniqueId())
+    comp: Any = None
     loaded_setting = False
-    if spec.setting is not None:
-        import_comp = getattr(item, "ImportFusionComp", None)
-        if callable(import_comp):
-            imported = import_comp(spec.setting)
-            if imported is not None:
-                loaded_setting = True
-    comp = item.GetFusionCompByIndex(1)  # [I] the template's Text+/Macro lives in its first comp
-    if comp is None:
-        raise OpError(
-            "title_has_no_comp",
-            f"title item {uid} has no Fusion composition",
-            "use a Fusion title template (a Fusion composition clip holding "
-            "a Text+ or MacroOperator)",
-            item_id=uid,
-        )
-    if spec.setting is not None and not loaded_setting:
+    import_comp = getattr(item, "ImportFusionComp", None)
+    if callable(import_comp):
+        imported = import_comp(spec.setting)
+        if imported is not None and not isinstance(imported, bool):
+            comp = imported
+            loaded_setting = True
+        elif imported is True:
+            after_count = int(comp_count_fn()) if callable(comp_count_fn) else comp_count
+            if after_count > comp_count:
+                comp = item.GetFusionCompByIndex(after_count)
+                if comp is not None:
+                    loaded_setting = True
+            comp_count = after_count
+
+    if not loaded_setting:
+        if comp is None:
+            comp = (
+                item.GetFusionCompByIndex(comp_count)
+                if comp_count >= 1
+                else item.GetFusionCompByIndex(1)
+            )
+        if comp is None:
+            raise OpError(
+                "title_has_no_comp",
+                f"title item {uid} has no Fusion composition",
+                "use a Fusion title template (a Fusion composition clip holding "
+                "a Text+ or MacroOperator)",
+                item_id=uid,
+            )
         load_settings = getattr(comp, "LoadSettings", None)
         if callable(load_settings) and load_settings(spec.setting):
             loaded_setting = True
+
+    if not loaded_setting or comp is None:
+        raise OpError(
+            "title_setting_not_loaded",
+            f"title item {uid} could not load Fusion setting {spec.setting!r}",
+            "check that the .setting file exists on the edit PC and is a valid Fusion "
+            "composition or macro",
+            item_id=uid,
+            setting=spec.setting,
+        )
+    return comp, True
+
+
+def _title_apply(
+    item: Any, spec: TitleSpec, *, reused: bool = False
+) -> tuple[bool, str, dict[str, Any]]:
+    """Apply Text+ lines and/or Fusion macro inputs (and optional ``.setting``) to ``item``."""
+    uid = str(item.GetUniqueId())
+    comp, loaded_setting = _select_title_comp(item, spec, uid=uid, reused=reused)
 
     macro = comp.FindToolByID("MacroOperator") or comp.FindToolByID("GroupOperator")
     text_tool = comp.FindToolByID("TextPlus")  # [I] the Text+ registry id is "TextPlus"
 
     changed = loaded_setting
     applied_inputs: dict[str, Any] = {}
-    read_back_text = "\n".join(spec.lines)
 
+    # Resolve explicit `spec.inputs` first so explicit overrides take precedence over positional
+    # `spec.lines` (matching `aar.fusion.customize.apply_inputs_to_ast`).
+    primary = macro or text_tool
+    resolved_inputs: list[tuple[str, Any, str, Any]] = []
+    explicit_targets: set[tuple[int, str]] = set()
     if spec.inputs:
-        primary = macro or text_tool
         if primary is None and not all("." in k for k in spec.inputs):
             raise OpError(
                 "title_has_no_text_tool",
@@ -1534,7 +1564,7 @@ def _title_apply(item: Any, spec: TitleSpec) -> tuple[bool, str, dict[str, Any]]
         for key, want in spec.inputs.items():
             if "." in key:
                 tool_name, param = key.split(".", 1)
-                target = _find_tool_by_name(comp, tool_name)
+                target = find_tool_by_name(comp, tool_name)
                 if target is None:
                     raise OpError(
                         "title_has_no_text_tool",
@@ -1545,53 +1575,40 @@ def _title_apply(item: Any, spec: TitleSpec) -> tuple[bool, str, dict[str, Any]]
                     )
             else:
                 target, param = primary, key
-            have = target.GetInput(param)
-            if _fusion_values_equal(have, want):
-                applied_inputs[key] = have
-                continue
-            target.SetInput(param, want)
-            after = target.GetInput(param)
-            if not _fusion_values_equal(after, want):
-                raise OpError(
-                    "title_text_not_applied",
-                    f"title item {uid} input {key!r} reads back {after!r}, not {want!r}",
-                    "set the input by hand in the Inspector; the item stays in place and a rerun "
-                    "reuses it",
-                    item_id=uid,
-                    input=key,
-                    read_back=after,
-                )
-            changed = True
-            applied_inputs[key] = after
-        if not read_back_text:
-            str_vals = [str(v) for v in applied_inputs.values() if isinstance(v, str)]
-            read_back_text = "\n".join(str_vals)
-        return changed, read_back_text, applied_inputs
+            param_id = resolve_tool_input_id(target, param)
+            resolved_inputs.append((key, target, param_id, want))
+            explicit_targets.add((id(target), param_id))
 
+    line_read_backs: list[str] = []
+    macro_line_slots: dict[int, str] = {}
     if spec.lines:
-        text = "\n".join(spec.lines)  # [I] StyledText separates lines with "\n"
         if text_tool is not None:
-            have = text_tool.GetInput("StyledText")  # [I] the Text+ text input is "StyledText"
-            if have == text:
-                return changed, text, applied_inputs
-            # [I] With no time, SetInput sets the constant value of an input that is not animated.
-            # Its return value is not relied on: only the read-back counts.
-            text_tool.SetInput("StyledText", text)
-            after = text_tool.GetInput("StyledText")
-            if after != text:
-                raise OpError(
-                    "title_text_not_applied",
-                    f"title item {uid} reads back text {after!r}, not {text!r}",
-                    "set the text by hand in the Inspector; the item stays in place and a rerun "
-                    "reuses it",
-                    item_id=uid,
-                    read_back=after,
-                )
-            return True, after, applied_inputs
-        if macro is not None:
-            out_lines: list[str] = []
+            if (id(text_tool), "StyledText") not in explicit_targets:
+                text = "\n".join(spec.lines)  # [I] StyledText separates lines with "\n"
+                have = text_tool.GetInput("StyledText")  # [I] the Text+ text input is "StyledText"
+                if have == text:
+                    line_read_backs = [str(have)]
+                else:
+                    # [I] With no time, SetInput sets the constant value of an input that is not
+                    # animated. Its return value is not relied on: only the read-back counts.
+                    text_tool.SetInput("StyledText", text)
+                    after = text_tool.GetInput("StyledText")
+                    if after != text:
+                        raise OpError(
+                            "title_text_not_applied",
+                            f"title item {uid} reads back text {after!r}, not {text!r}",
+                            "set the text by hand in the Inspector; the item stays in place and a "
+                            "rerun reuses it",
+                            item_id=uid,
+                            read_back=after,
+                        )
+                    changed = True
+                    line_read_backs = [str(after)]
+        elif macro is not None:
             for idx, line in enumerate(spec.lines, start=1):
                 key = f"Input{idx}"
+                if (id(macro), key) in explicit_targets:
+                    continue
                 have = macro.GetInput(key)
                 if have != line:
                     macro.SetInput(key, line)
@@ -1607,18 +1624,60 @@ def _title_apply(item: Any, spec: TitleSpec) -> tuple[bool, str, dict[str, Any]]
                             read_back=after,
                         )
                     changed = True
-                    out_lines.append(str(after))
-                    applied_inputs[key] = after
+                    val_rb = after
                 else:
-                    out_lines.append(str(have))
-                    applied_inputs[key] = have
-            return changed, "\n".join(out_lines), applied_inputs
-        raise OpError(
-            "title_has_no_text_tool",
-            f"the composition of title item {uid} has no Text+ tool",
-            "use a template whose composition holds a Text+ tool",
-            item_id=uid,
-        )
+                    val_rb = have
+                macro_line_slots[idx] = str(val_rb)
+                applied_inputs[key] = val_rb
+        else:
+            raise OpError(
+                "title_has_no_text_tool",
+                f"the composition of title item {uid} has no Text+ tool",
+                "use a template whose composition holds a Text+ tool",
+                item_id=uid,
+            )
+
+    for key, target, param_id, want in resolved_inputs:
+        have = target.GetInput(param_id)
+        if have is not None and values_match(have, want):
+            val_rb = have
+        else:
+            target.SetInput(param_id, want)
+            after = target.GetInput(param_id)
+            if after is None or not values_match(after, want):
+                raise OpError(
+                    "title_text_not_applied",
+                    f"title item {uid} input {key!r} reads back {after!r}, not {want!r}",
+                    "set the input by hand in the Inspector; the item stays in place and a rerun "
+                    "reuses it",
+                    item_id=uid,
+                    input=key,
+                    read_back=after,
+                )
+            changed = True
+            val_rb = after
+        applied_inputs[key] = val_rb
+        if spec.lines:
+            if text_tool is not None and target is text_tool and param_id == "StyledText":
+                line_read_backs = [str(val_rb)]
+            elif macro is not None and target is macro and param_id.startswith("Input"):
+                suffix = param_id[5:]
+                if suffix.isdigit():
+                    idx = int(suffix)
+                    if 1 <= idx <= len(spec.lines):
+                        macro_line_slots[idx] = str(val_rb)
+
+    if spec.lines:
+        if text_tool is not None:
+            read_back_text = "\n".join(line_read_backs)
+        else:
+            read_back_text = "\n".join(
+                macro_line_slots[i] for i in range(1, len(spec.lines) + 1) if i in macro_line_slots
+            )
+    elif applied_inputs:
+        read_back_text = "\n".join(str(v) for v in applied_inputs.values() if isinstance(v, str))
+    else:
+        read_back_text = ""
 
     return changed, read_back_text, applied_inputs
 
@@ -1715,7 +1774,7 @@ def title_place(env: OpEnv, params: TitleParams) -> TitleResult:
                 )
             else:
                 item = reuse
-            changed, read_back, applied_inputs = _title_apply(item, spec)
+            changed, read_back, applied_inputs = _title_apply(item, spec, reused=reuse is not None)
         except OpError as exc:
             more = {"placed_item_id": placed_id} if placed_id is not None else {}
             raise _partial(exc, done, **more) from exc
