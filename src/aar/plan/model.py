@@ -41,6 +41,7 @@ from pydantic import (
     ConfigDict,
     Field,
     GetJsonSchemaHandler,
+    StrictBool,
     StrictInt,
     ValidationError,
     field_validator,
@@ -74,11 +75,12 @@ PlanVersion = Annotated[Literal[1, 2], BeforeValidator(_whole_number_version)]
 V2_PLAN_FIELDS = ("template", "head", "outro", "audio_tracks", "end_fade_frames")
 V2_SOURCE_FIELDS = ("color", "frame_size", "start_timecode", "start_timecode_rate")
 V2_SEGMENT_FIELDS = ("transform",)
+V2_TITLE_FIELDS = ("setting", "inputs")
 
 ShotSize = Literal["close", "medium", "wide", "unknown"]
 TargetKind = Literal["longform", "short"]
 VideoTransitionType = Literal["cut", "dissolve", "dip", "wipe", "push", "other"]
-TitleKind = Literal["title", "lower-third"]
+TitleKind = Literal["title", "lower-third", "graphic"]
 
 
 class _Model(BaseModel):
@@ -448,13 +450,44 @@ class OutroTransition(_Model):
         return self
 
 
-class Sting(_Model):
-    """Version 2. Text shown over the start of the outro."""
+FusionInputValue = StrictBool | Finite | str | list[Finite]
 
-    lines: list[Name] = Field(min_length=1, description="Text lines shown together.")
+
+def _check_fusion_inputs(inputs: dict[str, FusionInputValue]) -> dict[str, FusionInputValue]:
+    for key, val in inputs.items():
+        if isinstance(val, list) and len(val) != 2:
+            raise ValueError(
+                f"Fusion point input {key!r} must have 2 numbers [x, y], got {len(val)}"
+            )
+    return inputs
+
+
+class Sting(_Model):
+    """Version 2. Text or Fusion graphic shown over the start of the outro."""
+
+    lines: list[Name] = Field(default_factory=list, description="Text lines shown together.")
     start: int = Field(default=0, ge=0, description="Frames from the outro's first frame.")
     frames: int = Field(gt=0, description="How long the text shows, in frames.")
     template: Name | None = Field(default=None, description="Title template / preset name.")
+    setting: Name | None = Field(
+        default=None,
+        description="Version 2. Fusion .setting or .drfx template path or name.",
+    )
+    inputs: dict[Name, FusionInputValue] = Field(
+        default_factory=dict,
+        description="Version 2. Published Fusion macro input overrides.",
+    )
+
+    @field_validator("inputs")
+    @classmethod
+    def _validate_inputs(cls, value: dict[str, FusionInputValue]) -> dict[str, FusionInputValue]:
+        return _check_fusion_inputs(value)
+
+    @model_validator(mode="after")
+    def _lines_or_fusion(self) -> Sting:
+        if not self.lines and self.setting is None and not self.inputs:
+            raise ValueError("sting needs at least one line (or a Fusion setting/inputs)")
+        return self
 
 
 class Outro(_Model):
@@ -495,10 +528,29 @@ class AudioTrack(_Model):
 
 class Title(_Model):
     kind: TitleKind = "title"
-    lines: list[Name] = Field(min_length=1)
+    lines: list[Name] = Field(default_factory=list)
     record_in: int = Field(ge=0)
     record_out: int = Field(ge=0, description="End frame (exclusive).")
     template: str | None = Field(default=None, description="Template / preset name.")
+    setting: Name | None = Field(
+        default=None,
+        description="Version 2. Fusion .setting or .drfx template path or name.",
+    )
+    inputs: dict[Name, FusionInputValue] = Field(
+        default_factory=dict,
+        description="Version 2. Published Fusion macro input overrides.",
+    )
+
+    @field_validator("inputs")
+    @classmethod
+    def _validate_inputs(cls, value: dict[str, FusionInputValue]) -> dict[str, FusionInputValue]:
+        return _check_fusion_inputs(value)
+
+    @model_validator(mode="after")
+    def _lines_or_fusion(self) -> Title:
+        if not self.lines and self.setting is None and not self.inputs:
+            raise ValueError("title needs at least one line (or a Fusion setting/inputs)")
+        return self
 
 
 class CaptionStyle(_Model):
@@ -535,8 +587,8 @@ class EditPlan(_Model):
     version: PlanVersion = Field(
         default=PLAN_VERSION,
         description="Plan format version. 2 (the default) adds template, head, outro, "
-        "audio_tracks, end_fade_frames, Source.color and Segment.transform; a plan that says "
-        "1 may not use them.",
+        "audio_tracks, end_fade_frames, Source.color, Segment.transform and Fusion title "
+        "setting/inputs; a plan that says 1 may not use them.",
     )
     project: str = Field(min_length=1, description="Resolve project name.")
     timeline: str = Field(min_length=1, description="Target timeline name.")
@@ -604,11 +656,12 @@ class EditPlan(_Model):
         for kind, items, names in (
             ("sources", self.sources, V2_SOURCE_FIELDS),
             ("segments", self.segments, V2_SEGMENT_FIELDS),
+            ("titles", self.titles, V2_TITLE_FIELDS),
         ):
             for index, item in enumerate(items):
                 used.extend(((kind, index, name), getattr(item, name)) for name in names)
         for loc, value in used:
-            if value is None or value == []:
+            if value is None or value == [] or value == {}:
                 continue  # null or empty: the field is not used
             field = _dotted(loc)
             yield InitErrorDetails(
@@ -621,6 +674,20 @@ class EditPlan(_Model):
                 loc=loc,
                 input=_plain(value),
             )
+        for index, title in enumerate(self.titles):
+            if title.kind == "graphic":
+                loc = ("titles", index, "kind")
+                field = _dotted(loc)
+                yield InitErrorDetails(
+                    type=PydanticCustomError(
+                        "plan_version",
+                        "{field} value 'graphic' is a version 2 feature, but this plan says "
+                        'version 1: set "version": 2 or use "title" / "lower-third"',
+                        {"field": field},
+                    ),
+                    loc=loc,
+                    input=title.kind,
+                )
 
     def _outro_problems(self) -> Iterable[InitErrorDetails]:
         """Cross-references of the outro: its source, range, audio track and sting."""

@@ -344,7 +344,7 @@ class _Writer:
             duration=self.t(title.record_out - title.record_in),
         )
         text = ET.SubElement(element, "text")
-        ET.SubElement(text, "text-style", ref=style_id).text = "\n".join(title.lines)
+        ET.SubElement(text, "text-style", ref=style_id).text = "\n".join(title.placeholder_lines)
         definition = ET.SubElement(element, "text-style-def", id=style_id)
         ET.SubElement(
             definition,

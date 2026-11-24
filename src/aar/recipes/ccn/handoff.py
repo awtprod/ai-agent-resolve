@@ -137,6 +137,33 @@ def handoff_notes(
         listed.append("  Nothing: the FCPXML carries every feature this plan uses.")
     lines += _section("NOT IN THE FCPXML: REDO IN RESOLVE", listed, len(missing), report_id)
 
+    fusion_raw = report.get("fusion")
+    fusion_placements = (
+        _rows(fusion_raw.get("placements")) if isinstance(fusion_raw, Mapping) else []
+    )
+    if fusion_placements:
+        flines: list[str] = [
+            "  Beside this file: a .fusion.json manifest lists every Fusion graphic placement.",
+            "  Use 'aar fusion customize' or 'aar fusion render' on the hub, or apply the",
+            "  templates in Resolve's Fusion page matching the track and times below.",
+        ]
+        for p in fusion_placements[:MAX_LISTED]:
+            tpl = _line(p.get("setting") or p.get("template") or "Fusion graphic")
+            track = p.get("track", "?")
+            t_in = p.get("record_in_s", 0.0)
+            t_out = p.get("record_out_s", 0.0)
+            kind = _line(p.get("kind") or "graphic")
+            flines.append(
+                f"  - [{p.get('index', '?')}] {kind} on V{track} ({t_in}s..{t_out}s): {tpl}"
+            )
+            inputs = p.get("inputs")
+            if isinstance(inputs, Mapping) and inputs:
+                pairs = ", ".join(f"{_line(k)}={_line(v)}" for k, v in inputs.items())
+                flines.append(f"      inputs: {pairs}")
+            elif isinstance(p.get("lines"), list) and p["lines"]:
+                flines.append(f"      lines: {_line(' | '.join(str(x) for x in p['lines']))}")
+        lines += _section("FUSION GRAPHICS", flines, len(fusion_placements), report_id)
+
     media = _rows(report.get("media"))
     paths = sorted({_line(m.get("windows_path") or m.get("src") or "?") for m in media})
     lines += _section(

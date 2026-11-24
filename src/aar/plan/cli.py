@@ -459,12 +459,33 @@ def report_path(out: Path) -> Path:
     return out.with_name(f"{out.stem}.report.json")
 
 
-def _write_export(out: Path, report: Path, fcpxml: str, body: str, overwrite: bool) -> None:
-    """The FCPXML and its report land together or not at all (round 3, item 9)."""
-    write_pair([(out, fcpxml.encode("utf-8")), (report, body.encode("utf-8"))], overwrite=overwrite)
+def fusion_manifest_path(out: Path) -> Path:
+    """Where the companion Fusion manifest goes: beside the FCPXML, ``<name>.fusion.json``."""
+    return out.with_name(f"{out.stem}.fusion.json")
 
 
-def _render_export(report: dict[str, Any], out: Path, report_file: Path) -> str:
+def _write_export(
+    out: Path,
+    report: Path,
+    fcpxml: str,
+    body: str,
+    overwrite: bool,
+    *,
+    extra: list[tuple[Path, bytes]] | None = None,
+) -> None:
+    """The FCPXML, its report, and any companion Fusion manifest land together or not at all."""
+    files: list[tuple[Path, bytes | Path]] = [
+        (out, fcpxml.encode("utf-8")),
+        (report, body.encode("utf-8")),
+    ]
+    if extra:
+        files.extend(extra)
+    write_pair(files, overwrite=overwrite)
+
+
+def _render_export(
+    report: dict[str, Any], out: Path, report_file: Path, fusion_file: Path | None = None
+) -> str:
     timeline = report["timeline"]
     counts = report["exported"]
     lines = [
@@ -512,6 +533,8 @@ def _render_export(report: dict[str, Any], out: Path, report_file: Path) -> str:
         + ", ".join(f"{v} {k}" for k, v in report["self_check"]["checked"].items()),
         f"report: {report_file}",
     ]
+    if fusion_file is not None:
+        lines.append(f"fusion manifest: {fusion_file}")
     return "\n".join(lines) + "\n"
 
 
@@ -562,14 +585,26 @@ def _cmd_export(args: argparse.Namespace) -> int:
     out: Path = args.out
     report_file = report_path(out)
     report = {**result.report, "file": out.name}
+    extra: list[tuple[Path, bytes]] = []
+    fusion_file: Path | None = None
+    if "fusion" in result.report:
+        fusion_file = fusion_manifest_path(out)
+        fusion_payload = {**result.report["fusion"], "fcpxml": out.name}
+        report["fusion"] = fusion_payload
+        extra.append(
+            (
+                fusion_file,
+                (json.dumps(fusion_payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+            )
+        )
     body = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
     try:
-        _write_export(out, report_file, result.fcpxml, body, args.overwrite)
+        _write_export(out, report_file, result.fcpxml, body, args.overwrite, extra=extra)
     except ExportError as exc:
         return _export_refusal(exc, as_json)
     except OSError as exc:
         return _input_error(type(exc).__name__, str(exc), [], as_json)
-    text = body if as_json else _render_export(report, out, report_file)
+    text = body if as_json else _render_export(report, out, report_file, fusion_file)
     return cli_io.emit(_PROG, text)
 
 

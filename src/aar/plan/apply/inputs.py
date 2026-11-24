@@ -38,6 +38,14 @@ _EDIT_PATH = TypeAdapter(EditPath)
 #: Source fields added after ``plan_hash`` was first used (S18): left out while unset, so the
 #: hash of every plan written before them, and the phase results stamped with it, stay the same.
 _LATER_SOURCE_FIELDS = ("frame_size", "start_timecode", "start_timecode_rate")
+_LATER_TITLE_FIELDS = ("setting", "inputs")
+
+
+def _strip_unset_title_fields(item: dict[str, Any]) -> None:
+    if item.get("setting") is None:
+        item.pop("setting", None)
+    if not item.get("inputs"):
+        item.pop("inputs", None)
 
 
 def plan_hash(plan: EditPlan) -> str:
@@ -46,6 +54,11 @@ def plan_hash(plan: EditPlan) -> str:
         for name in _LATER_SOURCE_FIELDS:
             if source.get(name) is None:
                 source.pop(name, None)
+    for title in data.get("titles", ()):
+        _strip_unset_title_fields(title)
+    outro = data.get("outro")
+    if isinstance(outro, dict) and isinstance(outro.get("sting"), dict):
+        _strip_unset_title_fields(outro["sting"])
     canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 

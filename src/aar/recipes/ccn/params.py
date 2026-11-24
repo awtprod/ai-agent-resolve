@@ -84,6 +84,8 @@ class CcnLongformParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     sources: list[SourceParam] = Field(min_length=1, max_length=MAX_SOURCES)
+    extra_sources: list[SourceParam] = Field(default_factory=list, max_length=MAX_SOURCES)
+    fusion_templates: list[str] = Field(default_factory=list, max_length=16)
     recording_id: Segment
     timeline: TitleText
     kind: Literal["longform", "short"] = "longform"
@@ -95,6 +97,17 @@ class CcnLongformParams(BaseModel):
     laughs: bool = False
     allow_unknown_timecode: bool = False
 
+    @field_validator("fusion_templates")
+    @classmethod
+    def _fusion_templates(cls, value: list[str]) -> list[str]:
+        for idx, path in enumerate(value):
+            check_hub_file(path)
+            if not path.lower().endswith((".setting", ".drfx")):
+                raise ValueError(
+                    f"fusion_templates[{idx}] {path!r} must be a .setting or .drfx file"
+                )
+        return value
+
     @field_validator("media_map")
     @classmethod
     def _media_map(cls, value: dict[str, str]) -> dict[str, str]:
@@ -104,37 +117,45 @@ class CcnLongformParams(BaseModel):
             raise ValueError(exc.message) from None
         return value
 
+    def _source_label(self, index: int) -> str:
+        if index < len(self.sources):
+            return f"sources[{index}]"
+        return f"extra_sources[{index - len(self.sources)}]"
+
     @model_validator(mode="after")
     def _distinct(self) -> CcnLongformParams:
-        dup = first_duplicate([source.path for source in self.sources])
+        all_sources = [*self.sources, *self.extra_sources]
+        dup = first_duplicate([source.path for source in all_sources])
         if dup is not None:
-            n = dup[1]
+            a, b = dup
             raise ValueError(
-                f"sources[{n}] {self.sources[n].path!r} is a file already given (sources"
-                f"[{dup[0]}]: the same path, a symlink or a hardlink)"
+                f"{self._source_label(b)} {all_sources[b].path!r} is a file already given "
+                f"({self._source_label(a)}: the same path, a symlink or a hardlink)"
             )
         return self
 
     @model_validator(mode="after")
     def _covered(self) -> CcnLongformParams:
         mapping = media_map_from_mapping(self.media_map)
+        all_sources = [*self.sources, *self.extra_sources]
         refs = []
-        for n, source in enumerate(self.sources):
+        for n, source in enumerate(all_sources):
+            label = self._source_label(n)
             try:
                 refs.append(
                     media_ref(Source(id=source.id or f"source-{n}", media=source.path), mapping)
                 )
             except ExportError as exc:
                 raise ValueError(
-                    f"sources[{n}] {source.path!r}: the media map does not give the edit PC's "
+                    f"{label} {source.path!r}: the media map does not give the edit PC's "
                     f"path for it ({exc.message})"
                 ) from None
         clash = windows_collision(refs)
         if clash is not None:
             a, b = (next(n for n, ref in enumerate(refs) if ref is found) for found in clash)
             raise ValueError(
-                f"sources[{a}] and sources[{b}]: {collision_text(*clash)}; rename one of them "
-                "on the hub so the names differ by more than case"
+                f"{self._source_label(a)} and {self._source_label(b)}: {collision_text(*clash)}; "
+                "rename one of them on the hub so the names differ by more than case"
             )
         return self
 

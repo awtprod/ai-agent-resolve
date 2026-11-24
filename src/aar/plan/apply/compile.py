@@ -42,6 +42,7 @@ from aar.plan.apply.inputs import (
     import_bin,
     import_owners,
     import_step,
+    is_edit_path,
     plan_hash,
     title_templates,
     validate_assemble,
@@ -1072,6 +1073,8 @@ class _Finish:
                 t.record_out,
                 list(t.lines),
                 kind="title",
+                setting=t.setting,
+                inputs=dict(t.inputs),
             )
         if _has_sting(self.plan):
             sting = self.plan.outro.sting  # type: ignore[union-attr]
@@ -1084,6 +1087,8 @@ class _Finish:
                 start + sting.frames,
                 list(sting.lines),
                 kind="sting",
+                setting=sting.setting,
+                inputs=dict(sting.inputs),
             )
 
     def _one_title(
@@ -1096,8 +1101,19 @@ class _Finish:
         lines: list[str],
         *,
         kind: str,
+        setting: str | None = None,
+        inputs: dict[str, Any] | None = None,
     ) -> None:
-        if template is None:
+        if setting is not None and not is_edit_path(setting):
+            raise CompileError(
+                "setting_not_on_edit_pc",
+                f"{label}: Fusion setting {setting!r} is not an absolute edit-PC path",
+                "give an absolute Windows or UNC path on the edit PC "
+                "(e.g. C:/Templates/LowerThird.setting)",
+                location=label,
+                setting=setting,
+            )
+        if template is None and setting is None and not inputs:
             self.notes.append(f"{label} has no template name; cannot place it")
             return
         if len(lines) > 4:
@@ -1108,31 +1124,49 @@ class _Finish:
                 "split the title into at most 4 lines",
                 lines=len(lines),
             )
-        media = self.titles.get(template)
-        if media is not None:
-            ref: Any = media.model_dump(mode="json")
-        else:
-            # A template not (yet) in the prepare result is Unresolved, so submit refuses rather
-            # than dropping the title (R8, W29).
-            ref = unresolved(
+        if template is None:
+            ref: Any = unresolved(
                 "title_template",
-                f"pool id of title template {template!r}; run phase 'prepare' and pass "
-                "--prepare-result",
+                f"{label} specifies Fusion setting/inputs without a Resolve media-pool template; "
+                "set 'template' to a Fusion title/composition template in the media pool",
             )
+        else:
+            media = self.titles.get(template)
+            if media is not None:
+                ref = media.model_dump(mode="json")
+            else:
+                # A template not (yet) in the prepare result is Unresolved, so submit refuses rather
+                # than dropping the title (R8, W29).
+                ref = unresolved(
+                    "title_template",
+                    f"pool id of title template {template!r}; run phase 'prepare' and pass "
+                    "--prepare-result",
+                )
+        payload: dict[str, Any] = {
+            "template": ref,
+            "track": track,
+            "record_in": record_in,
+            "record_out": record_out,
+            "lines": lines,
+        }
+        if inputs:
+            payload["inputs"] = dict(inputs)
+        if setting is not None:
+            payload["setting"] = setting
+        detail = (
+            " / ".join(lines)
+            if lines
+            else (", ".join(f"{k}={v}" for k, v in (inputs or {}).items()) or (setting or ""))
+        )
+        summary_head = f"template {template!r}" if template is not None else f"setting {setting!r}"
         self._emit(
             "title.place",
-            {
-                "template": ref,
-                "track": track,
-                "record_in": record_in,
-                "record_out": record_out,
-                "lines": lines,
-            },
+            payload,
             FinishIntent(
                 kind=kind,
                 op="title.place",
                 target=f"{label} on video track {track} (record {record_in}..{record_out})",
-                summary=f"template {template!r}: {' / '.join(lines)}",
+                summary=f"{summary_head}: {detail}",
                 resolved=self._resolved(ref),
             ),
         )
@@ -1388,6 +1422,12 @@ def _check_steps(steps: list[Step]) -> None:
 def _step(phase: Phase, op: str, name: str, params: dict[str, Any], summary: str) -> Step:
     if not find_unresolved(params):
         params = get_op(op).params.model_validate(params).model_dump(mode="json")
+        if op == "title.place":
+            for title in params.get("titles", ()):
+                if not title.get("inputs"):
+                    title.pop("inputs", None)
+                if title.get("setting") is None:
+                    title.pop("setting", None)
     return Step(phase=phase, op=op, name=name, params=params, summary=summary)
 
 

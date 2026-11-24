@@ -16,9 +16,14 @@ Every plan feature FCPXML cannot carry is listed in the export report, with its 
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+from aar.fusion.apply import FusionManifest, FusionPlacement
+from aar.fusion.customize import customize_setting
+from aar.fusion.parse import load_template, resolve_template_path
 from aar.plan.apply.inputs import plan_hash
 from aar.plan.export.errors import EXPORT_CODES, ExportError
 from aar.plan.export.fcpxml import FCPXML_VERSION, write_fcpxml
@@ -36,6 +41,7 @@ __all__ = [
     "ExportError",
     "ExportResult",
     "VerifyResult",
+    "build_fusion_manifest",
     "build_layout",
     "export_fcpxml",
     "layout_for",
@@ -169,8 +175,9 @@ def _titles(layout: Layout) -> list[dict[str, Any]]:
     the first free lane above for one that overlaps another (Resolve trims overlaps on a
     track)."""
     fps = layout.plan.fps
-    return [
-        {
+    rows: list[dict[str, Any]] = []
+    for t in layout.titles:
+        row: dict[str, Any] = {
             "location": t.location,
             "kind": t.kind,
             "name": t.name,
@@ -180,8 +187,65 @@ def _titles(layout: Layout) -> list[dict[str, Any]]:
             "lane": t.lane,
             "imported_video": f"V{t.lane + 1}",
         }
-        for t in layout.titles
-    ]
+        if t.setting is not None:
+            row["setting"] = t.setting
+        if t.inputs:
+            row["inputs"] = t.inputs_dict
+        rows.append(row)
+    return rows
+
+
+def build_fusion_manifest(
+    layout: Layout,
+    *,
+    fcpxml_name: str | None = None,
+    customized_dir: Path | None = None,
+    search_dirs: Sequence[Path] = (),
+) -> FusionManifest:
+    """Build a :class:`FusionManifest` for every title/graphic in ``layout`` that specifies a
+    Fusion ``setting`` or ``inputs``. When ``customized_dir`` is given, also writes customized
+    ``.setting`` files for placements whose template can be resolved."""
+    plan = layout.plan
+    fps = plan.fps.num / plan.fps.den
+    placements: list[FusionPlacement] = []
+    for t in layout.titles:
+        if t.setting is None and not t.inputs:
+            continue
+        idx = len(placements)
+        inputs = t.inputs_dict
+        customized_rel: str | None = None
+        if customized_dir is not None and t.setting is not None:
+            tpl_path = resolve_template_path(t.setting, search_dirs=search_dirs)
+            if tpl_path is not None and tpl_path.suffix.lower() in (".setting", ".drfx"):
+                safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in tpl_path.stem)
+                out_file = customized_dir / f"fusion_{idx:03d}_{safe}.setting"
+                tpl = load_template(tpl_path)
+                customized_text = customize_setting(tpl, inputs=inputs, lines=list(t.lines))
+                out_file.parent.mkdir(parents=True, exist_ok=True)
+                out_file.write_text(customized_text, encoding="utf-8")
+                customized_rel = out_file.name
+        placements.append(
+            FusionPlacement(
+                index=idx,
+                kind=t.kind,
+                template=t.template,
+                setting=t.setting,
+                customized_setting=customized_rel,
+                track=t.lane + 1,
+                record_in_s=round(t.record_in / fps, 6),
+                record_out_s=round(t.record_out / fps, 6),
+                duration_s=round((t.record_out - t.record_in) / fps, 6),
+                lines=list(t.lines),
+                inputs=inputs,
+            )
+        )
+    return FusionManifest(
+        timeline_name=plan.timeline,
+        fps=fps,
+        resolution=(plan.resolution.width, plan.resolution.height),
+        fcpxml=fcpxml_name,
+        placements=placements,
+    )
 
 
 def build_report(
@@ -191,7 +255,7 @@ def build_report(
     (or Resolve's import) cannot carry."""
     plan = layout.plan
     res = plan.resolution
-    return {
+    report: dict[str, Any] = {
         "format": "fcpxml",
         "fcpxml_version": FCPXML_VERSION,
         "fcpxml_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -249,6 +313,9 @@ def build_report(
         "lint_warnings": [{"rule": f.rule, "message": f.message} for f in warnings],
         "self_check": check.as_dict(),
     }
+    if any(t.setting is not None or t.inputs for t in layout.titles):
+        report["fusion"] = build_fusion_manifest(layout).model_dump(mode="json")
+    return report
 
 
 def export_fcpxml(

@@ -29,6 +29,8 @@ RENDER_ONLY_CODES = frozenset(
         "render_too_large",
         "bad_output_path",
         "tool_missing",
+        "fusion_template_missing",
+        "fusion_render_failed",
         "render_failed",
         "render_timeout",
         "render_incomplete",
@@ -39,7 +41,9 @@ RENDER_ONLY_CODES = frozenset(
 RENDER_CODES = EXPORT_CODES | RENDER_ONLY_CODES
 
 #: Codes for a render that was started and failed in ffmpeg (the CLI exits 3, not 2).
-RUNTIME_CODES = frozenset({"render_failed", "render_timeout", "render_incomplete"})
+RUNTIME_CODES = frozenset(
+    {"fusion_render_failed", "render_failed", "render_timeout", "render_incomplete"}
+)
 
 
 class RenderError(CompileError):
