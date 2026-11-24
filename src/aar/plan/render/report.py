@@ -64,9 +64,14 @@ _FROM_LAYOUT = {
 
 
 def not_rendered(
-    plan: EditPlan, layout: Layout, font: FontChoice, luts: Mapping[str, object]
+    plan: EditPlan,
+    layout: Layout,
+    font: FontChoice,
+    luts: Mapping[str, object],
+    fusion_rendered: Mapping[str, str] | None = None,
 ) -> list[Item]:
     """Every plan feature the render does not play, with where it is and what to do."""
+    fusion_map = fusion_rendered or {}
     items: list[Item] = []
     if plan.template is not None:
         items.append(
@@ -166,6 +171,8 @@ def not_rendered(
             )
         )
     for title in layout.titles:
+        if title.location in fusion_map:
+            continue
         if font.path is None:
             items.append(
                 Item(
@@ -234,9 +241,15 @@ def notes(tl: Timeline, font: FontChoice, hub: Mapping[str, HubSource]) -> list[
     return out
 
 
-def rendered(tl: Timeline, font: FontChoice, luts: Mapping[str, str]) -> dict[str, Any]:
+def rendered(
+    tl: Timeline,
+    font: FontChoice,
+    luts: Mapping[str, str],
+    fusion_rendered: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     """What the render put on the timeline, in record frames."""
     fps = tl.plan.fps
+    fusion_map = fusion_rendered or {}
     pictures = []
     for pic in tl.pictures:
         entry: dict[str, Any] = {
@@ -260,6 +273,27 @@ def rendered(tl: Timeline, font: FontChoice, luts: Mapping[str, str]) -> dict[st
                 "units": "hub source pixels: centre x, centre y, width, height",
             }
         pictures.append(entry)
+    title_entries: list[dict[str, Any]] = []
+    for t in tl.titles:
+        if t.location in fusion_map:
+            title_entries.append(
+                {
+                    "location": t.location,
+                    "record": [t.record_in, t.record_out],
+                    "lines": list(t.lines),
+                    "timecode": fps.timecode(t.record_in),
+                    "fusion_template": fusion_map[t.location],
+                }
+            )
+        elif font.path is not None:
+            title_entries.append(
+                {
+                    "location": t.location,
+                    "record": [t.record_in, t.record_out],
+                    "lines": list(t.lines),
+                    "timecode": fps.timecode(t.record_in),
+                }
+            )
     return {
         "pictures": pictures,
         "dissolves": [
@@ -282,17 +316,7 @@ def rendered(tl: Timeline, font: FontChoice, luts: Mapping[str, str]) -> dict[st
             }
             for s in tl.sounds
         ],
-        "titles": [
-            {
-                "location": t.location,
-                "record": [t.record_in, t.record_out],
-                "lines": list(t.lines),
-                "timecode": fps.timecode(t.record_in),
-            }
-            for t in tl.titles
-        ]
-        if font.path is not None
-        else [],
+        "titles": title_entries,
         "luts": dict(sorted(luts.items())),
         "font": font.as_dict(),
     }

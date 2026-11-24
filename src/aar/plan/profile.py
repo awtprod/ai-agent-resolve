@@ -283,6 +283,11 @@ class RenderSettings(_Settings):
     timeout_per_media_s: float = Field(
         default=8.0, gt=0, description="Seconds of ffmpeg time allowed per second of timeline."
     )
+    fusion_templates_dir: str | None = Field(
+        default=None,
+        description="Optional directory searched for Fusion .setting/.drfx templates when "
+        "rendering titles and graphics (in addition to media_root and AAR_FUSION_TEMPLATES_DIR).",
+    )
 
 
 class Profile(_Model):

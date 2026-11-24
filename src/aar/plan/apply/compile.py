@@ -1072,6 +1072,8 @@ class _Finish:
                 t.record_out,
                 list(t.lines),
                 kind="title",
+                setting=t.setting,
+                inputs=dict(t.inputs),
             )
         if _has_sting(self.plan):
             sting = self.plan.outro.sting  # type: ignore[union-attr]
@@ -1084,6 +1086,8 @@ class _Finish:
                 start + sting.frames,
                 list(sting.lines),
                 kind="sting",
+                setting=sting.setting,
+                inputs=dict(sting.inputs),
             )
 
     def _one_title(
@@ -1096,6 +1100,8 @@ class _Finish:
         lines: list[str],
         *,
         kind: str,
+        setting: str | None = None,
+        inputs: dict[str, Any] | None = None,
     ) -> None:
         if template is None:
             self.notes.append(f"{label} has no template name; cannot place it")
@@ -1119,20 +1125,30 @@ class _Finish:
                 f"pool id of title template {template!r}; run phase 'prepare' and pass "
                 "--prepare-result",
             )
+        payload: dict[str, Any] = {
+            "template": ref,
+            "track": track,
+            "record_in": record_in,
+            "record_out": record_out,
+            "lines": lines,
+        }
+        if inputs:
+            payload["inputs"] = dict(inputs)
+        if setting is not None:
+            payload["setting"] = setting
+        detail = (
+            " / ".join(lines)
+            if lines
+            else (", ".join(f"{k}={v}" for k, v in (inputs or {}).items()) or (setting or ""))
+        )
         self._emit(
             "title.place",
-            {
-                "template": ref,
-                "track": track,
-                "record_in": record_in,
-                "record_out": record_out,
-                "lines": lines,
-            },
+            payload,
             FinishIntent(
                 kind=kind,
                 op="title.place",
                 target=f"{label} on video track {track} (record {record_in}..{record_out})",
-                summary=f"template {template!r}: {' / '.join(lines)}",
+                summary=f"template {template!r}: {detail}",
                 resolved=self._resolved(ref),
             ),
         )
@@ -1388,6 +1404,12 @@ def _check_steps(steps: list[Step]) -> None:
 def _step(phase: Phase, op: str, name: str, params: dict[str, Any], summary: str) -> Step:
     if not find_unresolved(params):
         params = get_op(op).params.model_validate(params).model_dump(mode="json")
+        if op == "title.place":
+            for title in params.get("titles", ()):
+                if not title.get("inputs"):
+                    title.pop("inputs", None)
+                if title.get("setting") is None:
+                    title.pop("setting", None)
     return Step(phase=phase, op=op, name=name, params=params, summary=summary)
 
 

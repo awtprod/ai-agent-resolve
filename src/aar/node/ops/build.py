@@ -28,6 +28,7 @@ trusted.
 from __future__ import annotations
 
 import itertools
+import math
 import re
 import string
 from collections.abc import Callable
@@ -1361,11 +1362,33 @@ def item_set_transform(env: OpEnv, params: TransformParams) -> TransformResult:
 # -- title.place -------------------------------------------------------------------------------
 
 MAX_RECORD_FRAME = 10_000_000
+_FusionScalar = bool | int | float | str | list[float]
+
+
+def _validate_fusion_input_value(key: str, value: Any) -> Any:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if not math.isfinite(float(value)):
+            raise ValueError(f"inputs[{key!r}] must be finite")
+        return value
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list) and len(value) == 2:
+        out: list[float] = []
+        for elem in value:
+            if isinstance(elem, bool) or not isinstance(elem, (int, float)):
+                raise ValueError(f"inputs[{key!r}] point elements must be finite numbers")
+            if not math.isfinite(float(elem)):
+                raise ValueError(f"inputs[{key!r}] point elements must be finite numbers")
+            out.append(float(elem))
+        return out
+    raise ValueError(f"inputs[{key!r}] must be bool, number, string, or [x, y] point")
 
 
 class TitleSpec(OpModel):
     template: MediaRef = Field(
-        description="A media-pool item holding a Text+ title (a Fusion composition clip)."
+        description="A media-pool item holding a Text+ or Fusion macro title composition."
     )
     track: int = Field(strict=True, ge=1, le=16, description="Video track.")
     record_in: int = Field(
@@ -1374,12 +1397,29 @@ class TitleSpec(OpModel):
     record_out: int = Field(
         strict=True, ge=1, le=MAX_RECORD_FRAME, description="End frame (exclusive)."
     )
-    lines: list[TitleLine] = Field(min_length=1, max_length=4)
+    lines: list[TitleLine] = Field(default_factory=list, max_length=4)
+    inputs: dict[str, _FusionScalar] = Field(
+        default_factory=dict,
+        description="Named Fusion MacroOperator / Tool.Param inputs to set and read back.",
+    )
+    setting: str | None = Field(
+        default=None,
+        description="Optional Fusion .setting file path on the edit PC to load into the comp.",
+    )
 
     @model_validator(mode="after")
-    def _ordered(self) -> TitleSpec:
+    def _ordered_and_content(self) -> TitleSpec:
         if self.record_out <= self.record_in:
             raise ValueError("record_out must be greater than record_in (ranges are [in, out))")
+        if not self.lines and not self.inputs and self.setting is None:
+            raise ValueError("give at least one line, Fusion input, or setting path")
+        if self.inputs:
+            validated: dict[str, Any] = {}
+            for k, v in self.inputs.items():
+                if not k or not k.strip():
+                    raise ValueError("Fusion input keys must be non-empty")
+                validated[k] = _validate_fusion_input_value(k, v)
+            object.__setattr__(self, "inputs", validated)
         return self
 
 
@@ -1403,6 +1443,7 @@ class TitlePlaced(OpModel):
     record_in: int
     record_out: int
     text: str
+    inputs: dict[str, Any] = Field(default_factory=dict)
 
 
 class TitleResult(OpModel):
@@ -1410,41 +1451,176 @@ class TitleResult(OpModel):
     titles: list[TitlePlaced]
 
 
-def _title_text(item: Any, text: str) -> tuple[bool, str]:
-    """Set the Text+ ``StyledText`` of the title item's first comp: ``(changed, read back)``."""
+def _fusion_values_equal(have: Any, want: Any) -> bool:
+    if have == want:
+        return True
+    if (
+        isinstance(have, (int, float))
+        and not isinstance(have, bool)
+        and isinstance(want, (int, float))
+        and not isinstance(want, bool)
+    ):
+        return abs(float(have) - float(want)) <= 1e-4
+    if isinstance(have, (list, tuple)) and isinstance(want, (list, tuple)):
+        return len(have) == len(want) and all(
+            _fusion_values_equal(a, b) for a, b in zip(have, want, strict=True)
+        )
+    return False
+
+
+def _comp_tools(comp: Any) -> list[Any]:
+    get_tools = getattr(comp, "GetToolList", None)
+    if callable(get_tools):
+        raw = get_tools(False)
+        if isinstance(raw, dict):
+            return list(raw.values())
+        if isinstance(raw, list):
+            return raw
+    return []
+
+
+def _find_tool_by_name(comp: Any, name: str) -> Any | None:
+    for tool in _comp_tools(comp):
+        if getattr(tool, "Name", None) == name:
+            return tool
+        attrs = getattr(tool, "GetAttrs", None)
+        if callable(attrs):
+            a = attrs()
+            if isinstance(a, dict) and a.get("TOOLS_Name") == name:
+                return tool
+    return None
+
+
+def _title_apply(item: Any, spec: TitleSpec) -> tuple[bool, str, dict[str, Any]]:
+    """Apply Text+ lines and/or Fusion macro inputs (and optional ``.setting``) to ``item``."""
     uid = str(item.GetUniqueId())
-    comp = item.GetFusionCompByIndex(1)  # [I] the template's Text+ lives in its first comp
+    loaded_setting = False
+    if spec.setting is not None:
+        import_comp = getattr(item, "ImportFusionComp", None)
+        if callable(import_comp):
+            imported = import_comp(spec.setting)
+            if imported is not None:
+                loaded_setting = True
+    comp = item.GetFusionCompByIndex(1)  # [I] the template's Text+/Macro lives in its first comp
     if comp is None:
         raise OpError(
             "title_has_no_comp",
             f"title item {uid} has no Fusion composition",
-            "use a Fusion title template (a Fusion composition clip holding a Text+)",
+            "use a Fusion title template (a Fusion composition clip holding "
+            "a Text+ or MacroOperator)",
             item_id=uid,
         )
-    tool = comp.FindToolByID("TextPlus")  # [I] the Text+ registry id is "TextPlus"
-    if tool is None:
+    if spec.setting is not None and not loaded_setting:
+        load_settings = getattr(comp, "LoadSettings", None)
+        if callable(load_settings) and load_settings(spec.setting):
+            loaded_setting = True
+
+    macro = comp.FindToolByID("MacroOperator") or comp.FindToolByID("GroupOperator")
+    text_tool = comp.FindToolByID("TextPlus")  # [I] the Text+ registry id is "TextPlus"
+
+    changed = loaded_setting
+    applied_inputs: dict[str, Any] = {}
+    read_back_text = "\n".join(spec.lines)
+
+    if spec.inputs:
+        primary = macro or text_tool
+        if primary is None and not all("." in k for k in spec.inputs):
+            raise OpError(
+                "title_has_no_text_tool",
+                f"the composition of title item {uid} has no MacroOperator or Text+ tool",
+                "use a template whose composition holds a MacroOperator or Text+ tool",
+                item_id=uid,
+            )
+        for key, want in spec.inputs.items():
+            if "." in key:
+                tool_name, param = key.split(".", 1)
+                target = _find_tool_by_name(comp, tool_name)
+                if target is None:
+                    raise OpError(
+                        "title_has_no_text_tool",
+                        f"the composition of title item {uid} has no tool named {tool_name!r}",
+                        "check the Fusion tool name in the template",
+                        item_id=uid,
+                        tool=tool_name,
+                    )
+            else:
+                target, param = primary, key
+            have = target.GetInput(param)
+            if _fusion_values_equal(have, want):
+                applied_inputs[key] = have
+                continue
+            target.SetInput(param, want)
+            after = target.GetInput(param)
+            if not _fusion_values_equal(after, want):
+                raise OpError(
+                    "title_text_not_applied",
+                    f"title item {uid} input {key!r} reads back {after!r}, not {want!r}",
+                    "set the input by hand in the Inspector; the item stays in place and a rerun "
+                    "reuses it",
+                    item_id=uid,
+                    input=key,
+                    read_back=after,
+                )
+            changed = True
+            applied_inputs[key] = after
+        if not read_back_text:
+            str_vals = [str(v) for v in applied_inputs.values() if isinstance(v, str)]
+            read_back_text = "\n".join(str_vals)
+        return changed, read_back_text, applied_inputs
+
+    if spec.lines:
+        text = "\n".join(spec.lines)  # [I] StyledText separates lines with "\n"
+        if text_tool is not None:
+            have = text_tool.GetInput("StyledText")  # [I] the Text+ text input is "StyledText"
+            if have == text:
+                return changed, text, applied_inputs
+            # [I] With no time, SetInput sets the constant value of an input that is not animated.
+            # Its return value is not relied on: only the read-back counts.
+            text_tool.SetInput("StyledText", text)
+            after = text_tool.GetInput("StyledText")
+            if after != text:
+                raise OpError(
+                    "title_text_not_applied",
+                    f"title item {uid} reads back text {after!r}, not {text!r}",
+                    "set the text by hand in the Inspector; the item stays in place and a rerun "
+                    "reuses it",
+                    item_id=uid,
+                    read_back=after,
+                )
+            return True, after, applied_inputs
+        if macro is not None:
+            out_lines: list[str] = []
+            for idx, line in enumerate(spec.lines, start=1):
+                key = f"Input{idx}"
+                have = macro.GetInput(key)
+                if have != line:
+                    macro.SetInput(key, line)
+                    after = macro.GetInput(key)
+                    if after != line:
+                        raise OpError(
+                            "title_text_not_applied",
+                            f"title item {uid} input {key!r} reads back {after!r}, not {line!r}",
+                            "set the text by hand in the Inspector; the item stays in place and a "
+                            "rerun reuses it",
+                            item_id=uid,
+                            input=key,
+                            read_back=after,
+                        )
+                    changed = True
+                    out_lines.append(str(after))
+                    applied_inputs[key] = after
+                else:
+                    out_lines.append(str(have))
+                    applied_inputs[key] = have
+            return changed, "\n".join(out_lines), applied_inputs
         raise OpError(
             "title_has_no_text_tool",
             f"the composition of title item {uid} has no Text+ tool",
             "use a template whose composition holds a Text+ tool",
             item_id=uid,
         )
-    have = tool.GetInput("StyledText")  # [I] the Text+ text input is "StyledText"
-    if have == text:
-        return False, text
-    # [I] With no time, SetInput sets the constant value of an input that is not animated.
-    # Its return value is not relied on: only the read-back counts.
-    tool.SetInput("StyledText", text)
-    after = tool.GetInput("StyledText")
-    if after != text:
-        raise OpError(
-            "title_text_not_applied",
-            f"title item {uid} reads back text {after!r}, not {text!r}",
-            "set the text by hand in the Inspector; the item stays in place and a rerun reuses it",
-            item_id=uid,
-            read_back=after,
-        )
-    return True, after
+
+    return changed, read_back_text, applied_inputs
 
 
 @op(
@@ -1456,7 +1632,8 @@ def _title_text(item: Any, text: str) -> tuple[bool, str]:
     traps=("append-endframe-exclusive",),
 )
 def title_place(env: OpEnv, params: TitleParams) -> TitleResult:
-    """Place Text+ title templates at exact record ranges and set their text, read back.
+    """Place Text+ or Fusion macro title templates at exact record ranges and set their text or
+    macro inputs, read back.
 
     ``InsertTitleIntoTimeline`` / ``InsertFusionTitleIntoTimeline`` land at the playhead with
     a default length that nothing can change afterwards, so the template is placed with
@@ -1525,7 +1702,6 @@ def title_place(env: OpEnv, params: TitleParams) -> TitleResult:
     appender = _Appender(env, timeline, repair_short=False)
     done: list[TitlePlaced] = []
     for spec, p, reuse in planned:
-        text = "\n".join(spec.lines)  # [I] StyledText separates lines with "\n"
         placed_id = None
         try:
             if reuse is None:
@@ -1539,7 +1715,7 @@ def title_place(env: OpEnv, params: TitleParams) -> TitleResult:
                 )
             else:
                 item = reuse
-            changed, read_back = _title_text(item, text)
+            changed, read_back, applied_inputs = _title_apply(item, spec)
         except OpError as exc:
             more = {"placed_item_id": placed_id} if placed_id is not None else {}
             raise _partial(exc, done, **more) from exc
@@ -1553,6 +1729,7 @@ def title_place(env: OpEnv, params: TitleParams) -> TitleResult:
                 record_in=int(item.GetStart()) - start,
                 record_out=int(item.GetEnd()) - start,
                 text=read_back,
+                inputs=applied_inputs,
             )
         )
     return TitleResult(timeline=env.identity(timeline), titles=done)

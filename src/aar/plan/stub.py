@@ -182,7 +182,9 @@ def first_duplicate(paths: Sequence[str | os.PathLike[str]]) -> tuple[int, int] 
     return None
 
 
-def _probe_rate(path: Path, sid: str) -> tuple[Fraction, tuple[int, int] | None]:
+def _probe_rate(
+    path: Path, sid: str, *, require_audio: bool = True
+) -> tuple[Fraction, tuple[int, int] | None]:
     """The rate a stub plan runs at for this file (produce's own rule) and its display size."""
     try:
         info = probe(path)
@@ -203,7 +205,7 @@ def _probe_rate(path: Path, sid: str) -> tuple[Fraction, tuple[int, int] | None]
             source=sid,
             path=str(path),
         )
-    if info.audio is None:
+    if require_audio and info.audio is None:
         raise StubError(
             "no_audio",
             f"source {sid!r}: {str(path)!r} has no audio stream; the transcript, the joins and "
@@ -289,33 +291,52 @@ def build_stub(
     resolution: tuple[int, int] | None = None,
     base: Mapping[str, Any] | None = None,
     allow_unknown_timecode: bool = False,
+    extra_sources: Sequence[StubSource] = (),
 ) -> StubResult:
     """Build a plan stub from hub media files (module docstring); a :class:`StubError` on refusal.
 
-    Every source belongs to ``recording_id`` at origin 0 (``aar analyze sync`` sets the others'
-    origins in ``aar plan produce --sync``). A source without a camera label gets A, B, C... by
-    position, and without an id ``cam-<label>``. The plan runs at the first source's rate; the
-    resolution defaults to its display size for a long-form."""
+    Every source in ``sources`` belongs to ``recording_id`` at origin 0 (``aar analyze sync`` sets
+    the others' origins in ``aar plan produce --sync``). A source without a camera label gets A,
+    B, C... by position, and without an id ``cam-<label>``. Optional ``extra_sources`` (intros,
+    outros, alpha graphic ``.mov`` overlays) are probed at the same frame rate, may omit audio,
+    and have no ``recording_id`` (so audio sync skips them). The plan runs at the first source's
+    rate; the resolution defaults to its display size for a long-form."""
     if not sources:
         raise StubError("invalid_stub", "give at least one media file", "pass a media path")
-    if len(sources) > MAX_SOURCES:
+    total_sources = len(sources) + len(extra_sources)
+    if total_sources > MAX_SOURCES:
         raise StubError(
             "invalid_stub",
-            f"{len(sources)} media files; a stub holds at most {MAX_SOURCES}",
+            f"{total_sources} media files; a stub holds at most {MAX_SOURCES}",
             "split the show",
         )
     cameras = _cameras(sources)
-    ids = _source_ids(sources, cameras)
+    cam_ids = _source_ids(sources, cameras)
+    extra_ids: list[str] = []
+    seen_ids = set(cam_ids)
+    for n, source in enumerate(extra_sources):
+        sid = source.id or f"extra-{n + 1}"
+        if sid in seen_ids:
+            raise StubError(
+                "duplicate_source_id",
+                f"two sources have the id {sid!r}",
+                "give each source its own id (or camera label)",
+                source=sid,
+            )
+        seen_ids.add(sid)
+        extra_ids.append(sid)
+    ids = [*cam_ids, *extra_ids]
     kept, extra, ignored = _base_parts(base)
     for item in extra:
-        if item.get("id") in ids:
+        if item.get("id") in seen_ids:
             raise StubError(
                 "duplicate_source_id",
                 f"the base's outro source id {item.get('id')!r} is also a media source's id",
                 "rename one of them",
                 source=item.get("id"),
             )
-    paths = [_regular_file(source.media, sid) for source, sid in zip(sources, ids, strict=True)]
+    all_sources = [*sources, *extra_sources]
+    paths = [_regular_file(source.media, sid) for source, sid in zip(all_sources, ids, strict=True)]
     dup = first_duplicate(paths)
     if dup is not None:
         first, again = ids[dup[0]], ids[dup[1]]
@@ -326,9 +347,10 @@ def build_stub(
             "give each camera's own file once",
             sources=[first, again],
         )
+    cam_count = len(sources)
     rates: list[Fraction] = []
-    for path, sid in zip(paths, ids, strict=True):
-        rates.append(_probe_rate(path, sid)[0])
+    for idx, (path, sid) in enumerate(zip(paths, ids, strict=True)):
+        rates.append(_probe_rate(path, sid, require_audio=idx < cam_count)[0])
     fps = rates[0]
     for rate, sid in zip(rates, ids, strict=True):
         if rate != fps:
@@ -360,9 +382,22 @@ def build_stub(
             "frame_size": [display[0], display[1]],
         }
         for source, camera, sid, path, (frames, display) in zip(
-            sources, cameras, ids, paths, measured, strict=True
+            sources, cameras, cam_ids, paths[:cam_count], measured[:cam_count], strict=True
         )
     ]
+    for source, sid, path, (frames, display) in zip(
+        extra_sources, extra_ids, paths[cam_count:], measured[cam_count:], strict=True
+    ):
+        extra_entry: dict[str, Any] = {
+            "id": sid,
+            "media": str(path),
+            "shot_size": source.shot_size,
+            "duration": frames,
+            "frame_size": [display[0], display[1]],
+        }
+        if source.camera is not None:
+            extra_entry["camera"] = source.camera
+        stub_sources.append(extra_entry)
     data: dict[str, Any] = {
         "project": project,
         "timeline": timeline,
@@ -402,7 +437,7 @@ def build_stub(
             {
                 "id": entry["id"],
                 "media": entry["media"],
-                "camera": entry["camera"],
+                "camera": entry.get("camera"),
                 "duration": entry["duration"],
                 "frame_size": entry["frame_size"],
                 "start_timecode": None if found is None else found.to_dict(fps),

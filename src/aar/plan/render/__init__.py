@@ -38,12 +38,15 @@ import secrets
 import shutil
 import signal
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Literal
 
+from aar.fusion.errors import FusionError
+from aar.fusion.parse import resolve_template_path
+from aar.fusion.render import render_fusion_clip
 from aar.host.transport import sha256_file
 from aar.media import (
     MediaError,
@@ -490,6 +493,7 @@ def _encode_chunks(
     lut_names: dict[str, str],
     settings: Any,
     work: Path,
+    fusion_clips: dict[str, Path] | None = None,
 ) -> list[Path]:
     """Each chunk encoded alone (picture only), checked to hold exactly its frames, starting on
     a key frame, with the same stream setup as the first chunk."""
@@ -505,6 +509,7 @@ def _encode_chunks(
             luts=lut_names,
             out_pix_fmt=codec.pix_fmt,
             span=(chunk.start, chunk.end),
+            fusion_clips=fusion_clips,
         )
         script = len(graph.text.encode("utf-8"))
         if script > MAX_FILTER_SCRIPT_BYTES:
@@ -676,6 +681,102 @@ def _join(
     )
 
 
+def _fusion_search_dirs(
+    profile: Profile, media_root: Path | None, extra_dirs: Sequence[Path] | None = None
+) -> list[Path]:
+    dirs: list[Path] = []
+    if extra_dirs:
+        for cand in extra_dirs:
+            if cand.is_dir() and cand not in dirs:
+                dirs.append(cand)
+    if profile.render.fusion_templates_dir:
+        cand = Path(profile.render.fusion_templates_dir)
+        if not cand.is_absolute() and media_root is not None:
+            cand = media_root / cand
+        if cand.is_dir() and cand not in dirs:
+            dirs.append(cand)
+    if media_root is not None and media_root.is_dir() and media_root not in dirs:
+        dirs.append(media_root)
+    return dirs
+
+
+def _resolve_fusion_titles(
+    tl: Timeline,
+    profile: Profile,
+    media_root: Path | None,
+    extra_dirs: Sequence[Path] | None = None,
+) -> tuple[dict[str, Path], list[Path]]:
+    search_dirs = _fusion_search_dirs(profile, media_root, extra_dirs)
+    resolved: dict[str, Path] = {}
+    for title in tl.titles:
+        if title.setting:
+            found = resolve_template_path(title.setting, search_dirs=search_dirs)
+            if found is None:
+                raise RenderError(
+                    "fusion_template_missing",
+                    f"{title.location}: Fusion setting {title.setting!r} could not be found",
+                    "give an existing .setting/.drfx path, set [render] fusion_templates_dir, "
+                    "or set AAR_FUSION_TEMPLATES_DIR",
+                    location=title.location,
+                    setting=title.setting,
+                )
+            resolved[title.location] = found
+        elif title.template:
+            found = resolve_template_path(title.template, search_dirs=search_dirs)
+            if found is not None:
+                resolved[title.location] = found
+    return resolved, search_dirs
+
+
+def _prerender_fusion_titles(
+    tl: Timeline,
+    fusion_templates: dict[str, Path],
+    search_dirs: list[Path],
+    work: Path,
+) -> tuple[dict[str, Path], dict[str, str]]:
+    if not fusion_templates:
+        return {}, {}
+    fps = tl.plan.fps
+    fps_float = fps.num / fps.den
+    res = (tl.plan.resolution.width, tl.plan.resolution.height)
+    ffmpeg_bin = str(resolve_tool("ffmpeg"))
+    clips: dict[str, Path] = {}
+    names: dict[str, str] = {}
+    for index, title in enumerate(tl.titles):
+        tpl_path = fusion_templates.get(title.location)
+        if tpl_path is None:
+            continue
+        out_mov = work / f"fusion_{index:03d}.mov"
+        duration_s = float(Fraction((title.record_out - title.record_in) * fps.den, fps.num))
+        try:
+            render_fusion_clip(
+                tpl_path,
+                out_mov,
+                duration_s=duration_s,
+                fps=fps_float,
+                resolution=res,
+                inputs=title.inputs_dict or None,
+                lines=title.lines,
+                asset_dirs=search_dirs,
+                codec="qtrle",
+                ffmpeg_bin=ffmpeg_bin,
+            )
+        except FusionError as exc:
+            raise RenderError(
+                "fusion_render_failed",
+                f"{title.location}: failed to render Fusion graphic {tpl_path.name!r}: "
+                f"{exc.message}",
+                "check the Fusion .setting/.drfx template, Loader assets, inputs, and "
+                "Pillow installation (pip install 'ai-agent-resolve[fusion]')",
+                location=title.location,
+                fusion_code=exc.code,
+                template=str(tpl_path),
+            ) from None
+        clips[title.location] = out_mov
+        names[title.location] = tpl_path.name
+    return clips, names
+
+
 def render_plan(
     plan: EditPlan,
     profile: Profile,
@@ -684,6 +785,7 @@ def render_plan(
     preset: Preset = "review",
     media_map: MediaMap | None = None,
     media_root: Path | None = None,
+    fusion_dirs: Sequence[Path] | None = None,
     transcript: Transcript | None = None,
     laughs: LaughMap | None = None,
     overwrite: bool = False,
@@ -741,6 +843,9 @@ def render_plan(
     tl = build_timeline(layout, hub)
     font = find_font(profile.render.font)
     luts = _luts(plan, used, media_root)
+    fusion_templates, resolved_fusion_dirs = _resolve_fusion_titles(
+        tl, profile, media_root, fusion_dirs
+    )
     codec = _codec_args(preset, profile, container)
     if memory_budget_mb is None:
         memory_budget_mb = profile.render.memory_budget_mb
@@ -759,6 +864,8 @@ def render_plan(
                 hub,
                 font,
                 luts,
+                fusion_templates=fusion_templates,
+                fusion_dirs=resolved_fusion_dirs,
                 work=work,
                 out=out,
                 report_file=report_file,
@@ -784,6 +891,8 @@ def _render(
     font: FontChoice,
     luts: dict[str, Path],
     *,
+    fusion_templates: dict[str, Path],
+    fusion_dirs: list[Path],
     work: Path,
     out: Path,
     report_file: Path,
@@ -807,6 +916,7 @@ def _render(
     for n, (sid, path) in enumerate(sorted(luts.items())):
         lut_names[sid] = f"lut{n}{path.suffix.lower()}"
         shutil.copyfile(path, work / lut_names[sid])
+    fusion_clips, fusion_names = _prerender_fusion_titles(tl, fusion_templates, fusion_dirs, work)
     settings = profile.render
     samples = sample_at(plan.fps, tl.total_frames)
     mix_passes = _mix(tl, hub, per_pass, settings, work)
@@ -830,7 +940,11 @@ def _render(
             "this is a render bug; report the plan",
             stage="loudness",
         )
-    parts = _encode_chunks(tl, hub, chunks, codec, font_name, lut_names, settings, work)
+    parts = _encode_chunks(
+        tl, hub, chunks, codec, font_name, lut_names, settings, work, fusion_clips=fusion_clips
+    )
+    for clip_path in fusion_clips.values():
+        clip_path.unlink(missing_ok=True)
     rendered_file = work / f"render.{container}"
     rate = f"{plan.fps.num}/{plan.fps.den}"
     _join(parts, chunks, codec, container, plan.fps, settings, timeline_s, rendered_file, work)
@@ -885,9 +999,17 @@ def _render(
             "mix_planned_mb": round(mix_memory_mb(min(per_pass, len(tl.sounds)))),
         },
         "media": [media.as_dict() for media in hub.values()],
-        "rendered": rendered(tl, font, {sid: str(path) for sid, path in luts.items()}),
+        "rendered": rendered(
+            tl,
+            font,
+            {sid: str(path) for sid, path in luts.items()},
+            fusion_rendered=fusion_names,
+        ),
         "loudness": loudness.as_dict(),
-        "not_rendered": [item.as_dict() for item in not_rendered(plan, tl.layout, font, luts)],
+        "not_rendered": [
+            item.as_dict()
+            for item in not_rendered(plan, tl.layout, font, luts, fusion_rendered=fusion_names)
+        ],
         "notes": [item.as_dict() for item in notes(tl, font, hub)]
         + (
             [

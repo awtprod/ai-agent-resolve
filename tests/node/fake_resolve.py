@@ -245,13 +245,16 @@ class FakeMediaPoolItem:
         file_path: str | None = None,
         title_text: str | None = None,
         title_tool: str = "TextPlus",
+        title_inputs: dict[str, Any] | None = None,
     ) -> None:
         if kind not in _KIND_TYPE:
             raise ValueError(f"unknown clip kind {kind!r}")
         # A Fusion title template: timeline items placed from it carry a Fusion comp whose
-        # ``title_tool`` tool (a Text+ by default) holds ``title_text`` as its StyledText.
+        # ``title_tool`` tool (a Text+ by default, or MacroOperator when ``title_inputs`` is given)
+        # holds ``title_text`` as its StyledText or ``title_inputs`` as named inputs.
         self.title_text = title_text
         self.title_tool = title_tool
+        self.title_inputs = dict(title_inputs) if title_inputs is not None else None
         self._app = app
         self._name = name
         self._uid = f"mpi-{next(app.ids)}"
@@ -560,11 +563,23 @@ class FakeGraph:
 class FakeFusionTool:
     """A Fusion tool (``Operator``): ``GetInput`` / ``SetInput`` on named inputs."""
 
-    def __init__(self, app: FakeResolve, owner: str, tool_id: str, inputs: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        app: FakeResolve,
+        owner: str,
+        tool_id: str,
+        inputs: dict[str, Any],
+        name: str | None = None,
+    ) -> None:
         self._app = app
         self._owner = owner
         self.tool_id = tool_id
+        self.Name = name or tool_id
+        self.ID = tool_id
         self.inputs = dict(inputs)
+
+    def GetAttrs(self) -> dict[str, Any]:
+        return {"TOOLS_RegID": self.tool_id, "TOOLS_Name": self.Name}
 
     def GetInput(self, id: str, time: float | None = None) -> Any:
         return self.inputs.get(id)
@@ -584,15 +599,24 @@ class FakeFusionComp:
         self._app = app
         self._owner = owner
         self.tools = tools
+        self.loaded_settings: list[str] = []
 
     def FindToolByID(self, id: str) -> FakeFusionTool | None:
         return next((t for t in self.tools if t.tool_id == id), None)
+
+    def GetToolList(self, selected: bool = False) -> dict[int, FakeFusionTool]:
+        return {i: t for i, t in enumerate(self.tools, start=1)}
+
+    def LoadSettings(self, path: str) -> bool:
+        self._app.calls.append(("LoadSettings", self._owner, path))
+        self.loaded_settings.append(path)
+        return True
 
     def clone(self, owner: str) -> FakeFusionComp:
         return FakeFusionComp(
             self._app,
             owner,
-            [FakeFusionTool(self._app, owner, t.tool_id, t.inputs) for t in self.tools],
+            [FakeFusionTool(self._app, owner, t.tool_id, t.inputs, t.Name) for t in self.tools],
         )
 
 
@@ -630,9 +654,15 @@ class FakeTimelineItem:
         self.item_type: str | None = None  # "transition" for a transition item
         self.transition_name: str | None = None  # the type AddTransition was given
         self.comps: list[FakeFusionComp] = []
-        if mpi is not None and mpi.title_text is not None and track_type == "video":
-            tool = FakeFusionTool(app, self._uid, mpi.title_tool, {"StyledText": mpi.title_text})
-            self.comps = [FakeFusionComp(app, self._uid, [tool])]
+        if mpi is not None and track_type == "video":
+            if mpi.title_inputs is not None:
+                tool = FakeFusionTool(app, self._uid, mpi.title_tool, dict(mpi.title_inputs))
+                self.comps = [FakeFusionComp(app, self._uid, [tool])]
+            elif mpi.title_text is not None:
+                tool = FakeFusionTool(
+                    app, self._uid, mpi.title_tool, {"StyledText": mpi.title_text}
+                )
+                self.comps = [FakeFusionComp(app, self._uid, [tool])]
 
     def clone(self, timeline: FakeTimeline) -> FakeTimelineItem:
         twin = FakeTimelineItem(

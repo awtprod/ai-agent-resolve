@@ -27,6 +27,7 @@ delayed to its record position (``adelay``) and padded to the timeline's exact l
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -146,12 +147,18 @@ def _picture_chain(
         filters.append(f"scale={hub.display[0]}:{hub.display[1]},setsar=1")
     if lut is not None:
         filters.append(f"lut3d=file={lut}")
-    filters += picture_filters(pic.framing, res)
-    filters += ["setsar=1", f"format={WORK_PIX_FMT}"]
-    if pic.fade_in:
-        filters.append(f"fade=t=in:start_frame=0:nb_frames={pic.fade_in}")
-    if pic.lane:
-        filters.append(f"format={LANE_PIX_FMT}")  # opaque, over the lane's transparent gaps
+    preserve_alpha = bool(pic.lane and hub.has_alpha)
+    filters += picture_filters(pic.framing, res, preserve_alpha=preserve_alpha)
+    if preserve_alpha:
+        filters += ["setsar=1", f"format={LANE_PIX_FMT}"]
+        if pic.fade_in:
+            filters.append(f"fade=t=in:start_frame=0:nb_frames={pic.fade_in}:alpha=1")
+    else:
+        filters += ["setsar=1", f"format={WORK_PIX_FMT}"]
+        if pic.fade_in:
+            filters.append(f"fade=t=in:start_frame=0:nb_frames={pic.fade_in}")
+        if pic.lane:
+            filters.append(f"format={LANE_PIX_FMT}")  # opaque, over the lane's transparent gaps
     return f"[{label}]{','.join(filters)}[{out}]"
 
 
@@ -174,10 +181,11 @@ def _title_filters(
 ) -> tuple[list[str], list[TitleText]]:
     """drawtext per line: lower thirds bottom left, titles and the sting centred; on the frames
     of ``span`` (a chunk of the timeline) that the title covers, counted from the span's start."""
+    draw_lines = title.placeholder_lines
     first = max(title.record_in, span[0]) - span[0]
     last = min(title.record_out, span[1]) - 1 - span[0]
     base = min(res.width, res.height)
-    sizes = [round(base * (0.075 if j == 0 else 0.055)) for j in range(len(title.lines))]
+    sizes = [round(base * (0.075 if j == 0 else 0.055)) for j in range(len(draw_lines))]
     steps = [round(size * 1.4) for size in sizes]
     block = sum(steps)
     if title.kind == "lower-third":
@@ -189,7 +197,7 @@ def _title_filters(
     filters: list[str] = []
     texts: list[TitleText] = []
     y = top
-    for j, (line, size) in enumerate(zip(title.lines, sizes, strict=True)):
+    for j, (line, size) in enumerate(zip(draw_lines, sizes, strict=True)):
         name = f"title{number}_{j}.txt"
         texts.append(TitleText(name, line))
         filters.append(
@@ -209,13 +217,15 @@ def video_graph(
     luts: dict[str, str],
     out_pix_fmt: str,
     span: tuple[int, int] | None = None,
+    fusion_clips: Mapping[str, Path] | None = None,
 ) -> VideoGraph:
     """The picture graph of ``span`` (record frames ``[start, end)``, a chunk; the whole
     timeline by default), ending in ``[vout]`` with exactly ``end - start`` frames. Its pictures
     are those that lie inside the span (a chunk is cut only where no picture, dissolve, fade or
     connected clip crosses). Run it with ``-copyts``: each picture is cut by its timestamps.
     ``luts`` maps a source id to its LUT file name in the work dir; ``font`` is the font file
-    name there (None: no titles)."""
+    name there (None: no titles); ``fusion_clips`` maps title locations to pre-rendered RGBA
+    ``.mov`` overlays."""
     plan = tl.plan
     fps, res = plan.fps, plan.resolution
     b0, b1 = span or (0, tl.total_frames)
@@ -327,10 +337,54 @@ def video_graph(
         )
         lines.append(f"[{acc}][{label}]overlay=0:0:shortest=1[o{lane}]")
         acc = f"o{lane}"
+    # Native Fusion title/graphic overlays: pre-rendered RGBA .mov clips composited with alpha.
+    fusion_map = fusion_clips or {}
+    for number, title in enumerate(tl.titles):
+        if title.location not in fusion_map:
+            continue
+        if title.record_out <= b0 or title.record_in >= b1:
+            continue
+        ov_start = max(title.record_in, b0)
+        ov_end = min(title.record_out, b1)
+        clip_in = ov_start - title.record_in
+        clip_out = ov_end - title.record_in
+        in_idx = len(uses)
+        uses.append(
+            Use(
+                fusion_map[title.location],
+                0,
+                None,
+                Fraction((title.record_out - title.record_in) * fps.den, fps.num),
+            )
+        )
+        fclip = f"fclip{number}"
+        lines.append(
+            f"[{in_idx}:0]trim=start_frame={clip_in}:end_frame={clip_out},"
+            f"scale={res.width}:{res.height},setsar=1,format={LANE_PIX_FMT},"
+            f"settb={_tb(fps)},setpts=N[{fclip}]"
+        )
+        f_members: list[str] = []
+        if ov_start > b0:
+            lines.append(_gap(f"g{gaps}", ov_start - b0, fps, res, clear=True))
+            f_members.append(f"g{gaps}")
+            gaps += 1
+        f_members.append(fclip)
+        if ov_end < b1:
+            lines.append(_gap(f"g{gaps}", b1 - ov_end, fps, res, clear=True))
+            f_members.append(f"g{gaps}")
+            gaps += 1
+        flane = f"flane{number}"
+        lines.append(
+            _join(f_members, flane, fps) if len(f_members) > 1 else f"[{f_members[0]}]null[{flane}]"
+        )
+        lines.append(f"[{acc}][{flane}]overlay=0:0:shortest=1[of{number}]")
+        acc = f"of{number}"
     titles: list[TitleText] = []
     drawn: list[str] = []
     if font is not None:
         for number, title in enumerate(tl.titles):
+            if title.location in fusion_map:
+                continue
             if title.record_out <= b0 or title.record_in >= b1:
                 continue
             filters, texts = _title_filters(title, number, res, font, (b0, b1))

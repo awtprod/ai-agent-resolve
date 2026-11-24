@@ -23,7 +23,10 @@ whisper = ["faster-whisper>=1.1,<2"]
 # aar.analyze.faces: OpenCV's YuNet face detector. The wheel is large, so it is not in dev; tests
 # inject a detector, and the one live test needs AAR_YUNET_MODEL (never downloaded).
 faces = ["opencv-python-headless>=4.9,<5", "numpy>=1.26,<3"]
-dev = ["pytest", "ruff", "ai-agent-resolve[drp,hub,analyze]"]
+# aar.fusion: rendering Fusion .setting/.drfx templates natively to RGBA frames. Pillow is imported
+# lazily; parsing/inspecting/customizing .setting files is stdlib-only.
+fusion = ["Pillow>=10"]
+dev = ["pytest", "ruff", "ai-agent-resolve[drp,hub,analyze,fusion]"]
 
 [project.scripts]
 aar = "aar.cli:main"
