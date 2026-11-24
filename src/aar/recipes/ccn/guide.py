@@ -72,6 +72,43 @@ def lessons_section(lessons: GuideLessons | None) -> list[str]:
     return lines
 
 
+def part_layout(stub: dict[str, Any]) -> list[str]:
+    """The lines on a reference camera of several files (S24a): each file's span of the
+    recording clock and the gaps between them, in recording seconds, and what a range across a
+    gap does; none for a camera of one file."""
+    parts = stub.get("parts") or []
+    if not parts:
+        return []
+    camera = (stub.get("camera_labels") or ["?"])[0]
+    lines = [
+        f"Camera {camera} is {len(parts)} files, one after another on the recording clock "
+        f"(placed by {stub.get('part_placement')}; recording seconds):",
+        "",
+    ]
+    for n, part in enumerate(parts):
+        gap = part.get("gap_s") or 0
+        if n and gap > 0:
+            lines.append(f"- gap {gap:.3f} s: no file, no picture or sound")
+        elif n:
+            lines.append("- (no gap: the next file goes on where this one ends)")
+        lines.append(
+            f"- part {part.get('part')} `{part.get('id')}`: {part.get('start_s'):.3f}-"
+            f"{part.get('end_s'):.3f} s"
+        )
+    lines += [
+        "",
+        "The transcript is the whole recording; `transcript.txt` marks each place two files",
+        "meet with a `-- ... --` line. Put every range edge in a pause well inside one file.",
+        "A range that runs across a gap is cut at it: produce leaves out the frames with no",
+        "file (and a few frames each side for the crossfade, never half a word) and warns",
+        "`range-crosses-gap`; that cut is then judged like any other. A range wholly inside a",
+        "gap, or past the last file's end, is an error. Where two files meet with no gap the",
+        "shot plays on unbroken.",
+        "",
+    ]
+    return lines
+
+
 def build_guide(
     *,
     db: str,
@@ -131,7 +168,11 @@ def build_guide(
     recipes = f"{RECIPES_ENV} {command(*aar)}"
     wordless = transcript.get("wordless") or {}
     stretches = wordless.get("stretches") or []
-    labels = [s.get("camera") for s in stub.get("sources", [])]
+    sources = stub.get("sources", [])
+    labels = list(stub.get("camera_labels") or dict.fromkeys(s.get("camera") for s in sources))
+    by_camera = {
+        label: [f"`{s.get('id')}`" for s in sources if s.get("camera") == label] for label in labels
+    }
     lines: list[str] = [
         "# Cut guide: ccn-longform",
         "",
@@ -173,8 +214,9 @@ def build_guide(
     lines += [
         "",
         f"Recording `{stub['recording_id']}`, {stub['fps']} fps, cameras: "
-        + ", ".join(f"{s.get('camera')} = `{s.get('id')}`" for s in stub.get("sources", [])),
+        + ", ".join(f"{label} = {', '.join(ids)}" for label, ids in by_camera.items()),
         "",
+        *part_layout(stub),
         "## 2. Read the show",
         "",
         "`transcript.txt` has one `[start-end] words` line per spoken run, in recording",
@@ -325,4 +367,11 @@ def build_guide(
     return "\n".join(lines) + return_guidance
 
 
-__all__ = ["RECIPES_ENV", "artifact_get", "build_guide", "command", "lessons_section"]
+__all__ = [
+    "RECIPES_ENV",
+    "artifact_get",
+    "build_guide",
+    "command",
+    "lessons_section",
+    "part_layout",
+]

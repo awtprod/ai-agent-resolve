@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import itertools
 import math
+from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
@@ -57,7 +58,9 @@ from aar.plan.produce.timeline import (
     assert_no_splice,
     is_cut,
     keep_frames,
+    less_holes,
     min_frames,
+    part_gaps,
     schedule_frames,
     split,
 )
@@ -161,7 +164,9 @@ def _matching(plan: EditPlan, path: str, media_root: Path | None) -> list[Source
 
 
 def apply_sync(plan: EditPlan, report: SyncReport, media_root: Path | None) -> EditPlan:
-    """The stub with each ``ok`` sync pair's ``suggested_recording_origin`` on its source."""
+    """The stub with each ``ok`` sync pair's ``suggested_recording_origin`` on its source. A
+    part of a camera of several files that the stub placed (``part_placement``) keeps its
+    origin: a pair naming one is refused (``sync-part-placed``)."""
     fps = parse_rational(report.fps)
     if fps != Fraction(plan.fps.num, plan.fps.den):
         raise ProduceInputError(
@@ -199,6 +204,14 @@ def apply_sync(plan: EditPlan, report: SyncReport, media_root: Path | None) -> E
                 "and leave out --sync",
             )
         for source in matched:
+            if source.part_placement is not None:
+                raise ProduceInputError(
+                    "sync-part-placed",
+                    f"the sync pair {pair.file} is source {source.id!r}, part {source.part} of "
+                    f"camera {source.camera!r}, which the stub placed by "
+                    f"{source.part_placement}; a sync report does not move it",
+                    hint="sync only the other cameras (aar analyze sync against the first file)",
+                )
             if plan.recording_key(source) != plan.recording_key(ref):
                 raise ProduceInputError(
                     "sync-recording-mismatch",
@@ -827,10 +840,13 @@ def cut(
     judge: Judge,
     laughs: LaughMap | None,
     pause_trim: bool = True,
+    holes: Sequence[Sequence[tuple[int, int]]] | None = None,
 ) -> Cut:
     """Transforms 1-4 and the invariants, with the media access injected (``runs_for``,
     ``judge``): pure and deterministic for pure arguments. With ``pause_trim`` off, transform 1
-    does nothing (and ``runs_for`` is never called); every other step runs."""
+    does nothing (and ``runs_for`` is never called); every other step runs. ``holes`` are the
+    frames of each keep range to leave out where it crosses a gap between a camera's files
+    (:func:`~aar.plan.produce.timeline.part_gaps`)."""
     s = settings
     need = min_frames(s.min_shot_s, fps)
     nudge_frames = reach_frames(s.join_nudge_ms, fps)
@@ -853,7 +869,8 @@ def cut(
             else []
         )
         trims += found
-        for a, b in kept_spans(k.start, k.end, found):
+        spans = kept_spans(k.start, k.end, found)
+        for a, b in less_holes(spans, holes[index]) if holes else spans:
             pieces += split(a, b, index, sched, coverage, fps)
     warnings: list[PlannerWarning] = []
     pieces, folds = fold_slivers(pieces, coverage, fps, need=need)
@@ -932,7 +949,15 @@ def produce(
     if sync is not None:
         stub = apply_sync(stub, sync, media_root)
     fps = stub.fps
-    coverage = {src.id: Coverage(src.recording_origin, src.duration) for src in stub.sources}
+    labels = Counter(src.camera for src in stub.sources if src.camera is not None)
+    coverage = {
+        src.id: Coverage(
+            src.recording_origin,
+            src.duration,
+            src.camera if src.camera is not None and labels[src.camera] > 1 else None,
+        )
+        for src in stub.sources
+    }
     origins = {key: value.origin for key, value in coverage.items()}
     if transcript.recording is None:
         raise ProduceInputError(
@@ -945,7 +970,24 @@ def produce(
     words = Words(transcript.words, rules.word_tolerance_s, fps, s.min_word_ms / 1000)
     keeps, snaps, keep_warnings = keep_frames(keep, words, fps, min_shot_s=s.min_shot_s)
     sched = schedule_frames(stub, schedule, s.default_camera)
-    parts = [split(k.start, k.end, i, sched, coverage, fps) for i, k in enumerate(keeps)]
+    gaps = part_gaps(
+        keeps,
+        sched,
+        coverage,
+        words,
+        fps,
+        handle=rules.handle_frames,
+        need=min_frames(s.min_shot_s, fps),
+    )
+    keeps = gaps.keeps
+    parts = [
+        [
+            piece
+            for a, b in less_holes([(k.start, k.end)], gaps.holes[i])
+            for piece in split(a, b, i, sched, coverage, fps)
+        ]
+        for i, k in enumerate(keeps)
+    ]
     used = list(dict.fromkeys(p.source for group in parts for p in group))
     sources = stub.source_map()
     content = [sources[i] for i in used]
@@ -967,7 +1009,7 @@ def produce(
                 f"the {what} is for recording {name!r}, not the one the cut comes from",
             )
     tracks = bind_faces(stub, faces, media_root)
-    warnings: list[PlannerWarning] = list(keep_warnings)
+    warnings: list[PlannerWarning] = list(keep_warnings) + gaps.warnings
     if tracks and stub.kind != "short":
         warnings.append(
             PlannerWarning(
@@ -1004,6 +1046,7 @@ def produce(
         judge=JoinJudge(audio, profile.qa, fps, s.out_quiet_preroll_ms),
         laughs=laughs,
         pause_trim=trim_pauses,
+        holes=gaps.holes,
     )
     warnings += done.warnings
     for source_id, seen in stats.items():

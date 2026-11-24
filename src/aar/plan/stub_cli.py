@@ -26,7 +26,9 @@ def register(sub: Any) -> None:
         description=(
             "Probe each media file (frame count, frame size, constant frame rate, sound, start "
             "timecode) and write the EditPlan stub aar plan produce takes. --camera, "
-            "--shot-size and --source-id, when given, are given once per media file, in order. "
+            "--shot-size, --source-id and --part, when given, are given once per media file, in "
+            "order. Files of one camera label with --part 1, 2, ... are that camera's "
+            "consecutive files (only the first file's camera may be several files). "
             "Exit status: 0 the stub was written, 2 a file or an argument was refused."
         ),
     )
@@ -45,6 +47,18 @@ def register(sub: Any) -> None:
         help="Shot size per media file.",
     )
     run.add_argument("--source-id", action="append", help="Source id per media file.")
+    run.add_argument(
+        "--part",
+        action="append",
+        type=int,
+        help="Part number per media file (1, 2, ...): that camera's consecutive files.",
+    )
+    run.add_argument(
+        "--placement",
+        action="append",
+        metavar="CAMERA=timecode|contiguous",
+        help="How a camera's parts are placed (default: by timecode when every part has one).",
+    )
     run.add_argument(
         "--resolution", help="WIDTHxHEIGHT (default: the first file's size, long-form only)."
     )
@@ -98,8 +112,15 @@ def _cmd_stub(args: argparse.Namespace) -> int:
         cameras = _per_file(args.camera, count, "--camera")
         sizes = _per_file(args.shot_size, count, "--shot-size")
         ids = _per_file(args.source_id, count, "--source-id")
+        parts = _per_file(args.part, count, "--part")
     except ValueError as exc:
         return _refuse(_bad(str(exc), "give it once per media file, or not at all"), as_json)
+    placement: dict[str, Any] = {}
+    for item in args.placement or []:
+        camera, _, method = item.partition("=")
+        if not camera or method not in ("timecode", "contiguous"):
+            return _refuse(_bad(f"--placement {item!r} is not CAMERA=timecode|contiguous"), as_json)
+        placement[camera] = method
     resolution = None
     if args.resolution is not None:
         match = _RESOLUTION.fullmatch(args.resolution)
@@ -115,8 +136,10 @@ def _cmd_stub(args: argparse.Namespace) -> int:
         except (OSError, ValueError) as exc:  # JSONDecodeError and UnicodeDecodeError too
             return _refuse(_bad(f"cannot read the base {args.base}: {exc}"), as_json)
     sources = [
-        StubSource(media, camera=camera, shot_size=size or "unknown", id=sid)
-        for media, camera, size, sid in zip(args.media, cameras, sizes, ids, strict=True)
+        StubSource(media, camera=camera, shot_size=size or "unknown", id=sid, part=part)
+        for media, camera, size, sid, part in zip(
+            args.media, cameras, sizes, ids, parts, strict=True
+        )
     ]
     try:
         result = build_stub(
@@ -129,6 +152,7 @@ def _cmd_stub(args: argparse.Namespace) -> int:
             resolution=resolution,
             base=base,
             allow_unknown_timecode=args.allow_unknown_timecode,
+            placement=placement,
         )
     except StubError as exc:
         return _refuse(exc.to_dict(), as_json)
@@ -146,6 +170,11 @@ def _cmd_stub(args: argparse.Namespace) -> int:
         label = tc["timecode"] if tc else "unknown"
         lines.append(
             f"  {source['id']}: {source['duration']} frames, start {label}, {source['media']}"
+        )
+    for part in report["parts"]:
+        lines.append(
+            f"  part {part['part']} {part['id']}: origin {part['recording_origin']}, gap "
+            f"{part['gap_frames']} frames ({part['placement']})"
         )
     for warning in report["warnings"]:
         lines.append(f"WARN  {warning['code']}: {warning['message']}")

@@ -11,6 +11,9 @@ enough to last ``min_shot_s`` and the rest of the pause stays trimmed. Only when
 short for that does the whole pause come back and the two pieces merge. Of the options, the one
 that brings back the least removed audio wins; on a tie, the previous side (as ``edl_v7``). The
 grown piece must still be covered by its source. A sliver with no such option is an error.
+
+Where one file of a camera ends and its next begins with no gap (S24a), the two pieces play as
+one shot: a piece is a sliver only when that whole shot is shorter than ``min_shot_s``.
 """
 
 from __future__ import annotations
@@ -63,13 +66,37 @@ def _options(
     return found
 
 
+def _one_shot(a: Piece, b: Piece, coverage: dict[str, Coverage]) -> bool:
+    """``b`` goes on from ``a`` in the next file of the same camera, with no gap."""
+    camera = coverage[a.source].camera
+    return (
+        camera is not None
+        and coverage[b.source].camera == camera
+        and a.keep == b.keep
+        and a.rec_out == b.rec_in
+    )
+
+
+def _shot(out: Sequence[Piece], index: int, coverage: dict[str, Coverage]) -> int:
+    """The length of the shot piece ``index`` is in (:func:`_one_shot` neighbours joined)."""
+    first = last = index
+    while first > 0 and _one_shot(out[first - 1], out[first], coverage):
+        first -= 1
+    while last + 1 < len(out) and _one_shot(out[last], out[last + 1], coverage):
+        last += 1
+    return out[last].rec_out - out[first].rec_in
+
+
 def fold_slivers(
     pieces: Sequence[Piece], coverage: dict[str, Coverage], fps: Fps, *, need: int
 ) -> tuple[list[Piece], list[Fold]]:
     out = coalesce(pieces)
     folds: list[Fold] = []
     while True:
-        index = next((i for i, p in enumerate(out) if p.length < need), None)
+        index = next(
+            (i for i, p in enumerate(out) if p.length < need and _shot(out, i, coverage) < need),
+            None,
+        )
         if index is None:
             return out, folds
         sliver = out[index]

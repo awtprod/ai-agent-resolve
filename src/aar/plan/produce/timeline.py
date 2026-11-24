@@ -13,6 +13,7 @@ test, ``aar.plan.rules.speech.word_at``).
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -40,10 +41,16 @@ class Piece:
 
 @dataclass(frozen=True)
 class Coverage:
-    """Where a source's media lies on the recording clock, in frames."""
+    """Where a source's media lies on the recording clock, in frames. ``camera`` is the label of
+    a camera of several files (S24a) the source is one part of; None otherwise."""
 
     origin: int
     duration: int | None
+    camera: str | None = None
+
+    @property
+    def end(self) -> int | None:
+        return None if self.duration is None else self.origin + self.duration
 
     def covers(self, rec_in: int, rec_out: int) -> bool:
         return rec_in - self.origin >= 0 and (
@@ -286,21 +293,36 @@ def keep_frames(
     return out, snaps, warnings
 
 
-def resolve_camera(plan: EditPlan, name: str) -> str:
-    """A camera name to a source id: the one source with that ``camera`` label, else the
-    source with that id."""
-    labelled = [s for s in plan.sources if s.camera == name]
+def resolve_camera(plan: EditPlan, name: str) -> tuple[str, ...]:
+    """A camera name to its source ids: the sources with that ``camera`` label in recording
+    order (one, or a camera's consecutive files, S24a), else the source with that id. Sources
+    of one label that overlap on the recording clock are two angles, not parts: ambiguous."""
+    labelled = sorted(
+        (s for s in plan.sources if s.camera == name),
+        key=lambda s: (plan.recording_key(s), s.recording_origin),
+    )
     if len(labelled) == 1:
-        return labelled[0].id
+        return (labelled[0].id,)
     if len(labelled) > 1:
         ids = ", ".join(repr(s.id) for s in labelled)
-        raise ProduceInputError(
-            "ambiguous-camera",
-            f"camera {name!r} names more than one source ({ids})",
-            hint="give each source its own camera label, or name a source id in the schedule",
-        )
+        prev = labelled[0]
+        for cur in labelled[1:]:
+            if (
+                plan.recording_key(cur) != plan.recording_key(prev)
+                or prev.duration is None
+                or cur.recording_origin < prev.recording_origin + prev.duration - PART_SLACK
+            ):
+                raise ProduceInputError(
+                    "ambiguous-camera",
+                    f"camera {name!r} names more than one source ({ids}) and they are not one "
+                    "camera's consecutive files (they overlap, or one has no duration)",
+                    hint="give each source its own camera label, or name a source id in the "
+                    "schedule",
+                )
+            prev = cur
+        return tuple(s.id for s in labelled)
     if any(s.id == name for s in plan.sources):
-        return name
+        return (name,)
     known = ", ".join(sorted({s.camera or s.id for s in plan.sources})) or "none"
     raise ProduceInputError(
         "unknown-camera",
@@ -308,12 +330,18 @@ def resolve_camera(plan: EditPlan, name: str) -> str:
     )
 
 
+#: Frames one part may start before the previous ends (the stub's ``PART_OVERLAP_FRAMES``); the
+#: frames both cover play from the earlier part.
+PART_SLACK = 2
+
+
 @dataclass(frozen=True)
 class ScheduleFrames:
-    """The camera schedule in recording frames: ``(start, end, source id)``, chronological.
-    ``None`` bounds mean open-ended (the default camera covers everything)."""
+    """The camera schedule in recording frames: ``(start, end, source ids)``, chronological; the
+    ids are one source, or a camera's parts in recording order. ``None`` bounds mean open-ended
+    (the default camera covers everything)."""
 
-    spans: list[tuple[int | None, int | None, str]]
+    spans: list[tuple[int | None, int | None, tuple[str, ...]]]
 
 
 def schedule_frames(
@@ -330,6 +358,67 @@ def schedule_frames(
     )
 
 
+def _covered_text(ids: Sequence[str], coverage: dict[str, Coverage], fps: Fps) -> str:
+    spans = []
+    for sid in ids:
+        c = coverage[sid]
+        end = "end" if c.end is None else f"{fps.seconds(c.end):.3f}"
+        spans.append(f"{sid} {fps.seconds(c.origin):.3f}-{end} s")
+    return ", ".join(spans)
+
+
+def on_camera(
+    start: int,
+    end: int,
+    keep: int,
+    camera: Sequence[str],
+    coverage: dict[str, Coverage],
+    fps: Fps,
+) -> list[Piece]:
+    """``[start, end)`` shown from ``camera``: one piece of its one source, or a piece per part
+    of a camera of several files, split where one file ends and the next begins. Frames in a gap
+    between two parts have no file and are left out (the producer warns of them,
+    :func:`part_gaps`); frames before the first part or after the last are an error, as for one
+    file, and so is a range with no frame in any part."""
+    if len(camera) == 1:
+        source = camera[0]
+        if not coverage[source].covers(start, end):
+            raise ProduceInputError(
+                "camera-does-not-cover",
+                f"source {source!r} has no media for recording "
+                f"{fps.seconds(start):.3f}-{fps.seconds(end):.3f} s",
+                hint="schedule another camera there, or fix the source's origin or duration",
+            )
+        return [Piece(source, start, end, keep)]
+    first, last = coverage[camera[0]], coverage[camera[-1]]
+    label = first.camera or camera[0]
+    where = f"{fps.seconds(start):.3f}-{fps.seconds(end):.3f} s"
+    if start < first.origin or (last.end is not None and end > last.end):
+        raise ProduceInputError(
+            "camera-does-not-cover",
+            f"camera {label!r} has no media for recording {where}: its files cover "
+            + _covered_text(camera, coverage, fps),
+            hint="schedule another camera there, or move the range inside the camera's files",
+        )
+    pieces: list[Piece] = []
+    cursor = start
+    for sid in camera:
+        cover = coverage[sid]
+        lo = max(cursor, cover.origin)
+        hi = end if cover.end is None else min(end, cover.end)
+        if hi > lo:
+            pieces.append(Piece(sid, lo, hi, keep))
+            cursor = hi
+    if not pieces:
+        raise ProduceInputError(
+            "range-in-gap",
+            f"recording {where} on camera {label!r} lies wholly in a gap between its files, "
+            "where it has no media; its files cover " + _covered_text(camera, coverage, fps),
+            hint="move the range into one of those spans, or schedule another camera there",
+        )
+    return pieces
+
+
 def split(
     start: int,
     end: int,
@@ -338,20 +427,21 @@ def split(
     coverage: dict[str, Coverage],
     fps: Fps,
 ) -> list[Piece]:
-    """``[start, end)`` cut into pieces at the schedule's camera changes.
+    """``[start, end)`` cut into pieces at the schedule's camera changes, and at the boundaries
+    between a camera's files (:func:`on_camera`).
 
     Every frame must be scheduled, and each piece's source must hold media for it.
     """
     pieces: list[Piece] = []
     cursor = start
-    for lo, hi, source in schedule.spans:
+    for lo, hi, camera in schedule.spans:
         a = start if lo is None else max(start, lo)
         b = end if hi is None else min(end, hi)
         if b <= a:
             continue
         if a > cursor:
             break
-        pieces.append(Piece(source, a, b, keep))
+        pieces += on_camera(a, b, keep, camera, coverage, fps)
         cursor = b
     if cursor < end or not pieces:
         gap_from = fps.seconds(cursor)
@@ -360,15 +450,115 @@ def split(
             f"no camera is scheduled for recording {gap_from:.3f} s inside keep range {keep}",
             hint="the camera schedule must cover every kept moment",
         )
-    for piece in pieces:
-        if not coverage[piece.source].covers(piece.rec_in, piece.rec_out):
-            raise ProduceInputError(
-                "camera-does-not-cover",
-                f"source {piece.source!r} has no media for recording "
-                f"{fps.seconds(piece.rec_in):.3f}-{fps.seconds(piece.rec_out):.3f} s",
-                hint="schedule another camera there, or fix the source's origin or duration",
-            )
     return pieces
+
+
+def less_holes(
+    spans: Sequence[tuple[int, int]], holes: Sequence[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """``spans`` less the frames of ``holes`` (both half-open, chronological)."""
+    out: list[tuple[int, int]] = []
+    for a, b in spans:
+        cursor = a
+        for lo, hi in holes:
+            if hi <= cursor or lo >= b:
+                continue
+            if lo > cursor:
+                out.append((cursor, lo))
+            cursor = max(cursor, hi)
+        if cursor < b:
+            out.append((cursor, b))
+    return out
+
+
+@dataclass(frozen=True)
+class PartGaps:
+    """What :func:`part_gaps` did: the keep ranges (an edge moved off a gap when the piece
+    beyond it was too short to keep), the frames to leave out of each and the warnings."""
+
+    keeps: list[KeepFrames]
+    holes: list[list[tuple[int, int]]]
+    warnings: list[PlannerWarning]
+
+
+def part_gaps(
+    keeps: Sequence[KeepFrames],
+    schedule: ScheduleFrames,
+    coverage: dict[str, Coverage],
+    words: Words,
+    fps: Fps,
+    *,
+    handle: int,
+    need: int,
+) -> PartGaps:
+    """Keep ranges that run across a gap between two files of the camera on screen (S24a): the
+    range is split at the gap and the frames with no file are left out, with a
+    ``range-crosses-gap`` warning naming the gap. The cut there is like any other: the hole
+    also leaves out the crossfade's ``handle`` frames at each file's edge (the media a
+    crossfade plays past a cut) and any word an edge would split, as a keep edge does. A piece
+    left at the range's start or end shorter than ``need`` frames is dropped with it."""
+    out_keeps: list[KeepFrames] = []
+    holes: list[list[tuple[int, int]]] = []
+    warnings: list[PlannerWarning] = []
+    for index, keep in enumerate(keeps):
+        pieces = split(keep.start, keep.end, index, schedule, coverage, fps)
+        mine: list[tuple[int, int]] = []
+        for prev, cur in itertools.pairwise(pieces):
+            if cur.rec_in <= prev.rec_out:
+                continue  # one file ends where the next begins: one shot
+            _, lo = _walk_inward(
+                words, fps, max(prev.rec_in, prev.rec_out - handle), prev.rec_in, up=False
+            )
+            _, hi = _walk_inward(
+                words, fps, min(cur.rec_out, cur.rec_in + handle), cur.rec_out, up=True
+            )
+            mine.append((lo, hi))
+        if not mine:
+            out_keeps.append(keep)
+            holes.append([])
+            continue
+        start, end = keep.start, keep.end
+        dropped: list[str] = []
+        if mine[0][0] - start < need:
+            dropped.append(f"{fps.seconds(start):.3f}-{fps.seconds(mine[0][0]):.3f} s")
+            start = mine.pop(0)[1]
+        if mine and end - mine[-1][1] < need:
+            dropped.append(f"{fps.seconds(mine[-1][1]):.3f}-{fps.seconds(end):.3f} s")
+            end = mine.pop()[0]
+        for prev, cur in itertools.pairwise(pieces):
+            if cur.rec_in <= prev.rec_out:
+                continue
+            gap_s = fps.seconds(cur.rec_in - prev.rec_out)
+            warnings.append(
+                PlannerWarning(
+                    code="range-crosses-gap",
+                    message=(
+                        f"keep range {index} runs across a {gap_s:.3f} s gap between camera "
+                        f"files ({prev.source!r} ends at {fps.seconds(prev.rec_out):.3f} s, "
+                        f"{cur.source!r} starts at {fps.seconds(cur.rec_in):.3f} s): it is cut "
+                        "there and the frames with no file are left out"
+                        + (
+                            f"; too short to keep, {' and '.join(dropped)} went too"
+                            if dropped
+                            else ""
+                        )
+                    ),
+                    at_s=round(fps.seconds(prev.rec_out), 3),
+                    source=cur.source,
+                    hint="end the range before the gap and start the next after it, in a pause",
+                )
+            )
+        if end - start < need:
+            raise ProduceInputError(
+                "range-in-gap",
+                f"keep range {index} ({fps.seconds(keep.start):.3f}-{fps.seconds(keep.end):.3f}"
+                " s) runs across gaps between camera files and leaves no piece of at least "
+                f"{need} frames",
+                hint="move the range inside one camera file (the guide lists their spans)",
+            )
+        out_keeps.append(replace(keep, start=start, end=end))
+        holes.append(mine)
+    return PartGaps(out_keeps, holes, warnings)
 
 
 def coalesce(pieces: Sequence[Piece]) -> list[Piece]:

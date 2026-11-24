@@ -110,6 +110,53 @@ def delayed_copy(src: Path, dest: Path, *, delay_s: float, gain: float = 0.5) ->
     return dest
 
 
+def frame_count(path: Path) -> int:
+    """The video stream's packet count (one per frame for these files), by ffprobe."""
+    probe = _tool("ffprobe", "AAR_FFPROBE")
+    assert probe is not None
+    run = subprocess.run(
+        [probe, "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries",
+         "stream=nb_read_packets", "-of", "csv=p=0", str(path)],
+        check=True, capture_output=True, text=True, timeout=60,
+    )  # fmt: skip
+    return int(run.stdout.strip().strip(","))
+
+
+def timecode_label(frames: int, nominal: int = 30) -> str:
+    """A non-drop ``HH:MM:SS:FF`` label of ``frames`` from 00:00:00:00 at ``nominal`` fps,
+    wrapped at midnight."""
+    frames %= 86400 * nominal
+    seconds, ff = divmod(frames, nominal)
+    return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}:{ff:02d}"
+
+
+def make_parts(
+    folder: Path,
+    gaps: list[int],
+    *,
+    name: str = "cam-a",
+    start_frames: int = 108000,
+    seconds: float = SECONDS,
+    **kw: Any,
+) -> list[tuple[Path, int]]:
+    """One camera's consecutive files (S24a): ``len(gaps) + 1`` synthetic shows (each with
+    :data:`WORDS` in its own clock), ``<name>_C001.mov`` first, starting at timecode frame
+    ``start_frames`` (01:00:00:00 at 29.97 by default); each next file's start timecode is where
+    the previous one ends plus ``gaps[n]`` frames (0: frame-contiguous; a negative gap
+    overlaps). Returns ``(path, start timecode frame)`` per file (wrapped at midnight)."""
+    out: list[tuple[Path, int]] = []
+    at = start_frames
+    folder.mkdir(parents=True, exist_ok=True)
+    for n in range(len(gaps) + 1):
+        path = make_show(
+            folder / f"{name}_C{n + 1:03d}.mov", seconds=seconds, timecode=timecode_label(at), **kw
+        )
+        out.append((path, at % (86400 * 30)))
+        if n < len(gaps):
+            at += frame_count(path) + gaps[n]
+    return out
+
+
 def transcript(recording: str, words: tuple[tuple[str, float, float], ...] = WORDS) -> dict:
     return {
         "recording": recording,
