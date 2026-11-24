@@ -575,20 +575,24 @@ def merge_parts(
     """One transcript, one readable text and one report for the recording from its parts' (in
     part order). Each part's words are kept to the part's own span of the recording clock (a word
     the transcriber placed past the file's last frame is cut back to it, one wholly outside is
-    dropped). The text renders each part's lines and puts a :func:`gap_line` between parts, so
-    the reader sees where the files meet and how long each gap with no file is. The report lists
-    each part's own report and the parts' wordless stretches together."""
+    dropped; where two parts overlap, the span is the earlier part's). The text renders each
+    part's lines and puts a :func:`gap_line` between parts, so the reader sees where the files
+    meet and how long each gap with no file is. The report lists each part's own report and the
+    parts' wordless stretches together."""
     words: list[Word] = []
     lines: list[Line] = []
     stretches: list[dict[str, Any]] = []
     total = duration = 0.0
     for n, part in enumerate(parts):
+        # where two files overlap by a frame or two, the earlier one's words stand (produce
+        # plays the earlier file there)
+        start = max(part.start_s, parts[n - 1].end_s) if n else part.start_s
         mine = [
             w.model_copy(
-                update={"start_s": max(w.start_s, part.start_s), "end_s": min(w.end_s, part.end_s)}
+                update={"start_s": max(w.start_s, start), "end_s": min(w.end_s, part.end_s)}
             )
             for w in part.transcript.words
-            if w.end_s > part.start_s and w.start_s < part.end_s
+            if w.end_s > start and w.start_s < part.end_s
         ]
         words += mine
         if n:

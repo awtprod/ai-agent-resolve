@@ -377,9 +377,10 @@ def on_camera(
 ) -> list[Piece]:
     """``[start, end)`` shown from ``camera``: one piece of its one source, or a piece per part
     of a camera of several files, split where one file ends and the next begins. Frames in a gap
-    between two parts have no file and are left out (the producer warns of them,
-    :func:`part_gaps`); frames before the first part or after the last are an error, as for one
-    file, and so is a range with no frame in any part."""
+    between two parts, a range edge in a gap too, have no file and are left out here (the
+    producer warns of them and moves the edges, :func:`part_gaps`); frames before the first part
+    or after the last are an error, as for one file, and so is a range with no frame in any
+    part."""
     if len(camera) == 1:
         source = camera[0]
         if not coverage[source].covers(start, end):
@@ -491,73 +492,99 @@ def part_gaps(
     handle: int,
     need: int,
 ) -> PartGaps:
-    """Keep ranges that run across a gap between two files of the camera on screen (S24a): the
-    range is split at the gap and the frames with no file are left out, with a
-    ``range-crosses-gap`` warning naming the gap. The cut there is like any other: the hole
-    also leaves out the crossfade's ``handle`` frames at each file's edge (the media a
-    crossfade plays past a cut) and any word an edge would split, as a keep edge does. A piece
-    left at the range's start or end shorter than ``need`` frames is dropped with it."""
+    """Keep ranges that meet a gap between two files of the camera on screen (S24a): a range
+    that runs across a gap is cut there (``range-crosses-gap``), and a range whose edge lies in
+    a gap starts or ends at the file beside it (``range-edge-in-gap``); either warning names the
+    gap's place and length. The frames with no file are left out, and the cut there is like any
+    other: each file edge it meets also gives up the crossfade's ``handle`` frames (the media a
+    crossfade plays past a cut) and any word the edge would split, as a keep edge does. A run of
+    files left between gaps (or between a gap and the range's edge) that is shorter than ``need``
+    frames is dropped too, and the warning names it."""
     out_keeps: list[KeepFrames] = []
     holes: list[list[tuple[int, int]]] = []
     warnings: list[PlannerWarning] = []
     for index, keep in enumerate(keeps):
         pieces = split(keep.start, keep.end, index, schedule, coverage, fps)
-        mine: list[tuple[int, int]] = []
-        for prev, cur in itertools.pairwise(pieces):
-            if cur.rec_in <= prev.rec_out:
-                continue  # one file ends where the next begins: one shot
-            _, lo = _walk_inward(
-                words, fps, max(prev.rec_in, prev.rec_out - handle), prev.rec_in, up=False
-            )
-            _, hi = _walk_inward(
-                words, fps, min(cur.rec_out, cur.rec_in + handle), cur.rec_out, up=True
-            )
-            mine.append((lo, hi))
-        if not mine:
+        # runs of pieces that play unbroken (one file, or files that meet with no gap)
+        runs: list[list[Piece]] = []
+        for piece in pieces:
+            if runs and piece.rec_in <= runs[-1][-1].rec_out:
+                runs[-1].append(piece)
+            else:
+                runs.append([piece])
+        lead, trail = runs[0][0].rec_in > keep.start, runs[-1][-1].rec_out < keep.end
+        if len(runs) == 1 and not lead and not trail:
             out_keeps.append(keep)
             holes.append([])
             continue
-        start, end = keep.start, keep.end
+        kept: list[tuple[int, int]] = []
         dropped: list[str] = []
-        if mine[0][0] - start < need:
-            dropped.append(f"{fps.seconds(start):.3f}-{fps.seconds(mine[0][0]):.3f} s")
-            start = mine.pop(0)[1]
-        if mine and end - mine[-1][1] < need:
-            dropped.append(f"{fps.seconds(mine[-1][1]):.3f}-{fps.seconds(end):.3f} s")
-            end = mine.pop()[0]
-        for prev, cur in itertools.pairwise(pieces):
-            if cur.rec_in <= prev.rec_out:
+        for n, run in enumerate(runs):
+            first, last = run[0], run[-1]
+            lo, hi = first.rec_in, last.rec_out
+            if n or lead:  # a file edge after a gap: the in point gives up the handle
+                _, lo = _walk_inward(words, fps, min(hi, lo + handle), hi, up=True)
+            if n < len(runs) - 1 or trail:  # a file edge before a gap
+                _, hi = _walk_inward(words, fps, max(lo, hi - handle), lo, up=False)
+            if hi - lo < need:
+                names = ", ".join(repr(p.source) for p in run)
+                dropped.append(
+                    f"{fps.seconds(first.rec_in):.3f}-{fps.seconds(last.rec_out):.3f} s "
+                    f"({names}, under {need} frames once the gap's edges are left out)"
+                )
                 continue
-            gap_s = fps.seconds(cur.rec_in - prev.rec_out)
+            kept.append((lo, hi))
+        too_short = f"; too short to keep, {' and '.join(dropped)} went too" if dropped else ""
+        gaps: list[tuple[str, int, int, str | None, str | None]] = []
+        if lead:
+            gaps.append(
+                ("range-edge-in-gap", keep.start, runs[0][0].rec_in, None, runs[0][0].source)
+            )
+        for a, b in itertools.pairwise(runs):
+            gaps.append(
+                ("range-crosses-gap", a[-1].rec_out, b[0].rec_in, a[-1].source, b[0].source)
+            )
+        if trail:
+            last = runs[-1][-1]
+            gaps.append(("range-edge-in-gap", last.rec_out, keep.end, last.source, None))
+        for code, lo, hi, before, after in gaps:
+            where = []
+            if before is not None:
+                where.append(f"{before!r} ends at {fps.seconds(lo):.3f} s")
+            if after is not None:
+                where.append(f"{after!r} starts at {fps.seconds(hi):.3f} s")
+            if code == "range-crosses-gap":
+                what = (
+                    f"keep range {index} runs across a {fps.seconds(hi - lo):.3f} s gap between "
+                    f"camera files ({', '.join(where)}): it is cut there"
+                )
+            else:
+                edge = "starts" if after is not None else "ends"
+                what = (
+                    f"keep range {index} {edge} in a gap between camera files, with "
+                    f"{fps.seconds(hi - lo):.3f} s of it in the gap "
+                    f"({', '.join(where)}): it {edge} at that file instead"
+                )
             warnings.append(
                 PlannerWarning(
-                    code="range-crosses-gap",
-                    message=(
-                        f"keep range {index} runs across a {gap_s:.3f} s gap between camera "
-                        f"files ({prev.source!r} ends at {fps.seconds(prev.rec_out):.3f} s, "
-                        f"{cur.source!r} starts at {fps.seconds(cur.rec_in):.3f} s): it is cut "
-                        "there and the frames with no file are left out"
-                        + (
-                            f"; too short to keep, {' and '.join(dropped)} went too"
-                            if dropped
-                            else ""
-                        )
-                    ),
-                    at_s=round(fps.seconds(prev.rec_out), 3),
-                    source=cur.source,
-                    hint="end the range before the gap and start the next after it, in a pause",
+                    code=code,
+                    message=f"{what}, and the frames with no file are left out{too_short}",
+                    at_s=round(fps.seconds(lo), 3),
+                    source=after or before,
+                    hint="start and end every range inside one camera file, in a pause "
+                    "(the guide lists each file's span)",
                 )
             )
-        if end - start < need:
+        if not kept:
             raise ProduceInputError(
                 "range-in-gap",
                 f"keep range {index} ({fps.seconds(keep.start):.3f}-{fps.seconds(keep.end):.3f}"
-                " s) runs across gaps between camera files and leaves no piece of at least "
-                f"{need} frames",
+                " s) meets gaps between camera files and leaves no piece of at least "
+                f"{need} frames: " + " and ".join(dropped),
                 hint="move the range inside one camera file (the guide lists their spans)",
             )
-        out_keeps.append(replace(keep, start=start, end=end))
-        holes.append(mine)
+        out_keeps.append(replace(keep, start=kept[0][0], end=kept[-1][1]))
+        holes.append([(a[1], b[0]) for a, b in itertools.pairwise(kept)])
     return PartGaps(out_keeps, holes, warnings)
 
 

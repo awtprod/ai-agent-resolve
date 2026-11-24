@@ -7,6 +7,7 @@ words in recording time."""
 from __future__ import annotations
 
 from fractions import Fraction
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -20,7 +21,7 @@ from aar.plan.produce.inputs import CameraSchedule, KeepList, SyncReport
 from aar.plan.produce.timeline import Coverage, less_holes, on_camera, resolve_camera
 from aar.plan.profile import load_profile
 from aar.plan.stub import StubSource, build_stub
-from ccn_support import WORDS, make_parts, make_show, needs_ffmpeg
+from ccn_support import WORDS, frame_count, make_parts, make_show, needs_ffmpeg, timecode_label
 
 #: Part 1 is recording frames 0-360, part 2 360-720 (no gap), then 90 frames (3.003 s) with no
 #: file, part 3 810-1170.
@@ -117,7 +118,82 @@ def test_a_short_piece_before_a_gap_is_left_out_with_it(show: dict[str, Any]) ->
     segs = _segs(result)
     assert [s[0] for s in segs] == ["cam-a-p3"] and segs[0][1] == 1
     (warning,) = [w for w in result.warnings if w.code == "range-crosses-gap"]
-    assert "too short to keep, 23.523-23.991 s went too" in warning.message
+    assert "too short to keep, 23.523-24.024 s ('cam-a-p2', under 30 frames" in warning.message
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(
+    ("ranges", "want"),
+    [
+        # starts 2 s into the gap (part 2 ends 24.024 s, part 3 starts 27.027 s)
+        ([(25.0, 31.5)], [("cam-a-p3", 1, None)]),
+        # ends in the gap: at part 2's end less the crossfade handle
+        ([(20.9, 26.0)], [("cam-a-p2", None, 359)]),
+        # ends in the gap, then a human cut to part 3: a cut like any other, never no-handle
+        ([(20.9, 26.0), (28.5, 31.5)], [("cam-a-p2", None, None), ("cam-a-p3", None, None)]),
+    ],
+)
+def test_a_range_edge_in_a_gap_moves_to_the_file_and_warns(
+    show: dict[str, Any], ranges: list[tuple[float, float]], want: list[tuple[str, Any, Any]]
+) -> None:
+    result = _produce(show, ranges)
+    segs = _segs(result)
+    assert [s[0] for s in segs] == [w[0] for w in want]
+    for seg, (_, src_in, src_out) in zip(segs, want, strict=True):
+        assert src_in is None or seg[1] == src_in
+        assert src_out is None or seg[2] == src_out
+    (warning,) = [w for w in result.warnings if w.code == "range-edge-in-gap"]
+    assert "in a gap between camera files" in warning.message
+    if ranges[0][0] == 25.0:
+        assert warning.at_s == 25.025 and "2.002 s of it in the gap" in warning.message
+        assert "'cam-a-p3' starts at 27.027 s" in warning.message
+    else:
+        assert (
+            warning.at_s == round(_s(720), 3) and "'cam-a-p2' ends at 24.024 s" in warning.message
+        )
+    assert not [w for w in result.warnings if w.code == "range-crosses-gap"]
+    report = lint(result.plan, load_profile("ccn"), transcript=show["transcript"])
+    assert report.ok, [f.message for f in report.findings if f.severity == "error"]
+
+
+@needs_ffmpeg
+def test_a_short_file_between_two_gaps_is_dropped_and_named(tmp_path: Path) -> None:
+    files = []
+    at = 108000
+    for n, (seconds, gap) in enumerate([(12.0, 15), (0.8, 15), (12.0, 0)]):
+        path = make_show(tmp_path / f"A{n + 1}.mov", seconds=seconds, timecode=timecode_label(at))
+        files.append(path)
+        at += frame_count(path) + gap
+    stub = build_stub(
+        [StubSource(p, camera="A", part=n + 1) for n, p in enumerate(files)],
+        recording_id="show-1",
+        project="P",
+        timeline="T",
+        kind="longform",
+        profile="ccn",
+    ).plan
+    origins = [s.recording_origin for s in stub.sources]
+    assert origins == [0, 375, 414]
+    words = [
+        Word(text=t, start_s=a + _s(o), end_s=b + _s(o))
+        for o, d in zip(origins, [s.duration for s in stub.sources], strict=True)
+        for t, a, b in WORDS
+        if b < _s(d)
+    ]
+    keep = KeepList.model_validate(
+        {"recording": "show-1", "ranges": [{"start_s": 8.9, "end_s": _s(414) + 4.1}]}
+    )
+    result = produce(
+        stub,
+        transcript=Transcript(recording="show-1", words=words),
+        keep=keep,
+        profile=load_profile("ccn"),
+        pause_trim=False,
+    )
+    assert [s[0] for s in _segs(result)] == ["cam-a-p1", "cam-a-p3"]
+    gaps = [w for w in result.warnings if w.code == "range-crosses-gap"]
+    assert len(gaps) == 2
+    assert all("('cam-a-p2', under 30 frames" in w.message for w in gaps)
 
 
 @needs_ffmpeg
@@ -133,6 +209,76 @@ def test_a_range_in_a_gap_or_past_the_last_file_is_refused(show: dict[str, Any])
         _produce(show, [(36.0, 40.5)])
     assert caught.value.code == "camera-does-not-cover"
     assert "its files cover" in caught.value.message
+
+
+@needs_ffmpeg
+def test_files_that_overlap_by_two_frames_play_as_one_shot(tmp_path: Path) -> None:
+    files = make_parts(tmp_path, [-2])
+    stub = build_stub(
+        [StubSource(p, camera="A", part=n + 1) for n, (p, _) in enumerate(files)],
+        recording_id="show-1",
+        project="P",
+        timeline="T",
+        kind="longform",
+        profile="ccn",
+    ).plan
+    assert [s.recording_origin for s in stub.sources] == [0, 358]
+    words = [
+        Word(text=t, start_s=a + _s(o), end_s=b + _s(o)) for o in (0, 358) for t, a, b in WORDS
+    ]
+    keep = KeepList.model_validate(
+        {"recording": "show-1", "ranges": [{"start_s": 8.9, "end_s": 12.4}]}
+    )
+    result = produce(
+        stub,
+        transcript=Transcript(recording="show-1", words=words),
+        keep=keep,
+        profile=load_profile("ccn"),
+        pause_trim=False,
+    )
+    # the earlier file plays to its end; the later one picks up 2 frames in
+    segs = _segs(result)
+    assert [(s[0], s[1], s[2]) for s in segs][1:] == [("cam-a-p2", 2, segs[1][2])]
+    assert segs[0][2] == 360 and result.plan.transitions == [] and result.cuts == 0
+
+
+@needs_ffmpeg
+def test_keep_ranges_that_meet_on_one_frame_keep_their_framing(tmp_path: Path) -> None:
+    """A single-file change S24a made on purpose: two keep ranges whose inward-rounded edges
+    meet on the same frame play unbroken (not a cut), so the framing level carries on instead
+    of dropping back to 1.0 (before S24a: 1.0, 1.25, 1.0)."""
+    media = make_show(tmp_path / "cam-a.mov")
+    stub = build_stub(
+        [StubSource(media, camera="A")],
+        recording_id="show-1",
+        project="P",
+        timeline="T",
+        kind="longform",
+        profile="ccn",
+    ).plan
+    meet = _s(255)
+    keep = KeepList.model_validate(
+        {
+            "recording": "show-1",
+            "ranges": [
+                {"start_s": 0.9, "end_s": 4.1},
+                {"start_s": 4.9, "end_s": meet},
+                {"start_s": meet + 1e-7, "end_s": 11.5},
+            ],
+        }
+    )
+    words = [Word(text=t, start_s=a, end_s=b) for t, a, b in WORDS]
+    for trim in (False, True):
+        result = produce(
+            stub,
+            transcript=Transcript(recording="show-1", words=words),
+            keep=keep,
+            profile=load_profile("ccn"),
+            pause_trim=trim,
+        )
+        segs = _segs(result)
+        assert segs[1][2] == segs[2][1] == 255
+        assert [s[3] for s in segs] == [1.0, 1.25, 1.25]
 
 
 @needs_ffmpeg
@@ -235,6 +381,10 @@ def test_on_camera_splits_at_file_edges_and_the_earlier_file_wins_an_overlap() -
         ("a2", 100, 199),
         ("a3", 229, 300),
     ]
+    # a range edge exactly on a file edge makes no empty piece
+    assert [p.source for p in on_camera(50, 100, 0, ("a1", "a2", "a3"), coverage, fps)] == ["a1"]
+    assert [p.source for p in on_camera(199, 260, 0, ("a1", "a2", "a3"), coverage, fps)] == ["a3"]
+    assert [p.source for p in on_camera(100, 150, 0, ("a1", "a2", "a3"), coverage, fps)] == ["a2"]
     assert less_holes([(0, 100), (120, 200)], [(90, 130), (150, 160)]) == [
         (0, 90),
         (130, 150),

@@ -142,6 +142,19 @@ def test_merge_keeps_words_in_their_part_and_marks_where_files_meet() -> None:
     assert [s["start_s"] for s in wordless["stretches"]] == [0.0, 10.0, 20.8]
 
 
+def test_merge_keeps_the_earlier_files_words_where_two_files_overlap() -> None:
+    # part 2 starts 2 frames (0.067 s) before part 1 ends; both transcribed the word there
+    parts = [
+        _part(1, 0.0, 10.0, [("so", 9.5, 9.98)]),
+        _part(2, 9.933, 20.0, [("so", 9.94, 9.98), ("then", 10.5, 11.0)]),
+    ]
+    merged, _, _ = merge_parts(parts, "show-1", wordless_min_s=60.0)
+    assert [(w.text, w.start_s, w.end_s) for w in merged.words] == [
+        ("so", 9.5, 9.98),
+        ("then", 10.5, 11.0),
+    ]
+
+
 # -- the steps on real files -------------------------------------------------------------------
 
 
