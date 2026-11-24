@@ -325,12 +325,76 @@ def _to_u8(v: float) -> int:
     return round(_clamp01(v) * 255.0)
 
 
-def _to_point(val: Any, default: tuple[float, float] = (0.5, 0.5)) -> tuple[float, float]:
+def _to_float(val: Any, tool_name: str, input_name: str) -> float:
+    """Coerce an evaluated Fusion input to a finite float or raise ``FusionError``."""
+    if isinstance(val, bool):
+        return float(int(val))
+    if isinstance(val, (int, float)):
+        out = float(val)
+    elif isinstance(val, str):
+        try:
+            out = float(val)
+        except ValueError as exc:
+            raise FusionError(
+                "invalid_input_value",
+                f"{tool_name}.{input_name} expects a number, got {val!r}",
+            ) from exc
+    else:
+        raise FusionError(
+            "invalid_input_value",
+            f"{tool_name}.{input_name} expects a number, got {val!r}",
+        )
+    if not math.isfinite(out):
+        raise FusionError(
+            "invalid_input_value",
+            f"{tool_name}.{input_name} produced non-finite number {out!r}",
+        )
+    return out
+
+
+def _to_point(
+    val: Any,
+    default: tuple[float, float] = (0.5, 0.5),
+    *,
+    tool_name: str = "",
+    input_name: str = "Center",
+) -> tuple[float, float]:
+    if val is None or val is default:
+        return default
     if isinstance(val, Point2D):
+        if not (math.isfinite(val.x) and math.isfinite(val.y)):
+            raise FusionError(
+                "invalid_input_value",
+                f"{tool_name}.{input_name} has non-finite point ({val.x!r}, {val.y!r})",
+            )
         return (val.x, val.y)
     if isinstance(val, (list, tuple)) and len(val) == 2:
-        return (float(val[0]), float(val[1]))
-    return default
+        return (
+            _to_float(val[0], tool_name, f"{input_name}[0]"),
+            _to_float(val[1], tool_name, f"{input_name}[1]"),
+        )
+    raise FusionError(
+        "invalid_input_value",
+        f"{tool_name}.{input_name} expects a 2D point, got {val!r}",
+    )
+
+
+def _mask_supersample_dims(w: int, h: int, label: str) -> tuple[int, int, int]:
+    """Return ``(scale, sw, sh)`` for mask rasterization within the global image budget.
+
+    Uses 2x supersampling when ``(2*w, 2*h)`` fits within :data:`MAX_CANVAS_DIM` and
+    :data:`MAX_CANVAS_PIXELS`; otherwise falls back to 1x (still bounded by the same caps).
+    """
+    if (
+        w * 2 <= MAX_CANVAS_DIM
+        and h * 2 <= MAX_CANVAS_DIM
+        and (w * 2) * (h * 2) <= MAX_CANVAS_PIXELS
+    ):
+        sw, sh = w * 2, h * 2
+        _check_image_size(sw, sh, f"{label} supersample")
+        return 2, sw, sh
+    _check_image_size(w, h, label)
+    return 1, w, h
 
 
 class _FusionGraphEvaluator:
@@ -476,6 +540,30 @@ class _FusionGraphEvaluator:
         finally:
             eval_stack.discard(key)
 
+    def _eval_float(
+        self,
+        tool_name: str,
+        input_name: str,
+        time: float,
+        frame_cache: dict[str, Any],
+        eval_stack: set[tuple[str, str]],
+        default: float,
+    ) -> float:
+        val = self._eval_input(tool_name, input_name, time, frame_cache, eval_stack, default)
+        return _to_float(val, tool_name, input_name)
+
+    def _eval_point(
+        self,
+        tool_name: str,
+        input_name: str,
+        time: float,
+        frame_cache: dict[str, Any],
+        eval_stack: set[tuple[str, str]],
+        default: tuple[float, float] = (0.5, 0.5),
+    ) -> tuple[float, float]:
+        val = self._eval_input(tool_name, input_name, time, frame_cache, eval_stack, default)
+        return _to_point(val, default, tool_name=tool_name, input_name=input_name)
+
     def _resolve_expr_prop(
         self,
         tool_name: str,
@@ -620,10 +708,10 @@ class _FusionGraphEvaluator:
         eval_stack: set[tuple[str, str]],
     ) -> Any:
         Image, _, _, _, _ = _require_pil()
-        r = float(self._eval_input(tool_name, "TopLeftRed", time, frame_cache, eval_stack, 0.0))
-        g = float(self._eval_input(tool_name, "TopLeftGreen", time, frame_cache, eval_stack, 0.0))
-        b = float(self._eval_input(tool_name, "TopLeftBlue", time, frame_cache, eval_stack, 0.0))
-        a = float(self._eval_input(tool_name, "TopLeftAlpha", time, frame_cache, eval_stack, 1.0))
+        r = self._eval_float(tool_name, "TopLeftRed", time, frame_cache, eval_stack, 0.0)
+        g = self._eval_float(tool_name, "TopLeftGreen", time, frame_cache, eval_stack, 0.0)
+        b = self._eval_float(tool_name, "TopLeftBlue", time, frame_cache, eval_stack, 0.0)
+        a = self._eval_float(tool_name, "TopLeftAlpha", time, frame_cache, eval_stack, 1.0)
 
         img = Image.new(
             "RGBA", (self._comp_w, self._comp_h), (_to_u8(r), _to_u8(g), _to_u8(b), _to_u8(a))
@@ -639,21 +727,18 @@ class _FusionGraphEvaluator:
         eval_stack: set[tuple[str, str]],
     ) -> Any:
         Image, ImageChops, ImageDraw, ImageFilter, _ = _require_pil()
-        center = _to_point(
-            self._eval_input(tool_name, "Center", time, frame_cache, eval_stack, (0.5, 0.5))
-        )
-        w_norm = float(self._eval_input(tool_name, "Width", time, frame_cache, eval_stack, 0.5))
-        h_norm = float(self._eval_input(tool_name, "Height", time, frame_cache, eval_stack, 0.5))
-        corner = float(
-            self._eval_input(tool_name, "CornerRadius", time, frame_cache, eval_stack, 0.0)
-        )
-        angle = float(self._eval_input(tool_name, "Angle", time, frame_cache, eval_stack, 0.0))
-        soft = float(self._eval_input(tool_name, "SoftEdge", time, frame_cache, eval_stack, 0.0))
+        center = self._eval_point(tool_name, "Center", time, frame_cache, eval_stack, (0.5, 0.5))
+        w_norm = self._eval_float(tool_name, "Width", time, frame_cache, eval_stack, 0.5)
+        h_norm = self._eval_float(tool_name, "Height", time, frame_cache, eval_stack, 0.5)
+        corner = self._eval_float(tool_name, "CornerRadius", time, frame_cache, eval_stack, 0.0)
+        angle = self._eval_float(tool_name, "Angle", time, frame_cache, eval_stack, 0.0)
+        soft = self._eval_float(tool_name, "SoftEdge", time, frame_cache, eval_stack, 0.0)
         invert = bool(self._eval_input(tool_name, "Invert", time, frame_cache, eval_stack, 0))
-        level = float(self._eval_input(tool_name, "Level", time, frame_cache, eval_stack, 1.0))
+        level = self._eval_float(tool_name, "Level", time, frame_cache, eval_stack, 1.0)
 
-        ss = 2  # 2x supersampling for crisp anti-aliased edges
-        sw, sh = self._comp_w * ss, self._comp_h * ss
+        ss, sw, sh = _mask_supersample_dims(
+            self._comp_w, self._comp_h, f"RectangleMask {tool_name!r}"
+        )
         mask = Image.new("L", (sw, sh), 0)
         draw = ImageDraw.Draw(mask)
 
@@ -676,7 +761,8 @@ class _FusionGraphEvaluator:
                 angle, resample=Image.Resampling.BICUBIC, center=(cx, cy), fillcolor=0
             )
 
-        mask = mask.resize((self._comp_w, self._comp_h), Image.Resampling.LANCZOS)
+        if ss > 1:
+            mask = mask.resize((self._comp_w, self._comp_h), Image.Resampling.LANCZOS)
         if soft > 1e-5:
             mask = mask.filter(ImageFilter.GaussianBlur(radius=soft * self._comp_w * 0.5))
         if invert:
@@ -698,18 +784,17 @@ class _FusionGraphEvaluator:
         eval_stack: set[tuple[str, str]],
     ) -> Any:
         Image, ImageChops, ImageDraw, ImageFilter, _ = _require_pil()
-        center = _to_point(
-            self._eval_input(tool_name, "Center", time, frame_cache, eval_stack, (0.5, 0.5))
-        )
-        w_norm = float(self._eval_input(tool_name, "Width", time, frame_cache, eval_stack, 0.5))
-        h_norm = float(self._eval_input(tool_name, "Height", time, frame_cache, eval_stack, 0.5))
-        angle = float(self._eval_input(tool_name, "Angle", time, frame_cache, eval_stack, 0.0))
-        soft = float(self._eval_input(tool_name, "SoftEdge", time, frame_cache, eval_stack, 0.0))
+        center = self._eval_point(tool_name, "Center", time, frame_cache, eval_stack, (0.5, 0.5))
+        w_norm = self._eval_float(tool_name, "Width", time, frame_cache, eval_stack, 0.5)
+        h_norm = self._eval_float(tool_name, "Height", time, frame_cache, eval_stack, 0.5)
+        angle = self._eval_float(tool_name, "Angle", time, frame_cache, eval_stack, 0.0)
+        soft = self._eval_float(tool_name, "SoftEdge", time, frame_cache, eval_stack, 0.0)
         invert = bool(self._eval_input(tool_name, "Invert", time, frame_cache, eval_stack, 0))
-        level = float(self._eval_input(tool_name, "Level", time, frame_cache, eval_stack, 1.0))
+        level = self._eval_float(tool_name, "Level", time, frame_cache, eval_stack, 1.0)
 
-        ss = 2
-        sw, sh = self._comp_w * ss, self._comp_h * ss
+        ss, sw, sh = _mask_supersample_dims(
+            self._comp_w, self._comp_h, f"EllipseMask {tool_name!r}"
+        )
         mask = Image.new("L", (sw, sh), 0)
         draw = ImageDraw.Draw(mask)
         cx = center[0] * sw
@@ -722,7 +807,8 @@ class _FusionGraphEvaluator:
             mask = mask.rotate(
                 angle, resample=Image.Resampling.BICUBIC, center=(cx, cy), fillcolor=0
             )
-        mask = mask.resize((self._comp_w, self._comp_h), Image.Resampling.LANCZOS)
+        if ss > 1:
+            mask = mask.resize((self._comp_w, self._comp_h), Image.Resampling.LANCZOS)
         if soft > 1e-5:
             mask = mask.filter(ImageFilter.GaussianBlur(radius=soft * self._comp_w * 0.5))
         if invert:
@@ -791,27 +877,21 @@ class _FusionGraphEvaluator:
             self._eval_input(tool_name, "Style", time, frame_cache, eval_stack, "Regular")
             or "Regular"
         )
-        size_norm = float(self._eval_input(tool_name, "Size", time, frame_cache, eval_stack, 0.08))
-        center = _to_point(
-            self._eval_input(tool_name, "Center", time, frame_cache, eval_stack, (0.5, 0.5))
+        size_norm = self._eval_float(tool_name, "Size", time, frame_cache, eval_stack, 0.08)
+        center = self._eval_point(tool_name, "Center", time, frame_cache, eval_stack, (0.5, 0.5))
+        h_align = self._eval_float(
+            tool_name, "HorizontalLeftCenterRight", time, frame_cache, eval_stack, 0.0
         )
-        h_align = float(
-            self._eval_input(
-                tool_name, "HorizontalLeftCenterRight", time, frame_cache, eval_stack, 0.0
-            )
+        v_align = self._eval_float(
+            tool_name, "VerticalTopCenterBottom", time, frame_cache, eval_stack, 0.0
         )
-        v_align = float(
-            self._eval_input(
-                tool_name, "VerticalTopCenterBottom", time, frame_cache, eval_stack, 0.0
-            )
-        )
-        r = float(self._eval_input(tool_name, "Red1", time, frame_cache, eval_stack, 1.0))
-        g = float(self._eval_input(tool_name, "Green1", time, frame_cache, eval_stack, 1.0))
-        b = float(self._eval_input(tool_name, "Blue1", time, frame_cache, eval_stack, 1.0))
-        a = float(self._eval_input(tool_name, "Alpha1", time, frame_cache, eval_stack, 1.0))
-        opacity = float(self._eval_input(tool_name, "Opacity1", time, frame_cache, eval_stack, 1.0))
-        line_spacing = float(
-            self._eval_input(tool_name, "LineSpacing", time, frame_cache, eval_stack, 1.0)
+        r = self._eval_float(tool_name, "Red1", time, frame_cache, eval_stack, 1.0)
+        g = self._eval_float(tool_name, "Green1", time, frame_cache, eval_stack, 1.0)
+        b = self._eval_float(tool_name, "Blue1", time, frame_cache, eval_stack, 1.0)
+        a = self._eval_float(tool_name, "Alpha1", time, frame_cache, eval_stack, 1.0)
+        opacity = self._eval_float(tool_name, "Opacity1", time, frame_cache, eval_stack, 1.0)
+        line_spacing = self._eval_float(
+            tool_name, "LineSpacing", time, frame_cache, eval_stack, 1.0
         )
 
         img = Image.new("RGBA", (self._comp_w, self._comp_h), (0, 0, 0, 0))
@@ -973,19 +1053,13 @@ class _FusionGraphEvaluator:
             return bg
 
         fg = self._eval_tool(fg_op, time, frame_cache, eval_stack)
-        center = _to_point(
-            self._eval_input(tool_name, "Center", time, frame_cache, eval_stack, (0.5, 0.5))
-        )
-        size = float(self._eval_input(tool_name, "Size", time, frame_cache, eval_stack, 1.0))
-        angle = float(self._eval_input(tool_name, "Angle", time, frame_cache, eval_stack, 0.0))
-        blend = float(self._eval_input(tool_name, "Blend", time, frame_cache, eval_stack, 1.0))
+        center = self._eval_point(tool_name, "Center", time, frame_cache, eval_stack, (0.5, 0.5))
+        size = self._eval_float(tool_name, "Size", time, frame_cache, eval_stack, 1.0)
+        angle = self._eval_float(tool_name, "Angle", time, frame_cache, eval_stack, 0.0)
+        blend = self._eval_float(tool_name, "Blend", time, frame_cache, eval_stack, 1.0)
         flip_h = bool(self._eval_input(tool_name, "FlipHoriz", time, frame_cache, eval_stack, 0))
         flip_v = bool(self._eval_input(tool_name, "FlipVert", time, frame_cache, eval_stack, 0))
 
-        if not (math.isfinite(size) and math.isfinite(angle) and math.isfinite(blend)):
-            raise FusionError(
-                "invalid_setting", f"Merge {tool_name!r} has non-finite transform parameter"
-            )
         if blend <= 0.0 or size <= 0.0:
             return bg
 
@@ -1070,23 +1144,11 @@ class _FusionGraphEvaluator:
         if src_op is None:
             return Image.new("RGBA", (self._comp_w, self._comp_h), (0, 0, 0, 0))
         src = self._eval_tool(src_op, time, frame_cache, eval_stack)
-        center = _to_point(
-            self._eval_input(tool_name, "Center", time, frame_cache, eval_stack, (0.5, 0.5))
-        )
-        size = float(self._eval_input(tool_name, "Size", time, frame_cache, eval_stack, 1.0))
-        aspect = float(self._eval_input(tool_name, "Aspect", time, frame_cache, eval_stack, 1.0))
-        angle = float(self._eval_input(tool_name, "Angle", time, frame_cache, eval_stack, 0.0))
-        blend = float(self._eval_input(tool_name, "Blend", time, frame_cache, eval_stack, 1.0))
-
-        if not (
-            math.isfinite(size)
-            and math.isfinite(aspect)
-            and math.isfinite(angle)
-            and math.isfinite(blend)
-        ):
-            raise FusionError(
-                "invalid_setting", f"Transform {tool_name!r} has non-finite transform parameter"
-            )
+        center = self._eval_point(tool_name, "Center", time, frame_cache, eval_stack, (0.5, 0.5))
+        size = self._eval_float(tool_name, "Size", time, frame_cache, eval_stack, 1.0)
+        aspect = self._eval_float(tool_name, "Aspect", time, frame_cache, eval_stack, 1.0)
+        angle = self._eval_float(tool_name, "Angle", time, frame_cache, eval_stack, 0.0)
+        blend = self._eval_float(tool_name, "Blend", time, frame_cache, eval_stack, 1.0)
 
         work = src
         sx = max(1e-4, size)
@@ -1125,9 +1187,7 @@ class _FusionGraphEvaluator:
         Image, _, _, _, _ = _require_pil()
         bg_op = self._connected_tool(tool, "Background")
         fg_op = self._connected_tool(tool, "Foreground")
-        mix = _clamp01(
-            float(self._eval_input(tool_name, "Mix", time, frame_cache, eval_stack, 0.5))
-        )
+        mix = _clamp01(self._eval_float(tool_name, "Mix", time, frame_cache, eval_stack, 0.5))
         bg = (
             self._eval_tool(bg_op, time, frame_cache, eval_stack)
             if bg_op
@@ -1414,59 +1474,110 @@ def render_fusion_clip(
     )
     stderr_thread.start()
 
+    watchdog_fired = threading.Event()
+    proc_reaped = threading.Event()
+    signal_lock = threading.Lock()
+    watchdog: threading.Timer | None = None
+
+    def _reap_proc() -> None:
+        _terminate_and_reap(proc)
+        with signal_lock:
+            proc_reaped.set()
+
+    def _kill_on_deadline() -> None:
+        watchdog_fired.set()
+        with signal_lock:
+            if proc_reaped.is_set() or proc.returncode is not None:
+                return
+            with contextlib.suppress(OSError):
+                proc.terminate()
+        if not proc_reaped.wait(timeout=0.15):
+            with signal_lock:
+                if not proc_reaped.is_set() and proc.returncode is None:
+                    with contextlib.suppress(OSError):
+                        proc.kill()
+
+    if deadline is not None:
+        remaining = max(0.001, deadline - time.monotonic())
+        watchdog = threading.Timer(remaining, _kill_on_deadline)
+        watchdog.daemon = True
+        watchdog.start()
+
     animated = evaluator.is_animated
-    timed_out = False
     try:
-        if not animated:
-            _check_deadline(f"rendering {tpl.name!r}")
-            img = evaluator.render_frame(0.0)
-            if comp_size != resolution:
-                img = img.resize(resolution, Image.Resampling.LANCZOS)
-            raw = img.tobytes()
-            for _ in range(num_frames):
-                _check_deadline(f"encoding {tpl.name!r}")
-                proc.stdin.write(raw)
-        else:
-            for f in range(num_frames):
-                _check_deadline(f"rendering frame {f} of {tpl.name!r}")
-                img = evaluator.render_frame(float(f))
+        try:
+            if not animated:
+                _check_deadline(f"rendering {tpl.name!r}")
+                img = evaluator.render_frame(0.0)
                 if comp_size != resolution:
                     img = img.resize(resolution, Image.Resampling.LANCZOS)
-                proc.stdin.write(img.tobytes())
-    except BrokenPipeError:
-        pass
-    except FusionError as exc:
-        if exc.code == "render_timeout":
-            timed_out = True
-        _terminate_and_reap(proc)
-        with contextlib.suppress(OSError):
-            proc.stdin.close()
-        stderr_thread.join(timeout=2.0)
-        tmp_path.unlink(missing_ok=True)
-        raise
-    except BaseException:
-        _terminate_and_reap(proc)
-        with contextlib.suppress(OSError):
-            proc.stdin.close()
-        stderr_thread.join(timeout=2.0)
-        tmp_path.unlink(missing_ok=True)
-        raise
-    finally:
-        with contextlib.suppress(OSError):
-            proc.stdin.close()
+                raw = img.tobytes()
+                for _ in range(num_frames):
+                    _check_deadline(f"encoding {tpl.name!r}")
+                    proc.stdin.write(raw)
+            else:
+                for f in range(num_frames):
+                    _check_deadline(f"rendering frame {f} of {tpl.name!r}")
+                    img = evaluator.render_frame(float(f))
+                    if comp_size != resolution:
+                        img = img.resize(resolution, Image.Resampling.LANCZOS)
+                    proc.stdin.write(img.tobytes())
+        except BrokenPipeError:
+            pass
+        except OSError as exc:
+            if not watchdog_fired.is_set():
+                _reap_proc()
+                with contextlib.suppress(OSError):
+                    proc.stdin.close()
+                stderr_thread.join(timeout=2.0)
+                tmp_path.unlink(missing_ok=True)
+                raise FusionError(
+                    "render_failed", f"error writing frames to ffmpeg for {tpl.name!r}: {exc}"
+                ) from exc
+        except BaseException:
+            _reap_proc()
+            with contextlib.suppress(OSError):
+                proc.stdin.close()
+            stderr_thread.join(timeout=2.0)
+            tmp_path.unlink(missing_ok=True)
+            raise
+        finally:
+            with contextlib.suppress(OSError):
+                proc.stdin.close()
 
-    if not timed_out:
+        if watchdog_fired.is_set():
+            _reap_proc()
+            stderr_thread.join(timeout=2.0)
+            tmp_path.unlink(missing_ok=True)
+            raise FusionError(
+                "render_timeout",
+                f"ffmpeg timed out after {timeout_s:g}s while encoding {tpl.name!r}",
+            )
+
         try:
             remaining = None if deadline is None else max(0.05, deadline - time.monotonic())
             proc.wait(timeout=remaining)
+            with signal_lock:
+                proc_reaped.set()
         except subprocess.TimeoutExpired:
-            _terminate_and_reap(proc)
+            _reap_proc()
             stderr_thread.join(timeout=2.0)
             tmp_path.unlink(missing_ok=True)
             raise FusionError(
                 "render_timeout",
                 f"ffmpeg timed out after {timeout_s:g}s while finishing {tpl.name!r}",
             ) from None
+
+        if watchdog_fired.is_set():
+            stderr_thread.join(timeout=2.0)
+            tmp_path.unlink(missing_ok=True)
+            raise FusionError(
+                "render_timeout",
+                f"ffmpeg timed out after {timeout_s:g}s while finishing {tpl.name!r}",
+            )
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
 
     stderr_thread.join(timeout=2.0)
 

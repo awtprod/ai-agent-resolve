@@ -667,3 +667,57 @@ def test_video_graph_composites_fusion_and_plain_titles_in_lane_order(tmp_path: 
         fusion_clips={tl2.titles[0].location: fake_mov},
     )
     assert g2.text.index("[flane0]overlay=") < g2.text.index("drawtext=")
+
+
+def test_render_plan_wrong_typed_input_raises_render_error(tmp_path: Path) -> None:
+    """Wrong-typed numeric plan inputs (e.g. Size='big') must raise RenderError
+    ('fusion_render_failed'), never escape as a raw ValueError.
+    """
+    blue_mp4 = _make_solid_clip(tmp_path / "blue.mp4", color="blue", seconds=2.0)
+    tpl_dir = tmp_path / "tpl"
+    tpl_dir.mkdir()
+    setting = tpl_dir / "TextTitle.setting"
+    setting.write_text(
+        """{
+\tTools = ordered() {
+\t\tTextTitle = MacroOperator {
+\t\t\tInputs = ordered() {
+\t\t\t\tSize = InstanceInput { SourceOp = "Title", Source = "Size", },
+\t\t\t},
+\t\t\tOutputs = { MainOutput1 = InstanceOutput { SourceOp = "Title", Source = "Output", }, },
+\t\t\tTools = ordered() {
+\t\t\t\tTitle = TextPlus {
+\t\t\t\t\tInputs = {
+\t\t\t\t\t\tStyledText = Input { Value = "Hello", },
+\t\t\t\t\t\tSize = Input { Value = 0.08, },
+\t\t\t\t\t},
+\t\t\t\t},
+\t\t\t},
+\t\t},
+\t},
+}
+""",
+        encoding="utf-8",
+    )
+    plan = EditPlan.model_validate(
+        _base_plan_dict(
+            str(blue_mp4),
+            titles=[
+                {
+                    "kind": "graphic",
+                    "setting": "TextTitle.setting",
+                    "inputs": {"Size": "big"},
+                    "record_in": 0,
+                    "record_out": 24,
+                }
+            ],
+        )
+    )
+    with pytest.raises(RenderError) as exc:
+        render_plan(
+            plan,
+            load_profile("ccn"),
+            out=tmp_path / "out.mp4",
+            fusion_templates=[setting],
+        )
+    assert exc.value.code == "fusion_render_failed"

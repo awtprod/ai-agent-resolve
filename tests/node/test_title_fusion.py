@@ -437,3 +437,148 @@ def test_fusion_apply_helpers_display_names_point_dicts_and_manifest_validation(
     with pytest.raises(FusionError) as exc2:
         apply_fusion_inputs_to_item(_StubItem(), inputs={"Input1": "Hello"})
     assert exc2.value.code == "apply_failed"
+
+
+def test_title_place_setting_identity_distinct_paths_and_unrelated_comp() -> None:
+    """Retry matches only the exact canonical setting path, never a same-stem path or an unrelated
+    pre-existing Composition 2. Plain titles without a setting still target comp 1.
+    """
+    from .fake_resolve import FakeFusionComp, FakeFusionTool
+
+    # 1. Two different full paths sharing the same filename stem ("LowerThird.setting").
+    show, tpl_id = _macro_show()
+    show.fake.faults.add("ImportFusionComp:append")
+    setting_a = "D:\\Templates\\PackA\\LowerThird.setting"
+    setting_b = "D:\\Templates\\PackB\\LowerThird.setting"
+
+    first = show.ok(
+        "title.place",
+        {
+            "timeline": show.ref("Main"),
+            "titles": [
+                {
+                    "template": {"unique_id": tpl_id},
+                    "track": 2,
+                    "record_in": 0,
+                    "record_out": 24,
+                    "setting": setting_a,
+                    "inputs": {"Input1": "From A"},
+                }
+            ],
+        },
+    )
+    assert first.titles[0].status == "placed"
+    item = show.main.GetItemListInTrack("video", 2)[0]
+    assert item.GetFusionCompCount() == 2
+    assert item.active_comp_name == "LowerThird"
+
+    # Retrying with the same path (different slash/case spelling) reuses comp 2 without reload.
+    retry_a = show.ok(
+        "title.place",
+        {
+            "timeline": show.ref("Main"),
+            "titles": [
+                {
+                    "template": {"unique_id": tpl_id},
+                    "track": 2,
+                    "record_in": 0,
+                    "record_out": 24,
+                    "setting": "d:/Templates/PackA/lowerthird.setting",
+                    "inputs": {"Input1": "From A"},
+                }
+            ],
+        },
+    )
+    assert retry_a.titles[0].status == "present"
+    assert item.GetFusionCompCount() == 2
+
+    # Retrying with a DIFFERENT full path that has the same stem must NOT match PackA's comp.
+    second = show.ok(
+        "title.place",
+        {
+            "timeline": show.ref("Main"),
+            "titles": [
+                {
+                    "template": {"unique_id": tpl_id},
+                    "track": 2,
+                    "record_in": 0,
+                    "record_out": 24,
+                    "setting": setting_b,
+                    "inputs": {"Input1": "From B"},
+                }
+            ],
+        },
+    )
+    assert second.titles[0].status == "updated"
+    assert item.GetFusionCompCount() == 3
+    assert item.GetFusionCompByIndex(2).FindToolByID("MacroOperator").GetInput("Input1") == "From A"
+    assert item.GetFusionCompByIndex(3).FindToolByID("MacroOperator").GetInput("Input1") == "From B"
+    assert item.active_comp_name == "LowerThird 1"
+
+    # 2. Pre-existing unrelated "Composition 2" with a MacroOperator must never match as loaded.
+    show2, tpl_id2 = _macro_show()
+    show2.ok(
+        "title.place",
+        {
+            "timeline": show2.ref("Main"),
+            "titles": [
+                {
+                    "template": {"unique_id": tpl_id2},
+                    "track": 2,
+                    "record_in": 0,
+                    "record_out": 24,
+                    "inputs": {"Input1": "Comp1 Text"},
+                }
+            ],
+        },
+    )
+    item2 = show2.main.GetItemListInTrack("video", 2)[0]
+    unrelated_macro = FakeFusionTool(
+        show2.fake, item2.GetUniqueId(), "MacroOperator", {"Input1": "UNRELATED"}, name="OtherMacro"
+    )
+    item2.comps.append(
+        FakeFusionComp(show2.fake, item2.GetUniqueId(), [unrelated_macro], name="Composition 2")
+    )
+
+    # Without ImportFusionComp succeeding, must refuse instead of selecting or clobbering Comp 2.
+    err = show2.fails(
+        "title.place",
+        {
+            "timeline": show2.ref("Main"),
+            "titles": [
+                {
+                    "template": {"unique_id": tpl_id2},
+                    "track": 2,
+                    "record_in": 0,
+                    "record_out": 24,
+                    "setting": setting_a,
+                    "inputs": {"Input1": "Should Not Clobber"},
+                }
+            ],
+        },
+    )
+    assert err.code == "title_setting_not_loaded"
+    assert unrelated_macro.GetInput("Input1") == "UNRELATED"
+
+    # Plain title (setting=None) still targets comp 1, leaving Composition 2 untouched.
+    plain = show2.ok(
+        "title.place",
+        {
+            "timeline": show2.ref("Main"),
+            "titles": [
+                {
+                    "template": {"unique_id": tpl_id2},
+                    "track": 2,
+                    "record_in": 0,
+                    "record_out": 24,
+                    "inputs": {"Input1": "Still Comp1"},
+                }
+            ],
+        },
+    )
+    assert plain.titles[0].status == "updated"
+    assert (
+        item2.GetFusionCompByIndex(1).FindToolByID("MacroOperator").GetInput("Input1")
+        == "Still Comp1"
+    )
+    assert unrelated_macro.GetInput("Input1") == "UNRELATED"

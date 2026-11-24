@@ -10,7 +10,9 @@ programmatic callers).
 
 from __future__ import annotations
 
+import contextlib
 import json
+import posixpath
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -22,11 +24,13 @@ from aar.fusion.errors import FusionError
 __all__ = [
     "FusionManifest",
     "FusionPlacement",
+    "activate_fusion_comp",
     "apply_fusion_inputs_to_item",
     "find_loaded_setting_comp",
     "find_tool_by_name",
     "iter_comp_tools",
     "load_fusion_manifest",
+    "record_loaded_setting",
     "resolve_tool_input_id",
     "values_match",
     "write_fusion_manifest",
@@ -219,21 +223,55 @@ def resolve_tool_input_id(tool: Any, key: str) -> str:
     return by_name if by_name is not None else key
 
 
-def _norm_setting_key(path_str: str) -> tuple[str, str]:
-    norm = path_str.replace("\\", "/").strip()
-    stem = Path(norm).stem.casefold()
-    return norm.casefold(), stem
+_SETTING_DATA_KEY = "aar.setting"
 
 
-def _comp_recorded_settings(obj: Any) -> list[str]:
-    out: list[str] = []
-    single = getattr(obj, "setting_path", None)
-    if isinstance(single, str) and single:
-        out.append(single)
-    many = getattr(obj, "loaded_settings", None)
-    if isinstance(many, (list, tuple, set)):
-        out.extend(s for s in many if isinstance(s, str) and s)
-    return out
+def _norm_setting_path(path_str: str) -> str:
+    """Canonicalize a Windows or POSIX setting path for exact identity comparison."""
+    raw = path_str.replace("\\", "/").strip()
+    if not raw:
+        return ""
+    unc = raw.startswith("//")
+    body = raw[2:] if unc else raw
+    norm = posixpath.normpath(body)
+    if unc:
+        norm = "//" + norm.lstrip("/")
+    return norm.casefold()
+
+
+def record_loaded_setting(comp: Any, setting_path: str) -> None:
+    """Persist the canonical ``setting_path`` identity on a Fusion ``comp``."""
+    norm = _norm_setting_path(setting_path)
+    if not norm:
+        return
+    set_data = getattr(comp, "SetData", None)
+    if callable(set_data):
+        with contextlib.suppress(Exception):
+            set_data(_SETTING_DATA_KEY, norm)
+    with contextlib.suppress(AttributeError, TypeError):
+        comp._aar_setting_path = norm
+
+
+def _comp_active_setting(comp: Any) -> str | None:
+    """Return the active canonical setting path recorded on ``comp``, if any."""
+    get_data = getattr(comp, "GetData", None)
+    if callable(get_data):
+        with contextlib.suppress(Exception):
+            val = get_data(_SETTING_DATA_KEY)
+            if isinstance(val, str) and val.strip():
+                return _norm_setting_path(val)
+    recorded_attr = getattr(comp, "_aar_setting_path", None)
+    if isinstance(recorded_attr, str) and recorded_attr.strip():
+        return _norm_setting_path(recorded_attr)
+    single = getattr(comp, "setting_path", None)
+    if isinstance(single, str) and single.strip():
+        return _norm_setting_path(single)
+    many = getattr(comp, "loaded_settings", None)
+    if isinstance(many, (list, tuple)) and many:
+        for entry in reversed(many):
+            if isinstance(entry, str) and entry.strip():
+                return _norm_setting_path(entry)
+    return None
 
 
 def _comp_name(comp: Any, listed_name: str | None = None) -> str:
@@ -250,14 +288,7 @@ def _comp_name(comp: Any, listed_name: str | None = None) -> str:
     return ""
 
 
-def find_loaded_setting_comp(item: Any, setting_path: str) -> Any | None:
-    """Return an existing Fusion comp on ``item`` that already matches ``setting_path``, if any."""
-    comp_count_fn = getattr(item, "GetFusionCompCount", None)
-    comp_count = int(comp_count_fn()) if callable(comp_count_fn) else 0
-    if comp_count < 1:
-        return None
-    target_norm, target_stem = _norm_setting_key(setting_path)
-
+def _listed_comp_names(item: Any) -> dict[int, str]:
     name_list_fn = getattr(item, "GetFusionCompNameList", None)
     listed_names: dict[int, str] = {}
     if callable(name_list_fn):
@@ -270,39 +301,52 @@ def find_loaded_setting_comp(item: Any, setting_path: str) -> Any | None:
             for k, nm in raw_names.items():
                 if isinstance(nm, str) and isinstance(k, int):
                     listed_names[k] = nm
+    return listed_names
 
-    generic_extra: Any | None = None
+
+def activate_fusion_comp(item: Any, comp: Any) -> None:
+    """Activate ``comp`` on ``item`` via ``LoadFusionCompByName`` when available and unambiguous."""
+    load_by_name = getattr(item, "LoadFusionCompByName", None)
+    if not callable(load_by_name):
+        return
+    listed = _listed_comp_names(item)
+    comp_count_fn = getattr(item, "GetFusionCompCount", None)
+    comp_count = int(comp_count_fn()) if callable(comp_count_fn) else 0
+    cname = ""
+    for idx in range(1, comp_count + 1):
+        if item.GetFusionCompByIndex(idx) is comp:
+            cname = _comp_name(comp, listed.get(idx))
+            break
+    if not cname:
+        cname = _comp_name(comp)
+    if not cname:
+        return
+    if listed and list(listed.values()).count(cname) > 1:
+        return
+    with contextlib.suppress(Exception):
+        load_by_name(cname)
+
+
+def find_loaded_setting_comp(item: Any, setting_path: str) -> Any | None:
+    """Return an existing Fusion comp on ``item`` whose recorded canonical setting path equals
+    ``setting_path``, or ``None`` if no comp carries that exact identity.
+    """
+    comp_count_fn = getattr(item, "GetFusionCompCount", None)
+    comp_count = int(comp_count_fn()) if callable(comp_count_fn) else 0
+    if comp_count < 1:
+        return None
+    target_norm = _norm_setting_path(setting_path)
+    if not target_norm:
+        return None
+
     for idx in range(comp_count, 0, -1):
         comp = item.GetFusionCompByIndex(idx)
         if comp is None:
             continue
-        recorded = _comp_recorded_settings(comp)
-        for rec in recorded:
-            rec_norm, rec_stem = _norm_setting_key(rec)
-            if rec_norm == target_norm or (target_stem and rec_stem == target_stem):
-                return comp
-        cname = _comp_name(comp, listed_names.get(idx))
-        if cname and target_stem and Path(cname.replace("\\", "/")).stem.casefold() == target_stem:
+        active = _comp_active_setting(comp)
+        if active is not None and active == target_norm:
             return comp
-        tools = iter_comp_tools(comp)
-        has_macro = False
-        for tool in tools:
-            if _tool_id(tool) in ("MacroOperator", "GroupOperator"):
-                has_macro = True
-                if target_stem and _tool_name(tool).casefold() == target_stem:
-                    return comp
-        # If an earlier ImportFusionComp appended an unnamed/generic comp (e.g. "Composition 2")
-        # with a macro and no conflicting recorded setting path, recognize it as the extra comp.
-        if (
-            idx > 1
-            and generic_extra is None
-            and has_macro
-            and not recorded
-            and (not cname or cname.casefold().startswith("composition "))
-        ):
-            generic_extra = comp
-
-    return generic_extra
+    return None
 
 
 def _set_and_verify(tool: Any, key: str, value: Any) -> Any:
@@ -369,9 +413,9 @@ def apply_fusion_inputs_to_item(
                 comp_count = after_count
 
         if loaded_setting is None:
-            if comp is None and comp_count >= 1:
-                comp = item.GetFusionCompByIndex(comp_count)
-            if comp is None:
+            if comp is None and comp_count == 1:
+                comp = item.GetFusionCompByIndex(1)
+            elif comp is None and comp_count == 0:
                 add_comp = getattr(item, "AddFusionComp", None)
                 if callable(add_comp):
                     comp = add_comp()
@@ -380,15 +424,17 @@ def apply_fusion_inputs_to_item(
                 if callable(load_settings) and load_settings(str(setting_path)):
                     loaded_setting = str(setting_path)
 
-        if loaded_setting is None:
+        if loaded_setting is None or comp is None:
             raise FusionError(
                 "apply_failed",
                 f"could not load Fusion .setting {setting_path} onto timeline item",
             )
+        record_loaded_setting(comp, loaded_setting)
+        activate_fusion_comp(item, comp)
     else:
         if comp_count < 1:
             raise FusionError("apply_failed", "timeline item has no Fusion composition")
-        comp = item.GetFusionCompByIndex(comp_count)
+        comp = item.GetFusionCompByIndex(1)
 
     if comp is None:
         raise FusionError("apply_failed", "timeline item Fusion composition is None")

@@ -338,6 +338,37 @@ def test_render_fusion_clip_timeout_and_atomic_cleanup(tmp_path: Path) -> None:
     assert not out_mov.exists()
     assert list(out_dir.iterdir()) == []
 
+    # Fake ffmpeg that ignores SIGTERM and never reads stdin while we write > 1 MiB of RGBA
+    # frames (far exceeding the OS pipe buffer), verifying the deadline watchdog unblocks
+    # proc.stdin.write() promptly instead of hanging.
+    import time as _time
+
+    stall_bin = tmp_path / "fake_ffmpeg_stall_stdin.py"
+    stall_bin.write_text(
+        f"#!{sys.executable}\nimport signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    stall_bin.chmod(stall_bin.stat().st_mode | stat.S_IXUSR)
+
+    t0 = _time.monotonic()
+    with pytest.raises(FusionError) as exc_stall:
+        render_fusion_clip(
+            setting,
+            out_mov,
+            duration_s=1.0,
+            fps=20.0,
+            resolution=(320, 180),  # 20 * 230,400 = ~4.6 MiB >> pipe buffer
+            ffmpeg_bin=str(stall_bin),
+            timeout_s=0.3,
+        )
+    elapsed = _time.monotonic() - t0
+    assert exc_stall.value.code == "render_timeout"
+    assert elapsed < 3.0
+    assert not out_mov.exists()
+    assert list(out_dir.iterdir()) == []
+
     # Fake ffmpeg that writes partial bytes then exits non-zero -> atomic cleanup removes temp file
     fail_bin = tmp_path / "fake_ffmpeg_fail.py"
     fail_bin.write_text(
@@ -365,3 +396,59 @@ def test_render_fusion_clip_timeout_and_atomic_cleanup(tmp_path: Path) -> None:
     assert exc_fail.value.code == "render_failed"
     assert not out_mov2.exists()
     assert list(out_dir2.iterdir()) == []
+
+
+def test_mask_supersample_budget_and_wrong_typed_inputs(tmp_path: Path) -> None:
+    from aar.fusion.errors import FusionError
+    from aar.fusion.render import MAX_CANVAS_DIM, MAX_CANVAS_PIXELS, _mask_supersample_dims
+
+    # 1080p and 4K fit 2x supersampling within budget.
+    assert _mask_supersample_dims(1920, 1080, "test") == (2, 3840, 2160)
+    assert _mask_supersample_dims(3840, 2160, "test") == (2, 7680, 4320)
+
+    # Large canvas whose 2x supersample would exceed MAX_CANVAS_DIM or MAX_CANVAS_PIXELS
+    # drops back to 1x so mask allocation never bypasses the pixel budget.
+    ss, sw, sh = _mask_supersample_dims(6000, 5000, "test")
+    assert ss == 1
+    assert (sw, sh) == (6000, 5000)
+    assert sw <= MAX_CANVAS_DIM and sh <= MAX_CANVAS_DIM and sw * sh <= MAX_CANVAS_PIXELS
+
+    ss2, sw2, sh2 = _mask_supersample_dims(8192, 4000, "test")
+    assert ss2 == 1
+    assert (sw2, sh2) == (8192, 4000)
+
+    # Wrong-typed numeric or point inputs raise FusionError("invalid_input_value"), not ValueError.
+    text_setting = tmp_path / "BadInput.setting"
+    text_setting.write_text(
+        """{
+\tTools = ordered() {
+\t\tBadInput = MacroOperator {
+\t\t\tInputs = ordered() {
+\t\t\t\tSize = InstanceInput { SourceOp = "Title", Source = "Size", },
+\t\t\t\tCenter = InstanceInput { SourceOp = "Title", Source = "Center", },
+\t\t\t},
+\t\t\tOutputs = { MainOutput1 = InstanceOutput { SourceOp = "Title", Source = "Output", }, },
+\t\t\tTools = ordered() {
+\t\t\t\tTitle = TextPlus {
+\t\t\t\t\tInputs = {
+\t\t\t\t\t\tStyledText = Input { Value = "Hello", },
+\t\t\t\t\t\tSize = Input { Value = 0.08, },
+\t\t\t\t\t\tCenter = Input { Value = { 0.5, 0.5 }, },
+\t\t\t\t\t},
+\t\t\t\t},
+\t\t\t},
+\t\t},
+\t},
+}
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(FusionError) as exc_num:
+        render_fusion_frame(text_setting, inputs={"Size": "big"}, resolution=(160, 90), time=0.0)
+    assert exc_num.value.code == "invalid_input_value"
+
+    with pytest.raises(FusionError) as exc_pt:
+        render_fusion_frame(
+            text_setting, inputs={"Center": "not-a-point"}, resolution=(160, 90), time=0.0
+        )
+    assert exc_pt.value.code == "invalid_input_value"

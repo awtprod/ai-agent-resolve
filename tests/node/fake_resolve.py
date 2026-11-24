@@ -621,15 +621,26 @@ class FakeFusionComp:
         owner: str,
         tools: list[FakeFusionTool],
         name: str = "Composition 1",
+        data: dict[str, Any] | None = None,
     ) -> None:
         self._app = app
         self._owner = owner
         self.tools = tools
         self.Name = name
         self.loaded_settings: list[str] = []
+        self.data: dict[str, Any] = dict(data) if data else {}
 
     def GetAttrs(self) -> dict[str, Any]:
         return {"COMPS_Name": self.Name}
+
+    def GetData(self, key: str | None = None) -> Any:
+        if key is None:
+            return dict(self.data)
+        return self.data.get(key)
+
+    def SetData(self, key: str, value: Any) -> bool:
+        self.data[key] = value
+        return True
 
     def FindToolByID(self, id: str) -> FakeFusionTool | None:
         return next((t for t in self.tools if t.tool_id == id), None)
@@ -653,6 +664,7 @@ class FakeFusionComp:
                 for t in self.tools
             ],
             name=self.Name,
+            data=self.data,
         )
 
 
@@ -878,6 +890,14 @@ class FakeTimelineItem:
     def GetFusionCompNameList(self) -> list[str]:
         return [c.Name for c in self.comps]
 
+    def LoadFusionCompByName(self, compName: str) -> FakeFusionComp | None:
+        self._app.calls.append(("LoadFusionCompByName", self._uid, compName))
+        for comp in self.comps:
+            if comp.Name == compName:
+                self.active_comp_name = compName
+                return comp
+        return None
+
     def ImportFusionComp(self, path: str) -> FakeFusionComp | None:
         self._app.calls.append(("ImportFusionComp", self._uid, path))
         if "ImportFusionComp:append" not in self._app.faults:
@@ -885,6 +905,12 @@ class FakeTimelineItem:
         stem = (
             re.split(r"[\\/]", path)[-1].rsplit(".", 1)[0] or f"Composition {len(self.comps) + 1}"
         )
+        existing_names = {c.Name for c in self.comps}
+        comp_name = stem
+        suffix = 1
+        while comp_name in existing_names:
+            comp_name = f"{stem} {suffix}"
+            suffix += 1
         # Append a distinct composition whose macro inputs are independent of comp 1.
         base_inputs = (
             dict(self.mpi.title_inputs)
@@ -892,7 +918,7 @@ class FakeTimelineItem:
             else {"Input1": "IMPORTED_1", "Input2": "IMPORTED_2", "Input3": 0.0}
         )
         tool = FakeFusionTool(self._app, self._uid, "MacroOperator", base_inputs, name=stem)
-        comp = FakeFusionComp(self._app, self._uid, [tool], name=stem)
+        comp = FakeFusionComp(self._app, self._uid, [tool], name=comp_name)
         comp.loaded_settings.append(path)
         self.comps.append(comp)
         return comp

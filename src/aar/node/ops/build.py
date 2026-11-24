@@ -37,8 +37,10 @@ from typing import Annotated, Any, Literal
 from pydantic import AfterValidator, Field, model_validator
 
 from aar.fusion.apply import (
+    activate_fusion_comp,
     find_loaded_setting_comp,
     find_tool_by_name,
+    record_loaded_setting,
     resolve_tool_input_id,
     values_match,
 )
@@ -1461,18 +1463,14 @@ def _select_title_comp(item: Any, spec: TitleSpec, *, uid: str, reused: bool) ->
     """Select (and if needed load ``spec.setting`` into) the target Fusion composition.
 
     Returns ``(comp, loaded_setting)``. Never falls back silently when ``spec.setting`` cannot be
-    loaded, and recognizes an already-loaded setting when ``reused=True`` so retries stay
-    idempotent.
+    loaded, and recognizes an already-loaded setting by exact canonical path when ``reused=True``
+    so retries stay idempotent without matching unrelated compositions.
     """
     comp_count_fn = getattr(item, "GetFusionCompCount", None)
     comp_count = int(comp_count_fn()) if callable(comp_count_fn) else 0
 
     if spec.setting is None:
-        comp = (
-            item.GetFusionCompByIndex(comp_count)
-            if comp_count >= 1
-            else item.GetFusionCompByIndex(1)
-        )
+        comp = item.GetFusionCompByIndex(1)  # [I] plain title templates carry one comp at index 1
         if comp is None:
             raise OpError(
                 "title_has_no_comp",
@@ -1486,6 +1484,7 @@ def _select_title_comp(item: Any, spec: TitleSpec, *, uid: str, reused: bool) ->
     if reused:
         existing = find_loaded_setting_comp(item, spec.setting)
         if existing is not None:
+            activate_fusion_comp(item, existing)
             return existing, False
 
     comp: Any = None
@@ -1506,11 +1505,18 @@ def _select_title_comp(item: Any, spec: TitleSpec, *, uid: str, reused: bool) ->
 
     if not loaded_setting:
         if comp is None:
-            comp = (
-                item.GetFusionCompByIndex(comp_count)
-                if comp_count >= 1
-                else item.GetFusionCompByIndex(1)
-            )
+            if comp_count > 1:
+                raise OpError(
+                    "title_setting_not_loaded",
+                    f"title item {uid} has {comp_count} Fusion compositions and ImportFusionComp "
+                    f"did not load {spec.setting!r}",
+                    "remove extra compositions on the item or ensure ImportFusionComp succeeds so "
+                    "an unrelated composition is not overwritten",
+                    item_id=uid,
+                    setting=spec.setting,
+                    comp_count=comp_count,
+                )
+            comp = item.GetFusionCompByIndex(1)
         if comp is None:
             raise OpError(
                 "title_has_no_comp",
@@ -1532,6 +1538,8 @@ def _select_title_comp(item: Any, spec: TitleSpec, *, uid: str, reused: bool) ->
             item_id=uid,
             setting=spec.setting,
         )
+    record_loaded_setting(comp, spec.setting)
+    activate_fusion_comp(item, comp)
     return comp, True
 
 
