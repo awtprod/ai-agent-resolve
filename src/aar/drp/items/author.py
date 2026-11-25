@@ -15,7 +15,7 @@ returns the ``Sm2TiItem`` row and its ``Items`` join row. The field map (docs/DE
 * **identity**: a fresh ``Sm2TiItem_id``;
 * **fresh**: what a later edit adds (a grade, a Fusion composition, effects, markers, import
   metadata, the edit history inside ``FieldsBlob``) is NULL or left out, as on an item Resolve
-  has just made;
+  has just made; ``CurrentSelectorIdx`` is 0 (it is derived from nothing);
 * **copied** from the template: every other column, each one of :data:`ITEM_COLUMNS`.
 
 It writes nothing. Whatever it cannot justify is a typed :class:`ItemError`; after authoring no
@@ -265,6 +265,9 @@ def author_item(
         MediaFrameRate=view.rate_bytes,
         Sm2TiTrack_id=placement.track_id,
         FieldsBlob=_fields_blob(tpl, placement.kind, placement.partners),
+        # Not derived from anything (most real items hold 0, others what looks like
+        # uninitialised memory): 0, so nothing of a template's reaches the new project.
+        CurrentSelectorIdx=0,
     )
     if placement.kind == "sound":
         row["MediaTrackIdx"] = 0

@@ -127,36 +127,7 @@ def register(subparsers: Any) -> None:
         "FCPXML file back and compares it with the plan. Exit: 0 ok, 1 --verify found a "
         "mismatch, 2 refused or unreadable input.",
     )
-    export.add_argument("plan", type=Path, help="EditPlan JSON file.")
-    export.add_argument("--profile", help="Profile name or .toml path (default: the plan's).")
-    export.add_argument(
-        "--format",
-        choices=["fcpxml", "library"],
-        default="fcpxml",
-        help="Output format: an FCPXML file (--out), or a project in a Resolve disk library "
-        "(--library with --seed, --facts and --project-name).",
-    )
-    target = export.add_mutually_exclusive_group()
-    target.add_argument("--out", type=Path, help="FCPXML file to write (never overwritten).")
-    target.add_argument(
-        "--verify", type=Path, metavar="FILE", help="Read FILE back and compare it with the plan."
-    )
-    export.add_argument(
-        "--media-map",
-        type=Path,
-        help="JSON object of linux_root -> windows_root, for sources with hub (Linux) paths.",
-    )
-    export.add_argument("--transcript", type=Path, help="Transcript JSON, for the lint.")
-    export.add_argument("--laughs", type=Path, help="Laugh map JSON, for the lint.")
-    export.add_argument(
-        "--overwrite", action="store_true", help="Replace an existing FCPXML and report."
-    )
-    export.add_argument(
-        "--allow-unknown-timecode",
-        action="store_true",
-        help="Export sources with no start_timecode anyway, their assets at 0s (Resolve links "
-        "their clips only if the file's timecode starts at 00:00:00:00).",
-    )
+    _fcpxml_export_arguments(export, ["fcpxml", "library"], required=False)
     lib = export.add_argument_group("library project (--format library)")
     lib.add_argument("--library", type=Path, help="The disk library's folder.")
     lib.add_argument(
@@ -203,7 +174,7 @@ def register(subparsers: Any) -> None:
     )
     add_library_budget_options(export)
     export.add_argument("--json", action="store_true", help="Print the report as JSON.")
-    export.set_defaults(func=_cmd_export)
+    export.set_defaults(func=_cmd_export, export_prog=export.prog)
 
     render = sub.add_parser(
         "render",
@@ -314,6 +285,59 @@ def _memory_mb(text: str) -> int:
 
 def _cmd_schema(args: argparse.Namespace) -> int:
     return cli_io.emit(_PROG, json.dumps(EditPlan.model_json_schema(), indent=2) + "\n")
+
+
+def _fcpxml_export_arguments(
+    parser: argparse.ArgumentParser, formats: list[str], *, required: bool
+) -> None:
+    """The FCPXML export's arguments of ``aar plan export``, in their order. The real parser
+    takes them with both formats and ``--out``/``--verify`` optional (``--format library`` needs
+    neither); :func:`_fcpxml_usage_error` builds a parser of these alone, as the command was
+    before the library format, to print its usage error unchanged."""
+    parser.add_argument("plan", type=Path, help="EditPlan JSON file.")
+    parser.add_argument("--profile", help="Profile name or .toml path (default: the plan's).")
+    parser.add_argument(
+        "--format",
+        choices=formats,
+        default="fcpxml",
+        help="Output format: an FCPXML file (--out), or a project in a Resolve disk library "
+        "(--library with --seed, --facts and --project-name).",
+    )
+    target = parser.add_mutually_exclusive_group(required=required)
+    target.add_argument("--out", type=Path, help="FCPXML file to write (never overwritten).")
+    target.add_argument(
+        "--verify", type=Path, metavar="FILE", help="Read FILE back and compare it with the plan."
+    )
+    parser.add_argument(
+        "--media-map",
+        type=Path,
+        help="JSON object of linux_root -> windows_root, for sources with hub (Linux) paths.",
+    )
+    parser.add_argument("--transcript", type=Path, help="Transcript JSON, for the lint.")
+    parser.add_argument("--laughs", type=Path, help="Laugh map JSON, for the lint.")
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Replace an existing FCPXML and report."
+    )
+    parser.add_argument(
+        "--allow-unknown-timecode",
+        action="store_true",
+        help="Export sources with no start_timecode anyway, their assets at 0s (Resolve links "
+        "their clips only if the file's timecode starts at 00:00:00:00).",
+    )
+
+
+def _fcpxml_usage_error(prog: str) -> int:
+    """The FCPXML export without ``--out`` or ``--verify``: argparse's own usage error of the
+    FCPXML arguments (usage, then ``prog: error: ...`` on stderr, exit 2), exactly as the
+    command printed it while ``--out``/``--verify`` were a required group."""
+    import sys
+
+    parser = argparse.ArgumentParser(prog=prog)
+    _fcpxml_export_arguments(parser, ["fcpxml"], required=True)
+    parser.add_argument("--json", action="store_true", help="Print the report as JSON.")
+    parser.print_usage(sys.stderr)
+    cli_io.warn(f"{prog}: error: one of the arguments --out --verify is required")
+    return cli_io.finalize(2)
 
 
 def _input_error(kind: str, message: str, details: list[Any], as_json: bool) -> int:
@@ -622,6 +646,8 @@ def _export_refusal(exc: ExportError, as_json: bool) -> int:
 
 def _cmd_export(args: argparse.Namespace) -> int:
     as_json: bool = args.json
+    if args.format != "library" and args.out is None and args.verify is None:
+        return _fcpxml_usage_error(getattr(args, "export_prog", "aar plan export"))
     try:
         plan = EditPlan.model_validate_json(args.plan.read_text(encoding="utf-8"))
         transcript: Transcript | None = (
@@ -655,12 +681,8 @@ def _cmd_export(args: argparse.Namespace) -> int:
         )
         if value
     ]
-    if library_only or (args.out is None) == (args.verify is None):
-        why = (
-            f"{', '.join(library_only)} only go with --format library"
-            if library_only
-            else "one of the arguments --out --verify is required"
-        )
+    if library_only:
+        why = f"{', '.join(library_only)} only go with --format library"
         return _input_error("usage", why, [], as_json)
     if args.verify is not None:
         return _do_verify(args.verify, plan, profile, media_map, as_json)
@@ -767,7 +789,10 @@ def _export_library(
             options=library_options(args),
         )
     except ExportError as exc:
+        _warn_residue(exc.details.get("residue"), as_json)
         return _export_refusal(exc, as_json)
+    except KeyboardInterrupt as exc:
+        return _export_interrupted(exc, as_json)
     for finding in result.warnings:
         cli_io.warn(f"warning {finding.rule}: {finding.message}")
     body = json.dumps(result.report, indent=2, ensure_ascii=False) + "\n"
@@ -780,6 +805,33 @@ def _export_library(
             return _input_error(type(exc).__name__, str(exc), [], as_json)
     text = body if as_json else _render_library(result.report)
     return cli_io.emit(_PROG, text)
+
+
+def _warn_residue(residue: object, as_json: bool) -> None:
+    if residue and not as_json:
+        cli_io.warn(f"  left in the library: {residue}; delete it by hand")
+
+
+def _export_interrupted(exc: KeyboardInterrupt, as_json: bool) -> int:
+    """An interrupted library export: say so, and what it left in the library (the staging
+    folder or lock it could not remove, or the project it had already placed)."""
+    notes = [str(n) for n in getattr(exc, "__notes__", [])]
+    residue = getattr(exc, "residue", None)
+    message = "the export was interrupted" + (": " + "; ".join(notes) if notes else "")
+    if as_json:
+        body = {
+            "ok": False,
+            "error": {
+                "code": "interrupted",
+                "message": message,
+                "fix_hint": "run the export again; delete what is named as left by hand",
+                "details": {"residue": residue} if residue else {},
+            },
+        }
+        cli_io.emit(_PROG, json.dumps(body, indent=2) + "\n")
+    else:
+        cli_io.warn(f"interrupted: {message}")
+    return 130
 
 
 def _render_library(report: dict[str, Any]) -> str:

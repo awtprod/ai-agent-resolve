@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from aar.drp import blobs
+from aar.drp.errors import DrpError
 from aar.drp.items.errors import ItemError
 from aar.drp.library import LibraryError, LibraryOptions, read_rows
 from aar.drp.mediapool import blobtree as bt
@@ -192,6 +194,39 @@ def frames_text(value: object) -> int | None:
     return int(value)
 
 
+#: How far from a whole frame a stored fraction may be and still be float noise on a whole
+#: frame (the bound :data:`aar.plan.timeline_import.FRAME_ROUNDOFF` uses on the same values).
+WHOLE_FRAME_NOISE = 1e-9
+#: The reason of an item whose range is whole frames written in Resolve's ``N|hex`` form with
+#: float noise in the fraction: not authored and not compared yet (the writer writes plain
+#: frame counts; whether Resolve's form matters is not known).
+NOISY_WHOLE_FRAMES = "whole frames stored with a fraction (N|hex, float noise): not compared yet"
+
+
+def _range_shape(item: Row) -> str | None:
+    """Why an item's ``Start``, ``Duration`` or ``In`` keeps it from being supported, or None:
+    a value that is not a frame count (``unreadable``), a true fraction of a frame
+    (``sub-frame``), or, when every such value is a whole frame stored as ``N|hex`` with float
+    noise in the fraction, :data:`NOISY_WHOLE_FRAMES`."""
+    noisy = False
+    for column in ("Start", "Duration", "In"):
+        value = item.get(column)
+        if (column == "In" and value is None) or frames_text(value) is not None:
+            continue
+        if not isinstance(value, str):
+            return f"unreadable {column}"
+        try:
+            _, fraction = blobs.parse_frames(value)
+        except DrpError:
+            return f"unreadable {column}"
+        if fraction is None:
+            return f"unreadable {column}"
+        if WHOLE_FRAME_NOISE < fraction < 1 - WHOLE_FRAME_NOISE:
+            return f"sub-frame {column} (a true fraction of a frame)"
+        noisy = True
+    return NOISY_WHOLE_FRAMES if noisy else None
+
+
 @refusing("bad_template", "reading an item's links", _HINT, error=ItemError)
 def links_of(item: Row) -> tuple[str, ...]:
     """The ids of the items ``item`` is linked to (``FieldsBlob`` #1.#1.#1, keys ``0``..), in
@@ -241,6 +276,7 @@ KNOWN_FIELDS = {
 _KIND_TOP = {"picture": "#2", "sound": "#15"}
 
 
+@refusing("bad_template", "reading an item's FieldsBlob", _HINT, error=ItemError)
 def field_paths(item: Row) -> list[tuple[str, int]]:
     """``(path, wire)`` of every field of an item's ``FieldsBlob`` down to the known depth."""
     out: list[tuple[str, int]] = []
@@ -258,6 +294,7 @@ def field_paths(item: Row) -> list[tuple[str, int]]:
     return out
 
 
+@refusing("bad_template", "reading an item's shape", _HINT, error=ItemError)
 def shape_of(rows: ItemRows, clips: dict[str, ClipRows]) -> Shape:
     """Whether ``rows`` is an item the writer can author (and use as a template), and the later
     additions it carries. Never raises: a value that does not decode refuses the item."""
@@ -267,10 +304,11 @@ def shape_of(rows: ItemRows, clips: dict[str, ClipRows]) -> Shape:
         return Shape(None, f"a {item.get('DbType')}, not a picture or sound of a media file")
     try:
         return _shape(rows, kind, clips)
-    except MediaPoolError as exc:  # ItemError is one
+    except MediaPoolError as exc:  # ItemError is one; the boundary makes every damage one
         return Shape(kind, f"does not decode: {exc.message}"[:200])
 
 
+@refusing("bad_template", "reading an item's shape", _HINT, error=ItemError)
 def _shape(rows: ItemRows, kind: str, clips: dict[str, ClipRows]) -> Shape:
     item = rows.item
     unknown = [c for c in item if c not in ITEM_COLUMNS]
@@ -278,11 +316,9 @@ def _shape(rows: ItemRows, kind: str, clips: dict[str, ClipRows]) -> Shape:
         return Shape(kind, f"has columns this writer does not know: {unknown[:4]}")
     if item.get("PrettyType") is not None:
         return Shape(kind, "a title or generator (PrettyType)")
-    for column in ("Start", "Duration"):
-        if frames_text(item.get(column)) is None:
-            return Shape(kind, f"sub-frame or unreadable {column}")
-    if item.get("In") is not None and frames_text(item.get("In")) is None:
-        return Shape(kind, "sub-frame or unreadable In")
+    range_problem = _range_shape(item)
+    if range_problem is not None:
+        return Shape(kind, range_problem)
     timemap = item.get("MediaTimemapBA")
     if not isinstance(timemap, bytes) or len(timemap) != 9 or timemap[0] != 2:
         return Shape(kind, "retimed (a time map other than full speed)")

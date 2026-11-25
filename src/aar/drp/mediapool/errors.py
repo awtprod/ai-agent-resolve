@@ -57,7 +57,7 @@ class MediaPoolError(ValueError):
 #: What a damaged blob, row or fact can raise below the package's own checks: the shared
 #: decoders' and encoders' errors (:class:`aar.drp.errors.DrpError`, which includes
 #: ``EncodeError``), ``struct`` unpacking, and the arithmetic, indexing, conversion and type
-#: errors of code working on what they return.
+#: errors of code working on what they return (an ``AttributeError``: a value of another type).
 DAMAGE_ERRORS: tuple[type[BaseException], ...] = (
     DrpError,
     struct.error,
@@ -65,6 +65,7 @@ DAMAGE_ERRORS: tuple[type[BaseException], ...] = (
     LookupError,
     ValueError,
     TypeError,
+    AttributeError,  # a value of another type than the code expects (``.decode`` on a number)
     RecursionError,
 )
 

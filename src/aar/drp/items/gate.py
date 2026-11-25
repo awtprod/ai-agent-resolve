@@ -25,14 +25,15 @@ from fractions import Fraction
 from pathlib import Path
 
 from aar.drp import blobs
+from aar.drp.errors import DrpError
 from aar.drp.items.author import ItemPlacement, author_item
 from aar.drp.items.errors import ItemError
 from aar.drp.items.fields import compare_items
 from aar.drp.items.media import media_view
 from aar.drp.items.rows import ItemRows, ItemSet, Shape, frames_text, links_of, read_items, shape_of
-from aar.drp.library import LibraryOptions
+from aar.drp.library import LibraryError, LibraryOptions
 from aar.drp.mediapool import blobtree as bt
-from aar.drp.mediapool.errors import MediaPoolError
+from aar.drp.mediapool.errors import MediaPoolError, refusing
 from aar.media.probe import timecode_frames
 
 __all__ = ["GroupScore", "ItemScoreboard", "extents_seconds", "format_scoreboard", "run"]
@@ -122,6 +123,7 @@ def _start_last_bit(target: _Target, rule: float) -> bool:
     return stored in (math.nextafter(rule, math.inf), math.nextafter(rule, -math.inf))
 
 
+@refusing("bad_template", "computing a sequence length", "check the projects", error=ItemError)
 def extents_seconds(rate: float, start_seconds: float, ends: Iterable[int]) -> float:
     """``MediaExtents``' length of a sequence: the end of its last item in seconds (its frame
     over the rate as a double) minus the sequence's start in seconds, as Resolve computes it
@@ -156,7 +158,7 @@ def _check_extents(sets: list[ItemSet], board: ItemScoreboard) -> None:
             try:
                 rate = blobs.decode_rate(rate_bytes)
                 start_s, length = blobs.decode_extents(extents)
-            except Exception:
+            except DrpError:
                 board.extents_skipped += 1
                 continue
             board.extents_checked += 1
@@ -170,6 +172,13 @@ def _check_extents(sets: list[ItemSet], board: ItemScoreboard) -> None:
                 )
 
 
+@refusing(
+    "bad_template",
+    "running the item gate",
+    "check the projects",
+    error=ItemError,
+    passthrough=(LibraryError,),
+)
 def run(
     projects: list[Path],
     *,
@@ -297,6 +306,7 @@ def _check(group: GroupScore, target: _Target, template: _Target) -> None:
         group.hidden[rule.pattern] = group.hidden.get(rule.pattern, 0) + 1
 
 
+@refusing("bad_template", "formatting the scoreboard", "report it", error=ItemError)
 def format_scoreboard(board: ItemScoreboard) -> str:
     """The scoreboard as text (no names of files or items: only paths of fields and counts)."""
     lines: list[str] = []
@@ -320,7 +330,7 @@ def format_scoreboard(board: ItemScoreboard) -> str:
         lines.append(f"  {count:6}  {reason}")
     lines.append(
         f"sequence extents: checked {board.extents_checked}, differing "
-        f"{len(board.extents_differing)}, skipped (sub-frame items or unreadable) "
+        f"{len(board.extents_differing)}, skipped (an item not in whole frames, or unreadable) "
         f"{board.extents_skipped}"
     )
     lines += [f"  EXTENTS {line}" for line in board.extents_differing]

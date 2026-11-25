@@ -13,7 +13,9 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from aar.drp.items.errors import ItemError
 from aar.drp.items.rows import ItemRows, links_of
+from aar.drp.mediapool.errors import MediaPoolError, refusing
 from aar.drp.mediapool.fields import (
     Difference,
     Exclusion,
@@ -92,8 +94,8 @@ ITEM_EXCLUDED: tuple[Exclusion, ...] = (
         r"I\.CurrentSelectorIdx",
         "unexplained",
         "unexplained: picture items hold apparently arbitrary values (302 distinct over 4,220 "
-        "in one project) and every sound item 0; copied from the template, as in the cut the "
-        "spike opened in Resolve",
+        "in one project, most 0) and every sound item 0; the writer writes 0, so nothing of a "
+        "template's reaches a new project",
         frozenset({"picture"}),
     ),
     Exclusion(
@@ -116,6 +118,7 @@ ITEM_EXCLUDED: tuple[Exclusion, ...] = (
 )
 
 
+@refusing("bad_template", "looking up an exclusion", "check the item rows", error=ItemError)
 def item_excluded(path: str, tags: Iterable[str]) -> Exclusion | None:
     """The exclusion that covers ``path`` (a field) for an item with ``tags``, if any."""
     tags = frozenset(tags)
@@ -135,18 +138,20 @@ def _roles(rows: ItemRows) -> dict[str, str]:
         roles[track] = "<T>"
     try:
         partners = links_of(rows.item)
-    except Exception:  # an item whose links do not decode is compared as bytes
+    except MediaPoolError:  # an item whose links do not decode is compared as bytes
         partners = ()
     for i, partner in enumerate(partners):
         roles.setdefault(partner, f"<P{i}>")
     return roles
 
 
+@refusing("bad_template", "laying an item's rows out", "check the item rows", error=ItemError)
 def flatten_item(rows: ItemRows) -> dict[str, Leaf]:
     """Every field of an item's rows as ``{path: leaf}``."""
     return flatten_rows([("I", rows.item), ("J", rows.link)], _roles(rows))
 
 
+@refusing("bad_template", "comparing two items' rows", "check the item rows", error=ItemError)
 def compare_items(
     expected: ItemRows, got: ItemRows, tags: Iterable[str]
 ) -> tuple[int, list[Difference], list[tuple[Exclusion, Difference]]]:

@@ -24,9 +24,9 @@ from typing import Any
 
 from aar.drp import blobs
 from aar.drp.errors import DrpError
-from aar.drp.items.rows import ItemRows, shape_of
-from aar.drp.library import LibraryError, LibraryOptions, read_rows
-from aar.drp.libwrite.errors import ProjectWriteError
+from aar.drp.items.rows import ITEM_COLUMNS, ItemRows, shape_of
+from aar.drp.library import SQL_ERRORS, LibraryError, LibraryOptions, read_rows
+from aar.drp.libwrite.errors import ProjectWriteError, refusing
 from aar.drp.mediapool import blobtree as bt
 from aar.drp.mediapool.errors import MediaPoolError
 from aar.drp.mediapool.templates import (
@@ -50,6 +50,44 @@ _HINT = (
 )
 #: The most tables a seed may have (a Resolve 21.1 project has 146).
 MAX_TABLES = 400
+_JOIN = ("DbOwner", "DbAssociate", "DbPropertyName", "DbIndex")
+#: The columns :func:`read_seed` and the writer read or write, per table; a seed whose table
+#: lacks one is refused (``bad_seed``), never read as if the value were empty. The media
+#: tables' own are :data:`aar.drp.mediapool.templates.REQUIRED_COLUMNS`, checked by
+#: :func:`aar.drp.mediapool.templates.clips_from_rows`.
+SEED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "SM_Project": ("SM_Project_id", "ProjectName"),
+    "SM_Config": ("FieldsBlob",),
+    "SM_Project_Sm2Timeline": _JOIN,
+    "Sm2Timeline": ("Sm2Timeline_id", "Name", "Sequence", "MpTimelineClip"),
+    "Sm2Sequence": ("Sm2Sequence_id", "FrameRate", "MediaExtents", "Resolution"),
+    "Sm2SequenceContainer": ("Sm2SequenceContainer_id", "Sm2Sequence_id"),
+    "Sm2SequenceContainer_Sm2TiTrack": _JOIN,
+    "Sm2TiTrack": ("Sm2TiTrack_id", "Type"),
+    "Sm2TiItem": ITEM_COLUMNS,
+    "Sm2TiItem_Sm2TiTrack": _JOIN,
+    "Sm2MpFolder": ("Sm2MpFolder_id", "MpFolder"),
+    "BtLockableBlobMap": ("BtLockableBlobMap_id",),
+}
+#: The triggers a Resolve 21.1 project has (whitespace collapsed): its two deletes of a media
+#: clip's metadata. The writer changes rows in every table (the project id), so a seed with
+#: any other trigger is refused: a trigger would make the copy differ from what was written.
+RESOLVE_TRIGGERS = frozenset(
+    {
+        (
+            "Delete_BtVideoInfo_trigger",
+            "CREATE TRIGGER Delete_BtVideoInfo_trigger AFTER DELETE ON BtVideoInfo BEGIN DELETE "
+            "FROM BtLockableBlob WHERE 1 = (SELECT Enable FROM TriggerControl WHERE Name = "
+            "'master_trigger') AND BlobOwner = OLD.BtVideoInfo_id; END",
+        ),
+        (
+            "Delete_BtAudioInfo_trigger",
+            "CREATE TRIGGER Delete_BtAudioInfo_trigger AFTER DELETE ON BtAudioInfo BEGIN DELETE "
+            "FROM BtLockableBlob WHERE 1 = (SELECT Enable FROM TriggerControl WHERE Name = "
+            "'master_trigger') AND BlobOwner = OLD.BtAudioInfo_id; END",
+        ),
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -94,11 +132,12 @@ def _bad(message: str, hint: str = _HINT, **details: Any) -> ProjectWriteError:
 
 
 def _tables(path: Path) -> list[str]:
-    """The ordinary tables of ``path`` (an immutable, read-only connection; no schema code)."""
+    """The ordinary tables of ``path`` (an immutable, read-only connection; no schema code),
+    after checking it has no trigger but Resolve's own (:data:`RESOLVE_TRIGGERS`)."""
     uri = path.resolve().as_uri() + "?mode=ro&immutable=1"
     try:
         conn = sqlite3.connect(uri, uri=True)
-    except sqlite3.Error as exc:
+    except SQL_ERRORS as exc:
         raise _bad(f"{path} cannot be opened: {exc}") from None
     try:
         conn.execute("PRAGMA trusted_schema = OFF")
@@ -106,7 +145,10 @@ def _tables(path: Path) -> list[str]:
         names = [
             str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         ]
-    except sqlite3.Error as exc:
+        triggers = conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+        ).fetchall()
+    except SQL_ERRORS as exc:
         raise _bad(f"{path} cannot be read: {exc}") from None
     finally:
         conn.close()
@@ -115,6 +157,12 @@ def _tables(path: Path) -> list[str]:
     bad = [n for n in names if not _TABLE_NAME.match(n)]
     if bad:
         raise _bad(f"{path} has a table whose name is not an element name: {bad[0]!r}")
+    for name, sql in triggers:
+        if (str(name), " ".join(str(sql or "").split())) not in RESOLVE_TRIGGERS:
+            raise _bad(
+                f"{path} has a trigger Resolve does not make ({str(name)[:80]!r}): it would "
+                "change the copy behind the writer's back"
+            )
     return [n for n in names if not n.startswith("sqlite_")]
 
 
@@ -156,6 +204,7 @@ def _uuids(value: object, out: set[str]) -> None:
         out.add(value)
 
 
+@refusing("bad_seed", "reading the seed", _HINT)
 def read_seed(path: str | Path, *, options: LibraryOptions | None = None) -> Seed:
     """Read and check a seed (see the module docstring); a ``bad_seed`` refusal otherwise.
     The seed's ``LibraryError`` (busy, damaged, too large...) becomes ``bad_seed`` with the
@@ -203,6 +252,10 @@ def _read_seed(p: Path, opts: LibraryOptions) -> Seed:
     missing = [t for t in needed if t not in tables]
     if missing:
         raise _bad(f"the seed has no {', '.join(missing[:4])} table")
+    for table, wanted in SEED_COLUMNS.items():
+        absent = [c for c in wanted if c not in lib.columns[table]]
+        if absent:
+            raise _bad(f"the seed's {table} table has no column {', '.join(absent[:4])}")
     project = _one(tables["SM_Project"], "project rows")
     timeline = _one(
         tables["Sm2Timeline"],

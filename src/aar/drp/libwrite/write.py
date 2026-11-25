@@ -19,7 +19,8 @@ from typing import Any
 
 from aar.drp.items.author import AuthoredItem
 from aar.drp.items.rows import links_of
-from aar.drp.libwrite.errors import ProjectWriteError
+from aar.drp.library import SQL_ERRORS
+from aar.drp.libwrite.errors import ProjectWriteError, refusing
 from aar.drp.libwrite.seed import Seed
 from aar.drp.mediapool.author import AuthoredClip
 from aar.drp.mediapool.templates import ClipRows
@@ -50,6 +51,7 @@ def _q(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+@refusing("bad_input", "computing the sequence length", "this is a caller bug; report it")
 def sequence_length(rate: float, start_seconds: float, ends: Sequence[int]) -> float:
     """``MediaExtents``' length (Resolve's formula, checked on 15 real sequences): the end of
     the last item, counted from frame 0, over the rate as a double, minus the start in
@@ -59,6 +61,7 @@ def sequence_length(rate: float, start_seconds: float, ends: Sequence[int]) -> f
     return max(ends) / rate - start_seconds
 
 
+@refusing("bad_input", "listing the operations", "this is a caller bug; report it")
 def operations_for(
     seed: Seed, timeline_name: str | None, items: Sequence[AuthoredItem], *, media: bool
 ) -> list[str]:
@@ -120,6 +123,7 @@ def _gaps(seed: Seed, items: Sequence[AuthoredItem]) -> bool:
     return False
 
 
+@refusing("bad_input", "writing the project's rows", "this is a caller bug; report it")
 def build_project(
     staged: Path,
     seed: Seed,
@@ -139,12 +143,8 @@ def build_project(
     _check_inputs(seed, clips, items)
     try:
         conn = sqlite3.connect(staged, isolation_level=None)
-    except sqlite3.Error as exc:
-        raise ProjectWriteError(
-            "library_unwritable",
-            f"cannot open the staged copy {staged}: {exc}",
-            "check the library",
-        ) from None
+    except SQL_ERRORS as exc:
+        raise _sql_refusal(exc, f"cannot open the staged copy {staged}") from None
     try:
         conn.execute("PRAGMA trusted_schema = OFF")
         mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
@@ -195,12 +195,8 @@ def build_project(
                 f"the written project fails SQLite's integrity check: {check[0][0]}",
                 "this is a writer bug; report the seed",
             )
-    except sqlite3.Error as exc:
-        raise ProjectWriteError(
-            "library_unwritable",
-            f"writing the staged project failed: {exc}",
-            "check that the library is writable and has room",
-        ) from None
+    except SQL_ERRORS as exc:
+        raise _sql_refusal(exc, "writing the staged project failed") from None
     finally:
         conn.close()
     for side in ("-journal", "-wal", "-shm"):
@@ -212,6 +208,47 @@ def build_project(
                 "this is a writer bug; report it",
             )
     return Built(staged, project_id, tuple(ops))
+
+
+#: SQLite's error names that say the library (its disk, its share, its permissions) failed,
+#: not the seed: anything else SQLite refuses while the copy's rows change is the seed's.
+_STORAGE_ERRORS = (
+    "SQLITE_FULL",
+    "SQLITE_IOERR",
+    "SQLITE_CANTOPEN",
+    "SQLITE_READONLY",
+    "SQLITE_BUSY",
+    "SQLITE_LOCKED",
+    "SQLITE_PERM",
+    "SQLITE_NOLFS",
+    "SQLITE_NOMEM",
+)
+
+
+#: SQLite's messages for those, for an error that carries no error name.
+_STORAGE_TEXT = ("disk", "full", "i/o", "readonly", "read-only", "unable to open", "locked", "busy")
+
+
+def _sql_refusal(exc: Exception, what: str) -> ProjectWriteError:
+    """A storage failure is ``library_unwritable``; any other error SQLite raises on the copy
+    (a constraint, a missing column, damage) is the seed's (``bad_seed``)."""
+    name = str(getattr(exc, "sqlite_errorname", "") or "")
+    text = str(exc).lower()
+    storage = name.startswith(_STORAGE_ERRORS) or (
+        not name and any(word in text for word in _STORAGE_TEXT)
+    )
+    if isinstance(exc, sqlite3.Error) and storage:
+        return ProjectWriteError(
+            "library_unwritable",
+            f"{what}: {exc} ({name})",
+            "check that the library is writable and has room",
+        )
+    return ProjectWriteError(
+        "bad_seed",
+        f"{what}: SQLite refused a change of the seed's copy ({type(exc).__name__}: {exc}"
+        + (f", {name})" if name else ")"),
+        "use a seed Resolve saved in a disk library",
+    )
 
 
 def _new_identity(conn: sqlite3.Connection, seed: Seed, project_id: str, name: str) -> None:

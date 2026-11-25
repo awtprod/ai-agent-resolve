@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from aar.drp.libwrite.errors import ProjectWriteError, refusing
+
 __all__ = ["OPENED", "OPERATIONS", "UNOPENED", "Operation", "unopened"]
 
 OPENED = "opened in Resolve"
@@ -102,6 +104,13 @@ OPERATIONS: dict[str, Operation] = {
 }
 
 
+@refusing("bad_input", "listing the operations not yet opened", "report it")
 def unopened(names: list[str]) -> list[str]:
-    """The operations of ``names`` no person has opened in Resolve yet."""
+    """The operations of ``names`` no person has opened in Resolve yet; an unknown name is
+    a ``bad_input`` refusal."""
+    unknown = [n for n in names if n not in OPERATIONS]
+    if unknown:
+        raise ProjectWriteError(
+            "bad_input", f"{unknown[0]!r} is not an operation of the writer", "report it"
+        )
     return [n for n in names if OPERATIONS[n].status != OPENED]

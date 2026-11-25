@@ -88,6 +88,7 @@ def _expected(kind: str, **change: Any) -> ItemRows:
         duration=place.duration,
         src_in=place.src_in,
         partners=place.partners,
+        selector=0,  # the field map: always 0, whatever the template holds
     )
     return ItemRows(
         row,
@@ -106,6 +107,13 @@ def test_an_item_reproduces_the_field_map_in_every_field(kind: str) -> None:
     assert compared > 40
     assert diffs == []
     assert hidden == []
+
+
+def test_current_selector_idx_is_zero_whatever_the_template_holds() -> None:
+    template = _template("picture")
+    assert template.item["CurrentSelectorIdx"] == 4242  # a made-up template value
+    assert _author("picture", template).item["CurrentSelectorIdx"] == 0
+    assert _author("sound").item["CurrentSelectorIdx"] == 0
 
 
 def test_the_time_map_is_the_frames_over_the_rate_minus_one_frame() -> None:
@@ -202,7 +210,7 @@ def test_a_sound_file_takes_its_import_rate_and_its_samples_as_frames() -> None:
             start=0.0,
             rate=48000,
             channels=2,
-            samples=3714110,
+            samples=2000082,
             codec="Linear PCM",
             depth=2,
         ),
@@ -211,9 +219,9 @@ def test_a_sound_file_takes_its_import_rate_and_its_samples_as_frames() -> None:
     rate = 30000 / 1001
     assert view.rate_bytes == struct.pack("<d", rate) + bytes(8)
     # Resolve's value: the samples as frames at the rate (a double) over the rate, minus a frame.
-    want = 3714110 / 48000 * rate / rate - 1 / rate
+    want = 2000082 / 48000 * rate / rate - 1 / rate
     assert view.last_seconds == want
-    assert want != 3714110 / 48000 - 1 / rate  # the plain form differs in the last bit here
+    assert want != 2000082 / 48000 - 1 / rate  # the plain form differs in the last bit here
     assert timemap(view.last_seconds) == b"\x02" + struct.pack(">d", want)
 
 
@@ -316,8 +324,10 @@ def test_an_id_already_taken_is_refused() -> None:
 @pytest.mark.parametrize(
     ("change", "reason"),
     [
-        ({"Duration": "31|60e5ffffffffef3f"}, "sub-frame"),
-        ({"In": "7|00"}, "sub-frame"),
+        ({"Duration": "12|000000000000d03f"}, "sub-frame Duration (a true fraction"),
+        ({"Duration": "12|7296ffffffffef3f"}, "whole frames stored with a fraction"),
+        ({"In": "7|00"}, "unreadable In"),
+        ({"Start": "x"}, "unreadable Start"),
         ({"MediaTimemapBA": kd(("DbType", S, "Sm2TimeMap"))}, "retimed"),
         ({"PrettyType": "Fusion Title"}, "title"),
         ({"MediaRef": uid(0x999)}, "not a file clip"),

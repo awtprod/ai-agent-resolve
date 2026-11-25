@@ -60,6 +60,7 @@ from aar.media.settle import Copied, TooLargeError, copy_settled, settle_identit
 __all__ = [
     "LIBRARY_KIND",
     "SQLITE_MAGIC",
+    "SQL_ERRORS",
     "SUPPORTED_PROJECT_VERSIONS",
     "LibraryError",
     "LibraryListing",
@@ -490,7 +491,8 @@ def _connect(
     """A read-only, immutable connection: SQLite creates no journal, WAL or lock files.
 
     Text comes back as bytes (text that is not UTF-8 is read, never a decode error), or with
-    ``text_as_bytes=False`` as ``str``, where text that is not UTF-8 is an SQLite error."""
+    ``text_as_bytes=False`` as ``str``, where text that is not UTF-8 raises (a
+    ``UnicodeDecodeError``, one of :data:`SQL_ERRORS`)."""
     uri = snapshot.resolve().as_uri() + "?mode=ro&immutable=1"
     conn = sqlite3.connect(uri, uri=True, isolation_level=None)
     try:
@@ -506,7 +508,21 @@ def _connect(
     return conn
 
 
-def _sql_error(path: Path, exc: sqlite3.Error, deadline: _Deadline) -> LibraryError:
+#: What SQLite can raise on a damaged or hostile file: its own errors, and a
+#: ``UnicodeDecodeError`` when the message SQLite gives (a damaged page can put any bytes in it)
+#: or a text value is not UTF-8. Every read below catches both, so a caller only ever sees a
+#: :class:`LibraryError`.
+SQL_ERRORS: tuple[type[Exception], ...] = (sqlite3.Error, UnicodeDecodeError)
+
+
+def _sql_error(path: Path, exc: Exception, deadline: _Deadline) -> LibraryError:
+    if isinstance(exc, UnicodeDecodeError):
+        return LibraryError(
+            "damaged",
+            f"{path}: SQLite cannot read it (it reports text that is not UTF-8: {exc.reason} "
+            f"at byte {exc.start})",
+            "open the project in Resolve and save it again, or restore it from a backup",
+        )
     text = str(exc)
     if isinstance(exc, sqlite3.DataError) or "too big" in text:
         return LibraryError(
@@ -1462,7 +1478,7 @@ def open_library(
             )
         try:
             conn = _connect(snapshot, deadline, min(max_member_bytes, opts.max_value_bytes))
-        except sqlite3.Error as exc:
+        except SQL_ERRORS as exc:
             raise _sql_error(p, exc, deadline) from None
         try:
             try:
@@ -1477,7 +1493,7 @@ def open_library(
                     )
                 _check_schema(conn, p)
                 tables = _load(conn, p, opts)
-            except sqlite3.Error as exc:
+            except SQL_ERRORS as exc:
                 raise _sql_error(p, exc, deadline) from None
         finally:
             conn.close()
@@ -1583,7 +1599,7 @@ def read_rows(
             )
         try:
             conn = _connect(snapshot, deadline, opts.max_value_bytes, text_as_bytes=False)
-        except sqlite3.Error as exc:
+        except SQL_ERRORS as exc:
             raise _sql_error(p, exc, deadline) from None
         try:
             try:
@@ -1645,13 +1661,21 @@ def read_rows(
                             )
                         out.append(tuple(values))
                     rows[table] = out
-            except sqlite3.Error as exc:
+            except SQL_ERRORS as exc:
                 raise _sql_error(p, exc, deadline) from None
         finally:
             conn.close()
     finally:
         snapshot.unlink(missing_ok=True)
     index = {c: i for i, c in enumerate(columns["SM_Project"])}
+    absent = [c for c in ("SM_Project_id", "ProjectVersion") if c not in index]
+    if absent:
+        raise LibraryError(
+            "not_a_project",
+            f"{p} is not a Resolve project this reader knows: it has no SM_Project."
+            f"{', SM_Project.'.join(absent)}",
+            "give the Project.db of a project in a Resolve disk library",
+        )
     projects = [{c: r[i] for c, i in index.items()} for r in rows["SM_Project"]]
     version = _check_project(p, {"SM_Project": projects})  # type: ignore[dict-item]
     deadline.check()

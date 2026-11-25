@@ -19,10 +19,12 @@ from typing import Any, Generic, TypeVar
 from aar.drp.items.author import AuthoredItem
 from aar.drp.library import LibraryError, LibraryOptions, take_snapshot
 from aar.drp.libwrite.check import check_written
-from aar.drp.libwrite.errors import CODES, ProjectWriteError
+from aar.drp.libwrite.cut import Cut
+from aar.drp.libwrite.errors import CODES, ProjectWriteError, by_caller, refusing
 from aar.drp.libwrite.ops import OPENED, OPERATIONS, UNOPENED, Operation, unopened
 from aar.drp.libwrite.place import Placed, check_project_name, place_project
 from aar.drp.libwrite.seed import Seed, read_seed
+from aar.drp.libwrite.verify import verify_written
 from aar.drp.libwrite.write import Built, ItemSpec, build_project, operations_for
 from aar.drp.mediapool.author import AuthoredClip
 from aar.drp.model import DrpFile
@@ -46,6 +48,7 @@ __all__ = [
     "make_project",
     "place_project",
     "read_seed",
+    "verify_written",
 ]
 
 _X = TypeVar("_X")
@@ -61,6 +64,10 @@ class Authored:
     specs: Sequence[ItemSpec]
     #: Anything the caller wants back (its report data).
     extra: Any = None
+    #: The cut the items were authored from (:class:`aar.drp.libwrite.cut.Cut` entries): the
+    #: layout :func:`verify_written` checks the written items against, independently of the
+    #: code that authored them. Required whenever there are items.
+    cuts: Sequence[Cut] = ()
 
 
 @dataclass
@@ -90,6 +97,7 @@ def _stage_seed(seed_path: Path, target: Path, options: LibraryOptions) -> None:
         ) from None
 
 
+@refusing("bad_input", "making the project", "this is a writer bug; report the seed and the plan")
 def make_project(
     library: Path,
     seed_path: Path,
@@ -105,14 +113,23 @@ def make_project(
 ) -> ProjectResult[_X]:
     """Make project ``project_name`` in ``library`` from the seed (see the module docstring).
     ``timeline_name`` None keeps the seed timeline's name. Raises :class:`ProjectWriteError`
-    (or the caller's own refusal from ``author`` or ``check``); nothing is placed then, and the
-    staging folder is removed."""
+    (or the caller's own refusal from ``author`` or ``check``, unchanged); nothing is placed
+    then, and the staging folder is removed (or what is left of it named on the error)."""
     opts = options or LibraryOptions()
+    check_project_name(project_name)
 
+    @refusing("bad_input", "building the project", "this is a writer bug; report the seed")
     def build(path: Path) -> ProjectResult[_X]:
         _stage_seed(seed_path, path, opts)
         seed = read_seed(path, options=opts)
-        authored = author(seed)
+        authored = by_caller(author, seed)
+        if authored.items and not authored.cuts:
+            raise ProjectWriteError(
+                "bad_input",
+                "the items come without the cut they were authored from, so the written "
+                "project cannot be verified against it",
+                "pass the Cut entries in Authored.cuts",
+            )
         ops = operations_for(seed, timeline_name, authored.items, media=bool(authored.clips))
         pending = unopened(ops)
         if pending and not allow_unopened:
@@ -140,7 +157,8 @@ def make_project(
             project_name=project_name,
             allowed_issues=allowed_issues,
         )
-        extra = check(path, seed, authored)
+        verify_written(path, seed, authored.cuts)
+        extra = by_caller(check, path, seed, authored)
         placed_stub = Placed(path, path.parent, "")
         return ProjectResult(placed_stub, built, seed, authored, drp, extra)
 

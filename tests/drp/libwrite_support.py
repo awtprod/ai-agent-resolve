@@ -84,7 +84,7 @@ def item_row(
     rate: float = RATE_2398,
     start_seconds: float = 86400 / RATE_2398,
     path: str = "X:\\Old\\Footage\\camera-b.MP4",
-    selector: int = 1372571043,
+    selector: int = 4242,
 ) -> dict[str, Any]:
     """A picture or sound item of ``clip`` as Resolve stores it (a full-speed item of a picture
     file: the clip's frames over its rate give the time map)."""

@@ -86,7 +86,7 @@ def _writer_project(
         facts_out["start"] = s.start_frame
         facts_out["rate"] = s.rate
         facts_out["cuts"] = cuts
-        return Authored([], items, specs)
+        return Authored([], items, specs, cuts=cuts)
 
     result = make_project(
         library,

@@ -70,7 +70,7 @@ def _cut(seed: Path, cuts_of: Any = None) -> Any:
         clip = s.clips[0]
         cuts = cuts_of(clip) if cuts_of else [Cut(clip, 0, 24, 0), Cut(clip, 24, 24, 100)]
         items, specs = author_cut(s, cuts, picks)
-        return Authored([], items, specs)
+        return Authored([], items, specs, cuts=cuts)
 
     return author
 
@@ -310,7 +310,7 @@ def test_a_project_that_does_not_read_back_as_written_is_never_placed(tmp_path: 
     def author(s: Any) -> Authored:
         items, specs = author_cut(s, [Cut(s.clips[0], 0, 24, 0)], picks)
         wrong = [ItemSpec(x.track, x.record_in, x.record_out + 1, x.src_in, x.path) for x in specs]
-        return Authored([], items, wrong)
+        return Authored([], items, wrong, cuts=[Cut(s.clips[0], 0, 24, 0)])
 
     with pytest.raises(ProjectWriteError) as info:
         _make(tmp_path, seed, author=author)
@@ -432,7 +432,8 @@ def test_a_killed_build_is_reported_by_the_next_placement(tmp_path: Path) -> Non
     projects = library / "Resolve Projects" / "Users" / "guest" / "Projects"
     assert list(projects.iterdir()) == []  # nothing half-placed
     placed, _ = place_project(library, "Next", lambda p: p.write_bytes(b"ok"))
-    assert len(placed.leftovers) == 1 and placed.leftovers[0].startswith("build-")
+    # The killed placement's build folder and its name lock, both listed, neither deleted.
+    assert [x.split("-")[0] for x in placed.leftovers] == ["build", "lock"]
     assert sorted(p.name for p in projects.iterdir()) == ["Next"]
 
 

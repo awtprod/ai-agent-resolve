@@ -21,23 +21,30 @@ from __future__ import annotations
 
 import hashlib
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
+from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, ParamSpec, TypeVar
 
 from aar.drp.items.errors import ItemError
 from aar.drp.items.media import media_view
 from aar.drp.items.rows import ItemSet, read_items
-from aar.drp.library import LibraryError, LibraryOptions
-from aar.drp.libwrite import Authored, ProjectResult, ProjectWriteError, make_project
+from aar.drp.library import SQL_ERRORS, LibraryError, LibraryOptions
+from aar.drp.libwrite import (
+    Authored,
+    ProjectResult,
+    ProjectWriteError,
+    check_project_name,
+    make_project,
+)
 from aar.drp.libwrite.cut import Cut, ItemTemplates, author_cut, pick_item_templates
 from aar.drp.libwrite.ops import OPERATIONS, unopened
 from aar.drp.libwrite.seed import Seed
 from aar.drp.mediapool import formulas as fm
 from aar.drp.mediapool.author import AuthoredClip, Placement, Template, author
-from aar.drp.mediapool.errors import MediaPoolError
+from aar.drp.mediapool.errors import DAMAGE_ERRORS, MediaPoolError
 from aar.drp.mediapool.facts import MediaFacts
 from aar.drp.mediapool.kinds import KINDS, kind_of_facts
 from aar.drp.mediapool.templates import ClipRows, read_templates
@@ -68,6 +75,62 @@ def _refuse(code: str, message: str, hint: str, **details: Any) -> ExportError:
 
 def _from_writer(exc: ProjectWriteError) -> ExportError:
     return ExportError(exc.code, exc.message, exc.hint, **exc.details)
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _refusing(what: str) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    """The export's one typed boundary (as the writers' :func:`aar.drp.libwrite.errors.refusing`):
+    an ``ExportError`` passes; the library writer's refusal becomes the export's of the same
+    code (its details, ``residue`` among them, kept); a media-pool or item refusal becomes
+    ``media_refused`` or ``item_refused``; a library reader's refusal and whatever damage the
+    code below lets escape become ``bad_input`` with the original type and message, and so does
+    an ``OSError`` (a file that cannot be read: the placement turns the library's own into
+    ``library_unwritable`` first). Interrupts pass unchanged."""
+
+    def wrap(func: Callable[_P, _R]) -> Callable[_P, _R]:
+        @wraps(func)
+        def guarded(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            try:
+                return func(*args, **kwargs)
+            except ExportError:
+                raise
+            except ProjectWriteError as exc:
+                raise _from_writer(exc) from exc
+            except ItemError as exc:
+                raise _refuse(
+                    "item_refused", f"{exc.message} [{exc.code}]", exc.hint, item_code=exc.code
+                ) from exc
+            except MediaPoolError as exc:
+                raise _refuse(
+                    "media_refused", f"{exc.message} [{exc.code}]", exc.hint, media_code=exc.code
+                ) from exc
+            except LibraryError as exc:
+                raise _refuse(
+                    "bad_input",
+                    f"{what}: {exc.message} [{exc.code}]",
+                    exc.hint,
+                    library_code=exc.code,
+                ) from exc
+            except OSError as exc:  # reading an input (the library's own are refused below)
+                raise _refuse(
+                    "bad_input",
+                    f"{what}: a file could not be read ({type(exc).__name__}: {exc})",
+                    "check the plan's seed, facts and template files are there and readable",
+                ) from exc
+            except (*DAMAGE_ERRORS, *SQL_ERRORS) as exc:
+                detail = f"{type(exc).__name__}: {exc}"[:400]
+                raise _refuse(
+                    "bad_input",
+                    f"{what} failed on a damaged value ({detail})",
+                    "report the plan, the seed and the templates",
+                ) from exc
+
+        return guarded
+
+    return wrap
 
 
 def _unsupported(layout: Layout) -> list[dict[str, str]]:
@@ -366,6 +429,7 @@ def _parse_resolution(text: str | None) -> tuple[int, int] | None:
     return int(w), int(h)
 
 
+@_refusing("exporting the plan as a library project")
 def export_library(
     plan: EditPlan,
     profile: Profile,
@@ -393,6 +457,7 @@ def export_library(
         read_timeline,
     )
 
+    check_project_name(project_name)  # before any work (a bad_project_name refusal)
     opts = options or LibraryOptions()
     report = lint(plan, profile, transcript=transcript, laughs=laughs)
     if not report.ok:
@@ -439,13 +504,10 @@ def export_library(
         clips, media_rows = _author_media(
             layout, s, used_facts, candidates, allow_unverified_media, added_at
         )
-        try:
-            seed_items = read_items(s.path, options=LibraryOptions(settle_seconds=0.0))
-        except (LibraryError, MediaPoolError):
-            seed_items = None
-        picks: ItemTemplates = pick_item_templates(
-            [*item_sets, *([seed_items] if seed_items is not None else [])]
-        )
+        # The seed's own items are templates too (read_seed has read the same file; a failure
+        # here is the seed's and is refused, never skipped).
+        seed_items = read_items(s.path, options=LibraryOptions(settle_seconds=0.0))
+        picks: ItemTemplates = pick_item_templates([*item_sets, seed_items])
         cuts = []
         for c in layout.clips:
             rows = ClipRows.from_tables(clips[c.src].rows)
@@ -464,7 +526,7 @@ def export_library(
         except ItemError as exc:
             raise _refuse("item_refused", f"{exc.message} [{exc.code}]", exc.hint) from None
         all_clips = [clips[src] for src in sorted(clips)]
-        return Authored(all_clips, items, specs, extra=media_rows)
+        return Authored(all_clips, items, specs, extra=media_rows, cuts=cuts)
 
     def import_check(path: Path, s: Seed, authored: Authored) -> dict[str, Any]:
         try:
@@ -500,21 +562,18 @@ def export_library(
             "reader_warnings": diff.get("reader_warnings", {}).get("count", 0),
         }
 
-    try:
-        result = make_project(
-            library,
-            seed,
-            project_name=project_name,
-            timeline_name=plan.timeline,
-            author=author_all,
-            allowed_issues=READER_WARNING_CODES,
-            check=import_check,
-            allow_unopened=allow_unopened,
-            user=user,
-            options=opts,
-        )
-    except ProjectWriteError as exc:
-        raise _from_writer(exc) from None
+    result = make_project(
+        library,
+        seed,
+        project_name=project_name,
+        timeline_name=plan.timeline,
+        author=author_all,
+        allowed_issues=READER_WARNING_CODES,
+        check=import_check,
+        allow_unopened=allow_unopened,
+        user=user,
+        options=opts,
+    )
     out = _report(layout, result, warnings, state.get("resolution_from"), seed)
     return LibraryExport(out, warnings, result)
 
@@ -529,7 +588,11 @@ def _report(
     plan = layout.plan
     res = plan.resolution
     built = result.built
-    digest = hashlib.sha256(result.placed.path.read_bytes()).hexdigest()
+    try:  # the project is placed: a failure to hash it is reported, not a refusal
+        digest: str | None = hashlib.sha256(result.placed.path.read_bytes()).hexdigest()
+    except OSError as exc:
+        digest = None
+        result.placed.cleanup.append(f"the placed Project.db could not be read to hash it: {exc}")
     ops = list(built.operations)
     items = result.authored.items
     return {

@@ -18,9 +18,10 @@ from aar.drp.items.author import AuthoredItem, ItemPlacement, author_item
 from aar.drp.items.errors import ItemError
 from aar.drp.items.media import media_view
 from aar.drp.items.rows import ItemRows, ItemSet, links_of, shape_of
-from aar.drp.libwrite.errors import ProjectWriteError
+from aar.drp.libwrite.errors import ProjectWriteError, refusing
 from aar.drp.libwrite.seed import Seed
 from aar.drp.libwrite.write import ItemSpec
+from aar.drp.mediapool.errors import MediaPoolError
 from aar.drp.mediapool.templates import ClipRows
 
 __all__ = ["Cut", "ItemTemplates", "author_cut", "pick_item_templates"]
@@ -65,6 +66,12 @@ class ItemTemplates:
         return found
 
 
+@refusing(
+    "bad_input",
+    "picking the template items",
+    "check the template projects",
+    passthrough=(MediaPoolError,),
+)
 def pick_item_templates(sets: Sequence[ItemSet]) -> ItemTemplates:
     """The first plain item (supported shape, no later additions) of each kind and linkage,
     in the order the projects and their items are given."""
@@ -83,6 +90,7 @@ def _bad(why: str) -> ProjectWriteError:
     return ProjectWriteError("bad_input", why, "check the cut list")
 
 
+@refusing("bad_input", "authoring the cut", "check the cut list", passthrough=(MediaPoolError,))
 def author_cut(
     seed: Seed,
     cuts: Sequence[Cut],

@@ -184,6 +184,7 @@ def media_view(clip: ClipRows) -> MediaView:
     )
 
 
+@refusing("bad_media", "writing a time map", _HINT, error=ItemError)
 def timemap(seconds: float) -> bytes:
     """``MediaTimemapBA`` of a file played at full speed: ``0x02`` and the time of its last
     frame as a big-endian double (the form every full-speed item in the corpus has)."""

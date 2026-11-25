@@ -35,6 +35,7 @@ def main(argv: list[str] | None = None) -> int:
             args.projects,
             options=LibraryOptions(settle_seconds=0.0),
             other_project=args.other_project,
+            linked_templates=args.linked_templates,
         )
     except (ItemError, LibraryError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)

@@ -17,7 +17,7 @@ from pathlib import Path
 from aar.drp import read_drp
 from aar.drp.errors import DrpError
 from aar.drp.library import LibraryError, LibraryOptions
-from aar.drp.libwrite.errors import ProjectWriteError
+from aar.drp.libwrite.errors import ProjectWriteError, refusing
 from aar.drp.libwrite.seed import Seed
 from aar.drp.libwrite.write import ItemSpec
 from aar.drp.model import DrpFile
@@ -31,6 +31,7 @@ def _fail(message: str, **details: object) -> ProjectWriteError:
     return ProjectWriteError("self_check_failed", message, _HINT, **details)
 
 
+@refusing("self_check_failed", "reading the written project back", _HINT)
 def check_written(
     path: Path,
     seed: Seed,
