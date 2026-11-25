@@ -11,6 +11,7 @@ from typing import TextIO
 
 from aar.drp.diff import SECTIONS, diff_projects
 from aar.drp.errors import DrpError
+from aar.drp.library_args import add_library_budget_options, library_options
 from aar.drp.reader import read_drp
 
 __all__ = [
@@ -71,13 +72,15 @@ def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
         action="store_true",
         help="exit 0 only if every change is decoded and DbId-matched (S8 post-write check)",
     )
+    add_library_budget_options(p)
     p.set_defaults(func=_diff)
 
 
 def _diff(args: argparse.Namespace) -> int:
     try:
-        a = read_drp(args.a)
-        b = read_drp(args.b)
+        options = library_options(args)
+        a = read_drp(args.a, library_options=options)
+        b = read_drp(args.b, library_options=options)
         result = diff_projects(a, b, gate=args.gate)
         if args.only:
             result = result.only(args.only)

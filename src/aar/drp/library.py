@@ -24,13 +24,20 @@ WAL or shm file is created next to either file. The snapshot is deleted on every
 
 Memory is bounded while the rows are fetched, not afterwards: every row and every byte fetched is
 charged against ``max_rows`` and ``max_load_bytes`` as it arrives, and SQLite itself refuses a
-single value over ``max_value_bytes``. A link the reader would not consume (an unknown
+single value over ``max_value_bytes``. The layout is bounded the same way: every value is charged
+against the layout budget (``max_layout_bytes``, twice ``max_load_bytes`` unless set) at its
+laid-out size before it is laid out, once per place it is laid out, so a row referenced many
+times is refused before its copies are made. The whole read after the snapshot (the SQL queries
+and the layout) has one time budget, ``max_read_seconds``, and a caller's own deadline
+(``stop_at``) is honoured during the layout too. A link the reader would not consume (an unknown
 ``DbPropertyName``, or an owner that is not read) is reported, never dropped silently.
 """
 
 from __future__ import annotations
 
+import binascii
 import bisect
+import math
 import os
 import re
 import sqlite3
@@ -74,26 +81,36 @@ SUPPORTED_PROJECT_VERSIONS = frozenset({15, 17})
 DEFAULT_SETTLE_SECONDS = 2.0
 DEFAULT_DEADLINE_SECONDS = 30.0
 DEFAULT_POLL_SECONDS = 0.25
-#: Budgets of one read. The largest real save seen is about 30 MB with under 1,000 timeline
-#: items; the largest real sample has 2,614 rows in the tables read, 0.6 MB of values in them and
-#: no value over 29 KB. Each budget leaves that at least ten times over, and together they keep
-#: the peak memory of a hostile file to a few hundred MB (DESIGN "Shared project library").
+#: Budgets of one read. The largest real save measured (a show project: a 29 MB file, 9,878
+#: timeline items in 39 timelines) has 21,637 rows in the tables read, 7.27 MB of load charge
+#: (4.55 MB of values plus the per-value charge), lays out to 7.09 MB and has no value over
+#: 29 KB. Each budget reads that project ten times over; DESIGN "Shared project library" gives
+#: the measured peak memory of the worst file each budget accepts.
 DEFAULT_MAX_DB_BYTES = 256 * 1024 * 1024
-DEFAULT_MAX_ROWS = 50_000
-DEFAULT_MAX_LOAD_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_ROWS = 220_000
+DEFAULT_MAX_LOAD_BYTES = 80 * 1024 * 1024
+#: The layout budget is this many times ``max_load_bytes`` unless set: a blob's laid-out (hex)
+#: form is twice its bytes.
+LAYOUT_PER_LOAD_BYTE = 2
 DEFAULT_MAX_VALUE_BYTES = 16 * 1024 * 1024
-DEFAULT_MAX_QUERY_SECONDS = 120.0
+DEFAULT_MAX_READ_SECONDS = 120.0
 #: Budgets of one listing (:func:`list_library`).
 DEFAULT_LISTING_SECONDS = 120.0
 DEFAULT_LISTING_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_ISSUES_PER_CODE = 100
 _MAX_BIN_DEPTH = 256
+#: A folder's member name holds its parent folders' names, up to this many characters; a deeper
+#: or longer path starts again from the folder's own name (the name only orders the members).
+_MAX_BIN_MEMBER_CHARS = 1024
+#: The layout checks the read's clock once per this many rows or writes.
+_CLOCK_EVERY = 1024
 _MAX_LISTED_PROJECTS = 500
 _MAX_SCANNED_ENTRIES = 20_000
 _MAX_FOLDER_DEPTH = 8
 _MAX_SHOWN_SKIPPED = 10
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_:.\-]*\Z")
 _LIBRARY_SUFFIXES = (".drp", ".drt", ".drb")
+_BIN_TAIL = "/MpFolder.xml"
 
 _JOIN = ("DbOwner", "DbAssociate", "DbPropertyName", "DbIndex")
 #: Every table and column read. A table or column missing from a file refuses it as
@@ -207,18 +224,19 @@ class LibraryError(ContainerError):
 
     Codes: ``busy`` (a journal is beside it, or it never settled before the deadline),
     ``damaged`` (SQLite cannot read it, or ``integrity_check`` fails), ``too_large`` (file, row,
-    value or time budget), ``not_a_project`` (not SQLite, or missing a table or column this
-    reader needs), ``unsupported_version``, ``unreadable`` (the file cannot be opened or is not
-    a regular file) and ``not_a_library`` (a folder given to :func:`list_library` has no
-    ``Users`` folder).
+    load, value, layout or time budget), ``not_a_project`` (not SQLite, or missing a table or
+    column this reader needs), ``unsupported_version``, ``unreadable`` (the file cannot be
+    opened or is not a regular file) and ``not_a_library`` (a folder given to
+    :func:`list_library` has no ``Users`` folder).
     """
 
-    def __init__(self, code: str, message: str, hint: str, *, timed_out: bool = False) -> None:
+    def __init__(self, code: str, message: str, hint: str, *, timed_out: str | None = None) -> None:
         super().__init__(f"{message} [{code}]; {hint}")
         self.code = code
         self.message = message
         self.hint = hint
-        #: The refusal is the ``max_query_seconds`` time budget running out.
+        #: The read ran out of time: ``"read"`` (its own ``max_read_seconds``) or ``"caller"``
+        #: (the caller's ``stop_at``, such as a listing's deadline); None otherwise.
         self.timed_out = timed_out
 
     def to_dict(self) -> dict[str, str]:
@@ -235,17 +253,67 @@ class LibraryOptions:
     max_db_bytes: int = DEFAULT_MAX_DB_BYTES
     #: Rows fetched from the tables read, in total.
     max_rows: int = DEFAULT_MAX_ROWS
-    #: Bytes of text and blob values fetched, in total (charged as each row arrives).
+    #: Bytes of text and blob values fetched, in total, plus 16 per value (charged as each row
+    #: arrives).
     max_load_bytes: int = DEFAULT_MAX_LOAD_BYTES
+    #: Bytes laid out (XML text, blobs as hex), charged before each value is laid out; None is
+    #: ``LAYOUT_PER_LOAD_BYTE`` times ``max_load_bytes``.
+    max_layout_bytes: int | None = None
     #: One value at most (SQLite's own length limit; also never more than ``max_member_bytes``).
     max_value_bytes: int = DEFAULT_MAX_VALUE_BYTES
-    max_query_seconds: float = DEFAULT_MAX_QUERY_SECONDS
+    #: The read after the snapshot is taken: integrity check, queries and layout.
+    max_read_seconds: float = DEFAULT_MAX_READ_SECONDS
+    #: A time on ``clock`` by which the whole read must end, whatever is left of
+    #: ``max_read_seconds`` (a listing sets its deadline here); None for none.
+    stop_at: float | None = None
     #: Where the private snapshot is written (default: the system temporary folder). Never the
     #: project's own folder or a folder inside it.
     snapshot_dir: Path | None = None
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
     now: Callable[[], float] = time.time
+
+    @property
+    def layout_limit(self) -> int:
+        if self.max_layout_bytes is not None:
+            return self.max_layout_bytes
+        return LAYOUT_PER_LOAD_BYTE * self.max_load_bytes
+
+
+class _Deadline:
+    """The read's time budget: ``max_read_seconds`` from its start, or the caller's ``stop_at``
+    if that comes first. :meth:`check` raises the refusal once it has passed."""
+
+    def __init__(self, path: Path, opts: LibraryOptions) -> None:
+        self.path = path
+        self.opts = opts
+        self.clock = opts.clock
+        own = opts.clock() + opts.max_read_seconds
+        caller = opts.stop_at if opts.stop_at is not None else math.inf
+        self.stop_at = min(own, caller)
+        self.by = "caller" if caller < own else "read"
+
+    def passed(self) -> bool:
+        return self.clock() > self.stop_at
+
+    def check(self) -> None:
+        if self.passed():
+            raise self.error()
+
+    def error(self) -> LibraryError:
+        if self.by == "caller":
+            return LibraryError(
+                "too_large",
+                f"{self.path}: the caller's deadline passed while it was read",
+                "give the read more time",
+                timed_out="caller",
+            )
+        return LibraryError(
+            "too_large",
+            f"{self.path}: reading it took longer than {self.opts.max_read_seconds:g} s",
+            "if this really is one project, raise the limit with --max-read-seconds",
+            timed_out="read",
+        )
 
 
 def is_library_path(path: str | Path) -> bool:
@@ -316,7 +384,7 @@ def _settled_copy(path: Path, target: Any, opts: LibraryOptions) -> Copied:
                 raise LibraryError(
                     "too_large",
                     f"{path}: {exc}",
-                    "raise max_db_bytes if this really is one project",
+                    "if this really is one project, raise the limit with --max-db-bytes",
                 ) from None
             except (OSError, ValueError) as exc:
                 raise LibraryError(
@@ -412,15 +480,14 @@ def _q(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-def _connect(snapshot: Path, opts: LibraryOptions, max_value: int) -> sqlite3.Connection:
+def _connect(snapshot: Path, deadline: _Deadline, max_value: int) -> sqlite3.Connection:
     """A read-only, immutable connection: SQLite creates no journal, WAL or lock files."""
     uri = snapshot.resolve().as_uri() + "?mode=ro&immutable=1"
     conn = sqlite3.connect(uri, uri=True, isolation_level=None)
     try:
         conn.text_factory = bytes  # text that is not UTF-8 is read, never a decode error
         conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, max(1, max_value))
-        stop_at = opts.clock() + opts.max_query_seconds
-        conn.set_progress_handler(lambda: 1 if opts.clock() > stop_at else 0, 10_000)
+        conn.set_progress_handler(lambda: 1 if deadline.passed() else 0, 10_000)
         conn.execute("PRAGMA trusted_schema = OFF")
         conn.execute("PRAGMA query_only = ON")
     except BaseException:
@@ -429,21 +496,16 @@ def _connect(snapshot: Path, opts: LibraryOptions, max_value: int) -> sqlite3.Co
     return conn
 
 
-def _sql_error(path: Path, exc: sqlite3.Error, opts: LibraryOptions) -> LibraryError:
+def _sql_error(path: Path, exc: sqlite3.Error, deadline: _Deadline) -> LibraryError:
     text = str(exc)
     if isinstance(exc, sqlite3.DataError) or "too big" in text:
         return LibraryError(
             "too_large",
             f"{path}: a value is larger than the per-value limit ({text})",
-            "raise max_value_bytes (and max_member_bytes) if this really is one project",
+            "if this really is one project, raise the limit with --max-value-bytes",
         )
     if "interrupted" in text:
-        return LibraryError(
-            "too_large",
-            f"{path}: reading it took longer than {opts.max_query_seconds:g} s",
-            "raise max_query_seconds if this really is one project",
-            timed_out=True,
-        )
+        return deadline.error()
     return LibraryError(
         "damaged",
         f"{path}: SQLite cannot read it ({type(exc).__name__}: {text})",
@@ -549,7 +611,7 @@ def _load(conn: sqlite3.Connection, path: Path, opts: LibraryOptions) -> Rows:
                     "too_large",
                     f"{path}: the values read come to more than the {_size(opts.max_load_bytes)} "
                     f"load budget (at {table})",
-                    "raise max_load_bytes if this really is one project",
+                    "if this really is one project, raise the limit with --max-load-bytes",
                 )
             out.append(make(values))
         tables[table] = out
@@ -561,7 +623,7 @@ def _too_many_rows(path: Path, opts: LibraryOptions, counted: int | None) -> Lib
     return LibraryError(
         "too_large",
         f"{path} has {rows} in the tables read, over the {opts.max_rows}-row limit",
-        "raise max_rows if this really is one project",
+        "if this really is one project, raise the limit with --max-rows",
     )
 
 
@@ -619,17 +681,30 @@ def _raw(text: str) -> bytes:
     return text.encode("utf-8", "surrogateescape")
 
 
-def _content(column: str, value: object) -> bytes | None:
-    """A column value as the XML text the reader expects: blobs as hex, the rest as text."""
+def _content(column: str, value: object) -> tuple[bytes | None, bool]:
+    """A column value as the XML text the reader expects: blobs as hex (which needs no
+    escaping, so the flag is False), the rest as text that still has to be escaped (True)."""
     if value is None:
-        return None
+        return None, False
     if column in _BLOB_COLUMNS and isinstance(value, bytes):
-        return value.hex().encode("ascii")
+        return binascii.hexlify(value), False
     if isinstance(value, bytes):
-        return value
+        return value, True
     if isinstance(value, float):
-        return repr(value).encode("ascii")  # "86400.0" is not a frame count: read as an issue
-    return str(value).encode("utf-8", "surrogateescape")
+        # "86400.0" is not a frame count: read as an issue
+        return repr(value).encode("ascii"), True
+    return str(value).encode("utf-8", "surrogateescape"), True
+
+
+def _laid_out_size(column: str, value: object) -> int:
+    """What :func:`_content` makes of ``value``, in bytes before escaping, without making it."""
+    if value is None:
+        return 0
+    if isinstance(value, bytes):
+        return 2 * len(value) if column in _BLOB_COLUMNS else len(value)
+    if isinstance(value, float):
+        return len(repr(value))
+    return len(str(value))
 
 
 def _escape(data: bytes, *, attribute: bool = False) -> bytes:
@@ -644,19 +719,33 @@ def _member_part(name: str | None) -> str:
 
 
 class _Budget:
-    def __init__(self, limit: int, path: Path) -> None:
+    """The layout's byte budget and the read's clock, both charged as the layout is built."""
+
+    def __init__(self, limit: int, path: Path, deadline: _Deadline, *, hint: str) -> None:
         self.left = limit
         self.limit = limit
         self.path = path
+        self.deadline = deadline
+        self.hint = hint
+        self.ticks = 0
 
     def charge(self, n: int) -> None:
         self.left -= n
         if self.left < 0:
             raise LibraryError(
                 "too_large",
-                f"{self.path}: the rows read come to more than the {self.limit}-byte XML budget",
-                "raise max_total_xml_bytes if this really is one project",
+                f"{self.path}: the rows read lay out to more than the {_size(self.limit)} "
+                "layout budget",
+                self.hint,
             )
+        self.tick()
+
+    def tick(self) -> None:
+        """One step of work: the read's clock is looked at once every ``_CLOCK_EVERY``."""
+        self.ticks += 1
+        if self.ticks >= _CLOCK_EVERY:
+            self.ticks = 0
+            self.deadline.check()
 
 
 #: Where an element came from: its byte span in the member, the row (``<table>/<id>``, or a
@@ -697,12 +786,32 @@ class _Doc:
             self.spans.append((start, len(self.buf), ref, None))
 
     def leaf(self, tag: str, content: bytes | None, row: str, column: str | None) -> None:
+        """An element holding ``content`` as text (escaped here)."""
         start = len(self.buf)
         name = tag.encode()
         if content:
             self._write(b"<", name, b">", _escape(content), b"</", name, b">")
         else:
             self._write(b"<", name, b"/>")
+        self.spans.append((start, len(self.buf), row, column))
+
+    def value(self, column: str, value: object, row: str) -> None:
+        """A column's element. Its laid-out size is charged before it is made (a blob's hex
+        is twice its bytes), so a value laid out many times is refused before its copies."""
+        start = len(self.buf)
+        name = column.encode()
+        self.budget.charge(_laid_out_size(column, value) + 2 * len(name) + 5)
+        content, needs_escape = _content(column, value)
+        if content:
+            if needs_escape:
+                escaped = _escape(content)
+                self.budget.charge(len(escaped) - len(content))  # what escaping added
+                content = escaped
+            self.buf += b"<" + name + b">"
+            self.buf += content
+            self.buf += b"</" + name + b">"
+        else:
+            self.buf += b"<" + name + b"/>"
         self.spans.append((start, len(self.buf), row, column))
 
     def take(self) -> bytes:
@@ -731,6 +840,12 @@ class _Builder:
         self.counts: Counter[str] = Counter()
         self.docs: list[_Doc] = []
         self.member_rows: dict[str, str] = {}
+        #: The next ``~n`` suffix to try for each member name asked for more than once.
+        self.suffixes: dict[str, int] = {}
+        #: Each folder's member path (``<parent path>/<name>``), made once per folder.
+        self.bin_paths: dict[str, str] = {}
+        #: Each folder's path length in the model (see :meth:`_model_path_sizes`).
+        self.model_paths: dict[str, int] = {}
         self.rows: dict[str, dict[str, _Row]] = {}
         self.joins: dict[str, dict[str, dict[str, list[_Link]]]] = {}
         for table, rows in tables.items():
@@ -764,6 +879,7 @@ class _Builder:
         out: dict[str, _Row] = {}
         id_column = f"{table}_id"
         for row in rows:
+            self.budget.tick()
             rid = _key(row[id_column])
             if rid is None:
                 self.issue("missing-id", f"a {table} row has no {id_column}; it is not read", table)
@@ -781,6 +897,7 @@ class _Builder:
     def _links(self, table: str, rows: list[_Row]) -> dict[str, dict[str, list[_Link]]]:
         out: dict[str, dict[str, list[_Link]]] = defaultdict(lambda: defaultdict(list))
         for row in rows:
+            self.budget.tick()
             owner = _key(row["DbOwner"])
             prop = _key(row["DbPropertyName"]) or ""
             index = row["DbIndex"]
@@ -793,6 +910,7 @@ class _Builder:
             for prop, links in props.items():
                 seen: set[int] = set()
                 for link in links:
+                    self.budget.tick()
                     index = link.index
                     if not isinstance(index, int) or isinstance(index, bool) or index in seen:
                         self.issue(
@@ -868,13 +986,24 @@ class _Builder:
         return name
 
     def _doc(self, name: str, row_ref: str) -> _Doc:
-        taken = {d.name for d in self.docs}
+        """A new member named ``name``, or with ``~<n>`` (the first free ``n``) added if that
+        is taken: to the folder part of a folder's member (``MediaPool/A/B~2/MpFolder.xml``, so
+        the reader still reads it as a folder), before the extension of any other. The ``n``
+        last tried for each name is kept, so naming is linear in the number of members whatever
+        the names."""
         unique = name
-        n = 1
-        while unique in taken:
-            n += 1
-            stem, dot, ext = name.rpartition(".")
-            unique = f"{stem}~{n}{dot}{ext}"
+        if unique in self.member_rows:
+            n = self.suffixes.get(name, 1)
+            if name.endswith(_BIN_TAIL):
+                stem, tail = name[: -len(_BIN_TAIL)], _BIN_TAIL
+            else:
+                stem, dot, ext = name.rpartition(".")
+                tail = dot + ext
+            while unique in self.member_rows:
+                self.budget.tick()
+                n += 1
+                unique = f"{stem}~{n}{tail}"
+            self.suffixes[name] = n
         doc = _Doc(unique, self.budget)
         self.docs.append(doc)
         self.member_rows[unique] = row_ref
@@ -883,7 +1012,7 @@ class _Builder:
     def leaves(self, doc: _Doc, table: str, rid: str, row: _Row, cols: tuple[str, ...]) -> None:
         ref = f"{table}/{rid}"
         for col in cols:
-            doc.leaf(col, _content(col, row[col]), ref, col)
+            doc.value(col, row[col], ref)
 
     # ------------------------------------------------------------------ members
 
@@ -931,6 +1060,7 @@ class _Builder:
                 doc.close()
         doc.open("LockableBlobMap")
         for bid, blob in self.rows["BtLockableBlob"].items():
+            self.budget.tick()
             tag = self._type("BtLockableBlob", bid, blob["DbType"])
             if tag is None:
                 continue
@@ -942,27 +1072,86 @@ class _Builder:
         doc.close()
         doc.close()
 
-    def _bin_member(self, fid: str) -> str:
+    def _bin_path(self, fid: str) -> str:
+        """The folder's names from the top down, ``/``-separated: its parent's path (made once
+        per folder, so a chain of folders costs one step each) and its own name. A path longer
+        than ``_MAX_BIN_MEMBER_CHARS`` or deeper than ``_MAX_BIN_DEPTH`` starts again from the
+        folder's own name, and a cycle is cut where the walk meets itself: the path only names
+        and orders the member, and the reader reads the folder's parent from the row."""
         folders = self.rows["Sm2MpFolder"]
-        names: list[str] = []
-        seen: set[str] = set()
+        paths = self.bin_paths
+        chain: list[str] = []
+        walking: set[str] = set()
         node: str | None = fid
-        while (
-            node is not None and node in folders and node not in seen and len(seen) < _MAX_BIN_DEPTH
-        ):
-            seen.add(node)
-            names.append(_member_part(_key(folders[node]["Name"])))
+        while node is not None and node in folders and node not in paths and node not in walking:
+            self.budget.tick()
+            walking.add(node)
+            chain.append(node)
             node = _key(folders[node]["MpFolder"])
-        return "MediaPool/" + "/".join(reversed(names)) + "/MpFolder.xml"
+        above = paths.get(node, "") if node is not None else ""
+        for folder in reversed(chain):
+            part = _member_part(_key(folders[folder]["Name"]))
+            path = f"{above}/{part}" if above else part
+            if len(path) > _MAX_BIN_MEMBER_CHARS or path.count("/") >= _MAX_BIN_DEPTH:
+                path = part
+            paths[folder] = above = path
+        return paths[fid]
+
+    def _bin_member(self, fid: str) -> str:
+        return "MediaPool/" + self._bin_path(fid) + _BIN_TAIL
+
+    def _model_path_sizes(self) -> None:
+        """How long each folder's path (``Bin.path``) will be in the model, so the layout can
+        charge it before the reader makes it: a chain of folders with long names makes paths
+        that grow with the chain's depth, which no single value or row shows.
+
+        The reader joins a folder's name (``?`` if it has none) with its parents' names, walking
+        up until a parent is missing or a folder repeats, at most ``_MAX_BIN_DEPTH + 1`` names.
+        Here a folder's size is its name's size plus one plus its parent's size, every folder of
+        a cycle having the whole cycle's size; that is exact without the depth cap and never
+        less with it, and it is cut to the depth cap times the longest name. One step per folder.
+        """
+        folders = self.rows["Sm2MpFolder"]
+        sizes = self.model_paths
+
+        def own(fid: str) -> int:
+            value = folders[fid]["Name"]
+            return (len(value) if isinstance(value, bytes) and value else 1) + 1
+
+        longest = max((own(fid) for fid in folders), default=0)
+        cap = (_MAX_BIN_DEPTH + 1) * longest
+        for start in folders:
+            chain: list[str] = []
+            at: dict[str, int] = {}
+            node: str | None = start
+            while node is not None and node in folders and node not in sizes and node not in at:
+                self.budget.tick()
+                at[node] = len(chain)
+                chain.append(node)
+                node = _key(folders[node]["MpFolder"])
+            if node is not None and node in at:  # the walk met itself: a cycle
+                cycle = chain[at[node] :]
+                whole = min(cap, sum(own(f) for f in cycle))
+                for f in cycle:
+                    sizes[f] = whole
+                del chain[at[node] :]
+                above = whole
+            else:
+                above = sizes.get(node, 0) if node is not None else 0
+            for f in reversed(chain):
+                above = sizes[f] = min(cap, above + own(f))
 
     def folders(self) -> None:
+        self._model_path_sizes()
         for fid, row in self.rows["Sm2MpFolder"].items():
+            self.budget.charge(self.model_paths[fid])  # its Bin.path in the model
             ref = f"Sm2MpFolder/{fid}"
             doc = self._doc(self._bin_member(fid), ref)
             doc.open("Sm2MpFolder", ref, fid)
             self.leaves(doc, "Sm2MpFolder", fid, row, ("Name", "MpFolder"))
             doc.open("MediaVec")
             for link in self._vector("Sm2MpFolder_Sm2MpMedia", fid, "MediaVec"):
+                self.budget.tick()
                 media = self._child("Sm2MpMedia", link, "Sm2MpFolder_Sm2MpMedia")
                 if media is None or link.child is None:
                     continue
@@ -1066,12 +1255,14 @@ class _Builder:
 
     def containers(self) -> None:
         for cid, _row in self.rows["Sm2SequenceContainer"].items():
+            self.budget.tick()
             ref = f"Sm2SequenceContainer/{cid}"
             doc = self._doc(f"SeqContainer/{_member_part(cid)}.xml", ref)
             doc.open("Sm2SequenceContainer", ref, cid)
             for prop, links in self._props("Sm2SequenceContainer_Sm2TiTrack", cid):
                 doc.open(prop)
                 for link in links:
+                    self.budget.tick()
                     track = self._child("Sm2TiTrack", link, "Sm2SequenceContainer_Sm2TiTrack")
                     if track is None or link.child is None:
                         continue
@@ -1094,6 +1285,7 @@ class _Builder:
         for prop, links in self._props("Sm2TiItem_Sm2TiTrack", tid):
             doc.open(prop)
             for link in links:
+                self.budget.tick()
                 item = self._child("Sm2TiItem", link, "Sm2TiItem_Sm2TiTrack")
                 if item is None or link.child is None:
                     continue
@@ -1118,7 +1310,12 @@ class _Builder:
 
     def unlinked(self, table: str, owner_column: str) -> None:
         """Report the rows of ``table`` no link placed: they are not read (none on real saves)."""
-        missed = [rid for rid in self.rows[table] if rid not in self.placed[table]]
+        placed = self.placed[table]
+        missed: list[str] = []
+        for rid in self.rows[table]:
+            self.budget.tick()
+            if rid not in placed:
+                missed.append(rid)
         if missed:
             owned = sum(1 for rid in missed if _key(self.rows[table][rid][owner_column]))
             self.issue(
@@ -1138,6 +1335,7 @@ class _Builder:
         for join, owners in self.joins.items():
             for owner, props in owners.items():
                 for prop, links in props.items():
+                    self.budget.tick()
                     if (owner, prop) in self.consumed[join]:
                         continue
                     read = _READ_PROPERTIES[join]
@@ -1174,6 +1372,8 @@ class LibraryView:
     member_rows: dict[str, str]
     spans: dict[str, list[Span]]
     _data: dict[str, bytes] = field(repr=False)
+    #: The read's time budget, still running while the reader builds the model from the view.
+    deadline: _Deadline | None = field(default=None, repr=False)
     kind: str = LIBRARY_KIND
     kind_source: str = "sqlite"
     sniffed_kind: str = LIBRARY_KIND
@@ -1204,6 +1404,11 @@ class LibraryView:
     def head(self, name: str) -> bytes:
         return self.read(name)[:1024]
 
+    def check_time(self) -> None:
+        """Refuse the read (:class:`LibraryError`) if its time budget has run out."""
+        if self.deadline is not None:
+            self.deadline.check()
+
     def close(self) -> None:
         self._data.clear()
 
@@ -1226,10 +1431,16 @@ def open_library(
     max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES,
     max_total_xml_bytes: int = 600 * 1024 * 1024,
 ) -> LibraryView:
-    """Snapshot, check and lay out one ``Project.db``; raises :class:`LibraryError` if refused."""
+    """Snapshot, check and lay out one ``Project.db``; raises :class:`LibraryError` if refused.
+
+    The layout is charged against ``options.layout_limit`` (and never more than the reader's
+    ``max_total_xml_bytes``). The read's time budget starts once the snapshot is taken and
+    keeps running in the returned view (:meth:`LibraryView.check_time`).
+    """
     p = Path(path)
     opts = options or LibraryOptions()
     snapshot, copied = _take_snapshot(p, opts)
+    deadline = _Deadline(p, opts)
     try:
         with snapshot.open("rb") as fh:
             head = fh.read(100)
@@ -1240,9 +1451,9 @@ def open_library(
                 "give the Project.db of a project in a Resolve disk library",
             )
         try:
-            conn = _connect(snapshot, opts, min(max_member_bytes, opts.max_value_bytes))
+            conn = _connect(snapshot, deadline, min(max_member_bytes, opts.max_value_bytes))
         except sqlite3.Error as exc:
-            raise _sql_error(p, exc, opts) from None
+            raise _sql_error(p, exc, deadline) from None
         try:
             try:
                 check = conn.execute("PRAGMA integrity_check(10)").fetchall()
@@ -1257,13 +1468,31 @@ def open_library(
                 _check_schema(conn, p)
                 tables = _load(conn, p, opts)
             except sqlite3.Error as exc:
-                raise _sql_error(p, exc, opts) from None
+                raise _sql_error(p, exc, deadline) from None
         finally:
             conn.close()
     finally:
         snapshot.unlink(missing_ok=True)
     version = _check_project(p, tables)
-    builder = _Builder(p, tables, _Budget(max_total_xml_bytes, p))
+    deadline.check()
+    if opts.layout_limit <= max_total_xml_bytes:
+        budget = _Budget(
+            opts.layout_limit,
+            p,
+            deadline,
+            hint="if this really is one project, raise the limit with --max-layout-bytes",
+        )
+    else:
+        budget = _Budget(
+            max_total_xml_bytes,
+            p,
+            deadline,
+            hint=(
+                "this is the most the reader holds (max_total_xml_bytes); --max-layout-bytes "
+                "cannot raise it further"
+            ),
+        )
+    builder = _Builder(p, tables, budget)
     del tables
     builder.build()
     [pid] = builder.rows["SM_Project"]
@@ -1272,9 +1501,11 @@ def open_library(
     data: dict[str, bytes] = {}
     spans: dict[str, list[Span]] = {}
     for doc in builder.docs:
+        budget.tick()
         data[doc.name] = doc.take()
         doc.spans.sort()
         spans[doc.name] = doc.spans
+    deadline.check()
     return LibraryView(
         path=p,
         size=copied.size,
@@ -1291,6 +1522,7 @@ def open_library(
         member_rows=builder.member_rows,
         spans=spans,
         _data=data,
+        deadline=deadline,
     )
 
 
@@ -1402,6 +1634,7 @@ SKIP_REASONS = {
     "symlink": "symbolic link(s), never followed",
     "unreadable": "folder(s) that could not be listed",
     "too_deep": f"folder(s) more than {_MAX_FOLDER_DEPTH} levels down, not looked into",
+    "nested": "project(s) inside another project's folder, not read",
 }
 #: Why the search for projects stopped before it had looked everywhere.
 CUT_REASONS = {
@@ -1557,18 +1790,24 @@ class _Scan:
         if not stat.S_ISDIR(mode):
             self.skip("unreadable", projects_dir, "not a folder")
             return
-        stack: list[tuple[Path, int]] = [(projects_dir, 0)]
+        # Each folder to look into, its depth and the project folder it is inside (None if
+        # none): a project's own folders are searched too, so a project nested inside another
+        # project's folder is listed as skipped rather than lost.
+        stack: list[tuple[Path, int, Path | None]] = [(projects_dir, 0, None)]
         while stack and not self.stopped:
-            folder, depth = stack.pop()
+            folder, depth, inside = stack.pop()
             listed = self.entries(folder)
             if self.stopped:
                 return
             if folder != projects_dir and any(e.name == "Project.db" for e in listed):
-                if len(self.found) >= _MAX_LISTED_PROJECTS:
+                if inside is not None:
+                    self.skip("nested", folder / "Project.db", f"inside {inside.name}")
+                elif len(self.found) >= _MAX_LISTED_PROJECTS:
                     self.cut("projects")
                     return
-                self.found.append((user, projects_dir, folder / "Project.db"))
-                continue
+                else:
+                    self.found.append((user, projects_dir, folder / "Project.db"))
+                    inside = folder
             children: list[os.DirEntry[str]] = []
             for entry in listed:
                 kind = self.kind(entry)
@@ -1580,7 +1819,7 @@ class _Scan:
                     else:
                         children.append(entry)
             for entry in sorted(children, key=lambda e: e.name, reverse=True):
-                stack.append((Path(entry.path), depth + 1))
+                stack.append((Path(entry.path), depth + 1, inside))
 
 
 def list_library(
@@ -1596,9 +1835,11 @@ def list_library(
     Each project is read in full (``read``, by default :func:`aar.drp.read_drp` with
     ``options``); a project that is refused (busy, damaged, ...) is listed with its refusal.
     The whole listing has one deadline (``deadline_seconds``, on ``options.clock``) and one
-    byte budget (``max_bytes``, the sizes of the files read): a project's wait for a save and
-    its query time are cut to what is left, and a project not reached in time or within the
-    budget is listed with ``not_read`` saying why. At most 500 projects and 20,000 folder
+    byte budget (``max_bytes``, the sizes of the files read): a project's wait for a save is cut
+    to what is left and its read ends by the deadline (``LibraryOptions.stop_at``, honoured
+    during the layout too), and a project not reached in time or within the budget is listed
+    with ``not_read`` saying why. A project folder inside another project's folder is listed in
+    ``skipped`` (``nested``), not read. At most 500 projects and 20,000 folder
     entries (the ``Users`` folder's included) are looked at, at most 8 folders deep, and no
     link is followed; every entry skipped is counted in ``skipped`` and the search stopping
     early is in ``cut_short``, so ``complete`` says whether anything was left out.
@@ -1655,30 +1896,36 @@ def list_library(
         left = deadline - opts.clock()
         if left <= 0:
             entry.not_read = (
-                f"the listing's {deadline_seconds:g} s deadline passed before it was reached"
+                f"the listing's {deadline_seconds:g} s deadline passed before it was reached "
+                "(raise --deadline)"
             )
             continue
         if listing.bytes_read + size > max_bytes:
             entry.not_read = (
                 f"it is {size} bytes, past what is left of the listing's {max_bytes}-byte "
-                f"budget ({listing.bytes_read} bytes read)"
+                f"budget ({listing.bytes_read} bytes read; raise --max-listing-bytes)"
             )
             continue
         each = replace(
             opts,
             deadline_seconds=min(opts.deadline_seconds, left),
-            max_query_seconds=min(opts.max_query_seconds, left),
+            stop_at=deadline if opts.stop_at is None else min(deadline, opts.stop_at),
         )
         try:
             drp = read(db, each)
         except LibraryError as exc:
             listing.bytes_read += size
             cut_wait = exc.code == "busy" and each.deadline_seconds < opts.deadline_seconds
-            cut_query = exc.timed_out and each.max_query_seconds < opts.max_query_seconds
-            if cut_wait or cut_query:
+            cut_query = exc.timed_out == "caller"
+            if cut_wait:
                 entry.not_read = (
-                    f"the listing's {deadline_seconds:g} s deadline passed while it was "
-                    f"{'waited for' if cut_wait else 'read'} ({exc.message})"
+                    f"the listing's {deadline_seconds:g} s deadline passed while it was waited "
+                    f"for ({exc.message}; raise --deadline)"
+                )
+            elif cut_query:
+                entry.not_read = (
+                    f"the listing's {deadline_seconds:g} s deadline passed while it was read "
+                    "(raise --deadline)"
                 )
             else:
                 entry.refusal = exc.to_dict()

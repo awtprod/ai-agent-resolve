@@ -19,8 +19,12 @@ from aar.drp.library import (
     SKIP_REASONS,
     LibraryError,
     LibraryListing,
-    LibraryOptions,
     list_library,
+)
+from aar.drp.library_args import (
+    add_library_budget_options,
+    add_listing_bytes_option,
+    library_options,
 )
 from aar.drp.model import DrpFile
 from aar.drp.reader import read_drp
@@ -87,6 +91,7 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     inspect.add_argument(
         "--blobs", action="store_true", help="fully decode every hex blob and report statistics"
     )
+    add_library_budget_options(inspect)
     inspect.set_defaults(func=_inspect)
 
     desc = sub.add_parser(
@@ -102,6 +107,7 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         default=DEFAULT_MAX_ITEMS,
         help=f"media clips and items per track to list (default {DEFAULT_MAX_ITEMS}, 0 = all)",
     )
+    add_library_budget_options(desc)
     desc.set_defaults(func=_describe)
 
     lib = sub.add_parser(
@@ -135,6 +141,8 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         help="time limit of the whole listing; projects not reached in time are listed as not "
         f"read (default {DEFAULT_LISTING_SECONDS:g})",
     )
+    add_listing_bytes_option(lib)
+    add_library_budget_options(lib)
     lib.set_defaults(func=_library)
 
     diff_cli.register(sub)
@@ -201,9 +209,9 @@ def _silence(stream: TextIO | None) -> None:
         os.close(devnull)
 
 
-def _read(path: str, *, check_blobs: bool = False) -> DrpFile | None:
+def _read(args: argparse.Namespace, *, check_blobs: bool = False) -> DrpFile | None:
     try:
-        return read_drp(path, check_blobs=check_blobs)
+        return read_drp(args.file, check_blobs=check_blobs, library_options=library_options(args))
     except DrpError as exc:
         _warn(f"aar drp: {exc}")
         return None
@@ -217,7 +225,7 @@ def _status(drp: DrpFile, written: int) -> int:
 
 
 def _inspect(args: argparse.Namespace) -> int:
-    drp = _read(args.file, check_blobs=args.blobs)
+    drp = _read(args, check_blobs=args.blobs)
     if drp is None:
         return EXIT_NOTHING_READ
     if args.json:
@@ -261,7 +269,7 @@ def _inspect(args: argparse.Namespace) -> int:
 
 
 def _describe(args: argparse.Namespace) -> int:
-    drp = _read(args.file)
+    drp = _read(args)
     if drp is None:
         return EXIT_NOTHING_READ
     return _status(drp, _emit(describe(drp, max_items=args.max_items)))
@@ -272,9 +280,14 @@ def _library(args: argparse.Namespace) -> int:
         if not math.isfinite(value) or value < 0:
             _warn(f"aar drp library: {flag} must be a number of seconds, 0 or more")
             return 2
-    options = LibraryOptions(deadline_seconds=args.wait)
+    options = library_options(args, deadline_seconds=args.wait)
     try:
-        listing = list_library(args.folder, options=options, deadline_seconds=args.deadline)
+        listing = list_library(
+            args.folder,
+            options=options,
+            deadline_seconds=args.deadline,
+            max_bytes=args.max_listing_bytes,
+        )
     except LibraryError as exc:
         _warn(f"aar drp library: {exc}")
         return EXIT_NOTHING_READ
@@ -292,13 +305,13 @@ def _library(args: argparse.Namespace) -> int:
 
 
 def _library_lines(listing: LibraryListing, refused: int) -> list[str]:
-    """The text listing. Every name from the library is quoted (:func:`quote`), so a name
-    holding quotes cannot make one line read as several fields."""
+    """The text listing. Every name, path and message from the library is quoted
+    (:func:`quote`), so one holding quotes cannot make one line read as several fields."""
     counts = [f"{refused} refused"] if refused else []
     if listing.not_read:
         counts.append(f"{listing.not_read} not read")
     lines = [
-        f"library: {listing.root}",
+        f"library: {quote(listing.root)}",
         f"projects: {len(listing.projects)}" + (f" ({', '.join(counts)})" if counts else ""),
     ]
     if not listing.complete:
@@ -316,11 +329,11 @@ def _library_lines(listing: LibraryListing, refused: int) -> list[str]:
     for p in listing.projects:
         where = "  " + quote(f"{p.user}/{p.folder}")
         if p.not_read is not None:
-            lines.append(f"{where}: NOT READ: {p.not_read}")
+            lines.append(f"{where}: NOT READ: {quote(p.not_read)}")
             continue
         if p.refusal is not None:
             r = p.refusal
-            lines.append(f"{where}: REFUSED {r['code']}: {r['message']}; {r['hint']}")
+            lines.append(f"{where}: REFUSED {r['code']}: {quote(r['message'])}; {r['hint']}")
             continue
         names = ", ".join(quote(n) for n in p.timelines) or "none"
         lines.append(

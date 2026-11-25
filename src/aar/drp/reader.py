@@ -156,7 +156,9 @@ def read_drp(
         ) as view:
             reader = _Reader(view, check_blobs, max_blob_output)
             _budgets(reader, max_total_blob_output, max_elements, max_total_xml_bytes)
-            return library.finish(reader.run(), view)
+            drp = library.finish(reader.run(), view)
+            view.check_time()  # the read's time budget covers building the model too
+            return drp
     with open_container(path, max_member_bytes=max_member_bytes) as container:
         reader = _Reader(container, check_blobs, max_blob_output)
         _budgets(reader, max_total_blob_output, max_elements, max_total_xml_bytes)

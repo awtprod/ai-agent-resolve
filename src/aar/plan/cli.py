@@ -13,7 +13,8 @@ from typing import Any
 from pydantic import ValidationError
 
 from aar import cli_io
-from aar.drp.library import DEFAULT_DEADLINE_SECONDS, LibraryOptions
+from aar.drp.library import DEFAULT_DEADLINE_SECONDS
+from aar.drp.library_args import add_library_budget_options, library_options
 from aar.node.ops.read import DescribeResult
 from aar.plan import stub_cli
 from aar.plan.apply import (
@@ -246,6 +247,7 @@ def register(subparsers: Any) -> None:
         help="Project.db only: how long to wait for a save in progress before refusing "
         f"(library_busy; default {DEFAULT_DEADLINE_SECONDS:g}).",
     )
+    add_library_budget_options(imp)
     imp.set_defaults(func=_cmd_import_timeline)
 
 
@@ -1008,7 +1010,7 @@ def _cmd_import_timeline(args: argparse.Namespace) -> int:
         timeline = read_timeline(
             args.drt,
             args.timeline,
-            library_options=LibraryOptions(deadline_seconds=args.wait),
+            library_options=library_options(args, deadline_seconds=args.wait),
         )
         result = import_timeline(
             plan,

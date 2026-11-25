@@ -789,7 +789,7 @@ def test_a_query_past_its_time_budget_is_too_large(tmp_path: Path) -> None:
     path = edited(tmp_path, rich_members(), many)
     ticks = iter(range(0, 10**9, 1000))
     options = LibraryOptions(
-        settle_seconds=0, deadline_seconds=0, max_query_seconds=1, clock=lambda: float(next(ticks))
+        settle_seconds=0, deadline_seconds=0, max_read_seconds=1, clock=lambda: float(next(ticks))
     )
     error = refusal(path, options)
     assert error.code == "too_large" and "longer than" in error.message

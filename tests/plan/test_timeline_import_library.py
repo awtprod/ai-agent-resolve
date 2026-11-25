@@ -124,3 +124,13 @@ def test_a_library_problem_refuses_the_import_as_damaged(
     code, _, _, text = run(tmp_path, capsys, db, plan)
     assert code == 2 and "refused (damaged_timeline)" in text
     assert "library-dangling-link" in text and "save it again" in text
+
+
+def test_the_library_budgets_are_raised_from_import_timeline(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _, db, plan = both(tmp_path)
+    code, diff, _, text = run(tmp_path, capsys, db, plan, "--wait", "0", "--max-rows", "5")
+    assert code == 2 and diff == {} and "raise the limit with --max-rows" in text
+    code, _, _, _ = run(tmp_path, capsys, db, plan, "--wait", "0", "--max-rows", "1000")
+    assert code == 0

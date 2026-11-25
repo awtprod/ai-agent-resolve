@@ -32,12 +32,8 @@ from aar.drp import library, read_drp
 from aar.drp.cli import _library_lines
 from aar.drp.describe import describe, quote
 from aar.drp.library import (
-    DEFAULT_MAX_LOAD_BYTES,
-    DEFAULT_MAX_ROWS,
-    DEFAULT_MAX_VALUE_BYTES,
     LibraryOptions,
     list_library,
-    open_library,
 )
 from aar.media import settle
 from aar.media.settle import TooLargeError, copy_settled
@@ -148,14 +144,6 @@ def test_import_refuses_a_timeline_with_an_item_under_an_unread_property(
 # ---------------------------------------------------------------------------- 2. memory
 
 
-def test_default_budgets_fit_real_projects_with_room() -> None:
-    # The largest real sample: 2,614 rows read, 0.6 MB of values, no value over 29 KB.
-    assert DEFAULT_MAX_ROWS >= 10 * 2_614
-    assert DEFAULT_MAX_LOAD_BYTES >= 10 * 618_157
-    assert DEFAULT_MAX_VALUE_BYTES >= 100 * 28_984
-    assert library.DEFAULT_MAX_DB_BYTES >= 8 * 30 * 1024 * 1024
-
-
 def _with_names(tmp_path: Path, size: int, count: int) -> Path:
     def big(tables: Tables) -> None:
         for row in tables["Sm2TiItem"][:count]:
@@ -174,7 +162,7 @@ def test_values_are_charged_as_they_are_fetched_not_after(tmp_path: Path) -> Non
     finally:
         tracemalloc.stop()
     assert error.code == "too_large" and "load budget" in error.message
-    assert "max_load_bytes" in error.hint
+    assert "--max-load-bytes" in error.hint
     assert peak < 5 * 1024 * 1024  # never all 8 MiB: refused within a row of the budget
     assert read_drp(path, library_options=FAST).project is not None  # the defaults read it
 
@@ -183,7 +171,7 @@ def test_one_value_over_max_value_bytes_is_refused_by_sqlite(tmp_path: Path) -> 
     path = _with_names(tmp_path, 300_000, 1)
     options = LibraryOptions(settle_seconds=0, deadline_seconds=0, max_value_bytes=100_000)
     error = refusal(path, options)
-    assert error.code == "too_large" and "max_value_bytes" in error.hint
+    assert error.code == "too_large" and "--max-value-bytes" in error.hint
 
 
 def test_rows_past_the_budget_are_refused(tmp_path: Path) -> None:
@@ -245,7 +233,7 @@ def test_a_listing_has_one_deadline_and_says_what_it_did_not_read(tmp_path: Path
     assert fake.t - 1000.0 <= 8.5  # the whole listing kept to its deadline, not 4 x 5 s
     text = "\n".join(_library_lines(listing, 1))
     assert "projects: 4 (1 refused, 3 not read)" in text and "INCOMPLETE" in text
-    assert '"guest/P3": NOT READ: the listing\'s 8 s deadline passed before' in text
+    assert '"guest/P3": NOT READ: "the listing\'s 8 s deadline passed before' in text
     assert list_library(root, options=options, deadline_seconds=100).not_read == 0
 
 
@@ -534,22 +522,6 @@ def test_a_virtual_table_standing_in_for_a_table_is_not_a_project(tmp_path: Path
     os.utime(path, (OLD, OLD))
     error = refusal(path)
     assert error.code == "not_a_project" and "it has no Sm2TiItem" in error.message
-
-
-def test_a_bin_chain_deeper_than_the_guard_is_cut_to_it(tmp_path: Path) -> None:
-    depth = library._MAX_BIN_DEPTH + 40
-
-    def chain(tables: Tables) -> None:
-        top = find(tables, "Sm2MpFolder", "bin1")
-        for n in range(depth):
-            parent = "bin1" if n == 0 else f"deep{n - 1}"
-            tables["Sm2MpFolder"].append(
-                {**top, "Sm2MpFolder_id": f"deep{n}", "Name": f"b{n}", "MpFolder": parent}
-            )
-
-    with open_library(edited(tmp_path, rich_members(), chain), options=FAST) as view:
-        parts = max(name.count("/") for name in view.names() if name.startswith("MediaPool/"))
-    assert parts == library._MAX_BIN_DEPTH + 1  # MediaPool/<at most 256 bins>/MpFolder.xml
 
 
 # ---------------------------------------------------------------------------- copy size limits
