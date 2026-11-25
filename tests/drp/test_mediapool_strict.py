@@ -375,7 +375,7 @@ def test_a_codec_tag_in_other_letters_is_no_known_codec() -> None:
     assert kind.video_codec == "?h264"
 
 
-@pytest.mark.parametrize("text", ["2_9.97", "\u0662\u0669.97", "29.97 ", "1e1"])
+@pytest.mark.parametrize("text", ["2_9.97", "\u0662\u0669.97", "29.97 ", "1e1", "1e1000000000"])
 def test_a_project_rate_that_is_not_plain_ascii_is_not_read(text: str) -> None:
     assert project_frame_rate([{"FieldsBlob": ms.setup_ba(text)}]) is None
     assert project_frame_rate([{"FieldsBlob": ms.setup_ba("29.97")}]) == Fraction(30000, 1001)
@@ -738,3 +738,36 @@ def test_more_layers_than_the_bound_are_refused() -> None:
     assert caught.value.code == "bad_template" and "4096" in caught.value.message
     few = ms.envelope(ms.pb(*fields[:4000]), zstd=False)
     assert len(list(bt.layers(few))) <= 4096
+
+
+def _compressed_needle() -> tuple[str, bytes]:
+    """A zstd envelope whose payload holds a needle that its compressed bytes do not."""
+    from compression import zstd
+
+    needle = "abcdefgh" * 4
+    body = b"\x81" + zstd.compress((needle * 20).encode())
+    wrapped = struct.pack(">II", 2, len(body)) + body
+    assert all(needle.encode(c) not in wrapped for c in ("utf-8", "utf-16-be", "utf-16-le"))
+    return needle, wrapped
+
+
+def _wrap(data: bytes, times: int) -> bytes:
+    for _ in range(times):
+        data = ms.pb((1, 2, data))
+    return data
+
+
+def test_a_value_reached_first_at_the_depth_limit_is_still_searched_from_a_shallower_one() -> None:
+    needle, wrapped = _compressed_needle()
+    # the copy under nine wrappers sits at depth 10; the direct copy at depth 1 must be opened
+    blob = ms.pb((1, 2, wrapped), (2, 2, _wrap(wrapped, 9)))
+    assert bt.contains_text(blob, {needle: "found"}) == "found"
+
+
+def test_a_layer_that_would_open_beyond_the_depth_limit_is_refused() -> None:
+    needle, wrapped = _compressed_needle()
+    with pytest.raises(MediaPoolError) as caught:
+        bt.contains_text(_wrap(wrapped, 10), {needle: "found"})
+    assert caught.value.code == "bad_template" and "10 deep" in caught.value.message
+    assert bt.contains_text(_wrap(wrapped, 9), {needle: "found"}) == "found"
+    assert bt.contains_text(_wrap(b"\x00\x00", 10), {needle: "found"}) is None

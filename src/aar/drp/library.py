@@ -1625,7 +1625,13 @@ def read_rows(
                         if rows_left < 0:
                             raise _too_many_rows(p, opts, None)
                         for value in values:
-                            size = len(value) if isinstance(value, bytes | str) else 0
+                            # Text is charged by its UTF-8 bytes: a character can take four.
+                            if isinstance(value, str):
+                                size = len(value.encode("utf-8", "surrogatepass"))
+                            elif isinstance(value, bytes):
+                                size = len(value)
+                            else:
+                                size = 0
                             bytes_left -= _VALUE_COST + size
                         if bytes_left < 0:
                             raise LibraryError(

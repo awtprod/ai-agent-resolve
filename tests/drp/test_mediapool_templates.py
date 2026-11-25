@@ -455,3 +455,32 @@ def test_gate_facts_file_is_checked_line_by_line(tmp_path: Path) -> None:
 def test_struct_layout_of_the_synthetic_extents_matches_the_reader() -> None:
     start, length = blobs.decode_extents(struct.pack("<dd", 1.5, 2.5))
     assert (start, length) == (1.5, 2.5)
+
+
+def test_text_is_charged_by_its_utf8_bytes_not_its_characters(tmp_path: Path) -> None:
+    from aar.drp.library import _VALUE_COST
+
+    def project(name: str, text: str) -> Path:
+        db = ms.write_project(tmp_path / f"{name}.db", ms.wav_template())
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE Sm2MpMedia SET Name = ?", (text,))
+        conn.commit()
+        conn.close()
+        os.utime(db, (1_000_000_000, 1_000_000_000))
+        return db
+
+    ascii_db = project("a", "a" * 1000)
+    wide_db = project("b", "\U0001f600" * 1000)  # the same characters, four bytes each
+    read = read_rows(ascii_db, ("Sm2MpMedia",), options=FAST)
+    budget = sum(
+        _VALUE_COST
+        + (len(v.encode()) if isinstance(v, str) else len(v) if isinstance(v, bytes) else 0)
+        for table in read.rows.values()
+        for row in table
+        for v in row
+    )
+    exact = LibraryOptions(settle_seconds=0.0, deadline_seconds=0.0, max_load_bytes=budget)
+    assert read_rows(ascii_db, ("Sm2MpMedia",), options=exact).rows["Sm2MpMedia"]
+    with pytest.raises(LibraryError) as caught:
+        read_rows(wide_db, ("Sm2MpMedia",), options=exact)
+    assert caught.value.code == "too_large"

@@ -12,6 +12,7 @@ refusal, never skipped.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -236,15 +237,17 @@ def layers(value: object) -> Iterator[bytes]:
     the length-delimited fields of protobuf messages, at most 10 layers deep and 4096 layers in
     all. Text is yielded UTF-8 encoded. More layers, or a zstd layer that does not decompress,
     is a ``bad_template`` refusal: a layer that cannot be searched could hide a template id."""
+    # Breadth first, so every value is first reached at the shallowest depth it occurs at and
+    # dedupe by content cannot leave a value unexpanded that a shallower path would expand.
     count = 0
-    stack: list[tuple[bytes, int]] = []
+    queue: deque[tuple[bytes, int]] = deque()
     if isinstance(value, str):
-        stack.append((value.encode("utf-8", "surrogatepass"), 0))
+        queue.append((value.encode("utf-8", "surrogatepass"), 0))
     elif isinstance(value, bytes):
-        stack.append((value, 0))
+        queue.append((value, 0))
     seen: set[bytes] = set()
-    while stack:
-        data, depth = stack.pop()
+    while queue:
+        data, depth = queue.popleft()
         if data in seen:
             continue
         seen.add(data)
@@ -252,9 +255,13 @@ def layers(value: object) -> Iterator[bytes]:
         if count > _MAX_WALKED:
             raise _bad("a blob", f"has more than {_MAX_WALKED} layers")
         yield data
-        if depth >= _MAX_LAYERS or len(data) < 2:
+        if len(data) < 2:
             continue
-        stack.extend((child, depth + 1) for child in _children(data))
+        children = [c for c in _children(data) if c not in seen]
+        if children and depth >= _MAX_LAYERS:
+            # A layer that would open further cannot be searched: refused, never skipped.
+            raise _bad("a blob", f"has layers more than {_MAX_LAYERS} deep")
+        queue.extend((child, depth + 1) for child in children)
 
 
 def _children(data: bytes) -> list[bytes]:
