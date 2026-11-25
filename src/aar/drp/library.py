@@ -65,12 +65,14 @@ __all__ = [
     "LibraryListing",
     "LibraryOptions",
     "LibraryProject",
+    "LibraryRows",
     "LibraryView",
     "Skipped",
     "finish",
     "is_library_path",
     "list_library",
     "open_library",
+    "read_rows",
 ]
 
 LIBRARY_KIND = "library"
@@ -480,12 +482,18 @@ def _q(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-def _connect(snapshot: Path, deadline: _Deadline, max_value: int) -> sqlite3.Connection:
-    """A read-only, immutable connection: SQLite creates no journal, WAL or lock files."""
+def _connect(
+    snapshot: Path, deadline: _Deadline, max_value: int, *, text_as_bytes: bool = True
+) -> sqlite3.Connection:
+    """A read-only, immutable connection: SQLite creates no journal, WAL or lock files.
+
+    Text comes back as bytes (text that is not UTF-8 is read, never a decode error), or with
+    ``text_as_bytes=False`` as ``str``, where text that is not UTF-8 is an SQLite error."""
     uri = snapshot.resolve().as_uri() + "?mode=ro&immutable=1"
     conn = sqlite3.connect(uri, uri=True, isolation_level=None)
     try:
-        conn.text_factory = bytes  # text that is not UTF-8 is read, never a decode error
+        if text_as_bytes:
+            conn.text_factory = bytes
         conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, max(1, max_value))
         conn.set_progress_handler(lambda: 1 if deadline.passed() else 0, 10_000)
         conn.execute("PRAGMA trusted_schema = OFF")
@@ -1524,6 +1532,128 @@ def open_library(
         _data=data,
         deadline=deadline,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class LibraryRows:
+    """Every column of some tables of one ``Project.db``, read by :func:`read_rows`.
+
+    ``rows[table]`` holds tuples in ``columns[table]`` order, with SQLite's own storage classes:
+    ``str`` (TEXT), ``bytes`` (BLOB), ``int``, ``float`` or ``None``."""
+
+    path: Path
+    size: int
+    sha256: str
+    project_version: int
+    columns: dict[str, tuple[str, ...]]
+    rows: dict[str, list[tuple[Any, ...]]]
+
+
+def read_rows(
+    path: str | Path, tables: tuple[str, ...], *, options: LibraryOptions | None = None
+) -> LibraryRows:
+    """Every column and row of ``tables`` in one ``Project.db``, through the same private
+    snapshot, integrity check, project check and budgets as :func:`open_library`.
+
+    The live file is never opened for writing; the snapshot is deleted on every path. Rows and
+    bytes are charged against ``max_rows`` and ``max_load_bytes`` as each row arrives, a value
+    over ``max_value_bytes`` is refused by SQLite, and the read has ``max_read_seconds``.
+    ``SM_Project`` is always read (the project check needs it). Raises :class:`LibraryError`.
+    """
+    p = Path(path)
+    opts = options or LibraryOptions()
+    wanted = tuple(dict.fromkeys(("SM_Project", *tables)))
+    for table in wanted:
+        if not isinstance(table, str) or not _NAME.match(table):
+            raise ValueError(f"not a table name: {table!r}")
+    snapshot, copied = _take_snapshot(p, opts)
+    deadline = _Deadline(p, opts)
+    columns: dict[str, tuple[str, ...]] = {}
+    rows: dict[str, list[tuple[Any, ...]]] = {}
+    try:
+        with snapshot.open("rb") as fh:
+            head = fh.read(100)
+        if not head.startswith(SQLITE_MAGIC):
+            raise LibraryError(
+                "not_a_project",
+                f"{p} is not an SQLite file (leading bytes {head[:16].hex() or 'none'})",
+                "give the Project.db of a project in a Resolve disk library",
+            )
+        try:
+            conn = _connect(snapshot, deadline, opts.max_value_bytes, text_as_bytes=False)
+        except sqlite3.Error as exc:
+            raise _sql_error(p, exc, deadline) from None
+        try:
+            try:
+                check = conn.execute("PRAGMA integrity_check(10)").fetchall()
+                if [str(r[0]) for r in check] != ["ok"]:
+                    raise LibraryError(
+                        "damaged",
+                        f"{p} fails SQLite's integrity check: {check[0][0]}",
+                        "open the project in Resolve and save it again, or restore it from a "
+                        "backup",
+                    )
+                kinds = dict(
+                    conn.execute(
+                        "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view')"
+                    ).fetchall()
+                )
+                missing = [t for t in wanted if kinds.get(t) != "table"]
+                if missing:
+                    raise LibraryError(
+                        "not_a_project",
+                        f"{p} is not a Resolve project this reader knows: it has no "
+                        f"{', '.join(missing[:8])}",
+                        "give the Project.db of a project in a Resolve disk library",
+                    )
+                total = 0
+                for table in wanted:
+                    (count,) = conn.execute(f"SELECT count(*) FROM {_q(table)}").fetchone()
+                    total += int(count)
+                if total > opts.max_rows:
+                    raise _too_many_rows(p, opts, total)
+                rows_left, bytes_left = opts.max_rows, opts.max_load_bytes
+                for table in wanted:
+                    names = tuple(
+                        str(r[1]) for r in conn.execute(f"PRAGMA table_info({_q(table)})")
+                    )
+                    columns[table] = names
+                    out: list[tuple[Any, ...]] = []
+                    sql = f"SELECT {', '.join(_q(c) for c in names)} FROM {_q(table)}"
+                    for values in conn.execute(sql):  # one row per step
+                        rows_left -= 1
+                        if rows_left < 0:
+                            raise _too_many_rows(p, opts, None)
+                        for value in values:
+                            # Text is charged by its UTF-8 bytes: a character can take four.
+                            if isinstance(value, str):
+                                size = len(value.encode("utf-8", "surrogatepass"))
+                            elif isinstance(value, bytes):
+                                size = len(value)
+                            else:
+                                size = 0
+                            bytes_left -= _VALUE_COST + size
+                        if bytes_left < 0:
+                            raise LibraryError(
+                                "too_large",
+                                f"{p}: the values read come to more than the "
+                                f"{_size(opts.max_load_bytes)} load budget (at {table})",
+                                "if this really is one project, raise the limit with "
+                                "--max-load-bytes",
+                            )
+                        out.append(tuple(values))
+                    rows[table] = out
+            except sqlite3.Error as exc:
+                raise _sql_error(p, exc, deadline) from None
+        finally:
+            conn.close()
+    finally:
+        snapshot.unlink(missing_ok=True)
+    index = {c: i for i, c in enumerate(columns["SM_Project"])}
+    projects = [{c: r[i] for c, i in index.items()} for r in rows["SM_Project"]]
+    version = _check_project(p, {"SM_Project": projects})  # type: ignore[dict-item]
+    deadline.check()
+    return LibraryRows(p, copied.size, copied.sha256, version, columns, rows)
 
 
 # --------------------------------------------------------------------------- provenance

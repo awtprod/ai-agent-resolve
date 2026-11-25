@@ -9,7 +9,8 @@ tests (decode -> encode is the identity on every corpus blob of that kind):
   exactly one frame (:func:`check_single_frame`). Resolve itself writes raw-block
   frames for small payloads; any conforming zstd decoder reads them. Writing raw blocks keeps the
   writer stdlib-only and its output deterministic (no compressor version in the loop).
-* keyed dict byte-array values: :func:`replace_kd_bytes`
+* keyed dict byte-array values: :func:`replace_kd_bytes`; whole keyed dicts: :func:`keyed_dict`
+* whole protobuf messages from a field list: :func:`protobuf`
 * hex text: :func:`hex_like` keeps the letter case of the text it replaces
 * XML character data: :func:`xml_text`
 
@@ -31,9 +32,11 @@ __all__ = [
     "check_text",
     "envelope",
     "hex_like",
+    "keyed_dict",
     "pb_key",
     "pb_len",
     "pb_varint",
+    "protobuf",
     "replace_field",
     "replace_kd_bytes",
     "varint",
@@ -189,17 +192,23 @@ def check_envelope_payload(original: bytes) -> None:
         raise EncodeError(f"the blob's payload must be exactly one zstd frame: {exc}") from exc
 
 
-def envelope(original: bytes, payload: bytes) -> bytes:
+def envelope(original: bytes, payload: bytes, *, codec: str | None = None) -> bytes:
     """Re-frame ``payload`` (protobuf bytes) with the framing of the ``original`` blob.
 
     Keeps the version and the codec: ``protobuf`` (0x80) stores the payload as is, ``zstd`` (0x81)
     stores it in a raw-block zstd frame, and ``none`` (header without a codec byte) as is. The
-    flag-only form (no header) keeps its codec byte.
+    flag-only form (no header) keeps its codec byte. ``codec`` (``"zstd"`` or ``"protobuf"``)
+    switches between those two codec bytes, for an original that has one of them; the version
+    and the form (header or flag-only) are kept.
     """
     env = blobs.parse_envelope(original)
     if env is None:
         raise EncodeError("the original blob is not an envelope")
     check_envelope_payload(original)
+    if codec is not None:
+        if codec not in ("zstd", "protobuf") or env.codec not in ("zstd", "protobuf"):
+            raise EncodeError(f"cannot frame a {env.codec} envelope as {codec!r}")
+        env = blobs.Envelope(env.version, env.declared_length, codec, env.payload_offset, b"")
     if env.codec == "zstd":
         body = bytes([blobs.CODEC_ZSTD]) + zstd_raw_frame(payload)
     elif env.codec == "protobuf":
@@ -267,3 +276,106 @@ def xml_text(value: str) -> bytes:
     """Character data the way Resolve writes it: ``&``, ``<`` and ``>`` escaped, UTF-8."""
     escaped = value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return escaped.encode("utf-8")
+
+
+# --------------------------------------------------------------------------- whole structures
+
+_KD_FIXED = {
+    blobs.KD_INT32: ">i",
+    blobs.KD_UINT32: ">I",
+    blobs.KD_INT64: ">q",
+    blobs.KD_UINT64: ">Q",
+    blobs.KD_DOUBLE: ">d",
+    blobs.KD_FLOAT: ">d",
+}
+_MAX_KD_DEPTH = 32
+
+
+def _kd_string(value: str | None) -> bytes:
+    if value is None:
+        return b"\xff\xff\xff\xff"
+    data = value.encode("utf-16-be")
+    if len(data) >= _U32_MAX:
+        raise EncodeError("keyed-dict string too long")
+    return struct.pack(">I", len(data)) + data
+
+
+def _kd_value(vtype: int, value: object, depth: int) -> bytes:
+    if depth > _MAX_KD_DEPTH:
+        raise EncodeError("keyed dict nested too deeply")
+    try:
+        if vtype == blobs.KD_STRING:
+            if value is not None and not isinstance(value, str):
+                raise EncodeError("a keyed-dict string must be str or None")
+            return _kd_string(value)
+        if vtype == blobs.KD_BYTES:
+            if value is None:
+                return b"\xff\xff\xff\xff"
+            if not isinstance(value, bytes) or len(value) >= _U32_MAX:
+                raise EncodeError("a keyed-dict byte array must be bytes under 4 GiB")
+            return struct.pack(">I", len(value)) + value
+        if vtype == blobs.KD_BOOL:
+            if not isinstance(value, bool):
+                raise EncodeError("a keyed-dict bool must be bool")
+            return b"\x01" if value else b"\x00"
+        if vtype in _KD_FIXED:
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                raise EncodeError(f"keyed-dict type 0x{vtype:x} needs a number")
+            if vtype not in (blobs.KD_DOUBLE, blobs.KD_FLOAT) and not isinstance(value, int):
+                raise EncodeError(f"keyed-dict type 0x{vtype:x} needs an integer")
+            return struct.pack(_KD_FIXED[vtype], value)
+        if vtype == blobs.KD_CHAR:
+            if not isinstance(value, str) or len(value) != 1 or ord(value) > 0xFFFF:
+                raise EncodeError("a keyed-dict char must be one BMP character")
+            return struct.pack(">H", ord(value))
+        if vtype == blobs.KD_DATE:
+            if not isinstance(value, bytes) or len(value) != 9:
+                raise EncodeError("a keyed-dict date must be its 9 raw bytes")
+            return value
+    except struct.error as exc:
+        raise EncodeError(f"keyed-dict value out of range for type 0x{vtype:x}: {exc}") from None
+    raise EncodeError(f"keyed-dict type 0x{vtype:x} is not written here")
+
+
+def keyed_dict(entries: list[tuple[str, int, int, object]] | tuple, *, header: int = 1) -> bytes:
+    """A keyed dict (the inverse of :func:`aar.drp.blobs.decode_keyed_dict`) from
+    ``(key, type, null flag, value)`` entries, in their order.
+
+    The scalar types, strings, byte arrays and raw 9-byte dates are written; lists and maps
+    (types 0x08, 0x09, 0x0B) are refused, as no media row has them at the top of a blob."""
+    if not 0 <= header <= _U32_MAX:
+        raise EncodeError("keyed-dict header out of range")
+    out = bytearray(struct.pack(">II", header, len(entries)))
+    for entry in entries:
+        key, vtype, null, value = entry
+        if not isinstance(key, str) or not key:
+            raise EncodeError("a keyed-dict key must be a non-empty str")
+        if null not in (0, 1):
+            raise EncodeError(f"keyed-dict null flag must be 0 or 1, not {null!r}")
+        out += _kd_string(key) + struct.pack(">IB", vtype, null) + _kd_value(vtype, value, 0)
+    return bytes(out)
+
+
+def protobuf(fields: list[tuple[int, int, int | bytes]] | tuple) -> bytes:
+    """A protobuf message, canonically encoded, from ``(number, wire, value)`` fields in their
+    order: varints (wire 0) take an int, fixed64 (1) 8 bytes, length-delimited (2) bytes and
+    fixed32 (5) 4 bytes. The inverse of ``aar.drp.blobs.decode_protobuf(nested_depth=0)`` on
+    every canonical message."""
+    out = bytearray()
+    for number, wire, value in fields:
+        if wire == 0:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise EncodeError(f"protobuf field {number}: a varint needs an int")
+            out += pb_varint(number, value)
+        elif wire == 2:
+            if not isinstance(value, bytes):
+                raise EncodeError(f"protobuf field {number}: a length-delimited value needs bytes")
+            out += pb_len(number, value)
+        elif wire in (1, 5):
+            size = 8 if wire == 1 else 4
+            if not isinstance(value, bytes) or len(value) != size:
+                raise EncodeError(f"protobuf field {number}: wire {wire} needs {size} bytes")
+            out += pb_key(number, wire) + value
+        else:
+            raise EncodeError(f"protobuf field {number}: wire type {wire} is not written")
+    return bytes(out)
