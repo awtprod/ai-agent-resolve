@@ -49,6 +49,7 @@ from aar.drp.mediapool.errors import DAMAGE_ERRORS, MediaPoolError
 from aar.drp.mediapool.facts import MediaFacts
 from aar.drp.mediapool.kinds import KINDS, kind_of_facts
 from aar.drp.mediapool.templates import ClipRows, read_templates
+from aar.media.probe import timecode_frames
 from aar.plan.apply.inputs import plan_hash
 from aar.plan.export import layout_for
 from aar.plan.export.errors import ExportError
@@ -260,14 +261,27 @@ def _check_facts(layout: Layout, facts: dict[str, MediaFacts]) -> None:
                 "check the facts belong to the plan's file",
                 source=src,
             )
-        if source.start_timecode is not None and source.start_timecode != timecode:
-            raise _refuse(
-                "facts_mismatch",
-                f"source {src}: the plan says it starts at {source.start_timecode}, its facts "
-                f"at {timecode}",
-                "check the facts belong to the plan's file",
-                source=src,
+        if source.start_timecode is not None:
+            # The plan counts the start in frames at the source's timecode rate (the plan's
+            # when unset); the facts give the timecode's text (S25d: compared as text before,
+            # so every plan that states a start was refused).
+            tc_rate = (
+                Fraction(source.start_timecode_rate.num, source.start_timecode_rate.den)
+                if source.start_timecode_rate is not None
+                else rate
             )
+            try:
+                found = None if timecode is None else timecode_frames(timecode, tc_rate)
+            except ValueError:
+                found = None
+            if found != source.start_timecode:
+                raise _refuse(
+                    "facts_mismatch",
+                    f"source {src}: the plan says it starts at frame {source.start_timecode} "
+                    f"(at {tc_rate} fps), its facts at {timecode or 'no timecode'}",
+                    "check the facts belong to the plan's file",
+                    source=src,
+                )
 
 
 def _check_seed(layout: Layout, seed: Seed, stated: tuple[int, int] | None) -> str:

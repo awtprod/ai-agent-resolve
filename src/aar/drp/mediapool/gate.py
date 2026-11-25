@@ -18,6 +18,8 @@ difference). A kind with one member cannot be checked and is listed ``single``. 
 from __future__ import annotations
 
 import json
+import os
+import stat
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -124,17 +126,41 @@ class Scoreboard:
         return out
 
 
-def load_facts(path: Path) -> dict[str, MediaFacts]:
+def load_facts(
+    path: Path, failures: dict[str, dict[str, str]] | None = None
+) -> dict[str, MediaFacts]:
     """The facts file (JSON lines), keyed by the path in lower case (Windows paths ignore case).
-    Lines for files that did not exist are skipped; a malformed line is an error."""
-    size = path.stat().st_size
-    if size > MAX_FACTS_FILE:
-        raise MediaPoolError(
-            "bad_facts", f"{path} is larger than {MAX_FACTS_FILE} bytes", "split it"
-        )
+    Lines for files that did not exist are skipped; a malformed line is an error. A line the
+    facts command (:mod:`aar.media.facts`) wrote for a file it could not measure, ``{"path",
+    "exists", "error": {"code", "message"}}``, is not facts: it is left out and, when
+    ``failures`` is given, recorded there under the path in lower case (the caller names it
+    when that file is needed). The file must be a regular file (a FIFO or device is refused
+    without blocking on it) of at most :data:`MAX_FACTS_FILE` bytes."""
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise MediaPoolError(
+                "bad_facts", f"{path} is not a regular file", "give the facts file itself"
+            )
+        if st.st_size > MAX_FACTS_FILE:
+            raise MediaPoolError(
+                "bad_facts", f"{path} is larger than {MAX_FACTS_FILE} bytes", "split it"
+            )
+        stream = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
     out: dict[str, MediaFacts] = {}
-    with path.open("rb") as stream:
+    total = 0
+    with stream:
         for number, line in enumerate(stream, 1):
+            total += len(line)
+            if total > MAX_FACTS_FILE:
+                raise MediaPoolError(
+                    "bad_facts", f"{path} grew past {MAX_FACTS_FILE} bytes", "split it"
+                )
             if number > MAX_FACT_LINES:
                 raise MediaPoolError(
                     "bad_facts", f"{path} has more than {MAX_FACT_LINES} lines", "split it"
@@ -149,6 +175,17 @@ def load_facts(path: Path) -> dict[str, MediaFacts]:
                 raise MediaPoolError(
                     "bad_facts", f"{path}:{number} is not JSON ({exc})", "measure again"
                 ) from None
+            if isinstance(data, dict) and "error" in data:
+                failed = _failure_line(data)
+                if failed is None:
+                    raise MediaPoolError(
+                        "bad_facts",
+                        f"{path}:{number} is an error line of the wrong shape",
+                        "measure again with aar media facts",
+                    )
+                if failures is not None:
+                    failures[failed[0].lower()] = failed[1]
+                continue
             if isinstance(data, dict) and data.get("exists") is False:
                 continue
             try:
@@ -159,6 +196,24 @@ def load_facts(path: Path) -> dict[str, MediaFacts]:
                 ) from None
             out[facts.path.lower()] = facts
     return out
+
+
+def _failure_line(data: dict[str, object]) -> tuple[str, dict[str, str]] | None:
+    """``(path, {"code", "message"})`` of a well-formed error line, else None."""
+    error = data.get("error")
+    path = data.get("path")
+    if set(data) != {"path", "exists", "error"} or not isinstance(data.get("exists"), bool):
+        return None
+    if not isinstance(path, str) or not 0 < len(path) <= 1024 or not isinstance(error, dict):
+        return None
+    if set(error) != {"code", "message"}:
+        return None
+    code, message = error.get("code"), error.get("message")
+    if not isinstance(code, str) or not isinstance(message, str):
+        return None
+    if not (0 < len(code) <= 64 and code.isascii() and code.replace("_", "").isalnum()):
+        return None
+    return path, {"code": code, "message": message[:2000]}
 
 
 def _clip_path(clip: ClipRows) -> tuple[str, str]:

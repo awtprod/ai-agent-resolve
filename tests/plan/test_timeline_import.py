@@ -547,6 +547,7 @@ def test_codes_are_stable() -> None:
         "output_folder_missing",
         "invalid_edited_plan",
         "nothing_matched",
+        "project_mismatch",
     } == IMPORT_CODES
     assert set(NOT_CARRIED_CODES).isdisjoint(DROPPED_CODES)
 

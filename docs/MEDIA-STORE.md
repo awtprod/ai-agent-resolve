@@ -187,8 +187,33 @@ export: give `import-timeline` the project's `Project.db` (`<library>/Resolve Pr
 <user>/Projects/<project>/Project.db`) and name the timeline with `--timeline NAME`. It is read
 from a private snapshot once Resolve has finished saving (`library_busy` while a save is in
 progress; `--wait SECONDS` sets how long to wait). `aar drp library <library>` lists the
-library's projects and their timelines. Automatic pickup of a saved project is S25b (DESIGN
-"Shared project library (S25)").
+library's projects and their timelines. A project the recipe handed over is picked up
+automatically when the owner saves it (S25d; see [Desktop handoff](DESKTOP-HANDOFF.md)).
+
+## Facts for library projects (S25d)
+
+A cut handed over as a library project needs, for every file it uses, facts measured on the
+edit PC's own file (not the hub's working copy, which `shrink` makes smaller): ffprobe's format
+and streams, the size, and the modification and creation times. It sits beside the two other
+PC-side steps: `shrink` makes the hub's working copy, `receipt` binds that copy to its PC
+original, and `facts` describes the PC original for the library writer. Run it once per show,
+after the files are final on the PC (a file changed afterwards needs measuring again), from the
+same copy of `src`, with the same Python and ffprobe:
+
+```console
+> set PYTHONPATH=C:\aar\src
+> python -m aar.media.facts E:\Show_1\Proxy E:\Show_1\Sound --out Z:\incoming\Show_1\facts.jsonl
+```
+
+A folder takes the media files directly in it (`.mp4 .m4v .mov .mxf .wav .mp3 .m4a .aac .png
+.braw`, not hidden); files can be named too. It is read-only on the media, writes one JSON line
+per file in the order of their paths (the same files give the same bytes), never overwrites
+`--out`, and exits 0 when every file was measured, 2 otherwise: a file it could not measure
+(missing, not a regular file, refused by ffprobe, timed out after `--timeout` seconds, changed
+while measured) is a line with its `error` and is printed. At most 256 files a run
+(`--max-files`) and 64 MiB of output (`--max-bytes`). `aar media facts` is the same command on
+a machine with `aar` installed; there `--pc-folder LOCAL=E:\Show_1` names a folder as the PC
+knows it. Point the recipe's `library.facts` at the file as the hub sees it.
 
 ## Verified desktop handoff
 

@@ -290,6 +290,12 @@ def run_worker(
                 scan_returns(log, store, actor)
             except Exception as exc:
                 _LOG.warning("Desktop return pickup failed: %s", safe_str(exc)[:2000])
+            from aar.recipes.library_returns import scan_library_returns
+
+            try:  # S25d: saves of handed-over library projects; its own bounds
+                scan_library_returns(log, store, actor)
+            except Exception as exc:
+                _LOG.warning("Library save pickup failed: %s", safe_str(exc)[:2000])
             next_returns = time.monotonic() + 60.0
         if once:
             break

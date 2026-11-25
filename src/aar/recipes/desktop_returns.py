@@ -12,7 +12,7 @@ import json
 import os
 import tempfile
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,12 @@ from aar.media.settle import copy_settled
 from aar.plan.export.errors import ExportError
 from aar.plan.export.media import media_map_from_mapping
 from aar.plan.model import EditPlan
-from aar.plan.timeline_import import TimelineImportError, import_timeline, read_timeline
+from aar.plan.timeline_import import (
+    TimelineFile,
+    TimelineImportError,
+    import_timeline,
+    read_timeline,
+)
 from aar.recipes.ccn.scratch import work_root
 from aar.recipes.events import EVENT_RESULT, RUNNER
 
@@ -107,46 +112,79 @@ def receive_one(
             "status": "needs_review",
             "partial_reconstruction": True,
         }
-        try:
-            plan = EditPlan.model_validate_json(store.read_bytes(req.plan_sha256))
-            timeline = read_timeline(snapshot)
-            imported = import_timeline(
-                plan,
-                timeline.timeline,
-                timeline.media,
-                media_map=mapping,
-                reader_warnings=timeline.warnings,
-            )
-            result["plan"] = store.put(
-                imported.plan.model_dump_json().encode(),
-                actor=actor,
-                project_id=project_id,
-                meta={"role": "returned-plan"},
-            )
-            result["diff"] = store.put(
-                json.dumps(imported.diff, allow_nan=False).encode(),
-                actor=actor,
-                project_id=project_id,
-                meta={"role": "returned-timeline-diff"},
-            )
-            result["not_carried"] = imported.not_carried
-            result["import_needs_attention"] = imported.needs_attention
-            result["limits"] = imported.diff.get("limits", [])
-        except (ValueError, OSError, TimelineImportError, ExportError) as exc:
-            result.update(status="failed", error=str(exc)[:2000])
-        # First writer wins if two workers process the same round/content concurrently.
-        with log.transaction() as txn:
-            from aar.recipes.state import load_state
-
-            if load_state(log, req.recipe_node, project_id=project_id).recipe_status == "cancelled":
-                return None
-            existing = log.get_by_idempotency_key(key)
-            if existing is not None:
-                return existing.payload
-            txn.append(EVENT_RETURN, RUNNER, result, project_id=project_id, idempotency_key=key)
-        return result
+        return record_import(
+            log,
+            store,
+            project_id,
+            recipe_node=req.recipe_node,
+            plan_sha256=req.plan_sha256,
+            mapping=mapping,
+            read=lambda: read_timeline(snapshot),
+            result=result,
+            key=key,
+            actor=actor,
+        )
     finally:
         snapshot.unlink(missing_ok=True)
+
+
+def record_import(
+    log: EventLog,
+    store: ArtifactStore,
+    project_id: str,
+    *,
+    recipe_node: str,
+    plan_sha256: str,
+    mapping: Any,
+    read: Callable[[], TimelineFile],
+    result: dict[str, Any],
+    key: str,
+    actor: Actor,
+) -> dict[str, Any] | None:
+    """Import the timeline ``read`` gives against the plan ``plan_sha256`` (the plan the
+    returned timeline was handed over from), store the edited plan and the diff, and journal
+    ``result`` once under ``key`` as a ``recipe.timeline_return``. One implementation for a
+    returned ``.drt`` and a library save (:mod:`aar.recipes.library_returns`): an import that
+    fails is recorded ``failed`` with its error; pickup never replaces the active plan or
+    decides a review. None when the run was cancelled meanwhile."""
+    try:
+        plan = EditPlan.model_validate_json(store.read_bytes(plan_sha256))
+        timeline = read()
+        imported = import_timeline(
+            plan,
+            timeline.timeline,
+            timeline.media,
+            media_map=mapping,
+            reader_warnings=timeline.warnings,
+        )
+        result["plan"] = store.put(
+            imported.plan.model_dump_json().encode(),
+            actor=actor,
+            project_id=project_id,
+            meta={"role": "returned-plan"},
+        )
+        result["diff"] = store.put(
+            json.dumps(imported.diff, allow_nan=False).encode(),
+            actor=actor,
+            project_id=project_id,
+            meta={"role": "returned-timeline-diff"},
+        )
+        result["not_carried"] = imported.not_carried
+        result["import_needs_attention"] = imported.needs_attention
+        result["limits"] = imported.diff.get("limits", [])
+    except (ValueError, OSError, TimelineImportError, ExportError) as exc:
+        result.update(status="failed", error=str(exc)[:2000])
+    # First writer wins if two workers process the same round/content concurrently.
+    with log.transaction() as txn:
+        from aar.recipes.state import load_state
+
+        if load_state(log, recipe_node, project_id=project_id).recipe_status == "cancelled":
+            return None
+        existing = log.get_by_idempotency_key(key)
+        if existing is not None:
+            return existing.payload
+        txn.append(EVENT_RETURN, RUNNER, result, project_id=project_id, idempotency_key=key)
+    return result
 
 
 def _scan_error(

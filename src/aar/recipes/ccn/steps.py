@@ -665,6 +665,7 @@ def export_step(ctx: StepContext) -> StepOutput:
     )
     result.report["return_directory"] = str(return_dir.relative_to(export_root().resolve()))
     report_id = _json_artifact(ctx, result.report, "export-report")
+    library = _library_handoff(ctx, params, plan, project, round_)
     notes = handoff_notes(
         project=project,
         timeline=timeline,
@@ -672,6 +673,7 @@ def export_step(ctx: StepContext) -> StepOutput:
         report=result.report,
         report_id=report_id,
         loudness=loudness if isinstance(loudness, dict) else None,
+        library=library,
     )
     notes_id = ctx.put(notes.encode("utf-8"), mime=NOTES_MIME, meta={"role": "handoff-notes"})
     fusion_id: str | None = None
@@ -729,7 +731,50 @@ def export_step(ctx: StepContext) -> StepOutput:
     if fusion_id is not None:
         outputs["fusion_manifest"] = fusion_id
         artifacts = (fcpxml_id, report_id, notes_id, fusion_id)
+    if library is not None:
+        outputs["library_handoff"] = library
+        if library.get("report"):
+            artifacts = (*artifacts, library["report"])
+        if library["status"] != "placed":
+            error = library["error"]
+            outputs["warnings"] = [
+                {
+                    "code": f"library_{error['code']}",
+                    "message": error["message"],
+                    "fix_hint": error["hint"],
+                }
+            ]
     return StepOutput(outputs=outputs, artifact_ids=artifacts)
+
+
+def _library_handoff(
+    ctx: StepContext, params: CcnLongformParams, plan: EditPlan, project: str, round_: int
+) -> dict[str, Any] | None:
+    """The library hand-off's record (:mod:`.library_handoff`), with its export report stored
+    as an artifact; None when the params name no library. A refusal is a record, never a
+    failure of the step: the FCPXML hand-off goes on."""
+    if params.library is None:
+        return None
+    from aar.recipes.ccn.library_handoff import hand_over
+
+    check_cancelled(ctx)
+    record, report = hand_over(
+        params.library,
+        plan=plan,
+        plan_sha256=_need(ctx, "cut", "plan_sha256"),
+        profile=_profile(ctx),
+        media_map=params.media_map,
+        project=project,
+        round_=round_,
+        transcript=_transcript(ctx),
+        laughs=_laughs(ctx),
+    )
+    if report is not None:
+        record["report"] = _json_artifact(ctx, report, "library-export-report")
+    record["round"] = round_
+    record["recipe_node"] = ctx.recipe_node
+    record["media_map"] = params.media_map
+    return record
 
 
 __all__ = [

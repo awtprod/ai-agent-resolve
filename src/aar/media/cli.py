@@ -78,9 +78,16 @@ def register(subparsers: Any) -> None:
     timecode.add_argument("file", type=Path, help="Linux-local media file.")
     timecode.set_defaults(func=_cmd_timecode)
 
-    from aar.media import receipt, shrink
+    from aar.media import facts, receipt, shrink
 
     receipt.add_arguments(commands.add_parser("receipt", help="Verify PC and hub proxy copies."))
+    facts.add_arguments(
+        commands.add_parser(
+            "facts",
+            help="Measure media files on the edit PC for the library export (JSON lines).",
+            description=facts.DESCRIPTION,
+        )
+    )
 
     shrink.add_arguments(
         commands.add_parser(
