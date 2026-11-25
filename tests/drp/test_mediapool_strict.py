@@ -16,6 +16,7 @@ from typing import Any
 
 import mediapool_support as ms
 import pytest
+from drp_helpers import ZSTD_REASON
 from pydantic import ValidationError
 
 from aar.drp import blobs
@@ -742,10 +743,10 @@ def test_more_layers_than_the_bound_are_refused() -> None:
 
 def _compressed_needle() -> tuple[str, bytes]:
     """A zstd envelope whose payload holds a needle that its compressed bytes do not."""
-    from compression import zstd
+    zstandard = pytest.importorskip("zstandard", reason=ZSTD_REASON)
 
     needle = "abcdefgh" * 4
-    body = b"\x81" + zstd.compress((needle * 20).encode())
+    body = b"\x81" + zstandard.ZstdCompressor().compress((needle * 20).encode())
     wrapped = struct.pack(">II", 2, len(body)) + body
     assert all(needle.encode(c) not in wrapped for c in ("utf-8", "utf-16-be", "utf-16-le"))
     return needle, wrapped
