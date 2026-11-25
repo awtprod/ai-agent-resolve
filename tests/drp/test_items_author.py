@@ -439,3 +439,46 @@ def test_damaged_blobs_give_only_typed_refusals(seed_number: int) -> None:
     except ItemError:
         return
     assert got.item["Sm2TiItem_id"] == uid(0xD000 if kind == "picture" else 0xD001)
+
+
+# -- S25e-f2: a damaged constant of a template item is refused when the template is read ------
+
+
+def _constants(kind: str) -> dict[str, object]:
+    from aar.drp.items.rows import ITEM_CONSTANTS, PRECONFORM
+
+    return {**ITEM_CONSTANTS, "PreConformMediaExtents": PRECONFORM[kind]}
+
+
+@pytest.mark.parametrize("kind", ["picture", "sound"])
+@pytest.mark.parametrize("column", sorted(_constants("picture")))
+def test_a_template_item_with_a_damaged_constant_is_refused_naming_the_column(
+    kind: str, column: str
+) -> None:
+    """The item writer copies these columns from its template, and the verifier requires the
+    one value each holds: a template holding another is refused ``bad_template`` naming the
+    column, before anything is authored (not ``self_check_failed`` at placement)."""
+    template = _template(kind)
+    want = _constants(kind)[column]
+    template.item[column] = 7 if want is None else "3|0000000000000000"
+    with pytest.raises(ItemError) as info:
+        _author(kind, template)
+    assert info.value.code == "bad_template"
+    assert column in info.value.message, info.value.message
+
+
+def test_the_item_writer_and_the_verifier_state_the_same_constants() -> None:
+    from aar.drp.items.rows import ITEM_CONSTANTS, PRECONFORM
+    from aar.drp.libwrite.verify import ITEM_RULES, PICTURE_PRECONFORM
+
+    stated = {c: r[1] for c, r in ITEM_RULES.items() if isinstance(r, tuple)}
+    # CurrentSelectorIdx is written 0 whatever the template holds, so it is not copied.
+    assert set(stated) - set(ITEM_CONSTANTS) == {"CurrentSelectorIdx"}
+    for column, value in ITEM_CONSTANTS.items():
+        assert value == stated[column] and type(value) is type(stated[column]), column
+    assert PRECONFORM == {"picture": PICTURE_PRECONFORM, "sound": None}
+    # The synthetic Resolve rows hold them too.
+    for kind in ("picture", "sound"):
+        row = _template(kind).item
+        for column, value in _constants(kind).items():
+            assert row[column] == value and type(row[column]) is type(value), (kind, column)

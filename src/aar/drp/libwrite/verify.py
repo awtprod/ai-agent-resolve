@@ -22,8 +22,10 @@ back:
 * every column of every sound transition (:data:`TRANSITION_RULES`, one rule per column of the
   same closed list), recomputed from the cut's transitions (:class:`CutTransition`): its join
   (the outgoing entry's sound ends where exactly one other entry's sound starts, neither a
-  split edit), its ``Start`` (the cut minus Resolve's centring, ``(length + 1) // 2`` frames),
-  ``Duration``, ``AlignmentType`` and ``Position``, ``PrettyType`` (the kind's stored name,
+  split edit; two transitions on one clip do not overlap inside it, refused
+  ``transitions_overlap``), its ``Start`` (the cut minus Resolve's centring,
+  ``(length + 1) // 2`` frames), ``Duration``, ``AlignmentType`` and ``Position``,
+  ``PrettyType`` (the kind's stored name,
   from the verifier's own table), ``FieldsBlob`` byte for byte (one field #2 holding the bytes
   every sound transition holds, which inflate to its 44-byte value, framed plain, version 2),
   its place in the track's ``Items`` vector (record order, a transition before a clip that
@@ -297,6 +299,19 @@ def expected_transitions(
         )
     if len({t.cut for t in out}) != len(out):
         raise _fail("two transitions sit on one cut", field="transitions")
+    # On each entry, the frames after the cut of the transition into it and before the cut of
+    # the one out of it fit in its length (the plan export's rule and code).
+    for index, cut in enumerate(cuts):
+        into = sum(t.frames - t.before for t in out if t.incoming == index)
+        out_of = sum(t.before for t in out if t.outgoing == index)
+        if into and out_of and into + out_of > cut.duration:
+            raise ProjectWriteError(
+                "transitions_overlap",
+                f"the transitions into and out of cut entry {index} need {into + out_of} "
+                f"frames of its {cut.duration}, so they overlap",
+                _HINT,
+                field="transitions",
+            )
     return out
 
 

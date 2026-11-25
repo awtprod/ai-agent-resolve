@@ -16,7 +16,10 @@ returns the ``Sm2TiItem`` row and its ``Items`` join row. The field map (docs/DE
 * **fresh**: what a later edit adds (a grade, a Fusion composition, effects, markers, import
   metadata, the edit history inside ``FieldsBlob``) is NULL or left out, as on an item Resolve
   has just made; ``CurrentSelectorIdx`` is 0 (it is derived from nothing);
-* **copied** from the template: every other column, each one of :data:`ITEM_COLUMNS`.
+* **copied** from the template: every other column, each one of :data:`ITEM_COLUMNS`; each
+  holds the one value every plain item holds (:data:`aar.drp.items.rows.ITEM_CONSTANTS`, and
+  ``PreConformMediaExtents`` by kind), and a template holding anything else is refused
+  ``bad_template`` naming the column (:func:`aar.drp.items.rows.check_item`).
 
 It writes nothing. Whatever it cannot justify is a typed :class:`ItemError`; after authoring no
 id of the template (its own, its links, its media, its track) is left in any layer of any value.

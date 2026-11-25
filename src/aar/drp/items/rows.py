@@ -15,6 +15,7 @@ later additions it carries; an item it cannot support is never repaired, only li
 from __future__ import annotations
 
 import re
+import struct
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,11 +38,13 @@ from aar.drp.mediapool.templates import (
 
 __all__ = [
     "ITEM_COLUMNS",
+    "ITEM_CONSTANTS",
     "ITEM_TYPES",
     "ItemRows",
     "ItemSet",
     "Shape",
     "check_item",
+    "constant_problem",
     "links_of",
     "read_items",
     "shape_of",
@@ -123,6 +126,54 @@ LATER_COLUMNS = {
     "ImportExportMetadataBA": "import-metadata",
     "MarkersBA": "markers",
     "MediaMetadata": "item-metadata",
+}
+#: The columns the item writer copies from a template that hold one value on every plain item
+#: of the corpus (9,937 of the 9,938 picture and sound items of the two 21.1 saves; the other is
+#: a title): a template holding anything else is refused (:func:`check_item`), never copied.
+#: The verifier keeps its own table (:data:`aar.drp.libwrite.verify.ITEM_RULES`); a test
+#: compares the two.
+ITEM_CONSTANTS: dict[str, object] = {
+    "Track": None,
+    "LinkedItemSync": None,
+    "UiMemento": 0,
+    "Flags": 0,
+    "PriorityIndex": 0,
+    "MediaReelNumber": None,
+    "Group": None,
+    "pAuxLmVerTable": None,
+    "Thumbnail": None,
+    "ThumbnailDirtyFlag": 1,
+    "RenderTextEnabled": 1,
+    "RenderTextGanged": 1,
+    "RenderTextPrefixed": 1,
+    "TextRenderItemVec": None,
+    "LastChangedTime": 0,
+    "LastRenderedTime": 0,
+    "IsMarkedForCaching": 0,
+    "IsForceConformed": 1,
+    "MatchConflictState": 0,
+    "PrettyType": None,
+    "Resolution": None,
+    "IsPreConformed": 0,
+    "MixedFrameRateAlignment": 0.0,
+    "UseOppositeSrcForLeftEye": 0,
+    "UseOppositeSrcForRightEye": 0,
+    "WasDisbanded": 0,
+    "AlignmentType": None,
+    "Position": None,
+    "RenderCacheBA": None,
+    "ClipGroup": None,
+    "BlobLockSysId": "",
+    "OriginalClip": None,
+    "Sm2TiItem_Owner_id": None,
+    "CompTableLockSysId": "",
+    "VersionTableLockSysId": "",
+}
+#: ``PreConformMediaExtents``, copied too, by kind: every picture item of the corpus holds
+#: these 16 bytes (4,709 of 4,709), every sound item none.
+PRECONFORM: dict[str, bytes | None] = {
+    "picture": bytes.fromhex("00000100000030c20000010000003042"),
+    "sound": None,
 }
 _FRAMES = re.compile(r"-?[0-9]{1,12}\Z")
 _HINT = "use a template item from a project Resolve saved"
@@ -385,7 +436,30 @@ def check_item(rows: object, clips: dict[str, ClipRows]) -> ItemRows:
     shape = shape_of(rows, clips)
     if shape.refused is not None:
         raise _bad(f"the template item is not supported: {shape.refused}")
+    assert rows.kind is not None  # shape_of refuses any other type
+    constants = {**ITEM_CONSTANTS, "PreConformMediaExtents": PRECONFORM[rows.kind]}
+    problem = constant_problem(rows.item, constants)
+    if problem is not None:
+        raise _bad(f"the template item {problem}")
     return rows
+
+
+@refusing("bad_template", "checking a template's constant columns", _HINT, error=ItemError)
+def constant_problem(item: Row, constants: dict[str, object]) -> str | None:
+    """Why ``item`` is not a template whose copied constant columns hold ``constants`` (the
+    same type and value, a float bit for bit, as the verifier compares them), naming the
+    first column that differs; None when every one holds its value."""
+    for column, want in constants.items():
+        got = item.get(column)
+        same = type(got) is type(want) and (
+            struct.pack("<d", got) == struct.pack("<d", want)
+            if isinstance(got, float) and isinstance(want, float)
+            else got == want
+        )
+        if not same:
+            shown = f"{len(got)} bytes" if isinstance(got, bytes) else repr(got)[:60]
+            return f"holds {column} {shown}, not {want!r} (the value Resolve writes there)"
+    return None
 
 
 def _rows(lib: Any, table: str) -> list[Row]:

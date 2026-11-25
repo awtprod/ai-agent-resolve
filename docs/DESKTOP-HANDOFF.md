@@ -143,13 +143,19 @@ What you will see for a few kinds of save:
 
 A ccn cut of more than one continuous range has a short sound crossfade at each join; the
 library project carries those (a "Cross Fade 0 dB" or "+3 dB", centred on the cut, 2 to 16
-frames, on a 29.97 fps timeline), so such a cut is placed too. Keep them where they are, or
-trim the clips beside them as usual (the crossfade moves with the cut); a crossfade you delete
-or add is reported to the agent. Picture transitions, fades, other crossfades, titles, other
-tracks, gain, framing, markers and captions are not written: a cut that needs one of the first
-three is refused and goes by FCPXML only, and the notes count the plan details left out. Saves
-are picked up only while the round's review is open; after a decision or a later round they are
-not. The project's file is read up to 256 MiB.
+frames, on a 29.97 fps timeline), so such a cut is placed too. Keep them where they are, or trim
+the clips beside them as usual (the crossfade moves with the cut); a crossfade you delete or add
+is reported to the agent. What the agent cannot tell from your save: a crossfade you slide along
+its cut but that still covers the cut looks unchanged (the plan does not say where a crossfade
+sits on its cut); a crossfade you make longer or shorter is reported as the old one deleted and
+a new one added; and a crossfade you change to another kind (0 dB to +3 dB, or any other) is not
+noticed at all. If any of those matter, say so in your review note. A crossfade the plan gives
+no length (0 frames) is a plain cut and is written as one; the notes count it among the plan
+details left out. Picture transitions, fades, other crossfades, titles, other tracks, gain,
+framing, markers and captions are not written: a cut that needs one of the first three is
+refused and goes by FCPXML only, and the notes count the plan details left out. Saves are picked
+up only while the round's review is open; after a decision or a later round they are not. The
+project's file is read up to 256 MiB.
 
 Nothing the library route does can lose the FCPXML hand-off: any fault of the library, the seed,
 the facts file or the hub's own disk while writing the library project is the refusal

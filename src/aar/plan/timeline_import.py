@@ -165,8 +165,11 @@ STILL_EXTENSIONS = frozenset(
 #: project, S25e), in place of the one in :data:`LIMITS`.
 SOUND_TRANSITION_LIMIT = (
     "audio_transitions: sound transition items on A1 are compared with the plan's audio-only "
-    "crossfades by their cut and length; their kind (Cross Fade 0 dB, +3 dB...) is not read, "
-    "and those on other audio tracks are listed as added"
+    "crossfades by their cut and length only: a crossfade moved in Resolve that still covers "
+    "its cut reads as unchanged (the plan has no field for where it sits on the cut); one made "
+    "longer or shorter reads as the plan's crossfade removed and another added; its kind "
+    "(Cross Fade 0 dB, +3 dB...) is not read, so a changed kind is not seen; those on other "
+    "audio tracks are listed as added"
 )
 
 LIMITS = (

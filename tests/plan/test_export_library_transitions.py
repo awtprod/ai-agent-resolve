@@ -325,3 +325,76 @@ def test_sound_transitions_are_compared_only_for_a_library_project(tmp_path: Pat
         "audio_transitions: transition items on audio tracks are not compared"
         in (ignored.diff["limits"])
     )
+
+
+# -- S25e-f2 -----------------------------------------------------------------------------------
+
+
+def test_overlapping_crossfades_are_refused_by_the_export_with_the_writers_code(
+    tmp_path: Path,
+) -> None:
+    """The same cut the writer and the verifier refuse (two 16-frame crossfades on a 10-frame
+    clip) is refused by the plan export too, with the same code: no door lets it through."""
+    paths = _setup(tmp_path)
+    segments = [
+        {"track": 1, "source": "a", "src_in": 100, "src_out": 160},
+        {"track": 1, "source": "c", "src_in": 300, "src_out": 310},
+        {"track": 1, "source": "a", "src_in": 900, "src_out": 950},
+    ]
+    with pytest.raises(ExportError) as info:
+        _export(paths, _plan(segments, [_fade(0, 16), _fade(1, 16)]))
+    assert info.value.code == "transitions_overlap"
+
+
+def test_a_zero_length_crossfade_is_listed_as_not_carried(tmp_path: Path) -> None:
+    """A crossfade of 0 frames plays as the hard cut it sits on (the layout, the render and the
+    import skip it): the project holds a cut there, and the report says so instead of saying
+    nothing."""
+    paths = _setup(tmp_path)
+    plan = _plan(THREE, [_fade(0, 0), _fade(1, 2)])
+    report = _export(paths, plan).report
+    assert report["exported"]["sound_transitions"] == 1
+    listed = [i for i in report["not_carried"] if i["feature"] == "zero_length_transition"]
+    assert [i["location"] for i in listed] == ["transitions[0].audio"]
+    assert "hard cut" in listed[0]["detail"]
+    assert _transitions(Path(report["project"]["path"])) == [(131, 2, "Cross Fade 0DB", 2)]
+
+
+def _moved(tmp_path: Path, start: int) -> Any:
+    """A 2-frame crossfade on the cut at frame 60 (stored from 59), moved in the project to
+    start at ``start`` (record frames from the timeline's start), then imported."""
+    paths = _setup(tmp_path)
+    plan = _plan(THREE, [_fade(0)])
+    path = Path(_export(paths, plan).report["project"]["path"])
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "UPDATE Sm2TiItem SET Start = ? WHERE DbType = 'Sm2TiTransition'", (str(START + start),)
+    )
+    conn.commit()
+    conn.close()
+    timeline = read_timeline(path, library_options=OPTS)
+    return import_timeline(plan, timeline.timeline, timeline.media, sound_transitions=True)
+
+
+@pytest.mark.parametrize("start", [56, 61])
+def test_a_crossfade_moved_off_its_cut_is_one_removed_and_one_added(
+    tmp_path: Path, start: int
+) -> None:
+    """Moved to end two frames before the cut, or to start one frame after it: it no longer
+    contains its cut, so it is not the plan's crossfade."""
+    result = _moved(tmp_path, start)
+    codes = sorted((n["code"], n.get("location", "")) for n in result.diff["not_carried"])
+    assert codes == [("transition_added", ""), ("transition_missing", "transitions[0]")]
+
+
+@pytest.mark.parametrize("start", [58, 59, 60])
+def test_a_crossfade_moved_along_its_cut_reads_as_unchanged(tmp_path: Path, start: int) -> None:
+    """Ending on the cut, centred, starting on it: each contains the cut and has the plan's
+    length, so each reads as the plan's crossfade (the plan has no field for alignment), and
+    the diff's limits say so."""
+    result = _moved(tmp_path, start)
+    assert result.diff["unchanged"] is True and not result.diff["not_carried"]
+    [limit] = [x for x in result.diff["limits"] if x.startswith("audio_transitions:")]
+    assert "still covers its cut reads as unchanged" in limit
+    assert "longer or shorter reads as the plan's crossfade removed and another added" in limit
+    assert "a changed kind is not seen" in limit

@@ -255,6 +255,20 @@ def _not_carried(layout: Layout) -> list[dict[str, str]]:
         )
     for i, _ in enumerate(plan.captions):
         items.append(ReportItem("caption", f"captions[{i}]", "captions are burned in", "none"))
+    # A crossfade of no frames on a cut plays as the hard cut it sits on (the layout, the render
+    # and the import all skip it): no transition item is written for it, which changes nothing,
+    # so it is listed here rather than refused.
+    for i, tx in enumerate(plan.transitions):
+        if tx.video == "cut" and tx.audio is not None and tx.audio.frames == 0:
+            items.append(
+                ReportItem(
+                    "zero_length_transition",
+                    f"transitions[{i}].audio",
+                    f"a {tx.audio.type!r} of 0 frames plays as a hard cut: no transition is "
+                    "written",
+                    "none (give it a length to have a crossfade)",
+                )
+            )
     # A sound transition the project carries keeps its own kind: the FCPXML's note that it is
     # written as FCPXML's one audio crossfade does not apply.
     written = {

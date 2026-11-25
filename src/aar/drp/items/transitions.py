@@ -46,7 +46,14 @@ from aar.drp import blobs
 from aar.drp.errors import DrpError
 from aar.drp.items.author import AuthoredItem
 from aar.drp.items.errors import ItemError
-from aar.drp.items.rows import ITEM_COLUMNS, LATER_COLUMNS, ItemRows, _range_shape, frames_text
+from aar.drp.items.rows import (
+    ITEM_COLUMNS,
+    LATER_COLUMNS,
+    ItemRows,
+    _range_shape,
+    constant_problem,
+    frames_text,
+)
 from aar.drp.mediapool import blobtree as bt
 from aar.drp.mediapool.errors import MediaPoolError, refusing
 from aar.drp.mediapool.templates import Row
@@ -60,6 +67,7 @@ __all__ = [
     "SOUND_KINDS",
     "SOUND_PAYLOAD",
     "TRANSITION",
+    "TRANSITION_CONSTANTS",
     "TransitionPlacement",
     "TransitionShape",
     "author_transition",
@@ -104,6 +112,61 @@ SOUND_PAYLOAD = bytes.fromhex("030001") + bytes(41)
 #: hold exactly these bytes: a damaged stream can inflate to the same value (a flipped padding
 #: bit), and the writer copies only what Resolve wrote.
 SOUND_FIELD = bytes.fromhex("0000002c789c636660642016000000da0005")
+#: Every column the writer copies from a template, with the one value it holds on every sound
+#: transition of the corpus (854 of 854): a template holding anything else is refused
+#: (:func:`check_transition`, naming the column), never copied. The verifier keeps its own
+#: table (:data:`aar.drp.libwrite.verify.TRANSITION_RULES`); a test compares the two.
+TRANSITION_CONSTANTS: dict[str, object] = {
+    "Name": "Transition",
+    "Track": None,
+    "LinkedItemSync": None,
+    "MarkersBA": None,
+    "UiMemento": 0,
+    "Flags": 0,
+    "PriorityIndex": 0,
+    "In": None,
+    "MediaRef": None,
+    "MediaStartTime": None,
+    "MediaFilePath": None,
+    "MediaReelNumber": None,
+    "MediaTimemapBA": None,
+    "Group": None,
+    "pLmVerTable": None,
+    "pAuxLmVerTable": None,
+    "Thumbnail": None,
+    "ThumbnailDirtyFlag": 1,
+    "RenderTextEnabled": 1,
+    "RenderTextGanged": 1,
+    "RenderTextPrefixed": 1,
+    "TextRenderItemVec": None,
+    "LastChangedTime": None,
+    "LastRenderedTime": None,
+    "IsMarkedForCaching": None,
+    "IsForceConformed": 1,
+    "MatchConflictState": 0,
+    "MediaTrackIdx": None,
+    "Resolution": None,
+    "EffectFiltersBA": None,
+    "IsPreConformed": 0,
+    "PreConformMediaExtents": None,
+    "ImportExportMetadataBA": None,
+    "MediaFrameRate": None,
+    "VirtualAudioTrackBA": None,
+    "MixedFrameRateAlignment": 0.0,
+    "UseOppositeSrcForLeftEye": 0,
+    "UseOppositeSrcForRightEye": 0,
+    "WasDisbanded": 0,
+    "CurrentSelectorIdx": 0,
+    "RenderCacheBA": None,
+    "ClipGroup": None,
+    "MediaMetadata": None,
+    "CompositionTable": None,
+    "BlobLockSysId": "",
+    "OriginalClip": None,
+    "Sm2TiItem_Owner_id": None,
+    "CompTableLockSysId": "",
+    "VersionTableLockSysId": "",
+}
 #: Columns a transition never holds (it plays no media; nothing later was added).
 _EMPTY_COLUMNS = (
     "In",
@@ -275,6 +338,9 @@ def check_transition(rows: object) -> ItemRows:
     shape = transition_shape(rows, 1)
     if shape.refused is not None:
         raise _bad(f"the template transition is not supported: {shape.refused}")
+    problem = constant_problem(rows.item, TRANSITION_CONSTANTS)
+    if problem is not None:
+        raise _bad(f"the template transition {problem}")
     return rows
 
 

@@ -32,6 +32,7 @@ from aar.drp.items.errors import ItemError
 from aar.drp.items.rows import ITEM_COLUMNS, ItemRows, read_items
 from aar.drp.items.transitions import (
     SOUND_KINDS,
+    TRANSITION_CONSTANTS,
     TransitionPlacement,
     author_transition,
     check_transition,
@@ -261,12 +262,16 @@ def _flip(data: bytes, rng: random.Random) -> bytes:
 @pytest.mark.parametrize("seed_number", range(4))
 def test_fuzz_a_damaged_template_is_a_typed_refusal_or_a_valid_row(seed_number: int) -> None:
     """Aimed at the fixed-layout parts: the envelope's version and length, the qCompress
-    length prefix, the zlib stream and the protobuf tags; and at random columns."""
+    length prefix, the zlib stream and the protobuf tags; and at random columns, constants
+    among them. Each is a typed refusal or the row the untouched template gives, every column
+    and the join row equal (DESIGN "Transitions and the latest save (S25e)")."""
     rng = random.Random(seed_number)
     good = envelope(pb((2, 2, TRANSITION_FIELD)))
+    reference = author_transition(_template(), _place(), transition_id=NEW)
+    junk = [None, 0, -1, "x", b"\xff", 2.5, 10**30, "3|0000000000000000", "", 1, True, 0.0]
     for _ in range(300):
         template = _template()
-        target = rng.choice(["envelope", "prefix", "zlib", "tag", "column", "any"])
+        target = rng.choice(["envelope", "prefix", "zlib", "tag", "column", "constant", "any"])
         blob = bytearray(good)
         if target == "envelope":
             blob[rng.randrange(9)] ^= 1 << rng.randrange(8)
@@ -279,14 +284,15 @@ def test_fuzz_a_damaged_template_is_a_typed_refusal_or_a_valid_row(seed_number: 
         elif target == "any":
             blob = bytearray(_flip(good, rng))
         template.item["FieldsBlob"] = bytes(blob)
-        if target == "column":
-            column = rng.choice(list(ITEM_COLUMNS))
-            template.item[column] = rng.choice([None, 0, -1, "x", b"\xff", 2.5, 10**30])
+        if target in ("column", "constant"):
+            columns = ITEM_COLUMNS if target == "column" else tuple(TRANSITION_CONSTANTS)
+            template.item[rng.choice(list(columns))] = rng.choice(junk)
         try:
             authored = author_transition(template, _place(), transition_id=NEW)
         except ItemError:
             continue
         assert authored.item["FieldsBlob"] == good
+        assert authored.item == reference.item and authored.link == reference.link
 
 
 # -- joins in a cut ---------------------------------------------------------------------------
@@ -611,3 +617,156 @@ def test_the_fields_blob_rule_is_byte_for_byte_on_its_framing(tmp_path: Path) ->
             _verify(path, seed, cuts, tx)
     _plant(path, "UPDATE Sm2TiItem SET FieldsBlob = ? WHERE DbType = 'Sm2TiTransition'", good)
     _verify(path, seed, cuts, tx)
+
+
+# -- S25e-f2: one rule at every door, early template refusals, the mutants that survived ------
+
+
+def _overlapping(clip: Any) -> list[Cut]:
+    """A 10-frame clip between two others: two 16-frame crossfades put 8 frames each in it."""
+    return [Cut(clip, 0, 24, 50), Cut(clip, 24, 10, 100), Cut(clip, 34, 24, 150)]
+
+
+OVERLAPPING = [CutTransition(0, 16, "Cross Fade 0 dB"), CutTransition(1, 16, "Cross Fade 0 dB")]
+
+
+def test_two_crossfades_overlapping_inside_one_clip_are_refused_by_the_writer(
+    tmp_path: Path,
+) -> None:
+    """Each side fits its own clip (8 of 24, 8 of 10, 8 of 10, 8 of 24), but the middle clip
+    would hold 16 frames of crossfade in 10: the plan export's ``transitions_overlap``."""
+    with pytest.raises(ProjectWriteError) as info:
+        _make(tmp_path, _overlapping, OVERLAPPING)
+    assert info.value.code == "transitions_overlap", info.value
+    # The writer's own refusal, before anything is written (the verifier's names no transition).
+    assert info.value.message.startswith(
+        "cut entry 1: transition 0 and transition 1 need 16 frames of its 10"
+    ), info.value.message
+    projects = tmp_path / "lib" / "Resolve Projects" / "Users" / "guest" / "Projects"
+    assert list(projects.iterdir()) == []
+
+
+def test_two_crossfades_that_exactly_fill_a_clip_are_placed(tmp_path: Path) -> None:
+    def exact(clip: Any) -> list[Cut]:
+        return [Cut(clip, 0, 24, 50), Cut(clip, 24, 16, 100), Cut(clip, 40, 24, 150)]
+
+    result = _make(tmp_path, exact, OVERLAPPING)
+    assert "add_sound_transitions" in result.built.operations
+
+
+def test_the_verifier_refuses_overlapping_crossfades_with_the_same_code(tmp_path: Path) -> None:
+    path, seed, cuts, _ = _written(tmp_path)
+    from aar.drp.libwrite.verify import expected_transitions
+
+    clip = cuts[0].clip
+    with pytest.raises(ProjectWriteError) as info:
+        expected_transitions(_overlapping(clip), OVERLAPPING)
+    assert info.value.code == "transitions_overlap"
+    # ... and the whole check, before any row is compared
+    with pytest.raises(ProjectWriteError) as info:
+        _verify(path, seed, _overlapping(clip), OVERLAPPING)
+    assert info.value.code == "transitions_overlap"
+
+
+@pytest.mark.parametrize("column", sorted(TRANSITION_CONSTANTS))
+def test_a_template_with_a_damaged_constant_is_refused_naming_the_column(column: str) -> None:
+    """The validation's fuzz found rows copied with, for example, ``RenderTextEnabled``
+    ``3|0000000000000000``: the verifier refused them at placement as a writer bug. The
+    template is refused first, ``bad_template`` naming the column."""
+    template = _template()
+    # Another type than the constant's: a number where it is empty, else Resolve's N|hex text.
+    template.item[column] = 7 if TRANSITION_CONSTANTS[column] is None else "3|0000000000000000"
+    with pytest.raises(ItemError) as info:
+        author_transition(template, _place(), transition_id=NEW)
+    assert info.value.code == "bad_template"
+    assert column in info.value.message, info.value.message
+
+
+@pytest.mark.parametrize("value", [0, 2, 1.0, True, b"\x01", "1", "3|0000000000000000", None])
+def test_a_constant_of_the_wrong_type_is_refused(value: object) -> None:
+    template = _template()
+    template.item["RenderTextEnabled"] = value
+    with pytest.raises(ItemError, match="RenderTextEnabled"):
+        author_transition(template, _place(), transition_id=NEW)
+
+
+def test_the_writer_and_the_verifier_state_the_same_transition_constants() -> None:
+    stated = {c: r[1] for c, r in TRANSITION_RULES.items() if r != DERIVED}  # type: ignore[index]
+    copied = set(ITEM_COLUMNS) - {
+        "Sm2TiItem_id",
+        "DbType",
+        "Start",
+        "Duration",
+        "Sm2TiTrack_id",
+        "AlignmentType",
+        "Position",
+        "PrettyType",
+        "FieldsBlob",
+    }
+    assert set(TRANSITION_CONSTANTS) == set(stated) == copied
+    for column, value in TRANSITION_CONSTANTS.items():
+        assert value == stated[column] and type(value) is type(stated[column]), column
+
+
+def test_an_odd_crossfade_is_written_and_checked_by_the_verifiers_own_centring(
+    tmp_path: Path,
+) -> None:
+    """A 3-frame crossfade: Resolve puts two frames before the cut. Written through
+    ``make_project`` (so the verifier's own centring rule passes it), then planted one frame
+    later (where ``frames // 2`` would put it): refused."""
+    result = _make(tmp_path, three, [CutTransition(0, 3, "Cross Fade 0 dB")])
+    conn = sqlite3.connect(result.placed.path)
+    [(start, duration)] = conn.execute(
+        "SELECT Start, Duration FROM Sm2TiItem WHERE DbType = 'Sm2TiTransition'"
+    ).fetchall()
+    conn.close()
+    assert (start, duration) == (str(START + 24 - 2), "3")
+    cuts = list(result.authored.cuts)
+    tx = [CutTransition(0, 3, "Cross Fade 0 dB")]
+    _verify(result.placed.path, result.seed, cuts, tx)
+    _plant(
+        result.placed.path,
+        "UPDATE Sm2TiItem SET Start = ? WHERE DbType = 'Sm2TiTransition'",
+        str(START + 24 - 1),
+    )
+    with pytest.raises(ProjectWriteError) as info:
+        _verify(result.placed.path, result.seed, cuts, tx)
+    assert info.value.code == "self_check_failed"
+
+
+def test_the_verifier_checks_the_incoming_clips_handle_on_its_own(tmp_path: Path) -> None:
+    """The incoming clip starts one frame into its file: a 2-frame crossfade (one frame before
+    the cut) is written; the file then planted to hold a 4-frame one (two frames before the
+    cut, one more than the file has) is refused by the verifier's own handle rule."""
+
+    def late(clip: Any) -> list[Cut]:
+        return [Cut(clip, 0, 24, 10), Cut(clip, 24, 24, 1), Cut(clip, 48, 30, 200)]
+
+    result = _make(tmp_path, late, [CutTransition(0, 2, "Cross Fade 0 dB")])
+    path, seed, cuts = result.placed.path, result.seed, list(result.authored.cuts)
+    _plant(
+        path,
+        "UPDATE Sm2TiItem SET Start = ?, Duration = '4' WHERE DbType = 'Sm2TiTransition'",
+        str(START + 24 - 2),
+    )
+    with pytest.raises(ProjectWriteError) as info:
+        _verify(path, seed, cuts, [CutTransition(0, 4, "Cross Fade 0 dB")])
+    assert info.value.code == "self_check_failed"
+    assert "before the incoming clip's first frame" in info.value.message
+
+
+def test_the_verifier_wants_the_stored_bytes_not_only_their_value(tmp_path: Path) -> None:
+    """A ``FieldsBlob`` #2 of another zlib stream that inflates to the same 44 bytes (stored,
+    not deflated) is not what Resolve writes: refused byte for byte."""
+    import zlib
+
+    path, seed, cuts, tx = _written(tmp_path)
+    other = struct.pack(">I", len(TRANSITION_PAYLOAD)) + zlib.compress(TRANSITION_PAYLOAD, 0)
+    assert other != TRANSITION_FIELD and zlib.decompress(other[4:]) == TRANSITION_PAYLOAD
+    _plant(
+        path,
+        "UPDATE Sm2TiItem SET FieldsBlob = ? WHERE DbType = 'Sm2TiTransition'",
+        envelope(pb((2, 2, other))),
+    )
+    with pytest.raises(ProjectWriteError, match="#2"):
+        _verify(path, seed, cuts, tx)
