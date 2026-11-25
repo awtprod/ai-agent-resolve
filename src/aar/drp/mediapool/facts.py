@@ -4,13 +4,18 @@ The facts are measured on another machine (``ffprobe -show_format -show_streams`
 size and modification time, gathered by a script on the edit PC), so everything here is treated
 as untrusted: types are strict (a number sent as a string is refused), every text, list and
 mapping is bounded, and the timestamps must parse. Only the ffprobe fields the writer reads are
-typed; the others ffprobe prints vary by version and are ignored. Derived values are computed in
-:mod:`aar.drp.mediapool.formulas`, never here.
+typed; the others ffprobe prints vary by version and are ignored. Digits are matched as ASCII
+only (``[0-9]``, never ``\\d``, and never Python's ``int()`` on unchecked text, which reads other
+scripts' digits): a timecode or rotation tag in other digits is refused, not read. The path is
+checked by the edit PC's one path validator (:func:`aar.host.winpath.check_file_path`) and the
+hub's check for characters a reader cannot see (:func:`aar.hub.lessons.hidden_character`).
+Derived values are computed in :mod:`aar.drp.mediapool.formulas`, never here.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import UTC, datetime
 from typing import Annotated, Any
@@ -64,13 +69,30 @@ _UTC = re.compile(
     r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,9}))?Z\Z"
 )
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
-_WINDOWS_ROOT = re.compile(r"(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+\\)")
+#: A ``timecode`` tag (any case), as ffprobe prints it: ASCII digits only.
+TIMECODE_TAG = re.compile(r"[0-9]{2}:[0-9]{2}:[0-9]{2}[:;.][0-9]{2,3}\Z")
+#: A ``rotate`` tag: whole degrees in ASCII digits.
+_ROTATE_TAG = re.compile(r"-?[0-9]{1,4}\Z")
+#: The most a display rotation may say, in degrees (ffprobe gives -360..360).
+_MAX_ROTATION = 360.0
 
 
 def _no_control(value: str | None) -> str | None:
     if value is not None and _CONTROL.search(value):
         raise ValueError("text holds a control character")
     return value
+
+
+def _checked_tags(tags: dict[str, str]) -> dict[str, str]:
+    """The tags the writer reads, checked: a ``timecode`` tag (any case) must be ``HH:MM:SS:FF``
+    in ASCII digits and a ``rotate`` tag whole degrees in ASCII digits."""
+    for key, value in tags.items():
+        lower = key.lower()
+        if lower == "timecode" and not TIMECODE_TAG.match(value):
+            raise ValueError(f"the {key} tag {value[:40]!r} is not HH:MM:SS:FF in ASCII digits")
+        if lower == "rotate" and not _ROTATE_TAG.match(value):
+            raise ValueError(f"the rotate tag {value[:40]!r} is not whole degrees in ASCII digits")
+    return tags
 
 
 class ProbeStream(BaseModel):
@@ -128,10 +150,24 @@ class ProbeStream(BaseModel):
             raise ValueError(f"expected a rational like 30000/1001, got {value[:40]!r}")
         return value
 
+    @field_validator("tags")
+    @classmethod
+    def _tags(cls, value: dict[str, str]) -> dict[str, str]:
+        return _checked_tags(value)
+
     @field_validator("side_data_list")
     @classmethod
     def _side(cls, value: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for item in value:
+            if "rotation" in item:
+                rotation = item["rotation"]
+                if (
+                    isinstance(rotation, bool)
+                    or not isinstance(rotation, int | float)
+                    or not math.isfinite(rotation)
+                    or abs(rotation) > _MAX_ROTATION
+                ):
+                    raise ValueError(f"a side data rotation of {str(rotation)[:40]!r} degrees")
             if len(item) > 64:
                 raise ValueError("a side data entry has more than 64 fields")
             for key, field in item.items():
@@ -157,6 +193,11 @@ class ProbeFormat(BaseModel):
     duration: _Text | None = None
     tags: _Tags = {}
 
+    @field_validator("tags")
+    @classmethod
+    def _tags(cls, value: dict[str, str]) -> dict[str, str]:
+        return _checked_tags(value)
+
 
 class Probe(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
@@ -171,6 +212,35 @@ class Probe(BaseModel):
         if len(set(indexes)) != len(indexes):
             raise ValueError("two streams have the same index")
         return value
+
+
+def check_pc_path(value: str) -> str:
+    """An edit-PC file path as Resolve will store it. The edit PC's path rules are
+    :func:`aar.host.winpath.check_file_path` (one implementation: a drive or UNC root, no empty,
+    ``.`` or ``..`` component, so no doubled separator; no reserved device name; no character
+    Windows forbids in a name, the colon among them; no trailing dot or space; no control
+    character or lone surrogate). The writer adds three: no character a reader cannot see
+    (:func:`aar.hub.lessons.hidden_character`: bidirectional, zero-width, C1 control and other
+    format characters, which would be written into the clip unseen); backslashes only (Resolve's
+    folder and name are split at the last backslash, and how it stores a ``/`` was not seen);
+    and a folder under the root (how Resolve writes the folder of a file at a drive's or share's
+    root was not seen)."""
+    from aar.host.errors import PathRefused
+    from aar.host.winpath import check_file_path
+    from aar.hub.lessons import hidden_character
+
+    try:
+        win = check_file_path(value)
+    except PathRefused as exc:
+        raise ValueError(f"the path is not a valid edit-PC file path ({exc.reason})") from None
+    hidden = hidden_character(value)
+    if hidden is not None:
+        raise ValueError(f"the path holds a character a reader cannot see (U+{ord(hidden):04X})")
+    if "/" in value:
+        raise ValueError("the path must use backslashes only, as Resolve stores it")
+    if len(win.parts) < 2:
+        raise ValueError("the path must name a file in a folder, not at the root of a drive")
+    return value
 
 
 def parse_local_time(text: str) -> datetime:
@@ -215,18 +285,7 @@ class MediaFacts(BaseModel):
     @field_validator("path")
     @classmethod
     def _windows_path(cls, value: str) -> str:
-        if _CONTROL.search(value):
-            raise ValueError("the path holds a control character")
-        if "/" in value or not _WINDOWS_ROOT.match(value):
-            raise ValueError(
-                "the path must be an absolute Windows path (C:\\... or \\\\server\\share\\...)"
-            )
-        folder, _, name = value.rpartition("\\")
-        if not name or name in (".", "..") or not folder or folder.endswith("\\\\"):
-            raise ValueError("the path must name a file in a folder")
-        if any(part in (".", "..") for part in value.split("\\")[1:]):
-            raise ValueError("the path must not hold . or .. parts")
-        return value
+        return check_pc_path(value)
 
     @property
     def folder(self) -> str:
@@ -255,11 +314,14 @@ def facts_from_json(data: object) -> MediaFacts:
     """
     try:
         if isinstance(data, bytes | str):
-            if len(data) > MAX_FACTS_BYTES:
+            size = len(data if isinstance(data, bytes) else data.encode("utf-8", "surrogatepass"))
+            if size > MAX_FACTS_BYTES:
                 raise ValueError(f"the facts are longer than {MAX_FACTS_BYTES} bytes")
             data = json.loads(data)
         if not isinstance(data, dict):
             raise ValueError("the facts are not a JSON object")
+        # A lone surrogate (JSON "\\ud800") is text no file name, tag or blob can hold.
+        json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
         known = {"path", "exists", "size", "mtime_local", "mtime_utc", "ctime_utc", "ffprobe"}
         extra = sorted(str(k)[:40] for k in data if k not in known)
         if extra:

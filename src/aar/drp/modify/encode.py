@@ -192,17 +192,23 @@ def check_envelope_payload(original: bytes) -> None:
         raise EncodeError(f"the blob's payload must be exactly one zstd frame: {exc}") from exc
 
 
-def envelope(original: bytes, payload: bytes) -> bytes:
+def envelope(original: bytes, payload: bytes, *, codec: str | None = None) -> bytes:
     """Re-frame ``payload`` (protobuf bytes) with the framing of the ``original`` blob.
 
     Keeps the version and the codec: ``protobuf`` (0x80) stores the payload as is, ``zstd`` (0x81)
     stores it in a raw-block zstd frame, and ``none`` (header without a codec byte) as is. The
-    flag-only form (no header) keeps its codec byte.
+    flag-only form (no header) keeps its codec byte. ``codec`` (``"zstd"`` or ``"protobuf"``)
+    switches between those two codec bytes, for an original that has one of them; the version
+    and the form (header or flag-only) are kept.
     """
     env = blobs.parse_envelope(original)
     if env is None:
         raise EncodeError("the original blob is not an envelope")
     check_envelope_payload(original)
+    if codec is not None:
+        if codec not in ("zstd", "protobuf") or env.codec not in ("zstd", "protobuf"):
+            raise EncodeError(f"cannot frame a {env.codec} envelope as {codec!r}")
+        env = blobs.Envelope(env.version, env.declared_length, codec, env.payload_offset, b"")
     if env.codec == "zstd":
         body = bytes([blobs.CODEC_ZSTD]) + zstd_raw_frame(payload)
     elif env.codec == "protobuf":

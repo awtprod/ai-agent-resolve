@@ -32,7 +32,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     print(gate.format_scoreboard(board))
     declared = [k for k, s in KINDS.items() if s.status == "verified"]
-    passed = board.passed(declared)
+    mismatches = board.envelope_mismatches(KINDS)
+    for line in mismatches:
+        print(f"ENVELOPE {line}")
+    passed = board.passed(declared) and not mismatches
     print(f"declared verified kinds: {len(declared)}; gate {'passes' if passed else 'FAILS'}")
     return 0 if passed else 1
 

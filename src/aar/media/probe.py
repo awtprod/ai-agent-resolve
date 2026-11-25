@@ -163,7 +163,8 @@ def _timecode_tag(raw: Any) -> str | None:
     return None
 
 
-_TIMECODE = re.compile(r"(\d{2}):(\d{2}):(\d{2})([:;.])(\d{2,3})")
+# ASCII digits only: ``\d`` alone also matches other scripts' digits, which int() then reads.
+_TIMECODE = re.compile(r"(\d{2}):(\d{2}):(\d{2})([:;.])(\d{2,3})", re.ASCII)
 #: The only rates drop-frame timecode exists at: 29.97 and 59.94.
 DROP_FRAME_RATES = (Fraction(30000, 1001), Fraction(60000, 1001))
 #: The frame rates a camera or an edit runs at, which :func:`snap_rate` rounds to.

@@ -94,8 +94,8 @@ def test_good_facts_read() -> None:
     assert facts.mtime_local == datetime(2026, 3, 3, 4, 5, 6)
     assert facts.mtime_utc_ns % 1_000_000_000 == 123_456_700  # 7 digits kept exactly
     assert facts.ctime_utc_ns is not None
-    unc = facts_from_json(ms.wav_facts(path="\\\\server\\share\\take.wav"))
-    assert unc.folder == "\\\\server\\share"
+    unc = facts_from_json(ms.wav_facts(path="\\\\server\\share\\Show\\take.wav"))
+    assert unc.folder == "\\\\server\\share\\Show"
 
 
 def test_unknown_ffprobe_fields_are_ignored_not_trusted() -> None:

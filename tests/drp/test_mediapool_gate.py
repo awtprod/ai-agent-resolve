@@ -5,9 +5,10 @@ writes them) and ``AAR_MEDIA_PROJECTS`` to the Resolve-saved ``Project.db`` file
 files (separated by ``os.pathsep``). For every file with facts, its rows are authored from the
 facts with another file of the same kind as the template and compared with Resolve's rows field
 by field (:mod:`aar.drp.mediapool.gate`). Every kind :data:`aar.drp.mediapool.kinds.KINDS`
-declares ``verified`` must be equal on every compared field for as many files as it claims;
-every ``unverified`` kind must have one member whose own derived fields equal Resolve's. Nothing
-from the private files is committed; ``scripts/media_scoreboard.py`` prints the scoreboard.
+declares ``verified`` must be equal on every compared field for as many files as it claims, with
+the envelope it records; every ``unverified`` kind must have one member whose own derived fields
+equal Resolve's, or say which field nothing explains. Nothing from the private files is
+committed; ``scripts/media_scoreboard.py`` prints the scoreboard.
 """
 
 from __future__ import annotations
@@ -49,12 +50,20 @@ def test_every_verified_kind_reproduces_resolve(board: gate.Scoreboard) -> None:
         score = scores.get(kind)
         assert score is not None, f"no file of the verified kind {kind.label()}"
         assert score.status == "equal", (kind.label(), score.differing, score.refusals)
+        assert not score.unverified, (kind.label(), score.unverified)
         assert score.checked == status.files, (kind.label(), score.checked, status.files)
         assert score.fields == score.equal > 0
 
 
 @needs_key
-def test_every_unverified_kind_is_one_file_whose_derived_fields_match(
+def test_every_verified_kind_records_the_envelope_its_files_covered(
+    board: gate.Scoreboard,
+) -> None:
+    assert board.envelope_mismatches(KINDS) == []
+
+
+@needs_key
+def test_every_unverified_kind_is_one_file_or_says_what_is_unexplained(
     board: gate.Scoreboard,
 ) -> None:
     scores = {s.kind: s for s in board.kinds}
@@ -62,10 +71,17 @@ def test_every_unverified_kind_is_one_file_whose_derived_fields_match(
         if status.status == "verified":
             continue
         score = scores[kind]
-        assert score.status == "single" and status.files == 1
-        assert score.self_check is not None and score.self_check.startswith("equal"), (
-            score.self_check
-        )
+        if status.files == 1:
+            assert score.status == "single"
+            assert score.self_check is not None and score.self_check.startswith("equal"), (
+                score.self_check
+            )
+        else:
+            # ProRes 4444: its files compare equal, but only because a field nothing explains
+            # is excluded; that field must still be there, or the note is stale.
+            assert score.status == "equal" and score.checked == status.files, kind.label()
+            assert r"M\.FieldsBlob>#1\.#3" in score.hidden, (kind.label(), score.hidden)
+            assert "#1.#3" in status.note
 
 
 @needs_key
@@ -73,3 +89,8 @@ def test_no_kind_that_differs_is_declared(board: gate.Scoreboard) -> None:
     for score in board.kinds:
         if score.status in ("differs", "refused"):
             assert score.kind not in KINDS, score.kind.label()
+
+
+@needs_key
+def test_every_recorded_modification_time_parses(board: gate.Scoreboard) -> None:
+    assert [s.kind.label() for s in board.kinds if s.unreadable] == []

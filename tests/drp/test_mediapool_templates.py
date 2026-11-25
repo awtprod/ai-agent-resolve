@@ -103,7 +103,12 @@ def tables(*clips: ClipRows) -> dict[str, list[dict[str, Any]]]:
 def test_complete_clips_are_templates_and_other_media_rows_are_listed() -> None:
     t = tables(ms.wav_template(), ms.mp4_template(), ms.png_template())
     t["Sm2MpMedia"].append(
-        {"Sm2MpMedia_id": ms.uid(5), "DbType": "Sm2MpTimelineClip", "Name": "Timeline 1"}
+        {
+            **t["Sm2MpMedia"][0],
+            "Sm2MpMedia_id": ms.uid(5),
+            "DbType": "Sm2MpTimelineClip",
+            "Name": "Timeline 1",
+        }
     )
     clips, skipped = clips_from_rows(t)
     assert sorted(c.media["Name"] for c in clips) == [
@@ -156,7 +161,10 @@ def skipped_reason(edit) -> str:
                 {
                     "BtLockableBlob_id": ms.uid(78),
                     "DbType": "Sm2MpItemLockableBlob",
+                    "BtLockableBlobMap_id": ms.MAP,
+                    "FieldsBlob": b"",
                     "BlobOwner": t["Sm2MpMedia"][0]["Sm2MpMedia_id"],
+                    "DbSavedTime": 0,
                 }
             ),
             "lockable blob this writer does not know",
@@ -271,18 +279,44 @@ def test_compare_sees_a_changed_value_and_a_wrong_reference() -> None:
     assert [d.path for d in diffs] == ["JA0.DbAssociate"]
 
 
-def test_compare_ignores_metadata_order_and_envelope_codec_but_nothing_else() -> None:
+def _two_block_frame(payload: bytes) -> bytes:
+    """The same payload in a zstd frame of two raw blocks (the encoder writes one): another
+    frame, as Resolve's compressed frames are, that decodes to the same bytes."""
+    half = len(payload) // 2
+    out = encode.ZSTD_MAGIC + bytes([0x20, len(payload)])
+    for chunk, last in ((payload[:half], 0), (payload[half:], 1)):
+        out += ((len(chunk) << 3) | last).to_bytes(3, "little") + chunk
+    return out
+
+
+def test_compare_ignores_metadata_order_and_a_zstd_frame_but_not_the_codec() -> None:
     a = ms.wav_template()
+    # metadata entries in another order: equal (Resolve's order differs between saves)
     b = ms.replace_row(
+        a, "lockable", FieldsBlob=ms.metadata([(16, ""), (215, "older-take.wav"), (422, "")])
+    )
+    assert compare(a, b, "audio")[1] == []
+    # a missing entry is a difference
+    c = ms.replace_row(a, "lockable", FieldsBlob=ms.metadata([(16, ""), (215, "older-take.wav")]))
+    missing = {d.path for d in compare(a, c, "audio")[1]}
+    prefix = "L0.FieldsBlob.BlobData>#2>"
+    assert prefix + "meta{422}" in missing and prefix + "~order" in missing
+    assert all(p.startswith((prefix + "meta{422}", prefix + "~order")) for p in missing)
+    # the same message framed with the other codec: the envelope differs
+    d = ms.replace_row(
         a,
         "lockable",
-        FieldsBlob=ms.metadata([(16, ""), (215, "older-take.wav"), (422, "")], zstd=True),
+        FieldsBlob=ms.metadata([(422, ""), (215, "older-take.wav"), (16, "")], zstd=True),
     )
-    _, diffs, _ = compare(a, b, "audio")
-    assert diffs == []
-    c = ms.replace_row(a, "lockable", FieldsBlob=ms.metadata([(16, ""), (215, "older-take.wav")]))
-    _, diffs, _ = compare(a, c, "audio")
-    assert [d.path for d in diffs] == ["L0.FieldsBlob.BlobData>#2>meta{422}"]
+    assert [x.path for x in compare(a, d, "audio")[1]] == ["L0.FieldsBlob.BlobData"]
+    # a zstd envelope whose frame differs but decodes to the same message: equal
+    clip = a.audio[0]["Clip"]
+    env = blobs.parse_envelope(clip)
+    assert env is not None and env.codec == "zstd"
+    body = b"\x81" + _two_block_frame(blobs.unwrap_message(clip))
+    other = struct.pack(">II", env.version, len(body)) + body
+    assert other != clip
+    assert compare(a, ms.replace_row(a, "audio0", Clip=other), "audio")[1] == []
 
 
 def test_excluded_fields_are_reported_when_they_differ() -> None:

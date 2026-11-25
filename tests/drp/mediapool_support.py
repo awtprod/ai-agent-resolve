@@ -13,11 +13,12 @@ import sqlite3
 import struct
 import uuid
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from aar.drp import blobs
-from aar.drp.mediapool.templates import ClipRows
+from aar.drp.mediapool.templates import REQUIRED_COLUMNS, ClipRows
 from aar.drp.modify import encode
 
 S, I32, I64, B, BYTES, DBL = (
@@ -60,7 +61,10 @@ def pb(*fields: tuple[int, int, Any]) -> bytes:
     return encode.protobuf(list(fields))
 
 
-def envelope(payload: bytes, *, version: int = 2, zstd: bool = True) -> bytes:
+def envelope(payload: bytes, *, version: int = 2, zstd: bool | None = None) -> bytes:
+    """A framed message; by default zstd only when it is longer than 64 bytes, as Resolve does."""
+    if zstd is None:
+        zstd = len(payload) > 64
     body = b"\x81" + encode.zstd_raw_frame(payload) if zstd else b"\x80" + payload
     return struct.pack(">II", version, len(body)) + body
 
@@ -182,7 +186,7 @@ def media_fields(
     return envelope(pb(*outer))
 
 
-def metadata(entries: list[tuple[int, str]], *, zstd: bool = False) -> bytes:
+def metadata(entries: list[tuple[int, str]], *, zstd: bool | None = None) -> bytes:
     body = pb(*((2, 2, pb((1, 0, k), (2, 2, v.encode()))) for k, v in entries))
     data = pb((2, 2, header(body, 1000001)))
     return kd(("BlobData", BYTES, envelope(data, version=10001, zstd=zstd)))
@@ -324,6 +328,7 @@ def mp4_facts(**change: Any) -> dict[str, Any]:
         "codec_name": "h264",
         "codec_type": "video",
         "codec_tag_string": "avc1",
+        "profile": "High",
         "width": 3840,
         "height": 2160,
         "pix_fmt": "yuv420p",
@@ -388,6 +393,28 @@ def mp4_facts(**change: Any) -> dict[str, Any]:
             data_track[key[len("data_") :]] = value
         else:
             data[key] = value
+    return data
+
+
+def _iso(seconds: int) -> str:
+    return datetime.fromtimestamp(seconds, UTC).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+
+
+def mp4_template_facts(**change: Any) -> dict[str, Any]:
+    """The facts of :func:`mp4_template`'s own file (camera-b: 10 s at 23.976, 01:00:00:00)."""
+    created = _iso(1_788_000_000)
+    data = mp4_facts(
+        path="X:\\Old\\Footage\\camera-b.MP4",
+        mtime_local="Tue Sep 1 08:00:00 2026",
+        video_duration_ts=240240,
+        video_tags={"creation_time": created},
+        audio_duration_ts=480480,
+        data_duration_ts=240240,
+        data_tags={"timecode": "01:00:00:00"},
+    )
+    data["ffprobe"]["format"]["tags"] = {"creation_time": created}
+    for key, value in change.items():
+        data[key] = value
     return data
 
 
@@ -535,6 +562,18 @@ def png_facts(**change: Any) -> dict[str, Any]:
         else:
             data[key] = value
     return data
+
+
+def png_template_facts() -> dict[str, Any]:
+    """The facts of :func:`png_template`'s own file (1920x1080, 4000 bytes)."""
+    return png_facts(
+        path="X:\\Old\\title-card.png",
+        size=4000,
+        mtime_local="Tue Nov 3 10:00:00 2026",
+        ctime_utc=_iso(1_793_000_000).replace(".000000Z", ".0000000Z"),
+        stream_width=1920,
+        stream_height=1080,
+    )
 
 
 def png_template(*, base: int = 0x300, name: str = "title-card.png") -> ClipRows:
@@ -685,7 +724,8 @@ def write_project(
     tables["BtLockableBlobMap"] = [{"BtLockableBlobMap_id": MAP}]
     columns: dict[str, list[str]] = {}
     for table, rows in tables.items():
-        names: list[str] = []
+        # Resolve's tables have their columns whether or not they hold rows.
+        names: list[str] = list(REQUIRED_COLUMNS.get(table, ()))
         for row in rows:
             names += [c for c in row if c not in names]
         columns[table] = names or [f"{table}_id"]

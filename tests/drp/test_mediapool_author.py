@@ -14,6 +14,7 @@ import pytest
 from aar.drp import blobs
 from aar.drp.mediapool import Placement, Template, author, facts_from_json
 from aar.drp.mediapool import blobtree as bt
+from aar.drp.mediapool.author import CLIP_26_NOTE
 from aar.drp.mediapool.errors import MediaPoolError
 from aar.drp.mediapool.fields import flatten
 from aar.drp.mediapool.kinds import KINDS, KindStatus, kind_of_facts, kind_of_rows
@@ -32,6 +33,10 @@ def make(
     **kw: Any,
 ):
     tfacts = facts_from_json(with_facts) if with_facts is not None else None
+    # Most tests here are about one rule, not about the verdict: they see the rows even when the
+    # result would be unverified, and check ``status`` where it matters. The refusal itself is
+    # tested in "unverified results" below, without this.
+    kw.setdefault("allow_unverified", True)
     return author(
         facts_from_json(facts),
         Template(template, tfacts),
@@ -128,7 +133,7 @@ def test_ids_are_fresh_and_no_template_id_is_left() -> None:
 
 
 def test_a_camera_file_is_authored_from_its_facts() -> None:
-    result = make(ms.mp4_facts(), ms.mp4_template(), with_facts=ms.mp4_facts())
+    result = make(ms.mp4_facts(), ms.mp4_template(), with_facts=ms.mp4_template_facts())
     f = flat(result)
     assert result.status == "verified"
     assert f["V.Time.Timecode"] == ("text", "02:10:20:12")
@@ -143,7 +148,8 @@ def test_a_camera_file_is_authored_from_its_facts() -> None:
     extent = struct.unpack("<dd", bytes.fromhex(f["M.FieldsBlob>#1.#1.#5.0.MediaExtents"][1]))
     assert extent == (start, 6006000 / 48000)
     assert f["V.Clip>#7"] == ("ref", "<uuid>")
-    assert f["V.Radiometry"] == ("flagged",)  # copied: unexplained, equal across the kind
+    # copied: unexplained, equal across the kind (a flag-only protobuf envelope)
+    assert f["V.Radiometry"] == ("envelope", None, "protobuf")
 
 
 def test_history_and_later_state_of_the_template_are_left_out() -> None:
@@ -153,7 +159,7 @@ def test_history_and_later_state_of_the_template_are_left_out() -> None:
     assert "M.FieldsBlob>#1.#3" not in f
     assert not any(p.endswith(("Clip>#14", "Clip>#26")) for p in f)
     assert "SmPreset" not in result.rows and result.rows["Sm2MpMedia"][0]["PTZRPreset"] is None
-    assert len(result.notes) == 7
+    assert len(result.notes) == 8 and result.notes[-1] == CLIP_26_NOTE
 
 
 def test_without_the_templates_facts_its_look_is_unverified() -> None:
@@ -180,7 +186,9 @@ def test_an_unverified_kind_says_so() -> None:
 
 def test_a_still_takes_its_size_and_the_projects_rate() -> None:
     place = Placement(ms.FOLDER, 0, Fraction(24000, 1001), 1, ms.MAP)
-    f = flat(make(ms.png_facts(), ms.png_template(), placement=place, with_facts=ms.png_facts()))
+    f = flat(
+        make(ms.png_facts(), ms.png_template(), placement=place, with_facts=ms.png_template_facts())
+    )
     assert f["V.Geometry.FrameSize"] == ("int", 40961)
     assert f["V.Time.FrameRate"] == ("fixed16", ms.rate16(24000 / 1001).hex())
     assert f["V.Time.NumFrames"] == ("int", 1)
@@ -247,13 +255,13 @@ def test_a_metadata_blob_needs_the_projects_lockable_map() -> None:
 
 def test_a_bad_placement_is_refused() -> None:
     refusal(
-        "bad_facts",
+        "bad_placement",
         ms.wav_facts(),
         ms.wav_template(),
         placement=Placement("bin", 0, Fraction(25), 1, ms.MAP),
     )
     refusal(
-        "bad_facts",
+        "bad_placement",
         ms.wav_facts(),
         ms.wav_template(),
         placement=Placement(ms.FOLDER, -1, Fraction(25), 1, ms.MAP),
@@ -360,11 +368,13 @@ def test_rows_kind_and_facts_kind_agree_for_every_synthetic_kind() -> None:
         assert kind in KINDS
 
 
-def test_rewritten_blobs_keep_their_framing() -> None:
+def test_rewritten_blobs_keep_their_version_and_take_resolves_codec_for_their_length() -> None:
     template = ms.mp4_template()
     result = make(ms.mp4_facts(), template)
     for column in ("Clip",):
         old = blobs.parse_envelope(template.video[column])
         new = blobs.parse_envelope(result.rows["BtVideoInfo"][0][column])
         assert old is not None and new is not None
-        assert (old.version, old.codec) == (new.version, new.codec)
+        payload = blobs.unwrap_message(result.rows["BtVideoInfo"][0][column])
+        assert old.version == new.version
+        assert new.codec == ("zstd" if len(payload) > 64 else "protobuf")

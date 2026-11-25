@@ -15,6 +15,8 @@ CODES: dict[str, str] = {
     "vfr_without_timecode": "a variable frame rate file with no timecode track to give its rate",
     "not_exact": "a rate or duration that cannot be represented exactly",
     "id_collision": "a new id is already used in the project, or twice",
+    "bad_placement": "the placement (bin, position, project rate, dates, map) is out of range",
+    "unverified": "the result would not be verified, and the caller did not allow that",
 }
 
 

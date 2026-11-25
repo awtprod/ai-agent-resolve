@@ -12,13 +12,18 @@ Resolve saved), and returns the rows Resolve would have written had it imported 
   were equal across every file of the kind in the answer key.
 
 It returns data only and writes nothing. Whatever it cannot justify is refused with a typed
-:class:`MediaPoolError`, or named in the result's ``unverified``. Every blob of the template is
-taken apart by a closed list of known fields: a field it does not know is a refusal, and after
-authoring no id, file name or folder of the template may be left in any layer of any value.
+:class:`MediaPoolError`. A result that would not be verified (a kind with too little evidence, a
+file outside the envelope its kind was checked on, a template whose look is unproven or whose
+facts do not reproduce its own rows) is refused as ``unverified`` unless the caller passes
+``allow_unverified=True``; then the result says ``status="unverified"`` and lists the reasons.
+Every blob of the template is taken apart by a closed list of known fields: a field it does not
+know is a refusal, and after authoring no id, file name or folder of the template may be left in
+any layer of any value.
 """
 
 from __future__ import annotations
 
+import re
 import struct
 import uuid
 from collections.abc import Callable, Collection
@@ -30,8 +35,19 @@ from aar.drp.mediapool import blobtree as bt
 from aar.drp.mediapool import formulas as fm
 from aar.drp.mediapool.errors import MediaPoolError
 from aar.drp.mediapool.facts import MediaFacts
-from aar.drp.mediapool.kinds import KINDS, KindKey, KindStatus, kind_of_facts, kind_of_rows, matches
-from aar.drp.mediapool.templates import ClipRows, Row
+from aar.drp.mediapool.fields import compare, media_class
+from aar.drp.mediapool.kinds import (
+    KINDS,
+    STILL_EXTENSIONS,
+    KindKey,
+    KindStatus,
+    kind_of_facts,
+    kind_of_rows,
+    matches,
+    outside_envelope,
+)
+from aar.drp.mediapool.templates import ClipRows, Row, check_clip
+from aar.media.probe import STANDARD_RATES
 
 __all__ = ["AuthoredClip", "Placement", "Template", "author"]
 
@@ -40,8 +56,23 @@ _UUID_TEXT = 36
 METADATA_RULES: dict[int, Callable[[MediaFacts], str]] = {
     215: lambda facts: facts.name,
 }
-_CLIP_FIELDS = frozenset({1, 2, 3, 5, 6, 7, 13, 14, 15, 16, 18, 26})
+#: The fields of a ``Clip`` blob the writer knows, with their protobuf wire types.
+_CLIP_WIRES = {1: 2, 2: 2, 3: 2, 5: 2, 6: 2, 7: 2, 13: 0, 14: 0, 15: 0, 16: 0, 18: 0, 26: 2}
+_CLIP_FIELDS = frozenset(_CLIP_WIRES)
 _CLIP_PROJECT_LOCAL = (14, 26)
+#: An open question the result always carries: Resolve writes ``Clip`` field 26 on some clips
+#: only, and what decides it is not known (docs/DESIGN.md, "Media-pool rows (S25c1)").
+CLIP_26_NOTE = (
+    "Clip field 26 (the folder without its drive) is not written: Resolve writes it on some "
+    "clips only, and what decides that is an open question"
+)
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+#: The latest date added the writer accepts: the end of the year 9999, in seconds since 1970.
+_MAX_ADDED_AT = 253_402_300_799
+_UNVERIFIED_HINT = (
+    "author it with allow_unverified=True to get the rows anyway (the result lists these "
+    "reasons and says status='unverified'), or give a template and facts that verify it"
+)
 _TIME_KEYS = frozenset({"UniqueId", "Timecode", "StartFrame", "NumFrames", "FrameRate", "DbType"})
 _GEOMETRY_KEYS = frozenset(
     {"UniqueId", "Resolution", "IsResolutionTransposed", "FrameSize", "ScanType", "DbType"}
@@ -214,12 +245,12 @@ def _derive(facts: MediaFacts, kind: KindKey, placement: Placement) -> _Derived:
         d.frame_size = facts.size
     for stream in fm.audio_streams(facts):
         samples = fm.audio_samples(stream)
-        rate = int(stream.sample_rate or 0)
+        rate = fm.sample_rate(stream)
         d.audio.append(
             {
                 "codec": fm.audio_codec_name(stream),
                 "bit_depth": fm.audio_bit_depth(stream),
-                "channels": stream.channels,
+                "channels": fm.channels(stream),
                 "sample_rate": rate,
                 "samples": samples,
                 "layout": fm.channel_layout(stream),
@@ -227,6 +258,33 @@ def _derive(facts: MediaFacts, kind: KindKey, placement: Placement) -> _Derived:
             }
         )
     return d
+
+
+def _int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _check_placement(placement: object) -> Placement:
+    def refuse(why: str) -> MediaPoolError:
+        return MediaPoolError("bad_placement", f"the placement's {why}", "check the placement")
+
+    if not isinstance(placement, Placement):
+        raise refuse("type is not Placement")
+    if not isinstance(placement.folder_id, str) or not _UUID.match(placement.folder_id):
+        raise refuse("folder id is not a uuid text (give the bin's id)")
+    if not _int(placement.folder_index) or not 0 <= placement.folder_index < 2**31:
+        raise refuse("index in the bin is not a whole number from 0 to 2**31 - 1")
+    rate = placement.project_rate
+    if not isinstance(rate, Fraction | int) or isinstance(rate, bool) or rate not in STANDARD_RATES:
+        raise refuse(f"project frame rate {rate!r} is not a standard rate (a Fraction)")
+    if not _int(placement.added_at) or not 0 <= placement.added_at <= _MAX_ADDED_AT:
+        raise refuse("date added is not whole seconds from 1970 to the year 9999")
+    lockable = placement.lockable_map_id
+    if lockable is not None and (not isinstance(lockable, str) or not _UUID.match(lockable)):
+        raise refuse("lockable map id is not a uuid text")
+    if not _int(placement.saved_age_ms) or not 0 <= placement.saved_age_ms < 2**63:
+        raise refuse("metadata save age is not whole milliseconds from 0 to 2**63 - 1")
+    return placement
 
 
 def author(
@@ -237,17 +295,26 @@ def author(
     taken: Collection[str] = frozenset(),
     new_id: Callable[[], str] = lambda: str(uuid.uuid4()),
     kinds: dict[KindKey, KindStatus] | None = None,
+    allow_unverified: bool = False,
 ) -> AuthoredClip:
     """The rows of a new media clip for ``facts``, built from ``template``. ``taken`` holds the
-    ids already in the project the rows are for; ``new_id`` makes fresh ids (uuid4 text)."""
+    ids already in the project the rows are for; ``new_id`` makes fresh ids (uuid4 text).
+    A result that would not be verified is refused (``unverified``) unless ``allow_unverified``
+    is set; see the module docstring."""
     registry = KINDS if kinds is None else kinds
+    if not isinstance(facts, MediaFacts):
+        raise MediaPoolError("bad_facts", "the facts are not MediaFacts", "use facts_from_json")
     if not isinstance(template, Template):
         raise MediaPoolError(
             "no_template", "no template clip was given", "read templates from a saved project"
         )
+    rows = check_clip(template.rows)
+    if template.facts is not None and not isinstance(template.facts, MediaFacts):
+        raise _bad("the template's facts are not MediaFacts")
+    _check_placement(placement)
     _check_picture_decoded(facts)
     file_kind = kind_of_facts(facts)
-    look_note = matches(file_kind, kind_of_rows(template.rows), template.facts)
+    look_note = matches(file_kind, kind_of_rows(rows), template.facts)
     status = registry.get(file_kind)
     if status is None:
         raise MediaPoolError(
@@ -255,35 +322,75 @@ def author(
             f"no evidence yet that the rows of a {file_kind.label()} can be authored",
             "import the file in Resolve by hand, or add the kind to the corpus gate first",
         )
-    if not isinstance(placement.folder_id, str) or len(placement.folder_id) != _UUID_TEXT:
+    if status.status not in ("verified", "unverified"):
         raise MediaPoolError(
-            "bad_facts", "the placement's folder id is not a uuid text", "give the bin's id"
-        )
-    if not 0 <= placement.folder_index < 2**31 or placement.project_rate <= 0:
-        raise MediaPoolError(
-            "bad_facts",
-            "the placement's index or frame rate is out of range",
-            "check the placement",
+            "unsupported_kind",
+            f"the kind's status {status.status!r} is neither verified nor unverified",
+            "fix the kind registry",
         )
     derived = _derive(facts, file_kind, placement)
-    writer = _Writer(facts, template.rows, placement, derived, taken, new_id)
-    rows = writer.build()
+    # The rows are built before the verdict, so a template or a file the writer cannot handle
+    # is refused for that, not merely as unverified.
+    writer = _Writer(facts, rows, placement, derived, taken, new_id)
+    built = writer.build()
     unverified = []
     if status.status != "verified":
         unverified.append(
             f"kind not verified: {status.note or 'a single file of this kind was checked'}"
         )
+    unverified += outside_envelope(status, facts)
     if look_note is not None:
         unverified.append(look_note)
+    if template.facts is not None:
+        mismatch = _template_mismatch(template, rows, placement)
+        if mismatch is not None:
+            unverified.append(mismatch)
+    if unverified and not allow_unverified:
+        raise MediaPoolError(
+            "unverified",
+            f"the rows of {facts.name} would not be verified: " + "; ".join(unverified),
+            _UNVERIFIED_HINT,
+        )
     return AuthoredClip(
         kind=file_kind,
-        status=status.status if not unverified else "unverified",
+        status="unverified" if unverified else "verified",
         media_id=writer.media_id,
-        rows=rows,
+        rows=built,
         unverified=tuple(unverified),
-        notes=tuple(writer.notes),
-        template_media_id=template.rows.media_id,
+        notes=(*writer.notes, CLIP_26_NOTE),
+        template_media_id=rows.media_id,
     )
+
+
+def _template_mismatch(template: Template, rows: ClipRows, placement: Placement) -> str | None:
+    """Why the template's facts are not trusted, or None: the template clip is authored from its
+    own facts (itself as the template) and compared with its own rows the way the gate compares
+    (:func:`aar.drp.mediapool.fields.compare`). Facts that belong to another file, or to the file
+    as it is now rather than when Resolve read it, show up as a difference."""
+    assert template.facts is not None
+    try:
+        kind = kind_of_facts(template.facts)
+        derived = _derive(template.facts, kind, placement)
+        own = _Writer(template.facts, rows, placement, derived, frozenset(), _uuid4).build()
+    except MediaPoolError as exc:
+        return (
+            "the template's facts are not trusted: authoring the template from them is refused "
+            f"({exc.code}: {exc.message})"
+        )
+    media = media_class(rows, STILL_EXTENSIONS)
+    _, differences, _ = compare(rows, ClipRows.from_tables(own), media)
+    if not differences:
+        return None
+    first = differences[0]
+    return (
+        "the template's facts are not trusted: authored from them, the template differs from "
+        f"its own rows in {len(differences)} field(s), first {first.path} "
+        f"(rows {first.expected}, facts {first.got})"
+    )[:600]
+
+
+def _uuid4() -> str:
+    return str(uuid.uuid4())
 
 
 class _Writer:
@@ -331,6 +438,9 @@ class _Writer:
             unknown = sorted(set(numbers) - _CLIP_FIELDS)
             if unknown or len(numbers) != len(set(numbers)):
                 raise _bad(f"{what} holds fields this writer does not know or repeats: {unknown}")
+            wrong = sorted(f[0] for f in fields if f[1] != _CLIP_WIRES[f[0]])
+            if wrong:
+                raise _bad(f"{what} has fields of an unexpected wire type: {wrong}")
             for number in _CLIP_PROJECT_LOCAL:
                 if bt.pb_remove(fields, number):
                     self.notes.append(
@@ -726,7 +836,16 @@ class _Writer:
 
 def _check_picture_decoded(facts: MediaFacts) -> None:
     """Refuse a file whose picture ffprobe does not decode (BRAW: no codec, size or pixel
-    format; only its sound and timecode are measured)."""
+    format; only its sound and timecode are measured), and a file with more than one picture
+    (cover art aside): which one Resolve shows, and what it records of the others, was not seen."""
+    pictures = [s for s in facts.streams if s.codec_type == "video" and not s.is_attached_picture]
+    if len(pictures) > 1:
+        raise MediaPoolError(
+            "unsupported_kind",
+            f"{facts.name} has {len(pictures)} video streams that are not cover art; how "
+            "Resolve records a second picture was not seen",
+            "import the file in Resolve by hand, or remove the extra video stream first",
+        )
     video = fm.video_stream(facts)
     if video is not None and (
         video.codec_name is None or video.width is None or video.pix_fmt is None
@@ -746,7 +865,10 @@ def _clip_name(clip: ClipRows) -> tuple[str, str]:
     fields = bt.pb_decode(payload, "Clip")
     folder = bt.pb_get(fields, 1, "Clip")[2]
     name = bt.pb_get(fields, 2, "Clip")[2]
-    return folder.decode("utf-8", "replace"), name.decode("utf-8", "replace")
+    try:
+        return folder.decode("utf-8"), name.decode("utf-8")
+    except (AttributeError, UnicodeDecodeError):
+        raise _bad("the template's Clip folder or file name is not UTF-8 text") from None
 
 
 def _is_relink_history(value: object) -> bool:

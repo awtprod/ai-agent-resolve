@@ -15,12 +15,15 @@ rows, found on Resolve 21.1 saves (docs/DESIGN.md, "Media-pool rows (S25c1)"):
 * ``SmPreset`` (``SmPTZRPreset``): an empty pan/tilt/zoom preset some clips get once viewed.
 
 Rows are read through :func:`aar.drp.library.read_rows` (private snapshot, budgets; the live
-file is never opened for writing). A clip whose rows are incomplete or inconsistent is not a
-template: it is listed in ``skipped`` with the reason, never repaired.
+file is never opened for writing). A table without a column the writer reads is refused
+(``bad_template``). A clip whose rows are incomplete or inconsistent is not a template: it is
+listed in ``skipped`` with the reason, never repaired. :func:`check_clip` runs the same checks on
+rows a caller assembled, before anything is authored from them.
 """
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from fractions import Fraction
@@ -36,10 +39,12 @@ from aar.media.probe import snap_rate
 __all__ = [
     "CLIP_TYPES",
     "MEDIA_TABLES",
+    "REQUIRED_COLUMNS",
     "ClipRows",
     "Row",
     "Skipped",
     "TemplateSet",
+    "check_clip",
     "clips_from_rows",
     "project_frame_rate",
     "read_templates",
@@ -62,6 +67,45 @@ TEMPLATE_TABLES = (*MEDIA_TABLES, "SM_Config", "BtLockableBlobMap")
 CLIP_TYPES = frozenset({"Sm2MpVideoClip", "Sm2MpAudioClip"})
 METADATA_TYPE = "BtMetadataLockableBlob"
 _MAX_AUDIO = 16
+_JOIN = ("DbOwner", "DbAssociate", "DbPropertyName", "DbIndex")
+#: The columns the writer reads (or writes) in each media table; a table without one is refused.
+REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "Sm2MpMedia": (
+        "Sm2MpMedia_id",
+        "DbType",
+        "Name",
+        "MpFolder",
+        "Sm2MpFolder_id",
+        "Video",
+        "UniqueMediaPoolItemId",
+        "PTZRPreset",
+        "FieldsBlob",
+    ),
+    "BtVideoInfo": (
+        "BtVideoInfo_id",
+        "Sm2MpMedia_id",
+        "Clip",
+        "Time",
+        "Geometry",
+        "Proxy",
+        "VideoMetadata",
+        "MediaMetadata",
+    ),
+    "BtAudioInfo": ("BtAudioInfo_id", "Sm2MpMedia_id", "Clip", "TracksBA", "MediaMetadata"),
+    "BtAudioInfo_Sm2MpMedia": _JOIN,
+    "Sm2MpFolder_Sm2MpMedia": _JOIN,
+    "BtLockableBlob": (
+        "BtLockableBlob_id",
+        "DbType",
+        "BtLockableBlobMap_id",
+        "FieldsBlob",
+        "BlobOwner",
+        "DbSavedTime",
+    ),
+    "SmPreset": ("SmPreset_id", "Sm2MpMedia_id"),
+}
+_SCALARS = (type(None), int, float, str, bytes)
+_RATE_TEXT = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,6})?\Z")
 
 
 @dataclass(frozen=True)
@@ -96,6 +140,20 @@ class ClipRows:
             "SmPreset": list(self.presets),
         }
         return {t: rows for t, rows in out.items() if rows}
+
+    @classmethod
+    def from_tables(cls, rows: dict[str, tuple[Row, ...]]) -> ClipRows:
+        """A clip from its rows per table (as :func:`aar.drp.mediapool.author.author` returns
+        them)."""
+        return cls(
+            media=rows["Sm2MpMedia"][0],
+            video=rows["BtVideoInfo"][0] if "BtVideoInfo" in rows else None,
+            audio=tuple(rows.get("BtAudioInfo", ())),
+            audio_links=tuple(rows.get("BtAudioInfo_Sm2MpMedia", ())),
+            folder_link=rows["Sm2MpFolder_Sm2MpMedia"][0],
+            lockables=tuple(rows.get("BtLockableBlob", ())),
+            presets=tuple(rows.get("SmPreset", ())),
+        )
 
     def ids(self) -> set[str]:
         """The ids of the rows the clip owns (not the bin, map or other rows it points to)."""
@@ -140,9 +198,32 @@ def _text(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def check_columns(table: str, columns: tuple[str, ...] | list[str]) -> None:
+    """Refuse a media table that lacks a column the writer reads."""
+    missing = [c for c in REQUIRED_COLUMNS.get(table, ()) if c not in columns]
+    if missing:
+        raise MediaPoolError(
+            "bad_template",
+            f"the {table} table has no column {missing[0]}",
+            "use a project Resolve saved (disk library, version 17)",
+        )
+
+
+def _check_rows(table: str, rows: list[Row]) -> None:
+    for row in rows:
+        if not isinstance(row, dict) or not all(isinstance(k, str) for k in row):
+            raise _bad(f"a {table} row is not a mapping of column names")
+        check_columns(table, list(row))
+        for column, value in row.items():
+            if not isinstance(value, _SCALARS):
+                raise _bad(f"{table}.{column} holds a {type(value).__name__}, not a column value")
+
+
 def clips_from_rows(tables: dict[str, list[Row]]) -> tuple[list[ClipRows], list[Skipped]]:
     """Group the rows of :data:`MEDIA_TABLES` by clip, checking each clip's set is complete and
-    consistent. Returns the templates and the clips that are not, with the reason."""
+    consistent. Returns the templates and the clips that are not, with the reason. A missing
+    table, a row without a column the writer reads or a value no database column holds is a
+    ``bad_template`` refusal."""
     for table in MEDIA_TABLES:
         if table not in tables:
             raise MediaPoolError(
@@ -150,20 +231,22 @@ def clips_from_rows(tables: dict[str, list[Row]]) -> tuple[list[ClipRows], list[
                 f"the project has no {table} table",
                 "use a project Resolve saved (disk library, version 17)",
             )
-    by_owner: dict[str, dict[str, list[Row]]] = defaultdict(lambda: defaultdict(list))
+        _check_rows(table, tables[table])
+    # Rows are grouped by the exact id value: an id that is not text names no clip.
+    by_owner: dict[object, dict[str, list[Row]]] = defaultdict(lambda: defaultdict(list))
     for row in tables["BtVideoInfo"]:
-        by_owner[str(row.get("Sm2MpMedia_id"))]["video"].append(row)
+        by_owner[row["Sm2MpMedia_id"]]["video"].append(row)
     for row in tables["BtAudioInfo"]:
-        by_owner[str(row.get("Sm2MpMedia_id"))]["audio"].append(row)
+        by_owner[row["Sm2MpMedia_id"]]["audio"].append(row)
     for row in tables["BtAudioInfo_Sm2MpMedia"]:
-        by_owner[str(row.get("DbOwner"))]["audio_links"].append(row)
+        by_owner[row["DbOwner"]]["audio_links"].append(row)
     for row in tables["Sm2MpFolder_Sm2MpMedia"]:
-        by_owner[str(row.get("DbAssociate"))]["folder_links"].append(row)
+        by_owner[row["DbAssociate"]]["folder_links"].append(row)
     for row in tables["SmPreset"]:
-        by_owner[str(row.get("Sm2MpMedia_id"))]["presets"].append(row)
-    lockables: dict[str, list[Row]] = defaultdict(list)
+        by_owner[row["Sm2MpMedia_id"]]["presets"].append(row)
+    lockables: dict[object, list[Row]] = defaultdict(list)
     for row in tables["BtLockableBlob"]:
-        lockables[str(row.get("BlobOwner"))].append(row)
+        lockables[row["BlobOwner"]].append(row)
     clips: list[ClipRows] = []
     skipped: list[Skipped] = []
     for media in tables["Sm2MpMedia"]:
@@ -179,7 +262,7 @@ def clips_from_rows(tables: dict[str, list[Row]]) -> tuple[list[ClipRows], list[
     return clips, skipped
 
 
-def _clip(media: Row, owned: dict[str, list[Row]], lockables: dict[str, list[Row]]) -> ClipRows:
+def _clip(media: Row, owned: dict[str, list[Row]], lockables: dict[object, list[Row]]) -> ClipRows:
     mid = _text(media.get("Sm2MpMedia_id"))
     if mid is None:
         raise _bad("the clip has no Sm2MpMedia_id")
@@ -191,7 +274,7 @@ def _clip(media: Row, owned: dict[str, list[Row]], lockables: dict[str, list[Row
         if len(video_rows) != 1:
             raise _bad(f"a video clip needs one BtVideoInfo row, it has {len(video_rows)}")
         video: Row | None = video_rows[0]
-        if _text(video["BtVideoInfo_id"]) is None or media.get("Video") != video["BtVideoInfo_id"]:
+        if _text(video["BtVideoInfo_id"]) is None or media["Video"] != video["BtVideoInfo_id"]:
             raise _bad("Sm2MpMedia.Video does not name its BtVideoInfo row")
     else:
         if video_rows or media.get("Video") is not None:
@@ -206,10 +289,10 @@ def _clip(media: Row, owned: dict[str, list[Row]], lockables: dict[str, list[Row
     by_id = {a.get("BtAudioInfo_id"): a for a in audio_rows}
     if len(by_id) != len(audio_rows) or None in by_id:
         raise _bad("two BtAudioInfo rows share an id, or one has none")
-    order = sorted(
-        links, key=lambda r: r.get("DbIndex") if isinstance(r.get("DbIndex"), int) else -1
-    )
-    if [r.get("DbIndex") for r in order] != list(range(len(audio_rows))) or len(links) != len(
+    if any(type(r.get("DbIndex")) is not int for r in links):
+        raise _bad("an EmbeddedAudioVec join row's DbIndex is not a whole number")
+    order = sorted(links, key=lambda r: r["DbIndex"])
+    if [r["DbIndex"] for r in order] != list(range(len(audio_rows))) or len(links) != len(
         audio_rows
     ):
         raise _bad("the EmbeddedAudioVec join rows are missing, repeated or out of order")
@@ -225,12 +308,14 @@ def _clip(media: Row, owned: dict[str, list[Row]], lockables: dict[str, list[Row
         or media.get("MpFolder") != media.get("Sm2MpFolder_id")
     ):
         raise _bad("the clip's bin join row does not agree with its MpFolder")
+    if any(_text(a["BtAudioInfo_id"]) is None for a in audio):
+        raise _bad("a BtAudioInfo row's id is not a text")
     owner = video["BtVideoInfo_id"] if video is not None else audio[0]["BtAudioInfo_id"]
     found: list[Row] = []
     for key in {mid, *(a["BtAudioInfo_id"] for a in audio)} | (
         {video["BtVideoInfo_id"]} if video is not None else set()
     ):
-        found.extend(lockables.get(str(key), []))
+        found.extend(lockables.get(key, []))
     if any(r.get("DbType") != METADATA_TYPE or r.get("BlobOwner") != owner for r in found):
         raise _bad("the clip owns a lockable blob this writer does not know")
     if len(found) > 1:
@@ -254,6 +339,34 @@ def _bad(why: str) -> MediaPoolError:
     return MediaPoolError("bad_template", why, "choose another template clip")
 
 
+def check_clip(clip: object) -> ClipRows:
+    """``clip`` if it is one complete, consistent clip (the checks :func:`clips_from_rows` makes,
+    on exactly these rows, in this order); a ``bad_template`` refusal otherwise. Rows a caller
+    assembled are checked with this before anything is authored from them."""
+    if not isinstance(clip, ClipRows):
+        raise _bad("the template is not a ClipRows")
+    parts = (clip.audio, clip.audio_links, clip.lockables, clip.presets)
+    if not all(isinstance(p, tuple) for p in parts):
+        raise _bad("the template's rows are not tuples of rows")
+    if not isinstance(clip.media, dict) or not isinstance(clip.folder_link, dict):
+        raise _bad("the template's clip or bin join row is not a row")
+    tables: dict[str, list[Row]] = {
+        "Sm2MpMedia": [clip.media],
+        "BtVideoInfo": [] if clip.video is None else [clip.video],
+        "BtAudioInfo": list(clip.audio),
+        "BtAudioInfo_Sm2MpMedia": list(clip.audio_links),
+        "Sm2MpFolder_Sm2MpMedia": [clip.folder_link],
+        "BtLockableBlob": list(clip.lockables),
+        "SmPreset": list(clip.presets),
+    }
+    clips, skipped = clips_from_rows(tables)
+    if skipped:
+        raise _bad(skipped[0].reason)
+    if len(clips) != 1 or clips[0] != clip:
+        raise _bad("the template's rows are not exactly one clip's rows in their stored order")
+    return clip
+
+
 def project_frame_rate(config_rows: list[Row]) -> Fraction | None:
     """The project's timeline frame rate: ``SM_Config.FieldsBlob`` ``SetupBA`` field 69 (text
     such as ``29.97`` or ``23.976``), snapped to the standard rate it names. None when it cannot
@@ -265,23 +378,29 @@ def project_frame_rate(config_rows: list[Row]) -> Fraction | None:
         setup = kd.get("SetupBA")
         if not isinstance(setup, bytes):
             return None
-        fields = blobs.decode_protobuf(blobs.unwrap_message(setup), nested_depth=0)
+        fields = blobs.decode_protobuf(
+            blobs.unwrap_message(setup, max_output=1024 * 1024), nested_depth=0
+        )
     except DrpError:
         return None
     texts = [f.value for f in fields if f.number == 69 and isinstance(f.value, bytes)]
     if len(texts) != 1:
         return None
     try:
-        value = Fraction(texts[0].decode("ascii"))
-    except (UnicodeDecodeError, ValueError, ZeroDivisionError):
+        text = texts[0].decode("ascii")
+    except UnicodeDecodeError:
         return None
-    return snap_rate(value)
+    if not _RATE_TEXT.match(text):
+        return None  # Fraction() would also read underscores, exponents and spaces
+    return snap_rate(Fraction(text))
 
 
 def read_templates(path: str | Path, *, options: LibraryOptions | None = None) -> TemplateSet:
     """The template clips of a saved ``Project.db``. Raises :class:`aar.drp.library.LibraryError`
     if the project cannot be read, :class:`MediaPoolError` if it lacks the media tables."""
     lib = read_rows(path, TEMPLATE_TABLES, options=options)
+    for table in MEDIA_TABLES:
+        check_columns(table, lib.columns[table])
     tables = {t: _rows(lib, t) for t in TEMPLATE_TABLES}
     clips, skipped = clips_from_rows(tables)
     maps = tables["BtLockableBlobMap"]

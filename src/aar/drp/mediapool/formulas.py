@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from fractions import Fraction
 
 from aar.drp.mediapool.errors import MediaPoolError
-from aar.drp.mediapool.facts import MediaFacts, ProbeStream
+from aar.drp.mediapool.facts import TIMECODE_TAG, MediaFacts, ProbeStream
 from aar.media.probe import STANDARD_RATES, parse_probe_json, stream_rotation, timecode_frames
 
 __all__ = [
@@ -23,11 +23,13 @@ __all__ = [
     "audio_samples",
     "audio_streams",
     "channel_layout",
+    "channels",
     "creation_us",
     "frame_size",
     "picture_class",
     "qt_local_time",
     "resolution",
+    "sample_rate",
     "start_seconds",
     "start_timecode",
     "video_frames",
@@ -48,6 +50,13 @@ PICTURE_CLASSES: dict[str, tuple[str, Fraction]] = {
     "yuva444p12le": ("12-bit 4:4:4:4", Fraction(8)),
 }
 _FRAME_SIZE_PAD = 8192
+#: The longest file the writer authors: 24 hours. A longer frame or sample count is refused
+#: (no recording of the corpus comes near it, and a larger number is a measuring error).
+MAX_SECONDS = 24 * 3600
+#: Sample rates the writer accepts (Resolve was seen storing 44.1 and 48 kHz).
+MIN_SAMPLE_RATE, MAX_SAMPLE_RATE = 1000, 384000
+#: Creation times the writer accepts, in microseconds since 1970: from 1970 up to the year 9999.
+_MAX_US = int(datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC).timestamp()) * 1_000_000
 _ISO = re.compile(
     r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,9}))?Z\Z"
 )
@@ -142,11 +151,17 @@ def video_frames(facts: MediaFacts, rate: Fraction) -> int:
     if exact.denominator != 1:
         raise _refuse(
             "not_exact",
-            f"the video lasts {float(exact):.3f} frames at {rate} fps, not a whole number",
+            f"the video lasts {exact.numerator}/{exact.denominator} frames at {rate} fps, "
+            "not a whole number",
             "transcode the file to a constant frame rate first",
         )
     if exact < 1:
         raise _refuse("cannot_derive", "the video stream is shorter than one frame")
+    if exact > rate * MAX_SECONDS:
+        raise _refuse(
+            "cannot_derive",
+            f"the video lasts {int(exact)} frames, more than {MAX_SECONDS // 3600} hours",
+        )
     return int(exact)
 
 
@@ -155,7 +170,12 @@ def start_timecode(facts: MediaFacts) -> str | None:
     track or a camera's metadata track), else the container's
     (:class:`aar.media.probe.MediaInfo`)."""
     info = parse_probe_json(facts.probe.model_dump(), facts.path, facts.size)
-    return info.timecode
+    timecode = info.timecode
+    if timecode is not None and not TIMECODE_TAG.match(timecode):
+        raise _refuse(
+            "cannot_derive", f"the start timecode {timecode[:40]!r} is not HH:MM:SS:FF in ASCII"
+        )
+    return timecode
 
 
 def start_seconds(timecode: str | None, rate: Fraction) -> float:
@@ -177,14 +197,36 @@ def audio_samples(stream: ProbeStream) -> int:
         raise _refuse(
             "cannot_derive", f"audio stream {stream.index} has no duration_ts or sample_rate"
         )
-    rate = int(stream.sample_rate)
-    if not 1000 <= rate <= 384000:
-        raise _refuse("cannot_derive", f"audio stream {stream.index} has a sample rate of {rate}")
+    rate = sample_rate(stream)
     base = _rational(stream.time_base, f"audio stream {stream.index}'s time_base")
     samples = math.floor(stream.duration_ts * base * rate)
     if samples < 1:
         raise _refuse("cannot_derive", f"audio stream {stream.index} holds no samples")
+    if samples > rate * MAX_SECONDS:
+        raise _refuse(
+            "cannot_derive",
+            f"audio stream {stream.index} holds {samples} samples, "
+            f"more than {MAX_SECONDS // 3600} hours",
+        )
     return samples
+
+
+def sample_rate(stream: ProbeStream) -> int:
+    """The stream's sample rate in Hz (ASCII digits, checked by the facts model), within
+    :data:`MIN_SAMPLE_RATE`..:data:`MAX_SAMPLE_RATE`."""
+    if stream.sample_rate is None:
+        raise _refuse("cannot_derive", f"audio stream {stream.index} has no sample_rate")
+    rate = int(stream.sample_rate)
+    if not MIN_SAMPLE_RATE <= rate <= MAX_SAMPLE_RATE:
+        raise _refuse("cannot_derive", f"audio stream {stream.index} has a sample rate of {rate}")
+    return rate
+
+
+def channels(stream: ProbeStream) -> int:
+    """The stream's channel count; a stream without one is refused."""
+    if stream.channels is None:
+        raise _refuse("cannot_derive", f"audio stream {stream.index} has no channel count")
+    return stream.channels
 
 
 def audio_codec_name(stream: ProbeStream) -> str:
@@ -225,12 +267,18 @@ def channel_layout(stream: ProbeStream) -> int | None:
 
 
 def _iso_us(text: str) -> int | None:
+    """An ISO UTC time in microseconds since 1970; None if it is not one, names a date that
+    does not exist, or lies outside 1970..9999."""
     match = _ISO.match(text)
     if match is None:
         return None
-    whole = datetime(*(int(match.group(n)) for n in range(1, 7)), tzinfo=UTC)
+    try:
+        whole = datetime(*(int(match.group(n)) for n in range(1, 7)), tzinfo=UTC)
+    except ValueError:
+        return None
     fraction = (match.group(7) or "0").ljust(6, "0")[:6]
-    return int(whole.timestamp()) * 1_000_000 + int(fraction)
+    value = int(whole.timestamp()) * 1_000_000 + int(fraction)
+    return value if 0 <= value <= _MAX_US else None
 
 
 def creation_us(facts: MediaFacts) -> int:
@@ -241,14 +289,20 @@ def creation_us(facts: MediaFacts) -> int:
     if tag is not None:
         value = _iso_us(tag)
         if value is None:
-            raise _refuse("cannot_derive", f"the creation_time tag {tag[:40]!r} cannot be read")
+            raise _refuse(
+                "cannot_derive",
+                f"the creation_time tag {tag[:40]!r} is not a UTC time from 1970 to 9999",
+            )
         return value
     if facts.ctime_utc_ns is None:
         raise _refuse(
             "cannot_derive",
             "the file has no creation_time tag and its creation time was not measured",
         )
-    return facts.ctime_utc_ns // 1000
+    value = facts.ctime_utc_ns // 1000
+    if value > _MAX_US:
+        raise _refuse("cannot_derive", "the file's creation time lies after the year 9999")
+    return value
 
 
 def picture_class(stream: ProbeStream) -> tuple[str, Fraction]:

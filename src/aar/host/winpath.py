@@ -40,6 +40,7 @@ from aar.host.errors import PathRefused
 __all__ = [
     "PathForm",
     "PathMapper",
+    "check_file_path",
     "glob_escape",
     "normalize_root",
     "remote_spec",
@@ -136,13 +137,10 @@ def _within(path: _Win, root: _Win) -> bool:
     return _ascii_key(path)[: len(root.parts) + 1] == _ascii_key(root)
 
 
-def validate_windows_path(path: str, roots: tuple[_Win, ...]) -> _Win:
-    """Validate ``path`` as a transferable edit-PC file path inside one of ``roots``.
-
-    Returns the parsed, validated path. Raises :class:`PathRefused` otherwise. ``roots`` are
-    already-parsed roots (from :func:`normalize_root`); a UNC path is accepted only if ``roots``
-    holds a UNC root that contains it.
-    """
+def check_file_path(path: str) -> _Win:
+    """Validate ``path`` as an edit-PC file path, wherever it is: every rule of
+    :func:`validate_windows_path` except the allowed roots. Returns the parsed path; raises
+    :class:`PathRefused` with the reason otherwise."""
     if not isinstance(path, str) or not path:
         raise PathRefused(str(path), "empty")
     if any(ord(ch) < 0x20 for ch in path):
@@ -166,6 +164,17 @@ def validate_windows_path(path: str, roots: tuple[_Win, ...]) -> _Win:
     reason = _check_components(win)
     if reason is not None:
         raise PathRefused(path, reason)
+    return win
+
+
+def validate_windows_path(path: str, roots: tuple[_Win, ...]) -> _Win:
+    """Validate ``path`` as a transferable edit-PC file path inside one of ``roots``.
+
+    Returns the parsed, validated path. Raises :class:`PathRefused` otherwise. ``roots`` are
+    already-parsed roots (from :func:`normalize_root`); a UNC path is accepted only if ``roots``
+    holds a UNC root that contains it.
+    """
+    win = check_file_path(path)
     if win.unc and not any(root.unc for root in roots):
         raise PathRefused(path, "unc-not-allowed")
     within = False
