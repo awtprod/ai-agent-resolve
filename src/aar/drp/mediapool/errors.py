@@ -1,8 +1,22 @@
-"""The one error the media-pool writer raises: a refusal with a stable code and a hint."""
+"""The one error the media-pool writer raises: a refusal with a stable code and a hint.
+
+Every public entry point of the package is wrapped in :func:`refusing`, the one place where an
+error a damaged input can raise inside the shared decoders and encoders (:mod:`aar.drp.blobs`,
+:mod:`aar.drp.modify.encode`) or in the arithmetic and indexing done on what they return becomes
+a :class:`MediaPoolError`, with the original message kept. The specific refusals raised inside
+pass through unchanged; the wrapper only catches what no specific check foresaw.
+"""
 
 from __future__ import annotations
 
-__all__ = ["CODES", "MediaPoolError"]
+import struct
+from collections.abc import Callable
+from functools import wraps
+from typing import ParamSpec, TypeVar
+
+from aar.drp.errors import DrpError
+
+__all__ = ["CODES", "DAMAGE_ERRORS", "MediaPoolError", "refusing"]
 
 #: Every refusal code, with what it means.
 CODES: dict[str, str] = {
@@ -33,3 +47,54 @@ class MediaPoolError(ValueError):
 
     def to_dict(self) -> dict[str, str]:
         return {"code": self.code, "message": self.message, "hint": self.hint}
+
+
+#: What a damaged blob, row or fact can raise below the package's own checks: the shared
+#: decoders' and encoders' errors (:class:`aar.drp.errors.DrpError`, which includes
+#: ``EncodeError``), ``struct`` unpacking, and the arithmetic, indexing, conversion and type
+#: errors of code working on what they return.
+DAMAGE_ERRORS: tuple[type[BaseException], ...] = (
+    DrpError,
+    struct.error,
+    ArithmeticError,
+    LookupError,
+    ValueError,
+    TypeError,
+    RecursionError,
+)
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def refusing(
+    code: str,
+    what: str,
+    hint: str,
+    *,
+    passthrough: tuple[type[BaseException], ...] = (),
+) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    """Wrap a public entry point: any of :data:`DAMAGE_ERRORS` it lets escape becomes a
+    ``code`` refusal saying ``what`` failed, with the original error's type and message.
+    A :class:`MediaPoolError`, and the typed errors in ``passthrough``, pass unchanged."""
+    if code not in CODES:
+        raise ValueError(f"unknown media-pool error code {code!r}")
+
+    def wrap(func: Callable[_P, _R]) -> Callable[_P, _R]:
+        @wraps(func)
+        def guarded(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            try:
+                return func(*args, **kwargs)
+            except MediaPoolError:
+                raise
+            except passthrough:
+                raise
+            except DAMAGE_ERRORS as exc:
+                detail = f"{type(exc).__name__}: {exc}"[:400]
+                raise MediaPoolError(
+                    code, f"{what} failed on a damaged value ({detail})", hint
+                ) from exc
+
+        return guarded
+
+    return wrap

@@ -55,8 +55,15 @@ _FRAME_SIZE_PAD = 8192
 MAX_SECONDS = 24 * 3600
 #: Sample rates the writer accepts (Resolve was seen storing 44.1 and 48 kHz).
 MIN_SAMPLE_RATE, MAX_SAMPLE_RATE = 1000, 384000
-#: Creation times the writer accepts, in microseconds since 1970: from 1970 up to the year 9999.
-_MAX_US = int(datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC).timestamp()) * 1_000_000
+#: The years a date the writer authors may lie in (a file's modification and creation times, the
+#: date a clip was added): from 1970 to a few decades from now. A date outside them is a
+#: measuring error or hostile, and Resolve's text form of a year before 1000 is not known.
+FIRST_YEAR, LAST_YEAR = 1970, 2079
+#: The end of :data:`LAST_YEAR`, in seconds and in microseconds since 1970 (UTC).
+LATEST_SECONDS = int(datetime(LAST_YEAR, 12, 31, 23, 59, 59, tzinfo=UTC).timestamp())
+_MAX_US = LATEST_SECONDS * 1_000_000 + 999_999
+#: How a date out of range is described in a refusal.
+YEARS_TEXT = f"from {FIRST_YEAR} to {LAST_YEAR}"
 _ISO = re.compile(
     r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,9}))?Z\Z"
 )
@@ -79,11 +86,16 @@ def _refuse(code: str, message: str, hint: str = _HINT) -> MediaPoolError:
 
 def qt_local_time(value: datetime) -> str:
     """The modification time as Resolve writes it in a clip's ``Clip`` blob (field 3): the edit
-    PC's wall clock in C ``ctime`` form, the day padded with a space (``Tue Mar  3 04:05:06 2026``).
-    """
+    PC's wall clock in C ``ctime`` form, the day padded with a space (``Tue Mar  3 04:05:06 2026``),
+    the year in four digits. A year outside :data:`FIRST_YEAR`..:data:`LAST_YEAR` is refused."""
+    if not FIRST_YEAR <= value.year <= LAST_YEAR:
+        raise _refuse(
+            "bad_facts",
+            f"the file's modification time lies in the year {value.year}, not {YEARS_TEXT}",
+        )
     return (
         f"{_DAYS[value.weekday()]} {_MONTHS[value.month - 1]} {value.day:2d} "
-        f"{value.hour:02d}:{value.minute:02d}:{value.second:02d} {value.year}"
+        f"{value.hour:02d}:{value.minute:02d}:{value.second:02d} {value.year:04d}"
     )
 
 
@@ -268,7 +280,7 @@ def channel_layout(stream: ProbeStream) -> int | None:
 
 def _iso_us(text: str) -> int | None:
     """An ISO UTC time in microseconds since 1970; None if it is not one, names a date that
-    does not exist, or lies outside 1970..9999."""
+    does not exist, or lies outside :data:`FIRST_YEAR`..:data:`LAST_YEAR`."""
     match = _ISO.match(text)
     if match is None:
         return None
@@ -291,7 +303,7 @@ def creation_us(facts: MediaFacts) -> int:
         if value is None:
             raise _refuse(
                 "cannot_derive",
-                f"the creation_time tag {tag[:40]!r} is not a UTC time from 1970 to 9999",
+                f"the creation_time tag {tag[:40]!r} is not a UTC time {YEARS_TEXT}",
             )
         return value
     if facts.ctime_utc_ns is None:
@@ -300,8 +312,8 @@ def creation_us(facts: MediaFacts) -> int:
             "the file has no creation_time tag and its creation time was not measured",
         )
     value = facts.ctime_utc_ns // 1000
-    if value > _MAX_US:
-        raise _refuse("cannot_derive", "the file's creation time lies after the year 9999")
+    if not 0 <= value <= _MAX_US:
+        raise _refuse("cannot_derive", f"the file's creation time does not lie {YEARS_TEXT}")
     return value
 
 

@@ -409,13 +409,31 @@ def test_the_envelope_of_a_file() -> None:
     values = envelope_of(facts_from_json(ms.mp4_facts()))
     assert values == {
         "resolution": "3840x2160",
+        "coded_size": "3840x2160",
         "frame_rate": "24000/1001",
         "drop_frame": "non-drop",
         "bit_depth": "8",
         "chroma": "4:2:0",
         "video_profile": "High",
+        "video_level": "51",
+        "field_order": "progressive",
+        "sample_aspect_ratio": "1:1",
+        "display_aspect_ratio": "16:9",
+        "has_b_frames": "1",
+        "color_range": "tv",
+        "chroma_location": "left",
+        "video_raw_bits": "8",
+        "video_time_base": "1/24000",
+        "video_stream_rates": "24000/1001 24000/1001",
         "audio": "48000 Hz 2 ch",
         "audio_profile": "-",
+        "audio_codec": "pcm_s16be",
+        "audio_sample_format": "s16",
+        "audio_bits_per_sample": "16",
+        "audio_raw_bits": "-",
+        "audio_channel_layout": "-",
+        "audio_initial_padding": "0",
+        "audio_time_base": "1/48000",
     }
     drop = ms.mp4_facts(data_tags={"timecode": "01:00:00;00"})
     drop["ffprobe"]["streams"][0].update(
@@ -430,7 +448,7 @@ def test_prores_4444_is_not_verified_and_says_why() -> None:
 
 
 def test_every_result_names_clip_field_26_as_an_open_question() -> None:
-    result = run(ms.wav_facts(), ms.wav_template())
+    result = run(ms.wav_facts(), ms.wav_template(), template_facts=ms.wav_template_facts())
     assert any("field 26" in note for note in result.notes)
 
 
@@ -440,9 +458,14 @@ def test_every_result_names_clip_field_26_as_an_open_question() -> None:
 def test_an_unverified_kind_is_refused_unless_allowed() -> None:
     kind = kind_of_facts(facts_from_json(ms.wav_facts()))
     kinds = {kind: KindStatus("unverified", 1, "one file")}
-    error = refused("unverified", ms.wav_facts(), ms.wav_template(), kinds=kinds)
+    tfacts = ms.wav_template_facts()
+    error = refused(
+        "unverified", ms.wav_facts(), ms.wav_template(), kinds=kinds, template_facts=tfacts
+    )
     assert "allow_unverified=True" in error.hint and "one file" in error.message
-    result = run(ms.wav_facts(), ms.wav_template(), kinds=kinds, allow_unverified=True)
+    result = run(
+        ms.wav_facts(), ms.wav_template(), kinds=kinds, allow_unverified=True, template_facts=tfacts
+    )
     assert result.status == "unverified" and result.unverified == ("kind not verified: one file",)
 
 
@@ -512,9 +535,11 @@ def test_a_second_picture_is_refused() -> None:
 
 
 def test_an_absurd_sample_count_is_refused() -> None:
-    refused("cannot_derive", ms.wav_facts(stream_duration_ts=2**61), ms.wav_template())
-    refused("cannot_derive", ms.wav_facts(stream_duration_ts=48000 * 86400 + 1), ms.wav_template())
-    run(ms.wav_facts(stream_duration_ts=48000 * 86400), ms.wav_template())
+    tfacts = ms.wav_template_facts()
+    for samples in (2**61, 48000 * 86400 + 1):
+        facts = ms.wav_facts(stream_duration_ts=samples)
+        refused("cannot_derive", facts, ms.wav_template(), template_facts=tfacts)
+    run(ms.wav_facts(stream_duration_ts=48000 * 86400), ms.wav_template(), template_facts=tfacts)
 
 
 def test_an_unreadable_recorded_modification_time_is_reported_and_compared(
@@ -525,7 +550,10 @@ def test_an_unreadable_recorded_modification_time_is_reported_and_compared(
     clips = []
     for facts, base in ((first, 0x5000), (second, 0x6000)):
         result = author(
-            facts_from_json(facts), Template(ms.wav_template()), PLACE, new_id=ms.new_ids(base)
+            facts_from_json(facts),
+            Template(ms.wav_template(), facts_from_json(ms.wav_template_facts())),
+            PLACE,
+            new_id=ms.new_ids(base),
         )
         clips.append(ClipRows.from_tables(result.rows))
     clip = ms.clip_blob(

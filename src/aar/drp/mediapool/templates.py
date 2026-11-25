@@ -32,8 +32,8 @@ from typing import Any
 
 from aar.drp import blobs
 from aar.drp.errors import DrpError
-from aar.drp.library import LibraryOptions, LibraryRows, read_rows
-from aar.drp.mediapool.errors import MediaPoolError
+from aar.drp.library import LibraryError, LibraryOptions, LibraryRows, read_rows
+from aar.drp.mediapool.errors import MediaPoolError, refusing
 from aar.media.probe import snap_rate
 
 __all__ = [
@@ -105,6 +105,7 @@ REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
     "SmPreset": ("SmPreset_id", "Sm2MpMedia_id"),
 }
 _SCALARS = (type(None), int, float, str, bytes)
+_HINT = "use a template clip from a project Resolve saved, of the same kind"
 _RATE_TEXT = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,6})?\Z")
 
 
@@ -121,6 +122,7 @@ class ClipRows:
     presets: tuple[Row, ...] = ()
 
     @property
+    @refusing("bad_template", "reading the clip's id", _HINT)
     def media_id(self) -> str:
         return str(self.media["Sm2MpMedia_id"])
 
@@ -142,6 +144,7 @@ class ClipRows:
         return {t: rows for t, rows in out.items() if rows}
 
     @classmethod
+    @refusing("bad_template", "reading a clip from its rows per table", _HINT)
     def from_tables(cls, rows: dict[str, tuple[Row, ...]]) -> ClipRows:
         """A clip from its rows per table (as :func:`aar.drp.mediapool.author.author` returns
         them)."""
@@ -155,6 +158,7 @@ class ClipRows:
             presets=tuple(rows.get("SmPreset", ())),
         )
 
+    @refusing("bad_template", "reading the ids of the clip's rows", _HINT)
     def ids(self) -> set[str]:
         """The ids of the rows the clip owns (not the bin, map or other rows it points to)."""
         found = {self.media_id, str(self.media.get("UniqueMediaPoolItemId") or "")}
@@ -219,6 +223,7 @@ def _check_rows(table: str, rows: list[Row]) -> None:
                 raise _bad(f"{table}.{column} holds a {type(value).__name__}, not a column value")
 
 
+@refusing("bad_template", "reading the clips of the media tables", _HINT)
 def clips_from_rows(tables: dict[str, list[Row]]) -> tuple[list[ClipRows], list[Skipped]]:
     """Group the rows of :data:`MEDIA_TABLES` by clip, checking each clip's set is complete and
     consistent. Returns the templates and the clips that are not, with the reason. A missing
@@ -339,6 +344,7 @@ def _bad(why: str) -> MediaPoolError:
     return MediaPoolError("bad_template", why, "choose another template clip")
 
 
+@refusing("bad_template", "checking the template clip", _HINT)
 def check_clip(clip: object) -> ClipRows:
     """``clip`` if it is one complete, consistent clip (the checks :func:`clips_from_rows` makes,
     on exactly these rows, in this order); a ``bad_template`` refusal otherwise. Rows a caller
@@ -395,6 +401,7 @@ def project_frame_rate(config_rows: list[Row]) -> Fraction | None:
     return snap_rate(Fraction(text))
 
 
+@refusing("bad_template", "reading the template clips", _HINT, passthrough=(LibraryError,))
 def read_templates(path: str | Path, *, options: LibraryOptions | None = None) -> TemplateSet:
     """The template clips of a saved ``Project.db``. Raises :class:`aar.drp.library.LibraryError`
     if the project cannot be read, :class:`MediaPoolError` if it lacks the media tables."""

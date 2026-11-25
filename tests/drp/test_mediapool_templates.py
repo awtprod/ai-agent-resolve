@@ -362,12 +362,13 @@ def project_with(tmp_path: Path, name: str, *clips: ClipRows) -> Path:
 
 
 def answer(template: ClipRows, facts: dict[str, Any], base: int) -> ClipRows:
-    """Resolve's rows for ``facts``, as the writer itself authors them (synthetic answer key)."""
+    """Resolve's rows for ``facts``, as the writer itself authors them from a WAV template and
+    its own facts (synthetic answer key)."""
     from aar.drp.mediapool import Placement, Template, author
 
     result = author(
         facts_from_json(facts),
-        Template(template),
+        Template(template, facts_from_json(ms.wav_template_facts())),
         Placement(ms.FOLDER, 0, Fraction(30000, 1001), 1, ms.MAP),
         new_id=ms.new_ids(base),
     )

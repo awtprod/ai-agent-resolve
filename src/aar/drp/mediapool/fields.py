@@ -24,8 +24,11 @@ this docstring says otherwise.
   raw blocks, so the frames differ while the messages are the same. The codec is still compared.
   A zstd frame that does not decompress, or is not exactly one frame, is compared as bytes.
 * Anything that does not decode is compared byte for byte.
-* Metadata entries are compared by key and their list's order leaf is sorted: their order
-  differs between saves of the same file. A key that occurs twice keeps both entries.
+* Metadata entries are compared by key and their list's order leaf is sorted: their order is
+  not a function of their keys (in the corpus, clips with the same set of keys store them in
+  different orders), and what decides it is not known. No file is in both saved projects, so
+  whether it differs between saves of one file is not shown. A key that occurs twice keeps
+  both entries.
 
 :data:`EXCLUDED` is the reviewed list of fields that are not compared, each with its reason;
 nothing else is left out. An order leaf ignores the children that are excluded.
@@ -336,9 +339,10 @@ _META = re.compile(r"(L\d+\.FieldsBlob\.BlobData>#2>)#2(\[\d+\])?\Z")
 
 
 def _metadata_by_key(out: dict[str, Leaf]) -> dict[str, Leaf]:
-    """Metadata entries keyed by their key, not their position (their order differs between
-    saves of one file). ``meta{K}`` is the entry's value; ``meta{K}~e...`` the rest of the
-    entry (its message, its key field, its order); a key that occurs twice gets ``[1]``."""
+    """Metadata entries keyed by their key, not their position (their order is not a function
+    of their keys: clips with the same keys store them in different orders). ``meta{K}`` is the
+    entry's value; ``meta{K}~e...`` the rest of the entry (its message, its key field, its
+    order); a key that occurs twice gets ``[1]``."""
     renamed: dict[str, str] = {}
     containers: set[str] = set()
     seen: dict[tuple[str, object], int] = {}

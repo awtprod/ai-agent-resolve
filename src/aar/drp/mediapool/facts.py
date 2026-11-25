@@ -30,7 +30,7 @@ from pydantic import (
     field_validator,
 )
 
-from aar.drp.mediapool.errors import MediaPoolError
+from aar.drp.mediapool.errors import MediaPoolError, refusing
 
 __all__ = [
     "MAX_FACTS_BYTES",
@@ -112,6 +112,15 @@ class ProbeStream(BaseModel):
     color_transfer: _Text | None = None
     color_primaries: _Text | None = None
     color_range: _Text | None = None
+    chroma_location: _Text | None = None
+    field_order: _Text | None = None
+    sample_aspect_ratio: _Text | None = None
+    display_aspect_ratio: _Text | None = None
+    level: Annotated[StrictInt, Field(ge=-(2**31), lt=2**31)] | None = None
+    has_b_frames: Annotated[StrictInt, Field(ge=0, lt=2**31)] | None = None
+    coded_width: Annotated[StrictInt, Field(ge=0, le=65536)] | None = None
+    coded_height: Annotated[StrictInt, Field(ge=0, le=65536)] | None = None
+    initial_padding: Annotated[StrictInt, Field(ge=0, lt=2**31)] | None = None
     sample_fmt: _Text | None = None
     sample_rate: _Text | None = None
     channels: Annotated[StrictInt, Field(ge=1, le=64)] | None = None
@@ -130,7 +139,16 @@ class ProbeStream(BaseModel):
     side_data_list: Annotated[list[dict[str, Any]], Field(max_length=MAX_SIDE_DATA)] = []
 
     @field_validator(
-        "codec_type", "codec_name", "codec_tag_string", "pix_fmt", "sample_fmt", "channel_layout"
+        "codec_type",
+        "codec_name",
+        "codec_tag_string",
+        "pix_fmt",
+        "sample_fmt",
+        "channel_layout",
+        "chroma_location",
+        "field_order",
+        "sample_aspect_ratio",
+        "display_aspect_ratio",
     )
     @classmethod
     def _plain(cls, value: str | None) -> str | None:
@@ -307,6 +325,7 @@ class MediaFacts(BaseModel):
         return self.probe.streams
 
 
+@refusing("bad_facts", "reading the facts", "measure the file again")
 def facts_from_json(data: object) -> MediaFacts:
     """Facts from one collected record: ``{"path", "exists", "size", "mtime_local", "mtime_utc",
     "ctime_utc", "ffprobe": {"format", "streams"}}`` (or a JSON text of it, at most

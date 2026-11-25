@@ -17,7 +17,7 @@ Two files share a kind when every property below is equal. Each is read from the
 * ``look``: the properties Resolve keeps only inside the unexplained ``Radiometry`` blob
   (``pix_fmt``, the colour tags, the rotation). The rows cannot be read for them, so a template
   proves its ``look`` only through its own file's facts; without them :func:`matches` says the
-  look is unverified.
+  result is unverified (for every kind: a template without facts cannot be checked at all).
 
 :data:`KINDS` lists the kinds whose rows the writer may author, with the evidence: ``verified``
 kinds reproduced Resolve's own rows leave-one-out on the private answer key (the number of files
@@ -38,7 +38,7 @@ from dataclasses import dataclass, field, replace
 
 from aar.drp.mediapool import blobtree as bt
 from aar.drp.mediapool import formulas as fm
-from aar.drp.mediapool.errors import MediaPoolError
+from aar.drp.mediapool.errors import MediaPoolError, refusing
 from aar.drp.mediapool.facts import MediaFacts
 from aar.drp.mediapool.templates import ClipRows
 from aar.media.probe import is_drop_frame
@@ -100,16 +100,39 @@ class KindKey:
         return " ".join(parts)
 
 
-#: The properties a kind's evidence is recorded for (:func:`envelope_of`).
+#: The properties a kind's evidence is recorded for (:func:`envelope_of`): what the kind key
+#: leaves out but may change what Resolve stores. Besides the derived ones (resolution, frame
+#: rate, drop frame, bit depth and chroma), every ffprobe stream property that is constant across
+#: each verified kind in the corpus and could plausibly change a stored value is recorded, so a
+#: file that differs in any of them (an interlaced or anamorphic picture, another level, another
+#: sample format...) is not taken as covered by the evidence.
 ENVELOPE_PROPERTIES = (
     "resolution",
+    "coded_size",
     "frame_rate",
     "drop_frame",
     "bit_depth",
     "chroma",
     "video_profile",
+    "video_level",
+    "field_order",
+    "sample_aspect_ratio",
+    "display_aspect_ratio",
+    "has_b_frames",
+    "color_range",
+    "chroma_location",
+    "video_raw_bits",
+    "video_time_base",
+    "video_stream_rates",
     "audio",
     "audio_profile",
+    "audio_codec",
+    "audio_sample_format",
+    "audio_bits_per_sample",
+    "audio_raw_bits",
+    "audio_channel_layout",
+    "audio_initial_padding",
+    "audio_time_base",
 )
 #: ``pix_fmt`` -> (bit depth, chroma class).
 _PIXELS: dict[str, tuple[str, str]] = {
@@ -138,17 +161,37 @@ class KindStatus:
     envelope: Envelope | None = field(default=None, compare=False)
 
 
+def _value(value: object) -> str:
+    """A property as the envelope records it: ``-`` when the facts do not have it."""
+    return "-" if value is None else str(value)
+
+
 def envelope_of(facts: MediaFacts) -> dict[str, str]:
     """The values of :data:`ENVELOPE_PROPERTIES` for a measured file (``-`` where a property
-    does not apply). Rates are fractions as ffprobe gives them (``30000/1001``)."""
+    does not apply or the facts do not have it: an absent property is compared as absent).
+    Rates are fractions as ffprobe gives them (``30000/1001``); several audio streams are joined
+    with ``+``."""
     video = fm.video_stream(facts)
     out = dict.fromkeys(ENVELOPE_PROPERTIES, "-")
     if video is not None:
         if video.width is not None and video.height is not None:
             out["resolution"] = f"{video.width}x{video.height}"
+        if video.coded_width is not None or video.coded_height is not None:
+            out["coded_size"] = f"{_value(video.coded_width)}x{_value(video.coded_height)}"
         depth, chroma = _PIXELS.get(video.pix_fmt or "", (f"?{video.pix_fmt}", f"?{video.pix_fmt}"))
         out["bit_depth"], out["chroma"] = depth, chroma
-        out["video_profile"] = video.profile or "-"
+        out["video_profile"] = _value(video.profile)
+        out["video_level"] = _value(video.level)
+        out["field_order"] = _value(video.field_order)
+        out["sample_aspect_ratio"] = _value(video.sample_aspect_ratio)
+        out["display_aspect_ratio"] = _value(video.display_aspect_ratio)
+        out["has_b_frames"] = _value(video.has_b_frames)
+        out["color_range"] = _value(video.color_range)
+        out["chroma_location"] = _value(video.chroma_location)
+        out["video_raw_bits"] = _value(video.bits_per_raw_sample)
+        out["video_time_base"] = _value(video.time_base)
+        # the stream's own rates: the derived frame rate may come from a timecode track instead
+        out["video_stream_rates"] = f"{_value(video.r_frame_rate)} {_value(video.avg_frame_rate)}"
         if facts.extension not in STILL_EXTENSIONS:
             rate = fm.video_rate(facts)
             out["frame_rate"] = f"{rate.numerator}/{rate.denominator}"
@@ -158,7 +201,18 @@ def envelope_of(facts: MediaFacts) -> dict[str, str]:
     audio = fm.audio_streams(facts)
     if audio:
         out["audio"] = "+".join(f"{s.sample_rate} Hz {s.channels} ch" for s in audio)
-        out["audio_profile"] = "+".join(s.profile or "-" for s in audio)
+        per_stream = {
+            "audio_profile": lambda s: s.profile or None,
+            "audio_codec": lambda s: s.codec_name,
+            "audio_sample_format": lambda s: s.sample_fmt,
+            "audio_bits_per_sample": lambda s: s.bits_per_sample,
+            "audio_raw_bits": lambda s: s.bits_per_raw_sample,
+            "audio_channel_layout": lambda s: s.channel_layout,
+            "audio_initial_padding": lambda s: s.initial_padding,
+            "audio_time_base": lambda s: s.time_base,
+        }
+        for prop, read in per_stream.items():
+            out[prop] = "+".join(_value(read(s)) for s in audio)
     return out
 
 
@@ -208,6 +262,7 @@ def _audio_kinds_of_facts(facts: MediaFacts) -> tuple[AudioKind, ...]:
     return tuple(out)
 
 
+@refusing("bad_facts", "reading the file's kind from its facts", "measure the file again")
 def kind_of_facts(facts: MediaFacts) -> KindKey:
     """The kind of a measured file. Properties it cannot read become values no template has
     (``?<codec>``), so such a file finds no template rather than a wrong one."""
@@ -294,6 +349,7 @@ def _picture_of_rows(geometry: bt.KdEntries) -> tuple[str | None, bool]:
     return f"?{size[3]}/{width}x{height}", is_transposed
 
 
+@refusing("bad_template", "reading the template's kind from its rows", "choose another template")
 def kind_of_rows(clip: ClipRows) -> KindKey:
     """The kind of a saved clip, from its rows (``look`` is None: rows do not record it)."""
     name = _file_name(clip)
@@ -347,7 +403,8 @@ def matches(
     facts_kind: KindKey, template_rows_kind: KindKey, template_facts: MediaFacts | None
 ) -> str | None:
     """Whether a template may serve a file: None if it may with every property proven; the
-    reason if it may but its ``look`` is not proven (no facts for the template's file). Raises
+    reason if it may but cannot be proven, because the template's own facts are missing (then
+    neither its ``look`` nor its rows can be checked against its file, for every kind). Raises
     ``kind_mismatch`` when the rows, or the template's facts, show another kind."""
     if facts_kind.without_look() != template_rows_kind.without_look():
         raise MediaPoolError(
@@ -357,11 +414,9 @@ def matches(
             "give a template clip of the same kind",
         )
     if template_facts is None:
-        if not facts_kind.look:
-            return None  # no picture: nothing is kept in Radiometry
         return (
-            "the template's colour and pixel format (Radiometry) are not proven: "
-            "no facts for its file"
+            "the template's own facts are missing: its rows cannot be checked against its file "
+            "(nor its colour and pixel format, kept in Radiometry)"
         )
     other = kind_of_facts(template_facts)
     if other != facts_kind:
@@ -396,43 +451,54 @@ _AAC_44 = AudioKind("AAC", 3, 2, 44100, True)
 _AAC_48 = AudioKind("AAC", 3, 2, 48000, True)
 
 
-def _envelope(
-    *,
-    resolution: str = "-",
-    frame_rate: str = "-",
-    drop_frame: str = "-",
-    bit_depth: str = "-",
-    chroma: str = "-",
-    video_profile: str = "-",
-    audio: str = "-",
-    audio_profile: str = "-",
-) -> Envelope:
-    """An envelope of one value per property (every verified kind's evidence is that narrow)."""
-    values = {
-        "resolution": resolution,
-        "frame_rate": frame_rate,
-        "drop_frame": drop_frame,
-        "bit_depth": bit_depth,
-        "chroma": chroma,
-        "video_profile": video_profile,
-        "audio": audio,
-        "audio_profile": audio_profile,
-    }
-    return {prop: frozenset({values[prop]}) for prop in ENVELOPE_PROPERTIES}
-
-
-def _sound(audio: str) -> Envelope:
-    return _envelope(audio=audio)
+def _envelope(**values: str | tuple[str, ...]) -> Envelope:
+    """An envelope: the values each property had on the checked files (one, for every verified
+    kind); a property not given is ``-`` (absent or not applicable)."""
+    unknown = set(values) - set(ENVELOPE_PROPERTIES)
+    if unknown:
+        raise ValueError(f"unknown envelope properties {sorted(unknown)}")
+    out: dict[str, frozenset[str]] = {}
+    for prop in ENVELOPE_PROPERTIES:
+        value = values.get(prop, "-")
+        out[prop] = frozenset((value,) if isinstance(value, str) else value)
+    return out
 
 
 #: Envelope values the scoreboard derived from the checked files (generic values only).
 _UHD, _HD, _NTSC, _FILM = "3840x2160", "1920x1080", "30000/1001", "24000/1001"
+#: What every 48 kHz 24-bit PCM .wav file of the corpus has.
+_WAV_24 = {
+    "audio_codec": "pcm_s24le",
+    "audio_sample_format": "s32",
+    "audio_bits_per_sample": "24",
+    "audio_raw_bits": "24",
+    "audio_initial_padding": "0",
+    "audio_time_base": "1/48000",
+}
+
+
+def _wav(channels: int, layout: str = "-") -> Envelope:
+    return _envelope(audio=f"48000 Hz {channels} ch", audio_channel_layout=layout, **_WAV_24)
+
+
 #: Why ProRes 4444 is not verified although its files compare equal.
 _PRORES_4444_NOTE = (
     "Sm2MpMedia.FieldsBlob field #1.#3 is on every ProRes 4444 clip of the answer key and on "
     "almost no other clip, with values no rule derives; the writer leaves it out and the gate "
     "excludes it, so until it is explained the kind is not verified"
 )
+#: What the ProRes files of the corpus have in common.
+_PRORES = {
+    "resolution": _HD,
+    "coded_size": _HD,
+    "frame_rate": _NTSC,
+    "video_level": "-99",
+    "field_order": "progressive",
+    "has_b_frames": "0",
+    "color_range": "tv",
+    "video_time_base": "1/30000",
+    "video_stream_rates": f"{_NTSC} {_NTSC}",
+}
 
 #: The kinds the writer may author, with their evidence: the corpus gate on two Resolve 21.1
 #: saves (docs/DESIGN.md, "Media-pool rows (S25c1)"). ``files`` is the number of files whose rows
@@ -447,26 +513,42 @@ KINDS: dict[KindKey, KindStatus] = {
         68,
         envelope=_envelope(
             resolution=_UHD,
+            coded_size=_UHD,
             frame_rate=_FILM,
             drop_frame="non-drop",
             bit_depth="8",
             chroma="4:2:0",
             video_profile="High",
+            video_level="51",
+            field_order="progressive",
+            sample_aspect_ratio="1:1",
+            display_aspect_ratio="16:9",
+            has_b_frames="1",
+            color_range="tv",
+            chroma_location="left",
+            video_raw_bits="8",
+            video_time_base="1/24000",
+            video_stream_rates=f"{_FILM} {_FILM}",
             audio="48000 Hz 2 ch",
+            audio_codec="pcm_s16be",
+            audio_sample_format="s16",
+            audio_bits_per_sample="16",
+            audio_initial_padding="0",
+            audio_time_base="1/48000",
         ),
     ),
-    _audio("wav", _pcm(2, 2, False)): KindStatus("verified", 29, envelope=_sound("48000 Hz 2 ch")),
-    _audio("wav", _pcm(2, 2, True)): KindStatus("verified", 29, envelope=_sound("48000 Hz 2 ch")),
+    _audio("wav", _pcm(2, 2, False)): KindStatus("verified", 29, envelope=_wav(2)),
+    _audio("wav", _pcm(2, 2, True)): KindStatus("verified", 29, envelope=_wav(2, "stereo")),
     _video("apch", "10-bit 4:2:2", True, ("yuv422p10le", *_BT709)): KindStatus(
         "verified",
         17,
         envelope=_envelope(
-            resolution=_HD,
-            frame_rate=_NTSC,
             drop_frame="non-drop",
             bit_depth="10",
             chroma="4:2:2",
             video_profile="HQ",
+            video_raw_bits="10",
+            **_PRORES,
         ),
     ),
     _video("ap4h", "12-bit 4:4:4:4", False, ("yuva444p12le", "-", "-", "-", "tv", "0")): KindStatus(
@@ -474,21 +556,49 @@ KINDS: dict[KindKey, KindStatus] = {
         7,
         _PRORES_4444_NOTE,
         envelope=_envelope(
-            resolution=_HD, frame_rate=_NTSC, bit_depth="12", chroma="4:4:4:4", video_profile="4444"
+            bit_depth="12",
+            chroma="4:4:4:4",
+            video_profile="4444",
+            video_raw_bits="12",
+            sample_aspect_ratio=("-", "1:1"),
+            display_aspect_ratio=("-", "16:9"),
+            **_PRORES,
         ),
     ),
-    _audio("wav", _pcm(2, 1, False)): KindStatus("verified", 6, envelope=_sound("48000 Hz 1 ch")),
-    _audio("wav", _pcm(2, 1, True)): KindStatus("verified", 4, envelope=_sound("48000 Hz 1 ch")),
+    _audio("wav", _pcm(2, 1, False)): KindStatus("verified", 6, envelope=_wav(1)),
+    _audio("wav", _pcm(2, 1, True)): KindStatus("verified", 4, envelope=_wav(1, "mono")),
     KindKey(
         "still", "png", None, None, False, False, (), ("rgba", "gbr", "-", "-", "pc", "0")
     ): KindStatus(
         "verified",
         3,
         "a still whose name holds a digit is refused",
-        envelope=_envelope(resolution=_UHD, bit_depth="8", chroma="RGBA"),
+        envelope=_envelope(
+            resolution=_UHD,
+            coded_size=_UHD,
+            bit_depth="8",
+            chroma="RGBA",
+            video_level="-99",
+            sample_aspect_ratio="1:1",
+            display_aspect_ratio="16:9",
+            has_b_frames="0",
+            color_range="pc",
+            video_time_base="1/25",
+            video_stream_rates="25/1 25/1",
+        ),
     ),
     _audio("mp3", AudioKind("MP3", 3, 2, 44100, True)): KindStatus(
-        "verified", 2, envelope=_sound("44100 Hz 2 ch")
+        "verified",
+        2,
+        envelope=_envelope(
+            audio="44100 Hz 2 ch",
+            audio_codec="mp3",
+            audio_sample_format="fltp",
+            audio_bits_per_sample="0",
+            audio_channel_layout="stereo",
+            audio_initial_padding="0",
+            audio_time_base="1/14112000",
+        ),
     ),
     _audio("m4a", _AAC_44): KindStatus("unverified", 1, "one AAC .m4a file (with cover art)"),
     _audio("mp3", AudioKind("MP3", 3, 2, 48000, True)): KindStatus(

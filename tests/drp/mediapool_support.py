@@ -264,6 +264,7 @@ def wav_facts(**change: Any) -> dict[str, Any]:
         "duration_ts": 480000,
         "duration": "10.000000",
         "bits_per_raw_sample": "24",
+        "initial_padding": 0,
         "disposition": {"default": 0, "attached_pic": 0},
     }
     data: dict[str, Any] = {
@@ -317,6 +318,24 @@ def wav_template(
     )
 
 
+def wav_template_facts(**change: Any) -> dict[str, Any]:
+    """The facts of :func:`wav_template`'s own file (5.0 s, created at the time its rows hold)."""
+    data = wav_facts(
+        path="X:\\Old\\older-take.wav",
+        size=1_440_044,
+        mtime_local="Mon Oct 5 09:01:02 2026",
+        mtime_utc="2026-10-05T13:01:02.0000000Z",
+        ctime_utc=_iso(1_791_000_000).replace(".000000Z", ".0000000Z"),
+        stream_duration_ts=240000,
+        stream_duration="5.000000",
+    )
+    data["ffprobe"]["format"]["duration"] = "5.000000"
+    data["ffprobe"]["format"]["filename"] = data["path"]
+    for key, value in change.items():
+        data[key] = value
+    return data
+
+
 # --------------------------------------------------------------------------- MP4 (H.264 + PCM)
 
 
@@ -331,6 +350,15 @@ def mp4_facts(**change: Any) -> dict[str, Any]:
         "profile": "High",
         "width": 3840,
         "height": 2160,
+        "coded_width": 3840,
+        "coded_height": 2160,
+        "level": 51,
+        "has_b_frames": 1,
+        "field_order": "progressive",
+        "sample_aspect_ratio": "1:1",
+        "display_aspect_ratio": "16:9",
+        "chroma_location": "left",
+        "bits_per_raw_sample": "8",
         "pix_fmt": "yuv420p",
         "color_range": "tv",
         "color_space": "bt709",
@@ -353,6 +381,7 @@ def mp4_facts(**change: Any) -> dict[str, Any]:
         "sample_rate": "48000",
         "channels": 2,
         "bits_per_sample": 16,
+        "initial_padding": 0,
         "r_frame_rate": "0/0",
         "avg_frame_rate": "0/0",
         "time_base": "1/48000",
@@ -540,6 +569,12 @@ def png_facts(**change: Any) -> dict[str, Any]:
         "codec_tag_string": "[0][0][0][0]",
         "width": 3840,
         "height": 2160,
+        "coded_width": 3840,
+        "coded_height": 2160,
+        "level": -99,
+        "has_b_frames": 0,
+        "sample_aspect_ratio": "1:1",
+        "display_aspect_ratio": "16:9",
         "pix_fmt": "rgba",
         "color_range": "pc",
         "color_space": "gbr",

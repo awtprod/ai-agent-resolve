@@ -8,6 +8,11 @@ the facts (a hostile number or text, a deleted or added key, a duplicated stream
 template row (NULL, another type, a deleted column, damaged bytes), or a value deep inside a
 template blob (a keyed-dict entry's type, null flag, value or order; a protobuf field's number,
 wire type, value or order; a frame's bytes). The damage is seeded, so a failure names its seed.
+
+A second, aimed run damages one byte inside a fixed-layout value at any layer of a template blob
+(a resolution, a frame rate, audio extents, a timemap, a fixed64 or fixed32 protobuf field), the
+values the shared decoders read by position: a non-zero padding word there once escaped as an
+untyped ``BlobError`` (one case in about 18,000 of the unaimed damage found it).
 """
 
 from __future__ import annotations
@@ -249,6 +254,115 @@ def damage_blob(rng: random.Random, data: bytes, depth: int = 0) -> bytes:
     return _bytes_damage(rng, data)
 
 
+# --------------------------------------------------------------------------- aimed: fixed layouts
+
+#: Keyed-dict entries whose value has a fixed byte layout, read by position in ``aar.drp.blobs``
+#: (``decode_resolution``, ``decode_rate``, ``decode_extents``, ``decode_timemap``).
+FIXED_KEYS = frozenset(
+    {"Resolution", "FrameRate", "MediaFrameRate", "MediaExtents", "MediaTimemapBA"}
+)
+
+
+def _one_byte(rng: random.Random, value: bytes) -> bytes:
+    """``value`` with one byte changed and its length kept (a padding word, a sign, an exponent)."""
+    out = bytearray(value)
+    at = rng.randrange(len(out))
+    out[at] = rng.choice(
+        [v for v in (0x00, 0x01, 0x7F, 0x80, 0xFF, rng.randrange(256)) if v != out[at]]
+    )
+    return bytes(out)
+
+
+def _as_message(data: bytes) -> list[list[Any]] | None:
+    """``data`` as a canonical protobuf message without an envelope, or None."""
+    try:
+        fields = [[f.number, f.wire, f.value] for f in blobs.decode_protobuf(data, nested_depth=0)]
+        same = encode.protobuf([tuple(f) for f in fields]) == data  # type: ignore[misc]
+    except (DrpError, ValueError):
+        return None
+    return fields if fields and same else None
+
+
+def damage_fixed(rng: random.Random, data: bytes, depth: int = 0) -> bytes | None:
+    """``data`` with one byte changed inside one fixed-layout value at any layer (an entry of
+    :data:`FIXED_KEYS`, a fixed64 or fixed32 protobuf field), every layer around it encoded
+    again; None if ``data`` holds no such value."""
+    if depth > 6 or not data:
+        return None
+    try:
+        kd = blobs.decode_keyed_dict(data, strict=True) if data[:4] == b"\x00\x00\x00\x01" else None
+    except DrpError:
+        kd = None
+    if kd is not None:
+        entries = [[e.key, e.type, e.subtype, e.value] for e in kd.entries]
+        order = [i for i, e in enumerate(entries) if isinstance(e[3], bytes) and e[3]]
+        rng.shuffle(order)
+        for i in order:
+            if entries[i][0] in FIXED_KEYS:
+                entries[i][3] = _one_byte(rng, entries[i][3])
+            else:
+                inner = damage_fixed(rng, entries[i][3], depth + 1)
+                if inner is None:
+                    continue
+                entries[i][3] = inner
+            return encode.keyed_dict([tuple(e) for e in entries])  # type: ignore[misc]
+        return None
+    wrapped = blobs.parse_envelope(data) is not None
+    if wrapped:
+        try:
+            fields = _as_message(blobs.unwrap_message(data))
+        except DrpError:
+            fields = None
+    else:
+        fields = _as_message(data)
+    if fields is None:
+        return None
+    order = list(range(len(fields)))
+    rng.shuffle(order)
+    for i in order:
+        _number, wire, value = fields[i]
+        if wire in (1, 5):
+            fields[i][2] = _one_byte(rng, value)
+        elif wire == 2 and isinstance(value, bytes):
+            inner = damage_fixed(rng, value, depth + 1)
+            if inner is None:
+                continue
+            fields[i][2] = inner
+        else:
+            continue
+        payload = encode.protobuf([tuple(f) for f in fields])  # type: ignore[misc]
+        return encode.envelope(data, payload) if wrapped else payload
+    return None
+
+
+def damage_fixed_rows(rng: random.Random, clip: ClipRows) -> ClipRows | None:
+    """``clip`` with one fixed-layout value inside one of its blobs damaged; None if none
+    has one."""
+    rows: dict[str, list[Any]] = {
+        "media": [dict(clip.media)],
+        "video": [dict(clip.video)] if clip.video is not None else [],
+        "audio": [dict(r) for r in clip.audio],
+        "audio_links": [dict(r) for r in clip.audio_links],
+        "folder_link": [dict(clip.folder_link)],
+        "lockables": [dict(r) for r in clip.lockables],
+        "presets": [dict(r) for r in clip.presets],
+    }
+    cells = [
+        (row, column)
+        for group in rows.values()
+        for row in group
+        for column, value in row.items()
+        if isinstance(value, bytes)
+    ]
+    rng.shuffle(cells)
+    for row, column in cells:
+        damaged = damage_fixed(rng, row[column])
+        if damaged is not None:
+            row[column] = damaged
+            return _clip_of(rows, clip)
+    return None
+
+
 # --------------------------------------------------------------------------- damaging rows
 
 
@@ -306,7 +420,7 @@ def _clip_of(rows: dict[str, list[Any]], clip: ClipRows) -> ClipRows:
 
 
 _BASES = (
-    (ms.wav_facts, ms.wav_template, None),
+    (ms.wav_facts, ms.wav_template, ms.wav_template_facts),
     (ms.mp4_facts, ms.mp4_template, ms.mp4_template_facts),
     (ms.png_facts, ms.png_template, ms.png_template_facts),
 )
@@ -327,6 +441,27 @@ def run_case(seed: int) -> str:
             template = damage_rows(rng, template)
         else:
             damage_facts(rng, template_facts)
+    return _attempt(rng, facts, template, template_facts)
+
+
+def run_fixed_case(seed: int) -> str:
+    """One case with a fixed-layout value of the template damaged (and nothing else): returns
+    ``"ok"`` or ``"refused:<code>"``; raises anything else, or if the template holds no
+    fixed-layout value to damage."""
+    rng = random.Random(seed)
+    make_facts, make_template, make_template_facts = _BASES[seed % len(_BASES)]
+    damaged = damage_fixed_rows(rng, make_template())
+    assert damaged is not None, "every base template holds a fixed-layout value"
+    return _attempt(rng, make_facts(), damaged, make_template_facts())
+
+
+def _attempt(
+    rng: random.Random,
+    facts: dict[str, Any],
+    template: ClipRows,
+    template_facts: dict[str, Any] | None,
+) -> str:
+    """Every public entry point on the (damaged) inputs, then :func:`author`."""
     try:
         text = json.dumps(facts) if rng.randrange(2) else facts
         parsed = facts_from_json(text)
@@ -378,6 +513,52 @@ def test_damaged_facts_and_templates_give_only_typed_refusals(block: int) -> Non
         outcomes[outcome] = outcomes.get(outcome, 0) + 1
     # the damage reaches deep enough to be refused for many reasons, and some cases survive
     assert len(outcomes) >= 3, outcomes
+
+
+#: Aimed cases per test run: each base template in turn, one fixed-layout byte damaged.
+FIXED_CASES = 600
+
+
+@pytest.mark.parametrize("block", range(3))
+def test_damaged_fixed_layout_values_give_only_typed_refusals(block: int) -> None:
+    outcomes: dict[str, int] = {}
+    per = FIXED_CASES // 3
+    for seed in range(block * per, (block + 1) * per):
+        try:
+            outcome = run_fixed_case(seed)
+        except Exception as exc:  # the assertion this test exists for
+            raise AssertionError(f"fixed seed {seed}: {type(exc).__name__}: {exc}") from exc
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+    # some damage is refused (a padding word, a non-finite rate), some is overwritten or copied
+    assert "ok" in outcomes and any(o.startswith("refused:") for o in outcomes), outcomes
+
+
+def test_the_aimed_damage_reaches_every_fixed_layout() -> None:
+    """The aimed damage lands in a resolution's padding, a rate and the audio extents."""
+    hit: set[str] = set()
+    for seed in range(300):
+        rng = random.Random(seed)
+        for make_template in (ms.mp4_template, ms.wav_template, ms.png_template):
+            before = make_template()
+            after = damage_fixed_rows(rng, before)
+            assert after is not None
+            hit |= _changed_fixed(before, after)
+    assert {"Resolution padding", "FrameRate", "FieldsBlob (extents or rate)"} <= hit, hit
+
+
+def _changed_fixed(before: ClipRows, after: ClipRows) -> set[str]:
+    out: set[str] = set()
+    if before.video is not None and after.video is not None:
+        for column, key in (("Geometry", "Resolution"), ("Time", "FrameRate")):
+            old = blobs.decode_keyed_dict(before.video[column], strict=True).get(key)
+            new = blobs.decode_keyed_dict(after.video[column], strict=True).get(key)
+            if old != new:
+                assert isinstance(old, bytes) and isinstance(new, bytes)
+                padding = old[:4] != new[:4] or old[8:12] != new[8:12]
+                out.add("Resolution padding" if key == "Resolution" and padding else key)
+    if before.media["FieldsBlob"] != after.media["FieldsBlob"] and before.audio:
+        out.add("FieldsBlob (extents or rate)")
+    return out
 
 
 def test_the_undamaged_cases_author() -> None:

@@ -13,7 +13,7 @@ Resolve saved), and returns the rows Resolve would have written had it imported 
 
 It returns data only and writes nothing. Whatever it cannot justify is refused with a typed
 :class:`MediaPoolError`. A result that would not be verified (a kind with too little evidence, a
-file outside the envelope its kind was checked on, a template whose look is unproven or whose
+file outside the envelope its kind was checked on, a template without its own facts or whose
 facts do not reproduce its own rows) is refused as ``unverified`` unless the caller passes
 ``allow_unverified=True``; then the result says ``status="unverified"`` and lists the reasons.
 Every blob of the template is taken apart by a closed list of known fields: a field it does not
@@ -33,7 +33,7 @@ from typing import Any
 
 from aar.drp.mediapool import blobtree as bt
 from aar.drp.mediapool import formulas as fm
-from aar.drp.mediapool.errors import MediaPoolError
+from aar.drp.mediapool.errors import MediaPoolError, refusing
 from aar.drp.mediapool.facts import MediaFacts
 from aar.drp.mediapool.fields import compare, media_class
 from aar.drp.mediapool.kinds import (
@@ -67,8 +67,6 @@ CLIP_26_NOTE = (
     "clips only, and what decides that is an open question"
 )
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
-#: The latest date added the writer accepts: the end of the year 9999, in seconds since 1970.
-_MAX_ADDED_AT = 253_402_300_799
 _UNVERIFIED_HINT = (
     "author it with allow_unverified=True to get the rows anyway (the result lists these "
     "reasons and says status='unverified'), or give a template and facts that verify it"
@@ -158,7 +156,16 @@ class _Ids:
         self.made: set[str] = set()
 
     def __call__(self) -> str:
-        value = self.new_id()
+        # The id source is the caller's code, not untrusted input; an error it raises is still
+        # a typed refusal, so that it is never mistaken for a damaged template at the boundary.
+        try:
+            value = self.new_id()
+        except Exception as exc:
+            raise MediaPoolError(
+                "id_collision",
+                f"the id source raised {type(exc).__name__}: {str(exc)[:200]}",
+                "fix the id source (new_id), or leave it out to get uuid4 ids",
+            ) from exc
         if not isinstance(value, str) or len(value) != _UUID_TEXT:
             raise MediaPoolError(
                 "id_collision", f"the id source gave {value!r}, not a uuid text", "use uuid4 ids"
@@ -277,8 +284,8 @@ def _check_placement(placement: object) -> Placement:
     rate = placement.project_rate
     if not isinstance(rate, Fraction | int) or isinstance(rate, bool) or rate not in STANDARD_RATES:
         raise refuse(f"project frame rate {rate!r} is not a standard rate (a Fraction)")
-    if not _int(placement.added_at) or not 0 <= placement.added_at <= _MAX_ADDED_AT:
-        raise refuse("date added is not whole seconds from 1970 to the year 9999")
+    if not _int(placement.added_at) or not 0 <= placement.added_at <= fm.LATEST_SECONDS:
+        raise refuse(f"date added is not whole seconds since 1970, {fm.YEARS_TEXT}")
     lockable = placement.lockable_map_id
     if lockable is not None and (not isinstance(lockable, str) or not _UUID.match(lockable)):
         raise refuse("lockable map id is not a uuid text")
@@ -287,6 +294,12 @@ def _check_placement(placement: object) -> Placement:
     return placement
 
 
+@refusing(
+    "bad_template",
+    "authoring from the template's rows and the file's facts",
+    "use a template clip from a project Resolve saved, of the same kind, and facts measured "
+    "by the facts script; the message names the value that failed",
+)
 def author(
     facts: MediaFacts,
     template: Template,

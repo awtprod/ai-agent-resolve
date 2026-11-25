@@ -73,7 +73,7 @@ def refusal(code: str, *args: Any, **kw: Any) -> MediaPoolError:
 
 
 def test_a_sound_file_is_authored_from_its_facts() -> None:
-    result = make(ms.wav_facts(), ms.wav_template())
+    result = make(ms.wav_facts(), ms.wav_template(), with_facts=ms.wav_template_facts())
     f = flat(result)
     assert result.status == "verified" and result.unverified == ()
     assert f["M.Name"] == ("text", ms.WAV_NAME)
@@ -176,7 +176,10 @@ def test_a_template_whose_file_has_another_look_is_refused() -> None:
 def test_an_unverified_kind_says_so() -> None:
     kind = kind_of_facts(facts_from_json(ms.wav_facts()))
     result = make(
-        ms.wav_facts(), ms.wav_template(), kinds={kind: KindStatus("unverified", 1, "one file")}
+        ms.wav_facts(),
+        ms.wav_template(),
+        with_facts=ms.wav_template_facts(),
+        kinds={kind: KindStatus("unverified", 1, "one file")},
     )
     assert result.status == "unverified" and result.unverified == ("kind not verified: one file",)
 
