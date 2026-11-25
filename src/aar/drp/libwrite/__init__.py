@@ -22,7 +22,13 @@ from aar.drp.libwrite.check import check_written
 from aar.drp.libwrite.cut import Cut
 from aar.drp.libwrite.errors import CODES, ProjectWriteError, by_caller, refusing
 from aar.drp.libwrite.ops import OPENED, OPERATIONS, UNOPENED, Operation, unopened
-from aar.drp.libwrite.place import Placed, check_project_name, place_project
+from aar.drp.libwrite.place import (
+    Placed,
+    check_created,
+    check_project_name,
+    created_file,
+    place_project,
+)
 from aar.drp.libwrite.seed import Seed, read_seed
 from aar.drp.libwrite.verify import verify_written
 from aar.drp.libwrite.write import Built, ItemSpec, build_project, operations_for
@@ -122,7 +128,11 @@ def make_project(
     @refusing("bad_input", "building the project", "this is a writer bug; report the seed")
     def build(path: Path) -> ProjectResult[_X]:
         _stage_seed(seed_path, path, opts)
+        # Every later step opens the staged file by its name: each is checked to have acted on
+        # the file staged here (the placement compares it again before it changes modes).
+        made = created_file(path)
         seed = read_seed(path, options=opts)
+        check_created(path, made, "after reading the seed")
         authored = by_caller(author, seed)
         if authored.items and not authored.cuts:
             raise ProjectWriteError(
@@ -150,6 +160,7 @@ def make_project(
             clips=authored.clips,
             items=authored.items,
         )
+        check_created(path, made, "after writing its rows")
         drp = check_written(
             path,
             seed,
@@ -158,6 +169,7 @@ def make_project(
             project_name=project_name,
             allowed_issues=allowed_issues,
         )
+        check_created(path, made, "after reading it back")
         verify_written(
             path,
             seed,
@@ -166,11 +178,15 @@ def make_project(
             project_name=project_name,
             timeline_name=timeline_name,
         )
+        check_created(path, made, "after verifying it")
         extra = by_caller(check, path, seed, authored)
-        placed_stub = Placed(path, path.parent, "")
+        check_created(path, made, "after the caller's check")
+        placed_stub = Placed(path, path.parent, "", file_id=made)
         return ProjectResult(placed_stub, built, seed, authored, drp, extra)
 
-    placed, result = place_project(library, project_name, build, user=user)
+    placed, result = place_project(
+        library, project_name, build, user=user, file_id=lambda r: r.placed.file_id
+    )
     result.placed = placed
     result.built = Built(placed.path, result.built.project_id, result.built.operations)
     return result

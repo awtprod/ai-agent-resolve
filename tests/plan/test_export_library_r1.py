@@ -116,8 +116,8 @@ def test_an_export_placed_despite_a_late_rename_error_reports_it_placed(
     paths = base._setup(tmp_path)
     real = place._move
 
-    def late(folder: Path, target: Path) -> None:
-        real(folder, target)
+    def late(folder: Path, target: Path, **kwargs: Any) -> None:
+        real(folder, target, **kwargs)
         raise OSError(errno.EIO, "the share answered late")
 
     monkeypatch.setattr(place, "_move", late)

@@ -202,7 +202,9 @@ def run(
             if shape.refused is not None:
                 refused[f"{shape.kind or 'other'}: {shape.refused}"[:120]] += 1
                 continue
-            targets.append(_Target(items.path.name, items, rows, shape, bool(links_of(rows.item))))
+            # A project is its resolved full path: every library project's file is Project.db.
+            project = str(Path(items.path).resolve())
+            targets.append(_Target(project, items, rows, shape, bool(links_of(rows.item))))
     board = ItemScoreboard([], dict(refused), notes=notes)
     by_group: dict[str, GroupScore] = {}
     pools: dict[tuple[str | None, bool], list[_Target]] = defaultdict(list)

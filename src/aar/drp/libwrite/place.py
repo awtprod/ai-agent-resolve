@@ -15,6 +15,18 @@ the owner and group) of the library's own projects, and renames the folder into 
 replacing anything (``renameat2(RENAME_NOREPLACE)`` where the system has it, Windows' own
 rename, else a rename right after a fresh check).
 
+The placement acts only on what it created. A staging folder that already exists is used only
+when this user owns it and it is writable no more widely than the ``Projects`` folder (one this
+placement makes is private, as are its build folders). The build folder, the project folder and
+``Project.db`` are recorded (device and inode) when made; modes and owners are changed only
+through descriptors opened without following a link (``O_NOFOLLOW``, ``O_DIRECTORY``) and
+checked with ``fstat`` to be that very folder or file (a regular file with one name, this
+user's), the rename's source is named relative to the build folder's checked descriptor, the
+build folder is removed only when it is still the one made, and the placed file is read
+(:func:`read_placed`) only when it is the one written: anything else is ``library_unwritable``
+naming it. Windows has no ``O_NOFOLLOW`` or ``dir_fd``: there the same identities are checked
+on the paths (never a link or junction), and modes follow the share's.
+
 Two placements of names that fold to the same name are serialised by a lock file in the staging
 folder (``lock-<hash of the folded name>``, created exclusively), held from the existence check
 through the rename and removed on every path; a second placement of such a name is refused
@@ -38,6 +50,7 @@ import secrets
 import shutil
 import stat
 import sys
+import time
 import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -53,10 +66,14 @@ __all__ = [
     "MAX_NAME",
     "MAX_NAME_BYTES",
     "STAGING",
+    "FileId",
     "Placed",
+    "check_created",
     "check_project_name",
+    "created_file",
     "fold_name",
     "place_project",
+    "read_placed",
 ]
 
 #: The staging folder's name, inside ``Resolve Projects`` (beside ``Users``).
@@ -69,7 +86,12 @@ MAX_NAME_BYTES = 255
 #: The most entries looked at in one ``Projects`` folder or in the staging folder.
 _MAX_ENTRIES = 20_000
 _LOCK = "lock-"
+#: How many times a placement makes the staging folder again when another export's cleanup
+#: removed it (empty) between this placement's check and its lock.
+_ROOT_TRIES = 8
 _T = TypeVar("_T")
+#: A file's or folder's identity: ``(st_dev, st_ino)``.
+FileId = tuple[int, int]
 
 
 @dataclass
@@ -87,6 +109,19 @@ class Placed:
     #: What could not be removed after the project was placed (delete it by hand), and other
     #: notes of the placement.
     cleanup: list[str] = field(default_factory=list)
+    #: The identity of the ``Project.db`` this placement wrote (:func:`read_placed`).
+    file_id: FileId | None = None
+
+
+@dataclass
+class _Made:
+    """The identities of what this placement made, recorded when each was made."""
+
+    work: FileId | None = None
+    folder: FileId | None = None
+    #: Whether this placement made the staging folder or accepted it (:func:`_check_root`):
+    #: only then may its cleanup remove it when empty.
+    root: bool = False
 
 
 def _refuse(code: str, message: str, hint: str, **details: object) -> ProjectWriteError:
@@ -274,6 +309,186 @@ def _projects_dir(library: Path, user: str | None) -> tuple[Path, Path, str]:
     return users.parent, users / found[0] / "Projects", found[0]
 
 
+def _windows() -> bool:
+    return sys.platform == "win32"
+
+
+#: The errors of an ``open`` without following links that say the name is not what was made:
+#: a link (``ELOOP``; ``EMLINK`` on some BSDs), not a folder, or gone.
+_NOT_OURS = frozenset({errno.ELOOP, errno.EMLINK, errno.ENOTDIR, errno.ENOENT})
+
+
+def _replaced(what: str, path: Path, why: str) -> ProjectWriteError:
+    return _refuse(
+        "library_unwritable",
+        f"{what} {path} is not the one this export made ({why}); something changed it while "
+        "the export ran, and nothing more was done with it",
+        "check who else can write to the library's staging folder (Resolve Projects/"
+        f"{STAGING}) and export again",
+        path=str(path),
+    )
+
+
+def _checked(
+    st: os.stat_result, what: str, path: Path, made: FileId | None, *, folder: bool
+) -> FileId:
+    """``st``'s identity when it is a folder (``folder``) or a regular file, and the object
+    recorded as ``made``; when nothing is recorded yet (first sight, right after this
+    placement made it), a file must have one name and, on POSIX, belong to this user (later
+    the placement may have given it the library's owner: the identity is the proof then).
+    :func:`_replaced` otherwise."""
+    if folder and not stat.S_ISDIR(st.st_mode):
+        raise _replaced(what, path, "not a folder")
+    if not folder and not stat.S_ISREG(st.st_mode):
+        raise _replaced(what, path, "not a regular file")
+    ident = (st.st_dev, st.st_ino)
+    if made is not None:
+        if ident != made:
+            raise _replaced(what, path, "another file or folder is in its place")
+        return ident
+    if not folder and st.st_nlink != 1:
+        raise _replaced(what, path, f"a file with {st.st_nlink} names (a hard link)")
+    if not _windows() and st.st_uid != os.geteuid():
+        raise _replaced(what, path, f"it belongs to uid {st.st_uid}")
+    return ident
+
+
+def _open_own(
+    name: Path | str,
+    what: str,
+    path: Path,
+    made: FileId | None,
+    *,
+    folder: bool,
+    dir_fd: int | None = None,
+) -> tuple[int, FileId]:
+    """POSIX only: a descriptor of ``name`` (relative to ``dir_fd`` when given) opened without
+    following a link, and its identity, checked by :func:`_checked`; the caller closes it."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    if folder:
+        flags |= os.O_DIRECTORY
+    try:
+        fd = os.open(name, flags) if dir_fd is None else os.open(name, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno in _NOT_OURS:
+            why = f"{exc.strerror or exc} when opened without following a link"
+            raise _replaced(what, path, why) from None
+        raise
+    try:
+        return fd, _checked(os.fstat(fd), what, path, made, folder=folder)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _identify(path: Path, what: str, made: FileId | None, *, folder: bool) -> FileId:
+    """The identity of ``path``, checked by :func:`_checked`: on POSIX through a descriptor
+    opened without following a link; on Windows (no ``O_NOFOLLOW``) on the path itself, which
+    must not be a link or junction."""
+    if _windows():
+        if _is_link(path):
+            raise _replaced(what, path, "a symbolic link or junction")
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            raise _replaced(what, path, "it is gone") from None
+        return _checked(st, what, path, made, folder=folder)
+    fd, ident = _open_own(path, what, path, made, folder=folder)
+    os.close(fd)
+    return ident
+
+
+_STAGED = "the staged Project.db"
+
+
+@refusing("library_unwritable", "recording the staged project", "check the library")
+def created_file(path: Path) -> FileId:
+    """The identity of the ``Project.db`` a build has just created at ``path`` (a regular file
+    with one name, this user's, not a link): what :func:`check_created` and the placement
+    compare it with later."""
+    return _identify(Path(path), _STAGED, None, folder=False)
+
+
+@refusing("library_unwritable", "checking the staged project", "check the library")
+def check_created(path: Path, made: FileId, step: str) -> None:
+    """Refuse (``library_unwritable``) when ``path`` is no longer the file :func:`created_file`
+    recorded as ``made``; ``step`` says when."""
+    _identify(Path(path), f"{_STAGED} ({step})", made, folder=False)
+
+
+@refusing("library_unwritable", "reading the placed project", "check the library")
+def read_placed(placed: Placed) -> bytes:
+    """The bytes of the placed ``Project.db``, read only when it is the file the placement
+    wrote (:attr:`Placed.file_id`; on POSIX through a descriptor opened without following a
+    link); ``library_unwritable`` otherwise (the project folder is placed, but its file is not
+    what was written)."""
+    what = f"the placed Project.db (the project folder is placed at {placed.folder})"
+    if _windows():
+        _identify(placed.path, what, placed.file_id, folder=False)
+        data = placed.path.read_bytes()
+        _identify(placed.path, what, placed.file_id, folder=False)
+        return data
+    fd, _ = _open_own(placed.path, what, placed.path, placed.file_id, folder=False)
+    with os.fdopen(fd, "rb") as handle:
+        return handle.read()
+
+
+def _check_root(root: Path, library: Path, projects: Path) -> None:
+    """Refuse a staging folder that is a link, not a folder or not inside the library, that
+    this user does not own, or that others can write to more widely than the library's
+    ``Projects`` folder allows (the last two on POSIX; on Windows the share's ACLs decide). One
+    ``lstat``: a folder that is gone raises ``FileNotFoundError``."""
+    st = os.lstat(root)
+    if stat.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & getattr(
+        stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+    ):
+        raise _refuse(
+            "library_unwritable",
+            f"the staging folder {root} is a symbolic link or junction",
+            "aar places projects only in the library's own folders: delete the link (aar makes "
+            "its own staging folder)",
+        )
+    if not stat.S_ISDIR(st.st_mode):
+        raise _refuse(
+            "library_unwritable", f"the staging folder {root} is not a folder", "check the library"
+        )
+    _inside(root, library, "the staging folder")
+    if _windows():
+        return
+    me = os.geteuid()
+    hint = (
+        "aar uses only a staging folder of its own: when no export is running, delete it (the "
+        "next export makes a private one)"
+    )
+    if st.st_uid != me:
+        raise _refuse(
+            "library_unwritable",
+            f"the staging folder {root} belongs to uid {st.st_uid}, not to this user (uid {me})",
+            hint + ", or export as its owner",
+            folder=str(root),
+        )
+    mode = stat.S_IMODE(st.st_mode)
+    allowed = stat.S_IMODE(os.stat(projects).st_mode)
+    wider = mode & 0o022 & ~allowed
+    if wider:
+        who = " and ".join(w for bit, w in ((0o020, "its group"), (0o002, "anyone")) if wider & bit)
+        raise _refuse(
+            "library_unwritable",
+            f"the staging folder {root} (mode {mode:o}) can be written by {who}, more widely "
+            f"than the library's Projects folder allows (mode {allowed:o})",
+            hint + ", or make it no more open than the Projects folder",
+            folder=str(root),
+        )
+
+
+def _vanished(exc: OSError) -> bool:
+    """Whether ``exc`` says the staging folder was gone (another export's cleanup removed it
+    while it was empty; a third may have made it again since, so it is not looked at again).
+    On Windows a folder being removed refuses access until it is gone, so ``PermissionError``
+    counts there too (the tries are bounded: a real refusal is reported after the last)."""
+    return isinstance(exc, FileNotFoundError) or (_windows() and isinstance(exc, PermissionError))
+
+
 def _reference(projects: Path) -> tuple[os.stat_result, os.stat_result | None]:
     """The stat of a project folder already in the library and of its ``Project.db`` (the
     pattern to follow), or of the ``Projects`` folder itself when it holds none."""
@@ -289,37 +504,72 @@ def _reference(projects: Path) -> tuple[os.stat_result, os.stat_result | None]:
     return os.stat(projects), None
 
 
-def _apply_pattern(folder: Path, db: Path, projects: Path) -> list[str]:
-    """Give ``folder`` and ``db`` the mode, owner and group of the library's own projects;
-    return what was set or why it was not."""
-    if sys.platform == "win32":
-        return ["permissions follow the share's (Windows)"]
+def _apply_pattern(folder_fd: int, db_fd: int, projects: Path) -> list[str]:
+    """POSIX: give the folder and the file (descriptors checked by :func:`_open_own`) the mode,
+    owner and group of the library's own projects; return what was set or why it was not."""
     ref_dir, ref_db = _reference(projects)
     dir_mode = stat.S_IMODE(ref_dir.st_mode)
     file_mode = stat.S_IMODE(ref_db.st_mode) if ref_db is not None else dir_mode & 0o666
     notes = []
-    os.chmod(db, file_mode)
-    os.chmod(folder, dir_mode)
+    os.fchmod(db_fd, file_mode)
+    os.fchmod(folder_fd, dir_mode)
     notes.append(f"mode {dir_mode:o} on the folder and {file_mode:o} on Project.db")
-    for path in (db, folder):
-        mine = os.stat(path)
+    for fd, label in ((db_fd, "Project.db"), (folder_fd, "project")):
+        mine = os.fstat(fd)
         if (mine.st_uid, mine.st_gid) == (ref_dir.st_uid, ref_dir.st_gid):
             continue
         try:
-            os.chown(path, ref_dir.st_uid, ref_dir.st_gid)
+            os.fchown(fd, ref_dir.st_uid, ref_dir.st_gid)
         except PermissionError:
             try:
-                os.chown(path, -1, ref_dir.st_gid)
+                os.fchown(fd, -1, ref_dir.st_gid)
                 notes.append(
-                    f"{path.name}: owner left as uid {mine.st_uid} (the library's is "
+                    f"{label}: owner left as uid {mine.st_uid} (the library's is "
                     f"{ref_dir.st_uid}; only root may change it), group set"
                 )
             except PermissionError:
                 notes.append(
-                    f"{path.name}: owner and group left as {mine.st_uid}:{mine.st_gid} (the "
+                    f"{label}: owner and group left as {mine.st_uid}:{mine.st_gid} (the "
                     f"library's are {ref_dir.st_uid}:{ref_dir.st_gid}; not permitted)"
                 )
     return notes
+
+
+def _settle(
+    work: Path, folder: Path, made: _Made, expected: FileId | None, projects: Path
+) -> tuple[list[str], FileId]:
+    """Check that the build folder, the project folder and its ``Project.db`` are the ones this
+    placement made (``expected``: the file's identity as the build recorded it) and give them
+    the library's modes; return the notes and the file's identity."""
+    db = folder / "Project.db"
+    if _windows():
+        _identify(work, "the build folder", made.work, folder=True)
+        _identify(folder, "the built project folder", made.folder, folder=True)
+        return ["permissions follow the share's (Windows)"], _identify(
+            db, "the built Project.db", expected, folder=False
+        )
+    work_fd, _ = _open_own(work, "the build folder", work, made.work, folder=True)
+    try:
+        folder_fd, _ = _open_own(
+            folder.name,
+            "the built project folder",
+            folder,
+            made.folder,
+            folder=True,
+            dir_fd=work_fd,
+        )
+        try:
+            db_fd, ident = _open_own(
+                db.name, "the built Project.db", db, expected, folder=False, dir_fd=folder_fd
+            )
+            try:
+                return _apply_pattern(folder_fd, db_fd, projects), ident
+            finally:
+                os.close(db_fd)
+        finally:
+            os.close(folder_fd)
+    finally:
+        os.close(work_fd)
 
 
 def _exists(projects: Path, name: str) -> str | None:
@@ -415,16 +665,17 @@ _UNAVAILABLE = frozenset(
     {errno.ENOSYS, errno.EINVAL, errno.EPERM, errno.EOPNOTSUPP, getattr(errno, "ENOTSUP", 95)}
 )
 #: The C library's ``renameat2`` once looked up: unset, None (none here) or the call.
-_NOREPLACE: list[Callable[[bytes, bytes], tuple[int, int]] | None] = []
+_NOREPLACE: list[Callable[..., tuple[int, int]] | None] = []
 
 
-def _renameat2() -> Callable[[bytes, bytes], tuple[int, int]] | None:
+def _renameat2() -> Callable[..., tuple[int, int]] | None:
     """Linux's ``renameat2`` from the C library already loaded in the process (no search and
     no subprocess: ``CDLL(None)``), looked up at first use; None where there is none (another
-    system, or a C library without the symbol). The call returns ``(result, errno)``."""
+    system, or a C library without the symbol). The call ``(old, new, old_dir=AT_FDCWD)``
+    returns ``(result, errno)``; ``old`` is relative to the descriptor ``old_dir``."""
     if _NOREPLACE:
         return _NOREPLACE[0]
-    found: Callable[[bytes, bytes], tuple[int, int]] | None = None
+    found: Callable[..., tuple[int, int]] | None = None
     if sys.platform.startswith("linux"):
         import ctypes
 
@@ -442,8 +693,8 @@ def _renameat2() -> Callable[[bytes, bytes], tuple[int, int]] | None:
             ]
             func.restype = ctypes.c_int
 
-            def call(old: bytes, new: bytes) -> tuple[int, int]:
-                result = int(func(_AT_FDCWD, old, _AT_FDCWD, new, _RENAME_NOREPLACE))
+            def call(old: bytes, new: bytes, old_dir: int = _AT_FDCWD) -> tuple[int, int]:
+                result = int(func(old_dir, old, _AT_FDCWD, new, _RENAME_NOREPLACE))
                 return result, ctypes.get_errno()
 
             found = call
@@ -451,9 +702,11 @@ def _renameat2() -> Callable[[bytes, bytes], tuple[int, int]] | None:
     return found
 
 
-def _move(folder: Path, target: Path) -> None:
+def _move(folder: Path, target: Path, *, anchor: int | None = None) -> None:
     """Rename ``folder`` to ``target``, never replacing a project there: ``FileExistsError``
-    (or ``OSError`` with ``EEXIST``/``ENOTEMPTY``) when ``target`` exists.
+    (or ``OSError`` with ``EEXIST``/``ENOTEMPTY``) when ``target`` exists. With ``anchor`` (a
+    descriptor of ``folder``'s parent, POSIX) the source is ``folder``'s name in that folder,
+    so a parent swapped by its name meanwhile cannot change what is moved.
 
     Linux: ``renameat2(RENAME_NOREPLACE)``; when that call is not available here
     (:data:`_UNAVAILABLE`) a rename right after a fresh check, which cannot replace a project
@@ -462,17 +715,47 @@ def _move(folder: Path, target: Path) -> None:
     replaces an existing folder."""
     noreplace = _renameat2()
     if noreplace is not None:
-        result, code = noreplace(os.fsencode(folder), os.fsencode(target))
+        if anchor is None:
+            result, code = noreplace(os.fsencode(folder), os.fsencode(target))
+        else:
+            result, code = noreplace(os.fsencode(folder.name), os.fsencode(target), anchor)
         if result == 0:
             return
         if code not in _UNAVAILABLE:
             raise OSError(code, os.strerror(code), str(folder), None, str(target))
     if sys.platform != "win32" and (os.path.lexists(target) or _is_link(target)):
         raise FileExistsError(errno.EEXIST, "exists", str(target))
-    os.rename(folder, target)
+    if anchor is None:
+        os.rename(folder, target)
+    else:
+        os.rename(folder.name, target, src_dir_fd=anchor)
 
 
-def _identity(path: Path) -> tuple[int, int]:
+def _move_own(work: Path, folder: Path, target: Path, made: _Made) -> None:
+    """Rename this placement's project folder (checked to be the one made, in the build folder
+    made) to ``target``: on POSIX named relative to the build folder's checked descriptor."""
+    if _windows():
+        _identify(work, "the build folder", made.work, folder=True)
+        _identify(folder, "the built project folder", made.folder, folder=True)
+        _move(folder, target)
+        return
+    work_fd, _ = _open_own(work, "the build folder", work, made.work, folder=True)
+    try:
+        folder_fd, _ = _open_own(
+            folder.name,
+            "the built project folder",
+            folder,
+            made.folder,
+            folder=True,
+            dir_fd=work_fd,
+        )
+        os.close(folder_fd)
+        _move(folder, target, anchor=work_fd)
+    finally:
+        os.close(work_fd)
+
+
+def _identity(path: Path) -> FileId:
     st = os.lstat(path)
     return st.st_dev, st.st_ino
 
@@ -497,9 +780,12 @@ def place_project(
     build: Callable[[Path], _T],
     *,
     user: str | None = None,
+    file_id: Callable[[_T], FileId | None] | None = None,
 ) -> tuple[Placed, _T]:
     """Build a project with ``build(path)`` (it writes ``path``, a ``Project.db`` in the staging
     folder, and runs its checks) and place it as project ``name``; see the module docstring.
+    ``file_id`` gives, from what ``build`` returned, the identity of ``Project.db`` as the
+    build created it (:func:`created_file`): the placement refuses another file in its place.
     Raises :class:`ProjectWriteError`: ``not_a_library``, ``bad_project_name``,
     ``project_exists``, ``library_unwritable``, or whatever ``build`` raises (with what could
     not be removed named on it)."""
@@ -511,29 +797,12 @@ def place_project(
     claim = _Lock(root / _lock_name(name), f"{secrets.token_hex(16)} {os.getpid()}\n".encode())
     placed = Placed(projects / name / "Project.db", projects / name, user_name)
     work: Path | None = None
-    moving: dict[str, tuple[int, int]] = {}
+    made = _Made()
+    moving: dict[str, FileId] = {}
     # From the first statement that may make something in the library (the staging folder)
     # to the end of the cleanup, everything runs inside this one handler.
     try:
-        try:
-            root.mkdir(exist_ok=True)
-            _real_folder(root, "the staging folder", "library_unwritable")
-            _inside(root, library, "the staging folder")
-            placed.leftovers = sorted(_listdir(root))
-        except OSError as exc:
-            raise _refuse(
-                "library_unwritable",
-                f"cannot make a staging folder in {root.parent}: {exc}",
-                "check that the library is writable and has room",
-            ) from None
-        try:
-            _take_lock(root, claim, name)
-        except OSError as exc:
-            raise _refuse(
-                "library_unwritable",
-                f"cannot make a lock in the staging folder {root}: {exc}",
-                "check that the library is writable and has room",
-            ) from None
+        _stage_and_lock(library, root, projects, claim, name, placed, made)
         clash = _exists(projects, name)
         if clash is not None:
             raise _refuse(
@@ -544,7 +813,7 @@ def place_project(
             )
         work = root / f"build-{secrets.token_hex(8)}"
         try:
-            work.mkdir()
+            work.mkdir(mode=0o700)
         except OSError as exc:
             work = None  # not made by this placement: never removed by it
             raise _refuse(
@@ -552,10 +821,13 @@ def place_project(
                 f"cannot make a staging folder in {root}: {exc}",
                 "check that the library is writable and has room",
             ) from None
-        result = _build_and_rename(library, work, projects, name, build, placed, moving)
-        residue, interrupt = _cleanup(work, claim, root)
+        made.work = _identify(work, "the build folder", None, folder=True)
+        result = _build_and_rename(
+            library, work, projects, name, build, placed, moving, made, file_id
+        )
+        residue, interrupt = _cleanup(work, claim, root, made)
     except BaseException as exc:
-        residue, interrupt = _cleanup(work, claim, root)
+        residue, interrupt = _cleanup(work, claim, root, made)
         if not isinstance(exc, Exception) and _moved(moving, placed.folder):
             # An interrupt after the rename: the project is placed; say so.
             _note_placed(exc, placed, residue)
@@ -592,7 +864,55 @@ def place_project(
     return placed, result
 
 
-def _moved(moving: dict[str, tuple[int, int]], target: Path) -> bool:
+def _stage_and_lock(
+    library: Path,
+    root: Path,
+    projects: Path,
+    claim: _Lock,
+    name: str,
+    placed: Placed,
+    made: _Made,
+) -> None:
+    """Make (private) or accept the staging folder (:func:`_check_root`) and take the lock of
+    the folded name. Another export's cleanup may remove the staging folder while it is empty,
+    right after this one checked it: then it is made again, at most :data:`_ROOT_TRIES` times,
+    so exports of different names never fail each other over it."""
+    for attempt in range(1, _ROOT_TRIES + 1):
+        last = attempt == _ROOT_TRIES
+        again = f" (tried {attempt} times)" if last else ""
+        try:
+            try:
+                root.mkdir(mode=0o700)
+                made.root = True
+            except FileExistsError:
+                made.root = False
+            _check_root(root, library, projects)
+            made.root = True
+            placed.leftovers = sorted(_listdir(root))
+        except OSError as exc:
+            if not last and _vanished(exc):
+                time.sleep(0.002 * attempt)
+                continue
+            raise _refuse(
+                "library_unwritable",
+                f"cannot make a staging folder in {root.parent}: {exc}{again}",
+                "check that the library is writable and has room",
+            ) from None
+        try:
+            _take_lock(root, claim, name)
+        except OSError as exc:
+            if not last and _vanished(exc):
+                time.sleep(0.002 * attempt)
+                continue
+            raise _refuse(
+                "library_unwritable",
+                f"cannot make a lock in the staging folder {root}: {exc}{again}",
+                "check that the library is writable and has room",
+            ) from None
+        return
+
+
+def _moved(moving: dict[str, FileId], target: Path) -> bool:
     """Whether the folder this placement was renaming is at ``target`` now."""
     mine = moving.get("folder")
     return mine is not None and _placed_anyway(target, mine)
@@ -622,10 +942,27 @@ def _remove_root(root: Path) -> str | None:
     return None
 
 
-def _cleanup(work: Path | None, claim: _Lock, root: Path) -> tuple[list[str], BaseException | None]:
-    """Remove the build folder, then this placement's lock, then the staging folder if it is
-    empty. Returns what is left and an interrupt that landed meanwhile. A lock this placement
-    may have made but cannot be sure of (:func:`_lock_left`) is named, never removed."""
+def _remove_work(work: Path, made: _Made) -> str | None:
+    """Remove the build folder when it is the one this placement made; one put in its place
+    is named, never removed."""
+    if made.work is not None and os.path.lexists(work):
+        try:
+            _identify(work, "the build folder", made.work, folder=True)
+        except ProjectWriteError:
+            return (
+                f"{work} (not removed: it is not the build folder this export made; something "
+                "put it in its place)"
+            )
+    return _remove(work)
+
+
+def _cleanup(
+    work: Path | None, claim: _Lock, root: Path, made: _Made
+) -> tuple[list[str], BaseException | None]:
+    """Remove the build folder (:func:`_remove_work`), then this placement's lock, then the
+    staging folder if it is empty. Returns what is left and an interrupt that landed meanwhile.
+    A lock this placement may have made but cannot be sure of (:func:`_lock_left`) is named,
+    never removed."""
     residue: list[str] = []
     interrupt: BaseException | None = None
 
@@ -645,7 +982,7 @@ def _cleanup(work: Path | None, claim: _Lock, root: Path) -> tuple[list[str], Ba
             residue.append(problem)
 
     if work is not None:
-        attempt(work, lambda: _remove(work))
+        attempt(work, lambda: _remove_work(work, made))
 
     def lock_step() -> str | None:
         left = _lock_left(claim)
@@ -659,7 +996,9 @@ def _cleanup(work: Path | None, claim: _Lock, root: Path) -> tuple[list[str], Ba
         return None
 
     attempt(claim.path, lock_step)
-    if not residue:  # else the staging folder holds what is named (each path is inside it)
+    # Else the staging folder holds what is named (each path is inside it), or it is not this
+    # placement's to remove (one it refused).
+    if not residue and made.root:
         attempt(root, lambda: _remove_root(root))
     return residue, interrupt
 
@@ -671,7 +1010,9 @@ def _build_and_rename(
     name: str,
     build: Callable[[Path], _T],
     placed: Placed,
-    moving: dict[str, tuple[int, int]],
+    moving: dict[str, FileId],
+    made: _Made,
+    file_id: Callable[[_T], FileId | None] | None,
 ) -> _T:
     if os.stat(work).st_dev != os.stat(projects).st_dev:
         raise _refuse(
@@ -680,9 +1021,11 @@ def _build_and_rename(
             "keep the library's Resolve Projects folder on one file system",
         )
     folder = work / "project"
-    folder.mkdir()
+    folder.mkdir(mode=0o700)
+    made.folder = _identify(folder, "the built project folder", None, folder=True)
     result = by_caller(build, folder / "Project.db")
-    placed.permissions = _apply_pattern(folder, folder / "Project.db", projects)
+    expected = file_id(result) if file_id is not None else None
+    placed.permissions, placed.file_id = _settle(work, folder, made, expected, projects)
     # Again right before the move: nothing on the way may have become a link meanwhile.
     _, again, _ = _projects_dir(library, placed.user)
     if again != projects:
@@ -700,10 +1043,11 @@ def _build_and_rename(
             folder=clash,
         )
     target = projects / name
-    mine = _identity(folder)
+    mine = made.folder
+    assert mine is not None
     moving["folder"] = mine
     try:
-        _move(folder, target)
+        _move_own(work, folder, target, made)
     except OSError as exc:
         if _placed_anyway(target, mine):
             # The rename reported an error but the folder is in place (a share that answers
@@ -722,7 +1066,7 @@ def _build_and_rename(
     return result
 
 
-def _placed_anyway(target: Path, mine: tuple[int, int]) -> bool:
+def _placed_anyway(target: Path, mine: FileId) -> bool:
     """Whether ``target`` is the very folder that was being moved (same device and inode)."""
     try:
         here = _identity(target)

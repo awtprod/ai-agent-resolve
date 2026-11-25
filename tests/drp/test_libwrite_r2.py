@@ -106,7 +106,7 @@ def test_an_interrupt_between_making_the_lock_and_recording_it_names_the_lock(
     assert any(str(lock) in note for note in info.value.__notes__)
 
 
-@pytest.mark.parametrize("step", ["_listdir", "_real_folder", "_inside"])
+@pytest.mark.parametrize("step", ["_listdir", "_check_root", "_inside"])
 def test_an_interrupt_right_after_the_staging_folder_is_made_removes_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: str
 ) -> None:
@@ -130,8 +130,8 @@ def test_an_interrupt_right_after_the_rename_says_the_project_is_placed(
     library = make_library(tmp_path / "lib")
     real = place._move
 
-    def moved_then_interrupted(folder: Path, target: Path) -> None:
-        real(folder, target)
+    def moved_then_interrupted(folder: Path, target: Path, **kwargs: Any) -> None:
+        real(folder, target, **kwargs)
         raise KeyboardInterrupt
 
     monkeypatch.setattr(place, "_move", moved_then_interrupted)
@@ -164,7 +164,7 @@ def test_an_empty_staging_folder_that_cannot_be_removed_is_named(
 
 
 def _renameat2_failing(code: int) -> Callable[[], Callable[[bytes, bytes], tuple[int, int]]]:
-    return lambda: lambda old, new: (-1, code)
+    return lambda: lambda old, new, *anchor: (-1, code)
 
 
 @pytest.mark.parametrize(

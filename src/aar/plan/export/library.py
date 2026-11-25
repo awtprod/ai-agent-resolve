@@ -41,6 +41,7 @@ from aar.drp.libwrite import (
 )
 from aar.drp.libwrite.cut import Cut, ItemTemplates, author_cut, pick_item_templates
 from aar.drp.libwrite.ops import OPERATIONS, unopened
+from aar.drp.libwrite.place import read_placed
 from aar.drp.libwrite.seed import Seed
 from aar.drp.mediapool import formulas as fm
 from aar.drp.mediapool.author import AuthoredClip, Placement, Template, author
@@ -589,7 +590,8 @@ def _report(
     res = plan.resolution
     built = result.built
     try:  # the project is placed: a failure to hash it is reported, not a refusal
-        digest: str | None = hashlib.sha256(result.placed.path.read_bytes()).hexdigest()
+        # Read only when it is the file the placement wrote (else a typed refusal).
+        digest: str | None = hashlib.sha256(read_placed(result.placed)).hexdigest()
     except OSError as exc:
         digest = None
         result.placed.cleanup.append(f"the placed Project.db could not be read to hash it: {exc}")

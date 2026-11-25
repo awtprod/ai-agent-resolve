@@ -378,8 +378,8 @@ def test_an_error_reported_by_a_rename_that_happened_is_a_placed_project(
     seed = _seed(tmp_path)
     real_move = place._move
 
-    def late(folder: Path, target: Path) -> None:
-        real_move(folder, target)
+    def late(folder: Path, target: Path, **kwargs: Any) -> None:
+        real_move(folder, target, **kwargs)
         raise OSError(errno.EIO, "the share answered late")
 
     monkeypatch.setattr(place, "_move", late)
@@ -683,7 +683,7 @@ def test_a_move_refused_as_not_empty_is_project_exists(
     library = make_library(tmp_path / "lib")
     monkeypatch.setattr(place, "_renameat2", lambda: None)
 
-    def rename(src: Any, dst: Any) -> None:
+    def rename(src: Any, dst: Any, **kwargs: Any) -> None:
         raise OSError(errno.ENOTEMPTY, "Directory not empty", str(dst))
 
     monkeypatch.setattr(place.os, "rename", rename)
