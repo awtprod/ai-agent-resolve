@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 from aar.drp.model import DrpFile, Marker, MediaClip, Timeline, TimelineItem
 
-__all__ = ["describe", "frames_to_timecode", "printable"]
+__all__ = ["describe", "frames_to_timecode", "printable", "quote"]
 
 DEFAULT_MAX_ITEMS = 200
 _MAX_ISSUES = 25
@@ -37,6 +37,14 @@ def printable(text: str) -> str:
                 else f"\\U{code:08x}"
             )
     return "".join(out)
+
+
+def quote(text: str | None, missing: str = "?") -> str:
+    """``text`` in double quotes, with ``\\`` and ``"`` escaped, so a name from the file can
+    never close its quotes early and read as more fields of the line (``missing`` if None)."""
+    if text is None:
+        text = missing
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def frames_to_timecode(frame: int, fps: float | None) -> str:
@@ -70,16 +78,22 @@ def describe(drp: DrpFile, *, max_items: int = DEFAULT_MAX_ITEMS) -> str:
     out = lines.append
     v = drp.versions
     stamp = f"Resolve {v.app_version or '?'} (DbPrjVer {v.project_version})" if v else "no version"
-    out(
-        f"{drp.kind.upper()} file ({drp.kind_source}): {stamp}; {drp.size} bytes; "
-        f"{sum(1 for m in drp.members if m.role != 'directory')} members"
-    )
-    if not drp.is_zip:
+    if drp.kind == "library":
+        out(
+            f"LIBRARY project (Resolve disk library, SQLite Project.db): project version "
+            f"{v.project_version if v else '?'}; {drp.size} bytes; read from a settled snapshot"
+        )
+    else:
+        out(
+            f"{drp.kind.upper()} file ({drp.kind_source}): {stamp}; {drp.size} bytes; "
+            f"{sum(1 for m in drp.members if m.role != 'directory')} members"
+        )
+    if not drp.is_zip and drp.kind != "library":
         out(f"not a zip archive; leading bytes {drp.head_hex} ({drp.signature or 'unknown'})")
     if drp.project is not None:
         p = drp.project
         hint = f"; project frame rate {p.frame_rate_hint} (inferred)" if p.frame_rate_hint else ""
-        out(f'project "{p.name or "?"}"{hint}; project settings blob not decoded')
+        out(f"project {quote(p.name or None)}{hint}; project settings blob not decoded")
 
     media = drp.media_by_id()
     file_clips = [m for m in drp.media if m.type in ("video", "audio", "still", "other")]
@@ -87,7 +101,7 @@ def describe(drp: DrpFile, *, max_items: int = DEFAULT_MAX_ITEMS) -> str:
     counts = ", ".join(f"{n} {t}" for t, n in sorted(type_counts.items())) or "none"
     out(f"media pool: {len(drp.bins)} bin(s), {len(drp.media)} item(s) ({counts})")
     for b in drp.bins:
-        out(f"  bin {b.path}: {len(b.clip_ids)} item(s)")
+        out(f"  bin {quote(b.path)}: {len(b.clip_ids)} item(s)")
     shown = file_clips if max_items <= 0 else file_clips[:max_items]
     for clip in shown:
         out("  " + _media_line(clip))
@@ -108,7 +122,7 @@ def describe(drp: DrpFile, *, max_items: int = DEFAULT_MAX_ITEMS) -> str:
     if problems:
         out(f"warnings: {len(problems)}")
         for i in problems[:_MAX_ISSUES]:
-            out(f"  [{i.severity}] {i.code}: {i.message}")
+            out(f"  [{i.severity}] {i.code}: {quote(i.message)}")
         if len(problems) > _MAX_ISSUES:
             out(f"  ... and {len(problems) - _MAX_ISSUES} more (see inspect --json)")
     if drp.raw_members:
@@ -120,7 +134,9 @@ def describe(drp: DrpFile, *, max_items: int = DEFAULT_MAX_ITEMS) -> str:
 
 
 def _media_line(clip: MediaClip) -> str:
-    bits = [f"[{clip.type}] {clip.name or '?'}"]
+    """One media clip. Every string from the file (name, codec, path) is quoted (:func:`quote`)
+    so none can read as more fields of the line."""
+    bits = [f"[{clip.type}] {quote(clip.name or None)}"]
     if clip.frames is not None:
         bits.append(f"{clip.frames} frames @ {_fmt_rate(clip.frame_rate)}")
     if clip.resolution:
@@ -129,10 +145,10 @@ def _media_line(clip: MediaClip) -> str:
         a = clip.audio_tracks[0]
         bits.append(f"audio {len(clip.audio_tracks)} trk {a.sample_rate or '?'} Hz {a.channels}ch")
     if clip.codec:
-        bits.append(f"codec {clip.codec}")
+        bits.append(f"codec {quote(clip.codec)}")
     elif clip.type in ("video", "audio"):
         bits.append("codec unknown")
-    bits.append(f"path {clip.path or '(none)'} [{clip.path_source}]")
+    bits.append(f"path {quote(clip.path) if clip.path else '(none)'} [{clip.path_source}]")
     return "; ".join(bits)
 
 
@@ -142,7 +158,10 @@ def _timeline_lines(tl: Timeline, media: dict[str, MediaClip], max_items: int) -
     def tc(frame: int) -> str:
         return frames_to_timecode(frame, fps)
 
-    head = f'{tl.kind.capitalize()} "{tl.name or "?"}": {_fmt_rate(fps)}, {_fmt_res(tl.resolution)}'
+    head = (
+        f"{tl.kind.capitalize()} {quote(tl.name or None)}: "
+        f"{_fmt_rate(fps)}, {_fmt_res(tl.resolution)}"
+    )
     if tl.start_frame is not None:
         head += f", start {tc(tl.start_frame)} (frame {tl.start_frame})"
     if tl.start_frame is not None and tl.end_frame is not None:
@@ -154,7 +173,7 @@ def _timeline_lines(tl: Timeline, media: dict[str, MediaClip], max_items: int) -
     if not tl.tracks:
         lines.append("  no tracks" + ("" if tl.member else " (no SeqContainer member)"))
     for track in tl.tracks:
-        name = f' "{track.name}"' if track.name else ""
+        name = f" {quote(track.name)}" if track.name else ""
         lines.append(f"  {track.label}{name}: {len(track.items)} item(s)")
         shown = track.items if max_items <= 0 else track.items[:max_items]
         for item in shown:
@@ -174,20 +193,25 @@ def _timeline_lines(tl: Timeline, media: dict[str, MediaClip], max_items: int) -
 
 
 def _item_line(item: TimelineItem, media: dict[str, MediaClip], tc: Callable[[int], str]) -> str:
+    """One timeline item. Its name, its media's name and an unresolved media id come from the
+    file and are quoted (:func:`quote`), so a name cannot add ``src``, ``speed`` or ``media``
+    fields to the line."""
     rec = (
         f"{tc(item.record_start)}-{tc(item.record_end)}"
         if item.record_start is not None and item.record_end is not None
         else "?"
     )
     label = item.name or item.pretty_type or item.kind
-    parts = [rec, f"{item.kind}", f'"{label}"']
+    parts = [rec, f"{item.kind}", quote(label)]
     if item.source_in is not None and item.source_out is not None and item.kind != "transition":
         parts.append(f"src {tc(item.source_in)}-{tc(item.source_out)}")
     if item.speed is not None and abs(item.speed - 1.0) > 1e-9:
         parts.append(f"speed {item.speed:.4g}x")
     if item.media_ref:
         clip = media.get(item.media_ref)
-        parts.append(f"media {clip.name!r}" if clip else f"UNRESOLVED media {item.media_ref}")
+        parts.append(
+            f"media {quote(clip.name)}" if clip else f"UNRESOLVED media {quote(item.media_ref)}"
+        )
     if item.kind == "audio" and item.media_track_index is not None:
         parts.append(f"ch {item.media_track_index}")
     return " ".join(parts)
@@ -200,7 +224,10 @@ def _marker_line(marker: Marker, timeline: tuple[int, float | None] | None) -> s
         where += f" ({frames_to_timecode(base + marker.frame, fps)})"
     else:
         where = f"marker at {marker.frame} ({marker.frame_space})"
-    text = " ".join(x for x in (marker.color or "", repr(marker.name), marker.note) if x)
+    # The colour, name and note come from the file: each is quoted (:func:`quote`).
+    color = quote(marker.color) if marker.color else ""
+    note = quote(marker.note) if marker.note else ""
+    text = " ".join(x for x in (color, quote(marker.name), note) if x)
     dur = f" dur {marker.duration}" if marker.duration and marker.duration != 1 else ""
     return f"{where} {text}{dur}"
 

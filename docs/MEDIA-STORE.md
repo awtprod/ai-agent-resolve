@@ -182,6 +182,14 @@ the PC path the FCPXML named, so the map's hub root -> PC root pairs tie it back
 hub path (DESIGN "Timeline import (S20)"). For automatic pickup use the round-specific return folder printed in the handoff notes
 instead; see [Desktop handoff](DESKTOP-HANDOFF.md). The standalone command remains available.
 
+A project the owner saved in a Resolve disk project library (S25a, decision D10) needs no
+export: give `import-timeline` the project's `Project.db` (`<library>/Resolve Projects/Users/
+<user>/Projects/<project>/Project.db`) and name the timeline with `--timeline NAME`. It is read
+from a private snapshot once Resolve has finished saving (`library_busy` while a save is in
+progress; `--wait SECONDS` sets how long to wait). `aar drp library <library>` lists the
+library's projects and their timelines. Automatic pickup of a saved project is S25b (DESIGN
+"Shared project library (S25)").
+
 ## Verified desktop handoff
 
 See [Desktop handoff](DESKTOP-HANDOFF.md) for `shrink --receipt`, verification of both

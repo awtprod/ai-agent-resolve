@@ -11,7 +11,6 @@ import hashlib
 import json
 import os
 import tempfile
-import time
 from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
@@ -21,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from aar.hub.artifacts import ArtifactStore
 from aar.hub.events import Actor, Event, EventLog
-from aar.media.receipt import _stat_identity, open_regular
+from aar.media.settle import copy_settled
 from aar.plan.export.errors import ExportError
 from aar.plan.export.media import media_map_from_mapping
 from aar.plan.model import EditPlan
@@ -78,25 +77,20 @@ def receive_one(
     fd, temporary = tempfile.mkstemp(prefix="aar-return-", suffix=".drt", dir=work_root())
     snapshot = Path(temporary)
     try:
-        digest = hashlib.sha256()
-        size = 0
-        with os.fdopen(fd, "wb") as target, open_regular(path, dir_fd=directory_fd) as source:
-            before = os.fstat(source.fileno())
-            if before.st_size > MAX_DRT_BYTES:
-                raise ValueError("returned timeline exceeds 64 MiB")
-            if time.time() - before.st_mtime < SETTLE_SECONDS:
-                return None
-            while block := source.read(1024 * 1024):
-                size += len(block)
-                if size > MAX_DRT_BYTES:
-                    raise ValueError("returned timeline grew past 64 MiB")
-                digest.update(block)
-                target.write(block)
-            if _stat_identity(before) != _stat_identity(os.fstat(source.fileno())):
-                return None  # another save/copy is in progress; retry with a fresh snapshot
+        with os.fdopen(fd, "wb") as target:
+            copied = copy_settled(
+                path,
+                target,
+                max_bytes=MAX_DRT_BYTES,
+                settle_seconds=SETTLE_SECONDS,
+                what="returned timeline",
+                dir_fd=directory_fd,
+            )
+        if copied is None:
+            return None  # still being saved, or changed while copied; retry with a fresh snapshot
         key = (
             f"desktop-return:{project_id}:{req.recipe_node}:{req.round}:"
-            f"{req.plan_sha256}:{digest.hexdigest()}"
+            f"{req.plan_sha256}:{copied.sha256}"
         )
         existing = log.get_by_idempotency_key(key)
         if existing is not None:

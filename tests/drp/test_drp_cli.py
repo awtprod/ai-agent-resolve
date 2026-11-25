@@ -24,9 +24,9 @@ def test_describe_prints_timeline_and_items(capsys: pytest.CaptureFixture[str]) 
     ) in out
     assert (
         '    01:00:00:00-01:02:32:16 video "sample.mp4" src 00:00:00:00-00:02:32:16 '
-        "media 'sample.mp4'"
+        'media "sample.mp4"'
     ) in out
-    assert "[video] sample.mp4; 4576 frames @ 29.97 fps; 352x262" in out
+    assert '[video] "sample.mp4"; 4576 frames @ 29.97 fps; 352x262' in out
     assert "differs from the Media Pool path" in out
 
 
@@ -35,10 +35,10 @@ def test_describe_max_items_truncates(capsys: pytest.CaptureFixture[str]) -> Non
     assert main(["drp", "describe", "--max-items", "0", path]) == 0
     full = capsys.readouterr().out
     assert "A16: 0 item(s)" in full and "more" not in full
-    assert "[video] r19_template_media.mp4" in full
+    assert '[video] "r19_template_media.mp4"' in full
     assert main(["drp", "describe", "--max-items", "1", path]) == 0
     capped = capsys.readouterr().out
-    assert "[video] r19_template_media.mp4" in capped and "more" not in capped
+    assert '[video] "r19_template_media.mp4"' in capped and "more" not in capped
 
 
 def test_inspect_json_is_the_full_model(capsys: pytest.CaptureFixture[str]) -> None:

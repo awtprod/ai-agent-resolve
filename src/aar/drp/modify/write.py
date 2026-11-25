@@ -46,6 +46,7 @@ from typing import Any
 
 from aar import __version__
 from aar.drp.errors import ContainerError
+from aar.drp.library import LIBRARY_KIND
 from aar.drp.model import DrpFile
 from aar.drp.modify import engine, zipraw
 from aar.drp.modify.engine import EditRefused, Refusal
@@ -201,7 +202,15 @@ def _precheck(
                 details={"codes": noisy},
             )
         )
-    if drp.kind not in ("drp", "drt") or not drp.is_zip:
+    if drp.kind == LIBRARY_KIND:
+        refusals.append(
+            Refusal(
+                "library-project",
+                "a project in a Resolve disk library (Project.db) is read only: aar never "
+                "writes to a library; export the project from Resolve as a .drp and edit that",
+            )
+        )
+    elif drp.kind not in ("drp", "drt") or not drp.is_zip:
         refusals.append(
             Refusal("unsupported-kind", f"only .drp and .drt archives are edited, not {drp.kind}")
         )

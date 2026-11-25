@@ -11,7 +11,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterator
 from pathlib import Path
 
-from aar.drp import blobs
+from aar.drp import blobs, library
 from aar.drp.container import (
     DEFAULT_MAX_MEMBER_BYTES,
     Container,
@@ -127,8 +127,10 @@ def read_drp(
     max_total_blob_output: int = blobs.DEFAULT_MAX_TOTAL_OUTPUT,
     max_elements: int = DEFAULT_MAX_ELEMENTS,
     max_total_xml_bytes: int = DEFAULT_MAX_TOTAL_XML_BYTES,
+    library_options: library.LibraryOptions | None = None,
 ) -> DrpFile:
-    """Read a ``.drp``/``.drt``/``.drb`` file into a :class:`DrpFile`.
+    """Read a ``.drp``/``.drt``/``.drb`` file, or a library ``Project.db``, into a
+    :class:`DrpFile`.
 
     Raises :class:`~aar.drp.errors.ContainerError` only when the file itself cannot be read.
     Everything inside it that cannot be understood becomes an :class:`Issue` instead.
@@ -137,14 +139,39 @@ def read_drp(
     Memory and work are bounded per file: at most ``max_total_xml_bytes`` of XML is read,
     at most ``max_elements`` elements are scanned and at most ``max_total_blob_output`` bytes
     are decompressed. Hitting a budget is reported as an issue; the rest is read best effort.
+
+    A file :func:`aar.drp.library.is_library_path` accepts (a ``.db``, or SQLite content
+    under any other suffix than ``.drp``/``.drt``/``.drb``) is a project saved in a Resolve
+    disk library: :func:`aar.drp.library.open_library` snapshots and lays out its rows (with
+    ``library_options``' budgets, and no value over ``max_member_bytes``), this same reader
+    builds the model, and :func:`aar.drp.library.finish` points its provenance at rows. A
+    refused ``Project.db`` raises :class:`aar.drp.library.LibraryError` (a ``ContainerError``).
     """
+    if library.is_library_path(path):
+        with library.open_library(
+            path,
+            options=library_options,
+            max_member_bytes=max_member_bytes,
+            max_total_xml_bytes=max_total_xml_bytes,
+        ) as view:
+            reader = _Reader(view, check_blobs, max_blob_output)
+            _budgets(reader, max_total_blob_output, max_elements, max_total_xml_bytes)
+            drp = library.finish(reader.run(), view)
+            view.check_time()  # the read's time budget covers building the model too
+            return drp
     with open_container(path, max_member_bytes=max_member_bytes) as container:
         reader = _Reader(container, check_blobs, max_blob_output)
-        reader.budget = blobs.DecodeBudget(max_total_blob_output)
-        reader.max_elements = max_elements
-        reader.elements_left = max_elements
-        reader.xml_bytes_left = max_total_xml_bytes
+        _budgets(reader, max_total_blob_output, max_elements, max_total_xml_bytes)
         return reader.run()
+
+
+def _budgets(
+    reader: _Reader, max_total_blob_output: int, max_elements: int, max_total_xml_bytes: int
+) -> None:
+    reader.budget = blobs.DecodeBudget(max_total_blob_output)
+    reader.max_elements = max_elements
+    reader.elements_left = max_elements
+    reader.xml_bytes_left = max_total_xml_bytes
 
 
 def member_role(name: str) -> str:
@@ -221,7 +248,12 @@ _join_path = join_clip_path  # former private name
 
 
 class _Reader:
-    def __init__(self, container: Container, check_blobs: bool, max_blob_output: int) -> None:
+    def __init__(
+        self,
+        container: Container | library.LibraryView,
+        check_blobs: bool,
+        max_blob_output: int,
+    ) -> None:
         self.c = container
         self.check_blobs = check_blobs
         self.max_out = max_blob_output
@@ -395,7 +427,7 @@ class _Reader:
             members.append(MemberSummary(m.name, m.size, m.compressed_size, role, interpreted))
             if not m.is_dir and not interpreted:
                 raw_members.append(m.name)
-        if not c.is_zip:
+        if not c.has_members:
             self.issue(
                 "warning",
                 "not-zip",
@@ -412,17 +444,21 @@ class _Reader:
         for m in members:
             if m.interpreted:
                 self._load(m.name)
-        versions = self._versions(members) if c.is_zip else None
+        if c.fixed_versions is not None:  # a library project: ProjectVersion, no DbAppVer
+            versions = c.fixed_versions
+        else:
+            versions = self._versions(members) if c.has_members else None
+        projects = ("drp", "drt", library.LIBRARY_KIND)
         if (
-            c.is_zip
-            and c.kind in ("drp", "drt")
+            c.has_members
+            and c.kind in projects
             and "project.xml" not in self.docs
             and "project.xml" not in self.unreadable
         ):
             self.issue("error", "missing-member", "project.xml is missing")
-        if c.kind in ("drp", "drt") and not any(m.role == "bin" for m in members):
+        if c.kind in projects and not any(m.role == "bin" for m in members):
             self.issue("warning", "missing-member", "no MediaPool/.../MpFolder.xml member")
-        if c.kind in ("drp", "drt") and not any(m.role == "timeline" for m in members):
+        if c.kind in projects and not any(m.role == "timeline" for m in members):
             self.issue("info", "no-timelines", "no SeqContainer members")
 
         project = self._project()

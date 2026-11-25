@@ -158,8 +158,8 @@ def test_describe_lists_items_markers_and_problems(make_zip: MakeZip) -> None:
     text = describe(read_drp(make_zip("synth.drp", members())))
     assert 'Timeline "Edit": 25 fps, 1920x1080, start 01:00:00:00 (frame 90000)' in text
     assert '01:00:00:00-01:00:01:23 video "a.mov" src 00:00:00:10-00:00:02:08' in text
-    assert "UNRESOLVED media missing" in text
-    assert "frame 5 (01:00:00:05) Red 'Laugh' big" in text
+    assert 'UNRESOLVED media "missing"' in text
+    assert 'frame 5 (01:00:00:05) "Red" "Laugh" "big"' in text
     assert "1 timeline item(s) reference media missing from this file" in text
     assert 'project "Synth & Co"' in text
 

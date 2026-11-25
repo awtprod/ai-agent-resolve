@@ -3,7 +3,8 @@
 The flow: plan -> FCPXML (``aar plan export``) -> Resolve -> the owner edits -> File > Export >
 Timeline as ``.drt`` -> :func:`read_timeline` + :func:`import_timeline` -> an edited plan and a
 diff the agent reads. Pure and cold: nothing here talks to Resolve or the network, and the only
-file read is the ``.drt`` (through :mod:`aar.drp`, with its own size limits).
+file read is the ``.drt``, or a project's ``Project.db`` in a Resolve disk library (S25a),
+through :mod:`aar.drp` with its own size limits.
 
 The rule: **a wrong plan or a wrong diff is never returned without saying so.** Where the code
 cannot know, it reports; it does not guess quietly.
@@ -54,6 +55,7 @@ from pydantic import ValidationError
 
 from aar.drp import read_drp
 from aar.drp.errors import DrpError
+from aar.drp.library import LIBRARY_KIND, LibraryError, LibraryOptions
 from aar.drp.model import Issue, MediaClip, Timeline, TimelineItem
 from aar.plan.apply.errors import CompileError
 from aar.plan.export.errors import ExportError
@@ -77,6 +79,7 @@ MAX_LISTED_ISSUES = 50
 IMPORT_CODES = frozenset(
     {
         "unreadable_timeline",
+        "library_busy",
         "damaged_timeline",
         "no_timeline",
         "several_timelines",
@@ -321,16 +324,42 @@ def _issue_text(issue: Issue) -> str:
     return f"{issue.severity} {issue.code}{member}: {issue.message}"
 
 
-def read_timeline(path: Path, name: str | None = None) -> TimelineFile:
-    """Read ``path`` with :func:`aar.drp.read_drp` and pick its one timeline (or ``name``)."""
+def read_timeline(
+    path: Path, name: str | None = None, *, library_options: LibraryOptions | None = None
+) -> TimelineFile:
+    """Read ``path`` with :func:`aar.drp.read_drp` and pick its one timeline (or ``name``).
+
+    ``path`` is a ``.drt``, or a project's ``Project.db`` in a Resolve disk library (read
+    with ``library_options``). A library project that is being saved is refused as
+    ``library_busy`` (try again later); any other refused ``Project.db`` is
+    ``unreadable_timeline`` with the library's own reason code in the message.
+    """
     hint = "export the timeline from Resolve with File > Export > Timeline as a .drt file"
     try:
-        drp = read_drp(path)
+        drp = read_drp(path, library_options=library_options)
+    except LibraryError as exc:
+        code = "library_busy" if exc.code == "busy" else "unreadable_timeline"
+        raise TimelineImportError(
+            code,
+            f"{path} could not be read as a library project: {exc.message} [{exc.code}]",
+            exc.hint,
+            library_code=exc.code,
+        ) from None
     except (DrpError, OSError) as exc:
         raise TimelineImportError(
             "unreadable_timeline", f"{path} could not be read as a .drt: {exc}", hint
         ) from None
-    if not drp.is_zip:
+    again = (
+        "export the timeline from Resolve again (File > Export > Timeline); if it repeats, "
+        "check the file with `aar drp describe`"
+    )
+    if drp.kind == LIBRARY_KIND:
+        hint = "check the timeline's name and the project with `aar drp describe Project.db`"
+        again = (
+            "open the project in Resolve and save it again; if it repeats, check it with "
+            "`aar drp describe Project.db`"
+        )
+    elif not drp.is_zip:
         raise TimelineImportError(
             "unreadable_timeline", f"{path} is not a .drt (not a zip archive)", hint
         )
@@ -343,8 +372,7 @@ def read_timeline(path: Path, name: str | None = None) -> TimelineFile:
             "damaged_timeline",
             f"{path}: the reader found {len(damage)} problem(s) that can hide or change "
             f"timeline items ({', '.join(sorted({i.code for i in damage}))})",
-            "export the timeline from Resolve again (File > Export > Timeline); if it repeats, "
-            "check the file with `aar drp describe`",
+            again,
             problems=listed,
             issues=[{"severity": i.severity, "code": i.code} for i in damage],
         )

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,8 @@ from typing import Any
 from pydantic import ValidationError
 
 from aar import cli_io
+from aar.drp.library import DEFAULT_DEADLINE_SECONDS
+from aar.drp.library_args import add_library_budget_options, library_options
 from aar.node.ops.read import DescribeResult
 from aar.plan import stub_cli
 from aar.plan.apply import (
@@ -196,8 +199,12 @@ def register(subparsers: Any) -> None:
 
     imp = sub.add_parser(
         "import-timeline",
-        help="Bring a timeline edited in Resolve (.drt) back as an EditPlan and a diff.",
+        help="Bring a timeline edited in Resolve (.drt or library Project.db) back as an "
+        "EditPlan and a diff.",
         description="Reads the timeline exported from Resolve (File > Export > Timeline, .drt), "
+        "or a timeline of a project saved in a Resolve disk library (its Project.db, read from a "
+        "settled snapshot; a project being saved is refused as library_busy; a project holds "
+        "several timelines, so name one with --timeline), "
         "matches its items to the plan it was exported from (the same --media-map as the "
         "export), and writes the edited plan (the picture items on each track that holds planned "
         "segments, in record order, become that track's segments; titles take their items' "
@@ -213,7 +220,12 @@ def register(subparsers: Any) -> None:
         "not_carried: the next export would not have it; an item on the primary track also "
         "needs the segments around it checked by eye), 2 refused or unreadable input.",
     )
-    imp.add_argument("drt", type=Path, metavar="TIMELINE.drt", help="Timeline exported as .drt.")
+    imp.add_argument(
+        "drt",
+        type=Path,
+        metavar="TIMELINE.drt|Project.db",
+        help="Timeline exported as .drt, or a project's Project.db in a Resolve disk library.",
+    )
     imp.add_argument("--plan", type=Path, required=True, help="The plan the timeline came from.")
     imp.add_argument(
         "--media-map",
@@ -227,6 +239,15 @@ def register(subparsers: Any) -> None:
         "--profile", help="Profile name or .toml path for the lint (default: the plan's)."
     )
     imp.add_argument("--json", action="store_true", help="Print the diff as JSON.")
+    imp.add_argument(
+        "--wait",
+        type=float,
+        default=DEFAULT_DEADLINE_SECONDS,
+        metavar="SECONDS",
+        help="Project.db only: how long to wait for a save in progress before refusing "
+        f"(library_busy; default {DEFAULT_DEADLINE_SECONDS:g}).",
+    )
+    add_library_budget_options(imp)
     imp.set_defaults(func=_cmd_import_timeline)
 
 
@@ -984,7 +1005,13 @@ def _cmd_import_timeline(args: argparse.Namespace) -> int:
                 "give the plan and the diff different paths",
                 path=str(out),
             )
-        timeline = read_timeline(args.drt, args.timeline)
+        if not math.isfinite(args.wait) or args.wait < 0:
+            return _input_error("invalid-input", "--wait must be 0 or more seconds", [], as_json)
+        timeline = read_timeline(
+            args.drt,
+            args.timeline,
+            library_options=library_options(args, deadline_seconds=args.wait),
+        )
         result = import_timeline(
             plan,
             timeline.timeline,

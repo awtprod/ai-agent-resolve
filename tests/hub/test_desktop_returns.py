@@ -82,6 +82,56 @@ def test_return_keeps_drt_and_reconstructed_plan_and_diff(tmp_path: Path) -> Non
         hub.log.close()
 
 
+def test_return_over_the_size_cap_is_refused_and_leaves_no_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import contextlib
+
+    from aar.media import settle
+    from aar.recipes import desktop_returns
+
+    hub, request, path = packet(tmp_path)
+    size = path.stat().st_size
+
+    def snapshots() -> list[Path]:
+        return list((tmp_path / "work").rglob("aar-return-*"))
+
+    try:
+        monkeypatch.setattr(desktop_returns, "MAX_DRT_BYTES", size - 1)
+        with pytest.raises(settle.TooLargeError, match="exceeds"):
+            receive_one(hub.log, hub.store, hub.project_id, request, path, AGENT)
+        assert snapshots() == []
+        monkeypatch.setattr(desktop_returns, "MAX_DRT_BYTES", size)
+        result = receive_one(hub.log, hub.store, hub.project_id, request, path, AGENT)
+        assert result is not None and result["status"] == "needs_review"
+
+        # Within the cap when opened, then grown past it while copied (Resolve still writing).
+        monkeypatch.setattr(desktop_returns, "MAX_DRT_BYTES", size + 10)
+        real_open = settle.open_regular
+
+        @contextlib.contextmanager
+        def open_and_grow(p, *, dir_fd=None):  # type: ignore[no-untyped-def]
+            with real_open(p, dir_fd=dir_fd) as stream:
+                read = stream.read
+
+                def read_then_grow(n: int = -1) -> bytes:
+                    data = read(n)
+                    if data:
+                        with path.open("ab") as writer:
+                            writer.write(b"\x00" * 100)
+                    return data
+
+                stream.read = read_then_grow
+                yield stream
+
+        monkeypatch.setattr(settle, "open_regular", open_and_grow)
+        with pytest.raises(settle.TooLargeError, match="grew past"):
+            receive_one(hub.log, hub.store, hub.project_id, request, path, AGENT)
+        assert snapshots() == []
+    finally:
+        hub.log.close()
+
+
 def test_bad_return_is_visible_and_not_retried_forever(tmp_path: Path) -> None:
     hub, request, path = packet(tmp_path)
     try:

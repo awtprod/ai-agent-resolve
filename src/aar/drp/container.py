@@ -159,6 +159,16 @@ class Container:
     def is_zip(self) -> bool:
         return self._zip is not None
 
+    @property
+    def has_members(self) -> bool:
+        """Whether there are members to read (a zip archive; see also ``LibraryView``)."""
+        return self._zip is not None
+
+    @property
+    def fixed_versions(self) -> None:
+        """A container's version stamp is read from its members' header comments."""
+        return None
+
     def names(self) -> list[str]:
         return [m.name for m in self.members if not m.is_dir]
 

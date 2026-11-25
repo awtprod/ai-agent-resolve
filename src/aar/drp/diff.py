@@ -31,6 +31,15 @@ Unreadable inputs (a member that cannot be read, a ``.drp``/``.drt`` that is not
 missing ``project.xml``) raise :class:`~aar.drp.diff_model.DiffError`; they are never
 reported as differences.
 
+A project read from a Resolve disk library (``kind == "library"``, a ``Project.db``) has no
+XML text and no zip members, so when either side is one: the opaque compare does not run (a
+note says so, and the gate fails, since nothing vouches for the undecoded content); and when
+only one side is, the container fields that only describe the file format (``kind``,
+``sniffed_kind``, ``is_zip``) and the ``DbAppVer`` stamp, which a library does not store, are
+not compared, and a library timeline whose ``Resolution`` is stored as 0x0 (it follows the
+project's resolution, which Resolve writes into an export instead) is not compared on
+resolution. Each of these is listed in the notes, never silently dropped.
+
 Gate (S8's post-write check). ``ProjectDiff.gate`` passes only when every change is semantic
 (decoded) and matched by DbId (markers: owner DbId plus frame), no DbId or zip member name is
 duplicated, and both files read without warnings. ``diff_projects(..., gate=True)`` also turns
@@ -66,6 +75,7 @@ from aar.drp.diff_model import (
     short_id_pair,
 )
 from aar.drp.diff_opaque import OpaqueEngine, Source, Unit, member_root
+from aar.drp.library import LIBRARY_KIND
 from aar.drp.model import (
     Bin,
     DrpFile,
@@ -349,6 +359,24 @@ class _Differ:
         self.media = {"a": a.media_by_id(), "b": b.media_by_id()}
         self.dbid_pairs = 0
         self.dbid_objects = 0
+        library_sides = [s for s, d in (("A", a), ("B", b)) if d.kind == LIBRARY_KIND]
+        #: Either side is a library project: no opaque compare (no XML text to compare).
+        self.library = bool(library_sides)
+        #: Exactly one side is: the file-format fields and DbAppVer are not compared.
+        self.mixed = len(library_sides) == 1
+        self.library_notes: list[str] = []
+        if self.library:
+            sides = " and ".join(library_sides)
+            self.library_notes.append(
+                f"{sides} {'is a project' if len(library_sides) == 1 else 'are projects'} "
+                "read from a Resolve disk library (Project.db): undecoded content was not "
+                "compared, so the gate cannot pass"
+            )
+        if self.mixed:
+            self.library_notes.append(
+                "a .drp/.drt compared with a library project: the container kind, is_zip and "
+                "DbAppVer (which a library does not store) were not compared"
+            )
 
     # ------------------------------------------------------------------ driver
 
@@ -372,20 +400,21 @@ class _Differ:
             "max_elements": self.max_elements,
             "max_total_xml_bytes": self.max_total_xml_bytes,
         }
-        sources = (Source(self.a, "A", **budgets), Source(self.b, "B", **budgets))
-        try:
-            engine = OpaqueEngine(
-                sources,
-                self.units,
-                self.cover_objects,
-                self.changed,
-                self.owners,
-                self.relocated,
-            )
-            self.out.extend(engine.run())
-        finally:
-            for s in sources:
-                s.close()
+        if not self.library:
+            sources = (Source(self.a, "A", **budgets), Source(self.b, "B", **budgets))
+            try:
+                engine = OpaqueEngine(
+                    sources,
+                    self.units,
+                    self.cover_objects,
+                    self.changed,
+                    self.owners,
+                    self.relocated,
+                )
+                self.out.extend(engine.run())
+            finally:
+                for s in sources:
+                    s.close()
         ordered = [c for _, c in sorted(enumerate(self.out), key=lambda ic: self._order(*ic))]
         return ProjectDiff(
             a=FileSummary.of(self.a),
@@ -407,6 +436,11 @@ class _Differ:
         if loose:
             reasons.append(f"{loose} change(s) on objects not matched by DbId")
         reasons.extend(self.duplicates)
+        if self.library:
+            reasons.append(
+                "a library project (Project.db) has no XML text, so undecoded content cannot "
+                "be compared"
+            )
         for side, drp in (("A", self.a), ("B", self.b)):
             codes = sorted({i.code for i in drp.issues if i.severity in ("warning", "error")})
             if codes:
@@ -436,6 +470,7 @@ class _Differ:
         notes = [
             f"duplicate DbId: {d}; pairs by occurrence order (heuristic)" for d in self.duplicates
         ]
+        notes.extend(self.library_notes)
         if self.dbid_objects and not self.dbid_pairs:
             notes.append(
                 "no DbId is shared between A and B: they look like different projects, so "
@@ -486,6 +521,12 @@ class _Differ:
                 ctx.change("header", "changed", detail, field_name=name, old=old, new=new)
             )
 
+        if self.mixed:
+            prj_a = a.versions.project_version if a.versions else None
+            prj_b = b.versions.project_version if b.versions else None
+            if prj_a != prj_b:
+                emit("DbPrjVer", prj_a, prj_b, f"DbPrjVer {prj_a} → {prj_b}")
+            return
         if a.kind != b.kind:
             emit("kind", a.kind, b.kind, f"container kind {a.kind} → {b.kind}")
         if a.sniffed_kind != b.sniffed_kind:
@@ -960,6 +1001,15 @@ class _Differ:
             "extents": (b.start_seconds, b.duration_seconds),
         }
         diffs = _diffs(va, vb)
+        if "resolution" in diffs and self.mixed:
+            lib, other = (a, b) if self.a.kind == LIBRARY_KIND else (b, a)
+            if lib.resolution == (0, 0) and other.resolution != (0, 0):
+                del diffs["resolution"]
+                self.library_notes.append(
+                    f"timeline {_q(tl.name)}: the library stores its resolution as 0x0 (it "
+                    f"follows the project's), the export writes {_res(other.resolution)}; "
+                    "not compared"
+                )
         self._mark(("timeline", tkey), diffs)
 
         def emit(
