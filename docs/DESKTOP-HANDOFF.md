@@ -120,7 +120,10 @@ What you will see for a few kinds of save:
   `allow_unopened_operations` (write operations nobody has yet seen Resolve open; every real
   export needs it until the staging projects are confirmed) and `allow_unverified_media` (clips
   of a kind or size the evidence does not cover). With them off a cut that needs them is
-  refused, and the refusal is in the notes. Every path must be inside `AAR_MEDIA_ROOT`.
+  refused, and the refusal is in the notes. Every path must be inside `AAR_MEDIA_ROOT` when it
+  is set. With `AAR_MEDIA_ROOT` unset nothing restricts where the library may be: the export
+  places the project and the pickup reads saves wherever `library.folder` points (a follow-up;
+  set `AAR_MEDIA_ROOT` on the hub).
 - **What the notes say.** Placed: the library, user, project and timeline to open, that saving
   is all, the operations not yet seen working and the clips without full evidence. Refused:
   the export's code, message and fix hint. The export step's result carries the same as

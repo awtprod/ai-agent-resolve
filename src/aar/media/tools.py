@@ -98,26 +98,48 @@ class RunResult:
 _WINDOWS = os.name == "nt"
 
 
+#: The suffixes Windows starts a program by directly; PATHEXT's others (``.bat``, ``.cmd``,
+#: scripts) run through another program that reads the arguments again, so they are never
+#: added to a name, only taken when named in full.
+_DIRECT_SUFFIXES = (".com", ".exe")
+
+
+def _windows_names(name: str) -> list[str]:
+    """What a program ``name`` may be on Windows, in PATHEXT's order as ``shutil.which`` tries
+    them: ``name`` itself when it ends in a PATHEXT suffix, else ``name`` with each of
+    PATHEXT's ``.com`` and ``.exe`` added."""
+    pathext = os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD"
+    suffixes = [ext.strip().lower() for ext in pathext.split(";") if ext.strip()]
+    if any(name.lower().endswith(ext) for ext in suffixes):
+        return [name]
+    return [name + ext for ext in suffixes if ext in _DIRECT_SUFFIXES]
+
+
+def _program(path: str) -> bool:
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
 def _which(name: str) -> str | None:
     """``name`` as ``shutil.which`` finds it on POSIX. On Windows ``shutil.which`` looks in the
     current folder first (and resolves a relative ``PATH`` entry against it), so a program
     left in a media folder the command runs from could be run in ffprobe's place: there only
-    an absolute path, or a name found in an absolute ``PATH`` folder (as ``<name>.exe`` when it
-    has no suffix), is taken."""
+    an absolute path, or a name found in an absolute ``PATH`` folder, is taken, each with
+    PATHEXT's suffixes added when it has none of them (:func:`_windows_names`), as
+    ``shutil.which`` does. These are paths of this system, so its own path rules apply."""
     if not _WINDOWS:
         return shutil.which(name)
     if os.path.isabs(name):
-        return name if os.path.isfile(name) else None
+        return next((c for c in _windows_names(name) if _program(c)), None)
     if os.sep in name or (os.altsep and os.altsep in name) or ":" in name:
         return None  # a relative path: it would be resolved against the current folder
-    candidates = [name] if os.path.splitext(name)[1] else [name + ".exe"]
+    candidates = _windows_names(name)
     for folder in os.environ.get("PATH", "").split(os.pathsep):
         folder = folder.strip().strip('"')
         if not folder or not os.path.isabs(folder):
             continue
         for candidate in candidates:
             found = os.path.join(folder, candidate)
-            if os.path.isfile(found) and os.access(found, os.X_OK):
+            if _program(found):
                 return found
     return None
 

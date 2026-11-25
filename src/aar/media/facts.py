@@ -41,7 +41,11 @@ folded, then as given), every JSON object with sorted keys; the same files give 
 
 A folder argument takes the media files directly in it (:data:`MEDIA_SUFFIXES`, not hidden,
 not in subfolders). ``--pc-folder LOCAL=PC`` names a folder as the edit PC knows it when the
-command runs elsewhere (on the PC itself the absolute path is already the PC's).
+command runs elsewhere (on the PC itself the absolute path is already the PC's): a drive or
+share root, or a folder below one; on Windows matched as Windows compares paths (case and
+separators ignored). Once it is given, a file under none of its folders is refused
+(``not_under_pc_folder``), never recorded under its own name. A file directly at a drive's or
+share's root is the error line ``at_root``: the library writer needs a folder below the root.
 """
 
 from __future__ import annotations
@@ -50,14 +54,16 @@ import argparse
 import contextlib
 import json
 import math
+import ntpath
 import os
+import posixpath
 import secrets
 import stat
 import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from aar.media.tools import (
@@ -194,37 +200,64 @@ def utc_text(ns: int) -> str:
 # --------------------------------------------------------------------------- paths
 
 
+_DEVICE_PREFIXES = ("\\\\?\\", "\\\\.\\")
+
+
 def _pc_path(local: Path, folders: Sequence[tuple[str, str]]) -> str | None:
     """The path the edit PC names ``local`` by: under a ``--pc-folder`` (the longest that
-    matches), else the absolute path itself when it is a Windows path; None otherwise."""
-    absolute = os.path.abspath(local)
+    matches), else, when no folder is given, the absolute path itself when it is a Windows
+    path; None otherwise. A local path is compared by this system's rules (Windows': case and
+    ``/`` or ``\\`` ignored); the PC path is built by Windows' rules wherever this runs."""
+    local_rules = ntpath if _WINDOWS else posixpath
+    flavour = PureWindowsPath if _WINDOWS else PurePosixPath
+    absolute = flavour(local_rules.abspath(os.fspath(local)))
     best: tuple[int, str] | None = None
     for here, there in folders:
-        here_abs = os.path.abspath(here)
-        rel = os.path.relpath(absolute, here_abs) if _inside(absolute, here_abs) else None
-        if rel is None:
+        here_abs = flavour(local_rules.abspath(here))
+        if not absolute.is_relative_to(here_abs):  # by parts, case-insensitive on Windows
             continue
-        if best is None or len(here_abs) > best[0]:
-            parts = [] if rel == "." else Path(rel).parts
-            best = (len(here_abs), str(PureWindowsPath(there, *parts)))
+        if best is None or len(here_abs.parts) > best[0]:
+            parts = absolute.parts[len(here_abs.parts) :]
+            best = (len(here_abs.parts), str(PureWindowsPath(there, *parts)))
     if best is not None:
         return best[1]
-    return absolute if _windows_absolute(absolute) else None
-
-
-def _inside(path: str, folder: str) -> bool:
-    try:
-        return os.path.commonpath([path, folder]) == folder
-    except ValueError:  # another drive on Windows
-        return False
+    if folders:
+        return None
+    text = str(absolute)
+    return text if _windows_absolute(text) else None
 
 
 def _windows_absolute(text: str) -> bool:
-    """A drive path (``E:\\...``) or a UNC path (``\\\\server\\share\\...``), backslashes."""
-    if "/" in text:
+    """A drive path (``E:\\...``) or a UNC path (``\\\\server\\share\\...``), backslashes; not a
+    device path (``\\\\?\\``, ``\\\\.\\``), which the library writer refuses."""
+    if "/" in text or text.startswith(_DEVICE_PREFIXES):
         return False
     win = PureWindowsPath(text)
     return bool(win.drive) and bool(win.root) and len(win.parts) >= 2
+
+
+def _at_root(pc_path: str) -> bool:
+    """A file directly at a drive's or share's root (``D:\\a.mov``), which the library writer
+    refuses (:func:`aar.drp.mediapool.facts.check_pc_path`: a folder below the root)."""
+    return len(PureWindowsPath(pc_path).parts) <= 2
+
+
+def _windows_folder(text: str) -> str | None:
+    """``text`` as an absolute folder on the edit PC, in the form Windows joins under: a drive
+    root (``D:\\``), a share root (``\\\\server\\share``, given with or without its trailing
+    backslash) or a folder below either, backslashes only; None for anything else (a
+    drive-relative ``D:`` or ``D:Show``, ``/``, an empty, ``.`` or ``..`` name, a device path)."""
+    if "/" in text or text.startswith(_DEVICE_PREFIXES):
+        return None
+    win = PureWindowsPath(text)
+    if not win.drive or not win.root or not text.startswith(win.drive):
+        return None  # drive-relative, rooted without a drive, or a server without a share
+    if "\\\\" in text[2:]:
+        return None  # an empty name: a doubled backslash past a UNC path's leading pair
+    names = text.lstrip("\\").split("\\")
+    if any(name in (".", "..") for name in names):
+        return None
+    return str(win)
 
 
 def _folder_files(folder: Path, skipped: list[tuple[str, str]]) -> list[Path]:
@@ -300,13 +333,21 @@ def targets(
     repeated = 0
     for local in files:
         pc = _pc_path(local, folders)
+        if pc is None and folders:
+            raise FactsRunError(
+                "not_under_pc_folder",
+                f"{str(local)!r} is in none of the --pc-folder folders given, so the edit PC's "
+                "name for it is unknown",
+                "add a --pc-folder for its folder (on the edit PC itself, FOLDER=FOLDER keeps "
+                "its own name), or measure it in a run of its own",
+            )
         if pc is None:
             raise FactsRunError(
                 "not_a_pc_path",
                 f"{str(local)!r} is not a Windows path, so the edit PC's name for it is unknown",
                 "run this on the edit PC, or name its folder there with --pc-folder LOCAL=PC",
             )
-        key = pc.casefold()
+        key = pc.lower()  # as Windows and the hub (load_facts) tell PC paths apart
         if key in out:
             repeated += 1
             continue
@@ -492,6 +533,14 @@ def measure(
                 "deadline",
                 f"not measured: the run's deadline of {deadline_s:g} s passed before this file",
             )
+        elif _at_root(target.pc_path):
+            record = _failed(
+                target,
+                "at_root",
+                "not measured: it is directly at the root of a drive or share, and a library "
+                "project needs its media in a folder below the root; move it into a folder",
+                exists=os.path.lexists(target.local),
+            )
         elif _utf8(target.pc_path) != target.pc_path:
             record = _failed(
                 target,
@@ -577,12 +626,14 @@ def _write_exclusive(path: Path, data: bytes) -> None:
 
 def _folder_pair(text: str) -> tuple[str, str]:
     here, sep, there = text.partition("=")
-    if not sep or not here or not _windows_absolute(there):
+    folder = _windows_folder(there) if sep and here else None
+    if folder is None:
         raise argparse.ArgumentTypeError(
             f"{text!r} is not LOCAL=PC (a local folder, '=', and the folder's absolute "
-            "Windows path on the edit PC)"
+            "Windows path on the edit PC: a drive or share root, or a folder below one, with "
+            "backslashes)"
         )
-    return here, there.rstrip("\\") or there
+    return here, folder
 
 
 def _positive(kind: type) -> Any:

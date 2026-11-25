@@ -7,6 +7,7 @@ never left; Windows' file times and program lookup are guarded (simulated here).
 
 from __future__ import annotations
 
+import argparse
 import errno
 import json
 import os
@@ -219,7 +220,7 @@ def test_the_run_has_a_deadline_and_says_what_it_did_not_measure(
 
 def test_the_deadline_by_the_clock(tmp_path: Path) -> None:
     ticks = iter([0.0, 10.0, 20.0, 30.0])
-    files = [Target(tmp_path / f"{n}.mp4", f"E:\\{n}.mp4") for n in "abc"]
+    files = [Target(tmp_path / f"{n}.mp4", f"E:\\Show\\{n}.mp4") for n in "abc"]
     result = measure(files, deadline_s=15.0, clock=lambda: next(ticks))
     assert [e["error"]["code"] for e in result.summary] == ["missing", "deadline", "deadline"]
     assert result.data.count(b"\n") == 3 and not result.interrupted
@@ -501,3 +502,148 @@ def test_on_windows_ffprobe_is_never_taken_from_the_current_folder(
     assert tools.resolve_tool("ffprobe") == str(real)
     monkeypatch.setenv("AAR_FFPROBE", str(real))
     assert tools.resolve_tool("ffprobe") == str(real)
+
+
+# --------------------------------------------------------------------------- S25d review: PC paths
+
+
+def test_a_drive_or_share_root_is_a_pc_folder_and_joins_under_its_backslash() -> None:
+    """``--pc-folder LOCAL=D:\\`` and a share root are folders like any other; a file below
+    them gets ``D:\\Show\\a.mov``, never the drive-relative ``D:Show\\a.mov``."""
+    assert facts_mod._folder_pair("/mnt/card=D:\\") == ("/mnt/card", "D:\\")
+    assert facts_mod._folder_pair("/mnt/nas=\\\\nas\\cams") == ("/mnt/nas", "\\\\nas\\cams\\")
+    assert facts_mod._folder_pair("/mnt/nas=\\\\nas\\cams\\") == ("/mnt/nas", "\\\\nas\\cams\\")
+    assert facts_mod._folder_pair("/m=E:\\Show 1\\") == ("/m", "E:\\Show 1")
+    selection = facts_mod.targets(
+        [Path("/mnt/card/Show/a.mov"), Path("/mnt/nas/Day 1/b.mov")],
+        [
+            facts_mod._folder_pair("/mnt/card=D:\\"),
+            facts_mod._folder_pair("/mnt/nas=\\\\nas\\cams"),
+        ],
+    )
+    assert [t.pc_path for t in selection.files] == [
+        "\\\\nas\\cams\\Day 1\\b.mov",
+        "D:\\Show\\a.mov",
+    ]
+    # Not a folder the PC can name unambiguously: refused when the arguments are read.
+    for bad in (
+        "D:",
+        "D:Show",
+        "E:/Show",
+        "\\\\nas",
+        "\\\\?\\C:\\Show",
+        "\\\\.\\C:\\Show",
+        "E:\\Show\\\\x",
+        "E:\\Show\\..\\x",
+        "E:\\.\\Show",
+        "\\Show",
+    ):
+        with pytest.raises(argparse.ArgumentTypeError):
+            facts_mod._folder_pair(f"/m={bad}")
+
+
+@pytest.mark.parametrize(
+    ("folder", "pc"), [("D:\\", "D:\\a.mp4"), ("\\\\nas\\cams", "\\\\nas\\cams\\a.mp4")]
+)
+def test_a_file_directly_at_a_root_is_its_own_error_line_the_hub_reads(
+    folder: str, pc: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The library writer needs a file in a folder below the root (check_pc_path); a facts
+    line for ``D:\\a.mp4`` would make the hub refuse the whole facts file, so it is not probed
+    and is written as an error line saying what to do instead."""
+    card = tmp_path / "card"
+    card.mkdir()
+    (card / "a.mp4").write_bytes(b"not probed")
+    out = tmp_path / "facts.jsonl"
+    code, lines = _run(
+        str(card), "--out", str(out), "--pc-folder", f"{card}={folder}", capsys=capsys
+    )
+    assert code == 2
+    assert lines[0] == {"path": pc, "ok": False, "error": {"code": "at_root", "message": ANY}}
+    assert "folder below" in lines[0]["error"]["message"]
+    failures: dict[str, dict[str, str]] = {}
+    assert load_facts(out, failures=failures) == {}  # the hub reads it, and names the file
+    assert failures[pc.lower()]["code"] == "at_root"
+
+
+def test_on_windows_a_pc_folder_matches_as_windows_compares(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Running on the PC, ``--pc-folder C:\\Media=D:\\Footage`` holds ``c:\\media\\clip.mov``
+    (case and separators as Windows compares them), but not ``C:\\Mediathek\\x.mov``."""
+    monkeypatch.setattr(facts_mod, "_WINDOWS", True)
+    folders = [facts_mod._folder_pair("C:\\Media=D:\\Footage")]
+    selection = facts_mod.targets(
+        [Path("c:\\media\\clip.mov"), Path("C:/MEDIA/Day 1/b.mov"), Path("C:\\Media\\CLIP.mov")],
+        folders,
+    )
+    assert [t.pc_path for t in selection.files] == [
+        "D:\\Footage\\clip.mov",
+        "D:\\Footage\\Day 1\\b.mov",
+    ]
+    assert selection.repeated == 1  # the same file on the PC, named twice
+    # Names Windows tells apart stay apart (the hub keys paths by lower case, not casefold).
+    selection = facts_mod.targets(
+        [Path("C:\\Media\\Stra\u00dfe.mov"), Path("C:\\Media\\STRASSE.mov")], folders
+    )
+    assert len(selection.files) == 2 and selection.repeated == 0
+    # Without mappings, on the PC, the path itself is the PC's.
+    assert [t.pc_path for t in facts_mod.targets([Path("c:\\media\\clip.mov")], []).files] == [
+        "c:\\media\\clip.mov"
+    ]
+    # ... unless it is a device path, which the library writer refuses.
+    with pytest.raises(facts_mod.FactsRunError) as caught:
+        facts_mod.targets([Path("\\\\?\\C:\\Media\\clip.mov")], [])
+    assert caught.value.code == "not_a_pc_path"
+
+
+@pytest.mark.parametrize(
+    ("windows", "path"),
+    [
+        (True, "C:\\Mediathek\\x.mov"),  # a longer name is not inside C:\Media
+        (True, "E:\\Other\\x.mov"),  # a PC path, but not under any folder given
+        (False, "/media/Show/a.mp4"),  # the local file system here tells case apart
+    ],
+)
+def test_a_file_under_no_pc_folder_given_is_refused_not_recorded_under_its_own_name(
+    windows: bool, path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(facts_mod, "_WINDOWS", windows)
+    folders = [("C:\\Media", "D:\\Footage")] if windows else [("/media/show", "E:\\Show")]
+    with pytest.raises(facts_mod.FactsRunError) as caught:
+        facts_mod.targets([Path(path)], folders)
+    assert caught.value.code == "not_under_pc_folder"
+    assert "--pc-folder" in caught.value.hint
+
+
+@pytest.mark.skipif(os.name != "posix", reason="simulates Windows' lookup with POSIX paths")
+def test_on_windows_an_override_or_name_without_extension_is_found_through_pathext(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``AAR_FFPROBE=C:\\ffmpeg\\bin\\ffprobe`` finds ``ffprobe.exe`` as ``shutil.which`` did,
+    and a bare name follows PATHEXT's order; only programs Windows starts directly (.com,
+    .exe) are added, never a batch file whose arguments cmd.exe would read."""
+    folder = tmp_path / "bin"
+    folder.mkdir()
+    for name in ("ffprobe.exe", "ffprobe.com", "ffmpeg.bat"):
+        (folder / name).write_text("#!/bin/sh\n")
+        (folder / name).chmod(0o755)
+    monkeypatch.setattr(tools, "_WINDOWS", True)
+    monkeypatch.setenv("PATH", str(folder))
+    monkeypatch.setenv("PATHEXT", ".EXE;.COM;.BAT;.CMD")
+    monkeypatch.setenv("AAR_FFPROBE", str(folder / "ffprobe"))
+    assert tools.resolve_tool("ffprobe") == str(folder / "ffprobe.exe")
+    monkeypatch.delenv("AAR_FFPROBE")
+    assert tools.resolve_tool("ffprobe") == str(folder / "ffprobe.exe")
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE")
+    assert tools.resolve_tool("ffprobe") == str(folder / "ffprobe.com")
+    monkeypatch.delenv("PATHEXT")  # Windows' own default order
+    assert tools.resolve_tool("ffprobe") == str(folder / "ffprobe.com")
+    monkeypatch.setenv("PATHEXT", ".EXE;.BAT")
+    with pytest.raises(tools.MediaToolMissing):
+        tools.resolve_tool("ffmpeg")  # only ffmpeg.bat: not added
+    monkeypatch.setenv("AAR_FFMPEG", str(folder / "ffmpeg.bat"))
+    assert tools.resolve_tool("ffmpeg") == str(folder / "ffmpeg.bat")  # named in full: taken
+    monkeypatch.setenv("AAR_FFPROBE", str(folder / "missing"))
+    with pytest.raises(tools.MediaToolMissing):
+        tools.resolve_tool("ffprobe")

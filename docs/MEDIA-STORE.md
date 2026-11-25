@@ -219,9 +219,20 @@ whole run (`--deadline`; files not reached are listed `deadline`) and 64 MiB of 
 (`--max-bytes`, error lines included; one that does not fit is only printed, `"in_file":
 false`). Ctrl+C writes what was measured and exits 130. Everything printed is ASCII JSON, so
 any console code page shows it; the file is UTF-8. On Windows ffprobe is taken only from an
-absolute `PATH` folder (or an absolute `AAR_FFPROBE`), never from the current folder. `aar media facts` is the same command on
-a machine with `aar` installed; there `--pc-folder LOCAL=E:\Show_1` names a folder as the PC
-knows it. Point the recipe's `library.facts` at the file as the hub sees it.
+absolute `PATH` folder (or an absolute `AAR_FFPROBE`), never from the current folder; a name
+without a `PATHEXT` suffix gets `.com` or `.exe` in `PATHEXT`'s order, so
+`AAR_FFPROBE=C:\ffmpeg\bin\ffprobe` finds `ffprobe.exe` (a batch file is taken only when named
+in full). A library project needs every file in a folder below a drive's or share's root: a
+file directly at a root (`D:\clip.mov`) is not measured and is listed `at_root`; move it into a
+folder. `aar media facts` is the same command on a machine with `aar` installed; there
+`--pc-folder LOCAL=E:\Show_1` names a folder as the PC knows it. A drive or share root is a
+folder too (`--pc-folder /mnt/card=D:\`, `--pc-folder /mnt/nas=\\nas\cams`); the option can be
+repeated, and the longest folder that holds a file wins. On Windows a folder is matched as
+Windows compares paths (`C:\Media` holds `c:\media\clip.mov`). Once `--pc-folder` is given,
+every file must be under one of its folders: one that is not is refused (`not_under_pc_folder`,
+exit 2, nothing written) instead of being recorded under its own name; on the PC itself,
+`--pc-folder E:\=E:\` keeps a drive's own names. Point the recipe's `library.facts` at the file
+as the hub sees it.
 
 ## Verified desktop handoff
 
