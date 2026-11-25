@@ -161,6 +161,14 @@ STILL_EXTENSIONS = frozenset(
     {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp", ".heic", ".dpx", ".exr"}
 )
 
+#: The ``audio_transitions`` limit of an import that compares sound transitions (a library
+#: project, S25e), in place of the one in :data:`LIMITS`.
+SOUND_TRANSITION_LIMIT = (
+    "audio_transitions: sound transition items on A1 are compared with the plan's audio-only "
+    "crossfades by their cut and length; their kind (Cross Fade 0 dB, +3 dB...) is not read, "
+    "and those on other audio tracks are listed as added"
+)
+
 LIMITS = (
     "enabled_state: the reader cannot see whether an item is enabled; a disabled clip is "
     "imported as if it plays",
@@ -318,6 +326,15 @@ class TimelineFile:
     timeline: Timeline
     media: dict[str, MediaClip]
     warnings: list[Issue] = field(default_factory=list)
+    #: ``drt`` or ``library`` (a ``Project.db``: its sound transitions are compared, S25e).
+    kind: str = "drt"
+
+    @property
+    def sound_transitions(self) -> bool:
+        """Whether its sound transition items stand for the plan's audio-only crossfades: in a
+        library project aar writes them as transition items (S25e); a ``.drt`` of an imported
+        FCPXML holds them as split edits with fades instead."""
+        return self.kind == "library"
 
 
 def _issue_text(issue: Issue) -> str:
@@ -430,7 +447,14 @@ def read_timeline(
             f"timeline {timeline.name!r} has no readable frame rate or start frame",
             hint,
         )
-    return TimelineFile(str(path), drp.sha256, timeline, drp.media_by_id(), list(drp.issues))
+    return TimelineFile(
+        str(path),
+        drp.sha256,
+        timeline,
+        drp.media_by_id(),
+        list(drp.issues),
+        "library" if drp.kind == LIBRARY_KIND else "drt",
+    )
 
 
 # -- the import ---------------------------------------------------------------------------------
@@ -757,11 +781,13 @@ class _Importer:
         timeline: Timeline,
         media: Mapping[str, MediaClip],
         media_map: MediaMap | None,
+        sound_transitions: bool = False,
     ) -> None:
         self.plan = plan
         self.timeline = timeline
         self.media = media
         self.media_map = media_map
+        self.sound_transitions = sound_transitions
         self.not_carried: list[dict[str, Any]] = []
         self.dropped: list[dict[str, Any]] = []
         self.foreign: list[dict[str, Any]] = []
@@ -1833,6 +1859,58 @@ class _Importer:
                         "location": e.location,
                     },
                 )
+        if self.sound_transitions:
+            self._sound_transition_items(plan, ranges)
+
+    def _sound_transition_items(self, plan: EditPlan, ranges: list[tuple[int, int]]) -> None:
+        """A library project's sound transitions (S25e) against the plan's audio-only
+        crossfades on V1's joins: one on A1 containing the cut, of the plan's length, is the
+        crossfade; any other is added; a crossfade with none is missing."""
+        sound = f"A{track_of_lane(0)}"
+        expected = [
+            _Expected(f"transitions[{number}]", ranges[tx.after][1], tx.audio.frames)
+            for number, tx in enumerate(plan.transitions)
+            if tx.video == "cut"
+            and tx.audio is not None
+            and tx.audio.frames > 0
+            and plan.segments[tx.after].track == 1
+        ]
+        for entry in self.items:
+            if entry.kind != "transition" or entry.is_video or entry.excluded:
+                continue
+            hit = next(
+                (
+                    e
+                    for e in expected
+                    if not e.found
+                    and entry.track == sound
+                    and entry.record_in <= e.cut <= entry.record_out
+                    and entry.record_out - entry.record_in == e.frames
+                ),
+                None,
+            )
+            if hit is not None:
+                hit.found = True
+            else:
+                self.carry_not(
+                    "transition_added",
+                    "a sound transition that the edited plan has no matching audio crossfade "
+                    "for (added in Resolve, moved off its cut, or its length changed)",
+                    entry.where(),
+                )
+        for e in expected:
+            if not e.found:
+                self.carry_not(
+                    "transition_missing",
+                    f"{e.location}.audio: no sound transition of {e.frames} frames at frame "
+                    f"{e.cut} on {sound} (removed in Resolve?); the plan keeps it",
+                    {
+                        "track": sound,
+                        "record_in": e.cut,
+                        "record_out": e.cut,
+                        "location": e.location,
+                    },
+                )
 
     def _audio(self, plan: EditPlan) -> None:
         """Each sound must be a picture item's own linked sound: the same file, in sync, over the
@@ -2102,7 +2180,12 @@ class _Importer:
             "foreign": self.foreign,
             "not_carried": self.not_carried,
             "dropped": self.dropped,
-            "limits": list(LIMITS),
+            "limits": [
+                SOUND_TRANSITION_LIMIT
+                if self.sound_transitions and line.startswith("audio_transitions:")
+                else line
+                for line in LIMITS
+            ],
             "assumptions": [dict(a) for a in ASSUMPTIONS],
         }
 
@@ -2164,13 +2247,16 @@ def import_timeline(
     media_map: MediaMap | None = None,
     profile: Profile | None = None,
     reader_warnings: Sequence[Issue] = (),
+    sound_transitions: bool = False,
 ) -> ImportResult:
     """The edited plan and the diff of ``timeline`` against ``plan``, or a typed refusal
     (:class:`TimelineImportError`, or the export's :class:`ExportError` when the plan itself
     cannot be laid out). With ``profile`` the edited plan is linted. Lint errors and an export
     layout refusal of the edited plan do not stop the import (the owner's edit stands); they set
-    ``lint_errors`` / ``export_errors`` in the diff."""
-    importer = _Importer(plan, timeline, media, media_map)
+    ``lint_errors`` / ``export_errors`` in the diff. With ``sound_transitions`` (a library
+    project: :attr:`TimelineFile.sound_transitions`) its sound transition items are compared
+    with the plan's audio-only crossfades (S25e); otherwise they are not compared."""
+    importer = _Importer(plan, timeline, media, media_map, sound_transitions)
     edited, diff = importer.run()
     report = lint(edited, profile) if profile is not None else None
     diff["lint"] = report.model_dump(mode="json") if report is not None else None

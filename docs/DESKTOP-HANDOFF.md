@@ -88,11 +88,11 @@ reported to the agent and not imported.
 
 What you will see for a few kinds of save:
 
-- **A save that brings the project back to how it was at an earlier save** (you undid your
-  edits and saved again), **or back to how the agent placed it**: nothing new is recorded. The
-  hub tells saves apart by the file's content, and it has already seen that content. The
-  agent's newest record is then still the later save you undid, not what is in the project
-  now; tell the agent if you went back.
+- **The latest save always wins.** Whatever you save is what the agent sees next: a save
+  that brings the project back to how it was at an earlier save (you undid your edits and
+  saved again), or back to how the agent placed it, is recorded as a new save like any other
+  (back to the placed cut, it reads "unchanged"). Only a save whose content is exactly what
+  the hub recorded last records nothing (there is nothing new in it).
 - **A save that changes nothing in the timeline** (you renamed the project inside Resolve,
   added a second timeline, or saved without changing anything that ends up in the file
   differently): it is recorded as a save like any other, with no change to the cut (every
@@ -124,23 +124,32 @@ What you will see for a few kinds of save:
   is set. With `AAR_MEDIA_ROOT` unset nothing restricts where the library may be: the export
   places the project and the pickup reads saves wherever `library.folder` points (a follow-up;
   set `AAR_MEDIA_ROOT` on the hub).
+- **Templates for crossfades.** A multi-range cut needs a sound crossfade Resolve saved to copy
+  from: give `templates` a `Project.db` whose timeline has a plain crossfade between two clips
+  (or leave one in the seed's timeline; it is removed with the seed's items). Without one the
+  cut is refused (`item_refused`, "no sound transition to use as the template").
 - **What the notes say.** Placed: the library, user, project and timeline to open, that saving
   is all, the operations not yet seen working and the clips without full evidence. Refused:
   the export's code, message and fix hint. The export step's result carries the same as
   `library_handoff` (with `warnings` on a refusal); the step itself succeeds on the FCPXML.
 - **How a save shows up.** In `recipe_status`, under `returned_edits`, like a `.drt` return,
   with `source: "library_save"`, the saved `Project.db` (`project_db`), the edited plan and
-  the diff. Why a save was not taken (the project missing, being saved, replaced, damaged, the
+  the diff, one record per save that differs from the newest one recorded (`follows` names the
+  record it follows; the latest save always wins). Why a save was not taken (the project missing, being saved, replaced, damaged, the
   timeline renamed, the library gone) is under `library_pickup`, once per condition. The same
   rules as for `.drt` returns: pickup never replaces the active plan or decides a review.
 
 ### Not carried, and limits
 
-A ccn cut of more than one continuous range has an audio crossfade at each join, which a
-library project cannot carry yet: such a cut is refused and goes by FCPXML only. Titles,
-transitions, fades, other tracks, gain, framing, markers and captions are not written (the
-notes count the plan details left out). Saves are picked up only while the round's review is
-open; after a decision or a later round they are not. The project's file is read up to 256 MiB.
+A ccn cut of more than one continuous range has a short sound crossfade at each join; the
+library project carries those (a "Cross Fade 0 dB" or "+3 dB", centred on the cut, 2 to 16
+frames, on a 29.97 fps timeline), so such a cut is placed too. Keep them where they are, or
+trim the clips beside them as usual (the crossfade moves with the cut); a crossfade you delete
+or add is reported to the agent. Picture transitions, fades, other crossfades, titles, other
+tracks, gain, framing, markers and captions are not written: a cut that needs one of the first
+three is refused and goes by FCPXML only, and the notes count the plan details left out. Saves
+are picked up only while the round's review is open; after a decision or a later round they are
+not. The project's file is read up to 256 MiB.
 
 Nothing the library route does can lose the FCPXML hand-off: any fault of the library, the seed,
 the facts file or the hub's own disk while writing the library project is the refusal

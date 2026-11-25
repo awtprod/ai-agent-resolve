@@ -1262,6 +1262,7 @@ def _cmd_import_timeline(args: argparse.Namespace) -> int:
             media_map=media_map,
             profile=profile,
             reader_warnings=timeline.warnings,
+            sound_transitions=timeline.sound_transitions,
         )
     except CompileError as exc:  # TimelineImportError, or the export's own refusals
         return _export_refusal(exc, as_json)  # type: ignore[arg-type]

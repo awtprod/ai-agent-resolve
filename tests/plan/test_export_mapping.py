@@ -98,6 +98,7 @@ def test_export_codes_are_stable() -> None:
             "project_exists",
             "not_a_library",
             "library_unwritable",
+            "bad_transition",
         ]
     )
 

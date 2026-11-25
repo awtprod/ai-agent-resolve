@@ -1,6 +1,7 @@
-"""S25d end to end, offline: the ``ccn-longform`` recipe hands the cut over as a library project
-beside the FCPXML; the "owner" edits the placed ``Project.db`` (row edits) and saves; the
-worker's sweep stores each save as a return exactly as a ``.drt`` return is stored."""
+"""S25d/S25e end to end, offline: the ``ccn-longform`` recipe hands the cut over as a library
+project beside the FCPXML (a multi-range cut with its sound crossfades, S25e); the "owner" edits
+the placed ``Project.db`` (row edits) and saves; the worker's sweep stores each save as a return
+exactly as a ``.drt`` return is stored."""
 
 from __future__ import annotations
 
@@ -25,8 +26,10 @@ from library_handoff_support import (
     delete,
     make_library_setup,
     pictures,
+    ripple_trim_tail,
     save,
     swap_first_two,
+    transitions,
     trim_tail,
 )
 
@@ -38,8 +41,7 @@ from ccn_support import needs_ffmpeg
 pytestmark = needs_ffmpeg
 pytest.importorskip("zstandard")
 
-#: One continuous range: one segment, no join, so no audio crossfade (which a library project
-#: cannot carry yet: the ccn profile puts one on every other join).
+#: One continuous range: one segment, no join, so no audio crossfade.
 ONE = {"ranges": [{"start_s": 0.9, "end_s": 11.1}]}
 THREE = {
     "ranges": [
@@ -152,17 +154,102 @@ def test_a_cut_is_handed_over_as_a_library_project_and_each_save_comes_back(
     assert not list(env.hub.log.iter_events(types=[EVENT_PICKUP]))
 
 
-def test_a_cut_the_library_cannot_carry_keeps_its_fcpxml_and_says_why(ccn_env: CcnEnv) -> None:
-    """Three ranges: the ccn profile puts an audio crossfade on each join, which a library
-    project cannot carry yet. The export still succeeds on the FCPXML; the refusal is a
-    warning in the step's result and in the notes."""
+def test_a_three_range_cut_is_placed_with_its_crossfades_and_a_trim_beside_one_comes_back(
+    ccn_env: CcnEnv,
+) -> None:
+    """Three ranges: the ccn profile puts a 2-frame "Cross Fade 0 dB" on each join. The project
+    is placed with both crossfades as sound transitions (S25e), the self-check's import finds
+    them, and the owner's ripple trim of the clip before the second crossfade comes back as
+    that one segment trimmed, the transition moved with its cut and found there."""
     env = ccn_env
     run, export = _run(env, keep=THREE)
     handoff = export["library_handoff"]
+    assert handoff["status"] == "placed", handoff.get("error")
+    assert "warnings" not in export
+    db = Path(handoff["library"]).joinpath(*handoff["parts"]) / "Project.db"
+    report = json.loads(env.hub.store.read_bytes(handoff["report"]))
+    assert report["exported"] == {
+        "segments": 3,
+        "outro": False,
+        "picture_items": 3,
+        "sound_items": 3,
+        "sound_transitions": 2,
+    }
+    assert "add_sound_transitions" in report["operations_not_opened"]
+    assert report["self_check"]["import"]["unchanged"] is True
+    plan = json.loads(env.hub.store.read_bytes(handoff["plan_sha256"]))
+    assert [t["audio"] for t in plan["transitions"]] == [
+        {"type": "Cross Fade 0 dB", "frames": 2}
+    ] * 2
+    clips = pictures(db)
+    cuts = [int(c["Start"]) + int(c["Duration"]) for c in clips[:2]]
+    # Each crossfade is centred on its cut: one frame before it, one after.
+    assert transitions(db) == [(cut - 1, 2, "Cross Fade 0DB") for cut in cuts]
+    notes = Path(export["copy"]["handoff_notes"]).read_text(encoding="utf-8")
+    assert "add_sound_transitions" in notes
+
+    # Nothing saved yet: nothing returned.
+    sweep = sweep_once(env)
+    assert (sweep.checked, sweep.unchanged, sweep.returned) == (1, 1, 0), sweep
+
+    # The owner ripple-trims 9 frames off the second clip's tail: the third clip and the
+    # crossfade on that join move up with the cut.
+    save(db, ripple_trim_tail(9, 1))
+    assert transitions(db) == [
+        (cuts[0] - 1, 2, "Cross Fade 0DB"),
+        (cuts[1] - 10, 2, "Cross Fade 0DB"),
+    ]
+    sweep = sweep_once(env)
+    assert sweep.returned == 1, sweep
+    [ret] = returned_edits(env.hub.log, env.hub.project_id, run)
+    diff = _diff(env, ret)
+    statuses = [seg["status"] for seg in diff["segments"]]
+    assert statuses == ["unchanged", "trimmed", "moved"], statuses
+    trimmed = diff["segments"][1]
+    assert (trimmed["head_frames"], trimmed["tail_frames"]) == (0, 9)
+    # Both crossfades are found at their cuts with their lengths: nothing added or missing.
+    assert not diff["not_carried"] and not diff["added"] and not diff["dropped"], diff
+    assert any(
+        line.startswith("audio_transitions: sound transition items on A1")
+        for line in diff["limits"]
+    )
+    edited = json.loads(env.hub.store.read_bytes(ret["plan"]))
+    assert [t["audio"]["frames"] for t in edited["transitions"]] == [2, 2]
+
+
+def test_a_crossfade_removed_in_the_project_comes_back_as_missing(ccn_env: CcnEnv) -> None:
+    env = ccn_env
+    run, export = _run(env, keep=THREE)
+    handoff = export["library_handoff"]
+    db = Path(handoff["library"]).joinpath(*handoff["parts"]) / "Project.db"
+
+    def drop_first_transition(conn: Any, _items: Any) -> None:
+        [(tid,)] = conn.execute(
+            "SELECT Sm2TiItem_id FROM Sm2TiItem WHERE DbType = 'Sm2TiTransition' "
+            "ORDER BY CAST(Start AS INTEGER) LIMIT 1"
+        ).fetchall()
+        conn.execute("DELETE FROM Sm2TiItem_Sm2TiTrack WHERE DbAssociate = ?", (tid,))
+        conn.execute("DELETE FROM Sm2TiItem WHERE Sm2TiItem_id = ?", (tid,))
+
+    save(db, drop_first_transition)
+    assert sweep_once(env).returned == 1
+    [ret] = returned_edits(env.hub.log, env.hub.project_id, run)
+    codes = [(n["code"], n.get("location")) for n in _diff(env, ret)["not_carried"]]
+    assert codes == [("transition_missing", "transitions[0]")]
+
+
+def test_a_cut_the_library_cannot_carry_keeps_its_fcpxml_and_says_why(ccn_env: CcnEnv) -> None:
+    """Three ranges, but neither the seed nor the templates hold a sound transition to author
+    the crossfades from: the export still succeeds on the FCPXML; the refusal is a warning in
+    the step's result and in the notes."""
+    env = ccn_env
+    run, export = _run(env, keep=THREE, transition_template=False)
+    handoff = export["library_handoff"]
     assert handoff["status"] == "refused"
-    assert handoff["error"]["code"] == "unsupported_plan_feature"
+    assert handoff["error"]["code"] == "item_refused"
+    assert "no sound transition" in handoff["error"]["message"]
     [warning] = export["warnings"]
-    assert warning["code"] == "library_unsupported_plan_feature"
+    assert warning["code"] == "library_item_refused"
     assert warning["fix_hint"] == handoff["error"]["hint"]
     copy = export["copy"]
     assert Path(copy["fcpxml"]).is_file()
@@ -171,7 +258,7 @@ def test_a_cut_the_library_cannot_carry_keeps_its_fcpxml_and_says_why(ccn_env: C
         "\nLIBRARY PROJECT: NOT WRITTEN\n  The cut was not written into the project library "
         '"Shared Library":\n' in notes
     )
-    assert "[unsupported_plan_feature]" in notes and "import the FCPXML" in notes
+    assert "[item_refused]" in notes and "import the FCPXML" in notes
     library = Path(handoff["library"]) / "Resolve Projects" / "Users" / "guest" / "Projects"
     assert list(library.iterdir()) == []
     # Nothing to pick up: a refused hand-off is never watched.

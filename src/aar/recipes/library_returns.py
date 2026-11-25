@@ -18,8 +18,11 @@ its export attempt not superseded, and no decision on that round's gate review):
    hub's own disk, never the system temporary folder; the journal is checked again after it.
    A file this worker has found not settled in :attr:`Limits.busy_after` sweeps in a row (one
    rewritten all the time) is reported ``busy`` (and looked at again in each sweep).
-4. Its SHA-256 equal to the placed file's: nothing to do. Equal to a save already returned, or
-   to one already reported as a condition: nothing to do.
+4. Its SHA-256 equal to the **most recent state the hub has recorded for the hand-off** (the
+   placed file's while nothing has been returned, else the newest return's): nothing to do.
+   The latest save always wins (owner, S25e): a save back to content seen earlier (an edit
+   undone, or the project as placed) is a new return whenever it differs from that newest
+   state. Equal to content already reported as a condition: nothing to do.
 5. Read with the timeline import's reader, refusing a file of any other project id
    (``project_replaced``) before reading the timeline; a missing timeline is
    ``timeline_missing``, a damaged file ``damaged``.
@@ -27,8 +30,12 @@ its export attempt not superseded, and no decision on that round's gate review):
    (:func:`aar.recipes.desktop_returns.record_import`: the same ``recipe.timeline_return``
    event with ``needs_review``, the edited plan and the diff as artifacts, the same rule that
    pickup never replaces the active plan or decides a review), with ``source: "library_save"``
-   and the saved ``Project.db`` itself as an artifact. Idempotent on the run, round, plan,
-   hand-off and the snapshot's hash: a second save is a second return, an unchanged file none.
+   and the saved ``Project.db`` itself as an artifact (its SHA-256 also as
+   ``snapshot_sha256``). Idempotent on the run, round, plan, hand-off, the newest recorded
+   state it follows (``placed``, or the return event's id) and the snapshot's hash: the same
+   save seen twice (two workers, a restarted one) is one return, and the same content saved
+   again later (after another return) is a new one. A return is recorded only while the state
+   it follows is still the newest, checked inside the transaction that records it.
 
 **Conditions** are ``recipe.library_pickup`` events (:data:`EVENT_PICKUP`), one per distinct
 condition: a condition about a file's content (``project_replaced``, ``damaged``,
@@ -55,6 +62,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import os
+import re
 import secrets
 import stat
 import time
@@ -222,6 +230,44 @@ def _review_open(log: EventLog, found: _Found) -> bool:
             if not gop.is_cancelled and state.gate_decision(gop) is not None:
                 return False
     return True
+
+
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+@dataclass(frozen=True)
+class _State:
+    """The most recent state the hub has recorded for a hand-off: the placed project
+    (``ref`` ``placed``) or its newest return (``return:<event id>``), and its content hash."""
+
+    ref: str
+    sha256: str
+
+    @property
+    def placed(self) -> bool:
+        return self.ref == "placed"
+
+
+def _recorded_state(log: EventLog, project_id: str, handoff: Handoff, op_node: str) -> _State:
+    """The newest recorded state of the hand-off ``op_node`` (see :class:`_State`)."""
+    from aar.recipes.desktop_returns import EVENT_RETURN
+
+    newest: Event | None = None
+    for event in _runner_events(log, [EVENT_RETURN], project_id):
+        payload = event.payload
+        if (
+            payload.get("source") == "library_save"
+            and payload.get("handoff") == op_node
+            and payload.get("recipe_node") == handoff.recipe_node
+        ):
+            newest = event
+    if newest is None:
+        return _State("placed", handoff.placed_sha256)
+    # The saved file's artifact id is its SHA-256 (returns before S25e carry only that).
+    sha = newest.payload.get("snapshot_sha256") or newest.payload.get("project_db")
+    if not isinstance(sha, str) or not _SHA256.match(sha):
+        raise ValueError(f"the recorded return {newest.id} names no saved file's hash")
+    return _State(f"return:{newest.id}", sha)
 
 
 def _returns_per_handoff(log: EventLog) -> dict[str, int]:
@@ -715,12 +761,19 @@ def _check_one(
         if snapshot is None:
             sweep.deferred += 1
             return
-        if snapshot.sha256 == h.placed_sha256:
-            sweep.unchanged += 1
+        state = _recorded_state(log, project_id, h, found.op_node)
+        if snapshot.sha256 == state.sha256:
+            if state.placed:
+                sweep.unchanged += 1
+            else:
+                sweep.repeated += 1
             return
+        # The latest save always wins: the key names the state this save follows, so the same
+        # content saved again after another return is a new return, and the same save seen
+        # twice is one.
         key = (
             f"library-return:{project_id}:{h.recipe_node}:{h.round}:{h.plan_sha256}:"
-            f"{found.op_node}:{snapshot.sha256}"
+            f"{found.op_node}:{state.ref}:{snapshot.sha256}"
         )
         if _seen(log, project_id, found.op_node, snapshot.sha256, key):
             sweep.repeated += 1
@@ -743,6 +796,8 @@ def _check_one(
             "project_id": h.project_id,
             "timeline": h.timeline,
             "project_db": saved,
+            "snapshot_sha256": snapshot.sha256,
+            "follows": state.ref,
             "file": "Project.db",
             "status": "needs_review",
             "partial_reconstruction": True,
@@ -758,11 +813,14 @@ def _check_one(
             result=result,
             key=key,
             actor=actor,
+            current=lambda: _recorded_state(log, project_id, h, found.op_node).ref == state.ref,
         )
         if stored is result:
             sweep.returned += 1
         elif stored is not None:  # another worker recorded this save first: not twice
             sweep.repeated += 1
+        else:  # the run was cancelled, or another save was recorded meanwhile: look again
+            sweep.deferred += 1
     except _Condition as cond:
         _report(log, found, generation, cond, sweep)
     except (OSError, ValueError, ExportError) as exc:  # the hub's own disk or a bad record

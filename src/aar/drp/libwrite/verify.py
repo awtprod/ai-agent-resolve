@@ -19,6 +19,17 @@ back:
   the other half of its layout entry and nothing else), empty as on an item Resolve has just
   made (a grade, Fusion, effects, markers, import metadata, item metadata), or a stated
   constant (every plain item of the corpus holds it);
+* every column of every sound transition (:data:`TRANSITION_RULES`, one rule per column of the
+  same closed list), recomputed from the cut's transitions (:class:`CutTransition`): its join
+  (the outgoing entry's sound ends where exactly one other entry's sound starts, neither a
+  split edit), its ``Start`` (the cut minus Resolve's centring, ``(length + 1) // 2`` frames),
+  ``Duration``, ``AlignmentType`` and ``Position``, ``PrettyType`` (the kind's stored name,
+  from the verifier's own table), ``FieldsBlob`` byte for byte (one field #2 holding the bytes
+  every sound transition holds, which inflate to its 44-byte value, framed plain, version 2),
+  its place in the track's ``Items`` vector (record order, a transition before a clip that
+  starts on its frame), and that the two clips hold the media it plays (frames before the
+  incoming clip's in point, frames of sound past the outgoing clip's out point), from the
+  clips' rows as written;
 * every media clip the writer adds: one media row, its picture info and its sound infos (each
   naming this clip, joined in order, as many as were authored), its one bin entry, and every
   ``Clip`` blob naming the same folder and file (the media's name);
@@ -46,7 +57,7 @@ from typing import Any
 from aar.drp import blobs
 from aar.drp.items.rows import ITEM_COLUMNS
 from aar.drp.library import LibraryOptions, read_rows
-from aar.drp.libwrite.cut import Cut
+from aar.drp.libwrite.cut import Cut, CutTransition
 from aar.drp.libwrite.errors import ProjectWriteError, refusing
 from aar.drp.libwrite.seed import (
     REPLACED_TABLES,
@@ -59,7 +70,15 @@ from aar.drp.mediapool.templates import MEDIA_TABLES, ClipRows
 from aar.drp.modify import encode
 from aar.media.probe import timecode_frames
 
-__all__ = ["ITEM_RULES", "Expected", "expected_items", "verify_written"]
+__all__ = [
+    "ITEM_RULES",
+    "TRANSITION_RULES",
+    "Expected",
+    "ExpectedTransition",
+    "expected_items",
+    "expected_transitions",
+    "verify_written",
+]
 
 _HINT = "this is a writer bug: the project was not placed; report the seed and the plan"
 _TABLES = (
@@ -150,6 +169,135 @@ ITEM_RULES: dict[str, object] = {
     "CompTableLockSysId": ("constant", ""),
     "VersionTableLockSysId": ("constant", ""),
 }
+
+
+#: The verifier's own table of the sound transitions it accepts: Resolve's menu name -> the
+#: ``PrettyType`` it stores (kept apart from the writer's on purpose; a test compares them).
+TRANSITION_NAMES = {"Cross Fade 0 dB": "Cross Fade 0DB", "Cross Fade +3 dB": "Cross Fade +3DB"}
+#: ``FieldsBlob`` #2 of every sound transition of the corpus (854 of 854), decompressed, and
+#: as stored (``qCompress``: the length, then the zlib stream; the same bytes on all 854).
+TRANSITION_PAYLOAD = bytes([3, 0, 1]) + bytes(41)
+TRANSITION_FIELD = bytes.fromhex("0000002c") + bytes.fromhex("789c636660642016000000da0005")
+_TRANSITION = "Sm2TiTransition"
+#: What the verifier requires of each column of a sound transition, as :data:`ITEM_RULES`
+#: does for a clip: :data:`DERIVED` (recomputed from the cut), or the constant every sound
+#: transition of the corpus holds. One entry per column of ``ITEM_COLUMNS`` (a test pins it).
+TRANSITION_RULES: dict[str, object] = {
+    "Sm2TiItem_id": DERIVED,
+    "DbType": DERIVED,
+    "Start": DERIVED,
+    "Duration": DERIVED,
+    "Sm2TiTrack_id": DERIVED,
+    "AlignmentType": DERIVED,
+    "Position": DERIVED,
+    "PrettyType": DERIVED,
+    "FieldsBlob": DERIVED,
+    "Name": ("constant", "Transition"),
+    "Track": ("constant", None),
+    "LinkedItemSync": ("constant", None),
+    "MarkersBA": ("constant", None),
+    "UiMemento": ("constant", 0),
+    "Flags": ("constant", 0),
+    "PriorityIndex": ("constant", 0),
+    "In": ("constant", None),
+    "MediaRef": ("constant", None),
+    "MediaStartTime": ("constant", None),
+    "MediaFilePath": ("constant", None),
+    "MediaReelNumber": ("constant", None),
+    "MediaTimemapBA": ("constant", None),
+    "Group": ("constant", None),
+    "pLmVerTable": ("constant", None),
+    "pAuxLmVerTable": ("constant", None),
+    "Thumbnail": ("constant", None),
+    "ThumbnailDirtyFlag": ("constant", 1),
+    "RenderTextEnabled": ("constant", 1),
+    "RenderTextGanged": ("constant", 1),
+    "RenderTextPrefixed": ("constant", 1),
+    "TextRenderItemVec": ("constant", None),
+    "LastChangedTime": ("constant", None),
+    "LastRenderedTime": ("constant", None),
+    "IsMarkedForCaching": ("constant", None),
+    "IsForceConformed": ("constant", 1),
+    "MatchConflictState": ("constant", 0),
+    "MediaTrackIdx": ("constant", None),
+    "Resolution": ("constant", None),
+    "EffectFiltersBA": ("constant", None),
+    "IsPreConformed": ("constant", 0),
+    "PreConformMediaExtents": ("constant", None),
+    "ImportExportMetadataBA": ("constant", None),
+    "MediaFrameRate": ("constant", None),
+    "VirtualAudioTrackBA": ("constant", None),
+    "MixedFrameRateAlignment": ("constant", 0.0),
+    "UseOppositeSrcForLeftEye": ("constant", 0),
+    "UseOppositeSrcForRightEye": ("constant", 0),
+    "WasDisbanded": ("constant", 0),
+    "CurrentSelectorIdx": ("constant", 0),
+    "RenderCacheBA": ("constant", None),
+    "ClipGroup": ("constant", None),
+    "MediaMetadata": ("constant", None),
+    "CompositionTable": ("constant", None),
+    "BlobLockSysId": ("constant", ""),
+    "OriginalClip": ("constant", None),
+    "Sm2TiItem_Owner_id": ("constant", None),
+    "CompTableLockSysId": ("constant", ""),
+    "VersionTableLockSysId": ("constant", ""),
+}
+
+
+@dataclass(frozen=True)
+class ExpectedTransition:
+    """One sound transition the cut asks for: its cut (record frame from the timeline's start),
+    length, the frames before the cut, its stored name, and the two entries it joins."""
+
+    number: int
+    cut: int
+    frames: int
+    before: int
+    pretty: str
+    outgoing: int
+    incoming: int
+
+
+@refusing("self_check_failed", "listing the transitions a cut asks for", _HINT)
+def expected_transitions(
+    cuts: Sequence[Cut], transitions: Sequence[CutTransition]
+) -> list[ExpectedTransition]:
+    """The sound transitions ``transitions`` ask for, each on a join of two entries of
+    ``cuts`` (recomputed here: the outgoing entry's sound ends where exactly one other entry's
+    sound starts, and neither is a split edit), centred as Resolve centres one."""
+    out: list[ExpectedTransition] = []
+    for number, tx in enumerate(transitions):
+        where = f"transition {number}"
+        if not isinstance(tx, CutTransition) or not isinstance(tx.after, int):
+            raise _fail(f"{where} is not a transition of the cut", field="transitions")
+        if tx.alignment != "centre" or tx.name not in TRANSITION_NAMES:
+            raise _fail(f"{where} is a {tx.name!r} aligned {tx.alignment!r}", field="PrettyType")
+        if not 0 <= tx.after < len(cuts) or not isinstance(tx.frames, int) or tx.frames < 1:
+            raise _fail(f"{where} names no cut entry or has no length", field="transitions")
+        out_cut = cuts[tx.after]
+        end = out_cut.record_in + out_cut.duration
+        incoming = [
+            i for i, c in enumerate(cuts) if i != tx.after and c.sound and c.record_in == end
+        ]
+        if not out_cut.sound or len(incoming) != 1:
+            raise _fail(f"{where} is not on a join of two sounds", field="transitions")
+        for c in (out_cut, cuts[incoming[0]]):
+            if any(v is not None for v in (c.sound_record_in, c.sound_src_in, c.sound_duration)):
+                raise _fail(f"{where} joins a split edit", field="transitions")
+        out.append(
+            ExpectedTransition(
+                number,
+                end,
+                tx.frames,
+                (tx.frames + 1) // 2,
+                TRANSITION_NAMES[tx.name],
+                tx.after,
+                incoming[0],
+            )
+        )
+    if len({t.cut for t in out}) != len(out):
+        raise _fail("two transitions sit on one cut", field="transitions")
+    return out
 
 
 @dataclass(frozen=True)
@@ -369,6 +517,7 @@ def verify_written(
     seed: Seed,
     cuts: Sequence[Cut],
     *,
+    transitions: Sequence[CutTransition] = (),
     clips: Sequence[ClipRows] = (),
     project_name: str,
     timeline_name: str | None,
@@ -379,22 +528,40 @@ def verify_written(
     (see the module docstring); returns how many items it checked, or raises
     ``self_check_failed`` naming the first difference."""
     unruled = sorted(set(ITEM_COLUMNS) ^ set(ITEM_RULES))
+    unruled += sorted(set(ITEM_COLUMNS) ^ set(TRANSITION_RULES))
     if unruled:
         raise _fail(f"the verifier has no rule for item columns {unruled[:4]}", field="rules")
     tables = _read_all(path, seed)
     want = expected_items(cuts)
+    fades = expected_transitions(cuts, transitions)
     rate = float(seed.rate)
     tracks = {"picture": seed.video_track, "sound": seed.audio_track}
     joins: dict[object, list[dict[str, Any]]] = {}
     for row in tables["Sm2TiItem_Sm2TiTrack"]:
         joins.setdefault(row.get("DbAssociate"), []).append(row)
-    items = tables["Sm2TiItem"]
-    if len(items) != len(want) or len(tables["Sm2TiItem_Sm2TiTrack"]) != len(want):
+    every = tables["Sm2TiItem"]
+    count = len(want) + len(fades)
+    if len(every) != count or len(tables["Sm2TiItem_Sm2TiTrack"]) != count:
         raise _fail(
-            f"the written project holds {len(items)} items and "
-            f"{len(tables['Sm2TiItem_Sm2TiTrack'])} join rows; the layout asks for {len(want)}",
+            f"the written project holds {len(every)} items and "
+            f"{len(tables['Sm2TiItem_Sm2TiTrack'])} join rows; the layout asks for {count}",
             field="items",
         )
+    items = [r for r in every if r.get("DbType") != _TRANSITION]
+    fade_rows = [r for r in every if r.get("DbType") == _TRANSITION]
+    if len(fade_rows) != len(fades):
+        raise _fail(
+            f"the written project holds {len(fade_rows)} transitions; the cut asks for "
+            f"{len(fades)}",
+            field="DbType",
+        )
+    # Each track's Items vector: record order, a transition before a clip starting on its frame.
+    order: dict[str, dict[tuple[str, int], int]] = {}
+    for kind in tracks:
+        keyed = [(e.record_in, 1, "clip", e.record_in) for e in want if e.kind == kind]
+        if kind == "sound":
+            keyed += [(t.cut - t.before, 0, "transition", t.cut) for t in fades]
+        order[kind] = {(k[2], k[3]): i for i, k in enumerate(sorted(keyed))}
     written: dict[tuple[str, int], dict[str, Any]] = {}  # (kind, record start) -> item
     medias: dict[str, _Media] = {}
     for kind, track in tracks.items():
@@ -414,9 +581,9 @@ def verify_written(
         ordered.sort(
             key=lambda lr: lr[0].get("DbIndex") if isinstance(lr[0].get("DbIndex"), int) else -1
         )
-        for index, ((link, row), exp) in enumerate(zip(ordered, expected, strict=True)):
+        for (link, row), exp in zip(ordered, expected, strict=True):
             where = f"the {kind} item at record frame {exp.record_in}"
-            _same(where, "DbIndex", link.get("DbIndex"), index)
+            _same(where, "DbIndex", link.get("DbIndex"), order[kind][("clip", exp.record_in)])
             _same(where, "join DbOwner", link.get("DbOwner"), track)
             _same(where, "join DbPropertyName", link.get("DbPropertyName"), "Items")
             _same(where, "DbType", row.get("DbType"), _TYPES[kind])
@@ -475,10 +642,115 @@ def verify_written(
         ids.add(item_id)
         derived = _derived(exp, row, medias[exp.media_id], tables, tracks, others)
         _check_columns(where, row, derived)
+    _check_transitions(seed, fade_rows, joins, fades, cuts, medias, tables, order["sound"], ids)
     _check_clips(seed, tables, clips, cuts)
     _check_rows(seed, tables, clips, project_name=project_name, timeline_name=timeline_name)
     _check_extents(seed, tables, want, rate)
-    return len(want)
+    return len(want) + len(fades)
+
+
+def _check_transitions(
+    seed: Seed,
+    rows: list[dict[str, Any]],
+    joins: dict[object, list[dict[str, Any]]],
+    fades: list[ExpectedTransition],
+    cuts: Sequence[Cut],
+    medias: dict[str, _Media],
+    tables: dict[str, list[dict[str, Any]]],
+    order: dict[tuple[str, int], int],
+    ids: set[object],
+) -> None:
+    """Every transition row against its rules (:data:`TRANSITION_RULES`), its join row, and
+    the media its two clips hold beyond the cut."""
+    by_start = {}
+    for row in rows:
+        start = _text_frames(row.get("Start"))
+        if start is None or start in by_start:
+            raise _fail("a transition has no whole-frame start, or two share one", field="Start")
+        by_start[start] = row
+    for fade in fades:
+        where = f"the transition at record frame {fade.cut}"
+        start = seed.start_frame + fade.cut - fade.before
+        row = by_start.pop(start, None)
+        if row is None:
+            raise _fail(f"{where} is not in the written project at frame {start}", field="Start")
+        link = joins.get(row.get("Sm2TiItem_id"), [])
+        if len(link) != 1:
+            raise _fail(f"{where} has {len(link)} join rows", field="Items")
+        _same(where, "DbIndex", link[0].get("DbIndex"), order[("transition", fade.cut)])
+        _same(where, "join DbOwner", link[0].get("DbOwner"), seed.audio_track)
+        _same(where, "join DbPropertyName", link[0].get("DbPropertyName"), "Items")
+        item_id = row.get("Sm2TiItem_id")
+        if (
+            not isinstance(item_id, str)
+            or not _UUID.match(item_id)
+            or item_id in seed.taken
+            or item_id in ids
+        ):
+            raise _fail(f"{where} has the id {item_id!r}, not a fresh one", field="Sm2TiItem_id")
+        ids.add(item_id)
+        derived: dict[str, object] = {
+            "Sm2TiItem_id": item_id,
+            "DbType": _TRANSITION,
+            "Start": str(start),
+            "Duration": str(fade.frames),
+            "Sm2TiTrack_id": seed.audio_track,
+            "AlignmentType": 2,
+            "Position": 2,
+            "PrettyType": fade.pretty,
+            "FieldsBlob": row.get("FieldsBlob"),  # checked by its structure below
+        }
+        _check_transition_fields(where, row.get("FieldsBlob"))
+        for column, value in row.items():
+            rule = TRANSITION_RULES.get(column)
+            if rule is None:
+                if value is not None:
+                    raise _fail(f"{where} holds {column} {value!r}; it must be empty", field=column)
+                continue
+            expect = derived[column] if rule == DERIVED else rule[1]  # type: ignore[index]
+            if not _equal(value, expect):
+                shown = value if not isinstance(value, bytes) else f"{len(value)} bytes"
+                raise _fail(
+                    f"{where} holds {column} {shown!r}; it must hold {expect!r}", field=column
+                )
+        # The media it plays: frames past the outgoing clip's out point, before the incoming
+        # clip's in point (the clips' rows as written).
+        out_cut, in_cut = cuts[fade.outgoing], cuts[fade.incoming]
+        after = fade.frames - fade.before
+        if fade.before > out_cut.duration or after > in_cut.duration:
+            raise _fail(f"{where} is longer than a clip it joins", field="Duration")
+        media = medias.get(out_cut.clip.media_id) or _media(out_cut.clip.media_id, tables)
+        if media.sound_frames is None or (
+            out_cut.src_in + out_cut.duration + after > media.sound_frames
+        ):
+            raise _fail(
+                f"{where} plays past the end of the outgoing clip's sound", field="Duration"
+            )
+        if in_cut.src_in < fade.before:
+            raise _fail(f"{where} plays before the incoming clip's first frame", field="Start")
+    if by_start:
+        raise _fail(f"{len(by_start)} transition(s) the cut does not ask for", field="DbType")
+
+
+def _check_transition_fields(where: str, value: object) -> None:
+    """A sound transition's ``FieldsBlob``: version 2, framed plain, one field #2 whose
+    qCompress'd value is :data:`TRANSITION_PAYLOAD`."""
+    if not isinstance(value, bytes) or len(value) < 9:
+        raise _fail(f"{where}'s FieldsBlob is not a blob", field="FieldsBlob")
+    version, length = struct.unpack(">II", value[:8])
+    if version != 2 or length != len(value) - 8 or value[8] != blobs.CODEC_PROTOBUF:
+        raise _fail(f"{where}'s FieldsBlob is not a plain version 2 message", field="FieldsBlob")
+    fields = blobs.decode_protobuf(value[9:], nested_depth=0)
+    if len(fields) != 1 or fields[0].number != 2 or not isinstance(fields[0].value, bytes):
+        raise _fail(f"{where}'s FieldsBlob holds other fields than #2", field="FieldsBlob")
+    if encode.protobuf([(2, 2, fields[0].value)]) != value[9:]:
+        raise _fail(f"{where}'s FieldsBlob is not in its canonical form", field="FieldsBlob")
+    inner = fields[0].value
+    if (
+        inner != TRANSITION_FIELD
+        or blobs.qcompress_decompress(inner, max_output=4096) != TRANSITION_PAYLOAD
+    ):
+        raise _fail(f"{where}'s FieldsBlob #2 is not the sound transition's value", field="#2")
 
 
 def _read_all(path: Path, seed: Seed) -> dict[str, list[dict[str, Any]]]:

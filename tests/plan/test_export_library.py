@@ -129,6 +129,7 @@ def test_a_plan_becomes_a_library_project_that_imports_back_unchanged(tmp_path: 
         "outro": False,
         "picture_items": 3,
         "sound_items": 3,
+        "sound_transitions": 0,
     }
     assert [m["status"] for m in report["media"]] == ["verified", "verified"]
     assert [op["operation"] for op in report["operations"]] == [
@@ -172,7 +173,7 @@ def test_gaps_are_carried(tmp_path: Path) -> None:
     [
         (
             {"transitions": [{"after": 0, "video": "dissolve", "video_frames": 6}]},
-            "join transition",
+            "a picture transition",
         ),
         (
             {

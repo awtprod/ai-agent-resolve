@@ -201,6 +201,8 @@ def test_every_public_entry_point_is_behind_the_typed_boundary() -> None:
         "aar.drp.items.rows",
         "aar.drp.items.fields",
         "aar.drp.items.gate",
+        "aar.drp.items.transitions",
+        "aar.drp.items.transition_gate",
         "aar.drp.libwrite",
         "aar.drp.libwrite.check",
         "aar.drp.libwrite.cut",

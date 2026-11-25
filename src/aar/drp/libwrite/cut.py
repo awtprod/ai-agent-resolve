@@ -4,8 +4,13 @@
 the timeline; picture, sound or both, and for a split edit the sound's own range) into authored
 items (:func:`aar.drp.items.author_item`) on the seed timeline's video and audio track, with the
 picture and the sound of one entry linked to each other, and returns the items as the read-back
-must find them. Template items come from :func:`pick_item_templates`: plain items Resolve saved,
-one per kind and linkage.
+must find them. :class:`CutTransition` entries put a sound crossfade on a join of two entries
+(:func:`aar.drp.items.transitions.author_transition`): the outgoing entry's sound must end
+exactly where another entry's sound starts (a join, not a gap or a split edit), and both clips
+must hold the media the transition plays beyond the cut (refused ``bad_transition``, never
+shortened). On each track the items are in record order, a transition before a clip that starts
+on the same frame (Resolve's order). Template items come from :func:`pick_item_templates`:
+plain items Resolve saved, one per kind and linkage, and one plain sound transition.
 """
 
 from __future__ import annotations
@@ -18,13 +23,20 @@ from aar.drp.items.author import AuthoredItem, ItemPlacement, author_item
 from aar.drp.items.errors import ItemError
 from aar.drp.items.media import media_view
 from aar.drp.items.rows import ItemRows, ItemSet, links_of, shape_of
+from aar.drp.items.transitions import (
+    TRANSITION,
+    TransitionPlacement,
+    author_transition,
+    frames_before,
+    transition_shape,
+)
 from aar.drp.libwrite.errors import ProjectWriteError, refusing
 from aar.drp.libwrite.seed import Seed
 from aar.drp.libwrite.write import ItemSpec
 from aar.drp.mediapool.errors import MediaPoolError
 from aar.drp.mediapool.templates import ClipRows
 
-__all__ = ["Cut", "ItemTemplates", "author_cut", "pick_item_templates"]
+__all__ = ["Cut", "CutTransition", "ItemTemplates", "author_cut", "pick_item_templates"]
 
 
 @dataclass(frozen=True)
@@ -45,11 +57,35 @@ class Cut:
 
 
 @dataclass(frozen=True)
+class CutTransition:
+    """A sound crossfade on the join after cut entry ``after`` (an index into the cut list):
+    Resolve's ``name`` of its kind (``Cross Fade 0 dB``...), its length and its alignment on
+    the cut."""
+
+    after: int
+    frames: int
+    name: str
+    alignment: str = "centre"
+
+
+@dataclass(frozen=True)
 class ItemTemplates:
-    """A template item per ``(kind, linked)``, each with the media clips of its project."""
+    """A template item per ``(kind, linked)``, each with the media clips of its project, and a
+    template sound transition (None when none was given)."""
 
     by_key: dict[tuple[str, bool], tuple[ItemRows, dict[str, ClipRows]]]
     sources: tuple[str, ...] = ()
+    transition: ItemRows | None = None
+
+    def get_transition(self) -> ItemRows:
+        if self.transition is None:
+            raise ItemError(
+                "no_template",
+                "no sound transition to use as the template",
+                "give --templates a project Resolve saved whose timeline has a plain sound "
+                "crossfade between two clips",
+            )
+        return self.transition
 
     def get(self, kind: str, linked: bool) -> tuple[ItemRows, dict[str, ClipRows]]:
         found = self.by_key.get((kind, linked))
@@ -73,17 +109,25 @@ class ItemTemplates:
     passthrough=(MediaPoolError,),
 )
 def pick_item_templates(sets: Sequence[ItemSet]) -> ItemTemplates:
-    """The first plain item (supported shape, no later additions) of each kind and linkage,
-    in the order the projects and their items are given."""
+    """The first plain item (supported shape, no later additions) of each kind and linkage, and
+    the first plain sound transition (on an audio track, no later-edit state), in the order the
+    projects and their items are given."""
     by_key: dict[tuple[str, bool], tuple[ItemRows, dict[str, ClipRows]]] = {}
+    transition: ItemRows | None = None
     for items in sets:
         for rows in items.items:
+            if rows.item.get("DbType") == TRANSITION:
+                _, track_type = items.tracks.get(str(rows.item.get("Sm2TiTrack_id")), ("", -1))
+                tshape = transition_shape(rows, track_type)
+                if transition is None and tshape.refused is None and not tshape.tags:
+                    transition = rows
+                continue
             shape = shape_of(rows, items.clips)
             if shape.refused is not None or shape.tags or shape.kind is None:
                 continue
             key = (shape.kind, bool(links_of(rows.item)))
             by_key.setdefault(key, (rows, items.clips))
-    return ItemTemplates(by_key, tuple(str(s.path) for s in sets))
+    return ItemTemplates(by_key, tuple(str(s.path) for s in sets), transition)
 
 
 def _bad(why: str) -> ProjectWriteError:
@@ -116,9 +160,11 @@ def author_cut(
     cuts: Sequence[Cut],
     templates: ItemTemplates,
     *,
+    transitions: Sequence[CutTransition] = (),
     new_id: Callable[[], str] = lambda: str(uuid.uuid4()),
 ) -> tuple[list[AuthoredItem], list[ItemSpec]]:
-    """The items of ``cuts`` on the seed's tracks (see the module docstring)."""
+    """The items of ``cuts`` and the sound crossfades of ``transitions`` on the seed's tracks
+    (see the module docstring)."""
     taken = set(seed.taken)
 
     def fresh() -> str:
@@ -157,11 +203,41 @@ def author_cut(
                     cut.duration if cut.sound_duration is None else cut.sound_duration,
                 )
             )
+    joins = _joins(seed, cuts, transitions)
+    # (record start, 0 for a transition / 1 for a clip, ...): Resolve's order on a track.
+    entries: dict[str, list[tuple[int, int, int, object]]] = {"picture": [], "sound": []}
+    for n, plan in enumerate(planned):
+        entries[plan[2]].append((plan[4], 1, n, plan))
+    for n, join in enumerate(joins):
+        entries["sound"].append((join.cut - join.before, 0, n, join))
     items: list[AuthoredItem] = []
     specs: list[ItemSpec] = []
     for kind, track in (("picture", seed.video_track), ("sound", seed.audio_track)):
-        mine = sorted((p for p in planned if p[2] == kind), key=lambda p: p[4])
-        for index, (item_id, cut, _, partners, record_in, src_in, duration) in enumerate(mine):
+        mine = sorted(entries[kind], key=lambda e: e[:3])
+        for index, (_, is_clip, _, entry) in enumerate(mine):
+            if not is_clip:
+                assert isinstance(entry, _Join)
+                placement_t = TransitionPlacement(
+                    name=entry.name,
+                    track_id=track,
+                    index=index,
+                    cut=seed.start_frame + entry.cut,
+                    frames=entry.frames,
+                    alignment=entry.alignment,
+                    rate=seed.rate,
+                )
+                items.append(
+                    author_transition(
+                        templates.get_transition(),
+                        placement_t,
+                        transition_id=fresh(),
+                        taken=seed.taken,
+                    )
+                )
+                start = entry.cut - entry.before
+                specs.append(ItemSpec("audio", start, start + entry.frames, 0, ""))
+                continue
+            item_id, cut, _, partners, record_in, src_in, duration = entry  # type: ignore[misc]
             template, clips = templates.get(kind, bool(partners))
             placement = ItemPlacement(
                 kind=kind,
@@ -185,3 +261,97 @@ def author_cut(
                 )
             )
     return items, specs
+
+
+@dataclass(frozen=True)
+class _Join:
+    """A transition placed on a join: its cut (record frame from the timeline's start)."""
+
+    cut: int
+    frames: int
+    before: int
+    name: str
+    alignment: str
+
+
+def _refuse(why: str, **details: object) -> ProjectWriteError:
+    return ProjectWriteError(
+        "bad_transition",
+        why,
+        "put the crossfade on a join of two clips whose media run on past the cut, or add it "
+        "in Resolve",
+        **details,
+    )
+
+
+def _joins(seed: Seed, cuts: Sequence[Cut], transitions: Sequence[CutTransition]) -> list[_Join]:
+    """Each transition's join: the outgoing entry's sound ends where exactly one other entry's
+    sound starts, neither is a split edit, and both clips hold the media it plays."""
+    out: list[_Join] = []
+    seen: set[int] = set()
+    for number, tx in enumerate(transitions):
+        where = f"transition {number}"
+        if not isinstance(tx, CutTransition):
+            raise _bad(f"{where} is a {type(tx).__name__}, not a CutTransition")
+        for name in ("after", "frames"):
+            value = getattr(tx, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise _bad(f"{where}'s {name} {value!r} is not a whole number")
+        if not isinstance(tx.name, str) or not isinstance(tx.alignment, str):
+            raise _bad(f"{where}'s name or alignment is not text")
+        if not 0 <= tx.after < len(cuts):
+            raise _refuse(f"{where} follows cut entry {tx.after}, which does not exist")
+        if tx.after in seen:
+            raise _refuse(f"{where}: the join after cut entry {tx.after} has two transitions")
+        seen.add(tx.after)
+        if tx.frames < 1:
+            raise _refuse(f"{where} is {tx.frames} frames long")
+        out_cut = cuts[tx.after]
+        if not out_cut.sound:
+            raise _refuse(f"{where} follows cut entry {tx.after}, which has no sound")
+        end = out_cut.record_in + out_cut.duration
+        incoming = [
+            i for i, c in enumerate(cuts) if i != tx.after and c.sound and c.record_in == end
+        ]
+        if len(incoming) != 1:
+            raise _refuse(
+                f"{where}: no single clip's sound starts where cut entry {tx.after}'s ends "
+                f"(frame {end}): not a join (a gap, or nothing follows)"
+            )
+        in_cut = cuts[incoming[0]]
+        for index, c in ((tx.after, out_cut), (incoming[0], in_cut)):
+            if any(v is not None for v in (c.sound_record_in, c.sound_src_in, c.sound_duration)):
+                raise _refuse(
+                    f"{where}: cut entry {index} is a split edit; a crossfade on a split edit "
+                    "was never seen"
+                )
+        try:
+            before = frames_before(tx.alignment, tx.frames)
+        except ItemError as exc:
+            raise _refuse(f"{where}: {exc.message}") from None
+        after = tx.frames - before
+        if before > out_cut.duration or after > in_cut.duration:
+            raise _refuse(
+                f"{where}: a {tx.frames}-frame transition is longer than a clip it joins "
+                f"({out_cut.duration} and {in_cut.duration} frames)"
+            )
+        out_view, in_view = media_view(out_cut.clip), media_view(in_cut.clip)
+        if out_view.sound_frames is None or in_view.sound_frames is None:
+            raise _refuse(f"{where}: a clip it joins has no sound")
+        past = out_cut.src_in + out_cut.duration + after
+        if past > out_view.sound_frames:
+            raise _refuse(
+                f"{where}: it plays {after} frame(s) past the outgoing clip's out point, to "
+                f"source frame {past}, but its sound has {out_view.sound_frames} frames",
+                needed=after,
+                available=out_view.sound_frames - out_cut.src_in - out_cut.duration,
+            )
+        if in_cut.src_in < before:
+            raise _refuse(
+                f"{where}: it plays {before} frame(s) ahead of the incoming clip's in point, "
+                f"but the clip starts {in_cut.src_in} frame(s) into its file",
+                needed=before,
+                available=in_cut.src_in,
+            )
+        out.append(_Join(end, tx.frames, before, tx.name, tx.alignment))
+    return out

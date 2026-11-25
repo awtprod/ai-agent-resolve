@@ -292,8 +292,9 @@ def test_a_recorded_path_part_that_climbs_or_hides_is_refused(
 def test_what_the_owner_sees_for_a_save_of_old_content_or_no_timeline_change(
     ccn_env: CcnEnv,
 ) -> None:
-    """Pinned as DESKTOP-HANDOFF describes it: a save that brings the file back to content
-    already returned, or to the placed content, records nothing new; a save that changes
+    """Pinned as DESKTOP-HANDOFF describes it (S25e: the latest save always wins): a save that
+    brings the file back to content returned earlier, or to the placed content, is a new
+    return; one equal to the newest recorded state records nothing; a save that changes
     nothing in the timeline (the project renamed) is a return with no segment changed."""
     env = ccn_env
     run, _handoff, project = _placed(env)
@@ -310,13 +311,21 @@ def test_what_the_owner_sees_for_a_save_of_old_content_or_no_timeline_change(
         os.utime(db, (1_000_000_000, 1_000_000_000))
         return sweep(env)
 
-    seq = env.hub.log.latest_seq()
     result = put_back(first)
-    assert (result.returned, result.repeated) == (0, 1)
+    assert (result.returned, result.repeated) == (1, 0)
     result = put_back(placed)
-    assert (result.returned, result.unchanged) == (0, 1)
-    assert env.hub.log.latest_seq() == seq  # nothing recorded for either
-    assert len(returned_edits(env.hub.log, env.hub.project_id, run)) == 2
+    assert (result.returned, result.unchanged) == (1, 0)
+    seq = env.hub.log.latest_seq()
+    result = put_back(placed)  # the newest recorded state: nothing new
+    assert (result.returned, result.repeated) == (0, 1)
+    assert env.hub.log.latest_seq() == seq
+    edits = returned_edits(env.hub.log, env.hub.project_id, run)
+    assert len(edits) == 4
+    tails = []
+    for ret in edits:
+        [segment] = json.loads(env.hub.store.read_bytes(ret["diff"]))["segments"]
+        tails.append(segment.get("tail_frames") if segment["status"] == "trimmed" else 0)
+    assert tails == [5, 10, 5, 0]
 
     conn = sqlite3.connect(db)
     conn.execute("UPDATE SM_Project SET ProjectName = 'Renamed in Resolve'")
