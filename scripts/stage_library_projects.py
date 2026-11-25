@@ -127,8 +127,8 @@ def _describe(entry: dict[str, Any], what: str) -> str:
     return (
         f"{what} Timeline {entry['timeline']!r} holds, of clip {entry['clip']!r}: "
         + "; ".join(parts)
-        + ". The project opens with no relink or offline prompt; the cuts play the clip's "
-        "picture and sound at those source frames."
+        + ". The project opens with no relink or offline prompt; each cut plays what it "
+        "names (picture, sound or both) of the clip at those source frames."
     )
 
 
