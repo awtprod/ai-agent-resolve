@@ -426,10 +426,17 @@ def test_file_times_windows_cannot_convert_are_error_lines_not_crashes(
         patch.setattr(facts_mod.time, "localtime", windows_localtime)
         record = measure_file(target)
     assert record["error"]["code"] == "bad_time", record
-    # Past the year 9999 (real on every system): no date the facts can hold.
+    # Past the year 9999: no date the facts can hold. The conversion is checked directly and the
+    # file's time is simulated, because not every file system stores a time that far out (ext4
+    # clamps it, so the file would simply read as an earlier year).
     far = 253_402_300_800 * 1_000_000_000
-    os.utime(clip, ns=(far, far))
-    record = measure_file(target)
+    with pytest.raises(facts_mod.TimeTextError, match="10000"):
+        facts_mod.utc_text(far)
+    os.utime(clip, ns=(1_700_000_000 * 10**9, 1_700_000_000 * 10**9))
+    year_10000 = time.struct_time((10000, 1, 1, 0, 0, 0, 5, 1, 0))
+    with monkeypatch.context() as patch:
+        patch.setattr(facts_mod.time, "localtime", lambda seconds=None: year_10000)
+        record = measure_file(target)
     assert record["error"]["code"] == "bad_time" and "10000" in record["error"]["message"]
     # A creation time that cannot be written is left out; the file is still measured.
     os.utime(clip, ns=(1_700_000_000 * 10**9, 1_700_000_000 * 10**9))
