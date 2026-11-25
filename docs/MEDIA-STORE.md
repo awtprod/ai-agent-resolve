@@ -187,8 +187,57 @@ export: give `import-timeline` the project's `Project.db` (`<library>/Resolve Pr
 <user>/Projects/<project>/Project.db`) and name the timeline with `--timeline NAME`. It is read
 from a private snapshot once Resolve has finished saving (`library_busy` while a save is in
 progress; `--wait SECONDS` sets how long to wait). `aar drp library <library>` lists the
-library's projects and their timelines. Automatic pickup of a saved project is S25b (DESIGN
-"Shared project library (S25)").
+library's projects and their timelines. A project the recipe handed over is picked up
+automatically when the owner saves it (S25d; see [Desktop handoff](DESKTOP-HANDOFF.md)).
+
+## Facts for library projects (S25d)
+
+A cut handed over as a library project needs, for every file it uses, facts measured on the
+edit PC's own file (not the hub's working copy, which `shrink` makes smaller): ffprobe's format
+and streams, the size, and the modification and creation times. It sits beside the two other
+PC-side steps: `shrink` makes the hub's working copy, `receipt` binds that copy to its PC
+original, and `facts` describes the PC original for the library writer. Run it once per show,
+after the files are final on the PC (a file changed afterwards needs measuring again), from the
+same copy of `src`, with the same Python and ffprobe:
+
+```console
+> set PYTHONPATH=C:\aar\src
+> python -m aar.media.facts E:\Show_1\Proxy E:\Show_1\Sound --out Z:\incoming\Show_1\facts.jsonl
+```
+
+A folder takes the media files directly in it (`.mp4 .m4v .mov .mxf .wav .mp3 .m4a .aac .png
+.braw`, not hidden); files can be named too. It is read-only on the media, writes one JSON line
+per file in the order of their paths (the same files give the same bytes), never overwrites
+`--out`, and exits 0 when every file was measured, 2 otherwise: a file it could not measure
+(missing, not a regular file, refused by ffprobe, timed out after `--timeout` seconds, changed
+while measured, a name that is not valid Unicode, a time Windows cannot convert) is a line with
+its `error` and is printed. What a folder holds that is not measured (hidden, other suffixes,
+subfolders, broken links) is counted by reason in the last printed line, with the first names;
+a folder that cannot be listed, or paths with no media file at all (`no_media`), are refused
+with exit 2 and nothing written. A file or folder below a folder that cannot be entered gets a
+line of its own (`unreadable`) and the other files are still measured; an entry of a folder
+that cannot be read is measured the same way when it has a media suffix and counted
+`unreadable` otherwise. A system error that stops the run is a JSON refusal naming the path
+(`system_error`, exit 2), never a traceback; a temporary file the command could not remove
+beside `--out` is named in `left_behind`. At most 256 files a run (`--max-files`), 30 minutes for the
+whole run (`--deadline`; files not reached are listed `deadline`) and 64 MiB of output
+(`--max-bytes`, error lines included; one that does not fit is only printed, `"in_file":
+false`). Ctrl+C writes what was measured and exits 130. Everything printed is ASCII JSON, so
+any console code page shows it; the file is UTF-8. On Windows ffprobe is taken only from an
+absolute `PATH` folder (or an absolute `AAR_FFPROBE`), never from the current folder; a name
+without a `PATHEXT` suffix gets `.com` or `.exe` in `PATHEXT`'s order, so
+`AAR_FFPROBE=C:\ffmpeg\bin\ffprobe` finds `ffprobe.exe` (a batch file is taken only when named
+in full). A library project needs every file in a folder below a drive's or share's root: a
+file directly at a root (`D:\clip.mov`) is not measured and is listed `at_root`; move it into a
+folder. `aar media facts` is the same command on a machine with `aar` installed; there
+`--pc-folder LOCAL=E:\Show_1` names a folder as the PC knows it. A drive or share root is a
+folder too (`--pc-folder /mnt/card=D:\`, `--pc-folder /mnt/nas=\\nas\cams`); the option can be
+repeated, and the longest folder that holds a file wins. On Windows a folder is matched as
+Windows compares paths (`C:\Media` holds `c:\media\clip.mov`). Once `--pc-folder` is given,
+every file must be under one of its folders: one that is not is refused (`not_under_pc_folder`,
+exit 2, nothing written) instead of being recorded under its own name; on the PC itself,
+`--pc-folder E:\=E:\` keeps a drive's own names. Point the recipe's `library.facts` at the file
+as the hub sees it.
 
 ## Verified desktop handoff
 

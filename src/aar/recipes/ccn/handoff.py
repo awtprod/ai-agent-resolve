@@ -103,6 +103,75 @@ def _sound(loudness: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def _quoted(value: Any) -> str:
+    return f'"{_line(value)}"'
+
+
+def refusal_lines(label: str, code: str, message: str, hint: str) -> list[str]:
+    """Why the cut is not in the library (S25d): the export's code, message and hint, and that
+    the FCPXML is unaffected. Plain text operations only: the export step's library guard uses
+    it for a failure it caught (:func:`aar.recipes.ccn.steps.library_route`)."""
+    return [
+        "",
+        "LIBRARY PROJECT: NOT WRITTEN",
+        f"  The cut was not written into the project library {_quoted(label)}:",
+        f"  {_line(message)} [{_line(code)}]",
+        f"  To fix: {_line(hint)}",
+        "  Nothing is lost: import the FCPXML beside this file as usual (IMPORT above).",
+    ]
+
+
+def library_lines(record: Mapping[str, Any]) -> list[str]:
+    """The library hand-off's section of the notes (S25d), in the owner's terms: which library
+    and project to open, and that saving is all; or why the cut is not in the library."""
+    label = _quoted(record.get("label") or record.get("library") or "the project library")
+    if record.get("status") != "placed":
+        error = record.get("error") if isinstance(record.get("error"), Mapping) else {}
+        return refusal_lines(
+            str(record.get("label") or record.get("library") or "the project library"),
+            str(error.get("code", "")),
+            str(error.get("message", "")),
+            str(error.get("hint", "")),
+        )
+    user = record.get("user")
+    lines = [
+        "",
+        "OR OPEN IT AS A LIBRARY PROJECT (NEW ROUTE, STILL BEING CONFIRMED)",
+        f"  The cut is also in the shared project library {label} as the project "
+        f"{_quoted(record.get('project_name'))}.",
+        "  1. In Resolve open the Project Manager and choose the project library "
+        f"{label}" + (f" (user {_quoted(user)})" if user else "") + ".",
+        f"  2. Open the project {_quoted(record.get('project_name'))}; its timeline is "
+        f"{_quoted(record.get('timeline'))}.",
+        "  3. Edit, then save the project (File > Save Project, or Ctrl+S). Saving is all that",
+        "     is needed: the hub notices each save while this review is open and records it for",
+        "     review. There is nothing to export and no .drt to make for it.",
+        "  Until library projects have been confirmed in Resolve, the FCPXML stays the dependable",
+        "  route: if the project does not open as expected, import the FCPXML instead and tell",
+        "  the agent what you saw.",
+    ]
+    ops = [_line(op) for op in record.get("operations_not_opened") or []]
+    if ops:
+        lines.append(
+            "  Not yet seen working in Resolve (check these first): " + ", ".join(ops[:12]) + "."
+        )
+    unverified = [_line(p) for p in record.get("unverified_media") or []]
+    if unverified:
+        lines.append(
+            "  Clips written without full evidence for their kind (check they play and link): "
+            + ", ".join(unverified[:MAX_LISTED])
+            + "."
+        )
+    if record.get("not_carried"):
+        lines.append(
+            f"  The library project leaves out {int(record['not_carried'])} plan detail(s) (gain, "
+            "framing, labels, notes, markers, captions): redo them in Resolve as for the FCPXML."
+        )
+    if record.get("pickup"):
+        lines.append(f"  The hub will NOT pick up saves of it: {_line(record['pickup'])}.")
+    return lines
+
+
 def handoff_notes(
     *,
     project: str,
@@ -111,10 +180,13 @@ def handoff_notes(
     report: Mapping[str, Any],
     report_id: str,
     loudness: Mapping[str, Any] | None,
+    library: Sequence[str] | None = None,
 ) -> str:
     """The notes for one exported round, from the export's ``report`` (stored as artifact
-    ``report_id``) and the render step's ``loudness`` output. CRLF lines: it is read on
-    Windows."""
+    ``report_id``) and the render step's ``loudness`` output; with ``library``, the library
+    hand-off's section, already made (:func:`library_lines`, S25d: the export step makes it
+    inside its library guard, so nothing here can fail for the library). CRLF lines: it is read
+    on Windows."""
     lines = [
         f"HANDOFF NOTES: {_line(timeline)}, round {round_} (project {_line(project)})",
         "",
@@ -187,6 +259,9 @@ def handoff_notes(
     steps = [s for s in report.get("import") or [] if isinstance(s, str)]
     lines += _section("IMPORT", [f"  {n}. {_line(s)}" for n, s in enumerate(steps, start=1)], 0, "")
 
+    if library is not None:
+        lines += library
+
     if report.get("return_directory"):
         lines += [
             "",
@@ -210,4 +285,11 @@ def handoff_notes(
     return "\r\n".join(lines) + "\r\n"
 
 
-__all__ = ["MAX_LISTED", "NOTES_MIME", "NOTES_SUFFIX", "handoff_notes"]
+__all__ = [
+    "MAX_LISTED",
+    "NOTES_MIME",
+    "NOTES_SUFFIX",
+    "handoff_notes",
+    "library_lines",
+    "refusal_lines",
+]

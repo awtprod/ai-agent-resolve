@@ -72,6 +72,95 @@ def check_hub_file(value: str) -> str:
     return value
 
 
+def check_hub_location(value: str) -> str:
+    """``value`` if it is a clean absolute hub path lexically inside the media root (when one is
+    set). Used for the library hand-off's paths (S25d), which are checked here by their text
+    only: whether they exist, what they are and where they lead (``realpath``) is checked when
+    the export step uses them, so a library that is gone or moved later is a refusal in the
+    hand-off notes and never fails the run's other steps."""
+    if "\x00" in value or len(value) > MAX_PATH:
+        raise ValueError("not a usable path")
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError(f"{value!r} holds a control character")
+    if not value.startswith("/"):
+        raise ValueError(f"{value!r} is not an absolute hub path")
+    parts = value.split("/")[1:]
+    if any(part in (".", "..") for part in parts) or "" in parts[:-1]:
+        raise ValueError(f"{value!r} has a '.', '..' or empty component")
+    root = os.environ.get(MEDIA_ROOT_ENV, "").strip()
+    if root:
+        clean = value.rstrip("/") or "/"
+        roots = {os.path.normpath(root), media_root() or ""}
+        if not any(clean == r or clean.startswith(r.rstrip("/") + "/") for r in roots if r):
+            raise ValueError(f"{value!r} is not under the media root ({MEDIA_ROOT_ENV})")
+    return value
+
+
+_LIBRARY_USER = r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,62}[A-Za-z0-9_-]$|^[A-Za-z0-9]$"
+
+
+class LibraryParam(BaseModel):
+    """The shared Resolve project library the export also hands the cut over to (S25d): the
+    library folder, the seed project the owner saved, the facts file the edit PC measured
+    (``aar media facts``), more template projects, the library user, and the two opt-ins of
+    ``aar plan export --format library``, both off by default."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    #: The library's folder on the hub (the one holding ``Resolve Projects``).
+    folder: str = Field(min_length=2, max_length=MAX_PATH)
+    #: A ``Project.db`` the owner saved: its timeline's rate, size and start are the cut's.
+    seed: str = Field(min_length=2, max_length=MAX_PATH)
+    #: The facts of every file the cut uses, measured on the edit PC (JSON lines).
+    facts: str = Field(min_length=2, max_length=MAX_PATH)
+    templates: list[Annotated[str, Field(min_length=2, max_length=MAX_PATH)]] = Field(
+        default_factory=list, max_length=8
+    )
+    #: The library user (``Resolve Projects/Users/<user>``); unset: the library's only one.
+    user: Annotated[str, Field(pattern=_LIBRARY_USER)] | None = None
+    #: How the owner knows the library in Resolve's Project Manager; unset: its folder's name.
+    label: TitleText | None = None
+    #: The seed project's resolution, when its timeline follows the project's and the project
+    #: does not store it (``--seed-resolution``).
+    seed_resolution: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,4}x[1-9][0-9]{0,4}$")] | None = (
+        None
+    )
+    #: Write operations nobody has yet seen Resolve open (``--allow-unopened-operations``).
+    allow_unopened_operations: bool = False
+    #: Media whose rows the evidence does not verify (``--allow-unverified-media``).
+    allow_unverified_media: bool = False
+
+    @field_validator("folder", "facts")
+    @classmethod
+    def _location(cls, value: str) -> str:
+        return check_hub_location(value)
+
+    @field_validator("seed")
+    @classmethod
+    def _seed(cls, value: str) -> str:
+        check_hub_location(value)
+        if not value.lower().endswith(".db"):
+            raise ValueError(f"the seed {value!r} must be a project's Project.db (a .db file)")
+        return value
+
+    @field_validator("templates")
+    @classmethod
+    def _templates(cls, value: list[str]) -> list[str]:
+        for idx, path in enumerate(value):
+            check_hub_location(path)
+            if not path.lower().endswith(".db"):
+                raise ValueError(f"templates[{idx}] {path!r} must be a Project.db (a .db file)")
+        return value
+
+    @model_validator(mode="after")
+    def _apart(self) -> LibraryParam:
+        folder = self.folder.rstrip("/") + "/"
+        for name, path in (("facts", self.facts), ("seed", self.seed)):
+            if path.rstrip("/") + "/" == folder:
+                raise ValueError(f"the library's {name} is the library folder itself")
+        return self
+
+
 class SourceParam(BaseModel):
     """One camera file on the hub (the proxy), with its labels."""
 
@@ -111,6 +200,8 @@ class CcnLongformParams(BaseModel):
     allow_unknown_timecode: bool = False
     #: Camera label -> how its parts are placed; unset: by timecode when every part has one.
     part_placement: dict[Camera, PartPlacement] = Field(default_factory=dict, max_length=1)
+    #: Also hand the cut over as a project in a shared Resolve library (S25d); unset: FCPXML only.
+    library: LibraryParam | None = None
 
     @field_validator("fusion_templates")
     @classmethod

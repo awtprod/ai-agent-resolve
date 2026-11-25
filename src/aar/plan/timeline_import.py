@@ -92,6 +92,7 @@ IMPORT_CODES = frozenset(
         "output_folder_missing",
         "invalid_edited_plan",
         "nothing_matched",
+        "project_mismatch",
     }
 )
 
@@ -325,14 +326,21 @@ def _issue_text(issue: Issue) -> str:
 
 
 def read_timeline(
-    path: Path, name: str | None = None, *, library_options: LibraryOptions | None = None
+    path: Path,
+    name: str | None = None,
+    *,
+    library_options: LibraryOptions | None = None,
+    project_id: str | None = None,
 ) -> TimelineFile:
     """Read ``path`` with :func:`aar.drp.read_drp` and pick its one timeline (or ``name``).
 
     ``path`` is a ``.drt``, or a project's ``Project.db`` in a Resolve disk library (read
     with ``library_options``). A library project that is being saved is refused as
     ``library_busy`` (try again later); any other refused ``Project.db`` is
-    ``unreadable_timeline`` with the library's own reason code in the message.
+    ``unreadable_timeline`` with the library's own reason code in the message. With
+    ``project_id`` (S25d: the id a library hand-off recorded), a file of any other project is
+    refused ``project_mismatch`` before anything else is read from it: a project folder of the
+    same name can hold another project.
     """
     hint = "export the timeline from Resolve with File > Export > Timeline as a .drt file"
     try:
@@ -349,6 +357,17 @@ def read_timeline(
         raise TimelineImportError(
             "unreadable_timeline", f"{path} could not be read as a .drt: {exc}", hint
         ) from None
+    if project_id is not None:
+        found = drp.project.id if drp.project is not None else None
+        if found != project_id:
+            raise TimelineImportError(
+                "project_mismatch",
+                f"{path} is project {found!r}, not the project {project_id!r} that was handed over",
+                "the project folder now holds another project; open the handed-over project "
+                "(or hand the cut over again)",
+                found=found,
+                expected=project_id,
+            )
     again = (
         "export the timeline from Resolve again (File > Export > Timeline); if it repeats, "
         "check the file with `aar drp describe`"

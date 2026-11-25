@@ -94,16 +94,67 @@ class RunResult:
         return self.stderr[-ERROR_TAIL_CHARS:]
 
 
+#: Read once, so tests can simulate Windows' rules on another system.
+_WINDOWS = os.name == "nt"
+
+
+#: The suffixes Windows starts a program by directly; PATHEXT's others (``.bat``, ``.cmd``,
+#: scripts) run through another program that reads the arguments again, so they are never
+#: added to a name, only taken when named in full.
+_DIRECT_SUFFIXES = (".com", ".exe")
+
+
+def _windows_names(name: str) -> list[str]:
+    """What a program ``name`` may be on Windows, in PATHEXT's order as ``shutil.which`` tries
+    them: ``name`` itself when it ends in a PATHEXT suffix, else ``name`` with each of
+    PATHEXT's ``.com`` and ``.exe`` added."""
+    pathext = os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD"
+    suffixes = [ext.strip().lower() for ext in pathext.split(";") if ext.strip()]
+    if any(name.lower().endswith(ext) for ext in suffixes):
+        return [name]
+    return [name + ext for ext in suffixes if ext in _DIRECT_SUFFIXES]
+
+
+def _program(path: str) -> bool:
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def _which(name: str) -> str | None:
+    """``name`` as ``shutil.which`` finds it on POSIX. On Windows ``shutil.which`` looks in the
+    current folder first (and resolves a relative ``PATH`` entry against it), so a program
+    left in a media folder the command runs from could be run in ffprobe's place: there only
+    an absolute path, or a name found in an absolute ``PATH`` folder, is taken, each with
+    PATHEXT's suffixes added when it has none of them (:func:`_windows_names`), as
+    ``shutil.which`` does. These are paths of this system, so its own path rules apply."""
+    if not _WINDOWS:
+        return shutil.which(name)
+    if os.path.isabs(name):
+        return next((c for c in _windows_names(name) if _program(c)), None)
+    if os.sep in name or (os.altsep and os.altsep in name) or ":" in name:
+        return None  # a relative path: it would be resolved against the current folder
+    candidates = _windows_names(name)
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        folder = folder.strip().strip('"')
+        if not folder or not os.path.isabs(folder):
+            continue
+        for candidate in candidates:
+            found = os.path.join(folder, candidate)
+            if _program(found):
+                return found
+    return None
+
+
 def resolve_tool(tool: Tool) -> str:
-    """Absolute path of ``tool``: the ``AAR_FF*`` override, otherwise the first on PATH."""
+    """Absolute path of ``tool``: the ``AAR_FF*`` override, otherwise the first on PATH
+    (:func:`_which`: never the current folder on Windows)."""
     var = ENV_VARS[tool]
     override = os.environ.get(var, "").strip()
     if override:
-        found = shutil.which(override)
+        found = _which(override)
         if found is None:
             raise MediaToolMissing(f"{var}={override!r} is not an executable program", tool=tool)
         return found
-    found = shutil.which(tool)
+    found = _which(tool)
     if found is None:
         raise MediaToolMissing(f"{tool} not found on PATH (or set {var})", tool=tool)
     return found

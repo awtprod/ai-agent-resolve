@@ -117,6 +117,12 @@ def status_view(
                 "These are proposals; the active plan and review decision are unchanged.",
             }
         )
+    from aar.recipes.library_returns import library_conditions
+
+    conditions = library_conditions(log, state.project_id, recipe_node)
+    if conditions:
+        # S25d: why a handed-over library project's save was not (yet) picked up, once each
+        view["library_pickup"] = conditions
     ignored_decisions = state.ignored_decisions()
     if ignored_decisions:
         # S19f: a human decision the fold ignores (recorded after a reopen superseded its gate),

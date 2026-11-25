@@ -25,6 +25,7 @@ import os
 import signal
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -47,7 +48,7 @@ from aar.recipes.ccn import transcript as transcript_mod
 from aar.recipes.ccn.export_files import copy_out, export_root, safe_name
 from aar.recipes.ccn.faults import qa_failure_upstream, upstream_failure
 from aar.recipes.ccn.guide import artifact_get, build_guide
-from aar.recipes.ccn.handoff import NOTES_MIME, NOTES_SUFFIX, handoff_notes
+from aar.recipes.ccn.handoff import NOTES_MIME, NOTES_SUFFIX, handoff_notes, refusal_lines
 from aar.recipes.ccn.params import CcnLongformParams, check_hub_file, media_root
 from aar.recipes.ccn.scratch import drop_scratch, op_scratch
 from aar.recipes.ccn.transcript import (
@@ -665,6 +666,9 @@ def export_step(ctx: StepContext) -> StepOutput:
     )
     result.report["return_directory"] = str(return_dir.relative_to(export_root().resolve()))
     report_id = _json_artifact(ctx, result.report, "export-report")
+    # S25d: everything the library route does, in one guarded region (library_route): from
+    # here on only its finished, plain results are used, so no library fault can fail the step.
+    library = library_route(ctx, params, plan, project, round_)
     notes = handoff_notes(
         project=project,
         timeline=timeline,
@@ -672,6 +676,7 @@ def export_step(ctx: StepContext) -> StepOutput:
         report=result.report,
         report_id=report_id,
         loudness=loudness if isinstance(loudness, dict) else None,
+        library=None if library is None else library.notes,
     )
     notes_id = ctx.put(notes.encode("utf-8"), mime=NOTES_MIME, meta={"role": "handoff-notes"})
     fusion_id: str | None = None
@@ -729,17 +734,186 @@ def export_step(ctx: StepContext) -> StepOutput:
     if fusion_id is not None:
         outputs["fusion_manifest"] = fusion_id
         artifacts = (fcpxml_id, report_id, notes_id, fusion_id)
+    if library is not None:
+        outputs["library_handoff"] = library.record
+        artifacts = (*artifacts, *library.artifacts)
+        if library.warnings:
+            outputs["warnings"] = [dict(w) for w in library.warnings]
     return StepOutput(outputs=outputs, artifact_ids=artifacts)
+
+
+@dataclass(frozen=True)
+class LibraryRoute:
+    """What the export step's library route made (S25d), finished and plain: the record for the
+    step's result (``library_handoff``), the notes' section, the warnings and the artifacts. The
+    export step only reads these, so nothing it does with them can fail for the library."""
+
+    record: dict[str, Any]
+    notes: tuple[str, ...]
+    warnings: tuple[dict[str, str], ...] = ()
+    artifacts: tuple[str, ...] = ()
+
+
+#: The fix hint of a library route that failed.
+LIBRARY_FAILED_HINT = "report it with the run's id; the FCPXML hand-off is unaffected"
+
+
+def library_route(
+    ctx: StepContext, params: CcnLongformParams, plan: EditPlan, project: str, round_: int
+) -> LibraryRoute | None:
+    """The library hand-off (:mod:`.library_handoff`), None when the params name no library.
+
+    **One guarded region.** Everything the library route does in the export step runs inside
+    this function's one ``try``: reading the inputs and the params' files, the snapshot folder,
+    the export, storing its report, the record and the notes' section. No :class:`Exception`
+    leaves it (a ``StepFailure`` included): a refusal is the export's typed record, anything
+    else the refusal ``library_failed`` with the error's type and message and the stage it
+    happened at (and the project's folder if one was already placed). The FCPXML, review video
+    and notes are then published as without a library.
+
+    ``KeyboardInterrupt`` and ``SystemExit`` (the worker stopping: ``StepInterrupted`` is a
+    ``KeyboardInterrupt``) are not caught: the step records no result, its claim lapses and the
+    step is claimed and run again from the start, FCPXML included (DESIGN "Library hand-off and
+    pickup (S25d)")."""
+    if params.library is None:
+        return None
+    progress: dict[str, Any] = {"stage": "starting"}
+    try:
+        return _library_route(ctx, params, plan, project, round_, progress)
+    except Exception as exc:  # the rule: a library fault never fails the export step
+        return _library_failed(ctx, params, round_, progress, exc)
+
+
+def _library_route(
+    ctx: StepContext,
+    params: CcnLongformParams,
+    plan: EditPlan,
+    project: str,
+    round_: int,
+    progress: dict[str, Any],
+) -> LibraryRoute:
+    """The library route's work; called only inside :func:`library_route`'s guard."""
+    from aar.recipes.ccn.handoff import library_lines
+    from aar.recipes.ccn.library_handoff import hand_over
+
+    lib = params.library
+    assert lib is not None
+    progress["stage"] = "checking for a stop"
+    check_cancelled(ctx)
+    progress["stage"] = "reading the run's plan, profile, transcript and laughs"
+    plan_sha256 = _need(ctx, "cut", "plan_sha256")
+    profile = _profile(ctx)
+    transcript = _transcript(ctx)
+    laughs = _laughs(ctx)
+    progress["stage"] = "writing the library project"
+    record, report = hand_over(
+        lib,
+        plan=plan,
+        plan_sha256=plan_sha256,
+        profile=profile,
+        media_map=params.media_map,
+        project=project,
+        round_=round_,
+        transcript=transcript,
+        laughs=laughs,
+        progress=progress,
+    )
+    artifacts: tuple[str, ...] = ()
+    if report is not None:
+        progress["stage"] = "storing the library export report"
+        record["report"] = _json_artifact(ctx, report, "library-export-report")
+        artifacts = (record["report"],)
+    record["round"] = round_
+    record["recipe_node"] = ctx.recipe_node
+    record["media_map"] = params.media_map
+    progress["stage"] = "writing the notes' library section"
+    notes = tuple(library_lines(record))
+    progress["stage"] = "checking the hand-off's record"
+    json.dumps(record, allow_nan=False)  # a step output: JSON only
+    if not all(isinstance(line, str) for line in notes):
+        raise TypeError("the notes' library section is not text")
+    warnings: tuple[dict[str, str], ...] = ()
+    if record["status"] != "placed":
+        error = record["error"]
+        warnings = (
+            {
+                "code": f"library_{error['code']}",
+                "message": error["message"],
+                "fix_hint": error["hint"],
+            },
+        )
+    return LibraryRoute(record=record, notes=notes, warnings=warnings, artifacts=artifacts)
+
+
+def _library_failed(
+    ctx: StepContext,
+    params: CcnLongformParams,
+    round_: int,
+    progress: dict[str, Any],
+    exc: Exception,
+) -> LibraryRoute:
+    """The refusal ``library_failed`` for ``exc``, caught by :func:`library_route`'s guard;
+    plain text operations only, and a fixed text if even they fail."""
+    from aar.recipes.textutil import safe_str
+
+    kind = type(exc).__name__
+    try:
+        lib = params.library
+        assert lib is not None
+        label = lib.label or Path(lib.folder).name
+        message = (
+            f"the library hand-off failed while {progress.get('stage')} ({kind}: {safe_str(exc)})"
+        )[:1500]
+        placed = progress.get("placed")
+        if placed:
+            message += (
+                f"; the project {str(placed)[:300]!r} was already placed in the library: it is "
+                "not recorded, so its saves are not picked up"
+            )
+        record: dict[str, Any] = {
+            "status": "refused",
+            "library": lib.folder,
+            "label": label,
+            "error": {"code": "library_failed", "message": message, "hint": LIBRARY_FAILED_HINT},
+            "round": round_,
+            "recipe_node": ctx.recipe_node,
+            "media_map": dict(params.media_map),
+        }
+        notes = tuple(refusal_lines(label, "library_failed", message, LIBRARY_FAILED_HINT))
+    except Exception as again:  # the last resort: fixed text naming both errors' types
+        message = (
+            f"the library hand-off failed ({kind}), and so did describing it "
+            f"({type(again).__name__})"
+        )
+        record = {
+            "status": "refused",
+            "error": {"code": "library_failed", "message": message, "hint": LIBRARY_FAILED_HINT},
+        }
+        notes = (
+            "",
+            "LIBRARY PROJECT: NOT WRITTEN",
+            f"  {message} [library_failed]",
+            "  Nothing is lost: import the FCPXML beside this file as usual (IMPORT above).",
+        )
+    warning = {
+        "code": "library_library_failed",
+        "message": message,
+        "fix_hint": LIBRARY_FAILED_HINT,
+    }
+    return LibraryRoute(record=record, notes=notes, warnings=(warning,))
 
 
 __all__ = [
     "ALLOW_WARN",
+    "LIBRARY_FAILED_HINT",
     "REQUIRED_QA",
+    "LibraryRoute",
     "aar_argv",
     "check_plan",
     "export_step",
     "guide_step",
     "laughs_step",
+    "library_route",
     "render_step",
     "review_qa_gate",
     "safe_name",

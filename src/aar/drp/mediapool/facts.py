@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
@@ -34,14 +35,20 @@ from aar.drp.mediapool.errors import MediaPoolError, refusing
 
 __all__ = [
     "MAX_FACTS_BYTES",
+    "MAX_FACTS_DEPTH",
     "MediaFacts",
     "ProbeFormat",
     "ProbeStream",
+    "check_depth",
     "facts_from_json",
+    "parse_json_line",
 ]
 
 #: The largest JSON text accepted for one file's facts.
 MAX_FACTS_BYTES = 1024 * 1024
+#: The deepest nesting of objects and lists accepted in one file's facts (ffprobe's deepest,
+#: a stream's side data list of objects, is 6 levels below the record).
+MAX_FACTS_DEPTH = 16
 MAX_STREAMS = 64
 MAX_TAGS = 256
 MAX_TEXT = 4096
@@ -75,6 +82,35 @@ TIMECODE_TAG = re.compile(r"[0-9]{2}:[0-9]{2}:[0-9]{2}[:;.][0-9]{2,3}\Z")
 _ROTATE_TAG = re.compile(r"-?[0-9]{1,4}\Z")
 #: The most a display rotation may say, in degrees (ffprobe gives -360..360).
 _MAX_ROTATION = 360.0
+
+
+def check_depth(value: object, limit: int = MAX_FACTS_DEPTH) -> None:
+    """A ``ValueError`` when ``value`` nests objects and lists deeper than ``limit`` levels
+    (the value itself is level 1). Iterative: no recursion however deep the value is."""
+    stack: list[tuple[object, int]] = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if isinstance(item, dict):
+            children: Iterable[object] = item.values()
+        elif isinstance(item, list):
+            children = item
+        else:
+            continue
+        if depth > limit:
+            raise ValueError(f"the facts nest deeper than {limit} levels")
+        stack.extend((child, depth + 1) for child in children)
+
+
+def parse_json_line(data: bytes | str) -> object:
+    """One line of JSON, nesting at most :data:`MAX_FACTS_DEPTH` levels; a ``ValueError`` for
+    anything else, a line nested too deeply for the parser included (never a
+    ``RecursionError``)."""
+    try:
+        value = json.loads(data)
+    except RecursionError:
+        raise ValueError(f"the facts nest deeper than {MAX_FACTS_DEPTH} levels") from None
+    check_depth(value)
+    return value
 
 
 def _no_control(value: str | None) -> str | None:
@@ -336,9 +372,10 @@ def facts_from_json(data: object) -> MediaFacts:
             size = len(data if isinstance(data, bytes) else data.encode("utf-8", "surrogatepass"))
             if size > MAX_FACTS_BYTES:
                 raise ValueError(f"the facts are longer than {MAX_FACTS_BYTES} bytes")
-            data = json.loads(data)
+            data = parse_json_line(data)
         if not isinstance(data, dict):
             raise ValueError("the facts are not a JSON object")
+        check_depth(data)
         # A lone surrogate (JSON "\\ud800") is text no file name, tag or blob can hold.
         json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
         known = {"path", "exists", "size", "mtime_local", "mtime_utc", "ctime_utc", "ffprobe"}
