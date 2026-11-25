@@ -39,6 +39,18 @@ def run(
     return code, diff, plan_text, out + err
 
 
+def same_but_the_transition_limit(drt: dict[str, Any], library: dict[str, Any]) -> bool:
+    """The two diffs are equal but for the ``audio_transitions`` limit: a library project's
+    sound transitions are compared (S25e), a .drt's are not."""
+    from aar.plan.timeline_import import LIMITS, SOUND_TRANSITION_LIMIT
+
+    want = [SOUND_TRANSITION_LIMIT if x.startswith("audio_transitions:") else x for x in LIMITS]
+    if drt.get("limits") != list(LIMITS) or library.get("limits") != want:
+        return False
+    rest = {k: v for k, v in drt.items() if k != "limits"}
+    return rest == {k: v for k, v in library.items() if k != "limits"}
+
+
 def test_the_same_timeline_imports_the_same_from_drt_and_library(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -46,7 +58,7 @@ def test_the_same_timeline_imports_the_same_from_drt_and_library(
     a = run(tmp_path, capsys, drt, plan)
     b = run(tmp_path, capsys, db, plan)
     assert a[0] == b[0] == 0
-    assert a[1] == b[1] and a[1]["unchanged"] is True
+    assert same_but_the_transition_limit(a[1], b[1]) and a[1]["unchanged"] is True
     assert a[2] == b[2]
 
 
@@ -57,7 +69,7 @@ def test_an_edit_saved_in_the_library_gives_the_same_diff_as_the_drt(
     drt, db, plan = both(tmp_path, edited)
     a = run(tmp_path, capsys, drt, plan)
     b = run(tmp_path, capsys, db, plan)
-    assert a[1] == b[1] and a[2] == b[2] and a[0] == b[0]
+    assert same_but_the_transition_limit(a[1], b[1]) and a[2] == b[2] and a[0] == b[0]
     assert b[1]["segments"][0]["status"] == "trimmed"
 
 

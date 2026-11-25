@@ -94,6 +94,14 @@ OPERATIONS: dict[str, Operation] = {
             "never tried in Resolve",
         ),
         Operation(
+            "add_sound_transitions",
+            UNOPENED,
+            "insert sound crossfades (Cross Fade 0 dB or +3 dB, centred on the cut, 2 to 16 "
+            "frames) on joins of two clips of the sound track",
+            "rows reproduce 112 of Resolve's own transitions field for field; a project made "
+            "this way has not been opened by a person yet",
+        ),
+        Operation(
             "set_extents",
             OPENED,
             "the sequence's MediaExtents length: the end of the last item in seconds minus the "

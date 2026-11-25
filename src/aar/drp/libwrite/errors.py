@@ -27,6 +27,8 @@ CODES: dict[str, str] = {
     "bad_seed": "the seed is not a project the writer can start from",
     "seed_mismatch": "the plan's frame rate, resolution or start differs from the seed timeline's",
     "bad_input": "the media or items to write are inconsistent",
+    "bad_transition": "a transition is not at a join of two clips, or the media it plays is "
+    "not there",
     "operation_not_opened": "the project needs an operation no person has opened in Resolve yet",
     "bad_project_name": "the project name is not a valid folder name on the share",
     "project_exists": "a project of that name is already in the library",

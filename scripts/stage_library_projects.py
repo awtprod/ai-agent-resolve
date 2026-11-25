@@ -17,7 +17,11 @@ Projects (``aar-stage-...``):
 a. two clips authored from facts, of a verified kind, cut together (the plan export);
 b. the seed's own clip in linked cuts, the timeline renamed (only ``rename_timeline`` new);
 c1. picture-only items; c2. sound-only items (the seed's own clip);
-d1. linked cuts with gaps; d2. a split edit, the sound leading the picture by 10 frames.
+d1. linked cuts with gaps; d2. a split edit, the sound leading the picture by 10 frames;
+e1. three linked cuts with a 2-frame Cross Fade 0 dB centred on each join (S25e, the ccn
+    profile's crossfade); e2. two linked cuts with a 16-frame Cross Fade +3 dB on the join.
+    The transition template comes from ``--templates`` (a plain sound crossfade Resolve saved);
+    the seed timeline must run at 29.97, the only rate the transition gate covers.
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ from aar.drp.items.media import media_view
 from aar.drp.items.rows import read_items
 from aar.drp.library import LibraryOptions
 from aar.drp.libwrite import Authored, ProjectWriteError, make_project
-from aar.drp.libwrite.cut import Cut, author_cut, pick_item_templates
+from aar.drp.libwrite.cut import Cut, CutTransition, author_cut, pick_item_templates
 from aar.drp.libwrite.seed import read_seed
 from aar.drp.mediapool import formulas as fm
 from aar.drp.mediapool.errors import MediaPoolError
@@ -73,6 +77,7 @@ def _writer_project(
     templates: list[Path],
     cuts_of: Any,
     timeline_name: str | None = None,
+    transitions: tuple[CutTransition, ...] = (),
 ) -> dict[str, Any]:
     """A writer-level project (the seed's own clip): integrity, reader and cut-list checks."""
     picks = pick_item_templates([read_items(p, options=_OPTS) for p in [*templates, seed]])
@@ -81,12 +86,12 @@ def _writer_project(
     def author(s: Any) -> Authored:
         clip = next(c for c in s.clips if c.audio and c.video is not None)
         cuts = cuts_of(clip)
-        items, specs = author_cut(s, cuts, picks)
+        items, specs = author_cut(s, cuts, picks, transitions=transitions)
         facts_out["clip"] = media_view(clip).name
         facts_out["start"] = s.start_frame
         facts_out["rate"] = s.rate
         facts_out["cuts"] = cuts
-        return Authored([], items, specs, cuts=cuts)
+        return Authored([], items, specs, cuts=cuts, transitions=transitions)
 
     result = make_project(
         library,
@@ -108,6 +113,7 @@ def _writer_project(
         "start": facts_out["start"],
         "rate": facts_out["rate"],
         "cuts": facts_out["cuts"],
+        "transitions": list(transitions),
     }
 
 
@@ -124,9 +130,25 @@ def _describe(entry: dict[str, Any], what: str) -> str:
                 f"{cut.sound_duration} frames from source frame {cut.sound_src_in})"
             )
         parts.append(line)
+    fades = []
+    for tx in entry.get("transitions", []):
+        cut = entry["cuts"][tx.after]
+        at = entry["start"] + cut.record_in + cut.duration
+        before = (tx.frames + 1) // 2
+        fades.append(
+            f"a {tx.frames}-frame {tx.name} on A1 across the cut at {_tc(at, rate)} "
+            f"({before} frame(s) before it, {tx.frames - before} after)"
+        )
+    tail = (
+        "; and " + "; ".join(fades) + " (the picture cuts hard; the sound blends across each "
+        "cut with no click, and the transition shows in A1 with its kind in the Inspector)"
+        if fades
+        else ""
+    )
     return (
         f"{what} Timeline {entry['timeline']!r} holds, of clip {entry['clip']!r}: "
         + "; ".join(parts)
+        + tail
         + ". The project opens with no relink or offline prompt; each cut plays what it "
         "names (picture, sound or both) of the clip at those source frames."
     )
@@ -217,13 +239,14 @@ def main(argv: list[str] | None = None) -> int:
                 "picture kind at the seed timeline's rate"
             )
         # (b)..(d) writer-level projects on the seed's own clip.
-        specs: list[tuple[str, str | None, Any, str]] = [
+        specs: list[tuple[str, str | None, Any, str, tuple[CutTransition, ...]]] = [
             (
                 "aar-stage-b-renamed-timeline",
                 "aar renamed timeline",
                 lambda clip: [Cut(clip, 0, 48, 0), Cut(clip, 48, 48, 240), Cut(clip, 96, 48, 120)],
                 "Only the timeline's name is new: it reads 'aar renamed timeline' in the timeline "
                 "tab and in the media pool.",
+                (),
             ),
             (
                 "aar-stage-c1-picture-only",
@@ -233,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
                     Cut(clip, 48, 48, 240, sound=False),
                 ],
                 "Picture items with no sound: V1 holds the cuts, A1 is empty.",
+                (),
             ),
             (
                 "aar-stage-c2-sound-only",
@@ -242,12 +266,14 @@ def main(argv: list[str] | None = None) -> int:
                     Cut(clip, 48, 48, 240, picture=False),
                 ],
                 "Sound items with no picture: A1 holds the cuts, V1 is empty.",
+                (),
             ),
             (
                 "aar-stage-d1-gaps",
                 None,
                 lambda clip: [Cut(clip, 15, 48, 0), Cut(clip, 93, 48, 240)],
                 "Gaps: 15 empty frames at the start and 30 between the two linked cuts.",
+                (),
             ),
             (
                 "aar-stage-d2-split-edit",
@@ -265,17 +291,40 @@ def main(argv: list[str] | None = None) -> int:
                 ],
                 "A split edit: the sound starts 10 frames before the picture (J-cut), the two "
                 "still linked (moving one moves the other).",
+                (),
+            ),
+            (
+                "aar-stage-e1-crossfades-0db",
+                None,
+                lambda clip: [
+                    Cut(clip, 0, 48, 10),
+                    Cut(clip, 48, 48, 120),
+                    Cut(clip, 96, 48, 240),
+                ],
+                "Sound crossfades (add_sound_transitions), as the ccn profile puts on every cut.",
+                (
+                    CutTransition(0, 2, "Cross Fade 0 dB"),
+                    CutTransition(1, 2, "Cross Fade 0 dB"),
+                ),
+            ),
+            (
+                "aar-stage-e2-crossfade-3db-16",
+                None,
+                lambda clip: [Cut(clip, 0, 60, 20), Cut(clip, 60, 60, 200)],
+                "A long sound crossfade of the other kind (add_sound_transitions).",
+                (CutTransition(0, 16, "Cross Fade +3 dB"),),
             ),
         ]
-        for name, timeline_name, cuts_of, what in specs:
+        for name, timeline_name, cuts_of, what, transitions in specs:
             entry = _writer_project(
-                library, args.seed, name, args.templates, cuts_of, timeline_name
+                library, args.seed, name, args.templates, cuts_of, timeline_name, transitions
             )
             statements.append(f"{name}: " + _describe(entry, what))
             entry["cuts"] = [
                 {k: getattr(c, k) for k in c.__dataclass_fields__ if k != "clip"}
                 for c in entry["cuts"]
             ]
+            entry["transitions"] = [vars(t) for t in entry["transitions"]]
             entry["rate"] = str(entry["rate"])
             entries.append(entry)
     except (ExportError, ProjectWriteError, MediaPoolError) as exc:

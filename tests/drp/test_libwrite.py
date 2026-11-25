@@ -196,6 +196,7 @@ def test_the_operation_list_is_closed_and_its_statuses_are_stable() -> None:
         "add_sound_only_items": False,
         "leave_gaps": False,
         "split_edit": False,
+        "add_sound_transitions": False,
         "set_extents": True,
     }
 

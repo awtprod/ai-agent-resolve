@@ -76,6 +76,8 @@ def operations_for(
     by_id = {i.item_id: i for i in items}
     linked = picture_only = sound_only = split = False
     for item in items:
+        if item.kind == "transition":
+            continue
         partners = _partners(item)
         if not partners:
             if item.kind == "picture":
@@ -100,6 +102,8 @@ def operations_for(
         ops.append("leave_gaps")
     if split:
         ops.append("split_edit")
+    if any(i.kind == "transition" for i in items):
+        ops.append("add_sound_transitions")
     ops.append("set_extents")
     return ops
 
@@ -113,7 +117,7 @@ def _gaps(seed: Seed, items: Sequence[AuthoredItem]) -> bool:
         spans = sorted(
             (int(i.item["Start"]), int(i.item["Start"]) + int(i.item["Duration"]))
             for i in items
-            if i.link["DbOwner"] == track
+            if i.link["DbOwner"] == track and i.kind != "transition"
         )
         cursor = seed.start_frame
         for start, end in spans:
@@ -303,13 +307,17 @@ def _check_inputs(seed: Seed, clips: Sequence[AuthoredClip], items: Sequence[Aut
         new_ids.add(item.item_id)
         if item.link["DbOwner"] not in (seed.video_track, seed.audio_track):
             raise bad("an item is placed on a track that is not the seed timeline's")
+        if item.kind not in ("picture", "sound", "transition"):
+            raise bad(f"an item is a {item.kind!r}")
         want = seed.video_track if item.kind == "picture" else seed.audio_track
         if item.link["DbOwner"] != want:
             raise bad(f"a {item.kind} item is placed on the other track")
     for track in (seed.video_track, seed.audio_track):
-        spans = sorted(
+        # Record order, a transition before a clip that starts on the same frame (Resolve's).
+        ordered = sorted(
             (
                 int(i.item["Start"]),
+                0 if i.kind == "transition" else 1,
                 int(i.item["Start"]) + int(i.item["Duration"]),
                 i.link["DbIndex"],
             )
@@ -317,9 +325,11 @@ def _check_inputs(seed: Seed, clips: Sequence[AuthoredClip], items: Sequence[Aut
             if i.link["DbOwner"] == track
         )
         cursor = seed.start_frame
-        for index, (start, end, db_index) in enumerate(spans):
-            if start < cursor:
-                raise bad("two items overlap on one track, or one starts before the timeline")
+        for index, (start, is_clip, end, db_index) in enumerate(ordered):
             if db_index != index:
                 raise bad("the items' DbIndex is not their record order")
+            if not is_clip:
+                continue  # a transition lies over the cut it sits on (checked by the verifier)
+            if start < cursor:
+                raise bad("two items overlap on one track, or one starts before the timeline")
             cursor = end

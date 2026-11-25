@@ -58,6 +58,8 @@ EXPORT_CODES = frozenset(
         "project_exists",
         "not_a_library",
         "library_unwritable",
+        # Sound transitions in a library project (S25e).
+        "bad_transition",
     }
 )
 

@@ -19,7 +19,7 @@ from typing import Any, Generic, TypeVar
 from aar.drp.items.author import AuthoredItem
 from aar.drp.library import LibraryError, LibraryOptions, take_snapshot
 from aar.drp.libwrite.check import check_written
-from aar.drp.libwrite.cut import Cut
+from aar.drp.libwrite.cut import Cut, CutTransition
 from aar.drp.libwrite.errors import CODES, ProjectWriteError, by_caller, refusing
 from aar.drp.libwrite.ops import OPENED, OPERATIONS, UNOPENED, Operation, unopened
 from aar.drp.libwrite.place import (
@@ -75,6 +75,9 @@ class Authored:
     #: layout :func:`verify_written` checks the written items against, independently of the
     #: code that authored them. Required whenever there are items.
     cuts: Sequence[Cut] = ()
+    #: The sound crossfades the transition items were authored from (S25e), checked the same
+    #: way.
+    transitions: Sequence[CutTransition] = ()
 
 
 @dataclass
@@ -174,6 +177,7 @@ def make_project(
             path,
             seed,
             authored.cuts,
+            transitions=authored.transitions,
             clips=[ClipRows.from_tables(c.rows) for c in authored.clips],
             project_name=project_name,
             timeline_name=timeline_name,

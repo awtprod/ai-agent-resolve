@@ -140,13 +140,16 @@ def record_import(
     result: dict[str, Any],
     key: str,
     actor: Actor,
+    current: Callable[[], bool] | None = None,
 ) -> dict[str, Any] | None:
     """Import the timeline ``read`` gives against the plan ``plan_sha256`` (the plan the
     returned timeline was handed over from), store the edited plan and the diff, and journal
     ``result`` once under ``key`` as a ``recipe.timeline_return``. One implementation for a
     returned ``.drt`` and a library save (:mod:`aar.recipes.library_returns`): an import that
     fails is recorded ``failed`` with its error; pickup never replaces the active plan or
-    decides a review. None when the run was cancelled meanwhile."""
+    decides a review. None when the run was cancelled meanwhile, or when ``current`` (checked
+    inside the recording transaction, after the key) says the state the return follows is no
+    longer the newest (a library save, S25e)."""
     try:
         plan = EditPlan.model_validate_json(store.read_bytes(plan_sha256))
         timeline = read()
@@ -156,6 +159,7 @@ def record_import(
             timeline.media,
             media_map=mapping,
             reader_warnings=timeline.warnings,
+            sound_transitions=timeline.sound_transitions,
         )
         result["plan"] = store.put(
             imported.plan.model_dump_json().encode(),
@@ -183,6 +187,8 @@ def record_import(
         existing = log.get_by_idempotency_key(key)
         if existing is not None:
             return existing.payload
+        if current is not None and not current():
+            return None
         txn.append(EVENT_RETURN, RUNNER, result, project_id=project_id, idempotency_key=key)
     return result
 

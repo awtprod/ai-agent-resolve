@@ -14,6 +14,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "drp"))
 
 from libwrite_support import (
+    crossfade,
     facts_lines,
     linked_pair,
     make_library,
@@ -55,12 +56,21 @@ def show_facts(pc_path: str, **change: Any) -> dict[str, Any]:
     return data
 
 
-def make_library_setup(base: Path, pc_paths: list[str], **lib: Any) -> dict[str, Any]:
+def make_library_setup(
+    base: Path, pc_paths: list[str], *, transition_template: bool = True, **lib: Any
+) -> dict[str, Any]:
     """A library, a seed and a facts file under ``base`` (inside the media root); the recipe's
-    ``library`` params for them (both opt-ins on unless ``lib`` says otherwise)."""
+    ``library`` params for them (both opt-ins on unless ``lib`` says otherwise). The seed's
+    timeline holds a cut with a sound crossfade (the transition template, S25e) unless
+    ``transition_template`` is False."""
     base.mkdir(parents=True, exist_ok=True)
     seeds = base / "seeds"
     seeds.mkdir(exist_ok=True)
+    items = (
+        crossfade(CLIP, 0xB000, start=START)
+        if transition_template
+        else linked_pair(CLIP, 0xB000, start=86400, duration=48, src_in=0)
+    )
     seed = write_seed(
         seeds / "Project.db",
         rate=RATE,
@@ -68,7 +78,7 @@ def make_library_setup(base: Path, pc_paths: list[str], **lib: Any) -> dict[str,
         resolution=(320, 180),
         rate_text="29.97",
         clips=[CLIP],
-        items=linked_pair(CLIP, 0xB000, start=86400, duration=48, src_in=0),
+        items=items,
     )
     facts = facts_lines(
         base / "facts.jsonl", *[show_facts(p) for p in pc_paths], mp4_template_facts()
@@ -87,6 +97,47 @@ def make_library_setup(base: Path, pc_paths: list[str], **lib: Any) -> dict[str,
 
 
 # --------------------------------------------------------------------------- the owner's edits
+
+
+def transitions(db: Path) -> list[tuple[int, int, str]]:
+    """``(Start, Duration, PrettyType)`` of every transition, in record order."""
+    conn = sqlite3.connect(db)
+    try:
+        rows = conn.execute(
+            "SELECT Start, Duration, PrettyType FROM Sm2TiItem WHERE DbType = 'Sm2TiTransition'"
+        ).fetchall()
+    finally:
+        conn.close()
+    return sorted((int(a), int(b), str(c)) for a, b, c in rows)
+
+
+def ripple_trim_tail(frames: int, index: int) -> Any:
+    """Trim the picture at ``index`` (and its sound) by ``frames`` at its tail, as Resolve's
+    ripple trim does: every later item, transitions included, moves up by ``frames``."""
+
+    def edit(conn: sqlite3.Connection, items: list[dict[str, Any]]) -> None:
+        item = items[index]
+        end = int(item["Start"]) + int(item["Duration"])
+        for rid in (item["Sm2TiItem_id"], item["sound"]):
+            conn.execute(
+                "UPDATE Sm2TiItem SET Duration = ? WHERE Sm2TiItem_id = ?",
+                (str(int(item["Duration"]) - frames), rid),
+            )
+        # Later clips, and the transitions whose window runs past the cut (the one on this
+        # clip's tail and every later one) move up with the cut.
+        later = conn.execute(
+            "SELECT Sm2TiItem_id, Start FROM Sm2TiItem WHERE CAST(Start AS INTEGER) >= ? OR "
+            "(DbType = 'Sm2TiTransition' AND CAST(Start AS INTEGER) + CAST(Duration AS INTEGER)"
+            " > ?)",
+            (end, end),
+        ).fetchall()
+        for rid, start in later:
+            conn.execute(
+                "UPDATE Sm2TiItem SET Start = ? WHERE Sm2TiItem_id = ?",
+                (str(int(start) - frames), rid),
+            )
+
+    return edit
 
 
 def pictures_of(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -116,14 +167,14 @@ def pictures(db: Path) -> list[dict[str, Any]]:
 def _reindex(conn: sqlite3.Connection) -> None:
     """Every track's ``Items`` vector dense from 0 in record order (as Resolve keeps it)."""
     links = conn.execute(
-        "SELECT j.rowid, j.DbOwner, CAST(i.Start AS INTEGER) FROM Sm2TiItem_Sm2TiTrack j "
-        "JOIN Sm2TiItem i ON i.Sm2TiItem_id = j.DbAssociate"
+        "SELECT j.rowid, j.DbOwner, CAST(i.Start AS INTEGER), i.DbType != 'Sm2TiTransition' "
+        "FROM Sm2TiItem_Sm2TiTrack j JOIN Sm2TiItem i ON i.Sm2TiItem_id = j.DbAssociate"
     ).fetchall()
-    by_track: dict[str, list[tuple[int, int]]] = {}
-    for rowid, owner, start in links:
-        by_track.setdefault(owner, []).append((start, rowid))
+    by_track: dict[str, list[tuple[int, int, int]]] = {}
+    for rowid, owner, start, is_clip in links:
+        by_track.setdefault(owner, []).append((start, is_clip, rowid))
     for entries in by_track.values():
-        for index, (_, rowid) in enumerate(sorted(entries)):
+        for index, (_, _, rowid) in enumerate(sorted(entries)):
             conn.execute(
                 "UPDATE Sm2TiItem_Sm2TiTrack SET DbIndex = ? WHERE rowid = ?", (index, rowid)
             )

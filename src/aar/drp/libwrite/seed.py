@@ -3,9 +3,10 @@
 A seed carries the project settings, the bin, and exactly one timeline whose tracks are the
 skeleton: one video track and one audio track (adding or removing tracks is not proven). Its
 timeline is empty, or holds only plain picture and sound items (no grade, effect, Fusion
-composition, marker or edit history: rows the writer would otherwise leave dangling), which are
-removed (``remove_items``): the real saves show that an item's id is named only by its join row
-and its linked items, and :func:`read_seed` checks that on the seed itself. The seed's own media
+composition, marker or edit history: rows the writer would otherwise leave dangling) and plain
+sound crossfades of a supported shape (S25e), which are removed (``remove_items``): the real
+saves show that an item's id is named only by its join row and its linked items, and
+:func:`read_seed` checks that on the seed itself. The seed's own media
 stay in the pool: removing media is not proven.
 
 :func:`read_seed` reads a seed through the bounded library reader
@@ -28,6 +29,7 @@ from typing import Any
 from aar.drp import blobs
 from aar.drp.errors import DrpError
 from aar.drp.items.rows import ITEM_COLUMNS, ItemRows, shape_of
+from aar.drp.items.transitions import TRANSITION, transition_shape
 from aar.drp.library import SQL_ERRORS, LibraryError, LibraryOptions, read_rows
 from aar.drp.libwrite.errors import ProjectWriteError, refusing
 from aar.drp.mediapool import blobtree as bt
@@ -436,9 +438,15 @@ def _read_seed(p: Path, opts: LibraryOptions) -> Seed:
     item_ids: list[str] = []
     for row in items:
         rows = ItemRows(row, by_item[str(row.get("Sm2TiItem_id"))])
-        shape = shape_of(rows, clips)
-        if shape.refused is not None or shape.tags:
-            why = shape.refused or ", ".join(sorted(shape.tags))
+        if row.get("DbType") == TRANSITION:
+            # A plain sound crossfade (S25e): its id is named nowhere else either (checked below).
+            tshape = transition_shape(rows, 1 if row.get("Sm2TiTrack_id") == audio_track else 0)
+            refused, tags = tshape.refused, tshape.tags
+        else:
+            shape = shape_of(rows, clips)
+            refused, tags = shape.refused, shape.tags
+        if refused is not None or tags:
+            why = refused or ", ".join(sorted(tags))
             raise _bad(
                 f"the seed timeline holds an item the writer cannot remove ({why}): removing it "
                 "would leave the rows it names behind",

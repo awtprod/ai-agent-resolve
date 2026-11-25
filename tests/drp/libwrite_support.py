@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sqlite3
 import struct
+import zlib
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ __all__ = [
     "PROJECT",
     "TIMELINE",
     "VIDEO_TRACK",
+    "crossfade",
     "facts_lines",
     "item_row",
     "linked_pair",
@@ -48,6 +50,7 @@ __all__ = [
     "mp4_facts",
     "mp4_template",
     "mp4_template_facts",
+    "transition_row",
     "write_seed",
 ]
 
@@ -157,6 +160,101 @@ def linked_pair(
         )
         out.append((row, join(track, me, "Items", index)))
     return out
+
+
+#: What a sound transition's FieldsBlob #2 holds, decompressed (the corpus's one value), and
+#: as stored: the length and a zlib stream, written out (not made with this host's zlib).
+TRANSITION_VALUE = bytes([3, 0, 1]) + bytes(41)
+TRANSITION_FIELD = struct.pack(">I", 44) + bytes.fromhex("789c636660642016000000da0005")
+
+
+def qcompress(data: bytes) -> bytes:
+    """Qt's qCompress of ``data`` (this host's zlib; used only for values other than the one
+    every transition holds)."""
+    return struct.pack(">I", len(data)) + zlib.compress(data)
+
+
+def transition_row(
+    item_id: str,
+    track: str,
+    *,
+    start: int,
+    frames: int,
+    pretty: str = "Cross Fade 0DB",
+    alignment: int = 2,
+    history: bool = False,
+) -> dict[str, Any]:
+    """A sound transition as Resolve stores it (written from DESIGN's field map, not from the
+    product): ``history`` adds the later-edit field #1.#21 (the record start)."""
+    fields = [(2, 2, TRANSITION_FIELD)]
+    if history:
+        fields.insert(0, (1, 2, pb((21, 0, start))))
+    row = {c: None for c in ITEM_COLUMNS}
+    row.update(
+        {
+            "Sm2TiItem_id": item_id,
+            "DbType": "Sm2TiTransition",
+            "Name": "Transition",
+            "Start": str(start),
+            "Duration": str(frames),
+            "UiMemento": 0,
+            "Flags": 0,
+            "PriorityIndex": 0,
+            "ThumbnailDirtyFlag": 1,
+            "RenderTextEnabled": 1,
+            "RenderTextGanged": 1,
+            "RenderTextPrefixed": 1,
+            "IsForceConformed": 1,
+            "MatchConflictState": 0,
+            "PrettyType": pretty,
+            "IsPreConformed": 0,
+            "Sm2TiTrack_id": track,
+            "MixedFrameRateAlignment": 0.0,
+            "UseOppositeSrcForLeftEye": 0,
+            "UseOppositeSrcForRightEye": 0,
+            "WasDisbanded": 0,
+            "CurrentSelectorIdx": 0,
+            "AlignmentType": alignment,
+            "Position": alignment,
+            "FieldsBlob": envelope(pb(*fields)),
+            "BlobLockSysId": "",
+            "CompTableLockSysId": "",
+            "VersionTableLockSysId": "",
+        }
+    )
+    return row
+
+
+def crossfade(
+    clip: ClipRows,
+    base: int,
+    *,
+    start: int,
+    lengths: tuple[int, int] = (48, 48),
+    src_in: int = 24,
+    frames: int = 2,
+    pretty: str = "Cross Fade 0DB",
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Two linked pairs of ``clip`` that abut at ``start + lengths[0]`` and a centred sound
+    transition of ``frames`` on the cut, as ``(item, join)`` rows in each track's order."""
+    first = linked_pair(clip, base, start=start, duration=lengths[0], src_in=src_in, index=0)
+    cut = start + lengths[0]
+    second = linked_pair(
+        clip, base + 2, start=cut, duration=lengths[1], src_in=src_in + lengths[0] + 8, index=1
+    )
+    # The picture track holds the two pictures at 0 and 1; the sound track 0, the transition
+    # at 1 and the second sound at 2.
+    sound2 = (second[1][0], join(AUDIO_TRACK, second[1][0]["Sm2TiItem_id"], "Items", 2))
+    fade = transition_row(
+        uid(base + 4), AUDIO_TRACK, start=cut - (frames + 1) // 2, frames=frames, pretty=pretty
+    )
+    return [
+        first[0],
+        second[0],
+        first[1],
+        (fade, join(AUDIO_TRACK, fade["Sm2TiItem_id"], "Items", 1)),
+        sound2,
+    ]
 
 
 def _extents(start_frame: int, rate: float, length: float = 0.0) -> bytes:

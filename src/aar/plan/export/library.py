@@ -10,16 +10,20 @@ placed in the library it is read back with the timeline import (S20) against the
 written from, and refused (``self_check_failed``) unless that import reports no change: the
 rule the FCPXML export applies to its own file.
 
-What the library project cannot carry yet is either refused (it would change the cut: a
-transition, the head's dissolve, a title or the sting, a clip off V1, a fade, a sound silenced
-by a muted track) or listed in the report under ``not_carried`` in the FCPXML report's own
-vocabulary (gain, transform and reframe, a label or note, markers, captions; and everything
-the layout already lists as not expressible).
+The layout's audio-only crossfades on V1's joins (the ``ccn`` profile's crossfade on every cut)
+are written as sound transition items (S25e: :mod:`aar.drp.items.transitions`) at the layout's
+own cut, length and alignment, when they are of a kind, alignment, length and timeline rate the
+transition gate covers. What the library project cannot carry yet is either refused (it would
+change the cut: any other transition, the head's dissolve, a picture transition, a title or the
+sting, a clip off V1, a fade, a sound silenced by a muted track) or listed in the report under
+``not_carried`` in the FCPXML report's own vocabulary (gain, transform and reframe, a label or
+note, markers, captions; and everything the layout already lists as not expressible).
 """
 
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -31,6 +35,7 @@ from typing import Any, ParamSpec, TypeVar
 from aar.drp.items.errors import ItemError
 from aar.drp.items.media import media_view
 from aar.drp.items.rows import ItemSet, read_items
+from aar.drp.items.transitions import MAX_FRAMES, MIN_FRAMES, RATES, SOUND_KINDS, frames_before
 from aar.drp.library import SQL_ERRORS, LibraryError, LibraryOptions
 from aar.drp.libwrite import (
     Authored,
@@ -39,7 +44,13 @@ from aar.drp.libwrite import (
     check_project_name,
     make_project,
 )
-from aar.drp.libwrite.cut import Cut, ItemTemplates, author_cut, pick_item_templates
+from aar.drp.libwrite.cut import (
+    Cut,
+    CutTransition,
+    ItemTemplates,
+    author_cut,
+    pick_item_templates,
+)
 from aar.drp.libwrite.ops import OPERATIONS, unopened
 from aar.drp.libwrite.place import read_placed
 from aar.drp.libwrite.seed import Seed
@@ -53,7 +64,7 @@ from aar.media.probe import timecode_frames
 from aar.plan.apply.inputs import plan_hash
 from aar.plan.export import layout_for
 from aar.plan.export.errors import ExportError
-from aar.plan.export.layout import Layout, ReportItem, muted_without_bus
+from aar.plan.export.layout import Layout, ReportItem, TransitionSpec, muted_without_bus
 from aar.plan.inputs import LaughMap, Transcript
 from aar.plan.lint import Finding, lint
 from aar.plan.model import EditPlan
@@ -135,19 +146,71 @@ def _refusing(what: str) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
     return wrap
 
 
+#: The layout's not-expressible features of a plan transition it could not place.
+_UNPLACED_TRANSITIONS = frozenset({"transition", "head_transition", "outro_transition"})
+_JOIN_LOCATION = re.compile(r"transitions\[([0-9]+)\]")
+#: The layout's alignment names -> the transition writer's.
+_ALIGNMENT = {"center": "centre", "right": "start", "left": "end"}
+
+
+def _sound_transition(layout: Layout, t: TransitionSpec) -> tuple[CutTransition | None, str]:
+    """The layout's transition as a sound crossfade the writer supports (with the plan's
+    transition it came from), or None and why it is not one."""
+    plan = layout.plan
+    found = _JOIN_LOCATION.fullmatch(t.location)
+    if t.kind != "join" or found is None:
+        return None, f"{t.kind} transition (a picture transition: none is supported yet)"
+    tx = plan.transitions[int(found.group(1))]
+    if t.video or t.form != "split" or tx.audio is None:
+        return None, "a picture transition (none is supported yet)"
+    if tx.audio.type not in SOUND_KINDS:
+        return None, f"a {tx.audio.type!r} sound transition (supported: {sorted(SOUND_KINDS)})"
+    rate = Fraction(plan.fps.num, plan.fps.den)
+    if rate not in RATES:
+        return None, f"a sound transition on a {rate} fps timeline (seen only at 29.97)"
+    if not MIN_FRAMES <= t.frames <= MAX_FRAMES:
+        return None, (
+            f"a {t.frames}-frame sound transition (lengths compared: {MIN_FRAMES} to {MAX_FRAMES})"
+        )
+    alignment = _ALIGNMENT.get(t.alignment, t.alignment)
+    if alignment != "centre":
+        return None, f"a sound transition aligned {t.alignment} (only centred is supported)"
+    if t.head_part != frames_before("centre", t.frames):
+        return None, (
+            f"a {t.frames}-frame centred sound transition: the layout puts {t.head_part} of its "
+            f"frames before the cut, Resolve {frames_before('centre', t.frames)} (an odd length)"
+        )
+    return CutTransition(-1, t.frames, tx.audio.type, alignment), ""
+
+
 def _unsupported(layout: Layout) -> list[dict[str, str]]:
     """Plan features a library project cannot carry yet and that would change the cut."""
     plan = layout.plan
     out: list[dict[str, str]] = []
     for t in layout.transitions:
-        out.append({"location": t.location, "feature": f"{t.kind} transition"})
+        written, why = _sound_transition(layout, t)
+        if written is None:
+            out.append({"location": t.location, "feature": why})
+    # A transition the layout could not place (at a gap, off V1, with nothing after it): the
+    # FCPXML reports it; a library project's import would drop it, which changes the plan.
+    for item in layout.not_expressible:
+        if item.feature in _UNPLACED_TRANSITIONS:
+            out.append(
+                {"location": item.location, "feature": f"a transition not on a join: {item.detail}"}
+            )
     for t in layout.titles:
         out.append({"location": t.location, "feature": f"{t.kind} title"})
     for c in layout.clips:
         if c.lane != 0:
             out.append({"location": c.location, "feature": "a clip off V1 (another track)"})
         if c.fade_in or c.fade_out:
-            out.append({"location": c.location, "feature": "an audio fade"})
+            out.append(
+                {
+                    "location": c.location,
+                    "feature": "an audio fade (no fade was seen in Resolve's saves: every "
+                    "transition there sits between two clips)",
+                }
+            )
         if muted_without_bus(plan, c.audio_track):
             out.append(
                 {"location": c.location, "feature": "sound silenced by a muted track (no gain)"}
@@ -192,7 +255,37 @@ def _not_carried(layout: Layout) -> list[dict[str, str]]:
         )
     for i, _ in enumerate(plan.captions):
         items.append(ReportItem("caption", f"captions[{i}]", "captions are burned in", "none"))
-    return [item.as_dict() for item in items] + [x.as_dict() for x in layout.not_expressible]
+    # A sound transition the project carries keeps its own kind: the FCPXML's note that it is
+    # written as FCPXML's one audio crossfade does not apply.
+    written = {
+        f"{t.location}.audio.type"
+        for t in layout.transitions
+        if _sound_transition(layout, t)[0] is not None
+    }
+    kept = [
+        x
+        for x in layout.not_expressible
+        if not (x.feature == "audio_transition_type" and x.location in written)
+    ]
+    return [item.as_dict() for item in items] + [x.as_dict() for x in kept]
+
+
+def _cut_transitions(layout: Layout, cuts: Sequence[Cut]) -> list[CutTransition]:
+    """Each written sound transition on its join: the cut entry whose range ends on its cut."""
+    out = []
+    for t in layout.transitions:
+        written, _ = _sound_transition(layout, t)
+        if written is None:
+            continue  # refused before anything was written (_unsupported)
+        ends = [i for i, c in enumerate(cuts) if c.record_in + c.duration == t.cut]
+        if len(ends) != 1:
+            raise _refuse(
+                "bad_transition",
+                f"{t.location}: no single clip ends on its cut at frame {t.cut}",
+                "this is an exporter bug; report the plan",
+            )
+        out.append(CutTransition(ends[0], written.frames, written.name, written.alignment))
+    return out
 
 
 def _facts_for(layout: Layout, facts: dict[str, MediaFacts]) -> dict[str, MediaFacts]:
@@ -536,18 +629,26 @@ def export_library(
                     sound=bool(rows.audio),
                 )
             )
+        transitions = _cut_transitions(layout, cuts)
         try:
-            items, specs = author_cut(s, cuts, picks)
+            items, specs = author_cut(s, cuts, picks, transitions=transitions)
         except ItemError as exc:
             raise _refuse("item_refused", f"{exc.message} [{exc.code}]", exc.hint) from None
         all_clips = [clips[src] for src in sorted(clips)]
-        return Authored(all_clips, items, specs, extra=media_rows, cuts=cuts)
+        return Authored(
+            all_clips, items, specs, extra=media_rows, cuts=cuts, transitions=transitions
+        )
 
     def import_check(path: Path, s: Seed, authored: Authored) -> dict[str, Any]:
         try:
             timeline = read_timeline(path, library_options=LibraryOptions(settle_seconds=0.0))
             result = import_timeline(
-                plan, timeline.timeline, timeline.media, media_map=media_map, profile=None
+                plan,
+                timeline.timeline,
+                timeline.media,
+                media_map=media_map,
+                profile=None,
+                sound_transitions=timeline.sound_transitions,
             )
         except (TimelineImportError, ExportError) as exc:
             raise _refuse(
@@ -650,6 +751,7 @@ def _report(
             "outro": any(c.location == "outro" for c in layout.clips),
             "picture_items": sum(i.kind == "picture" for i in items),
             "sound_items": sum(i.kind == "sound" for i in items),
+            "sound_transitions": sum(i.kind == "transition" for i in items),
         },
         "not_carried": _not_carried(layout),
         "notes": [item.as_dict() for item in layout.notes],
