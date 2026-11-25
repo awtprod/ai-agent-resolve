@@ -27,6 +27,7 @@ from aar.drp.libwrite.seed import Seed, read_seed
 from aar.drp.libwrite.verify import verify_written
 from aar.drp.libwrite.write import Built, ItemSpec, build_project, operations_for
 from aar.drp.mediapool.author import AuthoredClip
+from aar.drp.mediapool.templates import ClipRows
 from aar.drp.model import DrpFile
 
 __all__ = [
@@ -157,7 +158,14 @@ def make_project(
             project_name=project_name,
             allowed_issues=allowed_issues,
         )
-        verify_written(path, seed, authored.cuts)
+        verify_written(
+            path,
+            seed,
+            authored.cuts,
+            clips=[ClipRows.from_tables(c.rows) for c in authored.clips],
+            project_name=project_name,
+            timeline_name=timeline_name,
+        )
         extra = by_caller(check, path, seed, authored)
         placed_stub = Placed(path, path.parent, "")
         return ProjectResult(placed_stub, built, seed, authored, drp, extra)

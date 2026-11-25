@@ -18,18 +18,19 @@ rename, else a rename right after a fresh check).
 Two placements of names that fold to the same name are serialised by a lock file in the staging
 folder (``lock-<hash of the folded name>``, created exclusively), held from the existence check
 through the rename and removed on every path; a second placement of such a name is refused
-(``project_exists``) while the first holds it. The staging folder and the lock are removed on
-every path, failures and interrupts included; whatever cannot be removed is named in the
-refusal (its text and its ``residue`` detail) or, once placed, in :attr:`Placed.cleanup`. A
-folder or lock a killed process left is reported by the next placement in that library, never
-deleted by it. Nothing is ever written into an existing project's folder.
+(``project_exists``, naming the lock and any build folder a killed export left) while the first
+holds it. The lock holds a random token of the placement that made it, so the placement knows
+its own lock even when an interrupt lands between creating the file and recording that it did.
+From the moment the staging folder, the lock or the build folder may exist, every path
+(failures, ``OSError`` such as a full disk, and interrupts) either removes what this placement
+made or names it in the refusal (its text and its ``residue`` detail), in the interrupt's note,
+or, once placed, in :attr:`Placed.cleanup`. A folder or lock a killed process left is reported
+by the next placement in that library, never deleted by it. Nothing is ever written into an
+existing project's folder.
 """
 
 from __future__ import annotations
 
-import contextlib
-import ctypes
-import ctypes.util
 import errno
 import hashlib
 import os
@@ -330,67 +331,145 @@ def _lock_name(name: str) -> str:
     return _LOCK + hashlib.sha256(fold_name(name).encode("utf-8")).hexdigest()[:32]
 
 
-def _take_lock(root: Path, name: str) -> Path:
-    """The lock of the folded ``name`` in the staging folder, created exclusively; a
-    ``project_exists`` refusal when another placement holds it."""
-    lock = root / _lock_name(name)
+@dataclass
+class _Lock:
+    """This placement's claim on the lock of its folded name: ``path``, the ``token`` the lock
+    file holds once written, whether this placement created the file (``created``) and whether
+    another placement held it (``contended``: the file is not this placement's)."""
+
+    path: Path
+    token: bytes
+    tried: bool = False
+    created: bool = False
+    contended: bool = False
+
+
+def _take_lock(root: Path, claim: _Lock, name: str) -> None:
+    """Create ``claim.path`` exclusively and write the claim's token to it; a
+    ``project_exists`` refusal when another placement holds it (naming any build folder a
+    killed export left beside it). Whatever fails after the file exists propagates: the
+    caller's cleanup recognises the file as this placement's (:func:`_lock_left`)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    claim.tried = True
     try:
-        fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+        fd = os.open(claim.path, flags, 0o600)
+        claim.created = True
     except FileExistsError:
+        claim.contended = True
+        try:
+            builds = sorted(n for n in _listdir(root) if n.startswith("build-"))
+        except (OSError, ProjectWriteError):
+            builds = []
+        others = "".join(f"; {root / b}" for b in builds)
         raise _refuse(
             "project_exists",
             f"another export is placing a project named {name!r} (in some case) in this "
-            f"library: it holds the lock {lock}",
-            "wait for it and choose another name; if no export is running, a killed one left "
-            "the lock: delete it",
-            lock=str(lock),
+            f"library: it holds the lock {claim.path}"
+            + (f" (the staging folder also holds {', '.join(builds)})" if builds else ""),
+            "wait for it and choose another name; if no export is running, a killed export "
+            "left them: delete the lock"
+            + (" and the build folders" if builds else "")
+            + f" ({claim.path}{others}); each is safe to delete when no export is running",
+            lock=str(claim.path),
+            leftovers=[str(root / b) for b in builds],
         ) from None
     try:
-        os.write(fd, f"{os.getpid()} {fold_name(name)}\n".encode("utf-8", "replace"))
+        written = os.write(fd, claim.token)
+        if written != len(claim.token):
+            raise OSError(errno.EIO, f"the lock took {written} of {len(claim.token)} bytes")
     finally:
         os.close(fd)
-    return lock
+
+
+def _lock_left(claim: _Lock) -> str | None:
+    """Whether this placement's lock is (or may be) still there: ``"mine"`` when this
+    placement created it and it holds its token, a beginning of it or nothing (a write cut
+    short); ``"maybe"`` when the file is empty and the open was neither refused nor recorded
+    (an interrupt between creating the file and recording it, or another placement's file in
+    the same instant: named, never deleted); None otherwise."""
+    if claim.contended or not claim.tried:
+        return None
+    try:
+        if _is_link(claim.path) or not claim.path.is_file():
+            return None
+        with open(claim.path, "rb") as handle:
+            data = handle.read(len(claim.token) + 1)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "maybe" if claim.created else None
+    if claim.created and claim.token.startswith(data):
+        return "mine"
+    return "maybe" if not data else None
 
 
 _RENAME_NOREPLACE = 1
 _AT_FDCWD = -100
 
 
-def _renameat2() -> Callable[[bytes, bytes], int] | None:
-    """Linux's ``renameat2`` from the C library, or None where there is none."""
-    if not sys.platform.startswith("linux"):
-        return None
-    name = ctypes.util.find_library("c")
-    try:
-        libc = ctypes.CDLL(name, use_errno=True)
-        func = libc.renameat2
-    except (OSError, AttributeError):
-        return None
-    func.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-    func.restype = ctypes.c_int
-
-    def call(old: bytes, new: bytes) -> int:
-        return int(func(_AT_FDCWD, old, _AT_FDCWD, new, _RENAME_NOREPLACE))
-
-    return call
+#: The errors of ``renameat2`` that say the call is not available here (an old kernel or C
+#: library, a file system without the flag, a syscall filter that forbids it), not that the
+#: rename itself is refused: the placement falls back to a checked rename, which raises the
+#: real error if there is one.
+_UNAVAILABLE = frozenset(
+    {errno.ENOSYS, errno.EINVAL, errno.EPERM, errno.EOPNOTSUPP, getattr(errno, "ENOTSUP", 95)}
+)
+#: The C library's ``renameat2`` once looked up: unset, None (none here) or the call.
+_NOREPLACE: list[Callable[[bytes, bytes], tuple[int, int]] | None] = []
 
 
-_NOREPLACE = _renameat2()
+def _renameat2() -> Callable[[bytes, bytes], tuple[int, int]] | None:
+    """Linux's ``renameat2`` from the C library already loaded in the process (no search and
+    no subprocess: ``CDLL(None)``), looked up at first use; None where there is none (another
+    system, or a C library without the symbol). The call returns ``(result, errno)``."""
+    if _NOREPLACE:
+        return _NOREPLACE[0]
+    found: Callable[[bytes, bytes], tuple[int, int]] | None = None
+    if sys.platform.startswith("linux"):
+        import ctypes
+
+        try:
+            func = ctypes.CDLL(None, use_errno=True).renameat2
+        except (OSError, AttributeError, TypeError):
+            func = None
+        if func is not None:
+            func.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            func.restype = ctypes.c_int
+
+            def call(old: bytes, new: bytes) -> tuple[int, int]:
+                result = int(func(_AT_FDCWD, old, _AT_FDCWD, new, _RENAME_NOREPLACE))
+                return result, ctypes.get_errno()
+
+            found = call
+    _NOREPLACE.append(found)
+    return found
 
 
 def _move(folder: Path, target: Path) -> None:
-    """Rename ``folder`` to ``target``, never replacing anything there: ``FileExistsError``
-    (or ``OSError`` with ``EEXIST``/``ENOTEMPTY``) when ``target`` exists."""
-    if _NOREPLACE is not None:
-        if _NOREPLACE(os.fsencode(folder), os.fsencode(target)) == 0:
+    """Rename ``folder`` to ``target``, never replacing a project there: ``FileExistsError``
+    (or ``OSError`` with ``EEXIST``/``ENOTEMPTY``) when ``target`` exists.
+
+    Linux: ``renameat2(RENAME_NOREPLACE)``; when that call is not available here
+    (:data:`_UNAVAILABLE`) a rename right after a fresh check, which cannot replace a project
+    either (renaming a folder onto a folder that is not empty fails with ``ENOTEMPTY``, onto a
+    file with ``ENOTDIR``); any other error of the call is raised. Windows' rename never
+    replaces an existing folder."""
+    noreplace = _renameat2()
+    if noreplace is not None:
+        result, code = noreplace(os.fsencode(folder), os.fsencode(target))
+        if result == 0:
             return
-        code = ctypes.get_errno()
-        if code not in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):
+        if code not in _UNAVAILABLE:
             raise OSError(code, os.strerror(code), str(folder), None, str(target))
-        # The file system has no no-replace rename: fall back to a checked rename below.
-    if sys.platform != "win32" and (target.exists() or _is_link(target)):
+    if sys.platform != "win32" and (os.path.lexists(target) or _is_link(target)):
         raise FileExistsError(errno.EEXIST, "exists", str(target))
-    os.rename(folder, target)  # Windows' rename never replaces an existing folder
+    os.rename(folder, target)
 
 
 def _identity(path: Path) -> tuple[int, int]:
@@ -429,29 +508,32 @@ def place_project(
     top, projects, user_name = _projects_dir(library, user)
     _inside(projects, library, "the Projects folder")
     root = top / STAGING
-    try:
-        root.mkdir(exist_ok=True)
-        _real_folder(root, "the staging folder", "library_unwritable")
-        _inside(root, library, "the staging folder")
-        leftovers = sorted(_listdir(root))
-    except OSError as exc:
-        raise _refuse(
-            "library_unwritable",
-            f"cannot make a staging folder in {root.parent}: {exc}",
-            "check that the library is writable and has room",
-        ) from None
-    try:
-        lock = _take_lock(root, name)
-    except OSError as exc:
-        _remove_root(root)
-        raise _refuse(
-            "library_unwritable",
-            f"cannot make a lock in the staging folder {root}: {exc}",
-            "check that the library is writable and has room",
-        ) from None
-    placed = Placed(projects / name / "Project.db", projects / name, user_name, leftovers)
+    claim = _Lock(root / _lock_name(name), f"{secrets.token_hex(16)} {os.getpid()}\n".encode())
+    placed = Placed(projects / name / "Project.db", projects / name, user_name)
     work: Path | None = None
+    moving: dict[str, tuple[int, int]] = {}
+    # From the first statement that may make something in the library (the staging folder)
+    # to the end of the cleanup, everything runs inside this one handler.
     try:
+        try:
+            root.mkdir(exist_ok=True)
+            _real_folder(root, "the staging folder", "library_unwritable")
+            _inside(root, library, "the staging folder")
+            placed.leftovers = sorted(_listdir(root))
+        except OSError as exc:
+            raise _refuse(
+                "library_unwritable",
+                f"cannot make a staging folder in {root.parent}: {exc}",
+                "check that the library is writable and has room",
+            ) from None
+        try:
+            _take_lock(root, claim, name)
+        except OSError as exc:
+            raise _refuse(
+                "library_unwritable",
+                f"cannot make a lock in the staging folder {root}: {exc}",
+                "check that the library is writable and has room",
+            ) from None
         clash = _exists(projects, name)
         if clash is not None:
             raise _refuse(
@@ -464,14 +546,20 @@ def place_project(
         try:
             work.mkdir()
         except OSError as exc:
+            work = None  # not made by this placement: never removed by it
             raise _refuse(
                 "library_unwritable",
                 f"cannot make a staging folder in {root}: {exc}",
                 "check that the library is writable and has room",
             ) from None
-        result = _build_and_rename(library, work, projects, name, build, placed)
+        result = _build_and_rename(library, work, projects, name, build, placed, moving)
+        residue, interrupt = _cleanup(work, claim, root)
     except BaseException as exc:
-        residue, interrupt = _cleanup(work, lock, root)
+        residue, interrupt = _cleanup(work, claim, root)
+        if not isinstance(exc, Exception) and _moved(moving, placed.folder):
+            # An interrupt after the rename: the project is placed; say so.
+            _note_placed(exc, placed, residue)
+            raise
         if residue:
             text = "; ".join(residue)
             with_residue(exc, text, f"left in the library: {text}; delete it by hand")
@@ -497,42 +585,82 @@ def place_project(
                 )
             raise interrupt from exc
         raise
-    residue, interrupt = _cleanup(work, lock, root)
     placed.cleanup.extend(f"{r}; delete it by hand" for r in residue)
     if interrupt is not None:
-        text = f"the project was placed at {placed.folder}" + (
-            f"; left in the library: {'; '.join(residue)}" if residue else ""
-        )
-        with_residue(interrupt, "; ".join(residue), text)
+        _note_placed(interrupt, placed, residue)
         raise interrupt
     return placed, result
 
 
-def _remove_root(root: Path) -> None:
-    # Not empty: another placement is building there, or an interrupted one left a folder
-    # (each placement reports those as leftovers). Neither is this placement's error.
-    with contextlib.suppress(OSError):
+def _moved(moving: dict[str, tuple[int, int]], target: Path) -> bool:
+    """Whether the folder this placement was renaming is at ``target`` now."""
+    mine = moving.get("folder")
+    return mine is not None and _placed_anyway(target, mine)
+
+
+def _note_placed(exc: BaseException, placed: Placed, residue: list[str]) -> None:
+    text = f"the project was placed at {placed.folder}" + (
+        f"; left in the library: {'; '.join(residue)}" if residue else ""
+    )
+    with_residue(exc, "; ".join(residue), text)
+
+
+def _remove_root(root: Path) -> str | None:
+    """Remove the staging folder when it is empty. Not empty is no one's error (another
+    placement is building there, or a killed one left a folder each placement reports); an
+    empty one that cannot be removed is named."""
+    if _is_link(root):
+        return None
+    try:
         root.rmdir()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno in (errno.ENOTEMPTY, errno.EEXIST) or getattr(exc, "winerror", 0) == 145:
+            return None
+        return f"{root} (the staging folder, empty) could not be removed ({exc})"
+    return None
 
 
-def _cleanup(work: Path | None, lock: Path, root: Path) -> tuple[list[str], BaseException | None]:
-    """Remove the build folder, then the lock, then the staging folder if it is empty. Returns
-    what is left and an interrupt that landed meanwhile."""
+def _cleanup(work: Path | None, claim: _Lock, root: Path) -> tuple[list[str], BaseException | None]:
+    """Remove the build folder, then this placement's lock, then the staging folder if it is
+    empty. Returns what is left and an interrupt that landed meanwhile. A lock this placement
+    may have made but cannot be sure of (:func:`_lock_left`) is named, never removed."""
     residue: list[str] = []
     interrupt: BaseException | None = None
-    for path in (work, lock):
-        if path is None:
-            continue
+
+    def attempt(path: Path, step: Callable[[], str | None]) -> None:
+        nonlocal interrupt
         try:
-            problem = _remove(path)
+            problem = step()
         except BaseException as exc:  # an interrupt (or anything else): name what is left
-            problem = f"{path} was not removed ({type(exc).__name__}: {exc})"
+            problem = (
+                f"{path} was not removed ({type(exc).__name__}: {exc})"
+                if os.path.lexists(path)
+                else None
+            )
             if not isinstance(exc, Exception):
                 interrupt = interrupt or exc
         if problem is not None:
             residue.append(problem)
-    if not residue:
-        _remove_root(root)
+
+    if work is not None:
+        attempt(work, lambda: _remove(work))
+
+    def lock_step() -> str | None:
+        left = _lock_left(claim)
+        if left == "mine":
+            return _remove(claim.path)
+        if left == "maybe":
+            return (
+                f"{claim.path} (an empty lock this export may have made; delete it when no "
+                "export is running)"
+            )
+        return None
+
+    attempt(claim.path, lock_step)
+    if not residue:  # else the staging folder holds what is named (each path is inside it)
+        attempt(root, lambda: _remove_root(root))
     return residue, interrupt
 
 
@@ -543,6 +671,7 @@ def _build_and_rename(
     name: str,
     build: Callable[[Path], _T],
     placed: Placed,
+    moving: dict[str, tuple[int, int]],
 ) -> _T:
     if os.stat(work).st_dev != os.stat(projects).st_dev:
         raise _refuse(
@@ -572,6 +701,7 @@ def _build_and_rename(
         )
     target = projects / name
     mine = _identity(folder)
+    moving["folder"] = mine
     try:
         _move(folder, target)
     except OSError as exc:

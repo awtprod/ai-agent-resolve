@@ -1,31 +1,41 @@
-"""An independent read of a written project: does every item hold what its layout asks for?
+"""An independent read of a written project: is everything in the file what the writer meant?
 
 :func:`verify_written` runs on the staged file after the writer's own read-back
 (:func:`aar.drp.libwrite.check.check_written`) and before anything is placed. It does not use
 the code that wrote the rows (:func:`aar.drp.items.author_item`,
 :func:`aar.drp.items.media_view`, :func:`aar.drp.libwrite.cut.author_cut`,
-:func:`aar.drp.libwrite.write.sequence_length`): from the layout (the :class:`Cut` entries the
-caller authored the items from) and from each media clip's own rows *as written*, decoded here
-with the shared blob decoders only, it recomputes what every item and the sequence must hold, by
-the field map of docs/DESIGN.md ("Timeline items (S25c2)"), and compares it with the rows read
-back from the file:
+:func:`aar.drp.libwrite.write.sequence_length`, :mod:`aar.drp.mediapool`'s authoring): from the
+layout (the :class:`Cut` entries the caller authored the items from), from each media clip's own
+rows *as written* (decoded here with the shared blob decoders only) and from the seed's own rows
+(:attr:`Seed.digests`, taken when the seed was read), it recomputes what the file must hold, by
+the field map of docs/DESIGN.md ("Timeline items (S25c2)"), and compares it with every row read
+back:
 
-* per item: its type and track, its place in the track's ``Items`` vector (record order, dense
-  from 0), its record range (``Start``, ``Duration``), its source in (``In``), the media clip it
-  plays (``MediaRef``), and that clip's file path, start time, time map, frame rate, stream
-  index and channels (``MediaFilePath``, ``MediaStartTime``, ``MediaTimemapBA``,
-  ``MediaFrameRate``, ``MediaTrackIdx``, ``VirtualAudioTrackBA``);
-* its links: the other half of the same layout entry (a picture and its sound name each other)
-  and nothing else; an entry with one half has no links;
-* that the timeline holds those items and no others, and the sequence's ``MediaExtents``: the
-  seed's start, and the end of the last item over the rate minus the start.
+* every column of every item (:data:`ITEM_RULES`, one rule per column of the writer's closed
+  list :data:`aar.drp.items.rows.ITEM_COLUMNS`; a column outside it must be empty): recomputed
+  from the layout and the clip's rows (type, track, place in the track's ``Items`` vector,
+  ``Start``, ``Duration``, ``In``, ``Name``, ``MediaRef`` and the clip's file path, start time,
+  time map, frame rate, stream index and channels; ``FieldsBlob`` byte for byte: the link to
+  the other half of its layout entry and nothing else), empty as on an item Resolve has just
+  made (a grade, Fusion, effects, markers, import metadata, item metadata), or a stated
+  constant (every plain item of the corpus holds it);
+* every media clip the writer adds: one media row, its picture info and its sound infos (each
+  naming this clip, joined in order, as many as were authored), its one bin entry, and every
+  ``Clip`` blob naming the same folder and file (the media's name);
+* every other row of every table: what the seed held, with the project's new id, its name, the
+  timeline's name (renamed or kept) and the sequence's ``MediaExtents`` (the seed's start, and
+  the end of the last item over the rate minus the start) where the writer changes them, plus
+  exactly the authored media rows; the same tables and columns as the seed, the same number of
+  rows per table as the seed had plus what was added.
 
-A difference is ``self_check_failed`` naming the field and the item.
+A difference is ``self_check_failed`` naming the field and the item or table.
 """
 
 from __future__ import annotations
 
+import re
 import struct
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from fractions import Fraction
@@ -33,13 +43,22 @@ from pathlib import Path
 from typing import Any
 
 from aar.drp import blobs
+from aar.drp.items.rows import ITEM_COLUMNS
 from aar.drp.library import LibraryOptions, read_rows
 from aar.drp.libwrite.cut import Cut
 from aar.drp.libwrite.errors import ProjectWriteError, refusing
-from aar.drp.libwrite.seed import Seed
+from aar.drp.libwrite.seed import (
+    REPLACED_TABLES,
+    WRITER_CELLS,
+    Seed,
+    row_digest,
+    table_names,
+)
+from aar.drp.mediapool.templates import MEDIA_TABLES, ClipRows
+from aar.drp.modify import encode
 from aar.media.probe import timecode_frames
 
-__all__ = ["Expected", "expected_items", "verify_written"]
+__all__ = ["ITEM_RULES", "Expected", "expected_items", "verify_written"]
 
 _HINT = "this is a writer bug: the project was not placed; report the seed and the plan"
 _TABLES = (
@@ -53,6 +72,83 @@ _TABLES = (
 )
 _TYPES = {"picture": "Sm2TiVideoClip", "sound": "Sm2TiAudioClip"}
 _MAX_OUT = 1024 * 1024
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+
+#: An item column recomputed from the layout and the clip's rows (in :func:`_derived`).
+DERIVED = "derived"
+#: An item column a later edit fills in (a grade, Fusion, effects, import metadata, markers,
+#: item metadata): empty on an item Resolve has just made, and on every item written.
+FRESH = "fresh"
+#: ``FieldsBlob`` #2 of every plain picture item of the corpus (475 of 475), and the other
+#: constants of an item's ``FieldsBlob``: ``#1.#4`` (all 667) and a sound's ``#15`` (192).
+PICTURE_TAIL = bytes.fromhex("000000000000000600000000ffffffff")
+_FIELDS_ONE_FOUR = 1
+_SOUND_TAIL = 4
+#: ``PreConformMediaExtents`` of every picture item of the corpus (4,434 of 4,434).
+PICTURE_PRECONFORM = bytes.fromhex("00000100000030c20000010000003042")
+#: What the verifier requires of each column of an item: :data:`DERIVED`, :data:`FRESH`, or a
+#: constant (``("constant", value)``, the value every plain item of the corpus holds). One
+#: entry per column of :data:`aar.drp.items.rows.ITEM_COLUMNS` (a test pins that).
+ITEM_RULES: dict[str, object] = {
+    "Sm2TiItem_id": DERIVED,
+    "DbType": DERIVED,
+    "Name": DERIVED,
+    "Start": DERIVED,
+    "Duration": DERIVED,
+    "In": DERIVED,
+    "MediaRef": DERIVED,
+    "MediaStartTime": DERIVED,
+    "MediaFilePath": DERIVED,
+    "MediaTimemapBA": DERIVED,
+    "MediaTrackIdx": DERIVED,
+    "MediaFrameRate": DERIVED,
+    "Sm2TiTrack_id": DERIVED,
+    "VirtualAudioTrackBA": DERIVED,
+    "PreConformMediaExtents": DERIVED,
+    "FieldsBlob": DERIVED,
+    "pLmVerTable": FRESH,
+    "CompositionTable": FRESH,
+    "EffectFiltersBA": FRESH,
+    "ImportExportMetadataBA": FRESH,
+    "MarkersBA": FRESH,
+    "MediaMetadata": FRESH,
+    "Track": ("constant", None),
+    "LinkedItemSync": ("constant", None),
+    "UiMemento": ("constant", 0),
+    "Flags": ("constant", 0),
+    "PriorityIndex": ("constant", 0),
+    "MediaReelNumber": ("constant", None),
+    "Group": ("constant", None),
+    "pAuxLmVerTable": ("constant", None),
+    "Thumbnail": ("constant", None),
+    "ThumbnailDirtyFlag": ("constant", 1),
+    "RenderTextEnabled": ("constant", 1),
+    "RenderTextGanged": ("constant", 1),
+    "RenderTextPrefixed": ("constant", 1),
+    "TextRenderItemVec": ("constant", None),
+    "LastChangedTime": ("constant", 0),
+    "LastRenderedTime": ("constant", 0),
+    "IsMarkedForCaching": ("constant", 0),
+    "IsForceConformed": ("constant", 1),
+    "MatchConflictState": ("constant", 0),
+    "PrettyType": ("constant", None),
+    "Resolution": ("constant", None),
+    "IsPreConformed": ("constant", 0),
+    "MixedFrameRateAlignment": ("constant", 0.0),
+    "UseOppositeSrcForLeftEye": ("constant", 0),
+    "UseOppositeSrcForRightEye": ("constant", 0),
+    "WasDisbanded": ("constant", 0),
+    "CurrentSelectorIdx": ("constant", 0),
+    "AlignmentType": ("constant", None),
+    "Position": ("constant", None),
+    "RenderCacheBA": ("constant", None),
+    "ClipGroup": ("constant", None),
+    "BlobLockSysId": ("constant", ""),
+    "OriginalClip": ("constant", None),
+    "Sm2TiItem_Owner_id": ("constant", None),
+    "CompTableLockSysId": ("constant", ""),
+    "VersionTableLockSysId": ("constant", ""),
+}
 
 
 @dataclass(frozen=True)
@@ -152,8 +248,15 @@ def _media(media_id: str, tables: dict[str, list[dict[str, Any]]]) -> _Media:
     audios = [
         audio_by_id[r.get("DbAssociate")] for r in links if r.get("DbAssociate") in audio_by_id
     ]
-    if len(audios) != len(links) or len(videos) > 1 or (not videos and not audios):
-        raise _fail(f"the media clip {media_id} does not have its video and audio rows")
+    if len(videos) > 1:
+        raise _fail(
+            f"the media clip {media_id} has {len(videos)} picture infos", field="BtVideoInfo"
+        )
+    if len(audios) != len(links) or (not videos and not audios):
+        raise _fail(
+            f"the media clip {media_id} does not have its video and audio rows",
+            field="BtAudioInfo_Sm2MpMedia",
+        )
     first_track: dict[str, Any] | None = None
     if audios:
         tracks = _keyed(audios[0].get("TracksBA"), "the clip's TracksBA")
@@ -240,15 +343,24 @@ def _text_frames(value: object) -> int | None:
 
 
 @refusing("self_check_failed", "verifying the written project against its layout", _HINT)
-def verify_written(path: Path, seed: Seed, cuts: Sequence[Cut]) -> int:
+def verify_written(
+    path: Path,
+    seed: Seed,
+    cuts: Sequence[Cut],
+    *,
+    clips: Sequence[ClipRows] = (),
+    project_name: str,
+    timeline_name: str | None,
+) -> int:
     """Check the project written at ``path`` from ``seed`` holds exactly the items ``cuts``
-    asks for (see the module docstring); returns how many items it checked, or raises
+    asks for, the media clips ``clips`` the writer added, the project named ``project_name``
+    and the timeline named ``timeline_name`` (None: the seed's), and otherwise the seed's rows
+    (see the module docstring); returns how many items it checked, or raises
     ``self_check_failed`` naming the first difference."""
-    lib = read_rows(path, _TABLES, options=LibraryOptions(settle_seconds=0.0))
-    tables = {
-        t: [dict(zip(lib.columns[t], values, strict=True)) for values in lib.rows[t]]
-        for t in _TABLES
-    }
+    unruled = sorted(set(ITEM_COLUMNS) ^ set(ITEM_RULES))
+    if unruled:
+        raise _fail(f"the verifier has no rule for item columns {unruled[:4]}", field="rules")
+    tables = _read_all(path, seed)
     want = expected_items(cuts)
     rate = float(seed.rate)
     tracks = {"picture": seed.video_track, "sound": seed.audio_track}
@@ -263,6 +375,7 @@ def verify_written(path: Path, seed: Seed, cuts: Sequence[Cut]) -> int:
             field="items",
         )
     written: dict[tuple[str, int], dict[str, Any]] = {}  # (kind, record start) -> item
+    medias: dict[str, _Media] = {}
     for kind, track in tracks.items():
         mine = [r for r in items if r.get("Sm2TiTrack_id") == track]
         expected = sorted((e for e in want if e.kind == kind), key=lambda e: e.record_in)
@@ -290,7 +403,8 @@ def verify_written(path: Path, seed: Seed, cuts: Sequence[Cut]) -> int:
             _same(where, "Duration", row.get("Duration"), str(exp.duration))
             _same(where, "In", row.get("In"), str(exp.src_in) if exp.src_in else None)
             _same(where, "MediaRef", row.get("MediaRef"), exp.media_id)
-            media = _media(exp.media_id, tables)
+            media = medias.get(exp.media_id) or _media(exp.media_id, tables)
+            medias[exp.media_id] = media
             _same(where, "MediaFilePath", row.get("MediaFilePath"), media.path)
             _same(where, "MediaFrameRate", row.get("MediaFrameRate"), media.rate_bytes)
             _same(where, "MediaTimemapBA", row.get("MediaTimemapBA"), media.timemap)
@@ -309,6 +423,7 @@ def verify_written(path: Path, seed: Seed, cuts: Sequence[Cut]) -> int:
     by_group: dict[int, list[Expected]] = {}
     for e in want:
         by_group.setdefault(e.group, []).append(e)
+    ids: set[object] = set()
     for exp in want:
         row = written[(exp.kind, exp.record_in)]
         others = [
@@ -324,8 +439,327 @@ def verify_written(path: Path, seed: Seed, cuts: Sequence[Cut]) -> int:
                 "of its layout entry) and nothing else",
                 field="FieldsBlob #1.#1.#1",
             )
+        item_id = row.get("Sm2TiItem_id")
+        if (
+            not isinstance(item_id, str)
+            or not _UUID.match(item_id)
+            or item_id in seed.taken
+            or item_id in ids
+        ):
+            raise _fail(f"{where} has the id {item_id!r}, not a fresh one", field="Sm2TiItem_id")
+        ids.add(item_id)
+        derived = _derived(exp, row, medias[exp.media_id], tables, tracks, others)
+        _check_columns(where, row, derived)
+    _check_clips(seed, tables, clips, cuts)
+    _check_rows(seed, tables, clips, project_name=project_name, timeline_name=timeline_name)
     _check_extents(seed, tables, want, rate)
     return len(want)
+
+
+def _read_all(path: Path, seed: Seed) -> dict[str, list[dict[str, Any]]]:
+    """Every row of every table of the written file, which must have the seed's tables and
+    columns."""
+    try:
+        names = table_names(path)
+    except ProjectWriteError as exc:
+        raise _fail(f"the written project's tables cannot be listed: {exc.message}") from None
+    if sorted(names) != sorted(seed.columns):
+        extra = sorted(set(names) - set(seed.columns))
+        gone = sorted(set(seed.columns) - set(names))
+        raise _fail(
+            f"the written project's tables differ from the seed's (added {extra[:4]}, "
+            f"gone {gone[:4]})",
+            field="tables",
+        )
+    lib = read_rows(path, tuple(sorted(names)), options=LibraryOptions(settle_seconds=0.0))
+    for table in names:
+        if tuple(lib.columns[table]) != tuple(seed.columns[table]):
+            raise _fail(f"the written {table} table has other columns than the seed's", field=table)
+    return {
+        t: [dict(zip(lib.columns[t], values, strict=True)) for values in lib.rows[t]] for t in names
+    }
+
+
+def _derived(
+    exp: Expected,
+    row: dict[str, Any],
+    media: _Media,
+    tables: dict[str, list[dict[str, Any]]],
+    tracks: dict[str, str],
+    partners: list[str],
+) -> dict[str, object]:
+    """The value of every :data:`DERIVED` column of the item ``exp`` asks for."""
+    names = [r.get("Name") for r in tables["Sm2MpMedia"] if r.get("Sm2MpMedia_id") == exp.media_id]
+    picture = exp.kind == "picture"
+    return {
+        "Sm2TiItem_id": row.get("Sm2TiItem_id"),  # its freshness is checked on its own
+        "DbType": _TYPES[exp.kind],
+        "Name": names[0] if len(names) == 1 else None,
+        "Start": row.get("Start"),  # checked against the layout above
+        "Duration": str(exp.duration),
+        "In": str(exp.src_in) if exp.src_in else None,
+        "MediaRef": exp.media_id,
+        "MediaStartTime": media.start,
+        "MediaFilePath": media.path,
+        "MediaTimemapBA": media.timemap,
+        "MediaTrackIdx": None if picture else 0,
+        "MediaFrameRate": media.rate_bytes,
+        "Sm2TiTrack_id": tracks[exp.kind],
+        "VirtualAudioTrackBA": None if picture else _virtual_audio(media.channels),
+        "PreConformMediaExtents": PICTURE_PRECONFORM if picture else None,
+        "FieldsBlob": _fields_blob(exp.kind, partners),
+    }
+
+
+def _virtual_audio(channels: int | None) -> bytes:
+    """A sound item's ``VirtualAudioTrackBA`` (every plain sound item of the corpus): its
+    channels' ids ``0x4001``.. after a 2 and the count, then ``AudioType`` 1 for mono, 0 for
+    stereo."""
+    if channels not in (1, 2):
+        raise _fail(f"a sound item plays a clip of {channels} channel(s)", field="channels")
+    ids = b"".join(struct.pack(">I", 0x4001 + i) for i in range(channels))
+    return encode.keyed_dict(
+        [
+            ("ChannelsBA", blobs.KD_BYTES, 0, struct.pack(">II", 2, channels) + ids),
+            ("AudioType", blobs.KD_INT32, 0, 1 if channels == 1 else 0),
+        ]
+    )
+
+
+def _fields_blob(kind: str, partners: list[str]) -> bytes:
+    """An item's whole ``FieldsBlob``: ``#1`` holding the link list (keys ``0``.., highest
+    first) when the item is linked and ``#4`` = 1, then a picture's ``#2`` or a sound's ``#15``
+    constant; framed as Resolve frames a message of its length (version 2, plain protobuf up to
+    64 bytes, else a raw zstd frame)."""
+    inner: list[tuple[int, int, int | bytes]] = []
+    if partners:
+        entries = [(str(i), blobs.KD_STRING, 0, p) for i, p in enumerate(partners)]
+        inner.append((1, 2, encode.protobuf([(1, 2, encode.keyed_dict(entries[::-1]))])))
+    inner.append((4, 0, _FIELDS_ONE_FOUR))
+    tail: tuple[int, int, int | bytes] = (
+        (2, 2, PICTURE_TAIL) if kind == "picture" else (15, 0, _SOUND_TAIL)
+    )
+    payload = encode.protobuf([(1, 2, encode.protobuf(inner)), tail])
+    if len(payload) <= 64:
+        body = bytes([blobs.CODEC_PROTOBUF]) + payload
+    else:
+        body = bytes([blobs.CODEC_ZSTD]) + encode.zstd_raw_frame(payload)
+    return struct.pack(">II", 2, len(body)) + body
+
+
+def _check_columns(where: str, row: dict[str, Any], derived: dict[str, object]) -> None:
+    """Every column of the item against its rule (:data:`ITEM_RULES`); a column outside the
+    closed list must be empty."""
+    for column, value in row.items():
+        rule = ITEM_RULES.get(column)
+        if rule is None:
+            if value is not None:
+                raise _fail(f"{where} holds {column} {value!r}; it must be empty", field=column)
+            continue
+        if rule == DERIVED:
+            want = derived[column]
+        elif rule == FRESH:
+            want = None
+        else:
+            assert isinstance(rule, tuple)
+            want = rule[1]
+        if not _equal(value, want):
+            shown = value if not isinstance(value, bytes) else f"{len(value)} bytes"
+            raise _fail(
+                f"{where} holds {column} {shown!r}; "
+                + (
+                    "it must be empty, as on an item Resolve has just made"
+                    if rule == FRESH
+                    else f"it must hold {want if not isinstance(want, bytes) else want.hex()!r}"
+                ),
+                field=column,
+            )
+
+
+def _equal(got: object, want: object) -> bool:
+    if type(got) is not type(want):
+        return False
+    if isinstance(got, float) and isinstance(want, float):
+        return struct.pack("<d", got) == struct.pack("<d", want)
+    return got == want
+
+
+def _clip_text(row: dict[str, Any], what: str) -> tuple[bytes, bytes]:
+    fields = _message(row.get("Clip"), what)
+    folder, name = _one(fields, 1, what).value, _one(fields, 2, what).value
+    if not isinstance(folder, bytes) or not isinstance(name, bytes):
+        raise _fail(f"{what}'s folder or file name is not text", field="Clip")
+    return folder, name
+
+
+def _check_clips(
+    seed: Seed,
+    tables: dict[str, list[dict[str, Any]]],
+    clips: Sequence[ClipRows],
+    cuts: Sequence[Cut],
+) -> None:
+    """Each media clip the writer added, as written: one media row of a file clip, its picture
+    info (one for a picture file, none for a sound file) and its sound infos (each naming this
+    clip, joined in ``EmbeddedAudioVec`` order from 0, as many as were authored), its one entry
+    in the seed's bin, its lockable blobs and presets as many as were authored, and every
+    ``Clip`` blob naming the same folder and file, the media's name. A cut may play only a
+    clip of the seed or one added."""
+    known = {c.media_id for c in seed.clips} | {c.media_id for c in clips}
+    for cut in cuts:
+        if cut.clip.media_id not in known:
+            raise _fail(
+                f"the cut plays the media clip {cut.clip.media_id}, neither the seed's nor added",
+                field="MediaRef",
+            )
+    for clip in clips:
+        mid = clip.media_id
+        what = f"the added media clip {mid}"
+        medias = [r for r in tables["Sm2MpMedia"] if r.get("Sm2MpMedia_id") == mid]
+        if len(medias) != 1:
+            raise _fail(f"{what} has {len(medias)} media rows", field="Sm2MpMedia")
+        media = medias[0]
+        picture = media.get("DbType") == "Sm2MpVideoClip"
+        if media.get("DbType") not in ("Sm2MpVideoClip", "Sm2MpAudioClip"):
+            raise _fail(f"{what} is a {media.get('DbType')!r}", field="DbType")
+        videos = [r for r in tables["BtVideoInfo"] if r.get("Sm2MpMedia_id") == mid]
+        if len(videos) != (1 if picture else 0) or len(videos) != (clip.video is not None):
+            raise _fail(f"{what} has {len(videos)} picture infos", field="BtVideoInfo")
+        if media.get("Video") != (videos[0].get("BtVideoInfo_id") if videos else None):
+            raise _fail(f"{what}'s Video does not name its picture info", field="Video")
+        audios = {
+            r.get("BtAudioInfo_id"): r
+            for r in tables["BtAudioInfo"]
+            if r.get("Sm2MpMedia_id") == mid
+        }
+        links = [r for r in tables["BtAudioInfo_Sm2MpMedia"] if r.get("DbOwner") == mid]
+        order = sorted(r.get("DbIndex") for r in links if isinstance(r.get("DbIndex"), int))
+        named = [r.get("DbAssociate") for r in links]
+        if (
+            len(links) != len(clip.audio)
+            or len(audios) != len(clip.audio)
+            or order != list(range(len(links)))
+            or sorted(map(str, named)) != sorted(map(str, audios))
+            or len(set(named)) != len(named)
+            or any(r.get("DbPropertyName") != "EmbeddedAudioVec" for r in links)
+        ):
+            raise _fail(
+                f"{what} has {len(audios)} sound infos and {len(links)} sound joins "
+                f"(DbIndex {order}); it was authored with {len(clip.audio)}",
+                field="BtAudioInfo_Sm2MpMedia",
+            )
+        bins = [r for r in tables["Sm2MpFolder_Sm2MpMedia"] if r.get("DbAssociate") == mid]
+        if (
+            len(bins) != 1
+            or bins[0].get("DbOwner") != seed.folder_id
+            or bins[0].get("DbPropertyName") != "MediaVec"
+            or media.get("Sm2MpFolder_id") != seed.folder_id
+        ):
+            raise _fail(f"{what} is not in the seed's bin once", field="Sm2MpFolder_Sm2MpMedia")
+        owned = {mid, *map(str, audios)} | ({str(videos[0]["BtVideoInfo_id"])} if videos else set())
+        lockables = [r for r in tables["BtLockableBlob"] if r.get("BlobOwner") in owned]
+        presets = [r for r in tables["SmPreset"] if r.get("Sm2MpMedia_id") == mid]
+        if len(lockables) != len(clip.lockables) or len(presets) != len(clip.presets):
+            raise _fail(f"{what} has other metadata or preset rows than authored", field=what)
+        files = {_clip_text(r, f"{what}'s picture Clip") for r in videos}
+        files |= {_clip_text(r, f"{what}'s sound Clip") for r in audios.values()}
+        if len(files) != 1:
+            shown = sorted(
+                f"{a.decode(errors='replace')}\\{b.decode(errors='replace')}" for a, b in files
+            )
+            raise _fail(
+                f"{what}'s Clip blobs name {len(files)} files: {'; '.join(shown)}", field="Clip"
+            )
+        ((_, file_name),) = files
+        if media.get("Name") != file_name.decode("utf-8", "replace"):
+            raise _fail(f"{what} is named {media.get('Name')!r}, not its file's name", field="Name")
+    folder = sorted(
+        r.get("DbIndex")
+        for r in tables["Sm2MpFolder_Sm2MpMedia"]
+        if r.get("DbOwner") == seed.folder_id and r.get("DbPropertyName") == "MediaVec"
+    )
+    if clips and folder != list(range(len(folder))):
+        raise _fail(f"the bin's media are not in order from 0 ({folder[:8]}...)", field="DbIndex")
+
+
+def _check_rows(
+    seed: Seed,
+    tables: dict[str, list[dict[str, Any]]],
+    clips: Sequence[ClipRows],
+    *,
+    project_name: str,
+    timeline_name: str | None,
+) -> None:
+    """Every row of every table but the items': the seed's, but for the cells the writer
+    changes (each checked here or in :func:`_check_extents`), plus exactly the added clips'
+    rows."""
+    projects = tables["SM_Project"]
+    new_id = projects[0].get("SM_Project_id") if len(projects) == 1 else None
+    if (
+        not isinstance(new_id, str)
+        or not _UUID.match(new_id)
+        or new_id == seed.project_id
+        or new_id in seed.taken
+    ):
+        raise _fail(f"the project's id {new_id!r} is not a fresh one", field="SM_Project_id")
+    renamed = timeline_name is not None and timeline_name != seed.timeline_name
+    ids: dict[str, str | None] = {
+        "project_id": new_id,
+        "timeline_id": seed.timeline_id,
+        "timeline_clip_id": seed.timeline_clip_id,
+        "sequence_id": seed.sequence_id,
+    }
+    wanted: dict[str, object] = {
+        "SM_Project.ProjectName": project_name,
+        "Sm2Timeline.Name": timeline_name if renamed else seed.cells.get("Sm2Timeline.Name"),
+        "Sm2MpMedia.Name": timeline_name if renamed else seed.cells.get("Sm2MpMedia.Name"),
+    }
+    masks: dict[str, tuple[str, str, str]] = {}
+    for table, id_column, attribute, column in WRITER_CELLS:
+        value = ids[attribute]
+        if value is None:
+            continue
+        masks[table] = (id_column, value, column)
+        found = [r for r in tables[table] if r.get(id_column) == value]
+        if len(found) != 1:
+            raise _fail(f"the written {table} has {len(found)} rows of id {value}", field=table)
+        key = f"{table}.{column}"
+        if key in wanted and not _equal(found[0].get(column), wanted[key]):
+            raise _fail(
+                f"the written {key} is {found[0].get(column)!r}; it must be {wanted[key]!r}",
+                field=key,
+            )
+    added: dict[str, Counter[str]] = {t: Counter() for t in MEDIA_TABLES}
+    for clip in clips:
+        for table, rows in clip.tables().items():
+            columns = seed.columns.get(table, ())
+            for row in rows:
+                full = {c: row.get(c) for c in columns}
+                added[table][row_digest(full, project_id=new_id)] += 1
+    for table, rows in tables.items():
+        if table in REPLACED_TABLES:
+            continue
+        mask = masks.get(table)
+        got: Counter[str] = Counter()
+        for row in rows:
+            masked = (mask[2],) if mask is not None and row.get(mask[0]) == mask[1] else ()
+            got[row_digest(row, project_id=new_id, masked=masked)] += 1
+        had = Counter(seed.digests.get(table, {}))
+        gone = had - got
+        if gone:
+            raise _fail(
+                f"{sum(gone.values())} row(s) of the seed's {table} are changed or gone",
+                field=table,
+            )
+        extra = got - had
+        intended = added.get(table, Counter())
+        if extra != intended:
+            raise _fail(
+                f"the written {table} holds {len(rows)} rows: the seed's "
+                f"{sum(had.values())} and {sum(extra.values())} more, of which "
+                f"{sum((extra - intended).values())} the writer did not add (it added "
+                f"{sum(intended.values())})",
+                field=table,
+            )
 
 
 def _same(where: str, field: str, got: object, want: object) -> None:

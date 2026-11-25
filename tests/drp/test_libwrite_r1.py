@@ -662,7 +662,7 @@ def test_the_no_replace_rename_refuses_a_folder_the_check_missed(
     """The move's own guarantee on Linux: a folder of the name that appeared after every check
     (here: one the check does not see), even an empty one, which a plain rename replaces,
     stays as it is."""
-    if place._NOREPLACE is None:
+    if place._renameat2() is None:
         pytest.skip("this C library has no renameat2")
     ours, theirs = tmp_path / "ours", tmp_path / "theirs"
     ours.mkdir()
@@ -681,7 +681,7 @@ def test_a_move_refused_as_not_empty_is_project_exists(
 ) -> None:
     """A system without a no-replace rename: the rename meets a folder that is not empty."""
     library = make_library(tmp_path / "lib")
-    monkeypatch.setattr(place, "_NOREPLACE", None)
+    monkeypatch.setattr(place, "_renameat2", lambda: None)
 
     def rename(src: Any, dst: Any) -> None:
         raise OSError(errno.ENOTEMPTY, "Directory not empty", str(dst))

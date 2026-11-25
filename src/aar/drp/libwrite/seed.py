@@ -15,8 +15,11 @@ typed :class:`ProjectWriteError` (``bad_seed``).
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
+from collections import Counter
+from collections.abc import Collection
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -37,7 +40,15 @@ from aar.drp.mediapool.templates import (
 )
 from aar.media.probe import STANDARD_RATES, snap_rate
 
-__all__ = ["SEED_VERSIONS", "Seed", "read_seed"]
+__all__ = [
+    "REPLACED_TABLES",
+    "SEED_VERSIONS",
+    "WRITER_CELLS",
+    "Seed",
+    "read_seed",
+    "row_digest",
+    "table_names",
+]
 
 #: Project versions a seed may have: the version the media-pool and item gates were run on.
 SEED_VERSIONS = frozenset({17})
@@ -90,6 +101,78 @@ RESOLVE_TRIGGERS = frozenset(
 )
 
 
+#: The cells of a seed row the writer may change, each checked on its own by the verifier
+#: (:func:`aar.drp.libwrite.verify.verify_written`): ``(table, id column, the Seed attribute
+#: holding the row's id, column)``. Every other cell of every row of the seed's other tables
+#: must come out of the writer as it went in (but for the project id, :func:`row_digest`).
+WRITER_CELLS = (
+    ("SM_Project", "SM_Project_id", "project_id", "ProjectName"),
+    ("Sm2Timeline", "Sm2Timeline_id", "timeline_id", "Name"),
+    ("Sm2MpMedia", "Sm2MpMedia_id", "timeline_clip_id", "Name"),
+    ("Sm2Sequence", "Sm2Sequence_id", "sequence_id", "MediaExtents"),
+)
+#: The tables whose seed rows the writer removes and writes anew (the timeline's items and
+#: their join rows): the verifier checks every row of them against the layout instead.
+REPLACED_TABLES = ("Sm2TiItem", "Sm2TiItem_Sm2TiTrack")
+_MASKED = "\x00writer cell"
+_PROJECT = "\x00project id"
+
+
+@refusing("bad_input", "digesting a row", "this is a writer bug; report it")
+def row_digest(row: dict[str, Any], *, project_id: str, masked: Collection[str] = ()) -> str:
+    """A digest of every column and value of ``row`` (type and value; a double by its bits),
+    with a text equal to ``project_id`` and the ``masked`` columns standing for themselves, so
+    the seed's row and the written one digest alike when nothing else changed."""
+    h = hashlib.sha256()
+    for column in sorted(row):
+        value = row[column]
+        if column in masked:
+            value = _MASKED
+        elif isinstance(value, str) and value == project_id:
+            value = _PROJECT
+        if isinstance(value, float):
+            value = value.hex()
+            kind = "float"
+        else:
+            kind = type(value).__name__
+        h.update(repr((column, kind, value)).encode("utf-8", "backslashreplace"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def _masks(seed_ids: dict[str, str | None]) -> dict[str, tuple[str, str, str]]:
+    """``table -> (id column, id, masked column)`` of :data:`WRITER_CELLS` for these ids."""
+    out: dict[str, tuple[str, str, str]] = {}
+    for table, id_column, attribute, column in WRITER_CELLS:
+        value = seed_ids.get(attribute)
+        if value is not None:
+            out[table] = (id_column, value, column)
+    return out
+
+
+def fingerprint(
+    tables: dict[str, list[dict[str, Any]]], *, project_id: str, ids: dict[str, str | None]
+) -> tuple[dict[str, dict[str, int]], dict[str, object]]:
+    """Per table (but :data:`REPLACED_TABLES`), how many rows of each :func:`row_digest` it
+    holds; and the values of the :data:`WRITER_CELLS` (``"table.column"``)."""
+    masks = _masks(ids)
+    digests: dict[str, dict[str, int]] = {}
+    cells: dict[str, object] = {}
+    for table, rows in tables.items():
+        if table in REPLACED_TABLES:
+            continue
+        mask = masks.get(table)
+        counted: Counter[str] = Counter()
+        for row in rows:
+            masked: tuple[str, ...] = ()
+            if mask is not None and row.get(mask[0]) == mask[1]:
+                masked = (mask[2],)
+                cells[f"{table}.{mask[2]}"] = row.get(mask[2])
+            counted[row_digest(row, project_id=project_id, masked=masked)] += 1
+        digests[table] = dict(counted)
+    return digests, cells
+
+
 @dataclass(frozen=True)
 class Seed:
     path: Path
@@ -125,10 +208,20 @@ class Seed:
     columns: dict[str, tuple[str, ...]]
     #: The seed's own media file clips (templates too).
     clips: tuple[ClipRows, ...]
+    #: Per table (but :data:`REPLACED_TABLES`): how many rows of each :func:`row_digest`.
+    digests: dict[str, dict[str, int]]
+    #: The seed's values of the :data:`WRITER_CELLS`, by ``"table.column"``.
+    cells: dict[str, object]
 
 
 def _bad(message: str, hint: str = _HINT, **details: Any) -> ProjectWriteError:
     return ProjectWriteError("bad_seed", message, hint, **details)
+
+
+@refusing("bad_seed", "listing the tables", _HINT)
+def table_names(path: Path) -> list[str]:
+    """The ordinary tables of ``path`` (see :func:`_tables`)."""
+    return _tables(path)
 
 
 def _tables(path: Path) -> list[str]:
@@ -365,6 +458,18 @@ def _read_seed(p: Path, opts: LibraryOptions) -> Seed:
         folder_id = str(_one(roots, "root bins").get("Sm2MpFolder_id"))
     in_folder = [r for r in tables["Sm2MpFolder_Sm2MpMedia"] if r.get("DbOwner") == folder_id]
     maps = tables["BtLockableBlobMap"]
+    project_id = str(project.get("SM_Project_id"))
+    timeline_clip_id = str(clip_id) if timeline_clip else None
+    digests, cells = fingerprint(
+        tables,
+        project_id=project_id,
+        ids={
+            "project_id": project_id,
+            "timeline_id": timeline_id,
+            "timeline_clip_id": timeline_clip_id,
+            "sequence_id": str(sequence["Sm2Sequence_id"]),
+        },
+    )
     taken: set[str] = set()
     for rows_ in tables.values():
         for row in rows_:
@@ -373,11 +478,11 @@ def _read_seed(p: Path, opts: LibraryOptions) -> Seed:
     return Seed(
         path=p,
         version=first.project_version,
-        project_id=str(project.get("SM_Project_id")),
+        project_id=project_id,
         project_name=str(project.get("ProjectName") or ""),
         timeline_id=timeline_id,
         timeline_name=str(timeline.get("Name") or ""),
-        timeline_clip_id=str(clip_id) if timeline_clip else None,
+        timeline_clip_id=timeline_clip_id,
         sequence_id=str(sequence["Sm2Sequence_id"]),
         video_track=video_track,
         audio_track=audio_track,
@@ -395,6 +500,8 @@ def _read_seed(p: Path, opts: LibraryOptions) -> Seed:
         taken=frozenset(taken),
         columns={t: tuple(lib.columns[t]) for t in names},
         clips=tuple(clips_list),
+        digests=digests,
+        cells=cells,
     )
 
 
