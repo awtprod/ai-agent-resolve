@@ -31,7 +31,12 @@ name that is not valid Unicode; a time Windows cannot convert) is written as a l
 hub reads such a line as "measured with an error" and names it when a cut needs that file. In a
 folder, what is not measured (hidden, another suffix, a subfolder, a dangling link, not a
 regular file) is counted by reason and the first names are printed in the summary; when
-nothing at all is left to measure the run is refused (``no_media``, exit 2).
+nothing at all is left to measure the run is refused (``no_media``, exit 2). A named path or a
+folder entry the system will not describe (a folder above it that cannot be entered) is
+measured as a file, so its own line says why it cannot be read (an entry without a media
+suffix is listed ``unreadable``); any other system error about one file is that file's
+``unreadable`` line, and the rest are still measured. An ``OSError`` no step turned into a line
+or a refusal is the refusal ``system_error`` naming the path (exit 2), never a traceback.
 
 **Any console.** Everything printed is ASCII JSON (other characters escaped), so no console
 encoding can fail on a file name; the facts file itself is always UTF-8.
@@ -294,19 +299,38 @@ def _skip_reason(entry: os.DirEntry[str]) -> str | None:
     name = entry.name
     if name.startswith("."):
         return "hidden"
+    suffix = Path(name).suffix.lower()
     try:
         if entry.is_dir(follow_symlinks=False):
             return "subfolder"
         if entry.is_symlink() and not os.path.exists(entry.path):
             return "dangling_link"
-        suffix = Path(name).suffix.lower()
         if suffix not in MEDIA_SUFFIXES:
             return f"not_a_media_suffix:{suffix or '(none)'}"
         if not entry.is_file(follow_symlinks=True):
             return "not_a_regular_file"
     except OSError:
-        return "unreadable"
+        # What it is cannot be told: a media name is measured, so its own line says why it
+        # cannot be read; anything else is listed as unreadable.
+        return None if suffix in MEDIA_SUFFIXES else "unreadable"
     return None
+
+
+def _is_dir(path: Path) -> bool:
+    """Whether ``path`` is a folder; False when that cannot be told (Python 3.12 and 3.13 raise
+    ``PermissionError`` for a path below a folder that cannot be entered, where 3.14 returns
+    False): it is then measured as a file and its error line says why."""
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+def _os_text(exc: OSError) -> str:
+    """An ``OSError`` in words, with the path or paths it is about."""
+    text = exc.strerror or str(exc) or type(exc).__name__
+    names = [str(n) for n in (exc.filename, exc.filename2) if n is not None]
+    return f"{text}: {' -> '.join(repr(n) for n in names)}" if names else text
 
 
 def targets(
@@ -315,11 +339,13 @@ def targets(
     """Every file to measure, in output order, how many repeated paths were dropped and what
     the folders held that is not measured. ``too_many_files`` past ``max_files`` (exactly
     ``max_files`` is fine); ``not_a_pc_path`` for a file the PC has no name for;
-    ``folder_unreadable`` for a folder that cannot be listed."""
+    ``folder_unreadable`` for a folder that cannot be listed; ``path_unreadable`` for a path
+    whose absolute form the system cannot give. No ``OSError`` leaves it: a path whose kind
+    cannot be told is measured as a file, so its own line says why it cannot be read."""
     files: list[Path] = []
     skipped: list[tuple[str, str]] = []
     for path in paths:
-        if path.is_dir():
+        if _is_dir(path):
             files.extend(_folder_files(path, skipped))
         else:
             files.append(path)  # missing or odd files are measured, and listed with the error
@@ -332,7 +358,14 @@ def targets(
     out: dict[str, Target] = {}
     repeated = 0
     for local in files:
-        pc = _pc_path(local, folders)
+        try:
+            pc = _pc_path(local, folders)
+        except OSError as exc:  # the current folder is gone or cannot be read
+            raise FactsRunError(
+                "path_unreadable",
+                f"the absolute path of {str(local)!r} cannot be found ({_os_text(exc)})",
+                "run it from a folder that exists, or name the files by their absolute paths",
+            ) from None
         if pc is None and folders:
             raise FactsRunError(
                 "not_under_pc_folder",
@@ -501,6 +534,24 @@ class Measured:
     interrupted: bool = False
 
 
+def _measure_one(target: Target, *, timeout_s: float, notes: list[str]) -> dict[str, Any]:
+    if _at_root(target.pc_path):
+        return _failed(
+            target,
+            "at_root",
+            "not measured: it is directly at the root of a drive or share, and a library "
+            "project needs its media in a folder below the root; move it into a folder",
+            exists=os.path.lexists(target.local),
+        )
+    if _utf8(target.pc_path) != target.pc_path:
+        return _failed(
+            target,
+            "unrepresentable_name",
+            "its name is not valid Unicode, so the facts file cannot hold it; rename it",
+        )
+    return measure_file(target, timeout_s=timeout_s, notes=notes)
+
+
 def measure(
     files: Sequence[Target],
     *,
@@ -533,26 +584,14 @@ def measure(
                 "deadline",
                 f"not measured: the run's deadline of {deadline_s:g} s passed before this file",
             )
-        elif _at_root(target.pc_path):
-            record = _failed(
-                target,
-                "at_root",
-                "not measured: it is directly at the root of a drive or share, and a library "
-                "project needs its media in a folder below the root; move it into a folder",
-                exists=os.path.lexists(target.local),
-            )
-        elif _utf8(target.pc_path) != target.pc_path:
-            record = _failed(
-                target,
-                "unrepresentable_name",
-                "its name is not valid Unicode, so the facts file cannot hold it; rename it",
-            )
         else:
             try:
-                record = measure_file(target, timeout_s=min(timeout_s, left), notes=notes)
+                record = _measure_one(target, timeout_s=min(timeout_s, left), notes=notes)
             except KeyboardInterrupt:
                 interrupted = True
                 record = _failed(target, "interrupted", "not measured: the run was interrupted")
+            except OSError as exc:  # any system call about this one file: its own line
+                record = _failed(target, "unreadable", f"cannot measure it: {_os_text(exc)}")
         try:
             line = _line(record)
         except UnicodeEncodeError:
@@ -581,12 +620,13 @@ def measure(
     return Measured(bytes(out), summary, interrupted)
 
 
-def write_new(path: Path, data: bytes) -> None:
+def write_new(path: Path, data: bytes, left: list[str] | None = None) -> None:
     """Write ``data`` to ``path``, which must not exist: under a temporary name beside it,
     flushed, then given its name without replacing anything (``FileExistsError`` if it exists
     by then). On a POSIX file system without hard links the name itself is created exclusively
     and written (a run killed meanwhile can leave it short: the hub refuses a cut line). The
-    temporary file is removed on every path."""
+    temporary file is removed on every path; one that cannot be removed is added to ``left``
+    (the write's own outcome, or its error, stands)."""
     temp = path.with_name(f".{path.name}.aar-facts-{secrets.token_hex(4)}.part")
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o644)
     try:
@@ -604,8 +644,13 @@ def write_new(path: Path, data: bytes) -> None:
             except OSError:  # a file system without hard links
                 _write_exclusive(path, data)
     finally:
-        with contextlib.suppress(FileNotFoundError):
+        try:
             os.unlink(temp)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            if left is not None:
+                left.append(str(temp))
 
 
 def _write_exclusive(path: Path, data: bytes) -> None:
@@ -709,18 +754,56 @@ def say(value: Any, stream: Any = None) -> None:
 
 
 def run_command(args: argparse.Namespace) -> int:
+    """The command (module docstring). Its last guard: an ``OSError`` that no step turned into
+    a file's line or a refusal is the typed refusal ``system_error`` naming the path, exit 2,
+    never a traceback (programming errors are not caught)."""
+    left: list[str] = []
+    try:
+        return _run(args, left)
+    except OSError as exc:
+        error = FactsRunError(
+            "system_error",
+            f"the run stopped at a system error: {_os_text(exc)}",
+            "check that path and its permissions, then run again with a new --out",
+        )
+        record: dict[str, Any] = {"ok": False, "error": error.as_dict()}
+        if left:
+            record["left_behind"] = left
+        for stream in (sys.stdout, sys.stderr):  # the console itself may be what failed
+            try:
+                say(record, stream)
+                break
+            except OSError:
+                continue
+        return 2
+
+
+def _run(args: argparse.Namespace, left: list[str]) -> int:
     def refuse(error: FactsRunError, **extra: Any) -> int:
+        if left:
+            extra["left_behind"] = left
         say({"ok": False, "error": error.as_dict(), **extra})
         return 2
 
     out: Path = args.out
-    if os.path.lexists(out):
+    try:
+        taken = os.path.lexists(out)  # documented never to raise; guarded all the same
+        folder_ok = out.parent.is_dir()
+    except OSError as exc:  # Python 3.12 and 3.13 raise from is_dir where 3.14 returns False
+        return refuse(
+            FactsRunError(
+                "output_unwritable",
+                f"the folder of {str(out)!r} cannot be checked ({_os_text(exc)})",
+                "check the folder and its permissions",
+            )
+        )
+    if taken:
         return refuse(
             FactsRunError(
                 "output_exists", f"{str(out)!r} exists; it is never overwritten", "give a new name"
             )
         )
-    if not out.parent.is_dir():
+    if not folder_ok:
         return refuse(
             FactsRunError(
                 "output_folder_missing",
@@ -754,7 +837,7 @@ def run_command(args: argparse.Namespace) -> int:
     except FactsRunError as exc:
         return refuse(exc)
     try:
-        write_new(out, measured.data)
+        write_new(out, measured.data, left)
     except FileExistsError:
         return refuse(
             FactsRunError(
@@ -781,6 +864,8 @@ def run_command(args: argparse.Namespace) -> int:
     }
     if measured.interrupted:
         final["interrupted"] = True
+    if left:
+        final["left_behind"] = left
     say(final)
     if measured.interrupted:
         return 130

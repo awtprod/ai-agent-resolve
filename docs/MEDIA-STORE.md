@@ -214,7 +214,12 @@ while measured, a name that is not valid Unicode, a time Windows cannot convert)
 its `error` and is printed. What a folder holds that is not measured (hidden, other suffixes,
 subfolders, broken links) is counted by reason in the last printed line, with the first names;
 a folder that cannot be listed, or paths with no media file at all (`no_media`), are refused
-with exit 2 and nothing written. At most 256 files a run (`--max-files`), 30 minutes for the
+with exit 2 and nothing written. A file or folder below a folder that cannot be entered gets a
+line of its own (`unreadable`) and the other files are still measured; an entry of a folder
+that cannot be read is measured the same way when it has a media suffix and counted
+`unreadable` otherwise. A system error that stops the run is a JSON refusal naming the path
+(`system_error`, exit 2), never a traceback; a temporary file the command could not remove
+beside `--out` is named in `left_behind`. At most 256 files a run (`--max-files`), 30 minutes for the
 whole run (`--deadline`; files not reached are listed `deadline`) and 64 MiB of output
 (`--max-bytes`, error lines included; one that does not fit is only printed, `"in_file":
 false`). Ctrl+C writes what was measured and exits 130. Everything printed is ASCII JSON, so
