@@ -191,19 +191,26 @@ def run(
     templates of the product come from other projects than the cut's); ``linked_templates``
     takes the template of an unlinked item from the linked items of its kind (the writer uses
     a linked template for an unlinked item when no unlinked one is given)."""
-    sets = [read_items(p, options=options) for p in projects]
+    # A project is its resolved full path (every library project's file is Project.db), and
+    # each is read once: a project given twice, or through an alias path, would otherwise
+    # offer a second read of every item as that item's own template.
+    unique: dict[str, Path] = {}
+    for path in projects:
+        unique.setdefault(str(Path(path).resolve()), Path(path))
+    keyed = [(key, read_items(path, options=options)) for key, path in unique.items()]
+    sets = [items for _, items in keyed]
     refused: dict[str, int] = defaultdict(int)
     targets: list[_Target] = []
     notes: list[str] = []
-    for items in sets:
+    if len(unique) < len(projects):
+        notes.append(f"{len(projects) - len(unique)} project(s) given twice were read once")
+    for project, items in keyed:
         notes += [f"{items.path.name}: {n}" for n in items.skipped[:20]]
         for rows in items.items:
             shape = shape_of(rows, items.clips)
             if shape.refused is not None:
                 refused[f"{shape.kind or 'other'}: {shape.refused}"[:120]] += 1
                 continue
-            # A project is its resolved full path: every library project's file is Project.db.
-            project = str(Path(items.path).resolve())
             targets.append(_Target(project, items, rows, shape, bool(links_of(rows.item))))
     board = ItemScoreboard([], dict(refused), notes=notes)
     by_group: dict[str, GroupScore] = {}
@@ -228,17 +235,19 @@ def run(
 
 def _template(target: _Target, pool: list[_Target], other_project: bool) -> _Target | None:
     """Another item of the same kind and linkage: the same project first (another project
-    first with ``other_project``), then one playing another media clip, then one carrying no
-    later additions."""
+    first with ``other_project``), then one playing another media clip of another file (a file
+    imported twice is two clips), then one carrying no later additions."""
     media = target.rows.item.get("MediaRef")
+    file = _file(target)
     best: _Target | None = None
     best_key: tuple[int, int, int] | None = None
     for other in pool:
-        if other is target:
+        # The same item of the same project, whichever read it came from: never its own.
+        if other.project == target.project and other.rows.item_id == target.rows.item_id:
             continue
         key = (
             (other.project == target.project) == other_project,
-            other.rows.item.get("MediaRef") == media,
+            other.rows.item.get("MediaRef") == media or (file is not None and _file(other) == file),
             len(other.shape.tags),
         )
         if best_key is None or key < best_key:
@@ -246,6 +255,11 @@ def _template(target: _Target, pool: list[_Target], other_project: bool) -> _Tar
             if key == (False, False, 0):
                 break  # cannot do better
     return best
+
+
+def _file(target: _Target) -> str | None:
+    path = target.rows.item.get("MediaFilePath")
+    return path.casefold() if isinstance(path, str) and path else None
 
 
 def _check(group: GroupScore, target: _Target, template: _Target) -> None:

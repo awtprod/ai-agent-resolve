@@ -13,10 +13,18 @@ real item (docs/DESIGN.md, "Timeline items (S25c2)"):
   its length in frames is ``Duration / SampleRate * rate`` of its first audio track (a double),
   and the time of its last frame that over the rate minus ``1 / rate``, as for a picture; its
   start that track's ``StartTime``.
+
+The sound an item may read (``sound_frames``) is the first audio track's ``Duration`` samples
+over its ``SampleRate``, in frames at the item's rate (the picture's for a picture file, the
+import rate for a sound file), rounded up: the last frame may be partial. On the item gate's
+real sound items the end of the source range never passes this bound; 56 end exactly on it, and
+40 end inside the partial last frame (up to 0.0005 frames past the samples), so rounding down
+would refuse items Resolve made.
 """
 
 from __future__ import annotations
 
+import math
 import struct
 from dataclasses import dataclass
 from fractions import Fraction
@@ -57,6 +65,9 @@ class MediaView:
     frames: int | None
     #: Samples of the first audio track over its rate (None without sound).
     sound_seconds: float | None
+    #: Frames of sound at ``rate``, rounded up (None without sound): the most a sound item may
+    #: read.
+    sound_frames: int | None = None
 
 
 def _bad(why: str) -> ItemError:
@@ -135,6 +146,7 @@ def media_view(clip: ClipRows) -> MediaView:
     path = folder.decode("utf-8") + "\\" + name.decode("utf-8")
     channels = _channels(clip)
     sound_seconds: float | None = None
+    sound_samples: Fraction | None = None
     if clip.audio:
         track = _first_track(clip)
         samples = int(_number(track.get("Duration"), "Duration", int))
@@ -142,6 +154,7 @@ def media_view(clip: ClipRows) -> MediaView:
         if sample_rate <= 0 or samples < 0:
             raise _bad("the first audio track has no samples or no sample rate")
         sound_seconds = samples / sample_rate
+        sound_samples = Fraction(samples, sample_rate)
     if clip.video is not None:
         time = _kd(clip.video["Time"], "Time")
         rate_bytes, rate = _rate(time.get("FrameRate"), "Time.FrameRate")
@@ -160,12 +173,15 @@ def media_view(clip: ClipRows) -> MediaView:
         double = float(rate)
         track = _first_track(clip)
         start = float(_number(track.get("StartTime"), "StartTime", float))
+        if not math.isfinite(start):
+            raise _bad("the first audio track's StartTime is not a finite number")
         assert sound_seconds is not None
         # The length in frames at the rate, as a double, then the same rule as a picture's
         # (``(Duration / SampleRate) * rate / rate - 1 / rate``): the plain ``seconds - 1 / rate``
         # differs from Resolve's value in the last bit on 16 of 4,615 real sound items.
         last = sound_seconds * double / double - 1 / double
         picture_frames = None
+    sound_frames = None if sound_samples is None else math.ceil(sound_samples * rate)
     name_value = clip.media.get("Name")
     if not isinstance(name_value, str):
         raise _bad("Sm2MpMedia.Name is not text")
@@ -181,6 +197,7 @@ def media_view(clip: ClipRows) -> MediaView:
         last_seconds=last,
         frames=picture_frames,
         sound_seconds=sound_seconds,
+        sound_frames=sound_frames,
     )
 
 

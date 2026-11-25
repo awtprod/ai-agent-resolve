@@ -33,6 +33,7 @@ A difference is ``self_check_failed`` naming the field and the item or table.
 
 from __future__ import annotations
 
+import math
 import re
 import struct
 from collections import Counter
@@ -232,6 +233,9 @@ class _Media:
     channels: int | None
     #: The picture's frames (None for a sound file).
     frames: int | None
+    #: The first audio track's samples in frames at the item's rate, rounded up (None without
+    #: sound): the most a sound item may read.
+    sound_frames: int | None = None
 
 
 def _media(media_id: str, tables: dict[str, list[dict[str, Any]]]) -> _Media:
@@ -270,9 +274,26 @@ def _media(media_id: str, tables: dict[str, list[dict[str, Any]]]) -> _Media:
         raise _fail("the clip's Clip folder or name is not text")
     path = folder.decode("utf-8") + "\\" + name.decode("utf-8")
     channels: int | None = None
+    sound: Fraction | None = None
     if first_track is not None:
         count = first_track.get("NumChannels")
         channels = count if isinstance(count, int) and not isinstance(count, bool) else None
+        samples, sample_rate = first_track.get("Duration"), first_track.get("SampleRate")
+        if (
+            not isinstance(samples, int)
+            or not isinstance(sample_rate, int)
+            or isinstance(samples, bool)
+            or isinstance(sample_rate, bool)
+            or samples < 0
+            or sample_rate <= 0
+        ):
+            raise _fail("the clip's first audio track has no length or sample rate")
+        sound = Fraction(samples, sample_rate)
+
+    def sound_frames(rate: float) -> int | None:
+        # The rate as the standard rate it stands for (24000/1001, not the double's expansion).
+        return None if sound is None else math.ceil(sound * Fraction(rate).limit_denominator(1001))
+
     if videos:
         time = _keyed(videos[0].get("Time"), "the clip's Time")
         rate_bytes = time.get("FrameRate")
@@ -287,7 +308,8 @@ def _media(media_id: str, tables: dict[str, list[dict[str, Any]]]) -> _Media:
         if isinstance(timecode, str):
             start = timecode_frames(timecode, Fraction(rate).limit_denominator(1001)) / rate
         last = frames / rate - 1 / rate
-        return _Media(path, rate_bytes, start, b"\x02" + struct.pack(">d", last), channels, frames)
+        timemap = b"\x02" + struct.pack(">d", last)
+        return _Media(path, rate_bytes, start, timemap, channels, frames, sound_frames(rate))
     assert first_track is not None
     import_rate = _one(
         _sub(_message(media.get("FieldsBlob"), "the clip's FieldsBlob")),
@@ -298,14 +320,13 @@ def _media(media_id: str, tables: dict[str, list[dict[str, Any]]]) -> _Media:
         raise _fail("the clip's FieldsBlob #2.#1 is not a double")
     rate_bytes = import_rate.value + bytes(8)
     (rate,) = struct.unpack("<d", import_rate.value)
-    samples, sample_rate = first_track.get("Duration"), first_track.get("SampleRate")
+    samples, sample_rate = first_track["Duration"], first_track["SampleRate"]
     start = first_track.get("StartTime")
-    if not isinstance(samples, int) or not isinstance(sample_rate, int) or sample_rate <= 0:
-        raise _fail("the clip's first audio track has no length or sample rate")
     if not isinstance(start, float):
         raise _fail("the clip's first audio track has no StartTime")
     last = (samples / sample_rate) * rate / rate - 1 / rate
-    return _Media(path, rate_bytes, start, b"\x02" + struct.pack(">d", last), channels, None)
+    timemap = b"\x02" + struct.pack(">d", last)
+    return _Media(path, rate_bytes, start, timemap, channels, None, sound_frames(rate))
 
 
 def _sub(fields: list[blobs.PbField]) -> list[blobs.PbField]:
@@ -416,6 +437,10 @@ def verify_written(
                     raise _fail(f"{where} reads past the end of its media", field="In")
                 _same(where, "MediaTrackIdx", row.get("MediaTrackIdx"), None)
             else:
+                if media.sound_frames is None:
+                    raise _fail(f"{where} plays a clip without sound", field="MediaRef")
+                if exp.src_in + exp.duration > media.sound_frames:
+                    raise _fail(f"{where} reads past the end of its clip's sound", field="In")
                 _same(where, "MediaTrackIdx", row.get("MediaTrackIdx"), 0)
                 _check_channels(where, row.get("VirtualAudioTrackBA"), media.channels)
             written[(kind, exp.record_in)] = row

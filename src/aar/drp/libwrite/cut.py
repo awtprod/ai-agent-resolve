@@ -90,6 +90,26 @@ def _bad(why: str) -> ProjectWriteError:
     return ProjectWriteError("bad_input", why, "check the cut list")
 
 
+def _check_cut(cut: object) -> Cut:
+    """The entry's own fields: the record frames are whole numbers from the timeline's start
+    (the source range and duration are checked with the placement, against the clip), and a
+    split edit's sound range belongs to an entry that has a sound."""
+    if not isinstance(cut, Cut):
+        raise _bad(f"a cut entry is a {type(cut).__name__}, not a Cut")
+    if not isinstance(cut.picture, bool) or not isinstance(cut.sound, bool):
+        raise _bad("a cut entry's picture and sound are not True or False")
+    for name in ("record_in", "sound_record_in"):
+        value = getattr(cut, name)
+        if value is None and name != "record_in":
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise _bad(f"a cut entry's {name} {value!r} is not a whole frame from 0")
+    split = (cut.sound_record_in, cut.sound_src_in, cut.sound_duration)
+    if not cut.sound and any(v is not None for v in split):
+        raise _bad("a cut entry gives its sound its own range, but has no sound")
+    return cut
+
+
 @refusing("bad_input", "authoring the cut", "check the cut list", passthrough=(MediaPoolError,))
 def author_cut(
     seed: Seed,
@@ -110,6 +130,7 @@ def author_cut(
 
     planned: list[tuple[str, Cut, str, tuple[str, ...], int, int, int]] = []
     for cut in cuts:
+        _check_cut(cut)
         if not cut.picture and not cut.sound:
             raise _bad("a cut entry has neither picture nor sound")
         view = media_view(cut.clip)

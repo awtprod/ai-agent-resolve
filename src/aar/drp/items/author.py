@@ -117,8 +117,16 @@ def _check_placement(p: object, view: MediaView) -> ItemPlacement:
                 f"source range {p.src_in}..{p.src_in + p.duration} reads past the media's "
                 f"{view.frames} frames"
             )
-    elif not view.channels:
-        raise bad("kind is sound, but the media clip has no sound")
+    else:
+        if not view.channels or view.sound_frames is None:
+            raise bad("kind is sound, but the media clip has no sound")
+        # The sound's own length (its first audio track, the one MediaTrackIdx 0 plays), in
+        # frames at the item's rate: a sound may run shorter than its picture.
+        if p.src_in + p.duration > view.sound_frames:
+            raise bad(
+                f"source range {p.src_in}..{p.src_in + p.duration} reads past the media's "
+                f"{view.sound_frames} frames of sound"
+            )
     return p
 
 
