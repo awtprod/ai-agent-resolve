@@ -40,6 +40,7 @@ import json
 import math
 import re
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,7 +50,16 @@ from aar.drp.mediapool.blobtree import MAX_BLOB_OUTPUT
 from aar.drp.mediapool.templates import ClipRows
 from aar.drp.modify import encode
 
-__all__ = ["EXCLUDED", "Difference", "Exclusion", "compare", "excluded", "flatten"]
+__all__ = [
+    "EXCLUDED",
+    "Difference",
+    "Exclusion",
+    "compare",
+    "compare_flat",
+    "excluded",
+    "flatten",
+    "flatten_rows",
+]
 
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 _MAX_DEPTH = 12
@@ -381,21 +391,30 @@ def _metadata_by_key(out: dict[str, Leaf]) -> dict[str, Leaf]:
     return result
 
 
+def flatten_rows(
+    named: list[tuple[str, dict[str, Any] | None]], roles: dict[str, str]
+) -> dict[str, Leaf]:
+    """Every field of ``named`` rows (``(role, row)``; a None row is left out) as
+    ``{path: leaf}``, ids in ``roles`` replaced by their role (see the module docstring). The
+    one flattener the media-pool gate and the timeline-item gate (:mod:`aar.drp.items`) share."""
+    flat = _Flat(roles)
+    for role, row in named:
+        if row is None:
+            continue
+        for column, value in row.items():
+            flat.value(value, f"{role}.{column}")
+    return flat.out
+
+
 def flatten(clip: ClipRows) -> dict[str, Leaf]:
     """Every field of a clip's rows as ``{path: leaf}`` (see the module docstring)."""
-    flat = _Flat(_roles(clip))
     named: list[tuple[str, dict[str, Any] | None]] = [("M", clip.media), ("V", clip.video)]
     named += [(f"A{i}", r) for i, r in enumerate(clip.audio)]
     named += [(f"JA{i}", r) for i, r in enumerate(clip.audio_links)]
     named += [("JF0", clip.folder_link)]
     named += [(f"L{i}", r) for i, r in enumerate(clip.lockables)]
     named += [(f"P{i}", r) for i, r in enumerate(clip.presets)]
-    for role, row in named:
-        if row is None:
-            continue
-        for column, value in row.items():
-            flat.value(value, f"{role}.{column}")
-    return _metadata_by_key(flat.out)
+    return _metadata_by_key(flatten_rows(named, _roles(clip)))
 
 
 @dataclass(frozen=True)
@@ -419,18 +438,28 @@ def compare(
     and authored rows of one file; :data:`EXCLUDED` fields are not compared, but where they
     differ they are returned with the exclusion that hid them (so each exclusion is shown to be
     needed). An order leaf is compared without the children that are excluded."""
-    a, b = flatten(expected), flatten(got)
+    return compare_flat(flatten(expected), flatten(got), lambda path: excluded(path, media))
+
+
+def compare_flat(
+    a: dict[str, Leaf],
+    b: dict[str, Leaf],
+    rule: Callable[[str], Exclusion | None],
+) -> tuple[int, list[Difference], list[tuple[Exclusion, Difference]]]:
+    """The total comparison of two flattened row sets (:func:`flatten_rows`): every leaf is
+    compared unless ``rule`` names the exclusion that covers its field; an excluded leaf that
+    differs is returned with its exclusion, and an order leaf ignores excluded children."""
     compared = 0
     found: list[Difference] = []
     hidden: list[tuple[Exclusion, Difference]] = []
     for path in sorted(set(a) | set(b)):
         left, right = a.get(path), b.get(path)
         if path.endswith(ORDER):
-            left, right = _kept(left, media), _kept(right, media)
-        rule = excluded(path, media)
-        if rule is not None:
+            left, right = _kept(left, rule), _kept(right, rule)
+        exclusion = rule(base_path(path))
+        if exclusion is not None:
             if left != right:
-                hidden.append((rule, Difference(path, left, right)))
+                hidden.append((exclusion, Difference(path, left, right)))
             continue
         compared += 1
         if left != right:
@@ -438,7 +467,7 @@ def compare(
     return compared, found, hidden
 
 
-def _kept(order: Leaf | None, media: str) -> Leaf | None:
+def _kept(order: Leaf | None, rule: Callable[[str], Exclusion | None]) -> Leaf | None:
     if order is None:
         return None
-    return tuple(c for c in order if excluded(str(c), media) is None)
+    return tuple(c for c in order if rule(base_path(str(c))) is None)

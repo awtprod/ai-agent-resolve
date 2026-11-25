@@ -70,9 +70,11 @@ __all__ = [
     "Skipped",
     "finish",
     "is_library_path",
+    "library_users_dir",
     "list_library",
     "open_library",
     "read_rows",
+    "take_snapshot",
 ]
 
 LIBRARY_KIND = "library"
@@ -1952,6 +1954,41 @@ class _Scan:
                 stack.append((Path(entry.path), depth + 1, inside))
 
 
+def library_users_dir(root: str | Path) -> Path:
+    """The ``Users`` folder of the disk library at ``root`` (the library's folder or its
+    ``Resolve Projects`` folder); ``not_a_library`` when there is none. The one check the
+    listing and the library writer (:mod:`aar.drp.libwrite`) share."""
+    base = Path(root)
+    if (base / "Resolve Projects").is_dir():
+        base = base / "Resolve Projects"
+    users = base / "Users"
+    if not users.is_dir():
+        raise LibraryError(
+            "not_a_library",
+            f"{root} is not a Resolve disk library (no Users folder in it or in its "
+            "'Resolve Projects' folder)",
+            "give the library's folder, the one that holds 'Resolve Projects'",
+        )
+    return users
+
+
+def take_snapshot(path: str | Path, target: Path, options: LibraryOptions) -> Copied:
+    """A settled copy of the ``Project.db`` at ``path`` written to ``target``, a new file the
+    caller owns (made here, never over an existing one; removed again on any error). The copy
+    is the reader's own (:func:`_settled_copy`: regular file only, no journal beside it,
+    settled, unchanged while copied, at most ``max_db_bytes``). The library writer builds a new
+    project from such a copy of its seed, in its own staging folder."""
+    source = Path(path)
+    _check_kind(source)
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    try:
+        with os.fdopen(fd, "w+b") as handle:
+            return _settled_copy(source, handle, options)
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
+
+
 def list_library(
     root: str | Path,
     *,
@@ -1976,17 +2013,7 @@ def list_library(
     """
     opts = options or LibraryOptions()
     deadline = opts.clock() + deadline_seconds
-    base = Path(root)
-    if (base / "Resolve Projects").is_dir():
-        base = base / "Resolve Projects"
-    users = base / "Users"
-    if not users.is_dir():
-        raise LibraryError(
-            "not_a_library",
-            f"{root} is not a Resolve disk library (no Users folder in it or in its "
-            "'Resolve Projects' folder)",
-            "give the library's folder, the one that holds 'Resolve Projects'",
-        )
+    users = library_users_dir(root)
     if read is None:
         from aar.drp.reader import read_drp
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 import struct
 from collections.abc import Callable
 from functools import wraps
-from typing import ParamSpec, TypeVar
+from typing import ClassVar, ParamSpec, TypeVar
 
 from aar.drp.errors import DrpError
 
@@ -35,11 +35,16 @@ CODES: dict[str, str] = {
 
 
 class MediaPoolError(ValueError):
-    """A refusal: ``code`` (one of :data:`CODES`), ``message`` and a ``hint`` saying what to do."""
+    """A refusal: ``code`` (one of :data:`CODES`), ``message`` and a ``hint`` saying what to do.
+
+    A sibling writer (the timeline items of :mod:`aar.drp.items`) subclasses it with its own
+    ``CODES``, so the one boundary (:func:`refusing`) serves both."""
+
+    CODES: ClassVar[dict[str, str]] = CODES
 
     def __init__(self, code: str, message: str, hint: str) -> None:
-        if code not in CODES:
-            raise ValueError(f"unknown media-pool error code {code!r}")
+        if code not in self.CODES:
+            raise ValueError(f"unknown {type(self).__name__} code {code!r}")
         super().__init__(f"{message} [{code}]; {hint}")
         self.code = code
         self.message = message
@@ -73,27 +78,33 @@ def refusing(
     hint: str,
     *,
     passthrough: tuple[type[BaseException], ...] = (),
+    error: type[MediaPoolError] = MediaPoolError,
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
     """Wrap a public entry point: any of :data:`DAMAGE_ERRORS` it lets escape becomes a
-    ``code`` refusal saying ``what`` failed, with the original error's type and message.
-    A :class:`MediaPoolError`, and the typed errors in ``passthrough``, pass unchanged."""
-    if code not in CODES:
-        raise ValueError(f"unknown media-pool error code {code!r}")
+    ``code`` refusal of type ``error`` saying ``what`` failed, with the original error's type
+    and message. A refusal of type ``error`` and the typed errors in ``passthrough`` pass
+    unchanged; any other :class:`MediaPoolError` becomes an ``error``, keeping its code when
+    ``error`` has it."""
+    if code not in error.CODES:
+        raise ValueError(f"unknown {error.__name__} code {code!r}")
 
     def wrap(func: Callable[_P, _R]) -> Callable[_P, _R]:
         @wraps(func)
         def guarded(*args: _P.args, **kwargs: _P.kwargs) -> _R:
             try:
                 return func(*args, **kwargs)
-            except MediaPoolError:
-                raise
+            except MediaPoolError as exc:
+                if isinstance(exc, error):
+                    raise
+                # A refusal of the sibling writer below this one keeps its code when this
+                # writer has it, so every refusal out of an entry point is of its own type.
+                kept = exc.code if exc.code in error.CODES else code
+                raise error(kept, exc.message, exc.hint) from exc
             except passthrough:
                 raise
             except DAMAGE_ERRORS as exc:
                 detail = f"{type(exc).__name__}: {exc}"[:400]
-                raise MediaPoolError(
-                    code, f"{what} failed on a damaged value ({detail})", hint
-                ) from exc
+                raise error(code, f"{what} failed on a damaged value ({detail})", hint) from exc
 
         return guarded
 
