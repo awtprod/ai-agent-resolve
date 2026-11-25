@@ -49,6 +49,7 @@ MAX_FACT_LINES = 100_000
 
 @dataclass
 class Member:
+    #: The project's resolved full path: every library project's file is Project.db.
     project: str
     clip: ClipRows
     facts: MediaFacts
@@ -190,7 +191,12 @@ def run(
     members: dict[KindKey, list[Member]] = defaultdict(list)
     unmatched: list[str] = []
     skipped: list[str] = []
-    for project in projects:
+    # Each project once, by its resolved path: a project given twice, or through an alias
+    # path, would otherwise offer a second read of every clip as that clip's own template.
+    unique: dict[str, Path] = {}
+    for given in projects:
+        unique.setdefault(str(Path(given).resolve()), Path(given))
+    for key, project in unique.items():
         tset: TemplateSet = read_templates(project, options=options)
         skipped.extend(f"{project.name}: {s.name}: {s.reason}" for s in tset.skipped)
         for clip in tset.clips:
@@ -203,7 +209,7 @@ def run(
             stale = seen_at is not None and seen_at != found.mtime_local
             members[kind_of_facts(found)].append(
                 Member(
-                    project.name,
+                    key,
                     clip,
                     found,
                     stale,
@@ -224,16 +230,30 @@ def run(
         for target in group:
             if target.stale:
                 continue
-            others = [m for m in group if m is not target]
+            others = [m for m in group if not _same_clip(m, target)]
             if not others:
                 score.self_check = _self_check(kind, target)
                 continue
             # A stale member's facts are not the facts its rows were made from: it serves as a
-            # template only when no other member is left, and then without its facts.
-            others.sort(key=lambda m: (m.stale, m.project != target.project))
+            # template only when no other member is left, and then without its facts. Another
+            # clip of the same file (imported twice) is the last choice before that: its facts
+            # are the target's, so a value wrongly copied rather than derived would not show.
+            file = target.facts.path.casefold()
+            others.sort(
+                key=lambda m: (
+                    m.stale,
+                    m.facts.path.casefold() == file,
+                    m.project != target.project,
+                )
+            )
             _check(score, kind, target, others[0])
     scores.sort(key=lambda s: (-s.members, s.kind.label()))
     return Scoreboard(scores, unmatched, skipped)
+
+
+def _same_clip(a: Member, b: Member) -> bool:
+    """The same clip of the same project, whichever read it came from."""
+    return a.project == b.project and a.clip.media_id == b.clip.media_id
 
 
 def _author(kind: KindKey, target: Member, template: Member) -> tuple[ClipRows, tuple[str, ...]]:
@@ -249,10 +269,12 @@ def _author(kind: KindKey, target: Member, template: Member) -> tuple[ClipRows, 
     )
     authored = author(
         target.facts,
-        Template(template.clip, None if template.stale else template.facts, template.project),
+        Template(
+            template.clip, None if template.stale else template.facts, Path(template.project).name
+        ),
         placement,
         kinds={kind: KindStatus("verified", 0)},
-        taken=target.clip.ids() if template is not target else frozenset(),
+        taken=target.clip.ids() if not _same_clip(template, target) else frozenset(),
         allow_unverified=True,
     )
     return ClipRows.from_tables(authored.rows), authored.unverified

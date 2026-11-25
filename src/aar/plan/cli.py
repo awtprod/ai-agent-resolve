@@ -127,32 +127,54 @@ def register(subparsers: Any) -> None:
         "FCPXML file back and compares it with the plan. Exit: 0 ok, 1 --verify found a "
         "mismatch, 2 refused or unreadable input.",
     )
-    export.add_argument("plan", type=Path, help="EditPlan JSON file.")
-    export.add_argument("--profile", help="Profile name or .toml path (default: the plan's).")
-    export.add_argument("--format", choices=["fcpxml"], default="fcpxml", help="Output format.")
-    target = export.add_mutually_exclusive_group(required=True)
-    target.add_argument("--out", type=Path, help="FCPXML file to write (never overwritten).")
-    target.add_argument(
-        "--verify", type=Path, metavar="FILE", help="Read FILE back and compare it with the plan."
-    )
-    export.add_argument(
-        "--media-map",
+    _fcpxml_export_arguments(export, ["fcpxml", "library"], required=False)
+    lib = export.add_argument_group("library project (--format library)")
+    lib.add_argument("--library", type=Path, help="The disk library's folder.")
+    lib.add_argument(
+        "--seed",
         type=Path,
-        help="JSON object of linux_root -> windows_root, for sources with hub (Linux) paths.",
+        help="A Project.db Resolve saved with the project settings and one timeline (one video "
+        "and one audio track, empty or holding only plain cuts) to copy.",
     )
-    export.add_argument("--transcript", type=Path, help="Transcript JSON, for the lint.")
-    export.add_argument("--laughs", type=Path, help="Laugh map JSON, for the lint.")
-    export.add_argument(
-        "--overwrite", action="store_true", help="Replace an existing FCPXML and report."
+    lib.add_argument("--facts", type=Path, help="Measured facts of every source file (JSON lines).")
+    lib.add_argument(
+        "--templates",
+        type=Path,
+        nargs="+",
+        action="extend",
+        default=[],
+        metavar="PROJECT.db",
+        help="Projects Resolve saved, holding clips and items to use as templates.",
     )
-    export.add_argument(
-        "--allow-unknown-timecode",
+    lib.add_argument("--project-name", help="The new project's name (a folder name).")
+    lib.add_argument(
+        "--library-user",
+        help="The library user to place the project under (default: the only one).",
+    )
+    lib.add_argument(
+        "--seed-resolution",
+        metavar="WxH",
+        help="The project's resolution when the seed timeline follows it and the project does "
+        "not store it (stated, reported, never written).",
+    )
+    lib.add_argument(
+        "--allow-unverified-media",
         action="store_true",
-        help="Export sources with no start_timecode anyway, their assets at 0s (Resolve links "
-        "their clips only if the file's timecode starts at 00:00:00:00).",
+        help="Author clips of a kind or file the media-pool gate did not verify (named in the "
+        "report).",
     )
+    lib.add_argument(
+        "--allow-unopened-operations",
+        action="store_true",
+        help="Write a project that uses operations no person has opened in Resolve yet "
+        "(named in the report).",
+    )
+    lib.add_argument(
+        "--report", type=Path, help="Also write the report JSON here (never overwritten)."
+    )
+    add_library_budget_options(export)
     export.add_argument("--json", action="store_true", help="Print the report as JSON.")
-    export.set_defaults(func=_cmd_export)
+    export.set_defaults(func=_cmd_export, export_prog=export.prog)
 
     render = sub.add_parser(
         "render",
@@ -263,6 +285,59 @@ def _memory_mb(text: str) -> int:
 
 def _cmd_schema(args: argparse.Namespace) -> int:
     return cli_io.emit(_PROG, json.dumps(EditPlan.model_json_schema(), indent=2) + "\n")
+
+
+def _fcpxml_export_arguments(
+    parser: argparse.ArgumentParser, formats: list[str], *, required: bool
+) -> None:
+    """The FCPXML export's arguments of ``aar plan export``, in their order. The real parser
+    takes them with both formats and ``--out``/``--verify`` optional (``--format library`` needs
+    neither); :func:`_fcpxml_usage_error` builds a parser of these alone, as the command was
+    before the library format, to print its usage error unchanged."""
+    parser.add_argument("plan", type=Path, help="EditPlan JSON file.")
+    parser.add_argument("--profile", help="Profile name or .toml path (default: the plan's).")
+    parser.add_argument(
+        "--format",
+        choices=formats,
+        default="fcpxml",
+        help="Output format: an FCPXML file (--out), or a project in a Resolve disk library "
+        "(--library with --seed, --facts and --project-name).",
+    )
+    target = parser.add_mutually_exclusive_group(required=required)
+    target.add_argument("--out", type=Path, help="FCPXML file to write (never overwritten).")
+    target.add_argument(
+        "--verify", type=Path, metavar="FILE", help="Read FILE back and compare it with the plan."
+    )
+    parser.add_argument(
+        "--media-map",
+        type=Path,
+        help="JSON object of linux_root -> windows_root, for sources with hub (Linux) paths.",
+    )
+    parser.add_argument("--transcript", type=Path, help="Transcript JSON, for the lint.")
+    parser.add_argument("--laughs", type=Path, help="Laugh map JSON, for the lint.")
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Replace an existing FCPXML and report."
+    )
+    parser.add_argument(
+        "--allow-unknown-timecode",
+        action="store_true",
+        help="Export sources with no start_timecode anyway, their assets at 0s (Resolve links "
+        "their clips only if the file's timecode starts at 00:00:00:00).",
+    )
+
+
+def _fcpxml_usage_error(prog: str) -> int:
+    """The FCPXML export without ``--out`` or ``--verify``: argparse's own usage error of the
+    FCPXML arguments (usage, then ``prog: error: ...`` on stderr, exit 2), exactly as the
+    command printed it while ``--out``/``--verify`` were a required group."""
+    import sys
+
+    parser = argparse.ArgumentParser(prog=prog)
+    _fcpxml_export_arguments(parser, ["fcpxml"], required=True)
+    parser.add_argument("--json", action="store_true", help="Print the report as JSON.")
+    parser.print_usage(sys.stderr)
+    cli_io.warn(f"{prog}: error: one of the arguments --out --verify is required")
+    return cli_io.finalize(2)
 
 
 def _input_error(kind: str, message: str, details: list[Any], as_json: bool) -> int:
@@ -571,6 +646,8 @@ def _export_refusal(exc: ExportError, as_json: bool) -> int:
 
 def _cmd_export(args: argparse.Namespace) -> int:
     as_json: bool = args.json
+    if args.format != "library" and args.out is None and args.verify is None:
+        return _fcpxml_usage_error(getattr(args, "export_prog", "aar plan export"))
     try:
         plan = EditPlan.model_validate_json(args.plan.read_text(encoding="utf-8"))
         transcript: Transcript | None = (
@@ -588,6 +665,25 @@ def _cmd_export(args: argparse.Namespace) -> int:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ProfileError) as exc:
         return _input_error(type(exc).__name__, str(exc), [], as_json)
 
+    if args.format == "library":
+        return _export_library(args, plan, profile, media_map, transcript, laughs, as_json)
+    library_only = [
+        flag
+        for flag, value in (
+            ("--library", args.library),
+            ("--seed", args.seed),
+            ("--facts", args.facts),
+            ("--templates", args.templates),
+            ("--project-name", args.project_name),
+            ("--report", args.report),
+            ("--seed-resolution", args.seed_resolution),
+            ("--library-user", args.library_user),
+        )
+        if value
+    ]
+    if library_only:
+        why = f"{', '.join(library_only)} only go with --format library"
+        return _input_error("usage", why, [], as_json)
     if args.verify is not None:
         return _do_verify(args.verify, plan, profile, media_map, as_json)
     try:
@@ -627,6 +723,153 @@ def _cmd_export(args: argparse.Namespace) -> int:
         return _input_error(type(exc).__name__, str(exc), [], as_json)
     text = body if as_json else _render_export(report, out, report_file, fusion_file)
     return cli_io.emit(_PROG, text)
+
+
+def _export_library(
+    args: argparse.Namespace,
+    plan: EditPlan,
+    profile: Any,
+    media_map: Any,
+    transcript: Transcript | None,
+    laughs: LaughMap | None,
+    as_json: bool,
+) -> int:
+    """``--format library``: the plan as a project in a disk library (S25c2)."""
+    from aar.drp.mediapool.errors import MediaPoolError
+    from aar.drp.mediapool.gate import load_facts
+    from aar.plan.export.library import export_library
+
+    missing = [
+        flag
+        for flag, value in (
+            ("--library", args.library),
+            ("--seed", args.seed),
+            ("--facts", args.facts),
+            ("--project-name", args.project_name),
+        )
+        if not value
+    ]
+    if args.out is not None or args.verify is not None or args.overwrite:
+        missing.append("not --out, --verify or --overwrite")
+    if missing:
+        return _input_error("usage", "--format library needs " + ", ".join(missing), [], as_json)
+    if args.report is not None and (args.report.exists() or args.report.is_symlink()):
+        return _export_refusal(
+            ExportError(
+                "output_exists",
+                f"{args.report} exists",
+                "choose another --report path (it is never overwritten)",
+            ),
+            as_json,
+        )
+    try:
+        facts = load_facts(args.facts)
+    except MediaPoolError as exc:
+        return _export_refusal(
+            ExportError("facts_missing", f"{exc.message} [{exc.code}]", exc.hint), as_json
+        )
+    except OSError as exc:
+        return _input_error(type(exc).__name__, str(exc), [], as_json)
+    try:
+        result = export_library(
+            plan,
+            profile,
+            library=args.library,
+            seed=args.seed,
+            facts=facts,
+            templates=args.templates,
+            project_name=args.project_name,
+            media_map=media_map,
+            transcript=transcript,
+            laughs=laughs,
+            allow_unverified_media=args.allow_unverified_media,
+            allow_unopened=args.allow_unopened_operations,
+            seed_resolution=args.seed_resolution,
+            user=args.library_user,
+            options=library_options(args),
+        )
+    except ExportError as exc:
+        _warn_residue(exc.details.get("residue"), as_json)
+        return _export_refusal(exc, as_json)
+    except KeyboardInterrupt as exc:
+        return _export_interrupted(exc, as_json)
+    for finding in result.warnings:
+        cli_io.warn(f"warning {finding.rule}: {finding.message}")
+    body = json.dumps(result.report, indent=2, ensure_ascii=False) + "\n"
+    if args.report is not None:
+        try:
+            write_pair([(args.report, body.encode("utf-8"))], overwrite=False)
+        except ExportError as exc:
+            return _export_refusal(exc, as_json)
+        except OSError as exc:
+            return _input_error(type(exc).__name__, str(exc), [], as_json)
+    text = body if as_json else _render_library(result.report)
+    return cli_io.emit(_PROG, text)
+
+
+def _warn_residue(residue: object, as_json: bool) -> None:
+    if residue and not as_json:
+        cli_io.warn(f"  left in the library: {residue}; delete it by hand")
+
+
+def _export_interrupted(exc: KeyboardInterrupt, as_json: bool) -> int:
+    """An interrupted library export: say so, and what it left in the library (the staging
+    folder or lock it could not remove, or the project it had already placed)."""
+    notes = [str(n) for n in getattr(exc, "__notes__", [])]
+    residue = getattr(exc, "residue", None)
+    message = "the export was interrupted" + (": " + "; ".join(notes) if notes else "")
+    if as_json:
+        body = {
+            "ok": False,
+            "error": {
+                "code": "interrupted",
+                "message": message,
+                "fix_hint": "run the export again; delete what is named as left by hand",
+                "details": {"residue": residue} if residue else {},
+            },
+        }
+        cli_io.emit(_PROG, json.dumps(body, indent=2) + "\n")
+    else:
+        cli_io.warn(f"interrupted: {message}")
+    return 130
+
+
+def _render_library(report: dict[str, Any]) -> str:
+    project = report["project"]
+    timeline = report["timeline"]
+    counts = report["exported"]
+    lines = [
+        f"wrote library project {project['name']!r}: {project['path']} "
+        f"(sha256 {project['sha256'][:12]})",
+        f"timeline {timeline['name']!r}: {timeline['fps']} fps, starts {timeline['start']}, "
+        f"{timeline['total_frames']} frames, {timeline['resolution']} "
+        f"(checked against: {timeline['resolution_checked_against']})",
+        f"items: {counts['picture_items']} picture, {counts['sound_items']} sound "
+        f"({counts['segments']} segment(s), outro {'yes' if counts['outro'] else 'no'})",
+        "operations:",
+        *(f"  {op['operation']}: {op['status']}" for op in report["operations"]),
+        "media:",
+        *(
+            f"  {m['source']}: {m['status']} ({m['kind']}) {m['path']}"
+            + "".join(f"\n    unverified: {why}" for why in m["unverified"])
+            for m in report["media"]
+        ),
+        f"not carried ({len(report['not_carried'])}):",
+        *(
+            f"  {item['location']}: {item['feature']}: {item['detail']} -> {item['action']}"
+            for item in report["not_carried"]
+        ),
+        *(
+            f"  staging leftover (safe to delete): {x}"
+            for x in report["placement"]["staging_leftovers"]
+        ),
+        *(f"  {x}" for x in report["placement"]["cleanup"]),
+        f"self-check: ok (import of the written project: unchanged; reader issues: "
+        f"{', '.join(report['self_check']['reader_issues']) or 'none'})",
+    ]
+    if report["operations_not_opened"]:
+        lines.append("NOT YET OPENED IN RESOLVE: " + ", ".join(report["operations_not_opened"]))
+    return "\n".join(lines) + "\n"
 
 
 def _do_verify(path: Path, plan: EditPlan, profile: Any, media_map: Any, as_json: bool) -> int:

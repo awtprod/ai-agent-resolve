@@ -60,6 +60,7 @@ from aar.media.settle import Copied, TooLargeError, copy_settled, settle_identit
 __all__ = [
     "LIBRARY_KIND",
     "SQLITE_MAGIC",
+    "SQL_ERRORS",
     "SUPPORTED_PROJECT_VERSIONS",
     "LibraryError",
     "LibraryListing",
@@ -70,9 +71,11 @@ __all__ = [
     "Skipped",
     "finish",
     "is_library_path",
+    "library_users_dir",
     "list_library",
     "open_library",
     "read_rows",
+    "take_snapshot",
 ]
 
 LIBRARY_KIND = "library"
@@ -488,7 +491,8 @@ def _connect(
     """A read-only, immutable connection: SQLite creates no journal, WAL or lock files.
 
     Text comes back as bytes (text that is not UTF-8 is read, never a decode error), or with
-    ``text_as_bytes=False`` as ``str``, where text that is not UTF-8 is an SQLite error."""
+    ``text_as_bytes=False`` as ``str``, where text that is not UTF-8 raises (a
+    ``UnicodeDecodeError``, one of :data:`SQL_ERRORS`)."""
     uri = snapshot.resolve().as_uri() + "?mode=ro&immutable=1"
     conn = sqlite3.connect(uri, uri=True, isolation_level=None)
     try:
@@ -504,7 +508,21 @@ def _connect(
     return conn
 
 
-def _sql_error(path: Path, exc: sqlite3.Error, deadline: _Deadline) -> LibraryError:
+#: What SQLite can raise on a damaged or hostile file: its own errors, and a
+#: ``UnicodeDecodeError`` when the message SQLite gives (a damaged page can put any bytes in it)
+#: or a text value is not UTF-8. Every read below catches both, so a caller only ever sees a
+#: :class:`LibraryError`.
+SQL_ERRORS: tuple[type[Exception], ...] = (sqlite3.Error, UnicodeDecodeError)
+
+
+def _sql_error(path: Path, exc: Exception, deadline: _Deadline) -> LibraryError:
+    if isinstance(exc, UnicodeDecodeError):
+        return LibraryError(
+            "damaged",
+            f"{path}: SQLite cannot read it (it reports text that is not UTF-8: {exc.reason} "
+            f"at byte {exc.start})",
+            "open the project in Resolve and save it again, or restore it from a backup",
+        )
     text = str(exc)
     if isinstance(exc, sqlite3.DataError) or "too big" in text:
         return LibraryError(
@@ -1460,7 +1478,7 @@ def open_library(
             )
         try:
             conn = _connect(snapshot, deadline, min(max_member_bytes, opts.max_value_bytes))
-        except sqlite3.Error as exc:
+        except SQL_ERRORS as exc:
             raise _sql_error(p, exc, deadline) from None
         try:
             try:
@@ -1475,7 +1493,7 @@ def open_library(
                     )
                 _check_schema(conn, p)
                 tables = _load(conn, p, opts)
-            except sqlite3.Error as exc:
+            except SQL_ERRORS as exc:
                 raise _sql_error(p, exc, deadline) from None
         finally:
             conn.close()
@@ -1581,7 +1599,7 @@ def read_rows(
             )
         try:
             conn = _connect(snapshot, deadline, opts.max_value_bytes, text_as_bytes=False)
-        except sqlite3.Error as exc:
+        except SQL_ERRORS as exc:
             raise _sql_error(p, exc, deadline) from None
         try:
             try:
@@ -1643,13 +1661,21 @@ def read_rows(
                             )
                         out.append(tuple(values))
                     rows[table] = out
-            except sqlite3.Error as exc:
+            except SQL_ERRORS as exc:
                 raise _sql_error(p, exc, deadline) from None
         finally:
             conn.close()
     finally:
         snapshot.unlink(missing_ok=True)
     index = {c: i for i, c in enumerate(columns["SM_Project"])}
+    absent = [c for c in ("SM_Project_id", "ProjectVersion") if c not in index]
+    if absent:
+        raise LibraryError(
+            "not_a_project",
+            f"{p} is not a Resolve project this reader knows: it has no SM_Project."
+            f"{', SM_Project.'.join(absent)}",
+            "give the Project.db of a project in a Resolve disk library",
+        )
     projects = [{c: r[i] for c, i in index.items()} for r in rows["SM_Project"]]
     version = _check_project(p, {"SM_Project": projects})  # type: ignore[dict-item]
     deadline.check()
@@ -1952,6 +1978,41 @@ class _Scan:
                 stack.append((Path(entry.path), depth + 1, inside))
 
 
+def library_users_dir(root: str | Path) -> Path:
+    """The ``Users`` folder of the disk library at ``root`` (the library's folder or its
+    ``Resolve Projects`` folder); ``not_a_library`` when there is none. The one check the
+    listing and the library writer (:mod:`aar.drp.libwrite`) share."""
+    base = Path(root)
+    if (base / "Resolve Projects").is_dir():
+        base = base / "Resolve Projects"
+    users = base / "Users"
+    if not users.is_dir():
+        raise LibraryError(
+            "not_a_library",
+            f"{root} is not a Resolve disk library (no Users folder in it or in its "
+            "'Resolve Projects' folder)",
+            "give the library's folder, the one that holds 'Resolve Projects'",
+        )
+    return users
+
+
+def take_snapshot(path: str | Path, target: Path, options: LibraryOptions) -> Copied:
+    """A settled copy of the ``Project.db`` at ``path`` written to ``target``, a new file the
+    caller owns (made here, never over an existing one; removed again on any error). The copy
+    is the reader's own (:func:`_settled_copy`: regular file only, no journal beside it,
+    settled, unchanged while copied, at most ``max_db_bytes``). The library writer builds a new
+    project from such a copy of its seed, in its own staging folder."""
+    source = Path(path)
+    _check_kind(source)
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    try:
+        with os.fdopen(fd, "w+b") as handle:
+            return _settled_copy(source, handle, options)
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
+
+
 def list_library(
     root: str | Path,
     *,
@@ -1976,17 +2037,7 @@ def list_library(
     """
     opts = options or LibraryOptions()
     deadline = opts.clock() + deadline_seconds
-    base = Path(root)
-    if (base / "Resolve Projects").is_dir():
-        base = base / "Resolve Projects"
-    users = base / "Users"
-    if not users.is_dir():
-        raise LibraryError(
-            "not_a_library",
-            f"{root} is not a Resolve disk library (no Users folder in it or in its "
-            "'Resolve Projects' folder)",
-            "give the library's folder, the one that holds 'Resolve Projects'",
-        )
+    users = library_users_dir(root)
     if read is None:
         from aar.drp.reader import read_drp
 

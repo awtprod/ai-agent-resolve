@@ -85,6 +85,19 @@ def test_export_codes_are_stable() -> None:
             "output_conflict",
             "rollback_failed",
             "output_locked",
+            "unsupported_plan_feature",
+            "facts_missing",
+            "facts_mismatch",
+            "media_refused",
+            "item_refused",
+            "bad_seed",
+            "seed_mismatch",
+            "bad_input",
+            "operation_not_opened",
+            "bad_project_name",
+            "project_exists",
+            "not_a_library",
+            "library_unwritable",
         ]
     )
 

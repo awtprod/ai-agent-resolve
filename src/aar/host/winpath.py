@@ -41,6 +41,7 @@ __all__ = [
     "PathForm",
     "PathMapper",
     "check_file_path",
+    "check_name",
     "glob_escape",
     "normalize_root",
     "remote_spec",
@@ -165,6 +166,27 @@ def check_file_path(path: str) -> _Win:
     if reason is not None:
         raise PathRefused(path, reason)
     return win
+
+
+def check_name(name: str) -> None:
+    """Validate ``name`` as one folder or file name on the edit PC (a project folder on the
+    share): the rules :func:`check_file_path` applies to each component of a path (no character
+    Windows forbids, the colon among them; no reserved device name; no trailing dot or space; no
+    control character or lone surrogate; not empty, ``.`` or ``..``). Raises
+    :class:`PathRefused` with the reason."""
+    if not isinstance(name, str) or not name:
+        raise PathRefused(str(name), "empty")
+    if any(ord(ch) < 0x20 for ch in name):
+        raise PathRefused(name, "control-character")
+    if _has_lone_surrogate(name):
+        raise PathRefused(name, "invalid-unicode")
+    if name in (".", ".."):
+        raise PathRefused(name, "dot-or-empty-component")
+    if "\\" in name or "/" in name:
+        raise PathRefused(name, "illegal-character")
+    reason = _component_ok(name)
+    if reason is not None:
+        raise PathRefused(name, reason)
 
 
 def validate_windows_path(path: str, roots: tuple[_Win, ...]) -> _Win:
