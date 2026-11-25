@@ -32,7 +32,7 @@ from libwrite_support import (
 from aar.media.probe import timecode_frames
 from aar.plan.model import EditPlan
 from aar.plan.profile import parse_profile
-from aar.recipes.ccn.handoff import handoff_notes
+from aar.recipes.ccn.handoff import handoff_notes, library_lines, refusal_lines
 from aar.recipes.ccn.library_handoff import hand_over, project_name
 from aar.recipes.ccn.params import LibraryParam
 
@@ -173,6 +173,9 @@ def test_a_plan_that_states_its_start_timecode_is_checked_against_the_facts(root
         ("seed_missing", "bad_seed"),
         ("seed_not_sqlite", "bad_seed"),
         ("library_link_out", "path_outside_media_root"),
+        ("library_link_to_sibling", "path_outside_media_root"),
+        ("facts_link_to_sibling", "path_outside_media_root"),
+        ("template_outside", "path_outside_media_root"),
         ("read_only", "library_unwritable"),
     ],
 )
@@ -205,6 +208,22 @@ def test_every_fault_at_export_time_is_a_typed_refusal(root: Path, damage: str, 
         outside = root.parent / "outside"
         library.rename(outside)
         library.symlink_to(outside, target_is_directory=True)
+    elif damage in ("library_link_to_sibling", "facts_link_to_sibling", "template_outside"):
+        # A folder beside the media root whose name starts with the root's: outside it.
+        sibling = root.with_name(root.name + "-old")
+        sibling.mkdir()
+        if damage == "library_link_to_sibling":
+            library.rename(sibling / "Library")
+            library.symlink_to(sibling / "Library", target_is_directory=True)
+        elif damage == "facts_link_to_sibling":
+            facts.rename(sibling / "facts.jsonl")
+            facts.symlink_to(sibling / "facts.jsonl")
+        else:
+            template = root / "template.db"
+            seed_copy = sibling / "Project.db"
+            seed_copy.write_bytes(seed.read_bytes())
+            template.symlink_to(seed_copy)
+            lib = lib.model_copy(update={"templates": [str(template)]})
     elif damage == "read_only":
         projects = library / "Resolve Projects"
         for folder in [projects, *projects.rglob("*")]:
@@ -248,6 +267,11 @@ def test_the_opt_ins_default_off(root: Path) -> None:
         {"folder": "/media/lib\x00x"},
         {"folder": "/media/li\nb"},
         {"folder": "/elsewhere/lib"},
+        {"folder": "/media2/Library"},
+        {"folder": "/media-old"},
+        {"seed": "/media2/seeds/Project.db"},
+        {"facts": "/mediafacts.jsonl"},
+        {"templates": ["/media2/t.db"]},
         {"seed": "/media/seeds/Project.txt"},
         {"seed": "C:\\seed\\Project.db"},
         {"facts": "/media/../facts.jsonl"},
@@ -335,17 +359,59 @@ def test_the_notes_quote_a_placed_and_a_refused_hand_off() -> None:
         "label": "Shared Library",
         "error": {"code": "not_a_library", "message": "no Users folder", "hint": "give the folder"},
     }
-    common = dict(
+    common: dict[str, Any] = dict(
         project="Show", timeline="Cut 1", round_=1, report={}, report_id="r", loudness=None
     )
-    text = handoff_notes(**common, library=placed)  # type: ignore[arg-type]
+    text = handoff_notes(**common, library=library_lines(placed))
     assert '"Shared Library" as the project "Show - Cut 1 r1"' in text
     assert "Saving is all that" in text and "Not yet seen working in Resolve" in text
-    text = handoff_notes(**common, library=refused)  # type: ignore[arg-type]
+    # the library user, when the record names one
+    assert 'choose the project library "Shared Library" (user "guest").' in text
+    assert "(user" not in "\n".join(library_lines({**placed, "user": None}))
+    # nothing listed that is not there
+    for absent in ("without full evidence", "leaves out", "will NOT pick up"):
+        assert absent not in text
+    text = handoff_notes(**common, library=library_lines(refused))
     assert "LIBRARY PROJECT: NOT WRITTEN" in text and "no Users folder [not_a_library]" in text
     assert "To fix: give the folder" in text
     # without a library the notes are what they were
-    assert "LIBRARY" not in handoff_notes(**common)  # type: ignore[arg-type]
+    assert "LIBRARY" not in handoff_notes(**common)
+    assert handoff_notes(**common) == handoff_notes(**common, library=None)
     # a value from the run cannot forge a heading: one line, quoted
     forged = dict(placed, project_name="x\r\nSOUND\r\n")
-    assert "\r\nSOUND\r\n\r\n" not in handoff_notes(**common, library=forged).split("OR OPEN")[1]  # type: ignore[arg-type]
+    forged_text = handoff_notes(**common, library=library_lines(forged))
+    assert "\r\nSOUND\r\n\r\n" not in forged_text.split("OR OPEN")[1]
+
+
+def test_the_notes_name_unverified_media_details_left_out_and_pickup_off() -> None:
+    record = {
+        "status": "placed",
+        "label": "Shared Library",
+        "project_name": "Show - Cut 1 r1",
+        "timeline": "Cut 1",
+        "operations_not_opened": [],
+        "unverified_media": ["E:\\Show\\a.mp4", "E:\\Show\\b.mp4"],
+        "not_carried": 3,
+        "pickup": "off: the placed Project.db could not be hashed (see cleanup)",
+    }
+    lines = library_lines(record)
+    assert (
+        "  Clips written without full evidence for their kind (check they play and link): "
+        "E:\\Show\\a.mp4, E:\\Show\\b.mp4."
+    ) in lines
+    assert (
+        "  The library project leaves out 3 plan detail(s) (gain, framing, labels, notes, "
+        "markers, captions): redo them in Resolve as for the FCPXML."
+    ) in lines
+    assert (
+        "  The hub will NOT pick up saves of it: off: the placed Project.db could not be hashed "
+        "(see cleanup)."
+    ) in lines
+    assert not any("Not yet seen working" in line for line in lines)
+    # the owner's note line: the FCPXML stays the dependable route
+    assert "  Until library projects have been confirmed in Resolve, the FCPXML stays the " in (
+        "\n".join(lines)
+    )
+    assert refusal_lines("Lib", "c", "m", "h") == library_lines(
+        {"status": "refused", "label": "Lib", "error": {"code": "c", "message": "m", "hint": "h"}}
+    )

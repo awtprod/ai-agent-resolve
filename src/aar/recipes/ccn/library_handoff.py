@@ -8,7 +8,9 @@ project folder named for the show, the timeline and the round. The FCPXML hand-o
 exactly as before; this is an addition until the owner has confirmed library projects in
 Resolve, so nothing here may fail the step: every refusal comes back as a typed record
 (``status: "refused"`` with the export's code, message and hint) that the notes and the step's
-result carry as a warning.
+result carry as a warning. Anything else this module raises is caught by the export step's one
+library guard (:func:`aar.recipes.ccn.steps.library_route`), which turns it into the refusal
+``library_failed``; this module does not catch broadly itself.
 
 What was placed is recorded in the step's runner-written result (``library_handoff``): the
 library, the user, the project folder's path below the library, the project id, the timeline,
@@ -135,9 +137,12 @@ def hand_over(
     round_: int,
     transcript: Transcript | None,
     laughs: LaughMap | None,
+    progress: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Write ``plan`` into the library; ``(record, export report or None)``. Never raises for
-    the library's, the seed's, the facts' or the cut's faults: those are a refused record."""
+    """Write ``plan`` into the library; ``(record, export report or None)``. The library's, the
+    seed's, the facts' and the cut's faults are a refused record; anything else raises, for the
+    export step's library guard. Once a project is placed, ``progress["placed"]`` names its
+    folder below the library (so a later failure can say what was left there)."""
     from aar.plan.export.library import export_library
 
     label = lib.label or Path(lib.folder).name
@@ -179,16 +184,6 @@ def hand_over(
             last = exc
             if exc.code != "project_exists":
                 break
-        except Exception as exc:  # never lose the FCPXML hand-off to a library fault
-            return (
-                _refused(
-                    lib,
-                    "library_failed",
-                    f"writing the library project failed ({type(exc).__name__}: {exc})"[:2000],
-                    "report it with the run's id; the FCPXML hand-off is unaffected",
-                ),
-                None,
-            )
     if result is None:
         assert last is not None
         message, hint = last.message, last.fix_hint
@@ -206,6 +201,8 @@ def hand_over(
         return _refused(lib, last.code, message, hint), None
     report = result.report
     placed = result.result.placed
+    if progress is not None:
+        progress["placed"] = str(placed.folder)
     digest = report["project"].get("sha256")
     record: dict[str, Any] = {
         "status": "placed",

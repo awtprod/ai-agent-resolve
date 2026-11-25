@@ -17,7 +17,6 @@ difference). A kind with one member cannot be checked and is listed ``single``. 
 
 from __future__ import annotations
 
-import json
 import os
 import stat
 from collections import defaultdict
@@ -31,7 +30,13 @@ from aar.drp.library import LibraryOptions
 from aar.drp.mediapool import blobtree as bt
 from aar.drp.mediapool.author import Placement, Template, author
 from aar.drp.mediapool.errors import MediaPoolError
-from aar.drp.mediapool.facts import MAX_FACTS_BYTES, MediaFacts, facts_from_json, parse_local_time
+from aar.drp.mediapool.facts import (
+    MAX_FACTS_BYTES,
+    MediaFacts,
+    facts_from_json,
+    parse_json_line,
+    parse_local_time,
+)
 from aar.drp.mediapool.fields import compare, media_class
 from aar.drp.mediapool.kinds import (
     ENVELOPE_PROPERTIES,
@@ -155,7 +160,12 @@ def load_facts(
     out: dict[str, MediaFacts] = {}
     total = 0
     with stream:
-        for number, line in enumerate(stream, 1):
+        for number in range(1, MAX_FACT_LINES + 2):
+            # One line at most MAX_FACTS_BYTES (+1 to tell a longer one): a line is never read
+            # whole into memory past the bound, even from a file that keeps growing.
+            line = stream.readline(MAX_FACTS_BYTES + 1)
+            if not line:
+                break
             total += len(line)
             if total > MAX_FACTS_FILE:
                 raise MediaPoolError(
@@ -166,14 +176,18 @@ def load_facts(
                     "bad_facts", f"{path} has more than {MAX_FACT_LINES} lines", "split it"
                 )
             if len(line) > MAX_FACTS_BYTES:
-                raise MediaPoolError("bad_facts", f"{path}:{number} is too long", "measure again")
+                raise MediaPoolError(
+                    "bad_facts",
+                    f"{path}:{number} is longer than {MAX_FACTS_BYTES} bytes",
+                    "measure again",
+                )
             if not line.strip():
                 continue
             try:
-                data = json.loads(line)
-            except ValueError as exc:
+                data = parse_json_line(line)
+            except ValueError as exc:  # not JSON, or nested past MAX_FACTS_DEPTH
                 raise MediaPoolError(
-                    "bad_facts", f"{path}:{number} is not JSON ({exc})", "measure again"
+                    "bad_facts", f"{path}:{number} is not usable JSON ({exc})", "measure again"
                 ) from None
             if isinstance(data, dict) and "error" in data:
                 failed = _failure_line(data)

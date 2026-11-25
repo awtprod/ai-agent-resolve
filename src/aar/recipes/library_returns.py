@@ -8,13 +8,16 @@ beside the ``.drt`` sweep of :mod:`aar.recipes.desktop_returns`) checks every ha
 review is still open (the run neither done nor cancelled, the hand-off's round the current one,
 its export attempt not superseded, and no decision on that round's gate review):
 
-1. The project folder is reached from the library folder one component at a time, without
-   following a link below the library (``O_NOFOLLOW``), and the library must still lead inside
-   the media root.
+1. The library must still lead (``realpath``) inside the media root, and is then opened from
+   the media root's descriptor one component of that resolved path at a time, and the project
+   folder from the library's one component at a time, never following a link (``O_NOFOLLOW``):
+   a link swapped in after the check is refused, not followed.
 2. A ``Project.db-journal`` or ``-wal`` beside the file is a save in progress: ``busy``.
 3. A settled copy (:func:`aar.media.settle.copy_settled`: unchanged for 2 s and while copied,
    at most :attr:`Limits.db_bytes`) is made into ``<AAR_WORK_DIR>/aar-library-snapshots``, the
    hub's own disk, never the system temporary folder; the journal is checked again after it.
+   A file this worker has found not settled in :attr:`Limits.busy_after` sweeps in a row (one
+   rewritten all the time) is reported ``busy`` (and looked at again in each sweep).
 4. Its SHA-256 equal to the placed file's: nothing to do. Equal to a save already returned, or
    to one already reported as a condition: nothing to do.
 5. Read with the timeline import's reader, refusing a file of any other project id
@@ -31,11 +34,15 @@ its export attempt not superseded, and no decision on that round's gate review):
 condition: a condition about a file's content (``project_replaced``, ``damaged``,
 ``timeline_missing``, ``too_large``) once per content hash, and one about the place
 (``library_missing``, ``not_a_library``, ``project_missing``, ``path_refused``,
-``path_outside_media_root``, ``busy``, ``unsupported_platform``) once between two returns.
+``path_outside_media_root``, ``busy``, ``unsupported_platform``, ``pickup_failed``) once per
+cause between two returns: each place where a condition is raised names its cause (a link
+below the library and a ``Project.db`` that is not a regular file are both ``path_refused``,
+two events), recorded as the event's ``cause``.
 They never raise: the sweep goes on with the next project, and the same project is looked at
 again in the next sweep (a file whose content already gave a condition is not read again).
 
-**Bounds** per sweep (:class:`Limits`): projects checked, bytes copied, seconds spent; a project
+**Bounds** per sweep (:class:`Limits`): projects checked, bytes copied (a copy that is then
+refused counts too), seconds spent; a project
 larger than the bytes left waits for a later sweep, and the order the hand-offs are taken in
 turns every minute, so one large, slow or hostile project cannot keep the others waiting.
 Snapshots a killed worker left in the snapshot folder (``.aar-pickup-*`` and the reader's
@@ -95,6 +102,8 @@ class Limits:
     settle_seconds: float = 2.0
     #: A snapshot older than this in the snapshot folder was left by a killed worker.
     stale_seconds: float = 3600.0
+    #: Sweeps in a row a file may be found not settled before it is reported ``busy``.
+    busy_after: int = 10
 
 
 class Handoff(BaseModel):
@@ -124,9 +133,21 @@ class _Found:
 
 
 class _Condition(Exception):
-    def __init__(self, code: str, message: str, hint: str, sha256: str | None = None) -> None:
+    """A condition to report; ``cause`` tells apart conditions of one code with different
+    causes (each raise site names its own; module docstring)."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        hint: str,
+        sha256: str | None = None,
+        *,
+        cause: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code, self.message, self.hint, self.sha256 = code, message, hint, sha256
+        self.cause = cause or code
 
 
 @dataclass
@@ -268,10 +289,74 @@ def sweep_snapshots(folder: Path, *, stale_seconds: float, now: float) -> tuple[
 # --------------------------------------------------------------------------- one project
 
 
+def _open_library(
+    handoff: Handoff, root: str | None, real: str, stack: contextlib.ExitStack[Any]
+) -> int:
+    """A descriptor of the library folder: its resolved path ``real`` (checked inside the media
+    root) opened from the media root's descriptor one component at a time without following a
+    link, so a link swapped in after the check is refused rather than followed. Without a
+    media root there is no boundary to keep: ``real`` itself is opened."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
+    if root is None:
+        start, below = real, []
+    else:
+        start = root
+        below = [part for part in real[len(root.rstrip("/")) :].split("/") if part]
+    try:
+        fd = os.open(start, os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError:
+        raise _Condition(
+            "library_missing",
+            f"the library folder {handoff.library!r} is not there",
+            "reconnect or restore the library folder on the hub's share",
+            cause="not_there",
+        ) from None
+    except OSError as exc:
+        raise _Condition(
+            "library_missing",
+            f"the library folder {handoff.library!r} cannot be opened ({exc.strerror})",
+            "check the library folder on the hub's share and its permissions",
+            cause="cannot_open",
+        ) from None
+    stack.callback(os.close, fd)
+    for part in below:
+        try:
+            fd = os.open(part, flags, dir_fd=fd)
+        except OSError as exc:
+            try:
+                is_link = stat.S_ISLNK(os.stat(part, dir_fd=fd, follow_symlinks=False).st_mode)
+            except OSError:
+                is_link = False
+            if exc.errno == errno.ELOOP or is_link:
+                raise _Condition(
+                    "path_refused",
+                    f"the library folder {handoff.library!r} changed while it was opened "
+                    f"({part!r} on its way is now a link); it is not followed",
+                    "put the library folder back as it was, inside the media root",
+                    cause="library_relinked",
+                ) from None
+            if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+                raise _Condition(
+                    "library_missing",
+                    f"the library folder {handoff.library!r} is not there",
+                    "reconnect or restore the library folder on the hub's share",
+                    cause="not_there",
+                ) from None
+            raise _Condition(
+                "library_missing",
+                f"the library folder {handoff.library!r} cannot be opened ({exc.strerror})",
+                "check the library folder on the hub's share and its permissions",
+                cause="cannot_open",
+            ) from None
+        stack.callback(os.close, fd)
+    return fd
+
+
 @contextlib.contextmanager
 def _project_dir(handoff: Handoff) -> Iterator[int]:
-    """A descriptor of the hand-off's project folder, reached without following a link below
-    the library folder; a :class:`_Condition` when it cannot be reached."""
+    """A descriptor of the hand-off's project folder, reached without following a link from
+    the media root down (:func:`_open_library`, then the recorded parts); a
+    :class:`_Condition` when it cannot be reached."""
     from aar.recipes.ccn.params import media_root
 
     nofollow, directory = getattr(os, "O_NOFOLLOW", None), getattr(os, "O_DIRECTORY", None)
@@ -291,26 +376,15 @@ def _project_dir(handoff: Handoff) -> Iterator[int]:
         )
     flags = os.O_RDONLY | nofollow | directory
     with contextlib.ExitStack() as stack:
-        try:
-            fd = os.open(handoff.library, os.O_RDONLY | directory)
-        except FileNotFoundError:
-            raise _Condition(
-                "library_missing",
-                f"the library folder {handoff.library!r} is not there",
-                "reconnect or restore the library folder on the hub's share",
-            ) from None
-        except OSError as exc:
-            raise _Condition(
-                "library_missing",
-                f"the library folder {handoff.library!r} cannot be opened ({exc.strerror})",
-                "check the library folder on the hub's share and its permissions",
-            ) from None
-        stack.callback(os.close, fd)
+        fd = _open_library(handoff, root, real, stack)
         for n, part in enumerate(handoff.parts):
             last = n == len(handoff.parts) - 1
             if part in ("", ".", "..") or "/" in part or "\x00" in part:
                 raise _Condition(
-                    "path_refused", f"the recorded path holds {part!r}", "hand the cut over again"
+                    "path_refused",
+                    f"the recorded path holds {part!r}",
+                    "hand the cut over again",
+                    cause="bad_part",
                 )
             try:
                 fd = os.open(part, flags, dir_fd=fd)
@@ -325,6 +399,7 @@ def _project_dir(handoff: Handoff) -> Iterator[int]:
                         f"{'/'.join(handoff.parts[: n + 1])!r} below the library is a link; "
                         "links below a library are never followed",
                         "replace the link with the folder itself",
+                        cause=f"link_below_library:{n}",
                     ) from None
                 if last and exc.errno in (errno.ENOENT, errno.ENOTDIR):
                     raise _Condition(
@@ -332,12 +407,14 @@ def _project_dir(handoff: Handoff) -> Iterator[int]:
                         f"the project folder {handoff.folder!r} is not in the library any "
                         "more (deleted or renamed)",
                         "restore the project folder under its name, or hand the cut over again",
+                        cause="folder_gone",
                     ) from None
                 raise _Condition(
                     "not_a_library",
                     f"{'/'.join(handoff.parts[: n + 1])!r} cannot be opened in the library "
                     f"({exc.strerror})",
                     "check the library's Users and Projects folders",
+                    cause=f"cannot_open:{n}",
                 ) from None
             stack.callback(os.close, fd)
         yield fd
@@ -353,11 +430,12 @@ def _side_file(folder_fd: int) -> str | None:
     return None
 
 
-def _busy(what: str) -> _Condition:
+def _busy(what: str, cause: str) -> _Condition:
     return _Condition(
         "busy",
         f"Resolve is saving the project ({what})",
         "nothing to do: the next sweep looks again once the save has finished",
+        cause=cause,
     )
 
 
@@ -373,6 +451,21 @@ class _Snapshot:
 #: for ``settle_seconds`` across sweeps counts as settled even when its modification time runs
 #: ahead of the hub's clock (a share's clock), as the library reader decides it.
 _WATCHED: dict[str, tuple[tuple[int, int, int, int], float]] = {}
+#: How many sweeps in a row this worker process found each hand-off's file not settled.
+_UNSETTLED: dict[str, int] = {}
+
+
+def _not_settled(op_node: str, limits: Limits) -> None:
+    """Count one more sweep that found the file not settled; ``busy`` once that reaches
+    :attr:`Limits.busy_after` (a file rewritten all the time; module docstring)."""
+    if len(_UNSETTLED) > 10_000:
+        _UNSETTLED.clear()
+    count = _UNSETTLED.get(op_node, 0) + 1
+    _UNSETTLED[op_node] = count
+    if count >= limits.busy_after:
+        raise _busy(
+            f"its file has not stopped changing in {count} sweeps in a row", "never_settles"
+        )
 
 
 def _settled(op_node: str, st: os.stat_result, limits: Limits, now: float, clock: float) -> Any:
@@ -401,12 +494,14 @@ def _snapshot(
     folder_fd: int,
     target_dir: Path,
     limits: Limits,
-    budget: int,
+    sweep: Sweep,
     times: tuple[float, float],
 ) -> _Snapshot | None:
     """A settled private copy of the project's ``Project.db``; None when it does not fit in
-    ``budget`` bytes this sweep, or has not settled yet (a save a moment ago: the next sweep
-    looks again, with nothing reported). The caller removes it."""
+    the bytes the sweep has left, or has not settled yet (a save a moment ago: the next sweep
+    looks again, with nothing reported, until :attr:`Limits.busy_after` sweeps in a row). The
+    bytes copied count against the sweep's budget whether the copy is taken or refused. The
+    caller removes it."""
     try:
         st = os.stat("Project.db", dir_fd=folder_fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -414,32 +509,37 @@ def _snapshot(
             "project_missing",
             f"the project folder {handoff.folder!r} holds no Project.db",
             "restore the project, or hand the cut over again",
+            cause="no_project_db",
         ) from None
     if not stat.S_ISREG(st.st_mode):
         raise _Condition(
             "path_refused",
             f"the Project.db of {handoff.folder!r} is not a regular file",
             "a project's Project.db must be the file itself, not a link",
+            cause="db_not_regular",
         )
     side = _side_file(folder_fd)
     if side is not None:
-        raise _busy(f"{side} is beside it")
+        raise _busy(f"{side} is beside it", "side_file")
     if st.st_size > limits.db_bytes:
         raise _Condition(
             "too_large",
             f"the saved project is {st.st_size} bytes, over the pickup's {limits.db_bytes}",
             "check the project; a cut's project is far smaller",
+            cause="over_bound",
         )
-    if st.st_size > budget:
+    if st.st_size > limits.bytes - sweep.bytes:
         return None
     ready, quiet = _settled(op_node, st, limits, *times)
     if not ready:
+        _not_settled(op_node, limits)
         return None
+    _UNSETTLED.pop(op_node, None)
     name = f"{SNAPSHOT_PREFIXES[0]}{os.getpid()}-{secrets.token_hex(6)}.db"
     path = target_dir / name
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
-        with os.fdopen(fd, "wb") as target:
+        with os.fdopen(fd, "wb") as target, _charged(target, sweep, st.st_size):
             try:
                 copied = copy_settled(
                     Path("Project.db"),
@@ -453,19 +553,39 @@ def _snapshot(
                 )
             except TooLargeError as exc:
                 raise _Condition(
-                    "too_large", str(exc), "check the project; a cut's project is far smaller"
+                    "too_large",
+                    str(exc),
+                    "check the project; a cut's project is far smaller",
+                    cause="grew_past_bound",
                 ) from None
             except ValueError as exc:  # a link or not a regular file (ReceiptError)
-                raise _Condition("path_refused", str(exc), "check the project folder") from None
+                raise _Condition(
+                    "path_refused", str(exc), "check the project folder", cause="copy_refused"
+                ) from None
         if copied is None:
-            raise _busy("it changed while it was copied")
+            raise _busy("it changed while it was copied", "changed_while_copied")
         side = _side_file(folder_fd)
         if side is not None:
-            raise _busy(f"{side} appeared while it was copied")
+            raise _busy(f"{side} appeared while it was copied", "side_file_after_copy")
     except BaseException:
         path.unlink(missing_ok=True)
         raise
     return _Snapshot(path, copied.sha256, copied.size)
+
+
+@contextlib.contextmanager
+def _charged(target: Any, sweep: Sweep, size: int) -> Iterator[None]:
+    """Count what was written to ``target`` against the sweep's bytes, on every path (a copy
+    refused after it was made has cost its bytes too); the file's ``size`` when the position
+    cannot be told."""
+    try:
+        yield
+    finally:
+        try:
+            spent = target.tell()
+        except (OSError, ValueError):
+            spent = size
+        sweep.bytes += spent
 
 
 def _read(snapshot: _Snapshot, handoff: Handoff, target_dir: Path, stop_at: float) -> Any:
@@ -503,7 +623,7 @@ def _read(snapshot: _Snapshot, handoff: Handoff, target_dir: Path, stop_at: floa
                 sha,
             ) from None
         if exc.code == "library_busy":
-            raise _busy("the reader found it being saved") from None
+            raise _busy("the reader found it being saved", "reader_busy") from None
         library_code = exc.details.get("library_code")
         if library_code == "too_large":
             raise _Condition("too_large", exc.message, exc.fix_hint, sha) from None
@@ -513,11 +633,11 @@ def _read(snapshot: _Snapshot, handoff: Handoff, target_dir: Path, stop_at: floa
 
 
 def _key_condition(
-    project_id: str, op_node: str, generation: int, code: str, sha: str | None
+    project_id: str, op_node: str, generation: int, code: str, sha: str | None, cause: str = ""
 ) -> str:
     if code in CONTENT_CONDITIONS and sha is not None:
         return f"library-pickup:{project_id}:{op_node}:{code}:{sha}"
-    return f"library-pickup:{project_id}:{op_node}:{generation}:{code}"
+    return f"library-pickup:{project_id}:{op_node}:{generation}:{code}:{cause}"
 
 
 def _report(log: EventLog, found: _Found, generation: int, cond: _Condition, sweep: Sweep) -> None:
@@ -527,7 +647,7 @@ def _report(log: EventLog, found: _Found, generation: int, cond: _Condition, swe
     project_id = found.event.project_id
     assert project_id is not None
     h = found.handoff
-    key = _key_condition(project_id, found.op_node, generation, cond.code, cond.sha256)
+    key = _key_condition(project_id, found.op_node, generation, cond.code, cond.sha256, cond.cause)
     sweep.conditions.append(cond.code)
     if log.get_by_idempotency_key(key) is not None:
         return
@@ -540,6 +660,7 @@ def _report(log: EventLog, found: _Found, generation: int, cond: _Condition, swe
         "project_id": h.project_id,
         "timeline": h.timeline,
         "condition": cond.code,
+        "cause": cond.cause[:200],
         "message": cond.message[:2000],
         "fix_hint": cond.hint[:1000],
     }
@@ -588,13 +709,12 @@ def _check_one(
                 folder_fd,
                 target_dir / PICKUP_AREA,
                 limits,
-                limits.bytes - sweep.bytes,
+                sweep,
                 times,
             )
         if snapshot is None:
             sweep.deferred += 1
             return
-        sweep.bytes += snapshot.size
         if snapshot.sha256 == h.placed_sha256:
             sweep.unchanged += 1
             return
@@ -639,7 +759,10 @@ def _check_one(
             key=key,
             actor=actor,
         )
-        sweep.returned += stored is not None
+        if stored is result:
+            sweep.returned += 1
+        elif stored is not None:  # another worker recorded this save first: not twice
+            sweep.repeated += 1
     except _Condition as cond:
         _report(log, found, generation, cond, sweep)
     except (OSError, ValueError, ExportError) as exc:  # the hub's own disk or a bad record
@@ -651,6 +774,7 @@ def _check_one(
                 "pickup_failed",
                 f"{type(exc).__name__}: {exc}"[:2000],
                 "check the hub's work folder and artifact store",
+                cause=type(exc).__name__,
             ),
             sweep,
         )

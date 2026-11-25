@@ -107,20 +107,32 @@ def _quoted(value: Any) -> str:
     return f'"{_line(value)}"'
 
 
-def _library(record: Mapping[str, Any]) -> list[str]:
-    """The library hand-off (S25d), in the owner's terms: which library and project to open,
-    and that saving is all; or why the cut is not in the library."""
+def refusal_lines(label: str, code: str, message: str, hint: str) -> list[str]:
+    """Why the cut is not in the library (S25d): the export's code, message and hint, and that
+    the FCPXML is unaffected. Plain text operations only: the export step's library guard uses
+    it for a failure it caught (:func:`aar.recipes.ccn.steps.library_route`)."""
+    return [
+        "",
+        "LIBRARY PROJECT: NOT WRITTEN",
+        f"  The cut was not written into the project library {_quoted(label)}:",
+        f"  {_line(message)} [{_line(code)}]",
+        f"  To fix: {_line(hint)}",
+        "  Nothing is lost: import the FCPXML beside this file as usual (IMPORT above).",
+    ]
+
+
+def library_lines(record: Mapping[str, Any]) -> list[str]:
+    """The library hand-off's section of the notes (S25d), in the owner's terms: which library
+    and project to open, and that saving is all; or why the cut is not in the library."""
     label = _quoted(record.get("label") or record.get("library") or "the project library")
     if record.get("status") != "placed":
         error = record.get("error") if isinstance(record.get("error"), Mapping) else {}
-        return [
-            "",
-            "LIBRARY PROJECT: NOT WRITTEN",
-            f"  The cut was not written into the project library {label}:",
-            f"  {_line(error.get('message', ''))} [{_line(error.get('code', ''))}]",
-            f"  To fix: {_line(error.get('hint', ''))}",
-            "  Nothing is lost: import the FCPXML beside this file as usual (IMPORT above).",
-        ]
+        return refusal_lines(
+            str(record.get("label") or record.get("library") or "the project library"),
+            str(error.get("code", "")),
+            str(error.get("message", "")),
+            str(error.get("hint", "")),
+        )
     user = record.get("user")
     lines = [
         "",
@@ -168,11 +180,13 @@ def handoff_notes(
     report: Mapping[str, Any],
     report_id: str,
     loudness: Mapping[str, Any] | None,
-    library: Mapping[str, Any] | None = None,
+    library: Sequence[str] | None = None,
 ) -> str:
     """The notes for one exported round, from the export's ``report`` (stored as artifact
     ``report_id``) and the render step's ``loudness`` output; with ``library``, the library
-    hand-off's record (S25d). CRLF lines: it is read on Windows."""
+    hand-off's section, already made (:func:`library_lines`, S25d: the export step makes it
+    inside its library guard, so nothing here can fail for the library). CRLF lines: it is read
+    on Windows."""
     lines = [
         f"HANDOFF NOTES: {_line(timeline)}, round {round_} (project {_line(project)})",
         "",
@@ -246,7 +260,7 @@ def handoff_notes(
     lines += _section("IMPORT", [f"  {n}. {_line(s)}" for n, s in enumerate(steps, start=1)], 0, "")
 
     if library is not None:
-        lines += _library(library)
+        lines += library
 
     if report.get("return_directory"):
         lines += [
@@ -271,4 +285,11 @@ def handoff_notes(
     return "\r\n".join(lines) + "\r\n"
 
 
-__all__ = ["MAX_LISTED", "NOTES_MIME", "NOTES_SUFFIX", "handoff_notes"]
+__all__ = [
+    "MAX_LISTED",
+    "NOTES_MIME",
+    "NOTES_SUFFIX",
+    "handoff_notes",
+    "library_lines",
+    "refusal_lines",
+]

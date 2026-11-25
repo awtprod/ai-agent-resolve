@@ -86,6 +86,21 @@ record per save. Keep the project's folder name and the timeline's name as they 
 renamed or deleted, a timeline renamed, or another project saved under the same folder name is
 reported to the agent and not imported.
 
+What you will see for a few kinds of save:
+
+- **A save that brings the project back to how it was at an earlier save** (you undid your
+  edits and saved again), **or back to how the agent placed it**: nothing new is recorded. The
+  hub tells saves apart by the file's content, and it has already seen that content. The
+  agent's newest record is then still the later save you undid, not what is in the project
+  now; tell the agent if you went back.
+- **A save that changes nothing in the timeline** (you renamed the project inside Resolve,
+  added a second timeline, or saved without changing anything that ends up in the file
+  differently): it is recorded as a save like any other, with no change to the cut (every
+  segment "unchanged").
+- **A project that keeps being saved** (Resolve's auto-save every few seconds): the hub waits
+  for the file to stay still for a moment; if it never does for about ten minutes, the agent is
+  told the project is busy, once, and the hub keeps looking.
+
 ### For an agent
 
 - **Measure the media on the edit PC first.** The library writer authors each clip from facts
@@ -123,3 +138,19 @@ library project cannot carry yet: such a cut is refused and goes by FCPXML only.
 transitions, fades, other tracks, gain, framing, markers and captions are not written (the
 notes count the plan details left out). Saves are picked up only while the round's review is
 open; after a decision or a later round they are not. The project's file is read up to 256 MiB.
+
+Nothing the library route does can lose the FCPXML hand-off: any fault of the library, the seed,
+the facts file or the hub's own disk while writing the library project is the refusal
+`library_failed` (with the error) in the notes and the step's result, and the FCPXML, video and
+notes are published as usual. One limit is not handled yet (S25d-f5): a library, seed or facts
+file on a share that stops answering (a hung mount) holds the export step before anything is
+published, and holds the worker's pickup, for as long as the share does not answer. If a round's
+export does not finish, check the share.
+
+**The facts file.** `aar media facts` lists, in its last printed line, what a folder held that
+it did not measure (hidden files, other suffixes such as `.mkv` or `.jpg`, subfolders, broken
+links) and why; name such a file to measure it anyway. A folder with nothing to measure is
+refused (`no_media`, exit 2). A whole run stops after `--deadline` seconds (30 minutes by
+default) and Ctrl+C stops it too (exit 130); either way the file is written with what was
+measured, and the rest are listed. Its printed lines are ASCII, so any console shows them; the
+file itself is UTF-8.

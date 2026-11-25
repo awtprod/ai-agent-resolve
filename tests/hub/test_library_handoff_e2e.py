@@ -202,3 +202,27 @@ def test_with_media_allowed_the_unopened_operations_are_the_refusal(ccn_env: Ccn
     assert handoff["error"]["code"] == "operation_not_opened", handoff["error"]
     notes = Path(export["copy"]["handoff_notes"]).read_text(encoding="utf-8")
     assert "[operation_not_opened]" in notes
+
+
+def test_a_library_fault_at_export_time_never_fails_the_step(ccn_env: CcnEnv) -> None:
+    """F1: the snapshot folder cannot be made (a regular file holds its name). The export step
+    is done, the FCPXML, video and notes are published, and the failure is the refusal
+    ``library_failed`` naming the error, in the step's result and the notes."""
+    from aar.recipes.ccn.library_handoff import SNAPSHOT_AREA
+
+    env = ccn_env
+    (env.work / SNAPSHOT_AREA).write_bytes(b"a file where the snapshot folder goes")
+    run, export = _run(env)
+    handoff = export["library_handoff"]
+    assert handoff["status"] == "refused"
+    assert handoff["error"]["code"] == "library_failed"
+    assert "FileExistsError" in handoff["error"]["message"]
+    assert [w["code"] for w in export["warnings"]] == ["library_library_failed"]
+    copy = export["copy"]
+    assert Path(copy["fcpxml"]).is_file() and Path(copy["review_mp4"]).is_file()
+    notes = Path(copy["handoff_notes"]).read_text(encoding="utf-8")
+    assert "LIBRARY PROJECT: NOT WRITTEN" in notes and "[library_failed]" in notes
+    assert "FileExistsError" in notes
+    assert recipe_status(env.hub.log, run)["status"] == "active"
+    (env.work / SNAPSHOT_AREA).unlink()
+    assert sweep_once(env).checked == 0  # nothing placed, nothing watched

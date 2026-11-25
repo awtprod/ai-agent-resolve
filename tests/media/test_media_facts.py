@@ -82,8 +82,18 @@ def test_the_facts_parse_with_the_hub_model_and_a_bad_file_is_listed(
         "failed": 1,
         "files": 3,
         "ok": False,
+        "not_in_file": 0,
         "repeated_paths_dropped": 0,
         "written": str(out),
+        # nothing in the folder is skipped silently: what is not measured is listed, and why
+        "skipped": {
+            "count": 2,
+            "by_reason": {"hidden": 1, "not_a_media_suffix:.txt": 1},
+            "first": [
+                {"path": str(show / ".hidden.mp4"), "reason": "hidden"},
+                {"path": str(show / "notes.txt"), "reason": "not_a_media_suffix:.txt"},
+            ],
+        },
     }
     records = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     assert [r["path"] for r in records] == [f"{PC}\\a.mov", f"{PC}\\B.mp4", f"{PC}\\broken.mov"]
@@ -146,7 +156,7 @@ def test_the_caps_hold(show: Path, tmp_path: Path, capsys: pytest.CaptureFixture
         "output_cap",
         "output_cap",
     ]
-    assert len(out.read_bytes()) < 1000
+    assert len(out.read_bytes()) <= 300  # error lines count against the cap too
     # A probe that runs past its timeout is killed and listed.
     out = tmp_path / "slow.jsonl"
     code, lines = _run(
@@ -180,17 +190,20 @@ def test_odd_files_are_listed_and_paths_need_a_pc_name(
 
 
 def test_pc_paths_and_times() -> None:
-    files, repeated = targets(
+    selection = targets(
         [Path("/media/show/Proxy/A.mp4"), Path("/media/show/proxy2/b.mov")],
         [("/media/show", "E:\\Show"), ("/media/show/proxy2", "\\\\nas\\cams\\P2")],
     )
     # in the order of the PC paths, case folded; the longest --pc-folder that holds a file wins
-    assert [t.pc_path for t in files] == ["\\\\nas\\cams\\P2\\b.mov", "E:\\Show\\Proxy\\A.mp4"]
-    assert repeated == 0
-    files, repeated = targets(
+    assert [t.pc_path for t in selection.files] == [
+        "\\\\nas\\cams\\P2\\b.mov",
+        "E:\\Show\\Proxy\\A.mp4",
+    ]
+    assert selection.repeated == 0
+    selection = targets(
         [Path("/media/show/A.mp4"), Path("/media/show/A.mp4")], [("/media/show", "E:\\Show")]
     )
-    assert len(files) == 1 and repeated == 1
+    assert len(selection.files) == 1 and selection.repeated == 1
     assert utc_text(1_773_392_706_123_456_789) == "2026-03-13T09:05:06.1234567Z"
     text = local_text(1_773_392_706)
     from aar.drp.mediapool.facts import parse_local_time
@@ -216,6 +229,43 @@ def test_the_hub_loader_refuses_bad_error_lines_and_never_blocks(tmp_path: Path)
         with pytest.raises(MediaPoolError) as caught:
             load_facts(fifo)
         assert "regular" in caught.value.message
+
+
+def test_the_hub_loader_bounds_nesting_and_line_length(tmp_path: Path) -> None:
+    """F2: a deeply nested line is a typed ``bad_facts`` (never a ``RecursionError``), and so
+    are a line past the hub's limit and nesting past :data:`MAX_FACTS_DEPTH`, read or parsed."""
+    from aar.drp.mediapool.facts import MAX_FACTS_BYTES, MAX_FACTS_DEPTH
+
+    deep = tmp_path / "deep.jsonl"
+    deep.write_bytes(b'{"path": "E:\\\\a.mp4", "x": ' + b"[" * 100_000 + b"]" * 100_000 + b"}\n")
+    with pytest.raises(MediaPoolError) as caught:
+        load_facts(deep)
+    assert caught.value.code == "bad_facts" and "nest deeper" in caught.value.message
+    # Just past the depth limit (the parser could read it): refused all the same.
+    nested: object = "x"
+    for _ in range(MAX_FACTS_DEPTH):
+        nested = [nested]
+    shallow = {"path": "E:\\a.mp4", "exists": True, "size": nested}
+    line = tmp_path / "nested.jsonl"
+    line.write_text(json.dumps(shallow) + "\n")
+    with pytest.raises(MediaPoolError) as caught:
+        load_facts(line)
+    assert "nest deeper" in caught.value.message
+    for given in (shallow, json.dumps(shallow)):
+        with pytest.raises(MediaPoolError) as caught:
+            facts_from_json(given)
+        assert caught.value.code == "bad_facts" and "nest deeper" in caught.value.message
+    with pytest.raises(MediaPoolError) as caught:
+        facts_from_json("[" * 100_000 + "]" * 100_000)
+    assert caught.value.code == "bad_facts"
+    # A line one byte past the limit (no newline needed to be refused), and exactly at it.
+    long = tmp_path / "long.jsonl"
+    long.write_bytes(b" " * MAX_FACTS_BYTES + b"x")
+    with pytest.raises(MediaPoolError) as caught:
+        load_facts(long)
+    assert "longer than" in caught.value.message
+    long.write_bytes(b" " * (MAX_FACTS_BYTES - 1) + b"\n")
+    assert load_facts(long) == {}
 
 
 _RUN_AND_LIST_MODULES = """

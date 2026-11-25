@@ -210,8 +210,16 @@ A folder takes the media files directly in it (`.mp4 .m4v .mov .mxf .wav .mp3 .m
 per file in the order of their paths (the same files give the same bytes), never overwrites
 `--out`, and exits 0 when every file was measured, 2 otherwise: a file it could not measure
 (missing, not a regular file, refused by ffprobe, timed out after `--timeout` seconds, changed
-while measured) is a line with its `error` and is printed. At most 256 files a run
-(`--max-files`) and 64 MiB of output (`--max-bytes`). `aar media facts` is the same command on
+while measured, a name that is not valid Unicode, a time Windows cannot convert) is a line with
+its `error` and is printed. What a folder holds that is not measured (hidden, other suffixes,
+subfolders, broken links) is counted by reason in the last printed line, with the first names;
+a folder that cannot be listed, or paths with no media file at all (`no_media`), are refused
+with exit 2 and nothing written. At most 256 files a run (`--max-files`), 30 minutes for the
+whole run (`--deadline`; files not reached are listed `deadline`) and 64 MiB of output
+(`--max-bytes`, error lines included; one that does not fit is only printed, `"in_file":
+false`). Ctrl+C writes what was measured and exits 130. Everything printed is ASCII JSON, so
+any console code page shows it; the file is UTF-8. On Windows ffprobe is taken only from an
+absolute `PATH` folder (or an absolute `AAR_FFPROBE`), never from the current folder. `aar media facts` is the same command on
 a machine with `aar` installed; there `--pc-folder LOCAL=E:\Show_1` names a folder as the PC
 knows it. Point the recipe's `library.facts` at the file as the hub sees it.
 

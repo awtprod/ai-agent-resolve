@@ -94,16 +94,45 @@ class RunResult:
         return self.stderr[-ERROR_TAIL_CHARS:]
 
 
+#: Read once, so tests can simulate Windows' rules on another system.
+_WINDOWS = os.name == "nt"
+
+
+def _which(name: str) -> str | None:
+    """``name`` as ``shutil.which`` finds it on POSIX. On Windows ``shutil.which`` looks in the
+    current folder first (and resolves a relative ``PATH`` entry against it), so a program
+    left in a media folder the command runs from could be run in ffprobe's place: there only
+    an absolute path, or a name found in an absolute ``PATH`` folder (as ``<name>.exe`` when it
+    has no suffix), is taken."""
+    if not _WINDOWS:
+        return shutil.which(name)
+    if os.path.isabs(name):
+        return name if os.path.isfile(name) else None
+    if os.sep in name or (os.altsep and os.altsep in name) or ":" in name:
+        return None  # a relative path: it would be resolved against the current folder
+    candidates = [name] if os.path.splitext(name)[1] else [name + ".exe"]
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        folder = folder.strip().strip('"')
+        if not folder or not os.path.isabs(folder):
+            continue
+        for candidate in candidates:
+            found = os.path.join(folder, candidate)
+            if os.path.isfile(found) and os.access(found, os.X_OK):
+                return found
+    return None
+
+
 def resolve_tool(tool: Tool) -> str:
-    """Absolute path of ``tool``: the ``AAR_FF*`` override, otherwise the first on PATH."""
+    """Absolute path of ``tool``: the ``AAR_FF*`` override, otherwise the first on PATH
+    (:func:`_which`: never the current folder on Windows)."""
     var = ENV_VARS[tool]
     override = os.environ.get(var, "").strip()
     if override:
-        found = shutil.which(override)
+        found = _which(override)
         if found is None:
             raise MediaToolMissing(f"{var}={override!r} is not an executable program", tool=tool)
         return found
-    found = shutil.which(tool)
+    found = _which(tool)
     if found is None:
         raise MediaToolMissing(f"{tool} not found on PATH (or set {var})", tool=tool)
     return found
