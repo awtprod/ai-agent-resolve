@@ -29,6 +29,8 @@ CODES: dict[str, str] = {
     "bad_input": "the media or items to write are inconsistent",
     "bad_transition": "a transition is not at a join of two clips, or the media it plays is "
     "not there",
+    "transitions_overlap": "two transitions on one clip need more frames than it has (the plan "
+    "export's code for the same rule)",
     "operation_not_opened": "the project needs an operation no person has opened in Resolve yet",
     "bad_project_name": "the project name is not a valid folder name on the share",
     "project_exists": "a project of that name is already in the library",

@@ -217,3 +217,39 @@ def test_a_return_recorded_meanwhile_defers_a_save_based_on_the_older_state(
     assert sweep(env).returned == 1  # the file as it is now, after the newest record
     edits = returned_edits(env.hub.log, env.hub.project_id, run)
     assert [segment_of(env, e) for e in edits] == [("trimmed", 2), ("trimmed", 4)]
+
+
+def test_a_second_rounds_hand_off_starts_from_its_own_placed_project(ccn_env: CcnEnv) -> None:
+    """Round 1's project is saved once (a return), the review rejected, round 2 places a new
+    project. Round 2's newest recorded state is its own placed project, never round 1's
+    return: its untouched project records nothing, and its first save follows ``placed``."""
+    from write_support import HUMAN
+
+    from aar.hub.reviews import decide
+    from aar.recipes.state import load_state
+
+    env = ccn_env
+    run, db1 = _placed(env)
+    save(db1, trim_tail(5))
+    assert sweep(env).returned == 1
+    review = load_state(env.hub.log, run).latest_in_round("review", 1)
+    assert review is not None
+    decide(env.hub.log, env.hub.project_id, review.review_id, "reject", "again", HUMAN)
+    work(env)
+    assert load_state(env.hub.log, run).current_round() == 2
+    keep = {"ranges": [{"start_s": 1.5, "end_s": 10.5}]}
+    agent_cut(env, run, keep=keep, key="r2", derives_from=review.review_id)
+    assert work(env) == 2
+    handoff = outputs(env, run, "export")["library_handoff"]
+    assert handoff["status"] == "placed", handoff
+    db2 = Path(handoff["library"]).joinpath(*handoff["parts"]) / "Project.db"
+    assert db2 != db1
+    seq = env.hub.log.latest_seq()
+    result = sweep(env)
+    assert (result.returned, result.unchanged) == (0, 1), result
+    assert env.hub.log.latest_seq() == seq
+    save(db2, trim_tail(5))  # the same edit as round 1's
+    assert sweep(env).returned == 1
+    edits = returned_edits(env.hub.log, env.hub.project_id, run)
+    assert [e["follows"] for e in edits] == ["placed", "placed"]
+    assert edits[0]["handoff"] != edits[1]["handoff"]

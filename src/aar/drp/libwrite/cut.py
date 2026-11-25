@@ -8,8 +8,10 @@ must find them. :class:`CutTransition` entries put a sound crossfade on a join o
 (:func:`aar.drp.items.transitions.author_transition`): the outgoing entry's sound must end
 exactly where another entry's sound starts (a join, not a gap or a split edit), and both clips
 must hold the media the transition plays beyond the cut (refused ``bad_transition``, never
-shortened). On each track the items are in record order, a transition before a clip that starts
-on the same frame (Resolve's order). Template items come from :func:`pick_item_templates`:
+shortened); the two transitions on one clip must not overlap inside it (refused
+``transitions_overlap``, the plan export's code for the same rule). On each track the items
+are in record order, a transition before a clip that starts on the same frame (Resolve's
+order). Template items come from :func:`pick_item_templates`:
 plain items Resolve saved, one per kind and linkage, and one plain sound transition.
 """
 
@@ -286,9 +288,12 @@ def _refuse(why: str, **details: object) -> ProjectWriteError:
 
 def _joins(seed: Seed, cuts: Sequence[Cut], transitions: Sequence[CutTransition]) -> list[_Join]:
     """Each transition's join: the outgoing entry's sound ends where exactly one other entry's
-    sound starts, neither is a split edit, and both clips hold the media it plays."""
+    sound starts, neither is a split edit, both clips hold the media it plays, and the two
+    transitions on one clip do not overlap (:func:`_check_overlaps`)."""
     out: list[_Join] = []
     seen: set[int] = set()
+    # Frames of each entry the transitions cover: (entry, frames) for each side of each one.
+    covered: list[tuple[int, int, str]] = []
     for number, tx in enumerate(transitions):
         where = f"transition {number}"
         if not isinstance(tx, CutTransition):
@@ -354,4 +359,28 @@ def _joins(seed: Seed, cuts: Sequence[Cut], transitions: Sequence[CutTransition]
                 available=in_cut.src_in,
             )
         out.append(_Join(end, tx.frames, before, tx.name, tx.alignment))
+        covered.append((tx.after, before, where))
+        covered.append((incoming[0], after, where))
+    _check_overlaps(cuts, covered)
     return out
+
+
+def _check_overlaps(cuts: Sequence[Cut], covered: list[tuple[int, int, str]]) -> None:
+    """The frames the transitions on one entry cover (the part of the incoming one after its
+    cut and of the outgoing one before its cut) fit in its sound: two transitions' windows
+    never overlap inside one clip. The plan export's rule, with its code."""
+    used: dict[int, list[tuple[int, str]]] = {}
+    for index, frames, where in covered:
+        used.setdefault(index, []).append((frames, where))
+    for index, parts in sorted(used.items()):
+        total = sum(frames for frames, _ in parts)
+        if len(parts) > 1 and total > cuts[index].duration:
+            raise ProjectWriteError(
+                "transitions_overlap",
+                f"cut entry {index}: {' and '.join(w for _, w in parts)} need {total} frames of "
+                f"its {cuts[index].duration}, so they would overlap",
+                "shorten the transitions or lengthen the clip",
+                entry=index,
+                needed=total,
+                available=cuts[index].duration,
+            )
